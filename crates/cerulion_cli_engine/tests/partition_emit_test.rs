@@ -1646,24 +1646,17 @@ fn a_non_trigger_block_input_is_co_located() {
 }
 
 /// THE INVERTED ARM. A MIXED topic (one `block` consumer + one `drop_oldest`
-/// consumer) MUST be co-located — the WHOLE flow, sibling included.
+/// consumer) is co-located WHOLE by the derived partition, sibling included.
 ///
-/// The refusing gate is per-CONSUMER (`Block` on a producer-less flow) and the
-/// mixed→`drop_oldest` degrade runs strictly LATER, at the runtime's install
-/// site — so on a split mixed topic the degrade can never rescue anything, the
-/// build is already dead. And in the block consumer's worker subgraph the
-/// sibling `drop_oldest` consumer is a FOREIGN node and is filtered out, so
-/// global mixedness is structurally invisible to the check that refuses.
-/// Keying the seed on `is_all_block()` would leave this legal, documented,
-/// separately-tested shape falling straight through into a split that cannot build.
+/// The seed is keyed on `TopicFlow::holds_its_producers()`, the rule the
+/// runtime wires a producer's slots by: a `block` consumer holds its producer
+/// whatever its siblings declare, so a mixed topic seeds exactly as an
+/// all-`block` one does.
 ///
-/// The SIBLING is not optional, and this arm is what says so. Co-locate only
-/// `{prod, blocker}` and the worker holding them reads consumers = `[block]`
-/// ⇒ `is_all_block()` TRUE ⇒ it INSTALLS the defer, while the monolith sees
-/// the mixed flow and DEGRADES to `drop_oldest`. The mixed-topic warn fires in
-/// neither process, so one graph runs two semantics in silence and `lossy` is
-/// throttled to `blocker`'s drain rate — the decision-K starvation the degrade
-/// exists to prevent. So the oracle is the WHOLE flow in ONE group.
+/// The seed takes EVERY consumer of the flow, so the sibling is placed with
+/// the producer too and no edge of the flow crosses a process. The sibling
+/// holds no credit slot, so placing it elsewhere would cost it a hop, not
+/// correctness. The oracle is the WHOLE flow in ONE group.
 #[test]
 fn a_mixed_block_topic_must_also_be_co_located() {
     let config = config_of(
@@ -1703,8 +1696,8 @@ fn a_mixed_block_topic_must_also_be_co_located() {
     assert_eq!(
         owner("prod"),
         owner("blocker"),
-        "a MIXED block topic must still co-locate its producer with its BLOCK consumer — \
-         the refusing gate is per-consumer and never sees the mixedness"
+        "a MIXED block topic co-locates its producer with its BLOCK consumer: the block \
+         consumer holds the producer whatever its sibling declares"
     );
     // THE SIBLING TOO. Its own seed claim, asserted directly rather than left
     // to an accident of the levelization repair: in this 3-node shape the group
@@ -1713,9 +1706,8 @@ fn a_mixed_block_topic_must_also_be_co_located() {
     assert_eq!(
         owner("prod"),
         owner("lossy"),
-        "the non-`block` SIBLING of a mixed topic must be co-located too — split off, the \
-         worker holding prod+blocker reads its flow as all-block and INSTALLS the defer \
-         while --single-process degrades it"
+        "the non-`block` SIBLING of a mixed topic is co-located too: the seed takes every \
+         consumer of a flow its block consumer holds"
     );
     assert!(
         groups.iter().any(|(_, m)| m.contains(&"prod".to_string())

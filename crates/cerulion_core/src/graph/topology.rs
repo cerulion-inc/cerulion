@@ -227,17 +227,6 @@ pub enum CreditBar {
 }
 
 impl TopicFlow {
-    /// True when the topic has ≥1 consumer and EVERY consumer is `block`.
-    /// Informational: a topic with any `block` consumer defers its producer
-    /// on those consumers' slots whatever its other consumers declare.
-    pub fn is_all_block(&self) -> bool {
-        !self.consumers.is_empty()
-            && self
-                .consumers
-                .iter()
-                .all(|c| matches!(c.policy, BackpressurePolicy::Block))
-    }
-
     /// Why this topic's `block` edges cannot carry a
     /// cross-process credit word — `None` means they CAN.
     ///
@@ -2757,8 +2746,8 @@ mod tests {
         assert_eq!(flow.consumers[0].node_id, "dst");
         assert_eq!(flow.consumers[0].policy, BackpressurePolicy::Block);
         assert_eq!(flow.consumers[0].depth, 4);
-        assert!(flow.is_all_block());
         assert!(flow.has_block_consumer());
+        assert!(flow.holds_its_producers());
         assert_eq!(flow.sum_consumer_depths(), 4);
     }
 
@@ -2948,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_consumers_are_not_all_block() {
+    fn a_block_consumer_holds_the_producer_of_a_mixed_topic() {
         let cfg = config(
             "p",
             vec![
@@ -2969,8 +2958,8 @@ mod tests {
         let flow = topo.topic("/p/src/out").unwrap();
         assert!(flow.has_block_consumer());
         assert!(
-            !flow.is_all_block(),
-            "mixed block+drop_oldest is NOT all-block"
+            flow.holds_its_producers(),
+            "a block consumer holds the producer whatever its drop_oldest sibling declares"
         );
         assert_eq!(flow.sum_consumer_depths(), 12);
     }

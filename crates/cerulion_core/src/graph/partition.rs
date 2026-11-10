@@ -4020,8 +4020,8 @@ mod block_colocation_tests {
     /// hand-picked six — the `0` rows are exactly the ones the previous
     /// seed-shaped predicate could REPRESENT but never answered correctly
     /// (`producers = 0` rendered "has 0 in-graph producers … two writers would
-    /// each spend the other's credit"; `block = 0` read as creditable while
-    /// `is_all_block()` was false).
+    /// each spend the other's credit"; `block = 0` read as creditable with no
+    /// `block` consumer to credit).
     ///
     /// The bar VALUE is asserted, not just its presence: a classifier that
     /// always answered one bar satisfies a totality-only check.

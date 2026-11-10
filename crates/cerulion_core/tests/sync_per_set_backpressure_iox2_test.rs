@@ -30,7 +30,7 @@
 //!
 //! Sample arms publish by hand on a driven `VirtualClock`, so the payload IS the
 //! wire stamp and a recorded set names exactly the frames it observed. Block
-//! arms cannot: the all-block rule requires an IN-GRAPH producer, so their
+//! arms cannot: a `block` input requires an IN-GRAPH producer, so their
 //! stimulus is a `period_ms` node and their oracles are counts, publish totals
 //! and FIFO contiguity — each derived by hand from the contract, never from a
 //! previous run.
@@ -296,7 +296,7 @@ fn the_slot_debt_is_taken_only_by_block_probed_fifo_inputs() {
 // PART 2 — `block` on a per-set Sync TRIGGER, end to end
 // ===========================================================================
 //
-// The all-block rule requires an IN-GRAPH producer (topology validation refuses
+// A `block` input requires an IN-GRAPH producer (topology validation refuses
 // a `block` edge whose topic nobody in the graph publishes — the scheduler can
 // only defer producers it schedules), so these arms cannot publish by hand the
 // way the sample arms do. The stimulus is a `period_ms` node writing a counter,
