@@ -289,7 +289,11 @@ first fire in the pass, one queue of the input more (its declared depth per
 writer) is excused, once and by name, because a node's init can read its inputs
 before the recording starts its read log and a resumed pass starts after reads
 its bag does not keep; a count past that queue is still a finding, on a resumed
-pass too. From `trace_format` 8 on a writer change on any edge stages a producer
+pass too. A resumed pass that holds no fire of the node and no read its body
+made stands down by name once a count passes that queue, because a node that
+returned `NodeError::Fatal` before the pass's anchor records exactly that and
+the bag records no stop; a from-start pass re-executes the stop, and a node
+that fires anywhere in a resumed pass is still judged. From `trace_format` 8 on a writer change on any edge stages a producer
 annotation, so the counts a bag that begins mid-run records before the trigger
 drain's first annotation are frames of the one writer whose run it began inside,
 counted as one writer more. That rule stands down by name where a count needs an
