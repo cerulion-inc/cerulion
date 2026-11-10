@@ -794,6 +794,21 @@ impl GraphTopology {
                             ),
                         });
                     }
+                    Some(_)
+                        if (flow.producers.len() > 1
+                            || self.multi_publisher_topics.contains(&flow.topic))
+                            && !crate::oracle_mutant::active(
+                                "block_shared_timeout_refusal_off",
+                            ) =>
+                    {
+                        return Err(TransportError::GraphError {
+                            reason: shared_topic_timeout_refusal(
+                                flow,
+                                c,
+                                self.multi_publisher_topics.contains(&flow.topic),
+                            ),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -2410,6 +2425,58 @@ pub enum MissingInputMeta {
     Skip,
 }
 
+/// The refusal of `block_timeout_ms` on the `block` edge `c` of a topic that
+/// has more than one in-graph producer or is listed in
+/// `multi_publisher_topics:` (`listed`).
+///
+/// A timeout release forgives the slot's counted frames, and a later publish
+/// that overflows the consumer's queue evicts a forgiven frame. The word
+/// bounds those evictions by `depth` times the topic's in-graph producers,
+/// which is exact on one connection. Each producer's connection is its own
+/// queue of `depth` frames, so with several connections one connection can
+/// evict while the bound sees room, and a publisher outside the graph opens a
+/// connection the word does not count. The forgiven count then stays above the
+/// frames really queued and the slot reads full with nothing to drain. A
+/// release when the consumer stops for good marks the slot released and never
+/// forgives, so it is not refused.
+// hot-path-alloc-ok-fn: cold: graph build, once per refused edge
+fn shared_topic_timeout_refusal(flow: &TopicFlow, c: &ConsumerEdge, listed: bool) -> String {
+    let mut why: Vec<String> = Vec::new();
+    match flow.producers.as_slice() {
+        [] => {}
+        [one] => why.push(format!("has 1 in-graph producer ('{one}')")),
+        many => why.push(format!(
+            "has {} in-graph producers ({})",
+            many.len(),
+            many.iter()
+                .map(|p| format!("'{p}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+    if listed {
+        why.push(
+            "is listed in `multi_publisher_topics:`, which lets publishers outside the graph \
+             write it"
+                .to_string(),
+        );
+    }
+    format!(
+        "input '{}.{}' on topic '{}' sets `block_timeout_ms`, but the topic {}. A timeout \
+         release keeps an exact count only on a topic with one producer: each producer's \
+         connection is its own queue, so on this topic a release can leave the slot's count \
+         high and release a consumer that keeps up again and again. Keep one producer on the \
+         topic and take it out of `multi_publisher_topics:`; or remove `block_timeout_ms`, and \
+         the slot is still released when the consumer stops for good (a fatal error, a tick \
+         panic, or its process dying); or wait for the version that counts each producer's \
+         queue on its own, which lifts this limit",
+        c.node_id,
+        c.input,
+        flow.topic,
+        why.join(" and ")
+    )
+}
+
 /// Refuse `block` on an input the network feeds.
 ///
 /// A topic in `network.ingress` is published on another host and arrives
@@ -2732,6 +2799,62 @@ mod tests {
             .validate()
             .expect_err("timeout 0");
         assert!(err.to_string().contains("block_timeout_ms: 0"), "{err}");
+    }
+
+    /// `block_timeout_ms` on a `block` edge of a topic with two in-graph
+    /// producers, or of a listed topic with one, is refused by name; the same
+    /// edge without the key, and the key on a topic with one unlisted
+    /// producer, validate.
+    #[test]
+    fn block_timeout_is_refused_on_a_topic_with_several_producers() {
+        let shared = |producers: &[&str], listed: bool, timeout: Option<u64>| {
+            let mut nodes: Vec<NodeDef> =
+                producers.iter().map(|p| node(p, &[], &["out"])).collect();
+            nodes.push(node("dst", &[("in", "/p/shared")], &[]));
+            let mut cfg = config("p", nodes);
+            for n in cfg.nodes.iter_mut().take(producers.len()) {
+                n.outputs[0].topic = Some("/p/shared".to_string());
+            }
+            if listed {
+                cfg.multi_publisher_topics = vec!["/p/shared".to_string()];
+            }
+            cfg.nodes[producers.len()].inputs[0].block_timeout_ms = timeout;
+            let mut entries: Vec<(&str, Vec<InputMeta>)> =
+                producers.iter().map(|p| (*p, vec![])).collect();
+            entries.push(("dst", vec![input_meta("in", BackpressurePolicy::Block, 2)]));
+            GraphTopology::build(&cfg, &infos(entries))
+                .expect("build")
+                .validate()
+        };
+        let tail = "A timeout release keeps an exact count only on a topic with one producer: \
+             each producer's connection is its own queue, so on this topic a release can leave \
+             the slot's count high and release a consumer that keeps up again and again. Keep \
+             one producer on the topic and take it out of `multi_publisher_topics:`; or remove \
+             `block_timeout_ms`, and the slot is still released when the consumer stops for good \
+             (a fatal error, a tick panic, or its process dying); or wait for the version that \
+             counts each producer's queue on its own, which lifts this limit";
+        let listing = "is listed in `multi_publisher_topics:`, which lets publishers outside \
+             the graph write it";
+        let err = shared(&["a", "b"], true, Some(50)).expect_err("two producers");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Graph validation error: input 'dst.in' on topic '/p/shared' sets \
+                 `block_timeout_ms`, but the topic has 2 in-graph producers ('a', 'b') and \
+                 {listing}. {tail}"
+            )
+        );
+        let err = shared(&["a"], true, Some(50)).expect_err("a listed topic");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Graph validation error: input 'dst.in' on topic '/p/shared' sets \
+                 `block_timeout_ms`, but the topic has 1 in-graph producer ('a') and \
+                 {listing}. {tail}"
+            )
+        );
+        shared(&["a", "b"], true, None).expect("no timeout: the death release still holds");
+        shared(&["a"], false, Some(50)).expect("one unlisted producer keeps its timeout");
     }
 
     #[test]

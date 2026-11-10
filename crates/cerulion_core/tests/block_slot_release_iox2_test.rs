@@ -11,10 +11,15 @@
 //! - after a timeout release, a FIFO consumer that resumes between two
 //!   publishes receives every frame published after the release, on a local
 //!   and on a split word;
-//! - on a topic two producers share, a read that finds the queue empty clears
-//!   the count a release left high: a FIFO read over real queues leaves the
-//!   slot with room, and a consumer that keeps up after a release is not
-//!   released again;
+//! - a single-producer edge with `block_timeout_ms` loads, is released once,
+//!   and its consumer then receives every frame published after the release
+//!   with the slot's count equal to the frames still queued;
+//! - on a word fed by two publishers, a FIFO read over real queues that finds
+//!   the queue empty clears the count a release left high;
+//! - `block_timeout_ms` on a topic with several producers is refused at load
+//!   with one text, however the input is made `block` and on the
+//!   single-process, planning and worker builds; without the key such a
+//!   consumer that stops for good still has its slot released;
 //! - a consumer node that stops with a fatal error has its slot released;
 //! - the live loop's wait sizing holds a deferred producer until its slot's
 //!   `block_timeout_ms` deadline, or until the drain that frees it, instead of
@@ -32,11 +37,12 @@
 //!
 //! Mutants (`--features oracle-mutants`, `CERULION_ORACLE_MUTANT=<name>`):
 //! `block_no_timeout_release`, `block_shared_release`, `block_cycle_off`,
-//! `block_accumulate_refusal_off`, `block_forgiven_drain_spends_credit` and
-//! `block_empty_resync_off` each make a row here fail.
+//! `block_accumulate_refusal_off`, `block_forgiven_drain_spends_credit`,
+//! `block_empty_resync_off` and `block_shared_timeout_refusal_off` each make a
+//! row here fail.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cerulion_core::clock::VirtualClock;
@@ -44,8 +50,9 @@ use cerulion_core::credit::{credit_edge_id, CreditShared, CreditWord, MappedCred
 use cerulion_core::graph::config::{
     GraphConfig, InputBackpressure, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef,
 };
-use cerulion_core::graph::node::NodeEntry;
-use cerulion_core::graph::GraphRuntime;
+use cerulion_core::graph::node::{ClosureNodeEntry, InputMeta, MacroPolicy, NodeEntry, NodeInfo};
+use cerulion_core::graph::{BuildPurpose, CrossProcessWiring, GraphRuntime};
+use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::scheduler::BackpressureCounters;
 use cerulion_core::transport::{TransportConfig, TransportManager};
@@ -342,13 +349,61 @@ fn entry(ty: &str) -> Box<dyn NodeEntry> {
     }
 }
 
-fn build(cfg: GraphConfig) -> Result<GraphRuntime, String> {
+fn factories_for(cfg: &GraphConfig) -> IndexMap<String, Box<dyn NodeEntry>> {
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
     for n in &cfg.nodes {
         factories.insert(n.id.clone(), entry(&n.node_type));
     }
+    factories
+}
+
+fn build(cfg: GraphConfig) -> Result<GraphRuntime, String> {
+    let factories = factories_for(&cfg);
     GraphRuntime::build_for_test(cfg, factories, Arc::new(VirtualClock::new()), 64)
         .map_err(|e| e.to_string())
+}
+
+/// Build `cfg` as the multi-process supervisor's planning build does, before
+/// it spawns a worker. `None` when it builds.
+fn planning_refusal(cfg: GraphConfig) -> Option<String> {
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("{}_plan", cfg.prefix),
+            clock: Arc::new(VirtualClock::new()),
+            subscriber_buffer_size: 64,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let factories = factories_for(&cfg);
+    match GraphRuntime::build_with_schema_hashes_provisioning_and_recorded(
+        cfg,
+        factories,
+        &mgr,
+        Arc::new(VirtualClock::new()),
+        None,
+        None,
+        None,
+        BuildPurpose::PlanningOnly,
+    ) {
+        Ok(_planning) => None,
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+/// Build `cfg` on the live free-run path a multi-process worker builds on.
+fn build_live(cfg: GraphConfig) -> Result<GraphRuntime, String> {
+    let factories = factories_for(&cfg);
+    GraphRuntime::build_for_test_with_policy_and_wiring(
+        cfg,
+        factories,
+        Arc::new(VirtualClock::new()),
+        64,
+        cerulion_core::MonitorWaitPolicy::off(),
+        CrossProcessWiring::none(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn fires(rt: &GraphRuntime, id: &str) -> u64 {
@@ -553,6 +608,139 @@ fn a_timeout_release_touches_only_the_timed_out_slot() {
         fires(&rt, "producer"),
         2,
         "the held consumer still defers the producer after the release"
+    );
+}
+
+/// A 10 ms consumer whose `inp` is `block`, depth 2. On every `drain`-th tick
+/// it drains its whole queue with `try_receive` and appends each frame's `x` to
+/// `seen`; `drain` 0 never drains.
+fn recording_block_consumer(
+    drain: Arc<AtomicU64>,
+    seen: Arc<Mutex<Vec<u32>>>,
+) -> Box<dyn NodeEntry> {
+    let meta = InputMeta {
+        name: "inp".to_string(),
+        schema_hash: <Vector3 as ShmMessage>::SCHEMA_HASH,
+        trigger: false,
+        depth: 2,
+        backpressure: BackpressurePolicy::Block,
+        expect_within_ms: None,
+        accumulate: false,
+        consume: Default::default(),
+    };
+    let info =
+        NodeInfo::with_meta(vec![meta], vec![]).with_policy(MacroPolicy::Period { period_ms: 10 });
+    let mut ticks = 0u64;
+    Box::new(
+        ClosureNodeEntry::new(info, move |ctx| {
+            ticks += 1;
+            let every = drain.load(Ordering::Relaxed);
+            if every == 0 || !ticks.is_multiple_of(every) {
+                return Ok(());
+            }
+            let sub = ctx.subscriber("inp").expect("the block input is wired");
+            let mut got = Vec::new();
+            sub.try_receive(|msg| {
+                let x = f64::from_le_bytes(msg.payload()[0..8].try_into().expect("8 bytes"));
+                got.push(x as u32);
+            })?;
+            seen.lock().expect("seen").extend(got);
+            Ok(())
+        })
+        .with_label("recording_block_consumer"),
+    )
+}
+
+/// A single-producer `block` edge (depth 2) with `block_timeout_ms: 50`
+/// loads, and its timeout release is exact. The consumer stalls until one
+/// release; it then drains every third tick, slower than the producer and well
+/// inside the timeout. Over 60 steps no second release follows, every frame
+/// published after the release reaches the consumer once and in order, so none
+/// was evicted, and the slot's count equals the frames still queued.
+#[test]
+fn a_single_producer_timeout_release_is_exact() {
+    const WINDOW: u64 = 60;
+    let drain = Arc::new(AtomicU64::new(0));
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let cfg = config(
+        "bsr_exact",
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node(
+                "consumer",
+                "recording_block",
+                vec![with_timeout(input("producer/out"), 50)],
+                vec![],
+            ),
+        ],
+    );
+    let mut nodes: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    nodes.insert("producer".to_string(), entry("producer"));
+    nodes.insert(
+        "consumer".to_string(),
+        recording_block_consumer(Arc::clone(&drain), Arc::clone(&seen)),
+    );
+    let mut rt = GraphRuntime::build_for_test(cfg, nodes, Arc::new(VirtualClock::new()), 64)
+        .expect("a single-producer block edge with block_timeout_ms loads");
+    // The producer's fires before the step that releases the slot.
+    let mut held_at = 0u64;
+    let mut stalled_steps = 0u64;
+    while releases(&rt, "consumer") == 0 {
+        assert!(stalled_steps < 30, "no timeout release within 300 ms");
+        held_at = fires(&rt, "producer");
+        rt.step(Duration::from_millis(10));
+        stalled_steps += 1;
+    }
+    assert_eq!(
+        held_at, 2,
+        "the stalled consumer held the producer at depth until the release"
+    );
+    assert!(
+        stalled_steps >= 6,
+        "released at step {stalled_steps}: the slot filled at step 2, so 50 ms of stall ends no \
+         earlier than step 6"
+    );
+    assert!(
+        seen.lock().expect("seen").is_empty(),
+        "precondition: the consumer drained nothing before the release"
+    );
+    drain.store(3, Ordering::Relaxed);
+    for _ in 0..WINDOW {
+        rt.step(Duration::from_millis(10));
+    }
+    let published = fires(&rt, "producer");
+    let seen = seen.lock().expect("seen").clone();
+    assert_eq!(
+        releases(&rt, "consumer"),
+        1,
+        "a consumer that drains inside the timeout is never released again (received {seen:?})"
+    );
+    let after: Vec<u32> = seen
+        .iter()
+        .copied()
+        .filter(|&x| u64::from(x) > held_at)
+        .collect();
+    let last = after.last().copied().map_or(held_at, u64::from);
+    let want: Vec<u32> = (held_at + 1..=last).map(|x| x as u32).collect();
+    assert_eq!(
+        after, want,
+        "every frame published after the release is received once, in order"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "no frame is received twice or out of order: {seen:?}"
+    );
+    assert!(
+        published - held_at >= 30,
+        "the producer resumes: {} fires after the release in {WINDOW} steps",
+        published - held_at
+    );
+    let queued = published - last;
+    assert!(queued <= 2, "{queued} frames queued past depth 2");
+    assert_eq!(
+        outstanding(&rt, "consumer"),
+        queued,
+        "the slot counts exactly the frames still queued ({published} published, {last} received)"
     );
 }
 
@@ -768,76 +956,143 @@ fn a_fifo_read_that_finds_the_queue_empty_clears_a_count_a_release_left_high() {
     assert_eq!(word.outstanding(), 0);
 }
 
-/// A `block` consumer, depth 2 with a 50 ms timeout, of a topic two producers
-/// share: its input has two connections and four queue places. Only `first`
-/// publishes (`quiet` is never triggered).
-fn shared_topic(prefix: &str) -> GraphConfig {
+/// A topic `/{prefix}/shared` listed in `multi_publisher_topics:`: `first`
+/// (a 10 ms producer) and, when `two`, `quiet` (an `external` producer the
+/// test never triggers) publish it, and `consumer`, of type `consumer_ty`,
+/// reads it through the input `inp` builds from the topic name.
+fn shared_topic(
+    prefix: &str,
+    two: bool,
+    consumer_ty: &str,
+    inp: impl FnOnce(&str) -> InputDef,
+) -> GraphConfig {
     let topic = format!("/{prefix}/shared");
-    let mut cfg = config(
-        prefix,
-        vec![
-            node("first", "producer", vec![], vec![output_on("out", &topic)]),
-            node(
-                "quiet",
-                "quiet_producer",
-                vec![],
-                vec![output_on("out", &topic)],
-            ),
-            node(
-                "consumer",
-                "host_block",
-                vec![with_timeout(input(&topic), 50)],
-                vec![],
-            ),
-        ],
-    );
+    let mut nodes = vec![node(
+        "first",
+        "producer",
+        vec![],
+        vec![output_on("out", &topic)],
+    )];
+    if two {
+        nodes.push(node(
+            "quiet",
+            "quiet_producer",
+            vec![],
+            vec![output_on("out", &topic)],
+        ));
+    }
+    nodes.push(node("consumer", consumer_ty, vec![inp(&topic)], vec![]));
+    let mut cfg = config(prefix, nodes);
     cfg.multi_publisher_topics = vec![topic];
     cfg
 }
 
-/// The consumer stalls until one timeout release, then is triggered on
-/// every step. The release forgives `first`'s two queued frames, which its
-/// next two frames evict from its own connection's queue while the backlog
-/// bound sees four places. Once the consumer drains, the slot must have room
-/// again, `first` must fire on every step, and no second release may follow
-/// over a window of six `block_timeout_ms`.
+/// The load refusal of `block_timeout_ms` on `consumer.inp` of the listed
+/// `topic`, whose in-graph producers `producers` names.
+fn shared_timeout_refusal(topic: &str, producers: &str) -> String {
+    format!(
+        "Graph validation error: input 'consumer.inp' on topic '{topic}' sets \
+         `block_timeout_ms`, but the topic {producers} and is listed in \
+         `multi_publisher_topics:`, which lets publishers outside the graph write it. A \
+         timeout release keeps an exact count only on a topic with one producer: each \
+         producer's connection is its own queue, so on this topic a release can leave the \
+         slot's count high and release a consumer that keeps up again and again. Keep one \
+         producer on the topic and take it out of `multi_publisher_topics:`; or remove \
+         `block_timeout_ms`, and the slot is still released when the consumer stops for good \
+         (a fatal error, a tick panic, or its process dying); or wait for the version that \
+         counts each producer's queue on its own, which lifts this limit"
+    )
+}
+
+/// `block_timeout_ms` on a `block` input of a topic with several producers is
+/// refused at load with one text: with the input `block` by the node's
+/// attribute or by the graph's `backpressure:` key, with two in-graph
+/// producers or with one on a listed topic, on the single-process build, the
+/// multi-process supervisor's planning build and a worker's live build. The
+/// same graphs without the key build.
 #[test]
-fn a_release_on_a_shared_topic_is_not_repeated_while_the_consumer_keeps_up() {
-    const WINDOW: u64 = 30;
-    let mut rt = build(shared_topic("bsr_shared")).expect("build");
-    let mut stalled_steps = 0u64;
-    while releases(&rt, "consumer") == 0 {
-        assert!(stalled_steps < 30, "no timeout release within 300 ms");
-        rt.step(Duration::from_millis(10));
-        stalled_steps += 1;
+fn block_timeout_on_a_topic_with_several_producers_is_refused_at_load() {
+    let timed = |topic: &str| with_timeout(input(topic), 50);
+    let keyed = |topic: &str| {
+        let mut i = with_timeout(input(topic), 50);
+        i.backpressure = Some(InputBackpressure::Block);
+        i
+    };
+    let two = "has 2 in-graph producers ('first', 'quiet')";
+    let one = "has 1 in-graph producer ('first')";
+    let forms = [
+        (
+            "the attribute, two producers",
+            shared_topic("bsr_mp_attr", true, "host_block", timed),
+            two,
+        ),
+        (
+            "the graph key, two producers",
+            shared_topic("bsr_mp_key", true, "host_drop_oldest", keyed),
+            two,
+        ),
+        (
+            "the attribute, one producer on a listed topic",
+            shared_topic("bsr_mp_one", false, "host_block", timed),
+            one,
+        ),
+    ];
+    for (form, cfg, producers) in forms {
+        let want = shared_timeout_refusal(&format!("/{}/shared", cfg.prefix), producers);
+        let err = build(cfg.clone())
+            .err()
+            .unwrap_or_else(|| panic!("{form}: the single-process build must refuse"));
+        assert_eq!(err, want, "{form}: the single-process build");
+        assert_eq!(
+            planning_refusal(cfg.clone()).as_deref(),
+            Some(want.as_str()),
+            "{form}: the planning build"
+        );
+        let err = build_live(cfg)
+            .err()
+            .unwrap_or_else(|| panic!("{form}: the worker build must refuse"));
+        assert_eq!(err, want, "{form}: the worker build");
     }
-    assert_eq!(releases(&rt, "consumer"), 1, "precondition: one release");
-    let fired_before = fires(&rt, "first");
-    // The window steps after which the slot read full although the consumer
-    // had just drained its queue.
-    let mut full_after_drain = Vec::new();
-    for step in 0..WINDOW {
-        rt.trigger_external("consumer").expect("trigger");
-        rt.step(Duration::from_millis(10));
-        if outstanding(&rt, "consumer") >= 2 {
-            full_after_drain.push(step);
-        }
-    }
-    let fired = fires(&rt, "first") - fired_before;
+    let keyed_plain = |topic: &str| {
+        let mut i = input(topic);
+        i.backpressure = Some(InputBackpressure::Block);
+        i
+    };
+    build(shared_topic("bsr_mp_plain", true, "host_block", input))
+        .expect("the attribute form without block_timeout_ms builds");
+    build(shared_topic(
+        "bsr_mp_kplain",
+        true,
+        "host_drop_oldest",
+        keyed_plain,
+    ))
+    .expect("the graph key form without block_timeout_ms builds");
     assert_eq!(
-        releases(&rt, "consumer"),
-        1,
-        "a consumer that keeps up is never released again (the slot read full after a drain \
-         at window steps {full_after_drain:?}; first fired {fired} times in {WINDOW} steps)"
+        planning_refusal(shared_topic("bsr_mp_pplain", true, "host_block", input)),
+        None,
+        "the planning build of the topic without block_timeout_ms builds"
     );
+}
+
+/// A `block` consumer of a topic two producers share, with no
+/// `block_timeout_ms`, still has its slot released when it stops for good.
+#[test]
+fn a_consumer_of_a_shared_topic_that_stops_releases_its_slot() {
+    let mut rt = build(shared_topic("bsr_mp_fatal", true, "fatal_block", input)).expect("build");
+    let mut held_at = 0;
+    for step in 0..STEPS {
+        if step == 9 {
+            held_at = fires(&rt, "first");
+            rt.trigger_external("consumer").expect("trigger");
+        }
+        rt.step(Duration::from_millis(10));
+    }
+    assert_eq!(held_at, 2, "precondition: the consumer held first at depth");
+    assert_eq!(releases(&rt, "consumer"), 1, "exactly one release");
+    let produced = fires(&rt, "first");
     assert!(
-        full_after_drain.is_empty(),
-        "the consumer drained its queue, so its slot has room after every step: full at \
-         window steps {full_after_drain:?}"
-    );
-    assert!(
-        fired >= WINDOW,
-        "first fires {fired} times in {WINDOW} steps: the slot never holds it"
+        produced >= 85,
+        "first resumes after the consumer stops (fires {produced}; held it would stay at 2)"
     );
     assert_eq!(fires(&rt, "quiet"), 0, "the second producer never fires");
 }

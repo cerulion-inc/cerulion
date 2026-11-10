@@ -27,7 +27,9 @@
 //! The producers of a topic share one [`StallCell`] per consumer slot. The
 //! caller reads the slot, judges it and forgives it inside
 //! [`StallCell::update`], under the cell's lock, so a second producer judges
-//! the mark the first one stored and one stall releases the slot once.
+//! the mark the first one stored and one stall releases the slot once. In a
+//! graph only a slot with one producer can time out: graph load refuses
+//! `block_timeout_ms` on a topic with several producers.
 //!
 //! The release lands at the first evaluation at or after the deadline;
 //! [`release_deadline_ns`] gives that deadline to a caller that sizes a wait.

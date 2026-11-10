@@ -1853,7 +1853,8 @@ fn block_edges_defer(producer: &str, edges: &[BlockDeferEdge], now_ns: u64) -> b
         // Read, judge and forgive under the slot's stall-cell lock. Every
         // producer of the topic shares the cell, so a second producer judges
         // the mark this one stored, never the one it replaced, and one stall
-        // releases the slot once.
+        // releases the slot once. Graph load refuses `block_timeout_ms` on a
+        // topic with several producers, so only a one-producer slot times out.
         let (reading, verdict, forgiven) = e.stall_clock.update(|mark| {
             let reading = SlotReading::of(&e.outstanding, e.threshold);
             let (verdict, next) = judge_slot(reading, mark, now_ns, e.timeout_ns);

@@ -897,7 +897,8 @@ pub fn scalar_param_value(value: &serde_yaml::Value) -> Option<String> {
 /// The three optional keys set this edge's backpressure from the graph
 /// instead of the node's `#[input(...)]` attribute; each key present wins over
 /// the attribute's value. `block_timeout_ms` is legal only on an edge whose
-/// effective policy is `block`.
+/// effective policy is `block`, on a topic with at most one in-graph producer
+/// that `multi_publisher_topics` does not list.
 ///
 /// ```yaml
 /// inputs:
@@ -921,7 +922,9 @@ pub struct InputDef {
     pub depth: Option<usize>,
     /// Under `block`: release this consumer's slot once it has stayed full,
     /// with nothing drained, for this many milliseconds. Absent: the producer
-    /// stays deferred until the consumer drains or dies.
+    /// stays deferred until the consumer drains or dies. Graph load refuses it
+    /// on a topic with more than one in-graph producer or listed in
+    /// `multi_publisher_topics`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_timeout_ms: Option<u64>,
 }

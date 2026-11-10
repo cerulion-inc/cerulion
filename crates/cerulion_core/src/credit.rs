@@ -111,8 +111,10 @@
 //!   of a frame published after the release. On a local word, a drain that
 //!   finds the consumer's queue empty also zeroes the queued count and the
 //!   backlog ([`CreditWord::record_drained_to_empty`]), which clears what the
-//!   backlog bound misses on a topic with several producers. The
-//!   `block_timeout_ms` release uses it.
+//!   backlog bound misses on a word with several connections. The
+//!   `block_timeout_ms` release uses it, and graph load refuses that key on a
+//!   topic with several producers, so a graph forgives only a word with one
+//!   connection.
 //!
 //! Whoever releases emits the loud event; this module only moves the word.
 //!
@@ -679,7 +681,10 @@ impl CreditShared {
     /// mints no word), the consumer's next drain that finds its queue empty
     /// zeroes the queued count and the backlog
     /// ([`CreditWord::record_drained_to_empty`]). The count never reads low,
-    /// so the producer never publishes past `depth`.
+    /// so the producer never publishes past `depth`. Graph load refuses
+    /// `block_timeout_ms` on a topic with more than one in-graph producer or
+    /// listed in `multi_publisher_topics:`, so a graph forgives only a word
+    /// with one connection, where this bound is exact.
     ///
     /// Deliberately issues NO wake: nothing ever parks waiting for the count to
     /// RISE (the release direction is [`record_drained`](Self::record_drained),
@@ -1080,8 +1085,8 @@ impl CreditShared {
     }
 
     /// Frames a timeout release forgave that the consumer still holds, queued
-    /// or in a slot (`Acquire`), as the word bounds them: on a topic with
-    /// several producers it can read above the frames really there (see
+    /// or in a slot (`Acquire`), as the word bounds them: on a word with
+    /// several connections it can read above the frames really there (see
     /// [`record_published_n`](Self::record_published_n)). Diagnostic only.
     pub fn forgiven(&self) -> u64 {
         Counts::unpack(self.counts.load(Ordering::Acquire)).forgiven()
@@ -2153,10 +2158,11 @@ impl CreditWord {
     /// every producer and consumer of a `block` topic fires one at a time on
     /// the thread that steps their level loop, an executor unit keeps them
     /// together, and a publish counts its frame after sending it. It clears
-    /// the excess the backlog bound leaves on a topic with several producers
+    /// the excess the backlog bound leaves on a word with several connections
     /// ([`CreditShared::record_published_n`]): once the consumer has drained
     /// everything it was sent, the slot counts only the frames its matcher's
-    /// slots hold.
+    /// slots hold. A graph never forgives such a word: graph load refuses
+    /// `block_timeout_ms` on a topic with several producers.
     ///
     /// On a [`Self::Mapped`] word it is [`CreditShared::record_drained`]. The
     /// producer runs in another process, so a frame can be sent and counted

@@ -634,8 +634,10 @@ late, never wrong.
 This warn only reports. To bound how long an alive-but-idle consumer can hold its
 producer, set `block_timeout_ms` on the consumer input: the producer's worker forgives that
 consumer's slot once it has been full and unmoved for that long, with a `warn!` naming the
-producer, the consumer, the edge and `reason="block_timeout"`. A consumer whose PROCESS
-DIED needs no timeout: the supervisor's `CreditDeathWatch` above releases its slot.
+producer, the consumer, the edge and `reason="block_timeout"`. Graph load refuses the key on a
+topic with more than one in-graph producer or listed in `multi_publisher_topics:`, before any
+worker starts. A consumer whose PROCESS DIED needs no timeout: the supervisor's
+`CreditDeathWatch` above releases its slot.
 
 Pinned end to end over REAL processes by `crates/cerulion_cli/tests/credit_death_e2e_test.rs`: the
 loud head and its fields, the ABSENCE of a repeat, the retraction, the free-run `groups=`. The
