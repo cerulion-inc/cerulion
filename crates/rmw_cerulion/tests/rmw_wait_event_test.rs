@@ -34,9 +34,10 @@
 //!   publish, no notification fires a later block, and an idle wait after the
 //!   last round times out with no fd wake;
 //! * a woken pass on which the publisher-event pump runs drains the woken
-//!   listener before its probe and still returns the message: exactly that
-//!   subscription is ready, the drained notification fires no later block, and
-//!   the next publish still wakes one;
+//!   listener before it probes every attached entity, and still returns the
+//!   message: exactly that subscription is ready, the listener holds no
+//!   notification after the return, so the next wait's entry pass finds nothing
+//!   to drain, and the next publish still wakes a block;
 //! * the PARK tier: on Linux a publish wakes a parked wait through the
 //!   topic DOORBELL (`park_blocks`/`park_wakes_doorbell`; a call's FIRST
 //!   block parks while a bell is mapped, and every later block of the call
@@ -3303,8 +3304,8 @@ unsafe fn listener_fd_of(subscription: *mut ffi::rmw_subscription_t) -> std::os:
         .event_listener_fd()
 }
 
-/// How many times [`deferred_round`] runs a round before it fails for want of an
-/// attempt the publisher-event pump stayed out of.
+/// How many attempts in all [`deferred_round`] runs for one round before it fails
+/// for want of an attempt the publisher-event pump stayed out of.
 const PUMP_ATTEMPTS: u32 = 3;
 
 /// Claim the process-wide publisher-event pump interval from the test thread:
@@ -3373,12 +3374,13 @@ impl Drop for PumpHeldOff {
 /// pump stayed out of (the stamp [`claim_pump_interval`] returned is unchanged
 /// after the take) must also have woken on the publish (one fd or doorbell
 /// wake) and must leave the wake's notification on the listener, and it ends
-/// the round. An attempt the pump reached is run again, up to
-/// [`PUMP_ATTEMPTS`] times, and then the round fails naming each attempt's
-/// stamps: a pass that runs the pump probes every attached entity, so it can
-/// serve the message after a timed-out block with no wake, or drain the woken
-/// listener before its probe. Each attempt publishes and takes its own message,
-/// and the next attempt's entry pass drains whatever notification it left.
+/// the round. An attempt the pump reached is run again, for at most
+/// [`PUMP_ATTEMPTS`] attempts in all, and then the round fails naming each
+/// attempt's stamps: a pass that runs the pump probes every attached entity, so
+/// it can serve the message after a timed-out block with no wake, or drain the
+/// woken listener before its probe. Each attempt publishes and takes its own
+/// message, and the next attempt's entry pass drains whatever notification it
+/// left.
 /// Returns (attempts run, attempts the pump reached).
 unsafe fn deferred_round(
     label: &str,
@@ -3475,17 +3477,20 @@ unsafe fn deferred_round(
 /// drain, the block woke on the publish (one fd or doorbell wake), and the listener is
 /// still readable after the take. That holds on every pass the publisher-event pump
 /// stays out of. A pass that runs it probes every attached entity: woken, it drains the
-/// woken listener before its probe and leaves no notification in place (pinned by
-/// `a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers`), and after a
-/// timed-out block it can serve the message with no wake. The pump is process wide and
-/// runs on whichever `rmw_wait` pass finds it due, so before each attempt of a round
-/// the test thread claims the pump's 20 ms interval (`claim_pump_interval`); an attempt
-/// the pump still reached checks only the return and the take, and is run again, up to
-/// `PUMP_ATTEMPTS` times, before the round fails (`deferred_round`). Across the rounds
-/// fd wakes stay at one per attempt at most: a notification left readable into a later
-/// block would fire it before the publish. In the middle round a second publish lands
-/// between the take and the next wait, while the listener still holds that round's
-/// notification (so the publish adds none of its own): that wait returns it from its
+/// woken entities before its probe, so its ready return leaves no notification that was
+/// on the listener at that drain (pinned on the fd tier by
+/// `a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers`; after a bell wake,
+/// a notification that lands after the drain stays for the next call's entry pass), and
+/// after a timed-out block it can serve the message with no wake. The pump is process
+/// wide and runs on whichever `rmw_wait` pass finds it due, so before each attempt of a
+/// round the test thread claims the pump's 20 ms interval (`claim_pump_interval`); an
+/// attempt the pump still reached checks only the return and the take, and is run
+/// again, for at most `PUMP_ATTEMPTS` (three) attempts in all, before the round fails
+/// (`deferred_round`). Across the rounds fd wakes stay at one per attempt at most: a
+/// notification left readable into a later block would fire it before the publish.
+/// In the middle round a second publish lands between the take and the next wait,
+/// while the listener still holds that round's notification (so the publish adds
+/// none of its own): that wait returns it from its
 /// entry pass, with no fd block or park entered and the listener drained, and the
 /// rounds go on. The last wait, with nothing published, times out with no fd wake and
 /// leaves the listener drained. Neither of those two waits claims the pump: the late
@@ -3641,6 +3646,12 @@ unsafe fn deferred_drain_rounds(tier: &str) {
     assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
 }
 
+/// How many attempts in all the pumped-wake pin
+/// (`a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers`) runs before it
+/// fails for want of an attempt whose block ended on the publish: an attempt whose
+/// block timed out around the pump's release does not count.
+const PUMPED_WAKE_ATTEMPTS: u32 = 3;
+
 /// A woken pass on which the publisher-event pump runs probes every attached
 /// entity, so it drains the woken listener BEFORE its probe, and it still returns
 /// the message. The wait set holds the published subscription A and an idle
@@ -3648,20 +3659,23 @@ unsafe fn deferred_drain_rounds(tier: &str) {
 /// probes every entity runs two post-wake probes, one that probes only what fired
 /// runs one. The pump is held off (`PumpHeldOff`) while the waiter climbs to the
 /// 20 ms cap rung and enters a fresh block; then it is made due and a message is
-/// published into that block, so the pass the block's wake starts is the one that
-/// pumps. An attempt counts only if the block ended on the publish and its pass
-/// probed both subscriptions (no new block, one fd wake, no timed-out block, two
-/// post-wake probes); an attempt whose block timed out around the release is run
-/// again, up to `PUMP_ATTEMPTS` times, and then the test fails naming each
-/// attempt's deltas. On the counted attempt exactly A is ready, the pass drained
-/// one listener and left A's listener unreadable, the pump stamp moved off the
-/// release value, and the take delivers the value with no drain of its own and
-/// leaves nothing for the next take. A 100 ms wait after it times out with no fd
-/// wake (the drained notification fires nothing), and a deferred-drain round on A
-/// then wakes on its publish and leaves the listener readable, so the drained
-/// listener still wakes a block. Fd tier on every platform
-/// (`CERULION_MONITOR_WAIT=0`, which also turns the period-park prediction off),
-/// spin off.
+/// published into that block. An attempt counts when that block ended on the
+/// publish (no new block, one fd wake, no timed-out block after the release): the
+/// pass the wake started is then the only pass since the release, so the due pump
+/// ran on it. An attempt whose block timed out around the release is run again,
+/// for at most `PUMPED_WAKE_ATTEMPTS` (three) attempts in all, and then the test
+/// fails naming each attempt's deltas. Every attempt's wait returns OK and its take
+/// delivers its message. On the counted attempt the pass ran two post-wake probes,
+/// exactly A is ready, the pass drained one listener and left A's listener
+/// unreadable, the pump stamp moved off the release value, and the take delivers
+/// the value with no drain of its own and leaves nothing for the next take. A
+/// 100 ms wait after it times out with nothing ready, and its entry pass finds no
+/// notification to drain (`drain_calls` delta 0: a notification the pumped pass
+/// left on A's listener would cost that entry pass one drain, and its passes after
+/// a timed-out block have nothing fired to drain). A deferred-drain round on A then
+/// wakes on its publish and leaves the listener readable, so the drained listener
+/// still wakes a block. Fd tier on every platform (`CERULION_MONITOR_WAIT=0`, which
+/// also turns the period-park prediction off), spin off.
 #[test]
 #[serial]
 fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
@@ -3701,11 +3715,11 @@ fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
             taken
         };
 
-        // (blocks entered, fd wakes, timed-out blocks, post-wake probes) after the
-        // release: the counted shape is (0, 1, 0, 2).
+        // (blocks entered, fd wakes, timed-out blocks) after the release: the
+        // counted shape is (0, 1, 0).
         let mut misses = Vec::new();
         let mut counted = None;
-        for attempt in 0..PUMP_ATTEMPTS {
+        for attempt in 0..PUMPED_WAKE_ATTEMPTS {
             let sent = CPoint {
                 x: 7.0,
                 y: -3.0,
@@ -3729,17 +3743,18 @@ fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
                 RMW_RET_OK
             );
             let (ret, ready) = handle.join().expect("wait thread");
-            let deltas = (
+            assert_eq!(ret, RMW_RET_OK, "attempt {attempt}: the wait returns");
+            let timing = (
                 blocks_entered(ws) - block,
                 data.fd_wakes.load(Ordering::Relaxed) - fd_wakes0,
                 data.timeout_wakes.load(Ordering::Relaxed) - timeouts0,
-                data.probes_wake.load(Ordering::Relaxed) - probes0,
             );
-            // Both read before any take, so neither can be the take's doing.
+            // All read before any take, so none can be the take's doing.
+            let probes = data.probes_wake.load(Ordering::Relaxed) - probes0;
             let drained = data.drain_calls.load(Ordering::Relaxed) - drains0;
             let readable = fd_readable_within(listener, Duration::ZERO);
-            if deltas == (0, 1, 0, 2) {
-                counted = Some((ret, ready, drained, readable, sent));
+            if timing == (0, 1, 0) {
+                counted = Some((ready, probes, drained, readable, sent));
                 break;
             }
             let mut out = CPoint::default();
@@ -3747,20 +3762,26 @@ fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
                 take_a(&mut out) && out == sent,
                 "attempt {attempt}: an attempt that does not count still delivers its message"
             );
-            misses.push(deltas);
+            misses.push(timing);
         }
-        let Some((ret, ready, drained, readable, sent)) = counted else {
+        let Some((ready, probes, drained, readable, sent)) = counted else {
             panic!(
-                "no attempt of {PUMP_ATTEMPTS} ran the pump on the pass its publish woke \
-                 ((blocks entered, fd wakes, timed-out blocks, post-wake probes) after the \
-                 release, (0, 1, 0, 2) counts): {misses:?}"
+                "no attempt of {PUMPED_WAKE_ATTEMPTS} had its block end on the publish, so \
+                 none could check the woken pass that runs the pump ((blocks entered, fd \
+                 wakes, timed-out blocks) after the release; (0, 1, 0) counts, and a block \
+                 that timed out around the release shows a timed-out block): {misses:?}"
             );
         };
         eprintln!(
-            "pumped-wake: attempts={} uncounted={misses:?} drain_calls_delta={drained}",
+            "pumped-wake: attempts={} uncounted={misses:?} probes_wake_delta={probes} \
+             drain_calls_delta={drained}",
             misses.len() + 1
         );
-        assert_eq!(ret, RMW_RET_OK, "the pumped woken pass returns");
+        assert_eq!(
+            probes, 2,
+            "the woken pass that runs the pump probes every attached entity \
+             (probes_wake delta; a pass that probes only what fired runs 1)"
+        );
         assert_eq!(
             ready,
             [true, false],
@@ -3789,19 +3810,28 @@ fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
         let mut again = CPoint::default();
         assert!(!take_a(&mut again), "one message, one take");
 
+        // The idle wait's entry pass drains every readable listener fd, so a
+        // notification the pumped pass left on A's listener costs it one drain; its
+        // passes after a timed-out block have nothing fired to drain.
         let fd_wakes_idle = data.fd_wakes.load(Ordering::Relaxed);
+        let drains_idle = data.drain_calls.load(Ordering::Relaxed);
         let handle = wait_on_two_subs_in_thread(subs, ws, Duration::from_millis(100));
         let (ret, ready) = handle.join().expect("idle wait thread");
         assert_eq!(ret, ffi::RMW_RET_TIMEOUT, "nothing published, so a timeout");
         assert_eq!(ready, [false, false], "nothing is ready");
         assert_eq!(
+            data.drain_calls.load(Ordering::Relaxed) - drains_idle,
+            0,
+            "the idle wait's entry pass finds no notification left on a listener to drain"
+        );
+        assert_eq!(
             data.fd_wakes.load(Ordering::Relaxed) - fd_wakes_idle,
             0,
-            "the drained notification fires no later block"
+            "no fd wake ends a block of the idle wait"
         );
         assert!(
             !fd_readable_within(listener, Duration::ZERO),
-            "the listener stays drained"
+            "A's listener is still unreadable after the idle wait"
         );
 
         deferred_round(
