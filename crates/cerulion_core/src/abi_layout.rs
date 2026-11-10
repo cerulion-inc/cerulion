@@ -328,7 +328,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 30;
+const EXPECTED_ABI: u32 = 31;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -410,6 +410,8 @@ static EXPECTED: &[Expected] = &[
             "fault_inject_publish_raw_after",
             "fault_inject_send_overflow_frame_after",
             "fault_inject_send_raw_loan",
+            // v31: the send-window test seam, `None` outside a test.
+            "block_send_hook",
             "frames_dropped_overflow",
             "frames_dropped_invariant_violation",
             "frames_dropped_send_fail",
@@ -433,14 +435,25 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS_AND_DOORBELL,
-            // Re-measured at ABI 26 on aarch64-apple-darwin, the one target this
-            // row's arm judges: the doorbell field's rank moved from 19 to 3 and
-            // the sixteen fields ranked 3 to 18 each moved up by one. No other
-            // field moved, and the field SET did not change.
+            // Re-measured at ABI 31 on aarch64-apple-darwin, the one target this
+            // row's arm judges (`dump_measured_table`): `block_send_hook` takes
+            // rank 2, and every field ranked 2 or above before it moves up by
+            // one.
             ranks: &[
-                8, 9, 0, 1, 12, 35, 6, 29, 30, 10, 28, 13, 14, 31, 15, 4, 5, 32, 16, 17, 18, 2, 19,
-                3, 11, 20, 21, 36, 33, 37, 22, 23, 24, 25, 26, 34, 7, 27,
+                9, 10, 0, 1, 13, 36, 7, 30, 31, 11, 29, 14, 15, 32, 16, 5, 6, 33, 2, 17, 18, 19, 3,
+                20, 4, 12, 21, 22, 37, 34, 38, 23, 24, 25, 26, 27, 35, 8, 28,
             ],
+        },
+    },
+    // v31: the send-window test seam the publisher holds by value. Its
+    // variants hold a `std` box or nothing.
+    Expected {
+        name: "BlockSendHook",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 8,
+            offsets: &[],
         },
     },
     Expected {
@@ -1011,6 +1024,7 @@ static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
         ),
     ),
     ("ConsumeMode", EnumPayload::NothingFirstParty),
+    ("BlockSendHook", EnumPayload::NothingFirstParty),
     ("ReadOutcomeKind", EnumPayload::NothingFirstParty),
     ("ReadSiteRole", EnumPayload::NothingFirstParty),
     ("ReadStageRole", EnumPayload::NothingFirstParty),

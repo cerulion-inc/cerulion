@@ -824,7 +824,19 @@ pub mod wire;
 ///   records.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 30;
+///
+/// - v31: a `block` frame is counted on its credit words BEFORE `send()`
+///   makes it visible, and the count is taken back when the send errs.
+///   `OutputProxy`'s drop is generic, so the count runs in code compiled into
+///   every node library: a library built against an earlier core still counts
+///   after `send()` returns, where a consumer in another process can pop the
+///   frame and record its drain first, and the late count leaves the word one
+///   frame above an empty queue. `CerulionPublisher` gains `block_send_hook`,
+///   the send-window test seam (`transport::publisher::BlockSendHook`,
+///   `None` outside a test).
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 31;
 
 // Re-export commonly used types
 #[cfg(unix)]

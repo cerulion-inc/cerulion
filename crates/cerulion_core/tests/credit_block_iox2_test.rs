@@ -73,6 +73,7 @@ use cerulion_core::graph::topology::MAX_CONSUMER_DEPTH;
 use cerulion_core::graph::{CreditBinding, CreditRole, CrossProcessWiring, GraphRuntime};
 use cerulion_core::prelude::*;
 use cerulion_core::scheduler::BackpressureCounters;
+use cerulion_core::transport::publisher::BlockSendHook;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
@@ -226,6 +227,48 @@ impl PlainConsumer {
 
     fn external_source(&mut self) -> ExternalSource {
         ExternalSource::HostDriven
+    }
+}
+
+/// The send-window PRODUCER: publishes its fire ordinal from 0, and at `init`
+/// installs the test's [`BlockSendHook`] on its own output's publisher, so the
+/// hook runs inside the runtime's real publish of every fire.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct WindowProducer {
+    #[output]
+    out: Vector3,
+    n: u64,
+    #[cerulion(reconstruct)]
+    hook: Arc<Mutex<Option<BlockSendHook>>>,
+}
+
+#[cerulion_node_impl]
+impl WindowProducer {
+    fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
+        let hook = self
+            .hook
+            .lock()
+            .map_err(|_| NodeError::Logic("the hook slot is poisoned".to_string()))?
+            .take();
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        match ctx.publisher_mut("out") {
+            Some(AnyPublisher::Ipc(publisher)) => {
+                publisher.set_block_send_hook_for_test(hook);
+                Ok(())
+            }
+            None => Err(NodeError::Logic(
+                "the window producer has no `out` publisher to hook".to_string(),
+            )),
+        }
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.n as f64;
+        self.n += 1;
+        Ok(())
     }
 }
 
@@ -3164,4 +3207,316 @@ fn prc_a_lockstep_barrier_rank_credit_blocked_at_depth_does_not_wedge() {
          was the cap and not credit becoming available"
     );
     rt.shutdown();
+}
+
+// ===========================================================================
+// The SEND WINDOW: a consumer that pops a frame before its producer's publish
+// returns
+// ===========================================================================
+
+/// The depth every send-window arm runs at: the tightest legal ceiling, where
+/// one stray count on the word holds the producer for good.
+const WINDOW_DEPTH: u32 = 1;
+
+/// Where the send-window hook finds the consumer. Filled after the producer is
+/// built, because the producer's build opens the topic's service and the
+/// consumer must open it second, as a consumer process does.
+type ConsumerSlot = Arc<Mutex<Option<CerulionSubscriber>>>;
+
+/// What the send-window hook saw: the bytes of every frame it popped, in pop
+/// order, and every read that failed or found the queue empty. The hook runs
+/// inside a publish, where a panic would be caught by the scheduler, so it
+/// records instead and the arm asserts the record.
+#[derive(Default)]
+struct WindowLog {
+    frames: Vec<Vec<u8>>,
+    errors: Vec<String>,
+}
+
+/// The consumer process's input port for a `block` input at
+/// [`WINDOW_DEPTH`]: a subscriber on the CONSUMER's transport context whose
+/// drains move the consumer's own mapping of the word through the real block
+/// probe.
+fn window_consumer(mgr: &TransportManager, word: &Arc<MappedCredit>) -> CerulionSubscriber {
+    let mut sub = mgr
+        .create_subscriber_with_buffers(TOPIC, mgr.default_topic_config(), WINDOW_DEPTH as usize)
+        .expect("the consumer's one-deep input port");
+    sub.register_block_probe_for_test(
+        CreditWord::mapped(Arc::clone(word)),
+        u64::from(WINDOW_DEPTH),
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        WINDOW_DEPTH as usize,
+    );
+    sub
+}
+
+/// The hook that drains INSIDE the send window: right after each `send()`
+/// returns, the consumer pops the frame and records its drain, before the
+/// producer's publish does anything else.
+fn pop_inside_the_window(consumer: &ConsumerSlot, log: &Arc<Mutex<WindowLog>>) -> BlockSendHook {
+    let consumer = Arc::clone(consumer);
+    let log = Arc::clone(log);
+    BlockSendHook::AfterSend(Box::new(move || {
+        let mut slot = consumer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_mut() {
+            None => log
+                .errors
+                .push("a frame was sent before the consumer attached".to_string()),
+            Some(sub) => match sub.try_view_raw(|bytes| bytes.to_vec()) {
+                Ok(Some(frame)) => log.frames.push(frame),
+                Ok(None) => log
+                    .errors
+                    .push("the sent frame was not in the consumer's queue".to_string()),
+                Err(e) => log.errors.push(format!("the consumer's read failed: {e}")),
+            },
+        }
+    }))
+}
+
+/// The `x` a `Vector3` frame carries: the first `f64` of its fixed section,
+/// which starts right after the wire header.
+fn x_of(frame: &[u8]) -> f64 {
+    let at = WireHeader::SIZE;
+    let bytes: [u8; 8] = frame[at..at + 8].try_into().expect("a Vector3 frame");
+    f64::from_le_bytes(bytes)
+}
+
+/// `template` with its `x` replaced, so a raw path sends a frame whose every
+/// byte the arm wrote.
+fn with_x(template: &[u8], x: f64) -> Vec<u8> {
+    let mut frame = template.to_vec();
+    let at = WireHeader::SIZE;
+    frame[at..at + 8].copy_from_slice(&x.to_le_bytes());
+    frame
+}
+
+/// The word's whole state, one field per atomic: `(outstanding, depth,
+/// wake_seq, parked mask, epoch)`.
+fn word_state(word: &MappedCredit) -> (u64, u32, u32, u32, u32) {
+    (
+        word.outstanding(),
+        word.depth(),
+        word.wake_seq_snapshot(),
+        word.parked_mask(),
+        word.epoch(),
+    )
+}
+
+/// Issue #817, on every send path. A consumer in another process pops a frame
+/// and records its drain while the producer is still inside its publish. A
+/// count taken after `send()` lands on a word the drain already left at zero,
+/// so the word reads one frame over an empty queue: at depth 1 that holds the
+/// producer for good. Counting before `send()` makes the frame visible only
+/// after its count, so every drain pays a count that is already there.
+///
+/// The four paths are the typed publish (`OutputProxy`'s drop), `publish_raw`,
+/// `send_raw_loan` and the overflow re-send. Oracle, by hand, after each one:
+/// the hook popped exactly the frame that was sent, the word reads 0, and the
+/// queue is empty.
+#[test]
+#[serial]
+fn a_drain_inside_the_send_window_leaves_the_word_at_zero() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("window", "consumer", "inp", WINDOW_DEPTH);
+    let clock = Arc::new(VirtualClock::new());
+    let mgr_p = manager("cb_win_p", ix.clone(), Arc::clone(&clock));
+    let mgr_c = manager("cb_win_c", ix, Arc::clone(&clock));
+    let mut publisher = mgr_p
+        .create_publisher(TOPIC, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("the producer's publisher");
+    publisher.register_block_outstanding_for_test(CreditWord::mapped(Arc::clone(&w.producer_side)));
+    let consumer: ConsumerSlot =
+        Arc::new(Mutex::new(Some(window_consumer(&mgr_c, &w.consumer_side))));
+    let log = Arc::new(Mutex::new(WindowLog::default()));
+    publisher.set_block_send_hook_for_test(pop_inside_the_window(&consumer, &log));
+
+    let after_each_path = |path: &str, sent: Option<&[u8]>, x: f64| {
+        let log = log.lock().expect("log");
+        assert_eq!(
+            log.errors,
+            Vec::<String>::new(),
+            "{path}: every read inside the window popped a frame"
+        );
+        let popped = log
+            .frames
+            .last()
+            .unwrap_or_else(|| panic!("{path}: the hook popped nothing"));
+        assert_eq!(
+            x_of(popped),
+            x,
+            "{path}: the hook popped the frame this path sent"
+        );
+        if let Some(sent) = sent {
+            assert_eq!(popped.as_slice(), sent, "{path}: byte for byte");
+        }
+        assert_eq!(
+            w.consumer_side.outstanding(),
+            0,
+            "{path}: a drain recorded inside the send window must leave the word at 0. A word at 1 \
+             here counts a frame that is no longer queued, and at depth 1 the producer's gate never \
+             opens again"
+        );
+        let mut slot = consumer.lock().expect("consumer");
+        let left = slot
+            .as_mut()
+            .expect("consumer")
+            .try_view_raw(|bytes| bytes.len())
+            .expect("the consumer reads");
+        assert_eq!(left, None, "{path}: and the queue is empty");
+    };
+
+    // The typed publish, `OutputProxy`'s drop.
+    let mut frame = publisher.loan_proxy::<Vector3>().expect("loan");
+    frame.x = 1.0;
+    drop(frame);
+    after_each_path("the typed publish", None, 1.0);
+    let template = log.lock().expect("log").frames[0].clone();
+
+    // `publish_raw`.
+    let raw = with_x(&template, 2.0);
+    publisher.publish_raw(&raw).expect("publish_raw sends");
+    after_each_path("publish_raw", Some(&raw), 2.0);
+
+    // `send_raw_loan`.
+    let loaned = with_x(&template, 3.0);
+    let mut loan = publisher.loan_raw_uninit(loaned.len()).expect("a raw loan");
+    for (slot, byte) in loan.bytes_uninit_mut().iter_mut().zip(&loaned) {
+        slot.write(*byte);
+    }
+    // SAFETY: the loan is exactly `loaned.len()` bytes and the loop above wrote
+    // every one of them.
+    let loan = unsafe { loan.assume_init() };
+    publisher.send_raw_loan(loan).expect("send_raw_loan sends");
+    after_each_path("send_raw_loan", Some(&loaned), 3.0);
+
+    // The overflow re-send.
+    let spilled = with_x(&template, 4.0);
+    publisher
+        .send_overflow_frame_for_test(&spilled[..WireHeader::SIZE], &spilled[WireHeader::SIZE..])
+        .expect("the overflow re-send sends");
+    after_each_path("the overflow re-send", Some(&spilled), 4.0);
+}
+
+/// Build the producer context around a [`WindowProducer`] that installs `hook`
+/// on its output at `init`.
+fn window_producer_ctx(
+    prefix: &str,
+    ix: &iceoryx2::config::Config,
+    mgr_name: &str,
+    clock: &Arc<VirtualClock>,
+    bindings: &[CreditBinding],
+    hook: BlockSendHook,
+) -> (Arc<TransportManager>, GraphRuntime) {
+    let mgr = manager(mgr_name, ix.clone(), Arc::clone(clock));
+    let config = config_of(
+        prefix,
+        "producer_ctx",
+        vec![node("producer", vec![], vec![producer_out()])],
+    );
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "producer".to_string(),
+        Box::new(WindowProducerEntry::with_state(WindowProducer {
+            hook: Arc::new(Mutex::new(Some(hook))),
+            ..Default::default()
+        })),
+    );
+    let rt = GraphRuntime::build_live_free_run(
+        config,
+        factories,
+        &mgr,
+        Arc::clone(clock) as Arc<dyn Clock>,
+        None,
+        cerulion_core::MonitorWaitPolicy::off(),
+        CrossProcessWiring::with_credit(None, bindings),
+    )
+    .expect("build the window producer's context");
+    (mgr, rt)
+}
+
+/// What one run of the send-window scenario leaves behind.
+#[derive(Debug, PartialEq)]
+struct WindowRun {
+    /// The `x` of every frame the consumer popped inside a send window.
+    delivered: Vec<f64>,
+    /// Reads inside the window that failed or found nothing.
+    errors: Vec<String>,
+    /// The producer's fire count.
+    fires: u64,
+    /// [`word_state`] after the run, read through the consumer's mapping.
+    word: (u64, u32, u32, u32, u32),
+}
+
+/// Two steps of a real producer context whose every publish is drained by the
+/// consumer inside its send window. The gate the second step passes or defers
+/// at is the runtime's own pre-fire on the mapped word.
+fn run_the_send_window_scenario(tag: &str) -> WindowRun {
+    const STEPS: u64 = 2;
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word(tag, "consumer", "inp", WINDOW_DEPTH);
+    let bind_p = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        u64::from(WINDOW_DEPTH),
+        CreditRole::Producer,
+    )];
+    let consumer: ConsumerSlot = Arc::new(Mutex::new(None));
+    let log = Arc::new(Mutex::new(WindowLog::default()));
+    let clock_p = Arc::new(VirtualClock::new());
+    let (_mgr_p, mut rt_p) = window_producer_ctx(
+        tag,
+        &ix,
+        &format!("{tag}_p"),
+        &clock_p,
+        &bind_p,
+        pop_inside_the_window(&consumer, &log),
+    );
+    let mgr_c = manager(&format!("{tag}_c"), ix, Arc::new(VirtualClock::new()));
+    *consumer.lock().expect("consumer") = Some(window_consumer(&mgr_c, &w.consumer_side));
+
+    for i in 0..STEPS {
+        step_free_run(&mut rt_p, &clock_p, i);
+    }
+    let fires = rt_p.node_handle("producer").expect("h").fire_count();
+    rt_p.shutdown();
+    let log = log.lock().expect("log");
+    WindowRun {
+        delivered: log.frames.iter().map(|f| x_of(f)).collect(),
+        errors: log.errors.clone(),
+        fires,
+        word: word_state(&w.consumer_side),
+    }
+}
+
+/// The strong pin for issue #817: after a drain inside the send window, the
+/// producer's own gate opens again and its next frame reaches the consumer.
+///
+/// Oracle, by hand, at depth 1 over two steps: step 0 reads the word at 0 and
+/// publishes frame 0, which the consumer pops inside the window; step 1 reads
+/// the word at 0 again and publishes frame 1. Delivery is `[0, 1]`. A count
+/// taken after the send leaves the word at 1 after step 0, step 1 defers, and
+/// delivery stops at `[0]`.
+#[test]
+#[serial]
+fn the_producer_publishes_again_after_a_drain_inside_the_send_window() {
+    let run = run_the_send_window_scenario("cbwagain");
+    assert_eq!(
+        run.errors,
+        Vec::<String>::new(),
+        "every read inside the window popped a frame"
+    );
+    assert_eq!(
+        run.delivered,
+        vec![0.0, 1.0],
+        "the consumer must receive both frames: the producer's gate reads the word the drain \
+         inside the window left behind"
+    );
+    assert_eq!(run.fires, 2, "the producer fired on both steps");
+    assert_eq!(
+        run.word.0, 0,
+        "and the word is back at 0, every frame drained"
+    );
 }

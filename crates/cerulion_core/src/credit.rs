@@ -391,9 +391,19 @@ impl CreditShared {
         !self.is_full()
     }
 
-    /// Record that one frame was published to this edge's topic — the consumer's
-    /// queue just gained a sample. Returns the `outstanding` count THIS publish
-    /// created.
+    /// Record that one frame is being published to this edge's topic. Returns
+    /// the `outstanding` count THIS publish created.
+    ///
+    /// The publisher calls this BEFORE `send()` makes the frame visible
+    /// (`CerulionPublisher::send_counted`), and takes the count back with
+    /// [`record_unpublished`](Self::record_unpublished) when the send reaches
+    /// no queue. The order is what keeps a consumer in another process exact:
+    /// the count is sequenced before the queue push, the push is a `Release`
+    /// store and the consumer's pop an `Acquire` load of it, and the drain is
+    /// sequenced after the pop, so the drain of a frame always finds that
+    /// frame's count on the word. A count taken after `send()` returns can land
+    /// after the drain of the frame it counts; the drain then saturates at 0
+    /// and the late count leaves the word one frame above an empty queue.
     ///
     /// `Release` so the producer's own subsequent `Acquire` defer-read, and the
     /// consumer's, see a consistent count. Deliberately issues NO wake: nothing
@@ -458,6 +468,33 @@ impl CreditShared {
         self.outstanding
             .fetch_add(n, Ordering::Release)
             .wrapping_add(n)
+    }
+
+    /// Take back the count one [`record_published`](Self::record_published)
+    /// took for a send that reached no queue. Returns the `outstanding` count
+    /// after the take-back.
+    ///
+    /// The inverse of the count, for the one publish whose `send()` returned
+    /// an error: with safe overflow on and the default degradation action, an
+    /// iceoryx2 send that errs pushed the frame to no connection, so no
+    /// consumer can ever drain it and the count it took must not stand.
+    ///
+    /// Saturating, like [`record_drained`](Self::record_drained): a drain of a
+    /// frame the word never counted can take the count away before this runs,
+    /// and a wrapping subtraction would then read `u64::MAX`, which defers the
+    /// producer forever. Issues no wake: the frame never reached a queue, so no
+    /// room a producer could be parked for has been freed.
+    pub fn record_unpublished(&self) -> u64 {
+        // INFALLIBLE: the closure always returns `Some`, so `try_update`
+        // returns `Ok(previous)`; the `Err` arm carries the same value and is
+        // matched only to read it without a discard.
+        match self
+            .outstanding
+            .try_update(Ordering::Release, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            }) {
+            Ok(previous) | Err(previous) => previous.saturating_sub(1),
+        }
     }
 
     /// Record that `removed` samples were drained from the consumer's queue —
