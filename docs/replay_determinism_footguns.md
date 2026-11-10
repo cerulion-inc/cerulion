@@ -286,7 +286,8 @@ publisher cap and the writers the read log names on the input, because a topic
 opened on a service that already existed with more publisher slots than the
 graph asks for accepts publishers from outside the graph. Before the node's
 first fire in the pass, one queue of the input more (its declared depth per
-writer) is excused, once and by name, because a node's init can read its inputs
+writer) is excused, and the report names it once as a judged note rather than a
+stand-down, because a node's init can read its inputs
 before the recording starts its read log and a resumed pass starts after reads
 its bag does not keep; a count past that queue is still a finding, on a resumed
 pass too. A resumed pass that holds no fire of the node and no read its body

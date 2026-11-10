@@ -6051,7 +6051,22 @@ fn rederivation_note_serde_spelling_is_pinned() {
         "a carried-heads disclosure mints no token: {json}"
     );
 
-    // …and the five spellings are DISTINCT, which a per-variant assertion
+    // The SIXTH kind: a `consume = latest` input judged with one queue
+    // excused before its node's first fire. Judged, so never a `stand_down`;
+    // like the carried-heads note it carries no code.
+    let excused = replay_engine::RederivationNote {
+        kind: replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
+        code: None,
+        ..carried
+    };
+    let json = serde_json::to_value(&excused).unwrap();
+    assert_eq!(json["kind"], "latest_before_first_fire");
+    assert!(
+        json.get("code").is_none(),
+        "a before-first-fire note mints no token: {json}"
+    );
+
+    // …and the six spellings are DISTINCT, which a per-variant assertion
     // above cannot see (two variants renamed to one string would satisfy both).
     let all = [
         replay_engine::RederivationNoteKind::StandDown,
@@ -6059,6 +6074,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
         replay_engine::RederivationNoteKind::ReadSiteCensus,
         replay_engine::RederivationNoteKind::ProducerLabels,
         replay_engine::RederivationNoteKind::CarriedHeads,
+        replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
     ];
     let kinds: std::collections::BTreeSet<String> = all
         .iter()
@@ -6070,9 +6086,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
                 .to_string()
         })
         .collect();
-    assert_eq!(kinds.len(), 5, "every note kind has its own wire spelling");
+    assert_eq!(kinds.len(), 6, "every note kind has its own wire spelling");
     // The list above is TOTAL — an EXHAUSTIVE match over the
-    // enum, with no wildcard, so adding a sixth kind (or deleting one) fails
+    // enum, with no wildcard, so adding a seventh kind (or deleting one) fails
     // to COMPILE here rather than leaving the spelling walk one short.
     for k in &all {
         let _spelled: &str = match k {
@@ -6081,6 +6097,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
             replay_engine::RederivationNoteKind::ReadSiteCensus => "read_site_census",
             replay_engine::RederivationNoteKind::ProducerLabels => "producer_labels",
             replay_engine::RederivationNoteKind::CarriedHeads => "carried_heads",
+            replay_engine::RederivationNoteKind::LatestBeforeFirstFire => {
+                "latest_before_first_fire"
+            }
         };
         assert_eq!(serde_json::to_value(k).unwrap(), _spelled);
     }

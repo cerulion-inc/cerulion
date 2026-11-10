@@ -1196,8 +1196,8 @@ pub struct ReplayInputShortfall {
 
 /// What a [`RederivationNote`] can be — a CLOSED set, so no producer can emit
 /// a spelling by typo and no reader has to guess which arm an unknown one
-/// belongs in. FIVE variants; the count is pinned by the exhaustive `match`
-/// in `rederivation_note_serde_spelling_is_pinned` (a sixth is a
+/// belongs in. SIX variants; the count is pinned by the exhaustive `match`
+/// in `rederivation_note_serde_spelling_is_pinned` (a seventh is a
 /// compile error there), not by an ordinal claim here — each variant's own
 /// doc says what it adds and why it is additive on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1253,6 +1253,19 @@ pub enum RederivationNoteKind {
     /// counter refuses the pass instead of annotating a verdict, so no report
     /// can carry such a kind and the enum holds no dead vocabulary for it.
     CarriedHeads,
+    /// A `consume = latest` input read through two subscribers was judged
+    /// with one queue excused before its node's first fire in the pass,
+    /// because a read the read log does not hold (the node's init, or a read
+    /// before a resumed pass's first retained step) can have taken that many
+    /// of the frames its trigger drain counted. The subject is the node.
+    ///
+    /// NOT a [`RederivationNoteKind::StandDown`], for the reason
+    /// [`RederivationNoteKind::CarriedHeads`] is not: the rule judged every
+    /// step on an allowance that can only drop a finding, and a count past it
+    /// is a finding, so a `stand_down` would tell a reader the node went
+    /// unjudged. See [`replay_rederive::LatestBeforeFirstFireNote`]. Additive
+    /// on the wire, as the third to fifth variants are.
+    LatestBeforeFirstFire,
 }
 
 /// One thing the rank-local re-derivation verifier said that is
@@ -1263,8 +1276,9 @@ pub enum RederivationNoteKind {
 /// declined to judge, so a clean report never covers it), a `conservation`
 /// breach (evidence about the recording's credit accounting, which
 /// [`replay_rederive::RederivationReport::is_clean`] ignores by design), and the
-/// EVIDENCE kinds — a read-site census, a producer-label fault, and the
-/// carried-heads disclosure. See [`RederivationNoteKind`].
+/// EVIDENCE kinds: a read-site census, a producer-label fault, the
+/// carried-heads disclosure, and the queue a `consume = latest` input was
+/// judged with before its node's first fire. See [`RederivationNoteKind`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RederivationNote {
     /// The rank whose pass produced it.
@@ -1277,9 +1291,9 @@ pub struct RederivationNote {
     /// serde output is the same snake_case string, and nothing can emit an
     /// undeclared value by typo.
     pub kind: RederivationNoteKind,
-    /// What it is about: the node id for a stand-down, a read-site census or a
-    /// carried-heads note; the topic for a conservation breach or a
-    /// producer-label note.
+    /// What it is about: the node id for a stand-down, a read-site census, a
+    /// carried-heads note or a before-first-fire note; the topic for a
+    /// conservation breach or a producer-label note.
     pub subject: String,
     /// The rendered sentence, from the pure module's own `Display`.
     pub detail: String,
@@ -1306,6 +1320,23 @@ pub struct RederivationNote {
     /// absent, so a report carrying neither is byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+/// The `--report` note for one input judged with one queue excused before its
+/// node's first fire: kind [`RederivationNoteKind::LatestBeforeFirstFire`],
+/// the node as its subject, the note's own sentence as its detail, and no
+/// code.
+fn latest_before_first_fire_note(
+    rank: u32,
+    note: &replay_rederive::LatestBeforeFirstFireNote,
+) -> RederivationNote {
+    RederivationNote {
+        rank,
+        kind: RederivationNoteKind::LatestBeforeFirstFire,
+        subject: note.node_id.clone(),
+        detail: note.to_string(),
+        code: None,
+    }
 }
 
 /// The recording HOST's identity, parsed from the
@@ -15028,6 +15059,20 @@ fn run_rank_pass(
                     code: None,
                 });
             }
+            // The queue excused before a latest node's first fire is a
+            // judged note, as the carry widening is: `debug!`, the note
+            // carries it into the `--report`, and `code: None` because the
+            // kind is the whole of its cause.
+            for e in &report.before_first_fire {
+                tracing::debug!(
+                    rank = plan.rank(),
+                    node_id = %e.node_id,
+                    detail = %e,
+                    "replay: this consume = latest node was judged with one queue excused \
+                     before its first fire (report-only; see `detail`)"
+                );
+                rederivation_notes.push(latest_before_first_fire_note(plan.rank(), e));
+            }
             // Conservation is LOUD and NEVER a verdict (the pure module's own
             // rule — `is_clean` ignores it): a breach is evidence about the
             // RECORDING's credit accounting, not a claim the candidate's
@@ -18484,6 +18529,117 @@ mod node_trigger_decl_tests {
         assert_eq!(regressed.findings.len(), 1, "{:?}", regressed.findings);
         assert_eq!(regressed.findings[0].step, 6);
         assert!(regressed.findings[0].unread.is_some());
+    }
+
+    /// A `consume = latest` input whose recording reads it through two
+    /// subscribers, and whose node read four frames in its init, re-derives
+    /// clean with no stand-down, and the queue excused before the node's first
+    /// fire reaches the `--report` as one `latest_before_first_fire` note
+    /// about the node: no code, and a detail that never says "not verified".
+    #[test]
+    fn the_queue_excused_before_a_first_fire_reaches_the_report_as_a_judged_note() {
+        use super::replay_rederive::{
+            verify, NodeDecl, PassRestore, PassStops, RecordedFire, RecordedRead, RecordedStep,
+            RoleTrust,
+        };
+        use super::{latest_before_first_fire_note, RederivationNote, RederivationNoteKind};
+        use cerulion_core::graph::node::InputConsume;
+        use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+        let info = NodeInfo::with_meta(
+            vec![InputMeta {
+                name: "cam".to_string(),
+                schema_hash: 0,
+                trigger: true,
+                depth: 4,
+                backpressure: BackpressurePolicy::DropOldest,
+                expect_within_ms: None,
+                consume: InputConsume::Latest,
+            }],
+            vec![],
+        )
+        .with_policy(MacroPolicy::DataTrigger {
+            input_name: "cam".to_string(),
+        });
+        let wired = vec![InputDef {
+            name: "cam".to_string(),
+            source: "/cam".to_string(),
+        }];
+        let node = NodeDecl {
+            node_id: "sink".to_string(),
+            trigger: node_trigger_decl(
+                &info,
+                &wired,
+                None,
+                &|_| Some(true),
+                &|_| Some(1),
+                EVERY_EDGE,
+            ),
+            throttle_ns: None,
+            feeds_local_block_edge: false,
+            has_non_trigger_inputs: false,
+            trigger_input_capacities: Default::default(),
+        };
+        let rd = |kind, seq, popped, role| RecordedRead {
+            node_id: "sink".to_string(),
+            input: "cam".to_string(),
+            kind,
+            served_seq: Some(seq),
+            popped,
+            wire_stamp_ns: None,
+            role,
+            writer: None,
+        };
+        let steps = vec![
+            RecordedStep {
+                step: 0,
+                clock_ns: 1,
+                fires: vec![],
+                reads: vec![rd(ReadOutcomeKind::DrainedBatch, 3, 4, ReadSiteRole::Drain)],
+            },
+            RecordedStep {
+                step: 1,
+                clock_ns: 2,
+                fires: vec![RecordedFire {
+                    node_id: "sink".to_string(),
+                    fire_time_ns: 2,
+                }],
+                reads: vec![
+                    rd(ReadOutcomeKind::DrainedBatch, 4, 1, ReadSiteRole::Drain),
+                    rd(ReadOutcomeKind::Served, 4, 1, ReadSiteRole::Body),
+                ],
+            },
+        ];
+        let report = verify(
+            std::slice::from_ref(&node),
+            &steps,
+            &[],
+            RoleTrust::from_stamped(true, true),
+            &PassRestore::none(),
+            &PassStops::none(),
+        );
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        let notes: Vec<RederivationNote> = report
+            .before_first_fire
+            .iter()
+            .map(|n| latest_before_first_fire_note(2, n))
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].rank, 2);
+        assert_eq!(notes[0].kind, RederivationNoteKind::LatestBeforeFirstFire);
+        assert_eq!(notes[0].subject, "sink");
+        assert_eq!(notes[0].code, None);
+        assert!(
+            notes[0]
+                .detail
+                .contains("input 'cam' judged with one queue excused")
+                && !notes[0].detail.contains("not verified"),
+            "{}",
+            notes[0].detail
+        );
+        let json = serde_json::to_value(&notes[0]).expect("a note serializes");
+        assert_eq!(json["kind"], "latest_before_first_fire");
+        assert!(json.get("code").is_none(), "{json}");
     }
 
     /// The recording's stage set names a latest input's drain discipline: a
