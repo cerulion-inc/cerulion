@@ -19,16 +19,21 @@ the graph; neither stops motion by itself. The engaged state is held in the daem
 daemon restart clears it, and nothing else does; rcpd's latch, once that
 `estop` closed it, clears only through its `estop_clear` or by deleting its
 latch file and restarting rcpd.
-Nothing outside the daemon can read that state yet: an `engage-estop` returns
+No verb returns that state yet; a verb or rcp tool call that it refuses says
+so in its error. An `engage-estop` returns
 a reply to the caller, writes a warning to the log, sends that `estop` and
 asks Flashback to save a recording; an `estop` over the rcp plane engages the
 latch without that ask.
-It is the one e-stop latch the ops act verbs and the `cerulion/rcp/1` plane
-obey: while it is engaged, the ops act verbs `topic-publish` and
-`service-call` and every tool call over the `cerulion/rcp/1` plane except
-`estop` are refused, and an `estop` over that plane engages it too (see
+It is the one e-stop latch the ops act verbs, `restart` and the
+`cerulion/rcp/1` plane obey: while it is engaged, the ops act verbs `topic-publish` and
+`service-call`, the ops verb `restart` and every tool call over the
+`cerulion/rcp/1` plane except `estop` are refused, and an `estop` over that
+plane engages it too (see
 [`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
-does not read it, and neither does LAN ingress. An `engage-estop`
+reads it before it stops the graph and again before it starts it: an engage
+during the stop means the start command does not run, and an engage after
+the second read does not stop the graph it starts. LAN ingress does not read
+it. An `engage-estop`
 refuses each rcp tool call other than `estop` that the plane has not yet sent
 to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
 rcpd just before each send), then sends an `estop` to rcpd without waiting

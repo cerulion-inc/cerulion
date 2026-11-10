@@ -421,20 +421,27 @@ and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).
 ### One e-stop for the ops and rcp planes
 
 The ops e-stop that `cerulion-remoted` holds is one latch for the ops act
-verbs and the rcp plane. An `estop` call from a desk engages it before the
+verbs, the ops verb `restart` and the rcp plane. An `estop` call from a desk engages it before the
 call reaches rcpd, then rcpd engages its own latch as for any `estop`. The
 ops plane's `engage-estop` engages the same latch, then sends an `estop` to
 rcpd until rcpd answers, so rcpd engages its own latch too. While the ops latch is engaged:
 
-- every other tool call from a desk is refused before it reaches rcpd, with
-  error `-32001` and the message `refused: the robot's e-stop is engaged`;
+- every other tool call from a desk except `estop_clear` is refused before it
+  reaches rcpd, with error `-32001` and the message `refused: the robot's
+  e-stop is engaged`;
 - `estop_clear` is refused too, with `refused: the robot's ops e-stop is
   engaged; it clears when cerulion-remoted restarts`;
 - the ops act verbs `topic-publish` and `service-call` are refused;
-- `estop`, `tools/list`, the resources and the session messages still work;
-- `restart` does not read the latch: a desk with the operator role can
-  restart a graph while it is engaged, and LAN ingress does not read it
-  either.
+- the ops verb `restart` is refused (`unavailable: the robot's e-stop is
+  engaged, so restart is refused`) before it stops anything. It reads the
+  latch again after its stop command and before its start command, and an
+  engage in between means the start command does not run (`unavailable:
+  the robot's e-stop was engaged during the restart, so the graph was not
+  started again after its stop`). An engage after that second read does
+  not stop the graph the start command starts;
+- `estop`, `tools/list`, the resources and the session messages still work.
+
+LAN ingress does not read the latch.
 
 The ops latch is read when a desk's message arrives and again on the open
 connection to rcpd just before the plane sends it. A tool call already sent

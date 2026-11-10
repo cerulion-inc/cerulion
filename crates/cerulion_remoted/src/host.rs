@@ -122,8 +122,9 @@ impl KeyProvider for KeyFiles {
 /// Which ops verb set a plane serves, with what each set needs.
 pub(crate) enum OpsHost {
     /// The `cerulion-remoted` daemon: every verb. `engage-estop` engages
-    /// `lease`, the act verbs check it, and the rcp plane engages and checks
-    /// a clone of it, so all of them share one latch and one engage count.
+    /// `lease`, the act verbs check it, `restart` checks it before its stop and
+    /// again before its start, and the rcp plane engages and checks a clone of
+    /// it, so all of them share one latch and one engage count.
     /// With `rcpd`, each `engage-estop` also sends an `estop` to the robot's
     /// rcpd until rcpd answers ([`crate::rcp`]).
     Daemon {

@@ -681,10 +681,10 @@ unsafe fn sub_data(subscription: *const ffi::rmw_subscription_t) -> &'static Sub
 /// carries its OWN copy of that gate — a separate call site from the
 /// copying take's — so the adopted path needs its own reading of it.
 unsafe fn hash_mismatch_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
-    cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-        &sub_data(subscription).hash_mismatches,
-    )
-    .total_failures()
+    sub_data(subscription)
+        .hash_mismatches
+        .read()
+        .total_failures()
 }
 
 /// The subscription's decode-failure total. The pre-write entry gate
@@ -694,8 +694,7 @@ unsafe fn hash_mismatch_count(subscription: *const ffi::rmw_subscription_t) -> u
 unsafe fn decode_failure_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     sub_data(subscription)
         .decode_failures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .read()
         .total_failures()
 }
 
