@@ -152,11 +152,17 @@ fn wire_response_parity() {
         topics: vec![],
         log_lines_dropped: None,
     }));
-    let older: robot::WireResponse =
-        serde_json::from_str(r#"{"reply":"status","topics":[]}"#).unwrap();
+    let older = r#"{"reply":"status","topics":[]}"#;
     assert_eq!(
-        older,
+        serde_json::from_str::<robot::WireResponse>(older).unwrap(),
         robot::WireResponse::Status(robot::StatusReply {
+            topics: vec![],
+            log_lines_dropped: None,
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<desk::WireResponse>(older).unwrap(),
+        desk::WireResponse::Status(desk::StatusReply {
             topics: vec![],
             log_lines_dropped: None,
         })

@@ -705,6 +705,82 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f)
     }
 
+    /// A writer whose thread writes to `sink` and formats its own report
+    /// lines through a subscriber of that thread, so a test reads them.
+    fn spawn_reporting(limits: Limits, mut sink: Recorded) -> LogWriter {
+        let queue = Arc::new(Queue::new(limits));
+        let thread_queue = queue.clone();
+        // While the thread reports, REPORT takes its lines, so this queue
+        // receives none of them.
+        let format_into = unstarted(Limits::DEFAULT);
+        std::thread::Builder::new()
+            .name(THREAD_NAME.into())
+            .spawn(move || {
+                formatted_into(&format_into, || write_lines(&thread_queue, &mut sink));
+            })
+            .unwrap();
+        LogWriter {
+            inner: Arc::new(Inner { queue }),
+        }
+    }
+
+    #[test]
+    fn a_drop_while_the_writer_waits_is_reported_with_no_further_line() {
+        let sink = Recorded::default();
+        let writer = spawn_reporting(Limits { lines: 4, bytes: 4 }, sink.clone());
+        // One line written, then time for the writer thread to wait for the
+        // next one.
+        log(&writer, "ok\n");
+        assert_eq!(writer.drain(LONG), Drained::Written);
+        std::thread::sleep(Duration::from_millis(100));
+        // Past the byte bound alone, into an empty queue.
+        log(&writer, "too long\n");
+        assert_eq!(writer.dropped(), 1);
+        let until = Instant::now() + LONG;
+        while sink.lines().len() < 2 {
+            assert!(Instant::now() < until, "no drop report within {LONG:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(writer.drain(LONG), Drained::Written);
+        // A regime of one line ends silently: no caught-up line.
+        assert_eq!(
+            sink.lines(),
+            [
+                "ok\n",
+                " WARN cerulion_remoted: log lines were dropped: the log queue was full or a \
+                 write to stderr failed dropped=1 total_dropped=1\n"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_drain_waits_for_the_drop_report_being_written() {
+        let sink = Recorded::default();
+        sink.shut();
+        let writer = spawn_reporting(Limits { lines: 4, bytes: 4 }, sink.clone());
+        log(&writer, "too long\n");
+        // The writer thread holds its report at the shut gate.
+        sink.until_a_write_waits();
+        let grace = Duration::from_millis(200);
+        assert_eq!(writer.drain(grace), Drained::Discarded { discarded: 0 });
+        sink.open();
+        assert_eq!(writer.drain(LONG), Drained::Written);
+        assert_eq!(sink.lines().len(), 1, "{:?}", sink.lines());
+    }
+
+    #[cfg(feature = "test-seam")]
+    #[test]
+    fn the_test_seam_only_shrinks_the_queue_and_keeps_room_for_a_line() {
+        assert_eq!(test_queue_lines("1"), Some(1));
+        assert_eq!(test_queue_lines(" 8 "), Some(8));
+        assert_eq!(test_queue_lines("4096"), Some(4096));
+        assert_eq!(test_queue_lines("4097"), Some(4096));
+        assert_eq!(test_queue_lines("1000000"), Some(4096));
+        for refused in ["0", "-1", "", "x", "1.5", "18446744073709551616"] {
+            assert_eq!(test_queue_lines(refused), None, "{refused}");
+        }
+    }
+
     #[test]
     fn drops_are_reported_once_written_and_the_regime_ends_when_the_queue_empties() {
         let writer = unstarted(Limits::DEFAULT);

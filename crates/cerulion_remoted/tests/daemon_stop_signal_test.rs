@@ -15,14 +15,17 @@
 //!   ends the stop with status 4, within a bound of the deadline plus 5 s;
 //! - with stderr full, a graceful stop exits 0 long before the deadline: no
 //!   log line holds it, and the exit waits at most its grace for the log
-//!   queue.
+//!   queue;
+//! - with stderr full, a graceful stop waits for its queued lines: it still
+//!   runs a second after SIGTERM, and once the pipe drains it exits 0 with the
+//!   teardown's line written.
 //!
 //! The stage's participant is the test seam's probe, which logs whether the
 //! rcpd e-stop sender was already stopped when the stage ran it. A test that
-//! asserts the line the exit writes just before `_exit` sets the exit's wait
-//! for the log queue to 5 s through the test seam (the exit goes on once the
-//! line is written); the full-stderr tests keep the 100 ms a build without the
-//! test seam waits.
+//! asserts a line the exit waits for sets the exit's wait for the log queue
+//! to 5 s through the test seam (the exit goes on once the line is written);
+//! the other full-stderr tests keep the 100 ms a build without the test seam
+//! waits.
 //!
 //! Each daemon serves its own temp state root and device key, relays disabled;
 //! no peer connects, so the lazy wire plane never starts iceoryx2. The child
@@ -30,19 +33,25 @@
 //! `Daemon::start_with` removes, and gets the ones each test sets.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Read, Write};
+mod common;
+
+use std::io::{PipeReader, PipeWriter, Read};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
+use cerulion_remoted::log_writer::QUEUE_LINES_FOR_TEST_ENV as QUEUE_ENV;
+use cerulion_remoted::shutdown::{
+    CLOSE_ENDPOINT_FOR_TEST_ENV as CLOSE_ENV, EXIT_LOG_GRACE_FOR_TEST_ENV as GRACE_ENV,
+    PROBE_FOR_TEST_ENV as PROBE_ENV,
+};
+use common::stderr_pipe::{fill, pump, read_matching, KillOnDrop};
 
+/// The stop deadline variable, as docs/user-api.md names it.
 const HARD_EXIT_ENV: &str = "CERULION_REMOTED_HARD_EXIT_MS";
-const PROBE_ENV: &str = "CERULION_REMOTED_SHUTDOWN_PROBE_FOR_TEST";
-const CLOSE_ENV: &str = "CERULION_REMOTED_CLOSE_ENDPOINT_FOR_TEST";
-const GRACE_ENV: &str = cerulion_remoted::shutdown::EXIT_LOG_GRACE_FOR_TEST_ENV;
 /// The exit's wait for its line in the tests that assert that line.
 const GRACE_MS: &str = "5000";
 const MAC_KEY: &[u8] = b"stop-signal-mac-key";
@@ -88,30 +97,12 @@ fn write_state(root: &Path, secret: [u8; 32]) {
 
 /// A running daemon and the stderr lines read from it; killed and reaped on drop.
 struct Daemon {
-    child: Child,
+    child: KillOnDrop,
     lines: mpsc::Receiver<String>,
     log: Vec<String>,
     /// While held, the stderr reader reads nothing past the listening line.
     hold: Option<mpsc::Sender<()>>,
     _root: tempfile::TempDir,
-}
-
-/// Send each line of `stderr` to `lines`. With `hold`, stop reading after the
-/// listening line, the pipe still open, until the hold's sender is dropped.
-fn pump(
-    stderr: Box<dyn Read + Send>,
-    lines: mpsc::Sender<String>,
-    hold: Option<mpsc::Receiver<()>>,
-) {
-    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-        let listening = line.contains(LISTENING);
-        if lines.send(line).is_err() {
-            return;
-        }
-        if let (true, Some(hold)) = (listening, &hold) {
-            let _ = hold.recv();
-        }
-    }
 }
 
 impl Daemon {
@@ -153,6 +144,7 @@ impl Daemon {
             .env_remove(PROBE_ENV)
             .env_remove(CLOSE_ENV)
             .env_remove(GRACE_ENV)
+            .env_remove(QUEUE_ENV)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null());
@@ -167,16 +159,16 @@ impl Daemon {
                 (Box::new(std::io::empty()), None)
             }
         };
-        let mut child = command.spawn().expect("spawn cerulion-remoted");
+        let mut child = KillOnDrop(command.spawn().expect("spawn cerulion-remoted"));
         // The command's copy of a pipe's write end closes here.
         drop(command);
-        let stderr: Box<dyn Read + Send> = match child.stderr.take() {
+        let stderr: Box<dyn Read + Send> = match child.0.stderr.take() {
             Some(piped) => Box::new(piped),
             None => stderr,
         };
         let (sender, lines) = mpsc::channel();
         let (hold, held) = hold.unzip();
-        std::thread::spawn(move || pump(stderr, sender, held));
+        std::thread::spawn(move || pump(stderr, sender, held, LISTENING));
         let mut daemon = Daemon {
             child,
             lines,
@@ -190,27 +182,12 @@ impl Daemon {
 
     /// The first stderr line containing `needle`, read within `bound`.
     fn wait_for_line(&mut self, needle: &str, bound: Duration) -> String {
-        let until = Instant::now() + bound;
-        loop {
-            if let Some(line) = self.log.iter().find(|l| l.contains(needle)) {
-                return line.clone();
-            }
-            let left = until.saturating_duration_since(Instant::now());
-            match self.lines.recv_timeout(left) {
-                Ok(line) => self.log.push(line),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "no line with {needle:?} within {bound:?}; log:\n{}",
-                        self.dump()
-                    )
-                }
-            }
-        }
+        read_matching(&self.lines, &mut self.log, 0, bound, |l| l.contains(needle))
     }
 
     /// Send `signal`; returns the instant just before it was sent.
     fn signal(&self, signal: libc::c_int) -> Instant {
-        let pid = libc::pid_t::try_from(self.child.id()).unwrap();
+        let pid = libc::pid_t::try_from(self.child.0.id()).unwrap();
         let sent_at = Instant::now();
         // SAFETY: kill(2) with a pid this test spawned and a valid signal number;
         // no memory is shared with the call.
@@ -223,7 +200,7 @@ impl Daemon {
     /// the exit; then the rest of stderr is read into the log.
     fn wait_exit(&mut self, since: Instant, bound: Duration) -> (ExitStatus, Duration) {
         let status = loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
+            if let Some(status) = self.child.0.try_wait().unwrap() {
                 break status;
             }
             assert!(
@@ -256,13 +233,6 @@ impl Daemon {
         self.log
             .iter()
             .position(|line| needles.iter().all(|n| line.contains(n)))
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -506,37 +476,6 @@ fn a_participant_that_fails_exits_3_after_the_teardown() {
     );
 }
 
-/// Fill the pipe behind `writer` until it takes no more bytes. The write end
-/// is non-blocking only while it fills: its file status flags are shared with
-/// the daemon's stderr, which then blocks on its next write.
-fn fill(writer: &PipeWriter) {
-    use std::os::fd::AsRawFd;
-    let fd = writer.as_raw_fd();
-    // SAFETY: fcntl(2) reads and sets the flags of a descriptor this test owns.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
-    // SAFETY: as above.
-    assert_eq!(
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
-    );
-    // Large chunks first, so a pipe that grows on a large write grows to its
-    // largest size before it is full.
-    let mut writer = writer;
-    for chunk in [65_536, 1_024, 1] {
-        let bytes = vec![b'x'; chunk];
-        loop {
-            match writer.write(&bytes) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("filling the pipe: {e}"),
-            }
-        }
-    }
-    // SAFETY: as above.
-    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
-}
-
 #[test]
 fn the_hard_exit_does_not_wait_for_a_full_stderr() {
     let deadline = Duration::from_millis(700);
@@ -581,6 +520,40 @@ fn a_graceful_stop_exits_0_while_stderr_is_full() {
         status.code(),
         Some(0),
         "the graceful stop exits 0 while stderr is full, got {status:?} after {took:?}; log:\n{}",
+        daemon.dump()
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "the graceful stop took {took:?} while stderr was full"
+    );
+}
+
+#[test]
+fn a_graceful_stop_waits_for_its_queued_lines_while_stderr_is_full() {
+    let (mut daemon, filler) =
+        Daemon::start_holding(0x5a, &[(HARD_EXIT_ENV, "600000"), (GRACE_ENV, GRACE_MS)]);
+    fill(&filler);
+    drop(filler);
+    let sent = daemon.signal(libc::SIGTERM);
+    // The stop itself takes milliseconds; the exit then waits up to four
+    // fifths of its 5 s grace for the lines queued behind the full pipe.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        daemon.child.0.try_wait().unwrap().is_none(),
+        "exited with lines still queued behind a full stderr; log:\n{}",
+        daemon.dump()
+    );
+    daemon.hold = None;
+    let (status, _) = daemon.wait_exit(sent, STOP_BOUND);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the graceful stop exits 0 once its lines are written, got {status:?}; log:\n{}",
+        daemon.dump()
+    );
+    assert!(
+        daemon.line_with(&[TEARDOWN_RAN]).is_some(),
+        "the teardown's line, queued behind the full pipe, was written; log:\n{}",
         daemon.dump()
     );
 }

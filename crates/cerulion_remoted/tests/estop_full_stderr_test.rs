@@ -8,10 +8,11 @@
 //!   reaches rcpd, within 5 s;
 //! - the `cerulion/wire/2` `status` reply counts the log lines the daemon
 //!   dropped; once the pipe drains, a warn line reports the drops and an info
-//!   line reports that the writer caught up, naming the same total that
-//!   `status` then reads.
+//!   line reports that the writer caught up, and every line `status` then
+//!   counts is named by one of those lines or by a later drop or caught-up
+//!   line.
 //!
-//! The pipe is the one #804's full-stderr stop test fills: the test reads
+//! The pipe is filled as daemon_stop_signal_test.rs fills it: the test reads
 //! stderr up to the listening line, then reads nothing until it releases the
 //! pipe. A stand-in rcpd (hand-rolled HTTP/1 on loopback) reports each
 //! request it reads. The test seam's queue bound of one line makes a few log
@@ -20,22 +21,28 @@
 //! as the owner through the device index. Every wait is bounded.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
+mod common;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use cerud::client::OpsClient;
 use cerulion_link::{
-    alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame, write_frame, Endpoint,
-    EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream, RecvStream, RelayConfig, SendStream,
-    DEFAULT_MAX_FRAME_LEN,
+    alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame, write_frame,
+    Connection, Endpoint, EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream, RecvStream,
+    RelayConfig, SendStream, DEFAULT_MAX_FRAME_LEN,
 };
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
+use cerulion_remoted::log_writer::QUEUE_LINES_FOR_TEST_ENV;
+use cerulion_remoted::shutdown::{
+    CLOSE_ENDPOINT_FOR_TEST_ENV, EXIT_LOG_GRACE_FOR_TEST_ENV, HARD_EXIT_ENV, PROBE_FOR_TEST_ENV,
+};
 use cerulion_remoted::DeviceAccountIndex;
+use common::stderr_pipe::{fill, pump, read_matching, KillOnDrop};
 use serde_json::{json, Value};
 
 const MAC_KEY: &[u8] = b"full-stderr-mac-key";
@@ -43,8 +50,6 @@ const CHASSIS: &[u8] = b"full-stderr-chassis-secret-not-serial-derived";
 const T_NOW: u64 = 1_000_000_000_000;
 const OWNER: AccountId = AccountId([10; 32]);
 const TOKEN: &str = "full-stderr-fixture-token";
-/// The test seam that bounds the daemon's log queue in lines.
-const QUEUE_LINES_ENV: &str = "CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST";
 /// How long a daemon may take to log that it listens.
 const START_BOUND: Duration = Duration::from_secs(60);
 /// How long a step that is not the oracle may take.
@@ -82,8 +87,14 @@ fn caller(seed: u8) -> String {
 fn write_state(root: &Path, robot: u8, desks: &[u8]) -> std::path::PathBuf {
     let remoted = root.join("remoted");
     std::fs::create_dir_all(&remoted).unwrap();
-    std::fs::write(remoted.join("device_key"), [robot; 32]).unwrap();
-    std::fs::write(remoted.join("trust_store.mac_key"), MAC_KEY).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    // 0600, so the daemon logs no startup burst of permission warnings.
+    let private = |path: std::path::PathBuf, bytes: &[u8]| {
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    private(remoted.join("device_key"), &[robot; 32]);
+    private(remoted.join("trust_store.mac_key"), MAC_KEY);
     let roots = RootSet::new(vec![PublicKey([1; 32])], 1).unwrap();
     let mut store = TrustStore::provision(
         RobotId([5; 32]),
@@ -104,9 +115,10 @@ fn write_state(root: &Path, robot: u8, desks: &[u8]) -> std::path::PathBuf {
     }
     index.save(MAC_KEY).unwrap();
     let token_file = root.join("rcp.token");
-    std::fs::write(&token_file, format!("CERULION_RCP_TOKEN={TOKEN}\n")).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    private(
+        token_file.clone(),
+        format!("CERULION_RCP_TOKEN={TOKEN}\n").as_bytes(),
+    );
     token_file
 }
 
@@ -232,16 +244,6 @@ async fn estop_call_from(
     .await
 }
 
-/// A child process, killed and reaped on drop.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// A running daemon whose stderr the test holds full.
 struct Daemon {
     _child: KillOnDrop,
@@ -251,75 +253,6 @@ struct Daemon {
     hold: Option<mpsc::Sender<()>>,
     robot: EndpointAddr,
     _root: tempfile::TempDir,
-}
-
-/// Send each line of `stderr` to `lines`; after the listening line, read
-/// nothing more, the pipe still open, until the hold's sender is dropped.
-fn pump(stderr: PipeReader, lines: mpsc::Sender<String>, hold: mpsc::Receiver<()>) {
-    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-        let listening = line.contains(LISTENING);
-        if lines.send(line).is_err() {
-            return;
-        }
-        if listening {
-            let _ = hold.recv();
-        }
-    }
-}
-
-/// Fill the pipe behind `writer` until it takes no more bytes. The write end
-/// is non-blocking only while it fills: its file status flags are shared with
-/// the daemon's stderr, which then blocks on its next write.
-fn fill(writer: &PipeWriter) {
-    use std::os::fd::AsRawFd;
-    let fd = writer.as_raw_fd();
-    // SAFETY: fcntl(2) reads and sets the flags of a descriptor this test owns.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
-    // SAFETY: as above.
-    assert_eq!(
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
-    );
-    // Large chunks first, so a pipe that grows on a large write grows to its
-    // largest size before it is full.
-    let mut writer = writer;
-    for chunk in [65_536, 1_024, 1] {
-        let bytes = vec![b'x'; chunk];
-        loop {
-            match writer.write(&bytes) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("filling the pipe: {e}"),
-            }
-        }
-    }
-    // SAFETY: as above.
-    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
-}
-
-/// The first line of `log`, or else of `lines` (added to `log`), that
-/// contains every one of `needles`, within `bound`.
-fn read_until(
-    lines: &mpsc::Receiver<String>,
-    log: &mut Vec<String>,
-    needles: &[&str],
-    bound: Duration,
-) -> String {
-    let until = Instant::now() + bound;
-    loop {
-        if let Some(line) = log.iter().find(|l| needles.iter().all(|n| l.contains(n))) {
-            return line.clone();
-        }
-        let left = until.saturating_duration_since(Instant::now());
-        match lines.recv_timeout(left) {
-            Ok(line) => log.push(line),
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
-                "no line with {needles:?} within {bound:?}; log:\n{}",
-                log.join("\n")
-            ),
-        }
-    }
 }
 
 /// The endpoint of the daemon serving `root`, on loopback at the port its
@@ -359,14 +292,14 @@ impl Daemon {
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .env("CERULION_FLASHBACK", "off")
-            .env(QUEUE_LINES_ENV, "1")
+            .env(QUEUE_LINES_FOR_TEST_ENV, "1")
             .env_remove("CERULION_NETWORK")
             .env_remove("CERULION_STATE_ROOT")
             .env_remove("CERULION_RELAY_URL")
-            .env_remove("CERULION_REMOTED_HARD_EXIT_MS")
-            .env_remove("CERULION_REMOTED_SHUTDOWN_PROBE_FOR_TEST")
-            .env_remove("CERULION_REMOTED_CLOSE_ENDPOINT_FOR_TEST")
-            .env_remove("CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST")
+            .env_remove(HARD_EXIT_ENV)
+            .env_remove(PROBE_FOR_TEST_ENV)
+            .env_remove(CLOSE_ENDPOINT_FOR_TEST_ENV)
+            .env_remove(EXIT_LOG_GRACE_FOR_TEST_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(writer);
@@ -375,9 +308,9 @@ impl Daemon {
         drop(command);
         let (sender, lines) = mpsc::channel();
         let (hold, held) = mpsc::channel();
-        std::thread::spawn(move || pump(reader, sender, held));
+        std::thread::spawn(move || pump(reader, sender, Some(held), LISTENING));
         let mut log = Vec::new();
-        read_until(&lines, &mut log, &[LISTENING], START_BOUND);
+        read_matching(&lines, &mut log, 0, START_BOUND, |l| l.contains(LISTENING));
         let robot = beacon_address(root.path());
         fill(&filler);
         Daemon {
@@ -395,15 +328,15 @@ impl Daemon {
         self.hold = None;
     }
 
-    /// The first stderr line containing every one of `needles`, read within
-    /// `bound`.
-    fn wait_for_line(&mut self, needles: &[&str], bound: Duration) -> String {
-        read_until(&self.lines, &mut self.log, needles, bound)
-    }
-
-    /// Whether the pipe is still full: nothing past the listening line read.
-    fn stderr_still_held(&self) -> bool {
-        self.hold.is_some()
+    /// The first stderr line at or past index `from` of the log that
+    /// `matches`, read within `bound`.
+    fn wait_for_line_past(
+        &mut self,
+        from: usize,
+        bound: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
+        read_matching(&self.lines, &mut self.log, from, bound, matches)
     }
 }
 
@@ -442,19 +375,36 @@ async fn reply(recv: &mut RecvStream, id: i64, bound: Duration) -> Value {
     .await
 }
 
-/// The daemon's `status` reply over `cerulion/wire/2`, as JSON.
-async fn status(desk: &Endpoint, robot: EndpointAddr) -> Value {
+/// A `cerulion/wire/2` control stream to the daemon. Opening it logs the
+/// daemon's accept and control-stream lines; a `status` request on it logs
+/// nothing at info.
+struct Wire {
+    _connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+}
+
+async fn wire(desk: &Endpoint, robot: EndpointAddr) -> Wire {
     let connection = bounded("dial wire", STEP, dial(desk, robot, alpn::WIRE))
         .await
         .expect("dial wire");
-    let (mut send, mut recv) = bounded("open wire stream", STEP, open_frame_stream(&connection))
+    let (send, recv) = bounded("open wire stream", STEP, open_frame_stream(&connection))
         .await
         .expect("open wire stream");
-    send_json(&mut send, &json!({ "verb": "status" })).await;
+    Wire {
+        _connection: connection,
+        send,
+        recv,
+    }
+}
+
+/// The daemon's `status` reply on `wire`, as JSON.
+async fn status(wire: &mut Wire) -> Value {
+    send_json(&mut wire.send, &json!({ "verb": "status" })).await;
     let frame = bounded(
         "the status reply",
         STEP,
-        read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN),
+        read_frame(&mut wire.recv, DEFAULT_MAX_FRAME_LEN),
     )
     .await
     .expect("the status reply");
@@ -474,31 +424,50 @@ fn field(line: &str, name: &str) -> u64 {
 }
 
 /// While stderr is still full, `status` counts dropped lines; once the pipe
-/// drains, the drop line and the caught-up line are written, and `status`
-/// reads the total the caught-up line names.
+/// drains, the drop line and the caught-up line are written, and every line
+/// `status` counts after that is named by one of them or by a later drop or
+/// caught-up line.
 async fn drops_are_counted_then_reported(daemon: &mut Daemon, observer: &Endpoint) {
-    let held = status(observer, daemon.robot.clone()).await;
+    // Opened while stderr is held: its accept lines are logged now.
+    let mut wire = wire(observer, daemon.robot.clone()).await;
+    let held = status(&mut wire).await;
     let while_held = held["log_lines_dropped"]
         .as_u64()
         .unwrap_or_else(|| panic!("no log_lines_dropped count in {held}"));
+    // A regime of one dropped line ends silently, as the regime latch
+    // decides, so the caught-up line needs two.
     assert!(
-        while_held > 0,
-        "with stderr full and a queue of one line, lines were dropped: {held}"
+        while_held >= 2,
+        "with stderr full and a queue of one line, at least two lines were dropped: {held}"
     );
-    assert!(daemon.stderr_still_held());
+    let released_at = daemon.log.len();
     daemon.release_stderr();
-    let dropped = daemon.wait_for_line(&[DROPPED, "WARN"], STEP);
-    assert!(field(&dropped, "dropped") > 0, "{dropped}");
-    let caught_up = daemon.wait_for_line(&[CAUGHT_UP, "INFO"], STEP);
+    let reports = |l: &str, kind: &str, level: &str| {
+        l.contains(kind) && l.contains(level) && field(l, "total_dropped") >= while_held
+    };
+    daemon.wait_for_line_past(released_at, STEP, |l| reports(l, DROPPED, "WARN"));
+    let caught_up = daemon.wait_for_line_past(released_at, STEP, |l| reports(l, CAUGHT_UP, "INFO"));
     let total = field(&caught_up, "total_dropped");
-    assert!(total >= while_held, "{caught_up} after {held}");
-    let after = status(observer, daemon.robot.clone()).await;
-    assert_eq!(
-        after["log_lines_dropped"],
-        json!(total),
-        "status reads the total the caught-up line names; log:\n{}",
-        daemon.log.join("\n")
-    );
+    let after = status(&mut wire).await["log_lines_dropped"]
+        .as_u64()
+        .expect("a log_lines_dropped count");
+    assert!(after >= total, "status read {after} after {caught_up}");
+    if after > total {
+        // A line dropped after the caught-up line is named by the warn line
+        // that opens its regime, or by that regime's caught-up line when its
+        // drops came in more than one batch.
+        let past = daemon
+            .log
+            .iter()
+            .position(|l| *l == caught_up)
+            .expect("read above")
+            + 1;
+        daemon.wait_for_line_past(past, STEP, |l| {
+            ((l.contains(DROPPED) && l.contains("WARN"))
+                || (l.contains(CAUGHT_UP) && l.contains("INFO")))
+                && field(l, "total_dropped") >= after
+        });
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -543,10 +512,6 @@ async fn an_rcp_estop_reaches_rcpd_while_stderr_is_full() {
         serde_json::from_str::<Value>(text).unwrap()["estopped"],
         json!(true)
     );
-    assert!(
-        daemon.stderr_still_held(),
-        "the estop reached rcpd with stderr full"
-    );
     drops_are_counted_then_reported(&mut daemon, &desk).await;
 }
 
@@ -578,9 +543,5 @@ async fn an_ops_engage_estop_reaches_rcpd_while_stderr_is_full() {
         .expect("the ops task")
         .expect("engage-estop answers");
     assert_eq!(answer["engaged"], json!(true), "{answer}");
-    assert!(
-        daemon.stderr_still_held(),
-        "the estop reached rcpd with stderr full"
-    );
     drops_are_counted_then_reported(&mut daemon, &desk).await;
 }

@@ -1080,6 +1080,28 @@ mod tests {
         );
     }
 
+    /// A status reply names `log_lines_dropped` only when it has a count.
+    /// Hand oracle.
+    #[test]
+    fn a_status_reply_names_its_log_count_only_when_it_has_one() {
+        assert_eq!(
+            serde_json::to_string(&WireResponse::Status(StatusReply {
+                topics: vec![],
+                log_lines_dropped: None,
+            }))
+            .unwrap(),
+            r#"{"reply":"status","topics":[]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WireResponse::Status(StatusReply {
+                topics: vec![],
+                log_lines_dropped: Some(7),
+            }))
+            .unwrap(),
+            r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
+        );
+    }
+
     /// A plane with NO epoch sink installed must REFUSE a pushed epoch
     /// loudly — never report a success the desk would read as "the revocation
     /// landed". The default `WirePlane` has no sink, so this is the default
