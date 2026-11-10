@@ -364,11 +364,14 @@ unknown-git = "deny"
 # dropping host-built ports), which 0.10.0 answers with ENFILE on the next
 # `shm_open` of that number. It also writes a zero node counter when it creates
 # the global management segment, where 0.10.0 left the counter that goes into
-# every node id as whatever bytes the new segment held.
+# every node id as whatever bytes the new segment held. A listener's event drain
+# empties the trigger before it stores the idle state, where 0.10.0 stored it
+# first, so a notify landing between the two could leave the listener marked
+# notified with nothing to read and no later notify would wake it.
 # The revision also adds Android support: filesystem paths, file-backed named
 # shared memory with private-directory checks, abstract-namespace Unix datagram
 # sockets and POSIX timers for the watchdog. PRUNE this the moment an iceoryx2
-# release carries every change this fork revision adds.
+# release carries all four fixes and the Android support.
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
     "https://github.com/cerulion-inc/iceoryx2",
