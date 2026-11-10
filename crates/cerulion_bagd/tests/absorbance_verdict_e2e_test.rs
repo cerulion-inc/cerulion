@@ -565,8 +565,8 @@ fn non_probative(evidence: &AttemptEvidence, shown: &str) -> Option<Attempt> {
 /// attempt's captured lines apart from another's.
 ///
 /// Each attempt hands its recorded evidence to [`classify_attempt`] ahead of
-/// every assertion, and [`Attempt::NonProbative`] comes back from that call and
-/// from nothing else. A probative attempt then runs the arm's assertions, and a
+/// every assertion on the verdicts, rates and log lines it recorded, and
+/// [`Attempt::NonProbative`] comes back from that call and from nothing else. A probative attempt then runs the arm's assertions, and a
 /// wrong answer panics there: that failure is final and nothing re-runs.
 ///
 /// Each non-probative attempt's line goes to the process's stderr outside the
