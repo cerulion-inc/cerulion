@@ -3592,6 +3592,80 @@ fn a_send_that_reaches_no_queue_takes_its_count_back() {
     rt_p.shutdown();
 }
 
+/// A send that reaches no subscriber keeps its count: only an `Err` takes a
+/// count back. `Ok(0)` does not prove the frame missed every queue, because
+/// under iceoryx2's default `Warn` degradation a corrupted connection is pushed
+/// first and then left out of the recipient count.
+///
+/// One block word and no subscriber on the topic, so every send reaches no
+/// queue and returns `Ok`. Oracle, by hand: each of the four send paths adds
+/// one count, so the word reads 1, 2, 3 and 4, and the two paths that report
+/// recipients both report 0.
+#[test]
+#[serial]
+fn a_send_that_reaches_no_subscriber_keeps_its_count() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("cbwnone", "consumer", "inp", WINDOW_DEPTH);
+    let mgr_p = manager("cbwnone_p", ix, Arc::new(VirtualClock::new()));
+    let mut publisher = mgr_p
+        .create_publisher(TOPIC, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("the producer's publisher");
+    publisher.register_block_outstanding_for_test(CreditWord::mapped(Arc::clone(&w.producer_side)));
+    // A frame written by hand: a zeroed header and a `Vector3` fixed section.
+    // Nothing reads it, so only its length matters to the raw paths.
+    let blank = [0u8; WireHeader::SIZE + 24];
+
+    // The typed publish, `OutputProxy`'s drop.
+    let mut frame = publisher.loan_proxy::<Vector3>().expect("loan");
+    frame.x = 1.0;
+    drop(frame);
+    assert_eq!(w.consumer_side.outstanding(), 1, "the typed publish");
+
+    // `publish_raw`.
+    let raw = with_x(&blank, 2.0);
+    assert_eq!(
+        publisher.publish_raw(&raw).expect("publish_raw sends"),
+        0,
+        "no subscriber received it"
+    );
+    assert_eq!(
+        w.consumer_side.outstanding(),
+        2,
+        "publish_raw kept its count"
+    );
+
+    // `send_raw_loan`.
+    let loaned = with_x(&blank, 3.0);
+    let mut loan = publisher.loan_raw_uninit(loaned.len()).expect("a raw loan");
+    for (slot, byte) in loan.bytes_uninit_mut().iter_mut().zip(&loaned) {
+        slot.write(*byte);
+    }
+    // SAFETY: the loan is exactly `loaned.len()` bytes and the loop above wrote
+    // every one of them.
+    let loan = unsafe { loan.assume_init() };
+    assert_eq!(
+        publisher.send_raw_loan(loan).expect("send_raw_loan sends"),
+        0,
+        "no subscriber received it"
+    );
+    assert_eq!(
+        w.consumer_side.outstanding(),
+        3,
+        "send_raw_loan kept its count"
+    );
+
+    // The overflow re-send.
+    let spilled = with_x(&blank, 4.0);
+    publisher
+        .send_overflow_frame_for_test(&spilled[..WireHeader::SIZE], &spilled[WireHeader::SIZE..])
+        .expect("the overflow re-send sends");
+    assert_eq!(
+        w.consumer_side.outstanding(),
+        4,
+        "the overflow re-send kept its count"
+    );
+}
+
 /// The configuration that makes an `Err` from `send()` mean that no consumer's
 /// queue received the frame, which is what lets the take-back above be exact.
 ///
