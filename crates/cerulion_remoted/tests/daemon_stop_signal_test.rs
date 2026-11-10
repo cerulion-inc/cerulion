@@ -335,7 +335,7 @@ fn the_hard_exit_deadline_ends_a_stop_that_cannot_finish_with_4() {
         daemon
             .line_with(&[
                 "did not finish within the hard-exit deadline",
-                "deadline_ms=3000"
+                "deadline_ms=3000 "
             ])
             .is_some(),
         "one error line names the deadline; log:\n{}",
@@ -385,18 +385,20 @@ fn without_a_signal_the_deadline_ends_a_stop_the_endpoint_close_started_with_4()
             (GRACE_ENV, GRACE_MS),
         ],
     );
-    // Measured from before the start: the startup, the 3 s deadline and the
-    // exit's wait for its line.
-    let (status, took) = daemon.wait_exit(t0, START_BOUND + STOP_BOUND);
+    // From the listening line: the 3 s deadline and at most the exit's 5 s
+    // wait for its line.
+    let started = Instant::now();
+    let (status, took) = daemon.wait_exit(started, STOP_BOUND);
     assert_eq!(
         status.code(),
         Some(4),
         "the deadline ends the stalled stop with 4, got {status:?}; log:\n{}",
         daemon.dump()
     );
+    let since_spawn = took + (started - t0);
     assert!(
-        took >= Duration::from_millis(3000),
-        "exited {took:?} after the start, before the 3000 ms hard-exit deadline"
+        since_spawn >= Duration::from_millis(3000),
+        "exited {since_spawn:?} after the spawn, before the 3000 ms hard-exit deadline"
     );
     assert!(
         daemon.line_with(&[ENDPOINT_CLOSED]).is_some(),
@@ -412,7 +414,7 @@ fn without_a_signal_the_deadline_ends_a_stop_the_endpoint_close_started_with_4()
         daemon
             .line_with(&[
                 "did not finish within the hard-exit deadline",
-                "deadline_ms=3000"
+                "deadline_ms=3000 "
             ])
             .is_some(),
         "the deadline, not a signal, ended the stop; log:\n{}",

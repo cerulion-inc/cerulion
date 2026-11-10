@@ -9,11 +9,13 @@
 //!
 //! Exit status: 0 after a graceful stop, also one that starts because the
 //! accept loop stopped on its own, and when the network kill switch refuses to
-//! serve; 1 on a configuration or serving error; 2 on a command-line usage
-//! error; 3 when a participant registered on the shutdown stage failed,
-//! panicked or was cancelled (the teardown after it still ran; this binary
-//! registers none of its own); 4 when the hard-exit deadline or a second stop
-//! signal ends a stop that has not finished.
+//! serve; 1 on a configuration or serving error, or when the stop signals
+//! cannot be installed; 2 on a command-line usage error; 3 when a participant
+//! registered on the shutdown stage failed, panicked or was cancelled (the
+//! teardown after it still ran; this binary registers none of its own); 4 when
+//! the hard-exit deadline or a second stop signal ends a stop that has not
+//! finished, as the first stop signal does after the accept loop stopped on
+//! its own.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
