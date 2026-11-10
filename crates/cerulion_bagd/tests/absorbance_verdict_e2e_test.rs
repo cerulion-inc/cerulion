@@ -337,9 +337,27 @@ struct TapRun {
     published_for: Duration,
 }
 
+/// When the recorder evaluated the answers an arm asserts on, which fixes the
+/// histogram those answers were read against. A property of the arm, written
+/// in its judge, never of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailRead {
+    /// The arm checks the rows evaluated at finalize against the run's FINAL
+    /// histogram, plus what its judge shows an overflow gap mid-run cannot
+    /// change: the headline's live frame, polled for until the recorder's
+    /// evaluation converges to it, and the quiet arm's silence, which only a
+    /// `Short` evaluation breaks.
+    AtFinalize,
+    /// The arm also checks a line the recorder minted MID-RUN, at the first
+    /// evaluation that found its tap short, against the histogram as it stood
+    /// then. Counts only grow, so the final histogram holds every gap that
+    /// evaluation saw, but not WHEN each gap arrived.
+    MidRun,
+}
+
 /// Everything [`classify_attempt`] reads: the drain-gap histogram's bucket
-/// edges and counts as the run's health document carries them, and each
-/// priced tap's [`TapRun`].
+/// edges and counts as the run's health document carries them, each priced
+/// tap's [`TapRun`], and the arm's [`TailRead`].
 ///
 /// Nothing the recorder DERIVED is here: no verdict, rate estimate, measured
 /// tail, live status frame or log field. The type carries none, so no answer
@@ -349,14 +367,16 @@ struct AttemptEvidence {
     edges_us: Vec<u64>,
     counts: Vec<u64>,
     taps: Vec<TapRun>,
+    read: TailRead,
 }
 
 impl AttemptEvidence {
-    fn new(gaps: &DrainGapHistogram, taps: &[TapRun]) -> Self {
+    fn new(gaps: &DrainGapHistogram, read: TailRead, taps: &[TapRun]) -> Self {
         Self {
             edges_us: gaps.edges_us.clone(),
             counts: gaps.counts.clone(),
             taps: taps.to_vec(),
+            read,
         }
     }
 }
@@ -413,6 +433,14 @@ enum NonProbativeReason {
     /// the edge is `Unrankable`, one at or under it `Short`) and leaves every
     /// row without a measured tail or a required depth.
     OverflowTail(TailWalk),
+    /// The final 0.999 reading sits inside the ladder, yet a gap past the top
+    /// edge was recorded, and the arm checks a line minted mid-run
+    /// ([`TailRead::MidRun`]). An evaluation made while that gap held the rank
+    /// (as it does whenever fewer than 1000 gaps are recorded, where the rank is
+    /// the run maximum) read an overflow tail, and the contract leaves a line
+    /// minted then without a measured tail or a required depth. The histogram
+    /// does not say whether the line was minted before the gap or after it.
+    OverflowGapMidRun(TailWalk),
     /// A publisher committed outside the band of the rate its arm prices it
     /// at, so the run did not set up the scenario the arm checks.
     PublisherOffBand {
@@ -429,6 +457,13 @@ impl NonProbativeReason {
                 "the 0.999 drain-gap reading (rank {} of {} gaps) lands in the histogram's \
                  unbounded overflow bucket, which holds {} gap(s) past the ladder's top edge, \
                  so no tap can rank `Absorbs` or carry a measured tail against it",
+                walk.rank, walk.total, walk.overflow
+            ),
+            Self::OverflowGapMidRun(walk) => format!(
+                "the final 0.999 drain-gap reading (rank {} of {} gaps) is inside the ladder, \
+                 but {} gap(s) past its top edge were recorded and this arm checks a line \
+                 minted mid-run, which an evaluation made while such a gap held the rank \
+                 leaves without a measured tail or a required depth",
                 walk.rank, walk.total, walk.overflow
             ),
             Self::PublisherOffBand {
@@ -468,16 +503,21 @@ enum Classification {
 /// arm.
 ///
 /// Non-probative exactly when the 0.999 drain-gap reading, walked here over the
-/// recorded counts ([`walk_tail`]), lands in the overflow bucket, or when a
-/// priced tap's achieved rate (`sent` over `published_for`) sits outside the
-/// band of its commanded rate ([`in_rate_band`]). A pure function of
-/// [`AttemptEvidence`], which holds nothing the recorder decided, so a verdict
-/// a regression got wrong reaches the arm's assertions and fails there.
+/// recorded counts ([`walk_tail`]), lands in the overflow bucket; when an arm
+/// that checks a mid-run line ([`TailRead::MidRun`]) recorded any gap in the
+/// overflow bucket at all; or when a priced tap's achieved rate (`sent` over
+/// `published_for`) sits outside the band of its commanded rate
+/// ([`in_rate_band`]). A pure function of [`AttemptEvidence`], which holds
+/// nothing the recorder decided, so a verdict a regression got wrong reaches
+/// the arm's assertions and fails there.
 fn classify_attempt(evidence: &AttemptEvidence) -> Classification {
     let mut reasons = Vec::new();
-    if let Some(walk) = walk_tail(&evidence.edges_us, &evidence.counts).filter(TailWalk::overflowed)
-    {
-        reasons.push(NonProbativeReason::OverflowTail(walk));
+    if let Some(walk) = walk_tail(&evidence.edges_us, &evidence.counts) {
+        if walk.overflowed() {
+            reasons.push(NonProbativeReason::OverflowTail(walk));
+        } else if walk.overflow > 0 && evidence.read == TailRead::MidRun {
+            reasons.push(NonProbativeReason::OverflowGapMidRun(walk));
+        }
     }
     for tap in &evidence.taps {
         let commanded_mhz = millihertz(1, tap.period);
@@ -753,8 +793,12 @@ struct HeadlineRun {
 fn judge_headline(attempt: u32, run: &HeadlineRun) -> Attempt {
     let (fast_row, slow_row, gaps) = (&run.fast_row, &run.slow_row, &run.gaps);
     let (fast_sent, slow_sent, wall) = (run.fast_sent, run.slow_sent, run.wall);
+    // AT FINALIZE: the rows, and the live frame the wait polls for while the run
+    // goes on, which the recorder's evaluation reaches once its reading sits
+    // inside the ladder.
     let evidence = AttemptEvidence::new(
         gaps,
+        TailRead::AtFinalize,
         &[
             TapRun {
                 what: "the fast tap",
@@ -1082,8 +1126,11 @@ struct LoudRun {
 fn judge_loud(attempt: u32, run: &LoudRun) -> Attempt {
     let (a, topic) = (&run.row, &run.topic);
     let (sent, published_for) = (run.sent, run.published_for);
+    // MID-RUN: the head is minted at the first evaluation that found the tap
+    // short, against the histogram as it stood then.
     let evidence = AttemptEvidence::new(
         &run.gaps,
+        TailRead::MidRun,
         &[TapRun {
             what: "the loud arm's tap",
             period: FAST_PERIOD,
@@ -1201,14 +1248,12 @@ fn judge_loud(attempt: u32, run: &LoudRun) -> Attempt {
         for key in ["absorbance_us", "shortfall_at_least_us", "rate_mhz"] {
             measured(key)?;
         }
-        // The two fields an OVERFLOW tail leaves unknown by contract, which this
-        // attempt's tail is not: `classify_attempt` walked the run's final 0.999
-        // reading inside the ladder above. Counts only grow, and under 1000 gaps
-        // the 0.999 rank is the run maximum, so a head evaluated against an
-        // overflow tail leaves a gap that keeps the final reading in the overflow
-        // bucket and the attempt non-probative. A head that reaches here without
-        // a tail or a required depth is the code under test, and so is one on a
-        // run past 1000 gaps whose final reading came back inside the ladder.
+        // The two fields an OVERFLOW tail leaves unknown by contract. This
+        // attempt is probative under `TailRead::MidRun`, so its final histogram
+        // holds no gap past the ladder's top edge, and counts only grow: no
+        // evaluation during the run read an overflow tail, the head's included.
+        // A head that reaches here without a tail or a required depth is the
+        // code under test.
         for key in ["required_depth", "measured_tail_us"] {
             measured(key)?;
         }
@@ -1347,8 +1392,13 @@ fn judge_quiet(attempt: u32, run: &QuietRun) -> Attempt {
     // rather than a recorder that evaluated nothing.
     let a = &run.row;
     let (sent, published_for) = (run.sent, run.published_for);
+    // AT FINALIZE: the row. The loud lines this arm forbids come only from
+    // `Short` evaluations, and an evaluation against an overflow tail leaves a
+    // tap whose absorbance is over the ladder's top edge `Unrankable`, not
+    // `Short`.
     let evidence = AttemptEvidence::new(
         &run.gaps,
+        TailRead::AtFinalize,
         &[TapRun {
             what: "the quiet arm's tap",
             period: SLOW_PERIOD,
@@ -2401,14 +2451,17 @@ fn fails_non_probative<R>(
     }
 }
 
-/// A PROBATIVE attempt's failure is final. Each seeded regression rides a run
-/// whose recorded tail sits inside the ladder with one stray gap in the overflow
-/// bucket, and it fails on its first attempt with no second one asked for.
+/// A PROBATIVE attempt's failure is final. Each seeded regression fails on its
+/// first attempt with no second one asked for.
 ///
-/// 2000 recorded gaps put the 0.999 rank at 1998, inside the 1999 gaps the
-/// ladder holds, so the stray 300 ms gap does not hold the tail and every arm
-/// can check its verdicts. Each arm's unseeded control on the same histogram
-/// passes on attempt 1, so each failure below is its seed's.
+/// The headline and quiet seeds ride a run whose recorded tail sits inside the
+/// ladder beside one stray gap in the overflow bucket: 2000 recorded gaps put
+/// the 0.999 rank at 1998, inside the 1999 gaps the ladder holds, so the stray
+/// 300 ms gap does not hold the tail and both arms can check their verdicts.
+/// The loud arm also checks its mid-run head ([`TailRead::MidRun`]), which a
+/// stray gap leaves unknowable, so its seeds ride 2000 gaps all inside the
+/// ladder. Each arm's unseeded control on the same histogram passes on attempt
+/// 1, so each failure below is its seed's.
 #[test]
 fn a_seeded_regression_on_a_probative_attempt_fails_on_attempt_one_with_no_rerun() {
     let gaps = || seeded_gaps(1_999, 1);
@@ -2475,14 +2528,25 @@ fn a_seeded_regression_on_a_probative_attempt_fails_on_attempt_one_with_no_rerun
         "an unstalled recorder's 5 Hz tap must absorb its own gaps",
     );
 
-    // THE LOUD ARM: the head drops the in-ladder tail it was evaluated against.
-    passes_on_attempt_one("the seeded loud arm", &[seeded_loud(gaps())], judge_loud);
-    let mut no_tail = seeded_loud(gaps());
-    no_tail.lines = seeded_loud_lines(&TopicAbsorbance {
-        measured_tail_us: None,
-        required_depth: None,
-        ..no_tail.row
-    });
+    // THE LOUD ARM, on a run with no gap past the ladder.
+    let in_ladder = || seeded_gaps(2_000, 0);
+    passes_on_attempt_one(
+        "the seeded loud arm",
+        &[seeded_loud(in_ladder())],
+        judge_loud,
+    );
+    // The final row answers `Unrankable` against an in-ladder tail.
+    let mut unrankable = seeded_loud(in_ladder());
+    unrankable.row.verdict = AbsorbanceVerdict::Unrankable;
+    fails_on_attempt_one(
+        "the seeded loud arm",
+        &three(unrankable),
+        judge_loud,
+        "left: Unrankable",
+    );
+    // The head drops the in-ladder tail it was evaluated against.
+    let mut no_tail = seeded_loud(in_ladder());
+    no_tail.lines = seeded_loud_lines(&tailless(&no_tail.row));
     fails_on_attempt_one(
         "the seeded loud arm",
         &three(no_tail),
@@ -2491,16 +2555,67 @@ fn a_seeded_regression_on_a_probative_attempt_fails_on_attempt_one_with_no_rerun
     );
 }
 
+/// `row` as the recorder answers it against an OVERFLOW tail: no measured tail
+/// and no required depth.
+fn tailless(row: &TopicAbsorbance) -> TopicAbsorbance {
+    TopicAbsorbance {
+        measured_tail_us: None,
+        required_depth: None,
+        ..*row
+    }
+}
+
+/// A stray gap past the ladder makes the loud arm's attempt NON-PROBATIVE even
+/// when the final 0.999 reading comes back inside the ladder: its head may have
+/// been minted while that gap held the rank, which leaves the head without a
+/// tail or a required depth by contract. The arm runs again and passes on a
+/// clean attempt.
+///
+/// The seeded attempt 1 is what a single host stall before the head does to a
+/// run past 1000 gaps: 1999 gaps in the ladder, one past it, a tailless head and
+/// a final row that carries the in-ladder tail.
+#[test]
+fn a_stray_overflow_gap_reruns_the_loud_arm_whose_head_may_have_read_it() {
+    let mut stalled = seeded_loud(seeded_gaps(1_999, 1));
+    stalled.lines = seeded_loud_lines(&tailless(&stalled.row));
+    let clean = seeded_loud(seeded_gaps(2_000, 0));
+    let driven = drive(
+        "the seeded loud arm",
+        &[stalled, clean.clone(), clean],
+        judge_loud,
+    );
+    assert!(
+        driven.panic.is_none() && driven.calls == 2,
+        "a tailless head beside a stray overflow gap must re-run the loud arm, not fail \
+         it: {} attempt(s), printed {:?}, ended in {:?}",
+        driven.calls,
+        driven.printed,
+        driven.panic
+    );
+    let lines: Vec<&str> = driven.printed.lines().collect();
+    assert!(
+        lines.len() == 1
+            && lines[0].starts_with("the seeded loud arm: attempt 1 of 3 was NON-PROBATIVE: ")
+            && lines[0].contains("rank 1998 of 2000 gaps) is inside the ladder")
+            && lines[0].contains("minted mid-run")
+            && !lines[0].contains("unbounded overflow bucket"),
+        "attempt 1 names the stray gap beside an in-ladder reading: {lines:?}"
+    );
+}
+
 /// Three NON-PROBATIVE attempts fail the arm loudly, naming all three, and every
 /// attempt prints its evidence: the gap histogram with where its 0.999 reading
 /// lands, each tap's commanded, measured and achieved rates, and its number.
 ///
 /// Per arm, attempt 1 is an overflow tail alone, attempt 2 a publisher off its
-/// band alone over an in-ladder tail, and attempt 3 both, so each line names
-/// its own reasons and only those.
+/// band alone over an in-ladder tail, and attempt 3 a publisher off its band
+/// beside an overflow tail (for the loud arm, beside a stray overflow gap whose
+/// final reading is inside the ladder), so each line names its own reasons and
+/// only those.
 #[test]
 fn three_non_probative_attempts_fail_the_arm_naming_all_three() {
     const OVERFLOW: &str = "unbounded overflow bucket";
+    const MID_RUN: &str = "minted mid-run";
     const BEHIND: &str = "fell behind its grid";
 
     let mut slow_behind = seeded_headline(seeded_gaps(297, 0));
@@ -2548,19 +2663,20 @@ fn three_non_probative_attempts_fail_the_arm_naming_all_three() {
 
     let mut loud_behind = seeded_loud(seeded_gaps(427, 0));
     loud_behind.sent = 700;
-    let mut loud_both = seeded_loud(seeded_gaps(426, 1));
+    let mut loud_both = seeded_loud(seeded_gaps(1_999, 1));
+    loud_both.lines = seeded_loud_lines(&tailless(&loud_both.row));
     loud_both.sent = 700;
     fails_non_probative(
         "the seeded loud arm",
         &[seeded_loud(seeded_gaps(426, 1)), loud_behind, loud_both],
         judge_loud,
         [
-            (&[OVERFLOW, "rank 427 of 427"], &[BEHIND]),
+            (&[OVERFLOW, "rank 427 of 427"], &[BEHIND, MID_RUN]),
             (
                 &["the loud arm's tap committed at ~100000 mHz", BEHIND],
-                &[OVERFLOW],
+                &[OVERFLOW, MID_RUN],
             ),
-            (&[OVERFLOW, BEHIND], &[]),
+            (&[MID_RUN, "rank 1998 of 2000", BEHIND], &[OVERFLOW]),
         ],
     );
 }
@@ -2611,13 +2727,23 @@ const ON_GRID: TapRun = TapRun {
     published_for: Duration::from_secs(4),
 };
 
-/// `classify_attempt` over `gaps` and `taps`.
-fn classify(gaps: &DrainGapHistogram, taps: &[TapRun]) -> Classification {
-    classify_attempt(&AttemptEvidence::new(gaps, taps))
+/// Both ways an arm reads the tail.
+const READS: [TailRead; 2] = [TailRead::AtFinalize, TailRead::MidRun];
+
+/// `classify_attempt` over `gaps`, `read` and `taps`.
+fn classify(gaps: &DrainGapHistogram, read: TailRead, taps: &[TapRun]) -> Classification {
+    classify_attempt(&AttemptEvidence::new(gaps, read, taps))
 }
 
-/// The 0.999 reading inside the ladder, or no reading at all, is PROBATIVE,
-/// including when a stray gap sits in the overflow bucket without holding the
+/// `(in_ladder, rank)` for a histogram of `in_ladder` gaps beside one stray
+/// overflow gap whose 0.999 reading, at `rank`, the ladder holds: at exactly
+/// 1000 gaps rank 999 of the 999 in-ladder gaps, and at 2000 gaps rank 1998 of
+/// 1999.
+const STRAY: [(u64, u64); 2] = [(999, 999), (1_999, 1_998)];
+
+/// The 0.999 reading inside the ladder, or no reading at all, is PROBATIVE for
+/// either read when nothing sits past the ladder, and for an arm that reads at
+/// finalize when a stray gap sits in the overflow bucket without holding the
 /// rank.
 #[test]
 fn classify_attempt_finds_an_in_ladder_or_vacant_tail_probative() {
@@ -2629,21 +2755,24 @@ fn classify_attempt_finds_an_in_ladder_or_vacant_tail_probative() {
         ),
         None
     );
-    for gaps in [DrainGapHistogram::new(), DrainGapHistogram::default()] {
-        assert_eq!(
-            classify(&gaps, &[ON_GRID]),
-            Classification::Probative,
-            "{gaps:?}"
-        );
+    for read in READS {
+        for gaps in [DrainGapHistogram::new(), DrainGapHistogram::default()] {
+            assert_eq!(
+                classify(&gaps, read, &[ON_GRID]),
+                Classification::Probative,
+                "{read:?} {gaps:?}"
+            );
+        }
+        // In the ladder, with nothing past it.
+        for in_ladder in [297, 2_000] {
+            assert_eq!(
+                classify(&seeded_gaps(in_ladder, 0), read, &[ON_GRID]),
+                Classification::Probative,
+                "{read:?} {in_ladder}"
+            );
+        }
     }
-    // In the ladder, with nothing past it.
-    assert_eq!(
-        classify(&seeded_gaps(297, 0), &[ON_GRID]),
-        Classification::Probative
-    );
-    // One stray overflow gap at exactly 1000 gaps: rank 999, held by the 999
-    // in-ladder gaps. And at 2000 gaps: rank 1998 of 1999 in the ladder.
-    for (in_ladder, rank) in [(999, 999), (1_999, 1_998)] {
+    for (in_ladder, rank) in STRAY {
         let gaps = seeded_gaps(in_ladder, 1);
         let walk = walk_tail(&gaps.edges_us, &gaps.counts).expect("recorded gaps");
         assert_eq!(
@@ -2655,26 +2784,62 @@ fn classify_attempt_finds_an_in_ladder_or_vacant_tail_probative() {
             }
         );
         assert!(!walk.overflowed(), "{walk:?}");
-        assert_eq!(classify(&gaps, &[ON_GRID]), Classification::Probative);
+        assert_eq!(
+            classify(&gaps, TailRead::AtFinalize, &[ON_GRID]),
+            Classification::Probative
+        );
     }
 }
 
-/// The 0.999 reading in the overflow bucket is NON-PROBATIVE, and the reason
-/// carries the walk that put it there.
+/// An arm that checks a mid-run line is NON-PROBATIVE beside any gap past the
+/// ladder, even one that does not hold the final rank, and the reason carries
+/// the walk.
+#[test]
+fn classify_attempt_finds_a_stray_overflow_gap_non_probative_for_a_mid_run_line() {
+    for (in_ladder, rank) in STRAY {
+        let walk = TailWalk {
+            total: in_ladder + 1,
+            rank,
+            overflow: 1,
+        };
+        assert!(!walk.overflowed(), "{walk:?}");
+        assert_eq!(
+            classify(&seeded_gaps(in_ladder, 1), TailRead::MidRun, &[ON_GRID]),
+            Classification::NonProbative(vec![NonProbativeReason::OverflowGapMidRun(walk)]),
+            "{in_ladder} in the ladder, 1 past it"
+        );
+    }
+    // Two past it at 2500 gaps: rank 2498, held by the 2498 in-ladder gaps.
+    let walk = TailWalk {
+        total: 2_500,
+        rank: 2_498,
+        overflow: 2,
+    };
+    assert!(!walk.overflowed(), "{walk:?}");
+    assert_eq!(
+        classify(&seeded_gaps(2_498, 2), TailRead::MidRun, &[ON_GRID]),
+        Classification::NonProbative(vec![NonProbativeReason::OverflowGapMidRun(walk)])
+    );
+}
+
+/// The 0.999 reading in the overflow bucket is NON-PROBATIVE for either read,
+/// with the one reason that carries the walk that put it there.
 #[test]
 fn classify_attempt_finds_an_overflow_tail_non_probative() {
-    for (in_ladder, overflow, rank) in [(296, 1, 297), (998, 2, 999), (0, 1, 1), (0, 3, 3)] {
-        let walk = TailWalk {
-            total: in_ladder + overflow,
-            rank,
-            overflow,
-        };
-        assert!(walk.overflowed(), "{walk:?}");
-        assert_eq!(
-            classify(&seeded_gaps(in_ladder, overflow), &[ON_GRID]),
-            Classification::NonProbative(vec![NonProbativeReason::OverflowTail(walk)]),
-            "{in_ladder} in the ladder, {overflow} past it"
-        );
+    for read in READS {
+        for (in_ladder, overflow, rank) in [(296, 1, 297), (998, 2, 999), (0, 1, 1), (0, 3, 3)] {
+            let walk = TailWalk {
+                total: in_ladder + overflow,
+                rank,
+                overflow,
+            };
+            assert!(walk.overflowed(), "{walk:?}");
+            assert_eq!(
+                classify(&seeded_gaps(in_ladder, overflow), read, &[ON_GRID]),
+                Classification::NonProbative(vec![NonProbativeReason::OverflowTail(walk)]),
+                "{read:?}: {in_ladder} in the ladder, {overflow} past it"
+            );
+        }
     }
 }
 
@@ -2694,11 +2859,13 @@ fn classify_attempt_never_reads_a_malformed_histogram_as_an_overflow_tail() {
             "{edges_us:?} {counts:?}"
         );
         let gaps = DrainGapHistogram { edges_us, counts };
-        assert_eq!(
-            classify(&gaps, &[ON_GRID]),
-            Classification::Probative,
-            "{gaps:?}"
-        );
+        for read in READS {
+            assert_eq!(
+                classify(&gaps, read, &[ON_GRID]),
+                Classification::Probative,
+                "{read:?} {gaps:?}"
+            );
+        }
     }
 }
 
@@ -2711,7 +2878,11 @@ fn classify_attempt_holds_each_publisher_to_its_band() {
     // millihertz; 1000 s of publishing makes `sent` the achieved rate in mHz.
     for sent in [3_334, 5_000, 7_500] {
         assert_eq!(
-            classify(&in_ladder, &[tap("the edge tap", 200, sent, 1_000_000)]),
+            classify(
+                &in_ladder,
+                TailRead::AtFinalize,
+                &[tap("the edge tap", 200, sent, 1_000_000)]
+            ),
             Classification::Probative,
             "{sent} mHz is inside the band"
         );
@@ -2727,30 +2898,49 @@ fn classify_attempt_holds_each_publisher_to_its_band() {
             achieved_mhz: u64::from(sent),
         };
         assert!(off.describe().contains(way), "{}", off.describe());
-        assert_eq!(
-            classify(
-                &in_ladder,
-                &[ON_GRID, tap("the edge tap", 200, sent, 1_000_000)]
-            ),
-            Classification::NonProbative(vec![off]),
-            "{sent} mHz is outside the band, and the on-grid tap is not named"
-        );
+        for read in READS {
+            assert_eq!(
+                classify(
+                    &in_ladder,
+                    read,
+                    &[ON_GRID, tap("the edge tap", 200, sent, 1_000_000)]
+                ),
+                Classification::NonProbative(vec![off.clone()]),
+                "{read:?}: {sent} mHz is outside the band, and the on-grid tap is not named"
+            );
+        }
     }
-    // Both reasons at once: the overflow tail first, then each tap off its band.
+    // Both reasons at once: the tail's reason first, then each tap off its band.
     let behind = tap("the behind tap", 200, 8, 4_000);
+    let off = NonProbativeReason::PublisherOffBand {
+        what: "the behind tap",
+        commanded_mhz: 5_000,
+        achieved_mhz: 2_000,
+    };
     assert_eq!(
-        classify(&seeded_gaps(296, 1), &[behind, ON_GRID]),
+        classify(
+            &seeded_gaps(296, 1),
+            TailRead::AtFinalize,
+            &[behind, ON_GRID]
+        ),
         Classification::NonProbative(vec![
             NonProbativeReason::OverflowTail(TailWalk {
                 total: 297,
                 rank: 297,
                 overflow: 1
             }),
-            NonProbativeReason::PublisherOffBand {
-                what: "the behind tap",
-                commanded_mhz: 5_000,
-                achieved_mhz: 2_000,
-            },
+            off.clone(),
+        ])
+    );
+    assert_eq!(
+        classify(&seeded_gaps(1_999, 1), TailRead::MidRun, &[behind, ON_GRID]),
+        Classification::NonProbative(vec![
+            NonProbativeReason::OverflowGapMidRun(TailWalk {
+                total: 2_000,
+                rank: 1_998,
+                overflow: 1
+            }),
+            off,
         ])
     );
 }
