@@ -14990,14 +14990,14 @@ fn run_rank_pass(
                 // filter an operator actually runs under. The corrupt-recording
                 // stand-down is not "we declined to judge" but "this bag cannot
                 // have been written by any recorder". The unfired-since-anchor
-                // one leaves a whole node's unread-frame rule unjudged on a
-                // `--verify` that still passes, and a node the scheduler never
-                // fired records the same resumed slice as a stopped one; it is
-                // raised at most once per node per pass, and only on a resumed
-                // pass, which has one rank. The generic loop stays `debug!`
-                // because a healthy multi-rank replay legitimately declines
-                // several deciders per rank and a warn per decline is the flood
-                // class.
+                // one leaves a whole node's unread-frame rule unjudged with no
+                // change to the verdict or the exit code, and a node the
+                // scheduler never fired records the same resumed slice as a
+                // stopped one; it is raised at most once per node per pass, and
+                // only on a resumed pass, which has one rank. The generic loop
+                // stays `debug!` because a healthy multi-rank replay
+                // legitimately declines several deciders per rank and a warn
+                // per decline is the flood class.
                 if sd.reason == replay_rederive::StandDownReason::ImpossibleReadShape {
                     tracing::warn!(
                         rank = plan.rank(),

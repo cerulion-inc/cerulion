@@ -293,13 +293,17 @@ before the recording starts its read log and a resumed pass starts after reads
 its bag does not keep; a count past that queue is judged as one after a fire
 is, on a resumed pass too. A resumed pass that holds no fire of the node and no
 read its body made stands down by name once a count passes that queue (a
-`stand_down` entry of code `latest_unfired_since_anchor` in the `--report` JSON
-and a warning on stderr; `--verify` still exits 0 on it), because a node that
+`stand_down` of code `latest_unfired_since_anchor`, which also prints a warning
+on stderr and changes no exit code), because a node that
 returned `NodeError::Fatal` before the pass's anchor records exactly
 that, and so does a running node the scheduler never fired in the pass: the bag
 records no stop and the anchor does not stamp each node's stopped state. A
 from-start pass re-executes the stop, and a node that fires or reads in its
-body anywhere in a resumed pass is still judged. From `trace_format` 8 on a writer change on any edge stages a producer
+body anywhere in a resumed pass is still judged. A `--verify` replay of a bag
+this build recorded mid-run is refused before its first step when a read in it
+continues a writer run that began before the bag (`read_identity_absent`,
+exit 2), so on such a bag a neutral `--resim all` is the replay that reaches
+this rule. From `trace_format` 8 on a writer change on any edge stages a producer
 annotation, so the counts a bag that begins mid-run records before the trigger
 drain's first annotation are frames of the one writer whose run it began inside,
 counted as one writer more. That rule stands down by name where a count needs an

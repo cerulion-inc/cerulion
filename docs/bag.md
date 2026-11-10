@@ -1105,8 +1105,9 @@ fed:
   any bag a batch deeper than its read stage's window
   (`read_identity_batch_unattributed`): the read names only its newest frame.
 - A bag that starts mid-run (a `bag record --run` attach, a lapped ring, a
-  Flashback window): a free-run replay refuses a mid-run bag before any feed is
-  planned.
+  Flashback window): a free-run bag with several worker ranks is refused before
+  any feed is planned, and on a one-rank bag a read that continues a writer run
+  begun before the bag's first step names no writer (`read_identity_absent`).
 
  Replay such a bag with `--resim all` and no
 `--verify`, which re-creates each consumer's queue and labels its reads best
