@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-11
+
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. This release changes the command line in ways a script written for 1.x notices, among them the output of `cerulion topic echo` and how `cerulion graph run` runs a graph by default (see Changed), so it is a major version. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 31 (see Changed).
 
 ### Added
@@ -206,6 +208,8 @@ Semantic Versioning covers the graph YAML format, the `cerulion` command line an
   program with a hard real time budget should know it is there. The cause is
   eclipse-iceoryx/iceoryx2 issue 2035 and this note goes away when it is fixed.
 - An app that embeds `cerulion_android` copies the iceoryx2 `[patch.crates-io]` block of Cerulion's root `Cargo.toml` into its runtime crate's `Cargo.toml`, also when it depends on the crate from crates.io: a patch applies only in the workspace that declares it, and a published crate carries none. `cerulion_android_remote`, the crate that hosts the paired remote plane in an app, is not published to crates.io, so an app that hosts the plane takes it and `cerulion_android` from git at one commit. See `docs/android.md`, `Graph nodes in an app`.
+- LAN sessions are not authenticated or encrypted. On Linux and macOS a run with no `network:` block is viewable by any peer on the LAN, and a LAN peer can publish into the run's ingress topics. Keep a run on one machine with `--network off`, restrict it with a `network:` block, or refuse every LAN peer with `CERULION_LAN_ACCESS=paired`. Android apps default to `paired`. See `docs/networking.md`.
+- The remote e-stop (`engage-estop`) does not stop motion by itself, and a restart of `cerulion-remoted` clears its engaged state. A robot needs its own stop path, such as a hardwired e-stop. See `docs/remote_plane.md`.
 
 ## [1.0.0] - 2026-09-21
 
