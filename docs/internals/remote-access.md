@@ -130,14 +130,17 @@ the same entry instead of running the daemon.
   its last report to one `FailureRegimeLatch`, one failure per line
   (`drop_report`): a batch that opens the regime or crosses a decade of the
   total logs at warn (`dropped`, `total_dropped`), any other at debug; with
-  the queue empty, `on_success` ends an open regime with one info line (the
-  regime's `dropped`, `total_dropped`), silent for a regime of one line.
-  `writing` stays set until the report is written, so a drain waits for it.
+  the queue empty and no drop since that report, `on_success` ends an open
+  regime with one info line (the regime's `dropped`, `total_dropped`), silent
+  for a regime of one line. `writing` stays set until the report is written,
+  and the queue's `reported` count, which only the writer thread stores,
+  shows a drop it has not reported yet, so a drain waits for both.
   The writer thread formats those lines through the same subscriber, and a
   thread-local makes its `EventLine` write them straight to stderr, never
   into the queue; a report line whose write fails is not counted.
-  `LogWriter::drain` is each exit's wait: until the queue is empty and no
-  write or report is in flight, for at most four fifths of the grace; then
+  `LogWriter::drain` is each exit's wait: until the queue is empty, no write
+  or report is in flight and no drop is left unreported, for at most four
+  fifths of the grace; then
   all but the newest `KEPT_AT_EXIT` (8) queued lines are discarded, one error
   line (`discarded`) is queued after them when there are any, and it waits
   for the rest of the grace or until the queue is written. A line the stop
@@ -146,7 +149,10 @@ the same entry instead of running the daemon.
   binary 1 after one error line. In a build with the test seam only,
   `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a smaller line bound
   (`test_queue_lines`: a positive whole number, at most `QUEUE_LINES`), as
-  the crate's other `_FOR_TEST` variables set their seams. Pinned by the
+  the crate's other `_FOR_TEST` variables set their seams; it takes effect
+  once the daemon has logged that it listens (`shrink_queue_for_test`,
+  called right after that line), so the lines before it are queued under the
+  full bound. Pinned by the
   unit tests in `log_writer.rs`, `estop_full_stderr_test.rs` and
   `daemon_stop_signal_test.rs`.
 

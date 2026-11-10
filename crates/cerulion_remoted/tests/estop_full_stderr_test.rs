@@ -15,8 +15,12 @@
 //! The pipe is filled as daemon_stop_signal_test.rs fills it: the test reads
 //! stderr up to the listening line, then reads nothing until it releases the
 //! pipe. A stand-in rcpd (hand-rolled HTTP/1 on loopback) reports each
-//! request it reads. The test seam's queue bound of one line makes a few log
-//! lines overflow the daemon's log queue. Each daemon serves its own temp state
+//! request it reads. The test seam's queue bound of one line, which the daemon
+//! applies once it has logged that it listens, makes a few log lines overflow
+//! the daemon's log queue; the listening line the test waits for is queued
+//! under the full bound, and the report lines it waits for later are written
+//! by the writer thread itself, never queued, so no line this test waits for
+//! can be dropped. Each daemon serves its own temp state
 //! root and device key, relays disabled, with Flashback off; desks are paired
 //! as the owner through the device index. Every wait is bounded.
 #![cfg(unix)]

@@ -169,7 +169,7 @@ fn init_tracing() -> Result<LogWriter, ExitCode> {
     // fmt's own report of a failed write goes through `eprintln!`, which
     // panics when stderr cannot be written, so it is off; the log writer
     // counts a failed write itself.
-    match log_writer::start(queue_limits()) {
+    match log_writer::start(Limits::DEFAULT) {
         Ok(log) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -188,25 +188,6 @@ fn init_tracing() -> Result<LogWriter, ExitCode> {
             Err(ExitCode::FAILURE)
         }
     }
-}
-
-/// The log queue's bounds: [`Limits::DEFAULT`], or, in a build with the test
-/// seam only, a smaller line bound its override variable sets
-/// ([`log_writer::test_queue_lines`]).
-fn queue_limits() -> Limits {
-    #[cfg(feature = "test-seam")]
-    {
-        let lines = std::env::var(log_writer::QUEUE_LINES_FOR_TEST_ENV)
-            .ok()
-            .and_then(|value| log_writer::test_queue_lines(&value));
-        if let Some(lines) = lines {
-            return Limits {
-                lines,
-                ..Limits::DEFAULT
-            };
-        }
-    }
-    Limits::DEFAULT
 }
 
 fn main() -> ExitCode {

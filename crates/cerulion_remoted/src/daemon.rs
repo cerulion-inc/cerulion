@@ -241,6 +241,8 @@ pub(crate) async fn serve_core(
          always-on)"
     );
     #[cfg(feature = "test-seam")]
+    crate::log_writer::shrink_queue_for_test();
+    #[cfg(feature = "test-seam")]
     crate::shutdown::close_endpoint_for_test(endpoint);
 
     // The robot's own revocation fetch: the supervisor's sync worker leaves
