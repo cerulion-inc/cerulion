@@ -5,6 +5,29 @@ anything under `src/transport/`, `src/wire.rs`, `src/wake.rs`, or the network/ga
 code. Companion: `core-scheduler-graph.md` (execution side), `core-testing.md` (full test
 map). Code on `main` beats this document; when they disagree, fix the document.
 
+## Host-owned node leases
+
+`transport/plugin_lease.rs` provisions fixed lease rows before execution. Tokens
+use nonwrapping generations shared across contexts; a stale, foreign or wrong
+direction token cannot change a port or consume a frame. A row is claimed before
+loan or receive, so budget refusal has no transport effect. Native sample owners
+stay in the host and are returned exactly once.
+
+`graph/node_host_abi.rs` validates cached schema layout facts before lending the
+native mapping address. Accepted publish and receive calls borrow wire bytes in
+place. Adaptive variable outputs may explicitly submit a node-owned spill payload
+for a synchronous host copy. Submission retains the original loan on every result
+until the writer is destroyed and `SPILL_RELEASE` returns its storage. A normal
+finish consumes its lease; malformed frames never publish or consume a sequence.
+Read leases exclude snapshot, head mutation and restore of their port.
+
+Raw accumulation uses `AccumulatorSet`'s existing gather, order, loss, event and
+state machinery. A fire offers one repeatable batch; indexed immutable frame
+leases retain it until release. Per-port capture omits the outer input count and
+restore preflights the entire canonical record before applying native restore.
+`node_host_abi_test` asserts downstream wire bytes, discard/sequence behavior,
+spill lifetime, repeat views, state refusal and allocation-detector controls.
+
 ## Transport model
 
 - ONE LONG-LIVED iceoryx2 node per process, owned by the `TransportManager`
