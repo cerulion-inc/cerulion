@@ -116,6 +116,16 @@ impl Harness {
         budget: usize,
         carry_transport: bool,
     ) -> Self {
+        Self::construct_with_inputs(layout, cap, budget, carry_transport, "abi/oracle", None)
+    }
+    fn construct_with_inputs(
+        layout: PluginWireLayout,
+        cap: Option<usize>,
+        budget: usize,
+        carry_transport: bool,
+        input_topic: &str,
+        extra_input: Option<(&str, &str)>,
+    ) -> Self {
         let clock = Arc::new(VirtualClock::new());
         clock.set(777);
         let manager = TransportManager::init_for_test(
@@ -131,14 +141,21 @@ impl Harness {
         let publisher = manager
             .create_publisher("abi/oracle", MaxSliceLen::try_new(4096).unwrap(), 0)
             .unwrap();
-        let subscriber = manager.create_subscriber("abi/oracle").unwrap();
+        let subscriber = manager.create_subscriber(input_topic).unwrap();
         let env = Arc::new(HashMap::from([(
             "ABI_ORACLE".to_string(),
             "frozen".to_string(),
         )]));
+        let mut inputs = IndexMap::from([("in".to_string(), AnySubscriber::Ipc(subscriber))]);
+        if let Some((name, topic)) = extra_input {
+            inputs.insert(
+                name.to_string(),
+                AnySubscriber::Ipc(manager.create_subscriber(topic).unwrap()),
+            );
+        }
         let mut native = NodeContext::with_runtime_env(
             IndexMap::from([("out".to_string(), AnyPublisher::Ipc(publisher))]),
-            IndexMap::from([("in".to_string(), AnySubscriber::Ipc(subscriber))]),
+            inputs,
             clock.clone(),
             ShutdownSignal::new(),
             env.clone(),
@@ -147,28 +164,32 @@ impl Harness {
             native.set_transport(manager.clone());
         }
         // Outputs precede inputs here: binding ordinals are direction-scoped.
-        let host = HostContext::new(
-            native,
-            vec![
-                HostPortSpec {
-                    name: "out".into(),
-                    direction: LeaseDirection::Write,
-                    layout,
-                    read_mode: 0,
-                    accumulate_cap: None,
-                },
-                HostPortSpec {
-                    name: "in".into(),
-                    direction: LeaseDirection::Read,
-                    layout,
-                    read_mode: abi::read_mode::ONE,
-                    accumulate_cap: cap,
-                },
-            ],
-            env,
-            budget,
-        )
-        .unwrap();
+        let mut specs = vec![
+            HostPortSpec {
+                name: "out".into(),
+                direction: LeaseDirection::Write,
+                layout,
+                read_mode: 0,
+                accumulate_cap: None,
+            },
+            HostPortSpec {
+                name: "in".into(),
+                direction: LeaseDirection::Read,
+                layout,
+                read_mode: abi::read_mode::ONE,
+                accumulate_cap: cap,
+            },
+        ];
+        if let Some((name, _)) = extra_input {
+            specs.push(HostPortSpec {
+                name: name.into(),
+                direction: LeaseDirection::Read,
+                layout,
+                read_mode: abi::read_mode::ONE,
+                accumulate_cap: None,
+            });
+        }
+        let host = HostContext::new(native, specs, env, budget).unwrap();
         let context = abi::ContextHandle {
             value: register_context(host).unwrap(),
         };
@@ -211,11 +232,14 @@ impl Harness {
         unsafe { out.assume_init() }
     }
     fn receive(&self) -> abi::ReadSlotV1 {
+        self.receive_from(self.input)
+    }
+    fn receive_from(&self, port: abi::PortHandle) -> abi::ReadSlotV1 {
         let mut out = MaybeUninit::uninit();
         assert_eq!(
             abi_call!((HOST_API.receive_input)(
                 self.context,
-                self.input,
+                port,
                 abi::read_mode::ONE,
                 out.as_mut_ptr()
             ))
@@ -2279,4 +2303,339 @@ fn malformed_spill_spans_sizes_and_offsets_retain_the_mapping_and_count_once() {
         );
     });
     h.release(delivered);
+}
+
+#[test]
+fn retained_output_across_a_fire_matches_native_release_then_delivery() {
+    for _ in 0..2 {
+        let h = Harness::new(vector_layout(), None, 1);
+        let mut native = h
+            ._manager
+            .create_publisher(
+                "abi/native/retained",
+                MaxSliceLen::try_new(4096).unwrap(),
+                0,
+            )
+            .unwrap();
+        let mut native_input = h._manager.create_subscriber("abi/native/retained").unwrap();
+        let mut plugin_observer = h._manager.create_subscriber("abi/oracle").unwrap();
+        let mut native_retained = native.loan_proxy::<Vector3>().unwrap();
+        native_retained.__cer_defer_publish();
+        native_retained.x = 9.0;
+        native_retained.y = 8.0;
+        native_retained.z = 7.0;
+        let retained = h.loan();
+        write_values(&retained, [9.0, 8.0, 7.0]);
+        assert!(native_input.view_raw().unwrap().is_none());
+        assert!(plugin_observer.view_raw().unwrap().is_none());
+        with_context(h.context.value, |host| host.end_node_call()).unwrap();
+        h.clock.set(999);
+        with_context(h.context.value, |host| {
+            host.begin_node_call()?;
+            host.begin_fire()?;
+            assert_eq!(
+                (host.outstanding_leases(), host.invariant_failures()),
+                (1, 0)
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(native_retained.x, 9.0);
+        let mut refused = MaybeUninit::uninit();
+        assert_eq!(
+            abi_call!((HOST_API.loan_output)(
+                h.context,
+                h.output,
+                request(h.layout),
+                refused.as_mut_ptr()
+            ))
+            .code,
+            abi::status_code::INVALID_STATE
+        );
+        assert!(native_input.view_raw().unwrap().is_none());
+        assert!(plugin_observer.view_raw().unwrap().is_none());
+        drop(native_retained);
+        h.discard(retained, abi::discard_reason::TICK_FAILED);
+        assert_eq!(
+            abi_call!((HOST_API.discard_output)(
+                h.context,
+                retained.lease,
+                abi::discard_reason::TICK_FAILED
+            ))
+            .code,
+            abi::status_code::INVALID_HANDLE
+        );
+        {
+            let mut next = native.loan_proxy::<Vector3>().unwrap();
+            next.x = 1.0;
+            next.y = 0.0;
+            next.z = 0.0;
+        }
+        h.publish([1.0, 0.0, 0.0]);
+        let expected = oracle_frame(0, 999, [1.0, 0.0, 0.0]);
+        let native_frame = native_input
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&native_frame[..], &expected);
+        let delivered = h.receive();
+        inspect(&delivered, |frame| assert_eq!(frame, expected));
+        h.release(delivered);
+        assert_eq!(
+            with_context(h.context.value, |host| Ok((
+                host.outstanding_leases(),
+                host.counters().discarded
+            ))),
+            Ok((0, 1))
+        );
+    }
+}
+
+#[test]
+fn deferred_input_release_after_begin_fire_frees_its_row_exactly_once() {
+    let h = Harness::new(vector_layout(), None, 1);
+    h.publish([9.0, 8.0, 7.0]);
+    let retained = h.receive();
+    with_context(h.context.value, |host| host.end_node_call()).unwrap();
+    assert_eq!(
+        abi_call!((HOST_API.release_input)(h.context, retained.lease)).code,
+        abi::status_code::INVALID_STATE
+    );
+    // The client retains the refused release until its next admitted invocation.
+    let mut pending = Some(retained.lease);
+    inspect(&retained, |frame| {
+        assert_eq!(frame, oracle_frame(0, 777, [9.0, 8.0, 7.0]))
+    });
+    with_context(h.context.value, |host| {
+        host.begin_node_call()?;
+        host.begin_fire()
+    })
+    .unwrap();
+    assert_eq!(
+        with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+        Ok(1)
+    );
+    let mut refused = MaybeUninit::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.loan_output)(
+            h.context,
+            h.output,
+            request(h.layout),
+            refused.as_mut_ptr()
+        ))
+        .code,
+        abi::status_code::FAILED
+    );
+    let release = pending.take().unwrap();
+    assert_eq!(
+        abi_call!((HOST_API.release_input)(h.context, release)).code,
+        abi::status_code::OK
+    );
+    assert!(pending.take().is_none());
+    assert_eq!(
+        abi_call!((HOST_API.release_input)(h.context, release)).code,
+        abi::status_code::INVALID_HANDLE
+    );
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.counters().released
+        ))),
+        Ok((0, 1))
+    );
+    h.publish([1.0, 2.0, 3.0]);
+    let delivered = h.receive();
+    inspect(&delivered, |frame| {
+        assert_eq!(frame, oracle_frame(1, 777, [1.0, 2.0, 3.0]))
+    });
+    h.release(delivered);
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.counters().released,
+            host.invariant_failures()
+        ))),
+        Ok((0, 2, 0))
+    );
+}
+
+#[test]
+fn retained_output_does_not_block_data_trigger_maintenance_or_input_delivery() {
+    for _ in 0..2 {
+        let h = Harness::construct_with_inputs(
+            vector_layout(),
+            None,
+            3,
+            false,
+            "abi/runtime/trigger",
+            None,
+        );
+        let mut input = h
+            ._manager
+            .create_publisher(
+                "abi/runtime/trigger",
+                MaxSliceLen::try_new(4096).unwrap(),
+                0,
+            )
+            .unwrap();
+        let mut native_input = h._manager.create_subscriber("abi/runtime/trigger").unwrap();
+        let retained = h.loan();
+        write_values(&retained, [99.0, 98.0, 97.0]);
+        with_context(h.context.value, |host| host.end_node_call()).unwrap();
+        {
+            let mut frame = input.loan_proxy::<Vector3>().unwrap();
+            frame.x = 1.0;
+            frame.y = 2.0;
+            frame.z = 3.0;
+        }
+        assert_eq!(native_input.snapshot_latest_for_trigger(), (1, Some(777)));
+        assert_eq!(
+            with_context(h.context.value, |host| host
+                .runtime_drain_trigger_input("in")),
+            Ok((1, Some(777)))
+        );
+        with_context(h.context.value, |host| {
+            host.runtime_pump_history()?;
+            host.begin_node_call()?;
+            host.begin_fire()
+        })
+        .unwrap();
+        let delivered = h.receive();
+        let expected = oracle_frame(0, 777, [1.0, 2.0, 3.0]);
+        let native_frame = native_input
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&native_frame[..], &expected);
+        inspect(&delivered, |frame| assert_eq!(frame, expected));
+        h.release(delivered);
+        h.discard(retained, abi::discard_reason::TICK_FAILED);
+        let mut output = h._manager.create_subscriber("abi/oracle").unwrap();
+        for (sequence, values) in [(0, [4.0, 5.0, 6.0]), (1, [7.0, 8.0, 9.0])] {
+            h.publish(values);
+            let delivered = output
+                .view_raw_expecting(Vector3::SCHEMA_HASH)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&delivered[..], &oracle_frame(sequence, 777, values));
+        }
+    }
+}
+
+#[test]
+fn runtime_maintenance_protects_borrowed_input_and_delivers_an_unrelated_input() {
+    for _ in 0..2 {
+        let h = Harness::construct_with_inputs(
+            vector_layout(),
+            None,
+            3,
+            false,
+            "abi/runtime/held",
+            Some(("other", "abi/runtime/other")),
+        );
+        let mut source = h
+            ._manager
+            .create_publisher("abi/runtime/held", MaxSliceLen::try_new(4096).unwrap(), 0)
+            .unwrap();
+        let mut other_source = h
+            ._manager
+            .create_publisher("abi/runtime/other", MaxSliceLen::try_new(4096).unwrap(), 0)
+            .unwrap();
+        let mut native_held = h._manager.create_subscriber("abi/runtime/held").unwrap();
+        let mut native_other = h._manager.create_subscriber("abi/runtime/other").unwrap();
+        {
+            let mut frame = source.loan_proxy::<Vector3>().unwrap();
+            frame.x = 1.0;
+            frame.y = 2.0;
+            frame.z = 3.0;
+        }
+        assert_eq!(native_held.snapshot_latest_for_trigger(), (1, Some(777)));
+        assert_eq!(
+            with_context(h.context.value, |host| host
+                .runtime_drain_trigger_input("in")),
+            Ok((1, Some(777)))
+        );
+        let retained = h.receive();
+        let native_retained = native_held
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        with_context(h.context.value, |host| host.end_node_call()).unwrap();
+        {
+            let mut frame = other_source.loan_proxy::<Vector3>().unwrap();
+            frame.x = 4.0;
+            frame.y = 5.0;
+            frame.z = 6.0;
+        }
+        assert_eq!(native_other.snapshot_latest_for_trigger(), (1, Some(777)));
+        for operation in [
+            cerulion_core::scheduler::SyncHeadOp::FillBoundary,
+            cerulion_core::scheduler::SyncHeadOp::FillRefill,
+        ] {
+            assert_eq!(
+                with_context(h.context.value, |host| host
+                    .runtime_sync_head_op("in", operation))
+                .unwrap_err()
+                .status,
+                abi::status_code::INVALID_STATE
+            );
+        }
+        assert_eq!(
+            with_context(h.context.value, |host| host
+                .runtime_drain_trigger_input("in"))
+            .unwrap_err()
+            .status,
+            abi::status_code::INVALID_STATE
+        );
+        assert_eq!(
+            with_context(h.context.value, |host| host
+                .runtime_refill_trigger_input("in"))
+            .unwrap_err()
+            .status,
+            abi::status_code::INVALID_STATE
+        );
+        assert_eq!(
+            with_context(h.context.value, |host| host
+                .runtime_drain_trigger_input("other")),
+            Ok((1, Some(777)))
+        );
+        with_context(h.context.value, |host| {
+            host.runtime_pump_history()?;
+            host.begin_node_call()?;
+            host.begin_fire()
+        })
+        .unwrap();
+        let other = with_context(h.context.value, |host| {
+            host.binding(h.context.value, 1, LeaseDirection::Read)
+        })
+        .unwrap()
+        .port;
+        let delivered = h.receive_from(other);
+        let expected_other = oracle_frame(0, 777, [4.0, 5.0, 6.0]);
+        inspect(&delivered, |frame| assert_eq!(frame, expected_other));
+        let native_delivered = native_other
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&native_delivered[..], &expected_other);
+        let expected_held = oracle_frame(0, 777, [1.0, 2.0, 3.0]);
+        inspect(&retained, |frame| assert_eq!(frame, expected_held));
+        assert_eq!(&native_retained[..], &expected_held);
+        h.release(delivered);
+        h.release(retained);
+        drop(native_retained);
+        assert_eq!(
+            with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+            Ok(0)
+        );
+        assert_eq!(
+            with_context(h.context.value, |host| host.runtime_sync_head_op(
+                "missing",
+                cerulion_core::scheduler::SyncHeadOp::FillBoundary
+            ))
+            .unwrap_err()
+            .status,
+            abi::status_code::INVALID_ARGUMENT
+        );
+    }
 }
