@@ -337,7 +337,8 @@ impl FireTap {
     }
 
     /// Arm or extend the lease, then return a bounded page after `cursor`.
-    /// A pending, unsuperseded claim ends the page without advancing its cursor.
+    /// A sequence that is neither committed, overwritten nor dropped by its own
+    /// claim ends the page without advancing its cursor.
     /// A zero limit arms the lease without consuming any sequence or loss.
     pub fn serve(&self, cursor: Cursor, max: usize) -> FireBatch {
         let arming = self.arming.lock().unwrap_or_else(|e| e.into_inner());
@@ -400,10 +401,14 @@ impl FireTap {
             }
             let seq = batch.next + 1;
             let slot = &self.slots[((seq - 1) as usize) & (self.slots.len() - 1)];
-            // Only drops raise `settled`: reaching `seq` means `seq` was dropped
-            // or a later claim on this slot lapped it. A lapped `seq` is out of
-            // the window even if its writer still commits, so every later page
-            // counts it lost through `floor` too. Loss is counted once.
+            // Stamps only grow, and a claim needs an even stamp below its own.
+            // A stamp past `committed` therefore means `seq` was overwritten or
+            // can never claim. Only `seq`'s own drop stores `seq` in `settled`.
+            // A larger value is a later drop on this slot: `seq` may still be
+            // writing or reserved, so the page stops there. That later
+            // sequence is assigned, so the next page's `floor` passes `seq`
+            // and counts it lost once; a pending claim never lapped can stop
+            // pages until it commits, as before.
             let settled = slot.settled.load(Ordering::Acquire);
             let stamp = slot.stamp.load(Ordering::SeqCst);
             let committed = 2 * seq + 2;
@@ -425,7 +430,7 @@ impl FireTap {
                 } else {
                     batch.lost += 1;
                 }
-            } else if stamp > committed || settled >= seq {
+            } else if stamp > committed || settled == seq {
                 batch.lost += 1;
             } else {
                 break;
@@ -864,44 +869,91 @@ mod tests {
         assert_eq!(next.lost, 0);
     }
 
-    #[test]
-    fn a_later_drop_on_a_writing_slot_counts_each_sequence_once() {
-        let (tap, _) = tap(64);
-        tap.serve(Cursor::Now, 0);
+    /// Seq 1 pauses mid-write on slot 0, seqs 2..=64 commit, and seq 65 drops
+    /// on slot 0. Returns the paused writer's gate and the page of a reader
+    /// that loaded head before seq 65 was reserved.
+    fn race_a_later_drop_past_a_writing_claim<'scope>(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        tap: &'scope FireTap,
+    ) -> (
+        std::sync::mpsc::SyncSender<()>,
+        std::thread::ScopedJoinHandle<'scope, ()>,
+        FireBatch,
+    ) {
         let (claimed_tx, claimed_rx) = std::sync::mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = scope.spawn(move || {
+            tap.push_with(body(0), |seq| {
+                claimed_tx.send(seq).unwrap();
+                resume_rx.recv_timeout(PAUSE_LIMIT).unwrap();
+            })
+        });
+        assert_eq!(claimed_rx.recv().unwrap(), 1);
+        for id in 1..65 {
+            tap.push(body(id));
+        }
+        assert_eq!(tap.slots[0].stamp.load(Ordering::Relaxed), 3);
+        assert_eq!(tap.slots[0].settled.load(Ordering::Relaxed), 65);
+        tap.head.store(64, Ordering::Relaxed);
+        let raced = tap.serve(Cursor::After(0), 512);
+        tap.head.store(65, Ordering::Relaxed);
+        (resume_tx, writer, raced)
+    }
+
+    fn assert_seqs_2_to_64(records: &[FireRecord]) {
+        assert_eq!(records.len(), 63);
+        for (id, record) in (1..64).zip(records) {
+            assert_eq!((record.seq, record.at_ns), (id + 1, id));
+            assert_body(record);
+        }
+    }
+
+    #[test]
+    fn a_later_drop_does_not_count_a_writing_claim_lost() {
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
         let (raced, rest) = std::thread::scope(|scope| {
-            let tap_ref = &tap;
-            let writer = scope.spawn(move || {
-                tap_ref.push_with(body(0), |seq| {
-                    claimed_tx.send(seq).unwrap();
-                    resume_rx.recv_timeout(PAUSE_LIMIT).unwrap();
-                })
-            });
-            assert_eq!(claimed_rx.recv().unwrap(), 1);
-            // Seq 65 finds seq 1 still writing slot 0 and drops.
-            for id in 1..65 {
-                tap.push(body(id));
-            }
-            assert_eq!(tap.slots[0].settled.load(Ordering::Relaxed), 65);
-            // Replays a reader that loaded head before seq 65 was reserved.
-            tap.head.store(64, Ordering::Relaxed);
-            let raced = tap.serve(Cursor::After(0), 512);
-            tap.head.store(65, Ordering::Relaxed);
-            resume_tx.send(()).unwrap();
-            writer.join().unwrap();
+            let (resume, writer, raced) = race_a_later_drop_past_a_writing_claim(scope, &tap);
+            // Seq 1 is still writing: the window that now holds seq 65 has
+            // moved past it, so this page counts it lost through `floor`.
             let rest = tap.serve(Cursor::After(raced.next), 512);
+            resume.send(()).unwrap();
+            writer.join().unwrap();
             (raced, rest)
         });
-        assert_eq!((raced.next, raced.lost, raced.records.len()), (64, 1, 63));
-        assert_eq!((rest.next, rest.lost, rest.records.len()), (65, 1, 0));
-        // Seq 1 has now committed, but seq 65 superseded it. A reader that
-        // starts after the commit also counts it lost, so the raced page did
-        // not inflate loss: each sequence counts once in either order.
+        // Only seq 65 dropped, so the raced page stops at the writing seq 1.
+        assert_eq!((raced.next, raced.lost, raced.records.len()), (0, 0, 0));
+        assert_eq!((rest.next, rest.lost), (65, 2));
+        assert_seqs_2_to_64(&rest.records);
+    }
+
+    #[test]
+    fn a_writing_claim_a_later_drop_raced_is_delivered_or_floor_counted_after_commit() {
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let raced = std::thread::scope(|scope| {
+            let (resume, writer, raced) = race_a_later_drop_past_a_writing_claim(scope, &tap);
+            resume.send(()).unwrap();
+            writer.join().unwrap();
+            raced
+        });
+        assert_eq!((raced.next, raced.lost, raced.records.len()), (0, 0, 0));
         assert_eq!(tap.slots[0].stamp.load(Ordering::Relaxed), 4);
-        let fresh = tap.serve(Cursor::After(0), 512);
-        assert_eq!((fresh.next, fresh.lost, fresh.records.len()), (65, 2, 63));
-        assert_eq!(fresh.records, raced.records);
+        // A window that ends at seq 64 still holds the committed seq 1.
+        tap.head.store(64, Ordering::Relaxed);
+        let stale = tap.serve(Cursor::After(raced.next), 512);
+        tap.head.store(65, Ordering::Relaxed);
+        assert_eq!((stale.next, stale.lost, stale.records.len()), (64, 0, 64));
+        assert_eq!((stale.records[0].seq, stale.records[0].at_ns), (1, 0));
+        assert_body(&stale.records[0]);
+        assert_seqs_2_to_64(&stale.records[1..]);
+        // The window that holds seq 65 counts seq 1 lost through `floor` and
+        // the dropped seq 65 lost by its own drop: each one once.
+        let current = tap.serve(Cursor::After(raced.next), 512);
+        assert_eq!((current.next, current.lost), (65, 2));
+        assert_seqs_2_to_64(&current.records);
+        let tail = tap.serve(Cursor::After(64), 512);
+        assert_eq!((tail.next, tail.lost, tail.records.len()), (65, 1, 0));
     }
 
     #[test]
