@@ -366,6 +366,10 @@ impl EgressPlane for SupervisedEgressPlane {
     fn egress_stats(&self) -> Option<Vec<cerulion_core::EgressTopicStats>> {
         self.gateway.egress_stats()
     }
+
+    fn robot_startup_error(&self) -> Option<String> {
+        self.gateway.robot_startup_error()
+    }
 }
 
 impl Drop for SupervisedEgressPlane {
@@ -419,6 +423,24 @@ mod tests {
         // Totals count every failure and never reset on recovery.
         assert_eq!(latches.start.total_failures(), 3);
         assert_eq!(latches.fence.total_failures(), 7);
+    }
+
+    #[test]
+    fn a_supervised_gateway_reports_registration_failure_through_the_egress_trait() {
+        let root = IsolatedRoot::mint("startup-status");
+        let manager =
+            TransportManager::init_for_test(TransportConfig::default(), root.config()).unwrap();
+        let gateway = Arc::new(GatewayEgressPlane::new(Arc::clone(&manager)));
+        let plane: Arc<dyn EgressPlane> = Arc::new(SupervisedEgressPlane::new(
+            Arc::clone(&gateway),
+            Arc::new(crate::mirror::GatewayMirrorPlane::new(manager)),
+            false,
+        ));
+        let reason = "automatic robot registration: the robot state directory must be owner-only; run chmod 700 <dir>";
+        gateway.set_robot_startup_error(Some(reason.into()));
+        assert_eq!(plane.robot_startup_error().as_deref(), Some(reason));
+        gateway.set_robot_startup_error(None);
+        assert_eq!(plane.robot_startup_error(), None);
     }
 
     #[test]

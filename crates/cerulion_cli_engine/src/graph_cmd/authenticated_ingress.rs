@@ -334,6 +334,7 @@ fn watch_session(
     let expected = session.producers.clone();
     let mut failures = FailureRegimeLatch::new();
     let mut probe_failures = FailureRegimeLatch::new();
+    let mut registration_failures = FailureRegimeLatch::new();
     let mut missing = 0u8;
     loop {
         let Ok(stopped) = control.stopped.lock() else {
@@ -365,6 +366,13 @@ fn watch_session(
         let status = session
             .client
             .probe_status_until(Instant::now() + Duration::from_millis(200));
+        if let Ok(status) = &status {
+            report_robot_registration_status(
+                &registration.graph,
+                status.robot_startup_error.as_deref(),
+                &mut registration_failures,
+            );
+        }
         if holding_error.is_none() && !lost {
             if let Err(error) = &status {
                 missing = 0;
@@ -481,6 +489,152 @@ mod tests {
     use cerulion_core::transport::cerulion_q::{CatalogEntry, CatalogProvenance, CatalogReply};
     use cerulion_core::EgressQos;
     use cerulion_netd::account_access::{RobotPath, RobotPresence, RobotTrustSource};
+
+    #[test]
+    fn paired_graph_watch_reports_registration_failure_once_then_recovers_on_stderr() {
+        let _environment = crate::test_env::env_lock();
+        const CHILD: &str = "CERULION_PAIRED_REGISTRATION_WARN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["graph_cmd::authenticated_ingress::tests::paired_graph_watch_reports_registration_failure_once_then_recovers_on_stderr", "--exact", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr
+                    .matches("automatic robot registration failed; remote access is unavailable")
+                    .count(),
+                1,
+                "{stderr}"
+            );
+            assert!(
+                stderr
+                    .contains("the robot state directory must be owner-only; run chmod 700 <dir>"),
+                "{stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .matches("automatic robot registration recovered")
+                    .count(),
+                1,
+                "{stderr}"
+            );
+            return;
+        }
+        struct StatusPlane {
+            error: Mutex<Option<String>>,
+            probes: std::sync::atomic::AtomicUsize,
+        }
+        impl cerulion_netd::egress::EgressPlane for StatusPlane {
+            fn register_egress(
+                &self,
+                _: cerulion_netd::egress::EgressId,
+                _: &GatewayPlan,
+                _: &SchemaServing,
+                _: Option<&str>,
+            ) -> Result<bool, cerulion_netd::egress::EgressError> {
+                Ok(false)
+            }
+            fn release_egress(&self, _: cerulion_netd::egress::EgressId) {}
+            fn lan_access(&self) -> Option<LanAccess> {
+                Some(LanAccess::Paired)
+            }
+            fn robot_startup_error(&self) -> Option<String> {
+                let error = self.error.lock().unwrap().clone();
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                error
+            }
+        }
+        struct UnusedMirror;
+        impl cerulion_netd::mirror::MirrorPlane for UnusedMirror {
+            fn ensure_mirror(
+                &self,
+                key: &cerulion_netd::registry::TopicKey,
+                _: u64,
+            ) -> Result<(), cerulion_netd::mirror::MirrorError> {
+                Err(cerulion_netd::mirror::MirrorError::Register {
+                    key: key.clone(),
+                    source: Box::new(cerulion_core::TransportError::Internal {
+                        reason: "this status-only test must never demand a mirror".into(),
+                    }),
+                })
+            }
+            fn release_mirror(
+                &self,
+                _: &cerulion_netd::registry::TopicKey,
+            ) -> cerulion_netd::mirror::MirrorRelease {
+                cerulion_netd::mirror::MirrorRelease::Retired
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("netd.sock");
+        let plane = Arc::new(StatusPlane {
+            error: Mutex::new(Some(
+                "the robot state directory must be owner-only; run chmod 700 <dir>".into(),
+            )),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut daemon = cerulion_netd::daemon::start_with_egress(
+            socket.clone(),
+            Arc::new(UnusedMirror),
+            plane.clone(),
+            cerulion_netd::NetdConfig {
+                idle_grace: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let session = Session {
+            client: NetdClient::connect_existing_at(socket).unwrap(),
+            _catalogs: RemoteCatalogs::default(),
+            producers: vec![],
+        };
+        let registration = Registration {
+            plan: GatewayPlan {
+                egress_policy: cerulion_core::GatewayEgressPolicy::AllowAll,
+                announce: vec![],
+                ingress: vec![],
+            },
+            schemas: SchemaServing::default(),
+            namespace: String::new(),
+            graph: "paired-producing-graph".into(),
+        };
+        let control = Arc::new(Control {
+            stopped: Mutex::new(false),
+            wake: Condvar::new(),
+            fatal: Mutex::new(None),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        cerulion_core::init_logging(false, false);
+        let worker_control = control.clone();
+        let worker_running = running.clone();
+        let watch = std::thread::spawn(move || {
+            watch_session(session, &registration, &worker_control, &worker_running)
+        });
+        let wait_for_probes = |count| {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while plane.probes.load(Ordering::SeqCst) < count && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                plane.probes.load(Ordering::SeqCst) >= count,
+                "paired watcher stopped probing netd status"
+            );
+        };
+        wait_for_probes(2);
+        *plane.error.lock().unwrap() = None;
+        wait_for_probes(4);
+        *control.stopped.lock().unwrap() = true;
+        control.wake.notify_all();
+        watch.join().unwrap();
+        assert!(control.fatal.lock().unwrap().is_none());
+        assert!(running.load(Ordering::SeqCst));
+        daemon.shutdown();
+    }
 
     fn input() -> GatewayIngressEntry {
         GatewayIngressEntry {
