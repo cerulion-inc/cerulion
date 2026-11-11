@@ -142,6 +142,17 @@ remove them before committing.
   daemon shutdown. Endpoint transfer closes the outgoing desk endpoint before
   spawning remoted and permits new outgoing ownership only after reap. The idle
   watcher retains the singleton while that endpoint is held, including teardown.
+  Native admission uses `serving_hold::ServingHolds`, re-exported by remoted:
+  acquire a guard before ops/RCP or shell/exec work and retain it through final
+  drain and witness. Latch and owed-delivery sources refresh before the last
+  shared unlock. Netd takes the stable `serving.hold` inode exclusively through
+  idle reap; never unlink it. Source mutations require an admitted guard and
+  callbacks must not acquire the hold manager; missing daemon sources fail closed.
+  Stop handling installs before daemon accept startup. Remoted has its own process
+  group; direct SIGTERM starts within its hard-exit budget plus 500 ms, followed
+  by forced reap if necessary and revocation-fetch grace. Endpoint transfer calls
+  `MirrorPlane::begin_serving` before spawn and `end_serving` after both reap,
+  retiring outgoing assignments under the account controller's state lock.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway

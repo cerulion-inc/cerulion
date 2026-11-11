@@ -28,29 +28,14 @@ mirror plane - green there proves the wiring, not the live network planes.
 - A nonzero non-loopback TCP `CERULION_NETD_LISTEN` port is the ONLY gate for the mDNS
   beacon and standing mode (gateway boots at start, idle self-exit off). None means a
   reported refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
-- Network egress accepts a saved login or authenticated persistent robot pairing;
-  login expiry preserves offline serving. Never-logged-in/unpaired refuses with
-  `serving_login::REFUSAL`. `register_egress` rechecks before mutating. Explicit
-  LISTEN startup retains its prior-login prerequisite; network-off and injected
-  daemons are exempt.
-- The first accepted nonempty WAN egress registration owns ONE remoted child via
-  `SupervisedEgressPlane` and `robot_supervisor`, independent of LISTEN. Query-only
-  and local-only daemons start none. Last release/disconnect reaps only after
-  native serving holds, owed e-stop delivery and its latch clear; explicit LISTEN
-  holds the standing child until shutdown. The idle watcher retains the singleton
-  while `holds_serving_endpoint` is true, including last-release teardown.
-- Native idle admission: remoted holds `serving.hold` shared for admitted ops/RCP,
-  latch/owed delivery sources and shell/exec guards. Netd holds it exclusively
-  through idle SIGTERM and reap. Never unlink it. A held source retains serving;
-  source state transitions require a work guard. Missing daemon sources fail closed.
-- Remoted has its own process group; stop sends SIGTERM, waits its hard-exit
-  deadline plus 500 ms, then escalates and reaps. Budget this before epoch-fetch
-  grace and never return endpoint ownership before both have settled.
-- Endpoint transfer calls `MirrorPlane::begin_serving` before spawn and
-  `end_serving` after reap. The account controller closes its outgoing endpoint,
-  marks assignments pending retirement and fences new outgoing construction under
-  its state lock. Until shared outbound routing is available, serving machines
-  refuse WAN demands without fallback. Beacon facts share `discovery::robot_state`.
+- Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
+  LISTEN needs login; off/injected exempt. First nonempty WAN egress starts one
+  remoted without LISTEN; query/off starts none; standing persists until shutdown.
+- Idle reap waits for work/latch/owed delivery, retains singleton and exclusive
+  `serving.hold`; guards/sources share it, never unlink. Own process group, direct
+  TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
+- Controller lock fences outgoing at `begin_serving`; `end_serving` follows reap;
+  facts use `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata, and pins survive tearing. EVERY

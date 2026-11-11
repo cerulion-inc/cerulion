@@ -1,23 +1,15 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-The robot-side remote plane (daemon or `RemotePlane`): ONE iroh endpoint per
-robot (the device key's PUBLIC half IS the `EndpointId`, its 32-byte secret also
-seeds the pairing identity) multiplexing `cerulion/wire/2` and `cerulion/ops/1`. It
-also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
-`cerulion_wireclient`, `cerulion_connectd`, `cerud`, `cerulion_accountd` and
-`cerulion-wire`.
+ONE robot endpoint: device-key public half is `EndpointId`; its 32-byte secret
+seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules cover
+`cerulion_{pairing,link,wireclient,connectd,accountd}`, `cerud` and `cerulion-wire`.
 
 ## Invariants
-- Owned-server idle admission uses `serving_hold::ServingHolds`, installed on
-  daemon `OpsServing`. Acquire a work guard before shell/exec admission and retain
-  it through child drain and final witness; missing daemon manager is an error.
-  Ops/RCP admissions, the e-stop latch and owed delivery retain the native shared
-  fence. Netd's exclusive fence prevents new work racing idle stop; never unlink
-  the file. Shutdown participants still run on explicit SIGTERM while holds exist.
-- Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
-  to capability table in `authorizer.rs` is the sacred security surface. An
-  unclassified verb is DENIED; a new one must be classified there
-  (`authorizer_matrix_test.rs` pins it cell by cell).
+- Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
+  final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
+  fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
+- `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
+  verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
 - Bootstrap verbs self-gate on their own proof (chassis secret, cert chain, owner
   grant, CPace witness). The pairing subject is ALWAYS the TLS-authenticated device
   key, never a client arg, and validity, TTL and rollback checks use the robot's
