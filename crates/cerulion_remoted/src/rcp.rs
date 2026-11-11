@@ -105,7 +105,10 @@
 //! answers logs at error when the daemon stops gracefully (on Ctrl-C or
 //! SIGTERM, through `RcpdEstop::shut_down` in the daemon's teardown), when its
 //! task panics or when its runtime is dropped; at that graceful stop an
-//! attempt rcpd issued an MCP session first deletes it. A stop the hard-exit
+//! attempt rcpd issued an MCP session first deletes it. One that ends while
+//! it deletes the MCP session of an attempt rcpd answered logs at error when
+//! an engage came after that attempt began, since the `estop` it still owed
+//! that engage was not sent, and logs nothing otherwise. A stop the hard-exit
 //! deadline or a second signal ends, a SIGKILL or a crash may end it with no
 //! line or `DELETE`. An `estop` over this plane reaches rcpd in its own
 //! stream and starts no delivery. A library host has no rcp link and refuses
