@@ -95,6 +95,10 @@ impl HostClient {
             offset_of!(HostApiV1, capture_accumulate),
             offset_of!(HostApiV1, query_extension),
             offset_of!(HostApiV1, restore_accumulate),
+            offset_of!(HostApiV1, create_raw_publisher),
+            offset_of!(HostApiV1, finish_raw_output),
+            offset_of!(HostApiV1, register_raw_egress),
+            offset_of!(HostApiV1, destroy_raw_publisher),
         ];
         for offset in offsets {
             // SAFETY (U05): complete byte size/identity were checked; fn fields
@@ -203,7 +207,8 @@ impl HostClient {
             .and_then(|mut failure| failure.take())
     }
 
-    pub(super) fn has_failure(&self) -> bool {
+    /// Whether a prior host service failed during the current node call.
+    pub fn has_failure(&self) -> bool {
         self.0
             .failure
             .lock()
@@ -228,7 +233,14 @@ impl HostClient {
         &self,
         port: PortHandle,
     ) -> TransportResult<WriteSlotV1> {
-        let request = Self::request::<T>();
+        self.loan_frame(port, Self::request::<T>())
+    }
+
+    pub(super) fn loan_frame(
+        &self,
+        port: PortHandle,
+        request: LoanRequestV1,
+    ) -> TransportResult<WriteSlotV1> {
         let mut slot = WriteSlotV1 {
             data: std::ptr::null_mut(),
             lease: LeaseHandle::default(),
@@ -283,6 +295,51 @@ impl HostClient {
         };
         let status = host_call!(self, submit_spill, lease, bytes_span(payload), size);
         if let Err(error) = self.check(status) {
+            self.record_failure(error);
+        }
+    }
+
+    pub(super) fn create_raw(
+        &self,
+        request: RawPublisherRequestV1,
+    ) -> TransportResult<PortBindingV1> {
+        let mut binding = PortBindingV1 {
+            port: PortHandle::default(),
+            topic: bytes_span(&[]),
+            configured_capacity: 0,
+            read_mode: 0,
+        };
+        self.check(host_call!(
+            self,
+            create_raw_publisher,
+            request,
+            &mut binding
+        ))?;
+        if binding.port.value == 0 {
+            return Err(super::argument_error(
+                "host raw publisher handle is invalid",
+            ));
+        }
+        Ok(binding)
+    }
+    pub(super) fn finish_raw(&self, lease: LeaseHandle, size: u32) -> TransportResult<usize> {
+        let mut recipients = 0;
+        self.check(host_call!(
+            self,
+            finish_raw_output,
+            lease,
+            size,
+            &mut recipients
+        ))?;
+        usize::try_from(recipients)
+            .map_err(|_| super::argument_error("raw recipient count exceeds usize"))
+    }
+    pub(super) fn register_raw(&self, port: PortHandle) -> TransportResult<()> {
+        // Explicitly fallible: network registration failure must leave local ingress usable.
+        self.check(host_call!(self, register_raw_egress, port))
+    }
+    pub(super) fn destroy_raw(&self, port: PortHandle) {
+        if let Err(error) = self.check(host_call!(self, destroy_raw_publisher, port)) {
             self.record_failure(error);
         }
     }

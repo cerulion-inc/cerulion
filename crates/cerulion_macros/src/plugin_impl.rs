@@ -32,12 +32,64 @@ pub(crate) fn generate(common: &ItemImpl, port_helpers: &BTreeSet<String>) -> To
     plugin.items.retain(|item| {
         matches!(item, ImplItem::Fn(method) if names.contains(&method.sig.ident.to_string()))
     });
+    let mut refusals = Vec::new();
+    for item in &mut plugin.items {
+        let ImplItem::Fn(method) = item else { continue };
+        let contexts = method
+            .sig
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let syn::FnArg::Typed(input) = input else {
+                    return None;
+                };
+                let syn::Pat::Ident(name) = &*input.pat else {
+                    return None;
+                };
+                let mut ty = ContextType(false);
+                ty.visit_type(&input.ty);
+                ty.0.then(|| name.ident.to_string())
+            })
+            .collect();
+        let mut forbidden = NativeTransport {
+            contexts,
+            calls: Vec::new(),
+        };
+        forbidden.visit_block(&method.block);
+        if !forbidden.calls.is_empty() {
+            for span in forbidden.calls {
+                refusals.push(syn::Error::new(span, "ctx.transport() exposes native Rust transport ownership across the stable node boundary; use ctx.raw_ingress() for host-owned raw publishers").to_compile_error());
+            }
+            // This body is unreachable because the cfg-scoped compile error
+            // above refuses the plugin; native source and behavior are intact.
+            method.block = syn::parse_quote!({
+                unreachable!("stable node transport access was refused at compile time")
+            });
+        }
+    }
     let mut adapter = Adapter { names: &names };
     adapter.visit_item_impl_mut(&mut plugin);
     quote! {
         #[allow(unexpected_cfgs)]
         #[cfg(feature = "cdylib")]
         #plugin
+        #( #[allow(unexpected_cfgs)] #[cfg(feature = "cdylib")] #refusals )*
+    }
+}
+
+struct NativeTransport {
+    contexts: BTreeSet<String>,
+    calls: Vec<proc_macro2::Span>,
+}
+impl<'ast> Visit<'ast> for NativeTransport {
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "transport"
+            && matches!(&*call.receiver, syn::Expr::Path(receiver)
+            if receiver.path.get_ident().is_some_and(|name| self.contexts.contains(&name.to_string())))
+        {
+            self.calls.push(call.method.span());
+        }
+        syn::visit::visit_expr_method_call(self, call);
     }
 }
 
@@ -172,6 +224,20 @@ mod tests {
 
     fn compact(tokens: TokenStream) -> String {
         tokens.to_string().split_whitespace().collect()
+    }
+
+    #[test]
+    fn native_transport_access_has_a_cfg_scoped_refusal_naming_raw_ingress() {
+        let common: ItemImpl = syn::parse_quote! {
+            impl Node { fn __cer_user_init(&mut self, ctx: &NodeContext) { let _ = ctx.transport(); } }
+        };
+        let native = quote!(#common).to_string();
+        let generated = generate(&common, &BTreeSet::new()).to_string();
+        assert!(generated.contains("compile_error"));
+        assert!(generated.contains("ctx.raw_ingress()"));
+        assert!(generated.contains("cfg (feature = \"cdylib\")"));
+        assert!(native.contains("ctx . transport"));
+        assert!(!generated.contains("ctx . transport"));
     }
 
     #[test]
