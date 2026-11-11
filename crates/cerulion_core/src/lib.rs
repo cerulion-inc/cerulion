@@ -937,12 +937,14 @@ pub use serde;
 ///
 /// The level is chosen by the caller's verb class:
 /// - `verbose` (any verb, `-v/--verbose`) → `cerulion=debug`
-/// - one-shot verbs (`quiet_default = true`: run-and-exit introspection /
-///   management commands like `topic list`, `schema list`, `node info`) →
-///   `cerulion=warn`, so lifecycle breadcrumbs ("discovery ladder gathered",
-///   the netd first-use spawn line) don't interleave with the command's output.
-/// - long-running / runtime verbs (`quiet_default = false`: `graph run`,
-///   `node run`, `replay`, `viz`, …) → `cerulion=info` (the legacy default).
+/// - one-shot verbs and the runtime verbs whose output is their result
+///   (`quiet_default = true`: run-and-exit introspection / management commands
+///   like `topic list`, `schema list`, `node info`, plus `graph run` and
+///   `bag play`) → `cerulion=warn`, so lifecycle breadcrumbs ("discovery ladder
+///   gathered", the netd first-use spawn line) don't interleave with the
+///   command's output.
+/// - the other long-running / runtime verbs (`quiet_default = false`:
+///   `node run`, `graph profile`, `bag record`, `viz`, …) → `cerulion=info`.
 ///
 /// This is the FALLBACK only — an explicit `RUST_LOG` always wins (see
 /// [`init_logging`]).
