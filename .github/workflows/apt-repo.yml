@@ -37,8 +37,10 @@ jobs:
   preflight:
     name: Wait for release assets
     runs-on: ubuntu-22.04
-    # Release artifacts allow 45 minutes; the 60-minute poll deadline needs both.
-    timeout-minutes: 105
+    # The wait below polls 120 minutes for release-artifacts.yml's release job,
+    # which runs after its rmw, build (90-minute limit) and verify-rmw jobs;
+    # this job's limit outlasts the poll.
+    timeout-minutes: 135
     outputs:
       available: ${{ steps.inputs.outputs.available }}
       stable: ${{ steps.inputs.outputs.stable }}
@@ -171,7 +173,7 @@ jobs:
           fi
           version=${TAG#v}
           debian_version=$(tools/scripts/debian_version.sh "$version")
-          deadline=$(( $(date +%s) + 3600 ))
+          deadline=$(( $(date +%s) + 7200 ))
           mkdir -p "$RUNNER_TEMP/release-assets"
           while [ "$(date +%s)" -lt "$deadline" ]; do
             # Find this tag's release-artifacts.yml runs by asking the REST API

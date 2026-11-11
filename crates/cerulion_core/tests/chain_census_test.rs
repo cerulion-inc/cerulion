@@ -753,7 +753,7 @@ fn a_block_input_keeps_the_queued_path_and_makes_its_ends_serial() {
     );
     assert_eq!(
         sentence(&census, "block"),
-        "the input declares `block`, whose deferral a consumer running inside the producer's own fire could never reach"
+        "the input declares `block`, which defers the producer while the consumer is at threshold"
     );
     assert_eq!(
         sentence(&census, "block-involved"),
@@ -919,7 +919,7 @@ fn a_throttled_consumer_keeps_the_queued_path() {
     );
     assert_eq!(
         sentence(&census, "throttle"),
-        "the consumer declares `throttle_ms = 5`, and a direct call has nowhere to defer to"
+        "the consumer declares `throttle_ms = 5`, which can defer its fire past the step its frame arrives in"
     );
     assert_total(&census);
 }
@@ -1600,6 +1600,105 @@ nodes:
         ]
     );
     assert_eq!(census.chains()[1].head_level, 2);
+    assert_total(&census);
+}
+
+// ==========================================================================
+// Rule: no node reads a called consumer's output a level early
+// ==========================================================================
+
+/// `src -> mid -> end`, `mid` also writing `aux`, which `watch` reads as a
+/// latest value. The pair differs only in what fires `watch`, which places it
+/// at level 1 (`other/out`) or level 3 (`end/out`).
+fn reader_yaml(watch_trigger: &str) -> String {
+    format!(
+        r#"
+prefix: t
+nodes:
+  - id: src
+    type: src
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: other
+    type: other
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: mid
+    type: mid
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+      - name: aux
+        schema: std_msgs/Int32
+  - id: end
+    type: end
+    inputs:
+      - name: inp
+        source: mid/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: watch
+    type: watch
+    inputs:
+      - name: trig
+        source: {watch_trigger}
+      - name: side
+        source: mid/aux
+"#
+    )
+}
+
+fn reader_specs() -> Vec<(&'static str, Spec)> {
+    vec![
+        ("src", Spec::period(10)),
+        ("other", Spec::period(10)),
+        ("mid", Spec::data("inp")),
+        ("end", Spec::data("inp")),
+        ("watch", Spec::data("trig").ctx("side")),
+    ]
+}
+
+#[test]
+fn a_called_consumer_may_feed_a_latest_value_reader_above_its_own_level() {
+    // `watch` fires on `end`, at level 3: mid (level 1) has published by then
+    // on both paths.
+    let h = Harness::new(&reader_yaml("end/out"), &reader_specs());
+    let census = h.monolith();
+
+    assert_eq!(chains(&census), vec!["src->mid->end"]);
+    assert!(
+        verdicts(&census).contains(&"mid.inp <- src : FUSED".to_string()),
+        "got {:?}",
+        verdicts(&census)
+    );
+    assert_total(&census);
+}
+
+#[test]
+fn a_called_consumer_may_not_feed_a_latest_value_reader_at_or_below_its_level() {
+    // The ONLY change from the arm above: `watch` fires on `other`, at level
+    // 1, mid's own level. A queued run freezes mid's previous `aux` there; a
+    // run that calls mid when level 0 ends would freeze the new one.
+    let h = Harness::new(&reader_yaml("other/out"), &reader_specs());
+    let census = h.monolith();
+
+    assert_eq!(chains(&census), vec!["mid->end"]);
+    assert!(
+        verdicts(&census).contains(&"mid.inp <- src : early-latest-value-reader".to_string()),
+        "got {:?}",
+        verdicts(&census)
+    );
+    assert_eq!(
+        sentence(&census, "early-latest-value-reader"),
+        "'watch' reads the consumer's output '/t/mid/aux' as a latest value at level 1, \
+         after the chain head's level 0 and at or before the consumer's level 1"
+    );
     assert_total(&census);
 }
 

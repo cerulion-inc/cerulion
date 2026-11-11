@@ -481,6 +481,15 @@ pub struct NodeInfo {
     /// [`Self::with_sync_capture_stamps`]; the graph build refuses a node whose
     /// map misses a trigger input.
     pub(crate) sync_capture: Option<IndexMap<String, HeaderStampLocation>>,
+    /// `true` when the node fails each tick for which a declared output has
+    /// no publisher. A `#[cerulion_node]` node sets it (through
+    /// [`Self::with_publisher_for_every_output`] in process, and the
+    /// `"publisher_for_every_output":true` info JSON key for a cdylib). A
+    /// Python node, a raw FFI node and a hand-written entry leave it
+    /// `false`: such a node takes a publisher only for an output it writes.
+    /// The graph build refuses an unlisted declared output only when this is
+    /// `true`.
+    pub(crate) publisher_for_every_output: bool,
 }
 
 /// Macro-declared trigger policy. Mirrors
@@ -677,6 +686,7 @@ impl NodeInfo {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         }
     }
 
@@ -717,6 +727,7 @@ impl NodeInfo {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         }
     }
 
@@ -762,6 +773,7 @@ impl NodeInfo {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         }
     }
 
@@ -796,6 +808,22 @@ impl NodeInfo {
     #[doc(hidden)]
     pub fn sync_capture_stamps(&self) -> Option<&IndexMap<String, HeaderStampLocation>> {
         self.sync_capture.as_ref()
+    }
+
+    /// Builder that marks the node as one that needs a publisher for every
+    /// output it declares: the node fails each tick for which a declared
+    /// output has no publisher. `#[cerulion_node]` emits this call. The graph
+    /// build then refuses an output the node declares and its graph entry
+    /// does not list, before the graph starts.
+    pub fn with_publisher_for_every_output(mut self) -> Self {
+        self.publisher_for_every_output = true;
+        self
+    }
+
+    /// `true` when the node needs a publisher for every output it declares.
+    /// See [`Self::with_publisher_for_every_output`].
+    pub fn publisher_for_every_output(&self) -> bool {
+        self.publisher_for_every_output
     }
 
     /// Builder that attaches a per-node
@@ -3094,6 +3122,77 @@ pub fn cdylib_platform_check() -> Result<(), String> {
     })
 }
 
+/// What a node body's trigger input holds right now, as answered by
+/// [`NodeEntry::probe_trigger_input`].
+///
+/// The graph asks it for a `consume = latest` trigger input that it reads
+/// through two subscribers (the separate drain discipline): the step counts an
+/// arrival off the trigger subscriber, and this answer says whether the BODY
+/// subscriber, the one the tick reads, still holds a frame for that arrival.
+///
+/// `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
+///
+/// ```compile_fail,E0004
+/// use cerulion_core::graph::node::TriggerProbe;
+/// fn fires(p: TriggerProbe) -> bool {
+///     match p {
+///         TriggerProbe::Unread | TriggerProbe::Unknown => true,
+///         TriggerProbe::Empty => false,
+///     }
+/// }
+/// ```
+///
+/// The same match with a wildcard arm compiles:
+///
+/// ```
+/// use cerulion_core::graph::node::TriggerProbe;
+/// fn fires(p: TriggerProbe) -> bool {
+///     match p {
+///         TriggerProbe::Unread | TriggerProbe::Unknown => true,
+///         TriggerProbe::Empty => false,
+///         _ => true,
+///     }
+/// }
+/// assert!(!fires(TriggerProbe::Empty));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TriggerProbe {
+    /// The body subscriber holds a frame no read has taken yet. A read still
+    /// applies the input's own policy to it: `sample(N)` may decimate it and a
+    /// malformed frame is refused, so such a read can serve nothing.
+    Unread,
+    /// The body subscriber holds no frame: every frame delivered to it so far
+    /// was taken by an earlier read.
+    Empty,
+    /// The entry could not answer (no probe, a failed probe, a poisoned
+    /// lock). The step treats the arrival as it would without a probe.
+    Unknown,
+}
+
+/// A [`SyncHeadOp::ProbeNext`] answer read as a [`TriggerProbe`]: `Present` is
+/// a frame no read has taken, `Nothing` is an empty queue, and every other
+/// answer (`Failed`, or a kind the probe never returns) is
+/// [`TriggerProbe::Unknown`].
+fn trigger_probe_from(answer: SyncOpAnswer) -> TriggerProbe {
+    match answer {
+        SyncOpAnswer::Present => TriggerProbe::Unread,
+        SyncOpAnswer::Nothing => TriggerProbe::Empty,
+        _ => TriggerProbe::Unknown,
+    }
+}
+
+/// One crossing of a cdylib's `cerulion_node_sync_head_op`
+/// (`DylibNodeEntry::cross_sync_head_op`).
+struct SyncHeadOpCall {
+    /// The export's return code; zero is success.
+    ret: i32,
+    /// The raw answer kind it wrote, `-1` when it wrote none.
+    out_kind: i32,
+    /// The answer, `None` for a nonzero return or an unknown answer kind.
+    decoded: Option<SyncOpAnswer>,
+}
+
 /// Interface between the graph runtime and node logic.
 ///
 /// Implementations must be `Send` for use with `Arc<Mutex<Box<dyn NodeEntry>>>`.
@@ -3475,6 +3574,58 @@ pub trait NodeEntry: Send {
         false
     }
 
+    /// Without consuming anything, does a read of `input_name` right now find
+    /// a frame no read has taken yet?
+    ///
+    /// The graph asks this for a `consume = latest` trigger input read through
+    /// two subscribers, at the level boundary, after the trigger subscriber
+    /// counted an arrival and before the node fires: the step fires the node
+    /// only if the body still holds a frame. An arrival the tick's read
+    /// already drained (it landed after the boundary drain and before that
+    /// read) therefore fires nothing more.
+    ///
+    /// The graph asks it only of an entry whose [`Self::probes_trigger_input`]
+    /// is `true`.
+    ///
+    /// The default asks [`SyncHeadOp::ProbeNext`] when the entry
+    /// [`Self::supports_sync_head_ops`]: [`NodeContext::sync_head_op`] answers
+    /// it with a staged next frame or a non-empty subscriber queue. A
+    /// `consume = latest` input read through two subscribers stages nothing
+    /// and has no frozen slot (its tick reads the queue live), so the answer
+    /// is whether its queue holds a frame. Without head ops the default
+    /// answers [`TriggerProbe::Unknown`].
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        if !self.supports_sync_head_ops() {
+            return TriggerProbe::Unknown;
+        }
+        trigger_probe_from(self.sync_head_op(input_name, SyncHeadOp::ProbeNext))
+    }
+
+    /// Does [`Self::probe_trigger_input`] answer for a Data trigger input, not
+    /// only for the per-set Sync inputs the head ops serve?
+    ///
+    /// Read once per node at graph build, beside
+    /// [`Self::supports_sync_head_ops`], under the same static-answer contract:
+    /// the capability map is captured before [`Self::init`] injects the
+    /// context. The graph probes a `consume = latest` input read through two
+    /// subscribers only on a `true`. A `false` there is named once at build,
+    /// and such an input fires on every counted arrival, including one an
+    /// earlier read already drained.
+    ///
+    /// Default `false`, whatever [`Self::supports_sync_head_ops`] answers.
+    /// Return `true` only when [`Self::probe_trigger_input`] answers a Data
+    /// input from the subscriber its tick reads: a probe that answers
+    /// [`TriggerProbe::Empty`] while that subscriber holds a frame (as the
+    /// default does for an entry whose head ops answer
+    /// [`SyncOpAnswer::Nothing`] outside its Sync inputs) leaves the input
+    /// unfired. A `#[cerulion_node]` node and a `ClosureNodeEntry` answer
+    /// `true`. A [`DylibNodeEntry`] answers `true` when its library exports
+    /// `cerulion_node_probes_trigger_input` returning a positive value beside
+    /// `cerulion_node_sync_head_op`.
+    fn probes_trigger_input(&self) -> bool {
+        false
+    }
+
     /// Decode the capture stamp of the frame a per-set Sync slot holds, for a
     /// node that matches its Sync trigger on `header.stamp`. See
     /// [`NodeContext::sync_capture_stamp`].
@@ -3823,6 +3974,20 @@ impl NodeEntry for ClosureNodeEntry {
         self.unified_drain
     }
 
+    // The probe reads the body subscriber's queue and touches no frozen slot,
+    // so it answers on BOTH settings of `unified_drain`, including an opted-out
+    // closure, whose trigger input is read through two subscribers.
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        match self.context.as_mut() {
+            Some(ctx) => trigger_probe_from(ctx.sync_head_op(input_name, SyncHeadOp::ProbeNext)),
+            None => TriggerProbe::Unknown,
+        }
+    }
+
+    fn probes_trigger_input(&self) -> bool {
+        true
+    }
+
     fn sync_capture_stamp(
         &mut self,
         input_name: &str,
@@ -4030,6 +4195,15 @@ pub struct DylibNodeEntry {
     /// `cerulion_node_{drain,refill}_trigger_input`.
     sync_head_op_ffi:
         Option<unsafe extern "C" fn(u64, *const u8, usize, u32, *mut u64, *mut i32) -> i32>,
+    /// [`NodeEntry::probes_trigger_input`]: read ONCE at load through the
+    /// OPTIONAL handle-less `cerulion_node_probes_trigger_input() -> i32`.
+    /// `true` only when that export returns a positive value AND
+    /// [`Self::sync_head_op_ffi`] resolved, the symbol op code
+    /// [`SYNC_HEAD_OP_PROBE_NEXT`] crosses. An absent export, a zero, a
+    /// negative return (the exporter could not answer) or an absent head-op
+    /// symbol is `false`, and the graph build names the node's separate-drain
+    /// `consume = latest` inputs. ADDITIVE, no ABI bump.
+    probes_trigger_input: bool,
     /// The OPTIONAL state capture/restore FFI pair, resolved
     /// all-three-or-none by `load` (mirrors [`SnapshotFns`]). `None` for a
     /// raw-FFI cdylib or one built without the state exports, which is what makes them ADDITIVE with
@@ -4084,6 +4258,15 @@ pub struct DylibNodeEntry {
     /// different rate from a drain or a refill, and one open regime must not
     /// swallow another's loud head.
     sync_head_op_error_latched: bool,
+    /// The same twin for the `consume = latest` body probe
+    /// ([`NodeEntry::probe_trigger_input`]), which crosses the head-op symbol
+    /// as op code [`SYNC_HEAD_OP_PROBE_NEXT`] once per level boundary while the
+    /// input has a counted or carried arrival. Its OWN latch: a failing probe
+    /// and a failing per-set Sync op each get their loud head. One latch per
+    /// input ([`keyed_flood_log_action`]): the names of the inputs whose last
+    /// probe failed, so an input whose probe answers leaves another input's
+    /// failing regime latched.
+    trigger_probe_error_latched: std::collections::HashSet<String>,
     /// OPTIONAL external-source FFI symbol
     /// (`cerulion_node_external_source(handle, out_fd) -> i32`), resolved
     /// best-effort by `load` (mirrors [`SnapshotFns`]). `None` for a non-external
@@ -4695,6 +4878,23 @@ impl DylibNodeEntry {
                 .ok()
                 .map(|sym| *sym)
         };
+        // OPTIONAL `consume = latest` body-probe capability: handle-less,
+        // read ONCE here (the capability map is captured before `init`), and
+        // decided by `dylib_probes_trigger_input` together with the head-op
+        // symbol above. ADDITIVE, no ABI bump.
+        // Safety: same convention as every other symbol lookup.
+        let probes_trigger_input_fn = unsafe {
+            library
+                .get::<unsafe extern "C" fn() -> i32>(b"cerulion_node_probes_trigger_input\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+        // SAFETY: resolved by name and signature; a present symbol is trusted
+        // to match the ABI, exactly as every other lookup here. The export
+        // takes no handle, so calling it before `init` is within its contract.
+        let probes_trigger_input_ret = probes_trigger_input_fn.map(|f| unsafe { f() });
+        let probes_trigger_input =
+            dylib_probes_trigger_input(probes_trigger_input_ret, sync_head_op_ffi.is_some());
 
         // OPTIONAL state symbols — resolved best-effort, exactly
         // like the snapshot / external-source / drain symbols above. A raw-FFI
@@ -4875,7 +5075,9 @@ impl DylibNodeEntry {
             refill_trigger_ffi,
             refill_trigger_error_latched: false,
             sync_head_op_ffi,
+            probes_trigger_input,
             sync_head_op_error_latched: false,
+            trigger_probe_error_latched: std::collections::HashSet::new(),
             external_source_fn,
             external_is_doorbell_fd: false,
             leak_library_on_drop: false,
@@ -4896,6 +5098,51 @@ impl DylibNodeEntry {
     /// message instead of the upstream's "no detail provided" fallback.
     fn take_last_error(&self) -> Option<String> {
         take_last_error_via(self.take_last_error_fn, self.free_error_fn)
+    }
+
+    /// One call of `cerulion_node_sync_head_op` with `op_code` on
+    /// `input_name`, decoded and not logged. `None` when nothing crossed: no
+    /// head-op symbol, or no handle yet (before [`NodeEntry::init`]).
+    ///
+    /// The answer kind is decoded only on a zero return. A kind this host
+    /// does not know (a version skew between host and library) decodes to
+    /// `None`, as a nonzero return does: each caller reports both on its own
+    /// flood latch.
+    fn cross_sync_head_op(&mut self, input_name: &str, op_code: u32) -> Option<SyncHeadOpCall> {
+        let sync_fn = self.sync_head_op_ffi?;
+        let handle = self.handle?;
+        let mut out_ts: u64 = 0;
+        let mut out_kind: i32 = -1;
+        // Safety: identical contract to `drain_trigger_input`: a live
+        // registered handle, a borrowed `&str` valid for this call (the cdylib
+        // only reads it, never retains it), and our own stack slots as
+        // out-pointers.
+        let ret = unsafe {
+            sync_fn(
+                handle,
+                input_name.as_ptr(),
+                input_name.len(),
+                op_code,
+                &mut out_ts,
+                &mut out_kind,
+            )
+        };
+        let decoded = if ret == 0 {
+            match out_kind {
+                SYNC_OP_ANSWER_NOTHING => Some(SyncOpAnswer::Nothing),
+                SYNC_OP_ANSWER_PRESENT => Some(SyncOpAnswer::Present),
+                SYNC_OP_ANSWER_HEAD => Some(SyncOpAnswer::Head(out_ts)),
+                SYNC_OP_ANSWER_STAMP => Some(SyncOpAnswer::Stamp(out_ts)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Some(SyncHeadOpCall {
+            ret,
+            out_kind,
+            decoded,
+        })
     }
 
     /// The error for a node-error return (FFI code 1 from tick / shutdown,
@@ -4998,6 +5245,13 @@ impl DylibNodeEntry {
             // below (a hand-written info block has no macro behind it).
             #[serde(default)]
             params: Option<Vec<ParamSpec>>,
+            // `true` from a `#[cerulion_node]` library: the node fails each
+            // tick for which a declared output has no publisher. Additive,
+            // no ABI bump: absent (a raw FFI or Python info block, or a macro
+            // library built before this key) means `false`, and the graph
+            // build does not refuse an unlisted declared output.
+            #[serde(default)]
+            publisher_for_every_output: bool,
         }
 
         // ABI v6: each `inputs` entry is either a
@@ -5243,6 +5497,7 @@ impl DylibNodeEntry {
             "tick_within_ms",
             "throttle_ms",
             "params",
+            "publisher_for_every_output",
         ];
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json_str) {
             // Same `unknown_key` field name and the same did-you-mean as the
@@ -5591,6 +5846,7 @@ impl DylibNodeEntry {
         info.tick_within_ms = parsed.tick_within_ms;
         info.throttle_ms = parsed.throttle_ms;
         info.params = params;
+        info.publisher_for_every_output = parsed.publisher_for_every_output;
         Ok(info)
     }
 }
@@ -6573,47 +6829,21 @@ impl NodeEntry for DylibNodeEntry {
             } => SYNC_HEAD_OP_ADVANCE_REFILL,
             SyncHeadOp::Void => SYNC_HEAD_OP_VOID,
         };
-        let Some(sync_fn) = self.sync_head_op_ffi else {
-            return SyncOpAnswer::Failed; // no symbol → capability false → never installed
+        // No symbol (capability false, so never installed) or not
+        // initialized yet: nothing crossed, answered `Failed`.
+        let Some(SyncHeadOpCall {
+            ret,
+            out_kind,
+            decoded,
+        }) = self.cross_sync_head_op(input_name, op_code)
+        else {
+            return SyncOpAnswer::Failed;
         };
-        let Some(handle) = self.handle else {
-            return SyncOpAnswer::Failed; // not initialized yet
-        };
-        let mut out_ts: u64 = 0;
-        let mut out_kind: i32 = -1;
-        // Safety: identical contract to `drain_trigger_input` above — a live
-        // registered handle, a borrowed `&str` valid for this call (the cdylib
-        // only reads it, never retains it), and our own stack slots as
-        // out-pointers.
-        let ret = unsafe {
-            sync_fn(
-                handle,
-                input_name.as_ptr(),
-                input_name.len(),
-                op_code,
-                &mut out_ts,
-                &mut out_kind,
-            )
-        };
-        // Decode BEFORE reporting. A nonzero return and an unknown answer kind
-        // are two ways for ONE call to produce no usable answer, with one
-        // remedy (rebuild/redeploy the cdylib), so they share ONE regime — the
-        // flood-latch rule is per CALL SITE, exactly as the drain and refill
-        // latches are, and the loud head names which of the two it was.
-        let decoded = if ret == 0 {
-            match out_kind {
-                SYNC_OP_ANSWER_NOTHING => Some(SyncOpAnswer::Nothing),
-                SYNC_OP_ANSWER_PRESENT => Some(SyncOpAnswer::Present),
-                SYNC_OP_ANSWER_HEAD => Some(SyncOpAnswer::Head(out_ts)),
-                SYNC_OP_ANSWER_STAMP => Some(SyncOpAnswer::Stamp(out_ts)),
-                // A cdylib speaking an answer kind this host does not know is a
-                // VERSION SKEW. Guessing would fabricate a set member, so it is
-                // a failure like any other.
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // A nonzero return and an unknown answer kind are two ways for ONE
+        // call to produce no usable answer, with one remedy (rebuild/redeploy
+        // the cdylib), so they share ONE regime: the flood-latch rule is per
+        // CALL SITE, exactly as the drain and refill latches are, and the loud
+        // head names which of the two it was.
         match flood_log_action(&mut self.sync_head_op_error_latched, decoded.is_none()) {
             FloodLogAction::FirstFailure => {
                 let detail = self.take_last_error().unwrap_or_else(|| {
@@ -6680,6 +6910,80 @@ impl NodeEntry for DylibNodeEntry {
     /// runtime's pre-init capability-map capture).
     fn supports_sync_head_ops(&self) -> bool {
         self.sync_head_op_ffi.is_some()
+    }
+
+    /// Ask the library's body subscriber through `cerulion_node_sync_head_op`
+    /// as op code [`SYNC_HEAD_OP_PROBE_NEXT`]: `Present` is
+    /// [`TriggerProbe::Unread`], `Nothing` is [`TriggerProbe::Empty`], and no
+    /// symbol, no handle, a nonzero return or any other answer kind is
+    /// [`TriggerProbe::Unknown`], which the step mints on as it would for an
+    /// unprobed input.
+    ///
+    /// A call that produces no answer is reported on its own flood latch
+    /// (`trigger_probe_error_latched`, one per input), apart from the per-set
+    /// Sync ops': first failure at `error!`, then `debug!`, then one `info!`
+    /// on recovery.
+    fn probe_trigger_input(&mut self, input_name: &str) -> TriggerProbe {
+        let Some(SyncHeadOpCall {
+            ret,
+            out_kind,
+            decoded,
+        }) = self.cross_sync_head_op(input_name, SYNC_HEAD_OP_PROBE_NEXT)
+        else {
+            return TriggerProbe::Unknown;
+        };
+        match keyed_flood_log_action(
+            &mut self.trigger_probe_error_latched,
+            input_name,
+            decoded.is_none(),
+        ) {
+            FloodLogAction::FirstFailure => {
+                let detail = self.take_last_error().unwrap_or_else(|| {
+                    format!(
+                        "cerulion_node_sync_head_op returned code {ret}, kind {out_kind} \
+                         (no detail provided)"
+                    )
+                });
+                tracing::error!(
+                    node = %self.diag_label,
+                    input = %input_name,
+                    code = ret,
+                    kind = out_kind,
+                    error = %detail,
+                    "cdylib consume = latest body probe got no answer (op code 0 of \
+                     cerulion_node_sync_head_op failed or answered a kind this host does \
+                     not know); this input fires on every arrival its trigger subscriber \
+                     counts, including a frame an earlier read already took, until the \
+                     probe answers (suppressing further to debug until it recovers)"
+                );
+            }
+            FloodLogAction::SuppressedFailure => {
+                // Drain LAST_ERROR each time (allocator-pairing hygiene), quietly.
+                let _ = self.take_last_error();
+                tracing::debug!(
+                    node = %self.diag_label,
+                    input = %input_name,
+                    code = ret,
+                    kind = out_kind,
+                    "cdylib consume = latest body probe still failing (suppressed)"
+                );
+            }
+            FloodLogAction::Recovered => {
+                tracing::info!(
+                    node = %self.diag_label,
+                    input = %input_name,
+                    "cdylib consume = latest body probe recovered"
+                );
+            }
+            FloodLogAction::Quiet => {}
+        }
+        decoded.map_or(TriggerProbe::Unknown, trigger_probe_from)
+    }
+
+    /// Read once at `load` from `cerulion_node_probes_trigger_input`; see the
+    /// `probes_trigger_input` field.
+    fn probes_trigger_input(&self) -> bool {
+        self.probes_trigger_input
     }
 
     /// Query the cdylib's OPTIONAL external-source FFI export and
@@ -6848,6 +7152,40 @@ pub(crate) fn flood_log_action(latched: &mut bool, failed: bool) -> FloodLogActi
         }
         (false, false) => FloodLogAction::Quiet,
     }
+}
+
+/// A [`DylibNodeEntry`]'s [`NodeEntry::probes_trigger_input`], from what
+/// `load` resolved: `export_ret` is the return of
+/// `cerulion_node_probes_trigger_input` (`None` when the library does not
+/// export it), and `has_head_op` is whether `cerulion_node_sync_head_op`, the
+/// symbol op code [`SYNC_HEAD_OP_PROBE_NEXT`] crosses, resolved. `true` only
+/// for a positive return beside the head-op symbol; a zero, a negative return
+/// (the exporter could not answer) or an absent symbol is `false`.
+fn dylib_probes_trigger_input(export_ret: Option<i32>, has_head_op: bool) -> bool {
+    has_head_op && export_ret.is_some_and(|ret| ret > 0)
+}
+
+/// [`flood_log_action`] with one latch per `key`. `latched` holds the keys
+/// whose last call failed; a key is inserted on its first failure and removed
+/// on its recovery, so one key's failures and recoveries leave another key's
+/// latch as it was.
+fn keyed_flood_log_action(
+    latched: &mut std::collections::HashSet<String>,
+    key: &str,
+    failed: bool,
+) -> FloodLogAction {
+    let mut key_latched = latched.contains(key);
+    let action = flood_log_action(&mut key_latched, failed);
+    match action {
+        FloodLogAction::FirstFailure => {
+            latched.insert(key.to_owned());
+        }
+        FloodLogAction::Recovered => {
+            latched.remove(key);
+        }
+        FloodLogAction::SuppressedFailure | FloodLogAction::Quiet => {}
+    }
+    action
 }
 
 /// Decode an FFI error code into a human-readable description.
@@ -7232,6 +7570,67 @@ mod tests {
             FloodLogAction::FirstFailure
         );
         assert!(latched);
+    }
+
+    /// One latch per key: input `b` failing on every call while input `a`
+    /// answers gives one loud line for `b` and nothing for `a`, never a
+    /// recovery for `b` that `a`'s answer would fake on a shared latch.
+    #[test]
+    fn keyed_flood_log_action_latches_each_key_apart() {
+        let mut latched = std::collections::HashSet::new();
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            actions.push(keyed_flood_log_action(&mut latched, "b", true));
+            actions.push(keyed_flood_log_action(&mut latched, "a", false));
+        }
+        assert_eq!(
+            actions,
+            vec![
+                FloodLogAction::FirstFailure,
+                FloodLogAction::Quiet,
+                FloodLogAction::SuppressedFailure,
+                FloodLogAction::Quiet,
+                FloodLogAction::SuppressedFailure,
+                FloodLogAction::Quiet,
+            ]
+        );
+        assert_eq!(
+            keyed_flood_log_action(&mut latched, "b", false),
+            FloodLogAction::Recovered
+        );
+        assert!(latched.is_empty(), "a recovered key leaves no latch behind");
+        assert_eq!(
+            keyed_flood_log_action(&mut latched, "b", true),
+            FloodLogAction::FirstFailure,
+            "a new regime on the same key is loud again"
+        );
+    }
+
+    /// The probe capability a `DylibNodeEntry` reads at load: only a positive
+    /// return of `cerulion_node_probes_trigger_input` beside the head-op
+    /// symbol declares it. Each row is `(export return, has head op, probes)`.
+    #[test]
+    fn dylib_probe_capability_needs_a_positive_return_and_the_head_op() {
+        let rows = [
+            (None, false, false),
+            (None, true, false),
+            (Some(0), false, false),
+            (Some(0), true, false),
+            (Some(-1), false, false),
+            (Some(-1), true, false),
+            (Some(i32::MIN), true, false),
+            (Some(1), false, false),
+            (Some(1), true, true),
+            (Some(2), false, false),
+            (Some(2), true, true),
+        ];
+        for (export_ret, has_head_op, probes) in rows {
+            assert_eq!(
+                dylib_probes_trigger_input(export_ret, has_head_op),
+                probes,
+                "export return {export_ret:?}, head op {has_head_op}"
+            );
+        }
     }
 
     #[test]
@@ -8650,6 +9049,7 @@ mod tests {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         };
         assert_eq!(info.input_meta.len(), 1);
         assert!(info.input_meta[0].trigger);

@@ -832,8 +832,8 @@ pub unsafe extern "C" fn rmw_create_publisher(
         let type_name = ros_graph_type_name(bridge.qualified_name());
         let can_loan = bridge.can_loan();
         // Parity with the native graph build: arm the producer-side SHM
-        // doorbell (rings inside `notify_sent_sample`, which every rmw
-        // publish path already calls), so a consumer parked on this topic's
+        // doorbell (every rmw publish path rings it right after its send, in
+        // `wake_after_send`), so a consumer parked on this topic's
         // line — the event-driven `rmw_wait`'s park tier, or a native
         // monitor-wait loop in the same namespace — wakes the instant the
         // frame is committed. On macOS the ring costs a second atomic bump in
@@ -1400,10 +1400,7 @@ unsafe fn publish_impl(
                     // Wake event-driven subscribers + drain SubscriberConnected
                     // so a late joiner gets the retained history via
                     // `update_connections` (publish_raw itself doesn't notify).
-                    inner.publisher.check_subscriber_events();
-                    if let Err(e) = inner.publisher.notify_sent_sample() {
-                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                    }
+                    wake_after_send(&mut inner.publisher, &data.topic);
                     RMW_RET_OK
                 }
                 Err(e) => {
@@ -1502,10 +1499,7 @@ unsafe fn publish_impl(
             capture_frame_output(loan.bytes_mut());
             match inner.publisher.send_raw_loan(loan) {
                 Ok(_recipients) => {
-                    inner.publisher.check_subscriber_events();
-                    if let Err(e) = inner.publisher.notify_sent_sample() {
-                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                    }
+                    wake_after_send(&mut inner.publisher, &data.topic);
                     RMW_RET_OK
                 }
                 Err(e) => {
@@ -1990,10 +1984,7 @@ unsafe fn publish_windowed_loan(
                     } else {
                         data.borrow_copied_frames.fetch_add(1, Ordering::Relaxed);
                     }
-                    inner.publisher.check_subscriber_events();
-                    if let Err(e) = inner.publisher.notify_sent_sample() {
-                        tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                    }
+                    wake_after_send(&mut inner.publisher, &data.topic);
                     RMW_RET_OK
                 }
                 Err(e) => {
@@ -2105,10 +2096,7 @@ unsafe fn publish_copy_of_slot_struct(
     capture_frame_output(copy_loan.bytes_mut());
     match inner.publisher.send_raw_loan(copy_loan) {
         Ok(_recipients) => {
-            inner.publisher.check_subscriber_events();
-            if let Err(e) = inner.publisher.notify_sent_sample() {
-                tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-            }
+            wake_after_send(&mut inner.publisher, &data.topic);
             RMW_RET_OK
         }
         Err(e) => {
@@ -2231,10 +2219,7 @@ unsafe fn publish_loaned_impl(
         // push/finish/rollback machinery is needed.
         match inner.publisher.send_raw_loan(loan) {
             Ok(_recipients) => {
-                inner.publisher.check_subscriber_events();
-                if let Err(e) = inner.publisher.notify_sent_sample() {
-                    tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                }
+                wake_after_send(&mut inner.publisher, &data.topic);
                 RMW_RET_OK
             }
             Err(e) => {
@@ -2697,10 +2682,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 adopt_registered: Vec::with_capacity(forgeable_members),
             }),
             gid,
-            decode_failures: std::sync::Mutex::new(
+            decode_failures: crate::gated_latch::GatedLatch::new(
                 crate::decode_failure_latch::DecodeFailureLatch::new(),
             ),
-            hash_mismatches: std::sync::Mutex::new(
+            hash_mismatches: crate::gated_latch::GatedLatch::new(
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             ),
             loan_refusals: std::sync::Mutex::new(
@@ -2951,6 +2936,27 @@ unsafe fn serve_recorded_message(
     rec.ret
 }
 
+/// Wake a topic's consumers after a send that returned `Ok`: the doorbell ring
+/// first, right after the send (a consumer parked on the line wakes then), then
+/// `check_subscriber_events` (a `SubscriberConnected` drives history delivery),
+/// then the listener notify. A failed notify loses only the wake: the frame is
+/// already in the queue, and the failure is logged at debug.
+pub(crate) fn wake_after_send(
+    publisher: &mut cerulion_core::transport::publisher::CerulionPublisher,
+    topic: &str,
+) {
+    publisher.ring_doorbell();
+    publisher.check_subscriber_events();
+    if let Err(e) = publisher.notify_after_ring() {
+        tracing::debug!(topic = %topic, error = ?e, "notify failed");
+    }
+}
+
+/// How a subscription take leaves its listener: to the next `rmw_wait`, whose
+/// entry pass drains every readable listener fd before its full probe.
+pub(crate) const TAKE_LISTENER_DRAIN: cerulion_core::transport::subscriber::ListenerDrain =
+    cerulion_core::transport::subscriber::ListenerDrain::ByNextWait;
+
 /// The live take.
 unsafe fn take_impl_live(
     subscription: *const ffi::rmw_subscription_t,
@@ -3010,8 +3016,10 @@ unsafe fn take_impl_live(
     let mut info_out: Option<(u64, u64, u128)> = None;
     // ONE message per call (the rmw take contract): try_receive_one,
     // never the drain-everything path — extra drained frames would be
-    // silently lost (Principle #6).
-    let receive = inner.subscriber.try_receive_one(|msg| {
+    // silently lost (Principle #6). The listener is left for the next
+    // `rmw_wait` ([`TAKE_LISTENER_DRAIN`]).
+    let sub = &inner.subscriber;
+    let receive = sub.try_receive_one_with(TAKE_LISTENER_DRAIN, |msg| {
         let origin = msg.origin();
         let header = msg.header();
         // The DECISION lives in `take_gate` — one pure
@@ -3024,9 +3032,7 @@ unsafe fn take_impl_live(
             // somebody redeploys — on a 100 Hz topic that is ~100
             // lines/s forever, the disk-fill class. Loud once
             // per regime, counted always.
-            let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-                &data.hash_mismatches,
-            );
+            let mut latch = data.hash_mismatches.lock_failure();
             cerulion_core::transport::frame_drop_latch::report_schema_hash_mismatch(
                 &mut latch,
                 cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
@@ -3040,14 +3046,13 @@ unsafe fn take_impl_live(
             // Recovery is observed HERE — the hash gate passing is the
             // whole condition; whether the bridge can then DECODE the
             // frame is a different condition with its own latch.
-            let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-                &data.hash_mismatches,
-            );
-            cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
-                &mut latch,
-                cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
-                &data.topic,
-            );
+            data.hash_mismatches.on_success(|latch| {
+                cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
+                    latch,
+                    cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
+                    &data.topic,
+                )
+            });
         }
         // A member this build's C++ typesupport gives no way to WRITE
         // (a `bool[]` before Humble: the generator emits no `assign` for
@@ -3346,7 +3351,10 @@ unsafe fn take_adopted(
     let expected_hash = data.bridge.schema_hash();
     let api = *adopt.grant.api();
 
-    let owned = match inner.subscriber.try_receive_one_owned() {
+    let owned = match inner
+        .subscriber
+        .try_receive_one_owned_with(TAKE_LISTENER_DRAIN)
+    {
         Ok(o) => {
             // The receive SUCCEEDED, so close any open
             // receive-failure regime. A latch with no success side is worse
@@ -3446,9 +3454,7 @@ unsafe fn take_adopted(
         // Same regime latch + semantics as the copying take: the
         // frame is consumed and dropped, `taken` stays false.
         drop(owned);
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
+        let mut latch = data.hash_mismatches.lock_failure();
         cerulion_core::transport::frame_drop_latch::report_schema_hash_mismatch(
             &mut latch,
             cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
@@ -3459,14 +3465,13 @@ unsafe fn take_adopted(
         return RMW_RET_OK;
     }
     {
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
-        cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
-            &mut latch,
-            cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
-            &data.topic,
-        );
+        data.hash_mismatches.on_success(|latch| {
+            cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
+                latch,
+                cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
+                &data.topic,
+            )
+        });
     }
     let ts = header.timestamp_ns;
     let seq = header.sequence as u64;
@@ -4175,7 +4180,10 @@ unsafe fn take_loaned_impl(
             }
         }
     }
-    let owned = match inner.subscriber.try_receive_one_owned() {
+    let owned = match inner
+        .subscriber
+        .try_receive_one_owned_with(TAKE_LISTENER_DRAIN)
+    {
         Ok(o) => o,
         Err(e) => {
             // The transport-side budget arm lands here: with
@@ -4229,9 +4237,7 @@ unsafe fn take_loaned_impl(
         if let Some(s) = shadow.take() {
             inner.shadows.release(s);
         }
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
+        let mut latch = data.hash_mismatches.lock_failure();
         cerulion_core::transport::frame_drop_latch::report_schema_hash_mismatch(
             &mut latch,
             cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
@@ -4245,14 +4251,13 @@ unsafe fn take_loaned_impl(
         // Recovery is observed HERE — the hash gate passing is the whole
         // condition (same split as `take_impl`: framing is a different
         // condition with its own latch).
-        let mut latch = cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-            &data.hash_mismatches,
-        );
-        cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
-            &mut latch,
-            cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
-            &data.topic,
-        );
+        data.hash_mismatches.on_success(|latch| {
+            cerulion_core::transport::frame_drop_latch::report_schema_hash_match(
+                latch,
+                cerulion_core::transport::frame_drop_latch::FrameDropSite::Message,
+                &data.topic,
+            )
+        });
     }
     // The type-level blocker (see the copying take's arm): a member this
     // build cannot write refuses the frame HERE, before the forge writes its

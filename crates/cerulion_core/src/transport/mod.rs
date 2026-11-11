@@ -36,6 +36,7 @@ pub mod cerulion_q;
 pub mod dead_node_sweep;
 pub mod demand_authorizer;
 pub mod discovery;
+pub(crate) mod drain_clip_latch;
 pub(crate) mod egress_send;
 pub mod events;
 pub mod failure_regime_latch;
