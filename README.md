@@ -8,7 +8,7 @@
   </a>
 </p>
 
-**Cerulion (YC S24) gives AI agents a harness to control real robots. Our open-source runtime and harness give any AI agent a physical body, inside safety limits the robot enforces, and tools to autonomously debug recorded robot failures. It's ROS 2 compatible.**
+**Cerulion (YC S24) is the operating system for physical AI: an open-source, zero-copy robot runtime that records runs, replays failures against new code, and reaches your robots from anywhere. It's ROS 2 compatible.**
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![crates.io: cerulion_cli 2.0.0](https://img.shields.io/badge/crates.io-cerulion__cli%202.0.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
