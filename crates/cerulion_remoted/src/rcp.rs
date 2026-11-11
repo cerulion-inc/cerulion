@@ -105,7 +105,10 @@
 //! answers logs at error when the daemon stops gracefully (on Ctrl-C or
 //! SIGTERM, through `RcpdEstop::shut_down` in the daemon's teardown), when its
 //! task panics or when its runtime is dropped; at that graceful stop an
-//! attempt rcpd issued an MCP session first deletes it. A stop the hard-exit
+//! attempt rcpd issued an MCP session first deletes it. One that ends while
+//! it deletes the MCP session of an attempt rcpd answered logs at error when
+//! an engage came after that attempt began, since the `estop` it still owed
+//! that engage was not sent, and logs nothing otherwise. A stop the hard-exit
 //! deadline or a second signal ends, a SIGKILL or a crash may end it with no
 //! line or `DELETE`. An `estop` over this plane reaches rcpd in its own
 //! stream and starts no delivery. A library host has no rcp link and refuses
@@ -2168,11 +2171,14 @@ pub(crate) struct RcpdEstop {
 /// shared with that delivery.
 struct Owing {
     /// Serializes the engage count with the start and the end of a
-    /// delivery. Held for those steps only, never across an `.await`, and
-    /// no log line is written while it is held.
+    /// delivery (`RcpdEstop::send`, `Owing::finish`, `Owing::clear_mark`).
+    /// Held for those steps only, never across an `.await`; no log line is
+    /// written and no delivery's mark is dropped while it is held, since the
+    /// mark's drop takes it.
     period: Mutex<Period>,
     /// One more for each engage, added under `period`; each attempt reads it
-    /// without the lock as it begins.
+    /// without the lock as it begins, and `Owing::finish` and a delivery's
+    /// mark read it under the lock.
     engages: AtomicU64,
     /// The running delivery's id, 0 while none runs; set under `period`.
     running: AtomicU64,
@@ -2206,6 +2212,21 @@ impl Owing {
                 .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
         }
         decision
+    }
+
+    /// Clear `running` while it holds `id`, under `period`, as the mark of
+    /// delivery `id` drops. Returns the engage count read under that lock
+    /// when `running` held `id`, and `None` when it did not, as after
+    /// [`Owing::finish`] answered [`AfterAnswer::Done`]. An engage `send`
+    /// counts before the swap is in that count; one it counts after the swap
+    /// finds `running` cleared and starts a delivery. It writes no log line
+    /// and leaves the period open.
+    fn clear_mark(&self, id: u64) -> Option<u64> {
+        let _period = self.period.lock().unwrap_or_else(PoisonError::into_inner);
+        self.running
+            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| self.engages.load(Ordering::Acquire))
     }
 }
 
@@ -2245,9 +2266,9 @@ impl RcpdEstop {
     /// down, the delivery is dropped at once and logs its early end), `false`
     /// when one runs, which covers this engage. Under `Owing::period`, the
     /// first engage of a period names its engager, each engage adds one to
-    /// the count, and, when none runs, a delivery is marked running and
-    /// built; it is spawned on a task of its own, in the caller's span, once
-    /// the lock is released; a covered engage's line is likewise written
+    /// the count, and, when none runs, a delivery is marked running; once
+    /// the lock is released, it is built and spawned on a task of its own,
+    /// in the caller's span; a covered engage's line is likewise written
     /// after the release.
     pub(crate) fn send(&self, engager: &[u8; 32]) -> bool {
         let span = tracing::Span::current();
@@ -2270,13 +2291,31 @@ impl RcpdEstop {
         period.last_id += 1;
         let id = period.last_id;
         self.owing.running.store(id, Ordering::Release);
+        // `running` holds `id` from here, so a `send` while it runs is covered.
+        // Its engage is counted either before an attempt reads `engages`, so
+        // that attempt covers it, or after the read of the attempt rcpd
+        // answers, so `finish` reads the larger count and answers `Again`; a
+        // delivery that ends before `finish` has its mark read that count
+        // under `period`. Only this delivery's task calls `finish` for `id`,
+        // and it runs only after the spawn, so nothing ends the period before
+        // the spawn.
+        drop(period);
+        // The delivery is built after the release: its mark's drop takes
+        // `period`, so no mark is dropped on a thread that holds it. The mark
+        // is built first, so a panic while the rest is built drops it here,
+        // with `period` released. A `shut_down` before the handle store below
+        // does not find this delivery's handle; the `stop` receiver
+        // subscribed below reads the stop, so the delivery ends as on any
+        // stop and its mark writes the early-end line. On a runtime that has
+        // shut down, `spawn` drops the delivery and its mark writes that line
+        // on this thread. Both lines are written with `period` released.
         let delivery = Delivery {
             guard: Running {
                 owing: self.owing.clone(),
                 id,
                 by: hex::encode(first),
                 attempts: 0,
-                answered: false,
+                answered_at_start: None,
             },
             target: self.target.clone(),
             shared: self.shared.clone(),
@@ -2285,19 +2324,6 @@ impl RcpdEstop {
             retry_cap: self.retry_cap,
             stop: self.stop.subscribe(),
         };
-        // `running` holds `id` from here, so a `send` while it runs is covered.
-        // Its engage is counted either before an attempt reads `engages`, so
-        // that attempt covers it, or after the read of the attempt rcpd
-        // answers, so `finish` reads the larger count and answers `Again`.
-        // Only this delivery's task calls `finish` for `id`, and it runs only
-        // after the spawn, so nothing ends the period before the spawn. A
-        // `shut_down` before the store below does not find this delivery's
-        // handle; the `stop` receiver subscribed above reads the stop, so the
-        // delivery ends as on any stop and its mark writes the early-end line.
-        // On a runtime that has shut down, `spawn` drops the delivery and its
-        // mark writes that line on this thread. Both lines are written with
-        // `period` released.
-        drop(period);
         let task = self.runtime.spawn(delivery.run().instrument(span));
         // A delivery can end and a later one store its handle before this
         // store runs; the slot keeps the handle with the larger id.
@@ -2334,36 +2360,51 @@ impl RcpdEstop {
 }
 
 /// A delivery's mark in `Owing::running`. Its drop clears `running` while
-/// `running` still holds its id, and then logs at error unless rcpd had
-/// answered the attempt in flight: after a stop, a panic or a dropped
-/// runtime. A delivery that ends in the session `DELETE` of an attempt rcpd
-/// answered logs nothing. A delivery whose [`Owing::finish`] answers
-/// [`AfterAnswer::Done`] is cleared by `finish` instead.
+/// `running` still holds its id ([`Owing::clear_mark`]) and then, with
+/// `period` released, logs at error after a stop, a panic or a dropped
+/// runtime: with `answered_at_start` unset, that the delivery ended before
+/// rcpd answered; with it set (an end in the session `DELETE` of the
+/// attempt rcpd answered, on a panic or a dropped runtime) and an engage
+/// counted since that attempt began, that the `estop` owed to that engage
+/// was not sent. An end in that `DELETE` with no engage since logs nothing.
+/// A delivery whose [`Owing::finish`] answers [`AfterAnswer::Done`] is
+/// cleared by `finish` instead.
 struct Running {
     owing: Arc<Owing>,
     id: u64,
     /// The engager's device key, hex.
     by: String,
     attempts: u64,
-    /// Set when rcpd answers an attempt's estop call with its latch closed,
-    /// before the session `DELETE`, until the delivery sends once more.
-    answered: bool,
+    /// The engage count the attempt rcpd answered with its latch closed
+    /// began with, set as its estop call returns, before the session
+    /// `DELETE`; `None` until then and again once the delivery sends once
+    /// more.
+    answered_at_start: Option<u64>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let mine = self
-            .owing
-            .running
-            .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if mine && !self.answered {
-            tracing::error!(
+        let Some(engages) = self.owing.clear_mark(self.id) else {
+            return;
+        };
+        match self
+            .answered_at_start
+            .map(|at_start| after_answer(at_start, engages))
+        {
+            None => tracing::error!(
                 by = %self.by,
                 attempts = self.attempts,
                 "cerulion_remoted: the estop an ops engage-estop sent to rcpd ended before rcpd \
                  answered; rcpd's own latch may be open, and the next engage-estop sends it again"
-            );
+            ),
+            Some(AfterAnswer::Again) => tracing::error!(
+                by = %self.by,
+                attempts = self.attempts,
+                "cerulion_remoted: the estop an ops engage-estop sent to rcpd ended after rcpd's \
+                 latch closed, without the estop owed to a later engage-estop; rcpd's own latch \
+                 may be open again, and the next engage-estop sends it"
+            ),
+            Some(AfterAnswer::Done) => {}
         }
     }
 }
@@ -2386,11 +2427,13 @@ impl Delivery {
     /// on [`AfterAnswer::Again`] it sends at once again. Each attempt reads
     /// the token, then sends `initialize`, `notifications/initialized` and the
     /// [`ESTOP_TOOL`] call with [`OPS_ESTOP_REASON`] ([`estop_session`]),
-    /// records rcpd's answer that its latch closed on the delivery's mark as
-    /// soon as that call returns, and deletes the session rcpd issued, also
-    /// when the daemon stops mid attempt. After a failed attempt it logs through [`log_failure`] and
-    /// waits `retry_first`, then twice as long after each further failure, up
-    /// to `retry_cap`. The attempt and the wait end when the daemon stops.
+    /// records on the delivery's mark, as soon as that call returns, the
+    /// engage count that an attempt rcpd answered with its latch closed began
+    /// with, and deletes the session rcpd issued, also when the daemon stops
+    /// mid attempt. After a failed attempt it logs through [`log_failure`]
+    /// and waits `retry_first`, then twice as long after each further
+    /// failure, up to `retry_cap`. The attempt and the wait end when the
+    /// daemon stops.
     async fn run(mut self) {
         let mut failures = FailureRegimeLatch::new();
         let mut retry_in = self.retry_first;
@@ -2408,10 +2451,12 @@ impl Delivery {
                         }
                         () = stopping(&mut self.stop) => None,
                     };
-                    // Recorded before the `DELETE`: a delivery that ends in it
-                    // ends after rcpd answered.
+                    // Recorded before the `DELETE`, with the count this
+                    // attempt began with: a delivery that ends in it ends
+                    // after rcpd answered, and its mark compares that count
+                    // with the engages counted since.
                     if matches!(outcome, Some(Ok(_))) {
-                        self.guard.answered = true;
+                        self.guard.answered_at_start = Some(engages_at_start);
                     }
                     if upstream.session_id().is_some() {
                         let _ =
@@ -2443,7 +2488,7 @@ impl Delivery {
                                 "cerulion_remoted: an engage-estop arrived during the answered \
                                  attempt; sending the estop to rcpd once more"
                             );
-                            self.guard.answered = false;
+                            self.guard.answered_at_start = None;
                             retry_in = self.retry_first;
                             continue;
                         }
@@ -3530,6 +3575,12 @@ mod tests {
         NotJson,
         /// Answer the `estop` call with a result that does not say `estopped`.
         NoEstopped,
+        /// Answer the `estop` call with a body shaped as rcpd writes it, with
+        /// a stand-in `call_id`, when the graph did not acknowledge its e-stop
+        /// frame on the default results topic within rcpd's 2 s e-stop
+        /// timeout and its intent receipt was not written; the delivery reads
+        /// only `estopped` and `graph_acknowledged`.
+        Unacknowledged,
         /// Answer as rcpd does.
         Answer,
     }
@@ -3646,6 +3697,9 @@ mod tests {
                         )),
                         Turn::NotJson => Some(raw("200 OK", "", "not json")),
                         Turn::NoEstopped => Some(estop_answer(r#"{"graph_acknowledged":true}"#)),
+                        Turn::Unacknowledged => Some(estop_answer(
+                            r#"{"call_id":1,"estopped":true,"graph_acknowledged":false,"graph_error":"no answer on /rcp/results within 2000 ms","receipt":null,"result":null}"#,
+                        )),
                         _ if kind == "DELETE" => Some(empty("200 OK")),
                         _ if id.is_null() => Some(empty("202 Accepted")),
                         _ if kind == "initialize" => Some(json(
@@ -3725,6 +3779,9 @@ mod tests {
     const ATTEMPT_FAILED: &str = "the estop an ops engage-estop sent to rcpd failed";
     /// The line rcpd's answer logs.
     const LATCH_CLOSED: &str = "rcpd's e-stop latch closed by an ops engage-estop";
+    /// The line a delivery logs when it ends in the session `DELETE` of an
+    /// attempt rcpd answered, with an engage counted after that attempt began.
+    const OWED_RESEND: &str = "without the estop owed to a later engage-estop";
 
     /// Whether a captured `line` has `part`: a `name=value` field with no
     /// space must be one whole word of the line, any other part a substring.
@@ -4047,6 +4104,55 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[tracing_test::traced_test]
+    async fn an_estop_rcpd_answered_without_the_graphs_acknowledgement_ends_the_delivery_and_logs_so(
+    ) {
+        use Turn::{Answer, Unacknowledged};
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in = ScriptedRcpd::start(vec![Answer, Answer, Unacknowledged]).await;
+        let rcpd = sender_to(dir.path(), stand_in.addr);
+        // rcpd answers the first delivery's estop with its latch closed and
+        // the graph's acknowledgement missing, and the second's in full.
+        for (key, acknowledged) in [
+            ([1u8; 32], "graph_acknowledged=false"),
+            ([2u8; 32], "graph_acknowledged=true"),
+        ] {
+            assert!(rcpd.send(&key), "the engage started no delivery");
+            until_delivered(&rcpd).await;
+            assert_eq!(stand_in.kinds_so_far(), attempt());
+            assert_eq!(
+                rcpd.owing.period.lock().unwrap().engager,
+                None,
+                "the answered delivery left its period open"
+            );
+            let by = format!("by={}", hex::encode(key));
+            logs_assert(
+                |logs| match lines_with(logs, &[LATCH_CLOSED, &by]).as_slice() {
+                    [line]
+                        if ["WARN", acknowledged, "attempts=1", "failed_attempts=0"]
+                            .iter()
+                            .all(|part| has(line, part)) =>
+                    {
+                        Ok(())
+                    }
+                    lines => Err(format!("closed-latch lines: {lines:#?}")),
+                },
+            );
+        }
+        logs_assert(|logs| {
+            let failed = lines_with(logs, &[ATTEMPT_FAILED]);
+            let early = lines_with(logs, &[ENDED_EARLY]);
+            if failed.is_empty() && early.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failure lines: {failed:#?}, early-end lines: {early:#?}"
+                ))
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
     async fn a_delivery_rcpd_never_answers_ends_when_the_daemon_shuts_down() {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4203,8 +4309,8 @@ mod tests {
 
     /// The runtime's drop waits for `finish`, which runs inside the
     /// delivery's poll; its `Done` ends the period and clears the mark, so
-    /// the guard's drop finds the mark gone and reads no `answered` flag.
-    /// The period's engager is cleared only by that `Done`.
+    /// the guard's drop finds the mark gone and logs nothing, whatever it
+    /// recorded. The period's engager is cleared only by that `Done`.
     #[test]
     #[tracing_test::traced_test]
     fn a_delivery_rcpd_answered_logs_no_early_end_when_its_runtime_drops_during_finish() {
@@ -4272,6 +4378,166 @@ mod tests {
             !logs_contain(ENDED_EARLY),
             "a delivery rcpd answered logged an early end during its DELETE"
         );
+        assert!(
+            !logs_contain(OWED_RESEND),
+            "a delivery with no engage since its answered attempt began logged an owed estop"
+        );
+    }
+
+    /// A delivery engaged by `[1; 32]`, whose runtime is dropped while rcpd,
+    /// playing `script`, holds the session `DELETE` of the attempt it
+    /// answered, with `[2; 32]` engaged during that attempt: once rcpd has
+    /// read the estop call and before it answers when `before_answer`, else
+    /// once it has read the `DELETE`. The sender's token file is under `dir`.
+    /// Returns the stand-in's runtime, the stand-in and the sender.
+    fn dropped_in_the_delete(
+        dir: &Path,
+        script: Vec<Turn>,
+        before_answer: bool,
+    ) -> (tokio::runtime::Runtime, ScriptedRcpd, RcpdEstop) {
+        let stand_in_runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut stand_in = stand_in_runtime.block_on(ScriptedRcpd::start(script));
+        let delivery_runtime = tokio::runtime::Runtime::new().unwrap();
+        let link = link_to(dir, stand_in.addr, 0o600);
+        let rcpd = RcpdEstop::new(&link, bare_trust(), delivery_runtime.handle().clone());
+        assert!(rcpd.send(&[1; 32]));
+        for kind in &attempt()[..3] {
+            assert_eq!(stand_in_runtime.block_on(stand_in.next()).0, *kind);
+        }
+        if before_answer {
+            assert!(!rcpd.send(&[2; 32]), "the second engage started a delivery");
+            stand_in.release.notify_one();
+        }
+        assert_eq!(stand_in_runtime.block_on(stand_in.next()).0, "DELETE");
+        if !before_answer {
+            assert!(!rcpd.send(&[2; 32]), "the second engage started a delivery");
+        }
+        drop(delivery_runtime);
+        (stand_in_runtime, stand_in, rcpd)
+    }
+
+    /// A check that the captured lines hold exactly one owed line, at
+    /// error, for the engager `by` and one attempt.
+    fn one_owed_line(by: [u8; 32]) -> impl Fn(&[&str]) -> Result<(), String> {
+        let by = format!("by={}", hex::encode(by));
+        move |logs: &[&str]| match lines_with(logs, &[OWED_RESEND]).as_slice() {
+            [line] if has(line, "ERROR") && has(line, &by) && has(line, "attempts=1") => Ok(()),
+            lines => Err(format!("owed lines: {lines:#?}")),
+        }
+    }
+
+    /// Whether the captured lines hold exactly one line, at info, for the
+    /// engage by `[2; 32]` that a running delivery covered.
+    fn one_covered_engage(logs: &[&str]) -> Result<(), String> {
+        let by = format!("by={}", hex::encode([2u8; 32]));
+        match lines_with(logs, &["INFO", "already on its way", &by]).len() {
+            1 => Ok(()),
+            n => Err(format!("{n} lines for the covered engage")),
+        }
+    }
+
+    /// Check that no delivery runs on `rcpd` and that its period is still
+    /// open under `[1; 32]` with two engages counted. Called once the
+    /// delivery's runtime has dropped: a `period` lock held across that drop
+    /// would block the delivery's mark.
+    fn assert_the_period_owes_the_second_engage(rcpd: &RcpdEstop) {
+        assert_eq!(rcpd.owing.running.load(Ordering::Acquire), 0);
+        assert_eq!(rcpd.owing.engages.load(Ordering::Acquire), 2);
+        assert_eq!(
+            rcpd.owing.period.lock().unwrap().engager,
+            Some([1; 32]),
+            "the dropped delivery ended its period"
+        );
+    }
+
+    /// Engage `[3; 32]` on `rcpd`, now on a runtime of its own, and check
+    /// that the delivery it starts sends one whole attempt under the open
+    /// period's first engager `[1; 32]`. Returns once no delivery runs.
+    fn the_next_engage_sends_the_owed_estop(
+        stand_in_runtime: &tokio::runtime::Runtime,
+        stand_in: &mut ScriptedRcpd,
+        rcpd: &mut RcpdEstop,
+    ) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        rcpd.runtime = runtime.handle().clone();
+        assert!(rcpd.send(&[3; 32]), "the next engage started no delivery");
+        let mut call = String::new();
+        for kind in attempt() {
+            let (seen, text) = stand_in_runtime.block_on(stand_in.next());
+            assert_eq!(seen, kind, "{text}");
+            if seen == "tools/call" {
+                call = text;
+            }
+        }
+        assert_eq!(
+            caller_line(&call),
+            format!("{CALLER_HEADER}: iroh:{}", hex::encode([1u8; 32])),
+            "{call}"
+        );
+        until_blocking("the next delivery ends", || {
+            rcpd.owing.running.load(Ordering::Acquire) == 0
+        });
+    }
+
+    /// Whether the captured lines hold exactly one closed-latch line, at
+    /// warn, for one attempt under `[1; 32]`, and still exactly one owed line.
+    fn one_closed_latch_after_the_owed_line(logs: &[&str]) -> Result<(), String> {
+        let by = format!("by={}", hex::encode([1u8; 32]));
+        match lines_with(logs, &[LATCH_CLOSED]).as_slice() {
+            [line] if has(line, "WARN") && has(line, &by) && has(line, "attempts=1") => {}
+            lines => return Err(format!("closed-latch lines: {lines:#?}")),
+        }
+        one_owed_line([1; 32])(logs)
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_engage_during_the_delete_is_owed_by_a_delivery_dropped_in_it() {
+        use Turn::{Answer, Hold};
+        let dir = tempfile::tempdir().unwrap();
+        let (stand_in_runtime, mut stand_in, mut rcpd) =
+            dropped_in_the_delete(dir.path(), vec![Answer, Answer, Answer, Hold], false);
+        assert!(
+            !logs_contain(LATCH_CLOSED),
+            "the delivery got past its DELETE before the runtime dropped"
+        );
+        assert!(
+            !logs_contain(ENDED_EARLY),
+            "a delivery rcpd answered logged an early end during its DELETE"
+        );
+        logs_assert(one_owed_line([1; 32]));
+        logs_assert(one_covered_engage);
+        assert_the_period_owes_the_second_engage(&rcpd);
+        the_next_engage_sends_the_owed_estop(&stand_in_runtime, &mut stand_in, &mut rcpd);
+        logs_assert(one_closed_latch_after_the_owed_line);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_engage_before_rcpd_answers_is_owed_by_a_delivery_dropped_in_its_delete() {
+        use Turn::{Answer, AnswerOnRelease, Hold};
+        let dir = tempfile::tempdir().unwrap();
+        // The engage comes after the attempt read the engage count and before
+        // rcpd answers it: the mark records the count the attempt began with,
+        // and the count its drop reads holds the engage.
+        let (stand_in_runtime, mut stand_in, mut rcpd) = dropped_in_the_delete(
+            dir.path(),
+            vec![Answer, Answer, AnswerOnRelease, Hold],
+            true,
+        );
+        assert!(
+            !logs_contain(LATCH_CLOSED),
+            "the delivery got past its DELETE before the runtime dropped"
+        );
+        assert!(
+            !logs_contain(ENDED_EARLY),
+            "a delivery rcpd answered logged an early end during its DELETE"
+        );
+        logs_assert(one_owed_line([1; 32]));
+        logs_assert(one_covered_engage);
+        assert_the_period_owes_the_second_engage(&rcpd);
+        the_next_engage_sends_the_owed_estop(&stand_in_runtime, &mut stand_in, &mut rcpd);
+        logs_assert(one_closed_latch_after_the_owed_line);
     }
 
     /// Blocking tasks that hold threads of a runtime's blocking pool until
@@ -4381,34 +4647,56 @@ mod tests {
 
     #[test]
     #[tracing_test::traced_test]
-    fn a_delivery_mark_ends_only_the_delivery_it_names_and_logs_only_an_unanswered_end() {
+    fn a_delivery_mark_ends_only_the_delivery_it_names_and_logs_an_unanswered_end_or_an_owed_estop()
+    {
         let owing = Arc::new(Owing {
-            period: Mutex::new(Period::default()),
-            engages: AtomicU64::new(0),
+            period: Mutex::new(Period {
+                engager: Some([2; 32]),
+                last_id: 4,
+            }),
+            engages: AtomicU64::new(1),
             running: AtomicU64::new(2),
         });
-        let mark = |id: u64, answered: bool| Running {
+        let mark = |id: u64, answered_at_start: Option<u64>| Running {
             owing: owing.clone(),
             id,
             by: hex::encode([id as u8; 32]),
             attempts: 1,
-            answered,
+            answered_at_start,
         };
-        // A delivery that no longer runs leaves the running one alone.
-        drop(mark(1, false));
+        // A delivery that no longer runs leaves the running one alone, even
+        // one whose answered attempt began before the engage counted since.
+        drop(mark(1, None));
+        drop(mark(1, Some(0)));
         assert_eq!(owing.running.load(Ordering::Acquire), 2);
-        // The running delivery's mark clears it; an answered end is quiet.
-        drop(mark(2, true));
+        assert!(!logs_contain(ENDED_EARLY));
+        assert!(!logs_contain(OWED_RESEND));
+        // The running delivery's mark clears it; an end after an answered
+        // attempt that began with every engage counted is quiet.
+        drop(mark(2, Some(1)));
         assert_eq!(owing.running.load(Ordering::Acquire), 0);
         assert!(!logs_contain(ENDED_EARLY));
+        assert!(!logs_contain(OWED_RESEND));
         owing.running.store(3, Ordering::Release);
-        drop(mark(3, false));
+        drop(mark(3, None));
         assert_eq!(owing.running.load(Ordering::Acquire), 0);
+        assert!(!logs_contain(OWED_RESEND));
+        // An answered attempt that began before the one engage counted owes
+        // the estop to that engage.
+        owing.running.store(4, Ordering::Release);
+        drop(mark(4, Some(0)));
+        assert_eq!(owing.running.load(Ordering::Acquire), 0);
+        logs_assert(one_owed_line([4; 32]));
         let by = format!("by={}", hex::encode([3u8; 32]));
         logs_assert(|logs| match lines_with(logs, &[ENDED_EARLY]).as_slice() {
-            [line] if line.contains("ERROR") && line.contains(&by) => Ok(()),
+            [line] if has(line, "ERROR") && has(line, &by) => Ok(()),
             lines => Err(format!("early-end lines: {lines:#?}")),
         });
+        assert_eq!(
+            owing.period.lock().unwrap().engager,
+            Some([2; 32]),
+            "a delivery's mark ended its period"
+        );
     }
 
     #[test]
@@ -4589,13 +4877,71 @@ mod tests {
         stand_in.release.notify_one();
         runtime.block_on(until_delivered(&rcpd));
         // On a runtime that has shut down, the spawn drops the delivery,
-        // whose mark writes its early-end line on this thread.
+        // whose mark writes its early-end line on the sending thread. That
+        // send runs on a thread of its own: a mark dropped while `send` holds
+        // `period` blocks its thread on that lock, and the bounded wait below
+        // fails.
         let gone = tokio::runtime::Runtime::new().unwrap();
         let handle = gone.handle().clone();
         drop(gone);
         let late = RcpdEstop::new(&link, bare_trust(), handle);
-        assert_eq!(send_watched(&late, [3; 32]), (true, 1, 0));
-        assert_eq!(late.owing.running.load(Ordering::Acquire), 0);
+        let owing = late.owing.clone();
+        let (answered, answer) = std::sync::mpsc::channel();
+        let sending = std::thread::spawn(move || {
+            let _ = answered.send(send_watched(&late, [3; 32]));
+        });
+        let answer = match answer.recv_timeout(Duration::from_secs(20)) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("send dropped a delivery's mark while it held the period lock")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the send panicked before it answered")
+            }
+        };
+        sending.join().unwrap();
+        assert_eq!(answer, (true, 1, 0));
+        assert_eq!(owing.running.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_delivery_mark_writes_its_end_line_with_the_period_lock_released() {
+        // A second live dispatcher: each callsite's interest is asked of
+        // every dispatcher, so it is never cached as never.
+        let _keep = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        // Unset, the mark writes its early-end line; set to a count below
+        // the two engages, its owed line.
+        for answered_at_start in [None, Some(1)] {
+            let owing = Arc::new(Owing {
+                period: Mutex::new(Period::default()),
+                engages: AtomicU64::new(2),
+                running: AtomicU64::new(7),
+            });
+            let events = Arc::new(AtomicU64::new(0));
+            let under_lock = Arc::new(AtomicU64::new(0));
+            let watch = WatchesPeriod {
+                owing: owing.clone(),
+                events: events.clone(),
+                under_lock: under_lock.clone(),
+            };
+            let mark = Running {
+                owing: owing.clone(),
+                id: 7,
+                by: hex::encode([7u8; 32]),
+                attempts: 1,
+                answered_at_start,
+            };
+            tracing::subscriber::with_default(watch, || drop(mark));
+            assert_eq!(
+                (
+                    events.load(Ordering::Acquire),
+                    under_lock.load(Ordering::Acquire)
+                ),
+                (1, 0),
+                "{answered_at_start:?}: the lines the mark wrote, and those under the lock"
+            );
+            assert_eq!(owing.running.load(Ordering::Acquire), 0);
+        }
     }
 
     struct NoCapture;

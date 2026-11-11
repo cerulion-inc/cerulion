@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- An ops `engage-estop` delivery in `cerulion-remoted` can end, on a panic or a dropped runtime, while it deletes the MCP session of an attempt rcpd answered that its latch closed. When an `engage-estop` came after that attempt began, the delivery now logs at error that the `estop` it still owed that `engage-estop` was not sent; the next `engage-estop` sends it. Before, it logged nothing.
+
 ## [2.0.0] - 2026-11-11
 
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. This release changes the command line in ways a script written for 1.x notices, among them the output of `cerulion topic echo` and how `cerulion graph run` runs a graph by default (see Changed), so it is a major version. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 32 (see Changed).
