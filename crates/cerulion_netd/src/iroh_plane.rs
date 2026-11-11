@@ -99,7 +99,7 @@ pub use cerulion_wireclient::epoch::{EpochPushOutcome, EpochPushSeverity};
 use cerulion_wireclient::protocol::{
     decode_first_reply, is_unpaired_refusal, StreamPreamble, WireRequest, WireResponse,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
@@ -113,6 +113,31 @@ use crate::wan::{WanRegistry, WanRobot};
 /// loud rather than pin every other control op. Overridable via
 /// [`IrohMirrorPlane::with_dial_timeout`] (tests shorten it).
 pub const DEFAULT_WAN_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+enum PlaneRuntime {
+    Owned(Runtime),
+    Shared(Handle),
+}
+
+impl PlaneRuntime {
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        match self {
+            Self::Owned(runtime) => runtime.block_on(future),
+            Self::Shared(runtime) => runtime.block_on(future),
+        }
+    }
+
+    fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match self {
+            Self::Owned(runtime) => runtime.spawn(future),
+            Self::Shared(runtime) => runtime.spawn(future),
+        }
+    }
+}
 
 /// TLS reachability of a registered endpoint, without requesting access or data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +219,8 @@ struct IrohState {
     /// robot name → its live connection.
     robots: HashMap<String, RobotConn>,
     account_invalidated: bool,
+    /// Shared endpoints belong to the serving host and must never be closed here.
+    shared_endpoint: bool,
 }
 
 /// The iroh WAN mirror plane. Owns the desk's iroh endpoint, the per-robot
@@ -207,7 +234,7 @@ pub struct IrohMirrorPlane {
     /// The WAN robot registry (dial params + the desk seed + relay posture).
     registry: Arc<WanRegistry>,
     /// The dedicated tokio runtime the async iroh world runs on.
-    rt: Runtime,
+    rt: PlaneRuntime,
     /// The lazy endpoint + per-robot connections.
     inner: Arc<AsyncMutex<IrohState>>,
     /// The bound on a dial + each control/stream await.
@@ -239,6 +266,7 @@ pub struct IrohMirrorPlane {
     /// reconnect. A plain `std` mutex (no `.await` is ever held across it) so the
     /// shared push substrate can consult it as a synchronous gate.
     missing_cache_noted: Arc<std::sync::Mutex<HashSet<String>>>,
+    shared_control: Option<crate::shared_endpoint::SharedMirrorPlane>,
 }
 
 impl IrohMirrorPlane {
@@ -266,18 +294,68 @@ impl IrohMirrorPlane {
         Ok(Self {
             manager,
             registry,
-            rt,
+            rt: PlaneRuntime::Owned(rt),
             inner: Arc::new(AsyncMutex::new(IrohState {
                 endpoint: None,
                 robots: HashMap::new(),
                 account_invalidated: false,
+                shared_endpoint: false,
             })),
             dial_timeout: DEFAULT_WAN_DIAL_TIMEOUT,
             desk_key,
             authorizer: Arc::new(AllowAllAuthorizer),
             epoch_pushes: Arc::new(AsyncMutex::new(HashMap::new())),
             missing_cache_noted: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            shared_control: None,
         })
+    }
+
+    /// Consume through the serving host's endpoint without binding another one.
+    /// The registry must carry the same device identity as the endpoint.
+    /// `runtime` is the endpoint owner's runtime and must outlive the endpoint.
+    pub fn with_endpoint(mut self, endpoint: Endpoint, runtime: Handle) -> Result<Self, String> {
+        if endpoint.id().as_bytes() != &self.desk_key {
+            return Err("shared endpoint does not match the current device key".into());
+        }
+        self.rt.block_on(async {
+            let mut state = self.inner.lock().await;
+            if state.endpoint.is_some() || !state.robots.is_empty() {
+                return Err::<(), String>(
+                    "shared endpoint must be installed before any outgoing operation".into(),
+                );
+            }
+            state.endpoint = Some(endpoint);
+            state.shared_endpoint = true;
+            Ok(())
+        })?;
+        // Iroh connection drivers must survive local control/mirror retirement.
+        // A separate mirror runtime would strand their endpoint close events.
+        self.rt = PlaneRuntime::Shared(runtime);
+        Ok(self)
+    }
+
+    /// Delegate outbound mirrors to the serving process's owned endpoint.
+    /// This constructor never binds an endpoint in the consumer process.
+    pub fn new_shared(
+        manager: Arc<TransportManager>,
+        registry: Arc<WanRegistry>,
+        socket: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let shared_control = crate::shared_endpoint::SharedMirrorPlane::new(
+            socket,
+            manager.clone(),
+            registry.clone(),
+        );
+        let mut plane = Self::new(manager, registry)?;
+        plane.shared_control = Some(shared_control);
+        Ok(plane)
+    }
+
+    pub(crate) fn registry_owner(
+        &self,
+        proof: Option<Arc<cerulion_pairing::verify::OwnerCertificatePresentationWire>>,
+    ) -> Result<(), String> {
+        self.registry.replace_owner_certificate(proof)
     }
 
     /// Override the dial / await timeout (tests shorten it to catch a stalling /
@@ -303,6 +381,13 @@ impl IrohMirrorPlane {
     /// Account/key changes require a new plane and registry. The caller must also
     /// retire its mirror bookkeeping before installing that replacement.
     pub fn invalidate_account(&self) -> Result<(), String> {
+        if let Some(control) = &self.shared_control {
+            let cleanup_result = control.invalidate();
+            return self
+                .registry
+                .replace_owner_certificate(None)
+                .and(cleanup_result);
+        }
         let proof_result = self.registry.replace_owner_certificate(None);
         let cleanup_result = self.rt.block_on(async {
             let mut state = self.inner.lock().await;
@@ -337,7 +422,9 @@ impl IrohMirrorPlane {
                 }
             }
             if let Some(endpoint) = state.endpoint.take() {
-                endpoint.close().await;
+                if !state.shared_endpoint {
+                    endpoint.close().await;
+                }
             }
             cleanup_error.map_or(Ok(()), Err)
         });
@@ -355,6 +442,10 @@ impl IrohMirrorPlane {
         &self,
         robots: HashMap<String, WanRobot>,
     ) -> Result<Vec<TopicKey>, String> {
+        if let Some(control) = &self.shared_control {
+            self.registry.replace_membership(robots)?;
+            return control.sync();
+        }
         if robots
             .keys()
             .any(|robot| robot.is_empty() || robot.trim() != robot)
@@ -430,6 +521,9 @@ impl IrohMirrorPlane {
     /// Check TLS reachability only. No control request, enrollment or demand is
     /// sent. The total budget includes waiting for the plane and endpoint setup.
     pub fn probe_robot(&self, robot: &str, timeout: Duration) -> Result<RobotProbeOutcome, String> {
+        if let Some(control) = &self.shared_control {
+            return control.probe(robot, timeout);
+        }
         self.rt.block_on(async {
             match tokio::time::timeout(timeout, async {
                 let mut state = self.inner.lock().await;
@@ -470,6 +564,9 @@ impl IrohMirrorPlane {
     /// The total budget covers every phase, including waiting for the plane.
     /// Active topic readers keep their existing connection.
     pub fn query_catalog(&self, robot: &str, timeout: Duration) -> Result<CatalogReply, String> {
+        if let Some(control) = &self.shared_control {
+            return control.catalog(robot, timeout);
+        }
         self.rt.block_on(async {
             tokio::time::timeout(timeout, async {
                 let mut state = self.inner.lock().await;
@@ -498,6 +595,9 @@ impl IrohMirrorPlane {
         topic: &str,
         timeout: Duration,
     ) -> Result<SchemaReply, String> {
+        if let Some(control) = &self.shared_control {
+            return control.schema(robot, topic, timeout);
+        }
         self.rt.block_on(async {
             tokio::time::timeout(timeout, async {
                 let mut state = self.inner.lock().await;
@@ -1343,6 +1443,9 @@ impl IrohMirrorPlane {
     /// Check a pinned demand without waiting behind another WAN operation.
     /// A busy state is an error, never evidence that its reader is absent.
     pub fn has_reader(&self, key: &TopicKey) -> Result<bool, String> {
+        if let Some(control) = &self.shared_control {
+            return control.has_reader(key);
+        }
         let state = self
             .inner
             .try_lock()
@@ -1367,6 +1470,9 @@ impl IrohMirrorPlane {
     /// remain live. On cleanup failure, invalidate the whole account plane before
     /// creating a replacement; partial teardown cannot be rolled back.
     pub fn retire_robot(&self, robot: &str) -> Result<(), String> {
+        if let Some(control) = &self.shared_control {
+            return control.retire(robot);
+        }
         if robot.is_empty() || robot.trim() != robot {
             return Err("WAN retirement requires a nonempty canonical identifier".into());
         }
@@ -1496,6 +1602,18 @@ impl IrohMirrorPlane {
     }
 }
 
+impl Drop for IrohMirrorPlane {
+    fn drop(&mut self) {
+        // Owned runtime drop aborts its tasks. Shared handles do not: explicitly
+        // retire readers so their injection slots cannot outlive this plane.
+        if self.shared_control.is_some() || matches!(&self.rt, PlaneRuntime::Shared(_)) {
+            if let Err(error) = self.invalidate_account() {
+                tracing::warn!(error = %error, "outbound mirror shutdown could not acknowledge retirement");
+            }
+        }
+    }
+}
+
 /// The supervising per-topic reader: drive the SHARED validated re-inject primitive
 /// ([`IngressInjector::reinject_raw`]) until the uni stream ends, then — ONLY on a
 /// natural exit (a release-abort cancels this future before this point) — fire the
@@ -1595,6 +1713,25 @@ impl MirrorPlane for IrohMirrorPlane {
     }
 
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
+        if let Some(control) = &self.shared_control {
+            if let DemandDecision::Deny { reason } = self.authorizer.authorize_demand(
+                &DemandSubject::Wan {
+                    demander_key: self.desk_key,
+                },
+                &key.topic,
+            ) {
+                return Err(MirrorError::Iroh {
+                    key: key.clone(),
+                    reason: reason.to_string(),
+                });
+            }
+            return control
+                .ensure(key, schema_hash)
+                .map_err(|reason| MirrorError::Iroh {
+                    key: key.clone(),
+                    reason,
+                });
+        }
         self.rt
             .block_on(self.ensure_async(key, schema_hash))
             .map_err(|reason| MirrorError::Iroh {
@@ -1604,6 +1741,9 @@ impl MirrorPlane for IrohMirrorPlane {
     }
 
     fn release_mirror(&self, key: &TopicKey) -> MirrorRelease {
+        if let Some(control) = &self.shared_control {
+            return control.release(key);
+        }
         self.rt.block_on(self.release_async(key))
     }
 }

@@ -106,6 +106,8 @@ pub mod account_controller;
 #[cfg(feature = "wan")]
 pub mod iroh_plane;
 #[cfg(feature = "wan")]
+pub mod shared_endpoint;
+#[cfg(feature = "wan")]
 pub mod wan;
 
 pub use catalog_events::{

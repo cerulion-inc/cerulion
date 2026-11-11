@@ -54,6 +54,7 @@ fn delayed_old_cleanup_cannot_remove_replacement_provenance() {
         endpoint: None,
         robots: HashMap::new(),
         account_invalidated: false,
+        shared_endpoint: false,
     }));
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (continue_tx, continue_rx) = mpsc::sync_channel(1);
