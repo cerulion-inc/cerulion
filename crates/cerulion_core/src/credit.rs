@@ -139,7 +139,9 @@
 //!   queued, its forgiven backlog included, clips the word at 0, and is
 //!   reported once per regime and counted by the consumer
 //!   (`CerulionSubscriber::block_drains_clipped`); a drain the word's count
-//!   still covers is indistinguishable from a counted drain.
+//!   still covers is indistinguishable from a counted drain. A released slot
+//!   ([`CreditShared::release_slot`]) counts nothing, so its drains report no
+//!   clip.
 //! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
 //!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
 //!   without touching the word, so a `block` input read through them leaves
@@ -644,6 +646,10 @@ pub struct Drained {
     /// `multi_publisher_topics` topic, or a count another drain already
     /// took). The consumer's block probe reports it once per regime
     /// (`CerulionSubscriber::block_drains_clipped`).
+    ///
+    /// `0` on a released slot ([`CreditShared::release_slot`]): the release
+    /// zeroed the counts and the slot counts nothing after it, so its drains
+    /// remove frames it holds no count for by design.
     pub clipped: u64,
 }
 
@@ -1013,14 +1019,29 @@ impl CreditShared {
     ///
     /// Returns what the drain did, read off this one RMW ([`Drained`]): the
     /// forgiven frames it paid, and the frames it removed past both the
-    /// backlog and the queued count, which the subtraction clipped at 0.
+    /// backlog and the queued count, which the subtraction clipped at 0
+    /// (`0` on a released slot).
     pub fn record_drained(&self, removed: u64) -> Drained {
         if removed == 0 {
             return Drained::default();
         }
         let (prev, next) = self.update_counts(Ordering::Release, |c| c.drained(removed));
         self.note_credit_freed();
-        Drained::between(removed, prev, next)
+        self.clip_unless_released(Drained::between(removed, prev, next))
+    }
+
+    /// `drained` with its clip zeroed when this slot is released
+    /// ([`Self::release_slot`]), which counts nothing, so a frame its consumer
+    /// drains after the release is one the slot holds no count for by design.
+    /// Loads the release mark only when the drain clipped.
+    fn clip_unless_released(&self, drained: Drained) -> Drained {
+        if drained.clipped != 0 && self.is_released() {
+            return Drained {
+                clipped: 0,
+                ..drained
+            };
+        }
+        drained
     }
 
     /// [`Self::record_drained`] and the empty-queue resync in ONE RMW: the
@@ -1033,7 +1054,10 @@ impl CreditShared {
     ///
     /// Returns what the drain half did, as [`Self::record_drained`] does; the
     /// queued count and the backlog the resync zeroes left the queue unread,
-    /// so they are neither paid nor clipped.
+    /// so they are neither paid nor clipped. The split is read off the
+    /// closure's last run, so it stands when the RMW stores nothing (a drain
+    /// of frames the word never counted, on a word whose queued count and
+    /// backlog are already 0).
     fn record_drained_and_emptied(&self, removed: u64) -> Drained {
         let mut changed = false;
         let mut drain = Drained::default();
@@ -1050,7 +1074,7 @@ impl CreditShared {
         if removed != 0 || changed {
             self.note_credit_freed();
         }
-        drain
+        self.clip_unless_released(drain)
     }
 
     /// Record that frames the consumer popped from its queue now sit in its
@@ -1125,7 +1149,8 @@ impl CreditShared {
     ///
     /// A publish that read the slot unreleased just before this call can still
     /// land its increment after the zeroing store; [`Self::is_full`] reads the
-    /// mark first, so that stray count never defers anyone.
+    /// mark first, so that stray count never defers anyone. A drain of the
+    /// released slot reports no clip ([`Drained::clipped`]).
     pub fn release_slot(&self) -> bool {
         if self
             .released
@@ -2771,11 +2796,15 @@ mod tests {
     /// - `(2, 0, 0, 1) -> (0, 0, (1, 0, 0))`;
     /// - `(3, 0, 0, 0) -> (0, 0, (3, 0, 0))`: an idle drain changes nothing;
     /// - `(3, 0, 0, u64::MAX) -> (0, u64::MAX - 3, (0, 0, 0))`: past
-    ///   `u32::MAX`, where the queued subtraction saturates.
+    ///   `u32::MAX`, where the queued subtraction saturates;
+    /// - `(0, 0, 0, 1) -> (0, 1, (0, 0, 0))`: a frame the word never counted;
+    /// - `(0, 0, 1, 1) -> (0, 1, (0, 0, 1))`: the same beside a held frame.
     ///
     /// A local word's `record_drained_to_empty` returns the same split, read
     /// off the drain half of its RMW, and then zeroes the queued count and the
-    /// backlog it finds left; the held frame stays.
+    /// backlog it finds left; the held frame stays. On the last two vectors the
+    /// emptied RMW finds nothing to change and stores nothing, and its clip
+    /// still stands.
     #[test]
     fn a_drain_reports_what_it_paid_and_what_it_clipped() {
         let counts = |queued, backlog, held| Counts {
@@ -2784,13 +2813,15 @@ mod tests {
             held,
             held_forgiven: 0,
         };
-        let vectors: [(Counts, u64, u64, u64, Counts); 6] = [
+        let vectors: [(Counts, u64, u64, u64, Counts); 8] = [
             (counts(0, 2, 0), 3, 2, 1, counts(0, 0, 0)),
             (counts(0, 2, 0), 1, 1, 0, counts(0, 1, 0)),
             (counts(1, 0, 1), 2, 0, 1, counts(0, 0, 1)),
             (counts(2, 0, 0), 1, 0, 0, counts(1, 0, 0)),
             (counts(3, 0, 0), 0, 0, 0, counts(3, 0, 0)),
             (counts(3, 0, 0), u64::MAX, 0, u64::MAX - 3, counts(0, 0, 0)),
+            (counts(0, 0, 0), 1, 0, 1, counts(0, 0, 0)),
+            (counts(0, 0, 1), 1, 0, 1, counts(0, 0, 1)),
         ];
         for (before, removed, paid, clipped, after) in vectors {
             let w = CreditWord::local(4);
@@ -2824,6 +2855,66 @@ mod tests {
                  to empty on {before:?})"
             );
         }
+    }
+
+    /// A drain of a released slot clips nothing: the release zeroed the counts
+    /// and the slot counts nothing after it. Oracle, by hand, on depth-4
+    /// words: two frames are counted (2) and the slot is released (0). A
+    /// drain of 3 and a drain of 1 to empty each read `Drained { paid: 0,
+    /// clipped: 0 }` and leave the word at 0. A stray count of one frame that
+    /// a publish lands after the release (the race `release_slot` describes,
+    /// stored here by hand) is taken off by a drain of 2, which pays nothing
+    /// and clips nothing. The control: the same drains on an armed word at 0
+    /// clip 3 and 1.
+    #[test]
+    fn a_drain_of_a_released_slot_clips_nothing() {
+        let released = CreditWord::local(4);
+        assert_eq!(released.record_published_n(2), 2);
+        assert!(released.release_slot());
+        assert_eq!(released.outstanding(), 0, "the release zeroed the counts");
+        assert_eq!(
+            released.record_drained(3),
+            Drained::default(),
+            "a drain of 3 on the released slot clips nothing"
+        );
+        assert_eq!(
+            released.record_drained_to_empty(1),
+            Drained::default(),
+            "and neither does a drain of 1 to empty"
+        );
+        assert_eq!(released.outstanding(), 0);
+        released.counts.store(
+            Counts {
+                queued: 1,
+                ..Counts::default()
+            }
+            .pack(),
+            Ordering::Release,
+        );
+        assert_eq!(
+            released.record_drained(2),
+            Drained::default(),
+            "a drain past a stray count on the released slot clips nothing"
+        );
+        assert_eq!(released.outstanding(), 0, "and takes the stray count off");
+
+        let armed = CreditWord::local(4);
+        assert_eq!(
+            armed.record_drained(3),
+            Drained {
+                paid: 0,
+                clipped: 3
+            },
+            "the control: an armed word at 0 clips the drain of 3"
+        );
+        assert_eq!(
+            armed.record_drained_to_empty(1),
+            Drained {
+                paid: 0,
+                clipped: 1
+            },
+            "and the drain of 1 to empty"
+        );
     }
 
     /// Two clones of one LOCAL word are one word — the property every wiring

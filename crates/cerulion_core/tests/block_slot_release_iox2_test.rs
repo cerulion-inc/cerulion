@@ -14,6 +14,10 @@
 //!   back through the real publisher and restores the forgiven backlog that
 //!   count clamped, and the next frame is delivered; the drains of forgiven
 //!   frames report no clip, one frame at a time or in one read;
+//! - a consumer that keeps draining after its slot is released reports no
+//!   clip and logs no line of the clip report, on a latest and a FIFO input,
+//!   and a local word reports the drain of a frame it never counted when that
+//!   drain finds the queue empty: one loud head, then a counted repeat;
 //! - after a timeout release, a frame the release forgave that the per-set
 //!   Sync matcher moves into a slot (the trigger fill or refill, the
 //!   descent's peek) stays forgiven, a skipped forgiven head refilled with a
@@ -1046,6 +1050,175 @@ fn a_drain_of_forgiven_frames_reports_no_clip() {
         0,
         "a drain of a forgiven frame and a counted one clips nothing"
     );
+}
+
+/// The words every line of a `block` input's clip report starts with: the
+/// loud head, the decade line, the counted repeat and the recovery line.
+const CLIP_REPORT: &str = "block credit drain";
+/// The text of the loud line a clipped drain logs.
+const CLIP_LOUD: &str = "block credit drain removed frames its word never counted";
+/// The text of a counted repeat, logged at `debug`.
+const CLIP_REPEAT: &str = "block credit drain clipped at zero again";
+/// The text of the recovery line.
+const CLIP_RECOVERED: &str = "block credit drains match the word's count again";
+
+/// A consumer that keeps draining after its slot is released reports no clip:
+/// the release zeroed the slot's counts and the slot counts nothing after it,
+/// so a drain of a frame queued before the release or sent after it removes a
+/// frame the slot holds no count for by design, not one a writer outside the
+/// graph sent.
+///
+/// Oracle, by hand, on depth-2 local words over real depth-2 queues, as
+/// `(outstanding, forgiven)`. An input whose read drains the queue: frames 1
+/// and 2 are published (2, 0) and the slot is released (0, 0); frame 3 counts
+/// nothing and evicts frame 1, one read removes frames 2 and 3 and serves
+/// frame 3 (0, 0), and frame 4 is published and read the same way. A FIFO
+/// input: frame 1 is published (1, 0), the slot is released (0, 0), frame 2
+/// is published, and the reads serve frames 1 and 2 and then find the queue
+/// empty. `block_drains_clipped()` reads 0 after every read, and no line of
+/// the clip report is logged at any level. A clip reckoned without the
+/// release would count every one of those drains and log the loud head.
+#[test]
+#[traced_test]
+fn a_drain_of_a_released_slot_reports_no_clip() {
+    // How many captured lines carry `text`, at any level.
+    let lines_with = |text: &str| {
+        let n = std::cell::Cell::new(0usize);
+        logs_assert(|lines: &[&str]| {
+            n.set(lines.iter().filter(|l| l.contains(text)).count());
+            Ok(())
+        });
+        n.get()
+    };
+    let latest = CreditWord::local(2);
+    let (_latest_mgr, mut publisher, mut sub) = counting_edge("released_latest", &latest, false);
+    publish_x(&mut publisher, 1);
+    publish_x(&mut publisher, 2);
+    assert_eq!(counts(&latest), (2, 0), "frames 1 and 2 are counted");
+    assert!(latest.release_slot(), "the release takes the slot");
+    assert_eq!(counts(&latest), (0, 0), "and zeroes its counts");
+    publish_x(&mut publisher, 3);
+    assert_eq!(counts(&latest), (0, 0), "the released slot counts nothing");
+    assert_eq!(
+        read_x(&mut sub),
+        Some(3),
+        "the read drains frames 2 and 3 and serves the newest"
+    );
+    assert_eq!(counts(&latest), (0, 0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        0,
+        "a drain of the released slot is no clip"
+    );
+    publish_x(&mut publisher, 4);
+    assert_eq!(read_x(&mut sub), Some(4), "frame 4 is delivered");
+    assert_eq!(counts(&latest), (0, 0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        0,
+        "and neither is the drain of a frame sent after the release"
+    );
+    assert!(latest.is_released(), "the slot stays released");
+
+    let fifo = CreditWord::local(2);
+    let (_fifo_mgr, mut publisher, mut sub) = counting_edge("released_fifo", &fifo, true);
+    publish_x(&mut publisher, 1);
+    assert_eq!(counts(&fifo), (1, 0), "frame 1 is counted");
+    assert!(fifo.release_slot());
+    publish_x(&mut publisher, 2);
+    assert_eq!(read_x(&mut sub), Some(1), "frame 1");
+    assert_eq!(read_x(&mut sub), Some(2), "frame 2");
+    assert_eq!(read_x(&mut sub), None, "and the queue is empty");
+    assert_eq!(counts(&fifo), (0, 0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        0,
+        "no FIFO drain of the released slot clips"
+    );
+
+    assert_eq!(
+        lines_with(CLIP_REPORT),
+        0,
+        "no line of the clip report, at any level"
+    );
+}
+
+/// A frame a LOCAL word never counted is reported by the drain that finds the
+/// queue empty, the read a latest input makes. Its word's queued count and
+/// backlog are already 0 there, so the drain and the empty-queue resync leave
+/// the word as it was and its RMW stores nothing; the clip is reported all the
+/// same.
+///
+/// A writer the word does not count (a second writer on a
+/// `multi_publisher_topics` topic is one) sends frames 1 and 2 to a `block`
+/// input on a depth-2 local word over a real depth-2 queue, and each is read
+/// on its own. Oracle, by hand: the read of frame 1 clips (1) and is the loud
+/// head of the input's first regime; the read of frame 2 clips again (2)
+/// before any clean drain closed that regime, so it is a counted repeat. One
+/// loud line, one repeat at `debug`, no recovery line, and the word reads (0, 0)
+/// after each read.
+#[test]
+#[traced_test]
+fn a_local_word_reports_the_drain_of_a_frame_it_never_counted() {
+    // How many captured lines carry `text`, at any level.
+    let lines_with = |text: &str| {
+        let n = std::cell::Cell::new(0usize);
+        logs_assert(|lines: &[&str]| {
+            n.set(lines.iter().filter(|l| l.contains(text)).count());
+            Ok(())
+        });
+        n.get()
+    };
+    let word = CreditWord::local(2);
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "bsr_uncounted".to_string(),
+            clock: Arc::new(VirtualClock::new()),
+            subscriber_buffer_size: 2,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = "bsr_uncounted_topic";
+    let mut outside = mgr
+        .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("the outside writer's publisher");
+    let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+    sub.register_block_probe_for_test(
+        word.clone(),
+        2,
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        2,
+    );
+
+    publish_x(&mut outside, 1);
+    assert_eq!(counts(&word), (0, 0), "the outside writer counts nothing");
+    assert_eq!(read_x(&mut sub), Some(1), "frame 1");
+    assert_eq!(counts(&word), (0, 0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        1,
+        "the drain of frame 1 clipped"
+    );
+    publish_x(&mut outside, 2);
+    assert_eq!(read_x(&mut sub), Some(2), "frame 2");
+    assert_eq!(counts(&word), (0, 0));
+    assert_eq!(sub.block_drains_clipped(), 2, "and the drain of frame 2");
+
+    assert_eq!(
+        (
+            lines_with(CLIP_LOUD),
+            lines_with(CLIP_RECOVERED),
+            lines_with(CLIP_REPEAT)
+        ),
+        (1, 0, cerulion_core::testing::debug_lines_expected(1)),
+        "one loud head, no recovery line, and the second clip a counted repeat (a `debug!` \
+         line, so a release build counts none)"
+    );
+    // The level-free twin: in every build, no repeat line was emitted loud.
+    logs_assert(|lines: &[&str]| cerulion_core::testing::never_loud(lines, CLIP_REPEAT));
 }
 
 /// One operation of a hand-driven walk over the two slots of a per-set Sync

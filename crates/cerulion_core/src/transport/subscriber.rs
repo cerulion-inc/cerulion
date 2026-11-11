@@ -2504,10 +2504,10 @@ impl CerulionSubscriber {
     /// unless `block` is wired.
     ///
     /// A drain that removed frames reports what its RMW clipped
-    /// ([`Drained::clipped`](crate::credit::Drained::clipped)) through
-    /// [`Self::report_block_drain`]; an empty drain (`removed == 0`) reports
-    /// nothing, so an idle poll never reads as a drain the word counted in
-    /// full.
+    /// ([`Drained::clipped`](crate::credit::Drained::clipped), `0` on a
+    /// released slot) through [`Self::report_block_drain`]; an empty drain
+    /// (`removed == 0`) reports nothing, so an idle poll never reads as a drain
+    /// the word counted in full.
     ///
     /// Returns how many of the `removed` frames paid the backlog a
     /// `block_timeout_ms` release forgave
@@ -2602,7 +2602,8 @@ impl CerulionSubscriber {
     /// `block`: how many drains of this input removed more frames than their
     /// word had queued, its forgiven backlog included: drains of frames the
     /// word never counted (see
-    /// [`crate::credit::CreditShared::record_drained`]). A
+    /// [`crate::credit::CreditShared::record_drained`]). A drain of a released
+    /// slot ([`crate::credit::CreditShared::release_slot`]) is not one. A
     /// running total, never reset. `0` unless this input is wired `block`.
     /// Hidden from the documented API: tests and the runtime read it, and a
     /// user sees the same condition through the clip report's warning lines.
