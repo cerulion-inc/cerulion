@@ -1650,3 +1650,152 @@ fn raw_loan_and_foreign_completion_refusals_preserve_the_owner_and_delivery() {
         .unwrap();
     assert_eq!(&delivered[..], &expected);
 }
+
+#[test]
+fn raw_egress_refusal_keeps_local_ingress_and_zero_recipient_send_usable() {
+    let h = RawHarness::new(1);
+    let mut request = raw_request("__cerulion/raw-oracle");
+    request.full_queue = abi::full_queue::CONFIG_DEFAULT;
+    let mut out = MaybeUninit::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.create_raw_publisher)(
+            h.context,
+            request,
+            out.as_mut_ptr()
+        ))
+        .code,
+        0
+    );
+    // SAFETY: successful callback initialized the binding.
+    let binding = unsafe { out.assume_init() };
+    // The native control namespace is refused for dynamic egress only.
+    assert_eq!(
+        abi_call!((HOST_API.register_raw_egress)(h.context, binding.port)).code,
+        abi::status_code::FAILED
+    );
+    let slot = h.loan(binding.port, 64);
+    let expected = oracle_frame(8, 900, [1.0, 2.0, 3.0]);
+    fill_raw(&slot, &expected);
+    let mut recipients = 999;
+    assert_eq!(
+        abi_call!((HOST_API.finish_raw_output)(
+            h.context,
+            slot.lease,
+            64,
+            &mut recipients
+        ))
+        .code,
+        0
+    );
+    assert_eq!(recipients, 0);
+    let mut subscriber = h
+        .manager
+        .create_subscriber("__cerulion/raw-oracle")
+        .unwrap();
+    let slot = h.loan(binding.port, 64);
+    fill_raw(&slot, &expected);
+    assert_eq!(
+        abi_call!((HOST_API.finish_raw_output)(
+            h.context,
+            slot.lease,
+            64,
+            &mut recipients
+        ))
+        .code,
+        0
+    );
+    assert_eq!(recipients, 1);
+    let delivered = subscriber
+        .view_raw_expecting(Vector3::SCHEMA_HASH)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&delivered[..], &expected);
+}
+
+#[test]
+fn raw_creation_never_falls_back_to_another_context_transport() {
+    let ordinary = Harness::new(vector_layout(), None, 2);
+    let mut out = MaybeUninit::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.create_raw_publisher)(
+            ordinary.context,
+            raw_request("abi/raw/unavailable"),
+            out.as_mut_ptr()
+        ))
+        .code,
+        abi::status_code::UNSUPPORTED
+    );
+    let zero_budget = RawHarness::new(0);
+    assert_eq!(
+        abi_call!((HOST_API.create_raw_publisher)(
+            zero_budget.context,
+            raw_request("abi/raw/none"),
+            out.as_mut_ptr()
+        ))
+        .code,
+        abi::status_code::BUSY
+    );
+    let mut recipients = 999;
+    assert_eq!(
+        abi_call!((HOST_API.finish_raw_output)(
+            abi::ContextHandle::default(),
+            abi::LeaseHandle::default(),
+            64,
+            &mut recipients
+        ))
+        .code,
+        abi::status_code::INVALID_HANDLE
+    );
+    assert_eq!(recipients, 0);
+}
+
+#[test]
+fn raw_host_publish_and_receive_add_no_heap_allocation_after_warmup() {
+    let h = RawHarness::new(1);
+    let binding = h.create("abi/raw/allocs");
+    let mut subscriber = h.manager.create_subscriber("abi/raw/allocs").unwrap();
+    let expected = oracle_frame(19, 900, [11.0, 12.0, 13.0]);
+    let slot = h.loan(binding.port, 64);
+    fill_raw(&slot, &expected);
+    let mut recipients = 0;
+    assert_eq!(
+        abi_call!((HOST_API.finish_raw_output)(
+            h.context,
+            slot.lease,
+            64,
+            &mut recipients
+        ))
+        .code,
+        0
+    );
+    drop(
+        subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap(),
+    );
+    let count = CountAllocations::begin();
+    for _ in 0..8 {
+        let slot = h.loan(binding.port, 64);
+        fill_raw(&slot, &expected);
+        assert_eq!(
+            abi_call!((HOST_API.finish_raw_output)(
+                h.context,
+                slot.lease,
+                64,
+                &mut recipients
+            ))
+            .code,
+            0
+        );
+        assert_eq!(recipients, 1);
+        let delivered = subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&delivered[..], &expected);
+    }
+    // Subtract exactly the pinned upstream 2035 allocation per native loan.
+    let upstream = upstream_2035_publish_allocs(8);
+    assert_eq!(count.finish() - upstream, 0);
+}

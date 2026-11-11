@@ -339,6 +339,8 @@ impl HostContext {
 
     /// Borrow host runtime services for scheduler maintenance. This hook
     /// never crosses the node ABI and excludes every outstanding accessor.
+    /// Maintenance must preserve bound port owners and topology; their names
+    /// and borrowed topic storage remain fixed for the context lifetime.
     pub fn with_native<R>(
         &mut self,
         operation: impl FnOnce(&mut NodeContext) -> R,
