@@ -58,9 +58,11 @@ impl From<TimeSource> for EngineTimeSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum RecordEnv {
     /// Record every variable NAME, and VALUES only for CERULION_*, RUST_LOG
-    /// and IOX2_*. Every other value is stored as a hash, so a re-execution
-    /// can detect that it changed without the bag carrying your secrets. The
-    /// default.
+    /// and IOX2_* names with no TOKEN, KEY, SECRET, PASSWORD or CREDENTIAL
+    /// part, in any case, plural or with trailing digits (CERULION_KEY2 is
+    /// hashed). Every other value is stored as a hash, so a
+    /// re-execution can detect that it changed without the bag carrying your
+    /// secrets. The default.
     Allowlist,
     /// Record values verbatim. Full fidelity, but the bag embeds whatever
     /// secrets were in your environment (warned loudly at record time).
@@ -3583,7 +3585,8 @@ mod time_source_flag_tests {
         // what it means. Read each arm as a sentence.
         fn want(flag: RecordEnv) -> RecordEnvMode {
             match flag {
-                // `allowlist` (the default): values only for CERULION_*/RUST_LOG/IOX2_*.
+                // `allowlist` (the default): values only for CERULION_*/RUST_LOG/IOX2_*
+                // names with no secret marker segment.
                 RecordEnv::Allowlist => RecordEnvMode::Allowlist,
                 // `all`: verbatim values, secrets included.
                 RecordEnv::All => RecordEnvMode::All,

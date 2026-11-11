@@ -12,9 +12,10 @@
 //!   counts is named by one of those lines or by a later drop or caught-up
 //!   line.
 //!
-//! The pipe is filled as daemon_stop_signal_test.rs fills it: the test reads
-//! stderr up to the listening line, then reads nothing until it releases the
-//! pipe. A stand-in rcpd (hand-rolled HTTP/1 on loopback) reports each
+//! The pipe is filled by `common::stderr_pipe::fill`, the filler
+//! daemon_stop_signal_test.rs uses too: the test reads stderr up to the
+//! listening line, fills the pipe, then reads nothing until it releases
+//! it. A stand-in rcpd (hand-rolled HTTP/1 on loopback) reports each
 //! request it reads. The test seam's queue bound of one line, which the daemon
 //! applies once it has logged that it listens, makes a few log lines overflow
 //! the daemon's log queue; the listening line the test waits for is queued

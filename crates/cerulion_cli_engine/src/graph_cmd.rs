@@ -5637,8 +5637,9 @@ pub fn graph_run(
     // cumulative timing AND re-advanceable in replay for the graph's
     // OWN topics. `None` ⇒ a normal run (zero behavior change).
     record: Option<String>,
-    // The env.json capture policy (`--record-env`).
-    // Only consulted when `record` is `Some`.
+    // The env.json capture policy (`--record-env`). Renders the bag's
+    // env.json AND the run directory's env.json, which every run writes,
+    // recorded or not.
     record_env: RecordEnvMode,
     // bagd CPU placement (`--record-cpu`). Only
     // consulted when `record` is `Some`.
@@ -16576,8 +16577,10 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
 pub enum RecordEnvMode {
     /// The DEFAULT: record every variable NAME; record VALUES only for names
     /// on the documented allowlist ([`ENV_VALUE_ALLOWLIST_DOC`]: `CERULION_*`,
-    /// `RUST_LOG`, `IOX2_*`). Every other value is replaced by
-    /// `{"redacted": true, "fnv64": "<hex of the value's FNV-1a 64 hash>"}` —
+    /// `RUST_LOG`, `IOX2_*`) that carry no secret marker segment
+    /// ([`ENV_SECRET_NAME_MARKERS`], so `CERULION_RCP_TOKEN` is hashed). Every
+    /// other value is replaced by
+    /// `{"redacted": true, "fnv64": "<hex of the value's FNV-1a 64 hash>"}`:
     /// replay can DETECT divergence (hash mismatch) without the bag leaking the
     /// secret itself.
     #[default]
@@ -16591,8 +16594,22 @@ pub enum RecordEnvMode {
 }
 
 /// The documented `--record-env allowlist` value-allowlist (names whose VALUES
-/// are recorded verbatim under the default mode).
+/// are recorded verbatim under the default mode, unless the name carries a
+/// secret marker segment from [`ENV_SECRET_NAME_MARKERS`]).
 pub const ENV_VALUE_ALLOWLIST_DOC: &str = "CERULION_*, RUST_LOG, IOX2_*";
+
+/// The name segments that mark a variable as a SECRET under
+/// [`RecordEnvMode::Allowlist`]: its value is hashed like a non-allowlisted
+/// one even when the name is on [`ENV_VALUE_ALLOWLIST_DOC`].
+///
+/// A name is split into segments at every character that is not an ASCII
+/// letter or digit. A segment marks a secret when, compared
+/// case-insensitively and with any trailing digits removed, it equals one of
+/// these markers or the marker followed by `S` (`CERULION_API_KEY`,
+/// `CERULION_KEY2`, `CERULION_SECRETS`, `CERULION_DB-PASSWORD`). A marker
+/// inside a longer segment does not count (`CERULION_KEYBOARD_LAYOUT`,
+/// `CERULION_TOKENIZER`, `CERULION_APIKEY`), and `CERT` is not a marker.
+pub const ENV_SECRET_NAME_MARKERS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"];
 
 /// Where the spawned `bagd` recorder child runs
 /// (`graph run --record-cpu <CORE|none>`).
@@ -16748,11 +16765,28 @@ fn permitted_core_count() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
 }
 
+/// Whether `name` carries a secret marker segment (the rule on
+/// [`ENV_SECRET_NAME_MARKERS`]). Pure: it reads the name only, never the value.
+#[cfg(unix)]
+fn env_name_marks_a_secret(name: &str) -> bool {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|segment| {
+            let word = segment.trim_end_matches(|c: char| c.is_ascii_digit());
+            let plural_stem = word.strip_suffix(|c: char| c.eq_ignore_ascii_case(&'S'));
+            ENV_SECRET_NAME_MARKERS.iter().any(|marker| {
+                word.eq_ignore_ascii_case(marker)
+                    || plural_stem.is_some_and(|stem| stem.eq_ignore_ascii_case(marker))
+            })
+        })
+}
+
 /// Whether `name`'s VALUE is recorded verbatim under
-/// [`RecordEnvMode::Allowlist`] (see [`ENV_VALUE_ALLOWLIST_DOC`]).
+/// [`RecordEnvMode::Allowlist`]: the name is on [`ENV_VALUE_ALLOWLIST_DOC`]
+/// and [`env_name_marks_a_secret`] does not mark it.
 #[cfg(unix)]
 fn env_value_allowlisted(name: &str) -> bool {
-    name.starts_with("CERULION_") || name == "RUST_LOG" || name.starts_with("IOX2_")
+    (name.starts_with("CERULION_") || name == "RUST_LOG" || name.starts_with("IOX2_"))
+        && !env_name_marks_a_secret(name)
 }
 
 /// Render the `env.json` attachment bytes for `mode`
@@ -16831,9 +16865,10 @@ fn warn_record_env_mode(mode: RecordEnvMode) {
         ),
         RecordEnvMode::Allowlist => tracing::info!(
             allowlist = ENV_VALUE_ALLOWLIST_DOC,
+            secret_name_markers = %ENV_SECRET_NAME_MARKERS.join(", "),
             "recording env snapshot in allowlist mode: values recorded for allowlisted names \
-             only; all other values redacted to an FNV-1a 64 hash (divergence-detectable, \
-             secret-free)"
+             only, except a name with a secret marker segment; all other values redacted to an \
+             FNV-1a 64 hash (divergence-detectable, secret-free)"
         ),
     }
 }
@@ -26325,6 +26360,184 @@ process_groups:
         assert!(pa < pm && pm < pz, "keys must serialize SORTED: {text}");
     }
 
+    /// The secret-name rule over hand-written names: a marker counts only as
+    /// its own segment (split at every character that is not an ASCII letter or digit),
+    /// case-insensitively, with trailing digits removed, singular or plural.
+    #[cfg(unix)]
+    #[test]
+    fn env_name_marks_a_secret_matches_whole_marker_segments_only() {
+        let secret = [
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "cerulion_api_key",
+            "CERULION_Rcp_Token",
+            "CERULION_KEY2",
+            "CERULION_KEYS2",
+            "CERULION_SECRET",
+            "CERULION_SECRETS",
+            "CERULION_TOKENS",
+            "CERULION_KEYS",
+            "cerulion_api_keys",
+            "CERULION_PASSWORDS",
+            "CERULION_CREDENTIALS",
+            "CERULION_DB-PASSWORD",
+            "CERULION_DB.PASSWORD",
+            "CERULION_CREDENTIAL_FILE",
+            "CERULION__KEY",
+            "IOX2_SECRET",
+            "TOKEN",
+        ];
+        for name in secret {
+            assert!(
+                env_name_marks_a_secret(name),
+                "{name} has a secret marker segment and must be marked"
+            );
+        }
+        let plain = [
+            "CERULION_EXECUTION_MODE",
+            "RUST_LOG",
+            "IOX2_X",
+            "CERULION_KEYBOARD_LAYOUT",
+            "KEYBOARD_LAYOUT",
+            "CERULION_MONKEY",
+            "CERULION_TOKENIZER",
+            "CERULION_SECRETARY",
+            "CERULION_NETD_DEVICE_CERT",
+            "CERULION_NETD_TLS_CERTIFICATE",
+            "CERULION_APIKEY",
+            "CERULION_PASSWD",
+            "CERULION_AUTHTOKEN",
+            "CERULION_2KEY",
+            "CERULION_KEYSS",
+            "",
+        ];
+        for name in plain {
+            assert!(
+                !env_name_marks_a_secret(name),
+                "{name} has no secret marker segment and must stay unmarked"
+            );
+        }
+    }
+
+    /// The allowlist decision: allowlisted names stay verbatim unless the
+    /// name marks a secret; a name off the allowlist is never verbatim.
+    #[cfg(unix)]
+    #[test]
+    fn env_value_allowlisted_refuses_a_secret_named_allowlisted_variable() {
+        let verbatim = [
+            "CERULION_EXECUTION_MODE",
+            "RUST_LOG",
+            "IOX2_X",
+            "CERULION_KEYBOARD_LAYOUT",
+            "CERULION_MONKEY",
+            "CERULION_TOKENIZER",
+            "CERULION_NETD_DEVICE_CERT",
+        ];
+        for name in verbatim {
+            assert!(env_value_allowlisted(name), "{name} must stay verbatim");
+        }
+        let hashed = [
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "cerulion_api_key",
+            "CERULION_KEY2",
+            "CERULION_SECRETS",
+            "CERULION_DB-PASSWORD",
+            "CERULION_CREDENTIAL_FILE",
+            "IOX2_SECRET",
+            "KEYBOARD_LAYOUT",
+            "AWS_SECRET",
+        ];
+        for name in hashed {
+            assert!(!env_value_allowlisted(name), "{name} must be hashed");
+        }
+    }
+
+    /// The exact `env.json` bytes the default mode writes for a small fixed
+    /// environment. The `fnv64` values are hand oracles: FNV-1a 64 (offset
+    /// basis `0xcbf29ce484222325`, prime `0x100000001b3`) computed outside the
+    /// tree, of `rcp-token-value` and `hunter2`. Both secret-named values are
+    /// hashed even though their names are allowlisted, the plain names keep
+    /// their values, and neither secret appears anywhere in the bytes.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_allowlist_hashes_secret_named_values_to_exact_bytes() {
+        let vars = || {
+            vec![
+                ("RUST_LOG".to_string(), "debug".to_string()),
+                (
+                    "CERULION_RCP_TOKEN".to_string(),
+                    "rcp-token-value".to_string(),
+                ),
+                ("CERULION_KEYBOARD_LAYOUT".to_string(), "us".to_string()),
+                ("CERULION_DB-PASSWORD".to_string(), "hunter2".to_string()),
+                (
+                    "CERULION_EXECUTION_MODE".to_string(),
+                    "lockstep".to_string(),
+                ),
+            ]
+        };
+        let want = "{\n  \
+             \"CERULION_DB-PASSWORD\": {\n    \
+               \"fnv64\": \"4db147a54908e973\",\n    \
+               \"redacted\": true\n  \
+             },\n  \
+             \"CERULION_EXECUTION_MODE\": \"lockstep\",\n  \
+             \"CERULION_KEYBOARD_LAYOUT\": \"us\",\n  \
+             \"CERULION_RCP_TOKEN\": {\n    \
+               \"fnv64\": \"02c98bc82087034e\",\n    \
+               \"redacted\": true\n  \
+             },\n  \
+             \"RUST_LOG\": \"debug\"\n\
+             }";
+        let first = render_env_json(RecordEnvMode::Allowlist, vars());
+        assert_eq!(
+            String::from_utf8(first.clone()).unwrap(),
+            want,
+            "the default mode's env.json bytes"
+        );
+        let text = String::from_utf8_lossy(&first);
+        assert!(!text.contains("rcp-token-value"), "no plaintext token");
+        assert!(!text.contains("hunter2"), "no plaintext password");
+
+        // Determinism: a second render and a reversed input order give the
+        // same bytes.
+        assert_eq!(
+            render_env_json(RecordEnvMode::Allowlist, vars()),
+            first,
+            "two renders are byte-identical"
+        );
+        let reversed: Vec<_> = vars().into_iter().rev().collect();
+        assert_eq!(
+            render_env_json(RecordEnvMode::Allowlist, reversed),
+            first,
+            "input order does not change the bytes"
+        );
+    }
+
+    /// The secret-name rule belongs to the default mode only: `all` keeps a
+    /// secret-named value verbatim and `none` keeps its name with a `null`.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_all_keeps_a_secret_named_value_and_none_keeps_its_name() {
+        let vars = || {
+            vec![(
+                "CERULION_RCP_TOKEN".to_string(),
+                "rcp-token-value".to_string(),
+            )]
+        };
+        assert_eq!(
+            String::from_utf8(render_env_json(RecordEnvMode::All, vars())).unwrap(),
+            "{\n  \"CERULION_RCP_TOKEN\": \"rcp-token-value\"\n}",
+            "all mode is verbatim for a secret-named variable"
+        );
+        assert_eq!(
+            String::from_utf8(render_env_json(RecordEnvMode::None, vars())).unwrap(),
+            "{\n  \"CERULION_RCP_TOKEN\": null\n}",
+            "none mode records the name only"
+        );
+    }
+
     // =======================================================================
     // The UTC bag-filename stamp formatter (hand-rolled
     // epoch→civil; oracle epochs, incl. a stamp observed on a live run).
@@ -28275,6 +28488,11 @@ process_groups:
         assert!(
             logs_contain("allowlist mode") && logs_contain(ENV_VALUE_ALLOWLIST_DOC),
             "the default mode's info must name the documented allowlist"
+        );
+        assert!(
+            logs_contain("except a name with a secret marker segment")
+                && logs_contain("secret_name_markers=TOKEN, KEY, SECRET, PASSWORD, CREDENTIAL"),
+            "the default mode's info must state the secret-name rule and name every marker"
         );
     }
 
