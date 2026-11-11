@@ -41,11 +41,12 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Metadata per-call; refusals keep readers and idle fence. Retire only outbound.
 
 ## Testing
-- Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
+- Run `wire_plane_test` with `-- --test-threads=1`: at the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
-- Family tests parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
+- Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct
+  `TransportManager::get_or_init()` callers are `#[serial]`;
   e2e: loopback iroh only, relay off, direct dial, bounded awaits.
-- remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p` (not default-members).
+- remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
 Read docs/internals/remote-access.md before verb table, trust persistence, wire,
 pairing formats or epoch changes.
