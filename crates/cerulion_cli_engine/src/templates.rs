@@ -1489,11 +1489,12 @@ mod tests {
 
     #[test]
     fn raw_fixture_dependencies_are_a_subset_of_the_scaffold() {
-        let generated: toml::Value = generate_cargo_toml("raw").parse().unwrap();
-        let fixture: toml::Value =
-            include_str!("../../test_fixtures/test_node_raw_ffi_template_cdylib/Cargo.toml")
-                .parse()
-                .unwrap();
+        // Value's FromStr reads one TOML value; these are complete documents.
+        let generated: toml::Value = toml::from_str(&generate_cargo_toml("raw")).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!(
+            "../../test_fixtures/test_node_raw_ffi_template_cdylib/Cargo.toml"
+        ))
+        .unwrap();
         let allowed = generated["dependencies"].as_table().unwrap();
         for name in fixture["dependencies"].as_table().unwrap().keys() {
             assert!(
