@@ -1372,7 +1372,13 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y "${missing[@]}"
           fi
-          libclang=$(ls /usr/lib/llvm-*/lib/libclang*.so* 2>/dev/null | head -n 1 || true)
+          libclang=
+          for candidate in /usr/lib/llvm-*/lib/libclang.so* /usr/lib/llvm-*/lib/libclang-[0-9]*.so*; do
+            if [ -f "$candidate" ]; then
+              libclang=$candidate
+              break
+            fi
+          done
           if [ -z "$libclang" ]; then
             echo 'The runner has no preinstalled libclang for bindgen' >&2
             exit 1

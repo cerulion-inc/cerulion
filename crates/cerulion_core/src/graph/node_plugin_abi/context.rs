@@ -123,7 +123,7 @@ impl PluginNodeContext {
                 direction::OUTPUT,
             )?;
             if binding.configured_capacity == 0 {
-                // The host honestly marks an unwired declaration. It has no
+                // The host marks an unwired declaration. It has no
                 // publisher, matching the native context's missing entry.
                 continue;
             }

@@ -948,7 +948,8 @@ unsafe extern "C" fn sink_write(context: *mut u8, bytes: abi::Bytes) -> abi::Sta
     }
 }
 
-#[cfg(all(test, not(feature = "local-transport")))]
+#[cfg(test)]
+#[cfg(not(feature = "local-transport"))]
 mod tests {
     use super::*;
     #[test]
