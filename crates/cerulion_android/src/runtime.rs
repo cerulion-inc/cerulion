@@ -23,7 +23,7 @@ use cerulion_core::graph::{
     GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords, RunTopology,
 };
 use cerulion_core::transport::cerulion_q::{
-    format_run_id, RunEntry, RunEntryError, RunEntryState, FIRES_WIRE_VERSION,
+    format_run_id, RunEntry, RunEntryError, FIRES_WIRE_VERSION,
 };
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
@@ -2262,56 +2262,54 @@ fn host_run(
             return None;
         }
     };
-    // A desk reads fires by the topology in the run's `run.json`, so a run
-    // the `runs` verb names undescribable serves none.
-    let fires = match served_entry_check(hosted.run_id, &entry) {
-        Ok(()) => Some(Arc::clone(&hosted.fire_tap)),
+    let hosted_runs = network.hosted_runs();
+    match entry {
+        Ok(entry) => {
+            let fires = Some(Arc::clone(&hosted.fire_tap));
+            let guard = hosted_runs.host(
+                hosted.run_id,
+                HostedRun {
+                    entry,
+                    live: Arc::clone(&hosted.live),
+                    fires: fires.clone(),
+                },
+            );
+            Some(HostedRunHold {
+                _guard: guard,
+                fires,
+            })
+        }
+        // A desk reads fires by the topology in the run's `run.json`, so a
+        // run the `runs` verb names undescribable serves none.
         Err(error) => {
             tracing::warn!(
                 error = %error,
                 "the runs verb names the run undescribable: it serves no fires"
             );
-            None
+            Some(HostedRunHold {
+                _guard: hosted_runs.host_undescribable(hosted.run_id, error),
+                fires: None,
+            })
         }
-    };
-    let guard = network.hosted_runs().host(
-        hosted.run_id,
-        HostedRun {
-            entry,
-            live: Arc::clone(&hosted.live),
-            fires: fires.clone(),
-        },
-    );
-    Some(HostedRunHold {
-        _guard: guard,
-        fires,
-    })
-}
-
-/// The checks [`HostedRuns::host`](cerulion_core::transport::hosted_runs::HostedRuns::host)
-/// runs on `entry`: a failure names the run undescribable.
-fn served_entry_check(run_id: u128, entry: &RunEntry) -> Result<(), RunEntryError> {
-    RunEntry::new(
-        run_id,
-        entry.graph_name.as_str(),
-        entry.run_started_at_ns,
-        RunState::Live,
-        entry.graph_yaml.as_str(),
-        entry.run_json.as_str(),
-    )
-    .map(drop)
+    }
 }
 
 /// The entry the `runs` verb serves for `hosted`: the graph's name and its
 /// effective `graph.yaml`, and a `run.json` with the app's endpoint, the
 /// built topology and the fire telemetry the run serves.
+///
+/// The inner `Err` is a run that fails the served-entry checks, for example a
+/// `run.json` above the served cap with only its base keys. The host still
+/// serves it, as undescribable with that reason, so a desk learns why the run
+/// has no description. The outer `Err` is a graph whose `graph.yaml` does not
+/// render.
 fn hosted_run_entry(
     plan: &StartPlan,
     graph: &GraphConfig,
     gateway: &GatewayStartPlan,
     hosted: &HostedRunPlan,
     started_at_ns: u64,
-) -> Result<RunEntry, EmbedError> {
+) -> Result<Result<RunEntry, RunEntryError>, EmbedError> {
     let graph_yaml = effective_graph_yaml(graph)?;
     let endpoints = [RunEndpoint {
         id: APP_ENDPOINT.to_string(),
@@ -2332,7 +2330,7 @@ fn hosted_run_entry(
             })
             .collect(),
     }];
-    let run_json = render_hosted_run_manifest(&HostedRunSpec {
+    let run_json = match render_hosted_run_manifest(&HostedRunSpec {
         run_id: hosted.run_id,
         graph_name: graph.identity(),
         run_started_at_ns: started_at_ns,
@@ -2345,19 +2343,18 @@ fn hosted_run_entry(
             capacity: hosted.fire_tap.stats().capacity,
             lease_ms: u64::try_from(FIRE_TAP_CONFIG.lease.as_millis()).unwrap_or(u64::MAX),
         }),
-    });
-    // Not minted through `RunEntry::new`: `host` checks the entry again and
-    // serves one that fails a served-entry check (an artifact above the
-    // served cap) as an undescribable run with the reason, so a desk learns
-    // why the run has no description.
-    Ok(RunEntry {
-        run_id: format_run_id(hosted.run_id),
-        graph_name: graph.identity().to_string(),
-        run_started_at_ns: started_at_ns,
-        state: RunEntryState::Live,
+    }) {
+        Ok(run_json) => run_json,
+        Err(too_large) => return Ok(Err(too_large.into())),
+    };
+    Ok(RunEntry::new(
+        hosted.run_id,
+        graph.identity(),
+        started_at_ns,
+        RunState::Live,
         graph_yaml,
-        run_json: String::from_utf8_lossy(&run_json).into_owned(),
-    })
+        String::from_utf8_lossy(&run_json).into_owned(),
+    ))
 }
 
 /// The graph config the runtime built from, as the `graph.yaml` a hosted

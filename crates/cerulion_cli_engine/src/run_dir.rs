@@ -84,7 +84,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cerulion_core::graph::RunTopology;
-use cerulion_core::transport::cerulion_q::MAX_RUN_ARTIFACT_LEN;
+use cerulion_core::transport::cerulion_q::{RunEntryError, MAX_RUN_ARTIFACT_LEN};
 use cerulion_core::transport::run_registry::{RunHandle, RunRecord, RunState};
 
 /// Minting a run's IDENTITY and PERSISTING its description are two
@@ -1887,13 +1887,20 @@ pub struct HostedRunSpec<'a> {
 /// `topology.nodes`, so fires without it name no node), then `endpoints`.
 /// `omitted.full_len` is the byte length of the full render. Each size check
 /// counts the `omitted` key itself. The run is still served with its base
-/// keys and its `graph.yaml`. Only names above the cap on their own still give
-/// a render above it, which the served-entry check refuses.
-#[must_use]
-pub fn render_hosted_run_manifest(spec: &HostedRunSpec<'_>) -> Vec<u8> {
+/// keys and its `graph.yaml`.
+///
+/// # Errors
+///
+/// [`HostedRunManifestTooLarge`] when the render is above the cap with every
+/// key dropped that can be dropped: the base keys alone (a very long
+/// `graph_name` or `lan_access`) are too large. The result is never above the
+/// cap.
+pub fn render_hosted_run_manifest(
+    spec: &HostedRunSpec<'_>,
+) -> Result<Vec<u8>, HostedRunManifestTooLarge> {
     let full = render_hosted_doc(spec, &[], None);
     if full.len() <= MAX_RUN_ARTIFACT_LEN {
-        return full;
+        return Ok(full);
     }
     let mut dropped = vec!["telemetry", "topology"];
     let mut slim = render_hosted_doc(spec, &dropped, Some(full.len()));
@@ -1901,11 +1908,35 @@ pub fn render_hosted_run_manifest(spec: &HostedRunSpec<'_>) -> Vec<u8> {
         dropped.insert(0, "endpoints");
         slim = render_hosted_doc(spec, &dropped, Some(full.len()));
     }
-    debug_assert!(
-        slim.len() <= MAX_RUN_ARTIFACT_LEN || dropped.contains(&"endpoints"),
-        "a render above the cap has dropped every key it can drop"
-    );
-    slim
+    if slim.len() > MAX_RUN_ARTIFACT_LEN {
+        return Err(HostedRunManifestTooLarge {
+            len: slim.len(),
+            cap: MAX_RUN_ARTIFACT_LEN,
+        });
+    }
+    Ok(slim)
+}
+
+/// A hosted `run.json` that is above the served cap with every key dropped
+/// that [`render_hosted_run_manifest`] can drop.
+///
+/// It converts to [`RunEntryError::RunJsonTooLong`], the reason the `runs`
+/// verb gives for a run it cannot describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the hosted run.json is {len} bytes with only its base keys, above the {cap}-byte served cap"
+)]
+pub struct HostedRunManifestTooLarge {
+    /// The byte length of the smallest render.
+    pub len: usize,
+    /// The served cap, [`MAX_RUN_ARTIFACT_LEN`].
+    pub cap: usize,
+}
+
+impl From<HostedRunManifestTooLarge> for RunEntryError {
+    fn from(error: HostedRunManifestTooLarge) -> Self {
+        RunEntryError::RunJsonTooLong { len: error.len }
+    }
 }
 
 /// The hosted `run.json` without the keys in `drop`. With `full_len`, it also
@@ -3882,8 +3913,12 @@ mod tests {
         lease_ms: 5000,
     };
 
+    fn render_fitting(spec: &HostedRunSpec<'_>) -> Vec<u8> {
+        render_hosted_run_manifest(spec).expect("the hosted run.json fits the served cap")
+    }
+
     fn hosted_doc(spec: &HostedRunSpec<'_>) -> serde_json::Value {
-        serde_json::from_slice(&render_hosted_run_manifest(spec)).expect("hosted run.json parses")
+        serde_json::from_slice(&render_fitting(spec)).expect("hosted run.json parses")
     }
 
     /// THE hosted `run.json` oracle, byte for byte: the keys sort the way
@@ -3977,10 +4012,10 @@ mod tests {
   "version": 1
 }
 "#;
-        let rendered = render_hosted_run_manifest(&spec);
+        let rendered = render_fitting(&spec);
         assert_eq!(String::from_utf8(rendered.clone()).unwrap(), expected);
         assert_eq!(
-            render_hosted_run_manifest(&spec),
+            render_fitting(&spec),
             rendered,
             "two renders of one spec must be byte-identical"
         );
@@ -4086,8 +4121,7 @@ mod tests {
     fn run_directory_readers_read_a_hosted_manifest_as_undeclared() {
         let endpoints = lobby_endpoints();
         let topology = lobby_topology();
-        let bytes =
-            render_hosted_run_manifest(&hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES)));
+        let bytes = render_fitting(&hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES)));
         assert_eq!(run_manifest_trace_rings(&bytes), TraceRingsReport::Absent);
         assert_eq!(
             run_manifest_state_ring_consumer(&bytes),
@@ -4109,7 +4143,7 @@ mod tests {
         for run_id in [0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128, 0xbeef] {
             let mut spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
             spec.run_id = run_id;
-            let run_json = String::from_utf8(render_hosted_run_manifest(&spec)).unwrap();
+            let run_json = String::from_utf8(render_fitting(&spec)).unwrap();
             let entry = RunEntry::new(
                 run_id,
                 spec.graph_name,
@@ -4250,7 +4284,7 @@ mod tests {
             "the fixture is past the cap"
         );
 
-        let rendered = render_hosted_run_manifest(&spec);
+        let rendered = render_fitting(&spec);
         assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN);
         let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
         assert!(doc.get("topology").is_none(), "{doc}");
@@ -4283,7 +4317,7 @@ mod tests {
         }];
         let topology = lobby_topology();
         let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
-        let rendered = render_hosted_run_manifest(&spec);
+        let rendered = render_fitting(&spec);
         assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN);
         let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
         assert_eq!(
@@ -4326,7 +4360,7 @@ mod tests {
         );
         assert!(render_hosted_doc(&spec, &slim, Some(1)).len() > MAX_RUN_ARTIFACT_LEN);
 
-        let rendered = render_hosted_run_manifest(&spec);
+        let rendered = render_fitting(&spec);
         assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN, "{}", rendered.len());
         let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
         assert_eq!(
@@ -4343,5 +4377,46 @@ mod tests {
         let topology = lobby_topology();
         let doc = hosted_doc(&hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES)));
         assert!(doc.get("omitted").is_none(), "{doc}");
+    }
+
+    /// Base keys above the cap on their own are an error, never a render
+    /// above the cap, and the error converts to the reason the `runs` verb
+    /// gives for a run it cannot describe.
+    #[test]
+    fn a_hosted_manifest_whose_base_keys_pass_the_cap_is_an_error() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let long = "n".repeat(MAX_RUN_ARTIFACT_LEN / 2);
+        let lan = "l".repeat(MAX_RUN_ARTIFACT_LEN);
+        for (graph_name, lan_access) in [(long.as_str(), "open"), ("lobby", lan.as_str())] {
+            let mut spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+            spec.graph_name = graph_name;
+            spec.lan_access = lan_access;
+            let slim = render_hosted_doc(
+                &spec,
+                &["endpoints", "telemetry", "topology"],
+                Some(render_hosted_doc(&spec, &[], None).len()),
+            );
+            assert!(
+                slim.len() > MAX_RUN_ARTIFACT_LEN,
+                "the fixture is past the cap"
+            );
+
+            let error = render_hosted_run_manifest(&spec).expect_err("no render fits the cap");
+            assert_eq!(
+                error,
+                HostedRunManifestTooLarge {
+                    len: slim.len(),
+                    cap: MAX_RUN_ARTIFACT_LEN,
+                }
+            );
+            assert_eq!(
+                RunEntryError::from(error),
+                RunEntryError::RunJsonTooLong { len: slim.len() }
+            );
+            let text = error.to_string();
+            assert!(text.contains(&slim.len().to_string()), "{text}");
+            assert!(text.contains(&MAX_RUN_ARTIFACT_LEN.to_string()), "{text}");
+        }
     }
 }
