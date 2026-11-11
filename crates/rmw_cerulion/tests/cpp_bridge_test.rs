@@ -214,7 +214,7 @@ impl StringSlot {
                 &mut data,
                 &mut len,
             );
-            String::from_utf8_lossy(std::slice::from_raw_parts(data as *const u8, len)).into_owned()
+            String::from_utf8_lossy(std::slice::from_raw_parts(data.cast::<u8>(), len)).into_owned()
         }
     }
     fn destruct(&mut self) {

@@ -277,6 +277,48 @@ re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
 clock, `Sync` alignment, FIFO pop counts from the read log, and a
 `consume = latest` node's one fire per step from the read log's drains) are
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
+A `consume = latest` input read through a second subscriber is also held to the
+frames its trigger drain counted: a step that counted more frames since the
+node's last fire than that fire's read took, plus two per writer still
+delivering one, owed the node a fire, so a node that stops firing on frames its
+queue still holds is a finding. The writers are the larger of the graph's
+publisher cap and the writers the read log names on the input, because a topic
+opened on a service that already existed with more publisher slots than the
+graph asks for accepts publishers from outside the graph. Before the node's
+first fire in the pass, one queue of the input more (its declared depth per
+writer) is excused, and the `--report` JSON names it once as a judged note (a
+`rederivation_notes` entry of kind `latest_before_first_fire`) rather than a
+`stand_down`, because a node's init can read its inputs
+before the recording starts its read log and a resumed pass starts after reads
+its bag does not keep; a count past that queue is judged as one after a fire
+is, on a resumed pass too. A resumed pass that holds no fire of the node and no
+read its body made stands down by name once a count passes that queue (a
+`stand_down` of code `latest_unfired_since_anchor`, which also prints a warning
+on stderr and changes no exit code), because a node that
+returned `NodeError::Fatal` before the pass's anchor records exactly
+that, and so does a running node the scheduler never fired in the pass: the bag
+records no stop and the anchor does not stamp each node's stopped state. A
+from-start pass re-executes the stop, and a node that fires or reads in its
+body anywhere in a resumed pass is still judged. A `--verify` replay of a
+one-rank bag this build recorded mid-run is refused before its first step when
+a single-writer read in it continues a writer run that began before the bag
+(`read_identity_absent`, exit 2), so on such a bag a neutral `--resim all` is
+the replay that reaches this rule. From `trace_format` 8 on a writer change on any edge stages a producer
+annotation, so the counts a bag that begins mid-run records before the trigger
+drain's first annotation are frames of the one writer whose run it began inside,
+counted as one writer more. That rule stands down by name where a count needs an
+excuse the bag cannot check: a topic no graph node produces leaves the frames in
+delivery unbounded; a read log that does not name the writer of every frame
+counted since the node's last fire cannot rule out a publisher beyond the cap,
+until the node's next fire; and a node that produces a topic a `block` input in
+its own rank reads can have a fire held by that edge's pre-fire check with no
+record, which stands down the fire a pop owes on one subscriber too. A bag below
+`trace_format` 8 names no writer on a topic with one graph producer, so there a
+count past the cap stands down, from the start of a recording or resumed; a
+count of more than one frame is named whole from `trace_format` 9, when its
+batch frames fit the read stage. On a bag that does not record whether a
+`drop_oldest` input was read through one subscriber or two, a step that popped
+and fired nothing stands down rather than being judged as one.
 
 ### Divergence LOCALIZES to the producing rank
 

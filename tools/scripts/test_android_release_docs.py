@@ -56,8 +56,8 @@ def iceoryx2_entry_lines(patch_table):
     ]
 
 
-def unreleased_bullets(changelog):
-    section = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+def release_bullets(changelog, heading):
+    section = changelog.split(heading, 1)[1].split("\n## [", 1)[0]
     return [line for line in section.splitlines() if line.startswith("- ")]
 
 
@@ -141,7 +141,7 @@ class MacKeyChangelogEntry(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         text = CHANGELOG.read_text(encoding="utf-8")
-        cls.bullets = unreleased_bullets(text)
+        cls.bullets = release_bullets(text, "## [2.0.0]")
         cls.about_key = [b for b in cls.bullets if "MAC key" in b]
 
     def test_the_empty_key_fix_appears_once(self):

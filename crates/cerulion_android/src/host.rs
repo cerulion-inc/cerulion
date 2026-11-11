@@ -88,6 +88,9 @@ impl Host {
     fn observed_status(&self) -> Status {
         let lifecycle = lock_lifecycle(&self.lifecycle);
         let mut status = lock_status(&self.status).clone();
+        // An unwind that dropped a run writes no status, but the process
+        // record names a plane that did not stop.
+        crate::runtime::name_unstopped_plane(&mut status);
         match *lifecycle {
             Lifecycle::Idle => {}
             Lifecycle::Starting { .. } => status.state = RuntimeState::Starting,

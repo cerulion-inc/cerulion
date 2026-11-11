@@ -19,22 +19,31 @@ the graph; neither stops motion by itself. The engaged state is held in the daem
 daemon restart clears it, and nothing else does; rcpd's latch, once that
 `estop` closed it, clears only through its `estop_clear` or by deleting its
 latch file and restarting rcpd.
-Nothing outside the daemon can read that state yet: an `engage-estop` returns
-a reply to the caller, writes a warning to the log, sends that `estop` and
-asks Flashback to save a recording; an `estop` over the rcp plane engages the
-latch without that ask.
-It is the one e-stop latch the ops act verbs and the `cerulion/rcp/1` plane
-obey: while it is engaged, the ops act verbs `topic-publish` and
-`service-call` and every tool call over the `cerulion/rcp/1` plane except
-`estop` are refused, and an `estop` over that plane engages it too (see
+No verb returns that state yet; a verb or rcp tool call that it refuses says
+so in its error. An `engage-estop` engages the latch, sends that `estop`,
+then writes a warning to the log, asks Flashback to save a recording
+and returns a reply to the caller; an `estop` over the rcp plane engages
+the latch without that ask.
+It is the one e-stop latch the ops act verbs, `restart` and the
+`cerulion/rcp/1` plane obey: while it is engaged, the ops act verbs `topic-publish` and
+`service-call`, the ops verb `restart` and every tool call over the
+`cerulion/rcp/1` plane except `estop` are refused, and an `estop` over that
+plane engages it too (see
 [`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
-does not read it, and neither does LAN ingress. An `engage-estop`
+reads it before it stops the graph and again before it starts it: an engage
+during the stop means the start command does not run, and an engage after
+the second read does not stop the graph it starts. LAN ingress does not read
+it. An `engage-estop`
 refuses each rcp tool call other than `estop` that the plane has not yet sent
 to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
 rcpd just before each send), then sends an `estop` to rcpd without waiting
 for it, and sends it again while rcpd is not reachable or answers with an
-error, logging the failure, until rcpd answers that its latch closed. That
-latch then refuses the mutating calls rcpd holds and has not yet published;
+error, until rcpd answers that its latch closed. It logs the first failure and
+the 10th, 100th and so on at warn and the others at debug, and a delivery that
+ends before rcpd answers, as at a stop by Ctrl-C or SIGTERM, at error; a kill,
+a crash, the hard-exit deadline or a second stop signal may end it with no
+line. That latch then refuses the mutating calls rcpd holds when the `estop`
+reaches it and has not yet published;
 an `estop` over the rcp plane closes rcpd's own latch too. A robot still needs its own stop path (a hardwired e-stop) to
 stop motion. Only the `cerulion-remoted` daemon serves
 `engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
@@ -61,7 +70,8 @@ access can:
   the robot publishes it (`cerulion connect` brings these into the desk's own
   shared memory);
 - fetch a topic's schema, so a desk that has never seen the type can decode it;
-- read the per-topic counters (`status`);
+- read the per-topic counters, and the count of log lines the robot's
+  `cerulion-remoted` dropped (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
 A desk cannot write a topic on the robot or send it teleop commands over
@@ -153,6 +163,24 @@ the audit log. Its reply then waits for the receipt append, a brief lock held
 across one write and sync of the receipt file. Hash-chain integrity survives:
 each append is one atomic critical section, so concurrent appends form one valid
 tamper-evident chain.
+
+**A blocked log does not hold an e-stop.** `cerulion-remoted` writes its log
+lines to stderr from a thread of its own, through a queue of at most 4096
+lines and 1 MiB. While stderr takes no more lines, as with a full pipe or a
+stalled journald, no part of the daemon waits on one of those lines: a line
+that does not fit in the queue, or whose write fails, is dropped and counted.
+So an `estop` over `cerulion/rcp/1` and an ops `engage-estop` still reach the
+robot's `cerulion-rcpd`, and a graceful stop still ends. Two writers bypass
+the queue and still write to stderr directly: the iceoryx2 console logger and
+the message of a panic. Once stderr takes lines again, a warning names how
+many were dropped and, when more than one was, an info line says the log
+caught up. The count since the daemon started is `log_lines_dropped` in the
+`cerulion/wire/2` `status` reply; it leaves out the writer's own report lines
+and the lines an exit discards. A host that embeds the remote plane logs
+through its own subscriber and sends no such count. Each exit waits at most
+100 ms for the lines still queued; past four fifths of that, all but the
+newest 8 are discarded, and one error line counts them if stderr takes it in
+time.
 
 **What this rules out is serialization, not unavailability.** Resource
 exhaustion and network delivery still decide whether a remote `engage-estop`

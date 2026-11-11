@@ -657,7 +657,7 @@ pub unsafe fn cppstring_bytes<'a>(s: *const c_void, max: usize) -> Result<&'a [u
     if data.is_null() {
         return Err("std::string with null data and nonzero size (corrupt)");
     }
-    Ok(std::slice::from_raw_parts(data as *const u8, len))
+    Ok(std::slice::from_raw_parts(data.cast::<u8>(), len))
 }
 
 #[cfg(test)]
