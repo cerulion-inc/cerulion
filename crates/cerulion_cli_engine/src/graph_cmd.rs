@@ -28896,8 +28896,8 @@ process_groups:
     fn relative_recording_directory_hands_absolute_paths_to_bagd() {
         for _ in 0..2 {
             let workspace = tempfile::tempdir_in(".").unwrap();
-            assert!(workspace.path().is_relative());
-            let directory = workspace.path().join("recordings");
+            let directory = Path::new(workspace.path().file_name().unwrap()).join("recordings");
+            assert!(directory.is_relative());
             let expected_directory = std::env::current_dir().unwrap().join(&directory);
             let inputs = prepare_recording_inputs(RecordingInputSpec {
                 embed_config: &recorded_topics_config(),

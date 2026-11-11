@@ -647,7 +647,7 @@ struct BagdGuard;
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         if let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out recordings/gwrec_"])
+            .args(["-f", "bagd --out (/[^[:space:]]*/)?recordings/gwrec_"])
             .output()
         {
             for pid in String::from_utf8_lossy(&out.stdout)
@@ -695,18 +695,22 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
     let missing_sock =
         std::env::temp_dir().join(format!("cer_gwnd_missing_rec_{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&missing_sock);
+    let recordings = tmp.path().join("recordings");
+    std::fs::create_dir(&recordings).unwrap();
+    let relative_recordings = Path::new(recordings.file_name().unwrap());
+    assert!(relative_recordings.is_relative());
+    let record_flag = format!("--record={}", relative_recordings.display());
     let (mut guard, stdout_path, stderr_path) = spawn_graph_run(
         tmp.path(),
         "gwrec",
         false,
         port,
         &missing_sock,
-        &["--record=recordings"],
+        &[&record_flag],
     );
     let _bagd_guard = BagdGuard;
 
     // Recording works: the bag file appears (bagd handshake completed).
-    let recordings = tmp.path().join("recordings");
     let bag = wait_for_bag(&recordings, Duration::from_secs(90)).unwrap_or_else(|| {
         panic!(
             "bagd never created the bag\nstdout:\n{}\nstderr:\n{}",
@@ -714,6 +718,11 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
             read_file(&stderr_path)
         )
     });
+    assert!(bag.is_absolute());
+    assert_eq!(
+        bag.parent().unwrap().canonicalize().unwrap(),
+        recordings.canonicalize().unwrap()
+    );
 
     // A normal recording still emits the recorder's own status, including its bag path.
     let expected_status_path = bag.canonicalize().unwrap();
@@ -740,6 +749,7 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
                     .is_ok_and(|value| {
                         value["bag_path"]
                             .as_str()
+                            .filter(|path| Path::new(path).is_absolute())
                             .and_then(|path| Path::new(path).canonicalize().ok())
                             .as_ref()
                             == Some(&expected_status_path)
