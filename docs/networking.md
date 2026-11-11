@@ -59,7 +59,9 @@ default + gateway, the discovery ladder, and pairing.
   LOCAL topics instantly, then lists account-owned and explicitly paired robots
   through the authenticated iroh remote plane. Robot rows include offline and
   unknown reachability; online rows show the selected direct or relay path.
-  Each topic row names its robot. Account lookup has a two-second deadline and
+  Each topic row names its robot. Stale-session refresh has a two-second request
+  budget; a successful rotation can wait one additional second for publication.
+  Account lookup has a two-second deadline and
   robot catalogs share one four-second budget. Saved directory and authenticated
   direct-address hints let explicitly paired robots remain usable offline.
   `find` matches those catalogs. `echo`, `hz`, `info`, `snapshot`, and `viz --robot`

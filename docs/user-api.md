@@ -160,7 +160,8 @@ complete. `--all` also shows whether its trust comes from the account or a pairi
 Each remote topic row names its robot; identical topic names remain separate rows.
 The local section prints and flushes before account or robot requests. Account
 directory fetches wait at most two seconds. An expired session first gets another
-two-second budget to refresh and save its tokens. The robot metadata sweep has one
+two-second budget to refresh; saving a successful rotation can wait one more
+second. The robot metadata sweep has one
 four-second budget regardless of the number of robots. A saved directory and
 authenticated direct-address hints preserve paired access when the account service
 is unavailable. Cache-backed reads keep service diagnostics at debug; `topic list`
@@ -176,7 +177,8 @@ A sign-in without a device certificate cannot authenticate this machine to an
 account robot. With a still-valid session, the CLI enrolls its existing device key
 automatically in the background, without a browser step. It waits at most two
 seconds and attempts enrollment only once per process. A successful enrollment
-prints `this machine was enrolled as a device on your account`. An expired
+logs `this machine was enrolled as a device on your account` at info:
+`viz --robot` and `graph run` show it, and other commands show it with `-v`. An expired
 session or refused enrollment names the remedy. If access is refused because this machine's key is unpaired, run
 `cerulion login` again to enroll it. An authentication refusal does not mean the
 robot is offline. A producing run reports automatic robot registration failures

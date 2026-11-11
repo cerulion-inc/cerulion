@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Native Android account requests use verified system certificate roots without a Java context; client setup failures keep local topic reads available.
+
+- A successful session refresh has a separate bounded settlement window to save its replacement tokens, or revoke them after a concurrent sign-out, when the account store is briefly busy.
+
 - Topic discovery lists account-owned and explicitly paired robots anywhere, with direct or relayed reachability and visible offline status. Topic reads and remote visualization demand authenticated wire/2 streams automatically, keep identical local and remote names separate, and release streams when their observers exit. `topic echo`, `hz`, and `info` accept `--robot NAME` and refuse ambiguous names with exit 2.
 
 ## [2.0.0] - 2026-11-11

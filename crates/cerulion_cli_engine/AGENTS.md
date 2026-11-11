@@ -1,6 +1,6 @@
-# cerulion_cli_engine - agent notes
+# cerulion_cli_engine
 
-`cerulion_cli` parses args.
+CLI parses.
 Writers (`node create/delete/modify/stage`, graph create/partition/run
 partition saves, ros2 attach/migrate --write, schema create/delete) hold
 `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` across writes:
@@ -13,11 +13,11 @@ Locks are per root; --workspace is COLCON root. Stage declared ports via
 `graph_cmd::stage_declared_node`. Paired skips implicit LAN catalogs; Open,
 locators and scan retain them. Bad pairings are diagnostics. Observer channels
 are private per source; ambiguity needs selectors; caches bind account/key.
-Refresh/enroll: 2 s; enroll once/process, existing key, no browser; cache debug.
+Refresh 2 s, save 1 s; enroll 2 s, enroll once/process, existing key, no browser; cache debug.
 Unread catalogs cannot prove absence; keys need re-login, never offline; run warns if registration fails.
 
 ## Invariants
-- Engine enforces invariants; CLI checks are UX.
+- Engine: invariants; CLI: UX checks.
 - `account_robot_access`: netd alone opens WAN. Probes: 4 s total, 500 ms per robot,
   never pair/demand. Automatic catalogs share another 4 s; owned/paired coalesce by
   endpoint key. LAN/account merge requires robot ID AND key. Auth keeps
@@ -26,7 +26,7 @@ Unread catalogs cannot prove absence; keys need re-login, never offline; run war
   `device-chain.json` commits LAST.
 - `node build`'s rustc probe is advisory; the cdylib fingerprint, checked at load, counts.
 - Android: cdylibs prefer `<target>/<triple>/<profile>`, then `<target>/<profile>`;
-  `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
+  viz refuses before connecting/spawning. Account TLS: system roots, no JVM.
 - `node_metadata::parse_node_metadata` is the port/trigger authority; `INFO_END`
   before `INFO_START` is fatal.
 - Pinned schema hashes: never hand-compute; run `pinned_hashes`, copy to `topic_cmd.rs`.
@@ -41,10 +41,10 @@ Unread catalogs cannot prove absence; keys need re-login, never offline; run war
   (SIG_IGN/blocks survive exec); self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-## Workspace dependency contract
+## Workspace dependencies
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for contract and compiler checks.
-## Testing
+## Testing: lib env: test_env::env_lock
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
   root; no bash-only construct in a `container:` run step lacking `shell: bash`.

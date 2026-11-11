@@ -260,9 +260,13 @@ struct Fixture {
     home: tempfile::TempDir,
     service: Service,
     regime: Arc<Mutex<EnrollmentRegime>>,
+    // serial_test does not exclude the crate's other environment tests. Keep
+    // the shared guard until the fixture has restored every variable.
+    _environment_lock: std::sync::MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new(mode: Mode, expires: bool) -> Self {
+        let environment_lock = crate::test_env::env_lock();
         let home = tempfile::tempdir().unwrap();
         let state = AuthState {
             account_id: URL_SAFE_NO_PAD.encode(ACCOUNT.0),
@@ -286,6 +290,7 @@ impl Fixture {
             home,
             service,
             regime: Arc::new(Mutex::new(EnrollmentRegime::default())),
+            _environment_lock: environment_lock,
         }
     }
     fn enroll(&self) -> CliResult<bool> {

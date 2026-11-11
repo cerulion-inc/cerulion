@@ -84,6 +84,7 @@ impl RemoteCatalogs {
         for diagnostic in &self.diagnostics {
             if self.serves_cached_directory()
                 || diagnostic == crate::login_cmd::DEVICE_ENROLLMENT_REQUIRED
+                || diagnostic.contains("could not build a secure HTTP client")
             {
                 tracing::debug!(error = %diagnostic, "remote robot directory could not be fully checked");
             } else {

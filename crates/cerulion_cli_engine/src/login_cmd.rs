@@ -1066,11 +1066,20 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     refresh_session_until(None)
 }
 
-/// Refresh and persist a stale session on the calling thread within `budget`.
+/// Bound refresh-lock acquisition and the HTTP exchange by `budget`.
+/// A successful rotation gets one additional second to publish or retire it.
+/// Runs on the calling thread.
 /// The refresh token is single-use: never abandon this exchange on a worker thread.
 pub fn refresh_session_if_stale_within(budget: Duration) -> CliResult<Option<AuthState>> {
     refresh_session_until(Some(std::time::Instant::now() + budget))
 }
+
+// A successful exchange has consumed the old refresh token. Publication (or
+// retirement after a concurrent sign-out) must not inherit an exhausted HTTP
+// budget and discard the only replacement pair before a briefly busy store clears.
+const REFRESH_SETTLEMENT_BUDGET: Duration = Duration::from_secs(1);
+// Do not spend a single-use token on a request that cannot receive a reply.
+const REFRESH_REQUEST_FLOOR: Duration = Duration::from_millis(250);
 
 fn refresh_remaining(deadline: Option<std::time::Instant>, fallback: Duration) -> Duration {
     deadline.map_or(fallback, |deadline| {
@@ -1113,7 +1122,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
     }
     let base = account_service_base();
     let remaining = refresh_remaining(deadline, HTTP_TIMEOUT);
-    if remaining.is_zero() {
+    if remaining < REFRESH_REQUEST_FLOOR {
         return Err(CliError::Login(
             "session refresh exceeded its time budget".into(),
         ));
@@ -1125,6 +1134,8 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         "/v1/auth/refresh",
         &serde_json::json!({ "refresh_token": state.refresh_token }),
     )?;
+    let settlement_deadline =
+        deadline.map(|_| std::time::Instant::now() + REFRESH_SETTLEMENT_BUDGET);
     let now = auth::now_unix_ns();
     let new_state = AuthState {
         account_id: state.account_id.clone(),
@@ -1146,7 +1157,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
     // with the session it just retired.
     let publication = auth::with_store_lock_within(
         &auth_path,
-        refresh_remaining(deadline, Duration::from_secs(1)),
+        refresh_remaining(settlement_deadline, REFRESH_SETTLEMENT_BUDGET),
         || {
             let current = auth::load_from(&auth_path);
             let current_refresh = current.state().map(|c| c.refresh_token.as_str());
@@ -1175,7 +1186,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         // revoked only the pair we exchanged, and a login or a peer's refresh
         // holds a different session. Retire it whatever replaced it, so no
         // session stays live at the service that this machine cannot sign out.
-        let remaining = refresh_remaining(deadline, HTTP_TIMEOUT);
+        let remaining = refresh_remaining(settlement_deadline, HTTP_TIMEOUT);
         let revoked = if remaining.is_zero() {
             Err(CliError::Login(
                 "session refresh exceeded its time budget".into(),
@@ -1448,6 +1459,40 @@ fn build_http_client_with_timeout(
     redirect: reqwest::redirect::Policy,
     timeout: Duration,
 ) -> CliResult<reqwest::blocking::Client> {
+    use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<FailureRegimeLatch>> =
+        std::sync::OnceLock::new();
+    let result = build_secure_http_client(redirect, timeout);
+    let mut failures = FAILURES
+        .get_or_init(|| std::sync::Mutex::new(FailureRegimeLatch::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &result {
+        Err(error) => match failures.on_failure() {
+            RegimeDecision::Loud => {
+                tracing::warn!(error = %error, "account service unavailable: could not build a secure HTTP client; local topics remain available")
+            }
+            RegimeDecision::Suppressed { suppressed }
+            | RegimeDecision::StillFailing { suppressed, .. } => {
+                tracing::debug!(suppressed, "account HTTP client remains unavailable")
+            }
+        },
+        Ok(_) => {
+            if let Some(total_failures) = failures.on_success() {
+                tracing::info!(total_failures, "account HTTP client is available again");
+            }
+        }
+    }
+    result
+}
+
+#[cfg(any(target_os = "android", test))]
+mod android_tls;
+
+fn build_secure_http_client(
+    redirect: reqwest::redirect::Policy,
+    timeout: Duration,
+) -> CliResult<reqwest::blocking::Client> {
     // `install_default` refuses a second install and hands the provider back in
     // the Err — the already-installed case (an earlier client here, or a host
     // that set one), not a failure.
@@ -1457,13 +1502,18 @@ fn build_http_client_with_timeout(
         "cerulion-pairing-protocol",
         reqwest::header::HeaderValue::from_static("1"),
     );
-    reqwest::blocking::Client::builder()
+    let builder = reqwest::blocking::Client::builder()
         .redirect(redirect)
         .default_headers(headers)
         .timeout(timeout)
-        .user_agent(concat!("cerulion-cli/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("cerulion-cli/", env!("CARGO_PKG_VERSION")));
+    // The standalone Android CLI has no JVM. Use the system's certificate
+    // roots directly, with ordinary certificate and hostname verification.
+    #[cfg(any(target_os = "android", test))]
+    let builder = android_tls::configure(builder)?;
+    builder
         .build()
-        .map_err(|e| CliError::Login(format!("could not build the HTTP client: {e}")))
+        .map_err(|e| CliError::Login(format!("could not build a secure HTTP client: {e}")))
 }
 
 fn empty_body() -> serde_json::Value {
@@ -1837,13 +1887,46 @@ mod tests {
     }
 
     #[test]
+    fn a_tiny_refresh_budget_sends_no_request_and_preserves_the_single_use_token() {
+        let _environment = env_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", directory.path().to_str().unwrap());
+        auth::seed_logged_in_at(directory.path(), "account").unwrap();
+        let path = directory.path().join("auth.json");
+        let mut stale = auth::load_from(&path).state().unwrap().clone();
+        stale.expires_at_ns = 1;
+        auth::write_to(&path, &stale).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _service = EnvGuard::set(
+            ACCOUNT_SERVICE_ENV,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let error = refresh_session_if_stale_within(Duration::from_millis(100)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "session refresh exceeded its time budget"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(auth::load_from(&path).state().unwrap(), &stale);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn bounded_refresh_does_not_wait_thirty_seconds_on_a_peer_exchange() {
         let _g = env_lock();
         let dir = tempfile::tempdir().unwrap();
         auth::seed_logged_in_at(dir.path(), "acct").unwrap();
         let _home = EnvGuard::set("CERULION_HOME", dir.path().to_str().unwrap());
-        let _svc = EnvGuard::set(ACCOUNT_SERVICE_ENV, "http://127.0.0.1:1");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _svc = EnvGuard::set(
+            ACCOUNT_SERVICE_ENV,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
         let path = dir.path().join("auth.json");
         let mut state = auth::load_from(&path).state().unwrap().clone();
         state.expires_at_ns = 1;
@@ -1870,6 +1953,11 @@ mod tests {
         assert!(elapsed >= budget, "the lock wait ended early: {elapsed:?}");
         assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
         assert_eq!(auth::load_from(&path).state().unwrap(), &state);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the held refresh lock must prevent any account-service connection"
+        );
     }
 
     #[test]
@@ -1917,6 +2005,189 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
             "waiting for the peer must not spend another refresh token"
+        );
+    }
+
+    #[cfg(unix)]
+    struct BusyRefreshResult {
+        refreshed: CliResult<Option<AuthState>>,
+        stored: AuthState,
+        elapsed: Duration,
+    }
+
+    #[cfg(unix)]
+    fn refresh_after_busy_store(replacement: Option<AuthState>) -> BusyRefreshResult {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let _environment = env_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", directory.path().to_str().unwrap());
+        let path = directory.path().join("auth.json");
+        auth::write_to(
+            &path,
+            &AuthState {
+                account_id: "publication-account".into(),
+                session_token: "original-session".into(),
+                refresh_token: "single-use-refresh".into(),
+                expires_at_ns: 1,
+                logged_in_ever: true,
+                role: None,
+            },
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _service = EnvGuard::set(
+            ACCOUNT_SERVICE_ENV,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        listener.set_nonblocking(true).unwrap();
+        let (held, holding) = std::sync::mpsc::channel();
+        let (rotated, rotation) = std::sync::mpsc::channel();
+        let retire = replacement.is_some();
+        let peer_path = path.clone();
+        let peer = std::thread::spawn(move || {
+            auth::with_store_lock(&peer_path, || {
+                held.send(()).unwrap();
+                rotation.recv_timeout(Duration::from_secs(3)).unwrap();
+                if let Some(replacement) = replacement {
+                    auth::write_to(&peer_path, &replacement)?;
+                }
+                // Keep the store occupied after the refresh request succeeded
+                // and past its caller deadline, optionally replacing the login.
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            })
+            .unwrap();
+        });
+        holding.recv_timeout(Duration::from_secs(1)).unwrap();
+        let server = std::thread::spawn(move || {
+            for operation in ["refresh", "revoke"]
+                .into_iter()
+                .take(if retire { 2 } else { 1 })
+            {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "refresh never reached the account service"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("refresh accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                assert_ne!(reader.read_line(&mut first).unwrap(), 0);
+                assert!(first.starts_with(&format!("POST /v1/auth/{operation} ")));
+                let mut length = 0;
+                let mut protocol = false;
+                let mut authorized_rotation = false;
+                loop {
+                    let mut header = String::new();
+                    assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                    if header == "\r\n" {
+                        break;
+                    }
+                    let lower = header.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    protocol |= lower.trim() == "cerulion-pairing-protocol: 1";
+                    authorized_rotation |= lower.trim() == "authorization: bearer rotated-session";
+                }
+                assert!(protocol);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                drop(reader);
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let reply = if operation == "refresh" {
+                    assert_eq!(
+                        body,
+                        serde_json::json!({"refresh_token":"single-use-refresh"})
+                    );
+                    std::thread::sleep(Duration::from_millis(350));
+                    r#"{"session_token":"rotated-session","refresh_token":"rotated-refresh","expires_in":60}"#
+                } else {
+                    assert!(authorized_rotation);
+                    assert_eq!(
+                        body,
+                        serde_json::json!({"refresh_token":"rotated-refresh", "token":"rotated-refresh"})
+                    );
+                    "{}"
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).unwrap();
+                if operation == "refresh" {
+                    rotated.send(()).unwrap();
+                }
+            }
+        });
+        let budget = Duration::from_millis(500);
+        let began = std::time::Instant::now();
+        let refreshed = refresh_session_if_stale_within(budget);
+        let elapsed = began.elapsed();
+        server.join().unwrap();
+        peer.join().unwrap();
+        BusyRefreshResult {
+            refreshed,
+            stored: auth::load_from(&path).state().unwrap().clone(),
+            elapsed,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successful_bounded_refresh_persists_rotated_tokens_after_the_request_deadline() {
+        let result = refresh_after_busy_store(None);
+        assert!(
+            result.refreshed.unwrap().is_some(),
+            "a spent refresh token's replacement must be persisted"
+        );
+        assert!(
+            result.elapsed >= Duration::from_millis(500),
+            "publication must wait past the exhausted request budget"
+        );
+        assert!(
+            result.elapsed < Duration::from_secs(2),
+            "publication remains bounded: {:?}",
+            result.elapsed
+        );
+        assert_eq!(result.stored.account_id, "publication-account");
+        assert_eq!(result.stored.session_token, "rotated-session");
+        assert_eq!(result.stored.refresh_token, "rotated-refresh");
+        assert!(result.stored.session_is_valid(auth::now_unix_ns()));
+        assert!(result.stored.logged_in_ever);
+        assert_eq!(result.stored.role, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_superseded_bounded_refresh_retires_its_pair_after_the_request_deadline() {
+        let signed_out = AuthState {
+            account_id: "publication-account".into(),
+            session_token: String::new(),
+            refresh_token: String::new(),
+            expires_at_ns: 0,
+            logged_in_ever: true,
+            role: None,
+        };
+        let result = refresh_after_busy_store(Some(signed_out.clone()));
+        assert!(result.refreshed.unwrap().is_none());
+        assert_eq!(
+            result.stored, signed_out,
+            "a concurrent sign-out must never be overwritten"
+        );
+        assert!(result.elapsed >= Duration::from_millis(500));
+        assert!(
+            result.elapsed < Duration::from_secs(2),
+            "retirement remains bounded: {:?}",
+            result.elapsed
         );
     }
 
@@ -1986,6 +2257,7 @@ mod tests {
     /// catches a TLS-less `cargo build -p cerulion_cli`.
     #[test]
     fn reqwest_declares_a_tls_backend_and_the_client_builds_under_unified_providers() {
+        let _environment = crate::test_env::env_lock();
         let _client = http_client().expect(
             "the client builds under unified aws-lc-rs + ring providers — \
              without `http_client`'s ring install this panics in \
