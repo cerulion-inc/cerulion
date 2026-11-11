@@ -29,7 +29,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Desk key files are exactly 32 raw bytes, created 0600 with `create_new`, NEVER
+- Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
@@ -41,8 +41,8 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - Same-user outbound shares endpoint/runtime/node; pre-dial key/namespace gate. Metadata per-call; validation refusals keep readers/idle fence; cleanup errors fence control. Retire only outbound.
 
 ## Tests
-- Run `wire_plane_test` with `-- --test-threads=1`: at the macOS 256-file soft
-  limit a parallel run hits iceoryx service/port errors.
+- `wire_plane_test` uses `-- --test-threads=1`: parallel tests at the macOS
+  256-file soft limit hit iceoryx service/port errors.
 - Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct
   `TransportManager::get_or_init()` callers are `#[serial]`;
   e2e: loopback iroh only, relay off, direct dial, bounded awaits.

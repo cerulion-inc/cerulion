@@ -17602,6 +17602,8 @@ impl Drop for ScratchGuard {
 /// The prepared bagd input surface — [`prepare_recording_inputs`]'s result.
 #[cfg(unix)]
 struct RecordingInputs {
+    /// The bag path using the caller's directory spelling, for output and status.
+    display_out_path: std::path::PathBuf,
     /// Bag/ready/topics-json/env-json paths (see [`RecordingPaths`]).
     paths: RecordingPaths,
     /// RAII over the scratch files (ready/topics/env) — best-effort removed on
@@ -17708,8 +17710,8 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         ))
     })?;
     // Resolve a relative directory once, before passing paths to the recorder.
-    // Explicit absolute paths retain their spelling in recorder status.
-    let record_dir = if record_dir.is_absolute() {
+    // File arguments are absolute; presentation retains the caller's spelling.
+    let absolute_record_dir = if record_dir.is_absolute() {
         std::borrow::Cow::Borrowed(record_dir)
     } else {
         std::borrow::Cow::Owned(std::path::absolute(record_dir).map_err(|error| {
@@ -17722,7 +17724,13 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let paths = resolve_recording_paths(&record_dir, graph_name, now);
+    let paths = resolve_recording_paths(&absolute_record_dir, graph_name, now);
+    let display_out_path = record_dir.join(
+        paths
+            .out
+            .strip_prefix(absolute_record_dir.as_ref())
+            .map_err(|_| CliError::Validation("recording: output escaped its directory".into()))?,
+    );
     let scratch = ScratchGuard {
         paths: vec![
             paths.ready.clone(),
@@ -17829,6 +17837,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         }
     };
     Ok(RecordingInputs {
+        display_out_path,
         paths,
         scratch,
         graph_yaml,
@@ -17941,6 +17950,7 @@ fn report_record_schema_coverage(
 /// Bundled inputs for [`spawn_bagd_recorder`] (>7 independent args).
 #[cfg(unix)]
 struct BagdSpawnSpec<'a> {
+    display_out_path: Option<&'a Path>,
     status_off: bool,
     graph_name: &'a str,
     out_path: &'a Path,
@@ -18097,6 +18107,10 @@ fn bagd_argv(spec: &BagdSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
     if spec.status_off {
         argv.push("--status-period-ms".into());
         argv.push("0".into());
+    }
+    if let Some(directory) = spec.display_out_path.and_then(Path::parent) {
+        argv.push("--status-display-dir".into());
+        argv.push(directory.into());
     }
     argv
 }
@@ -19363,6 +19377,7 @@ fn spawn_bagd_recorder(spec: BagdSpawnSpec<'_>) -> CliResult<ChildGuard> {
     let BagdSpawnSpec {
         graph_name,
         out_path,
+        display_out_path,
         record_cpu,
         ..
     } = spec;
@@ -19448,7 +19463,7 @@ fn spawn_bagd_recorder(spec: BagdSpawnSpec<'_>) -> CliResult<ChildGuard> {
     })?;
     let pid = child.id();
     let guard = ChildGuard::new(child, format!("bagd[{graph_name}]"));
-    tracing::info!(graph = %graph_name, pid, bag = %out_path.display(), "spawned bagd recorder");
+    tracing::info!(graph = %graph_name, pid, bag = %display_out_path.unwrap_or(out_path).display(), "spawned bagd recorder");
     Ok(guard)
 }
 
@@ -21597,7 +21612,7 @@ struct SupervisorRecording {
     bagd: ChildGuard,
     _status_scope: Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
     /// The bag path (the deliverable — reported by `finalize`).
-    out_path: std::path::PathBuf,
+    display_out_path: std::path::PathBuf,
     /// RAII over the scratch files (ready/topics/env + bagd's iox2-config).
     _scratch: ScratchGuard,
 }
@@ -21615,7 +21630,7 @@ impl SupervisorRecording {
     fn finalize(mut self, graph_name: &str) -> CliResult<()> {
         self.bagd.signal_term();
         let outcome = wait_for_child_bounded(&mut self.bagd, RECORDING_FINALIZE_DEADLINE);
-        report_bagd_outcome(graph_name, &self.out_path, outcome, &mut self.bagd)
+        report_bagd_outcome(graph_name, &self.display_out_path, outcome, &mut self.bagd)
     }
 }
 
@@ -21723,6 +21738,7 @@ fn start_supervisor_recording(
     // from), not read from `graphs/<file>.yaml`, so the bag's graph and its
     // per-rank manifests cannot describe different runs.
     let RecordingInputs {
+        display_out_path,
         paths,
         mut scratch,
         graph_yaml,
@@ -21795,6 +21811,7 @@ fn start_supervisor_recording(
         .then(|| begin_flashback_plane(workspace_root, graph_name, effective_config));
     let (status_scope, status_off) = prepare_bagd_status(transport, producer_scope, graph_name);
     let mut bagd = spawn_bagd_recorder(BagdSpawnSpec {
+        display_out_path: Some(&display_out_path),
         graph_name,
         status_off,
         out_path: &paths.out,
@@ -21819,7 +21836,7 @@ fn start_supervisor_recording(
         if paths.out.exists() {
             CliError::Validation(format!(
                 "{e} A partial bag may exist at `{}` (un-finalized — replay will refuse it).",
-                paths.out.display()
+                display_out_path.display()
             ))
         } else {
             e
@@ -21843,14 +21860,14 @@ fn start_supervisor_recording(
     tracing::info!(
         graph = %graph_name,
         rings = ring_names.len(),
-        bag = %paths.out.display(),
+        bag = %display_out_path.display(),
         "bagd ready — multi-process recording armed (every worker ring + the departure ring)"
     );
 
     Ok(Some(SupervisorRecording {
         bagd,
         _status_scope: status_scope,
-        out_path: paths.out.clone(),
+        display_out_path,
         _scratch: scratch,
     }))
 }
@@ -22070,6 +22087,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // (also used by the multi-process supervisor recording, so the two
     // paths can never drift on the bagd handshake surface).
     let RecordingInputs {
+        display_out_path,
         paths,
         scratch: _scratch,
         graph_yaml: graph_yaml_path,
@@ -22119,6 +22137,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     let (_bagd_status_scope, status_off) =
         prepare_bagd_status(&transport, &producer_scope, graph_name);
     let mut guard = spawn_bagd_recorder(BagdSpawnSpec {
+        display_out_path: Some(&display_out_path),
         graph_name,
         status_off,
         out_path: &out_path,
@@ -22149,7 +22168,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         if out_path.exists() {
             CliError::Validation(format!(
                 "{e} A partial bag may exist at `{}` (un-finalized — replay will refuse it).",
-                out_path.display()
+                display_out_path.display()
             ))
         } else {
             e
@@ -22351,7 +22370,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // Report the bagd outcome UNCONDITIONALLY (logs) BEFORE the
     // run-error early return — the operator must learn the state of the
     // deliverable (.mcap on disk) even when the live run itself failed.
-    let bagd_result = report_bagd_outcome(graph_name, &out_path, bagd_outcome, &mut guard);
+    let bagd_result = report_bagd_outcome(graph_name, &display_out_path, bagd_outcome, &mut guard);
 
     // Propagate a live-run failure first (e.g. an inert external node refused at
     // launch) — the bag may be short but the run itself failed. The bagd outcome
@@ -24925,6 +24944,7 @@ process_groups:
     #[test]
     fn a_recorder_with_disabled_status_passes_the_existing_zero_period_flag() {
         let mut spec = BagdSpawnSpec {
+            display_out_path: None,
             graph_name: "scope",
             status_off: false,
             out_path: Path::new("recordings/scope.mcap"),
@@ -25111,6 +25131,7 @@ process_groups:
         let rings = vec!["cer_rec_0".to_string()];
         let argv = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            display_out_path: None,
             status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
@@ -25207,6 +25228,7 @@ process_groups:
         // And the same two hold when the optional args are absent, which is the
         // single-process shape.
         let lean = bagd_argv(&BagdSpawnSpec {
+            display_out_path: None,
             graph_name: "demo",
             status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
@@ -25279,6 +25301,7 @@ process_groups:
         let rings = vec!["cer_rec_0".to_string()];
         let argv = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            display_out_path: Some(Path::new("recordings/demo.mcap")),
             status_off: false,
             out_path: &out,
             topics_json_path: &topics_json,
@@ -25303,6 +25326,11 @@ process_groups:
             .unwrap_or_else(|e| panic!("the recorder must PARSE the argv built for it: {e}"));
         let args = cerulion_bagd::BagdArgs::from_arg_matches(&matches)
             .expect("BagdArgs::from_arg_matches over its own derive");
+        assert_eq!(args.out, out);
+        assert_eq!(
+            args.status_display_dir.as_deref(),
+            Some(Path::new("recordings"))
+        );
 
         // …and its startup validator must ACCEPT every `--attach` value. This is
         // the assertion that fails when an `--attach` value is malformed, with bagd's own refusal
@@ -25568,6 +25596,7 @@ process_groups:
 
         let rings = vec!["cer_rec_0".to_string()];
         let record = bagd_argv(&BagdSpawnSpec {
+            display_out_path: None,
             graph_name: "demo",
             status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
@@ -29164,6 +29193,8 @@ process_groups:
                 coordination: crate::replay_engine::CoordinationMode::Lockstep,
             })
             .unwrap();
+            assert_eq!(inputs.display_out_path.parent(), Some(directory.as_path()));
+            assert!(inputs.display_out_path.is_relative());
             for path in [
                 &inputs.paths.out,
                 &inputs.paths.ready,
@@ -29177,6 +29208,7 @@ process_groups:
                 assert_eq!(path.parent(), Some(expected_directory.as_path()));
             }
             let argv = bagd_argv(&BagdSpawnSpec {
+                display_out_path: Some(&inputs.display_out_path),
                 graph_name: "status",
                 status_off: false,
                 out_path: &inputs.paths.out,
@@ -29194,8 +29226,32 @@ process_groups:
             });
             assert_eq!(argv[1], "--out");
             assert_eq!(argv[2], inputs.paths.out.as_os_str());
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair[0] == "--status-display-dir" && pair[1] == directory.as_os_str()));
             assert!(!argv.iter().any(|arg| arg == "--status-period-ms"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_output_cannot_escape_the_selected_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join("recordings");
+        let result = prepare_recording_inputs(RecordingInputSpec {
+            embed_config: &recorded_topics_config(),
+            record_dir: &directory,
+            workspace_root: workspace.path(),
+            graphs_dir: &workspace.path().join("graphs"),
+            graph_name: "/escaping",
+            recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
+            record_env: RecordEnvMode::None,
+            coordination: crate::replay_engine::CoordinationMode::Lockstep,
+        });
+        assert!(
+            matches!(result, Err(CliError::Validation(message)) if message == "recording: output escaped its directory")
+        );
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

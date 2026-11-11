@@ -8,7 +8,7 @@ a tracked `.gitignore` when creating `.cerulion/`; migrate polls with
 Stage declared ports via `graph_cmd::stage_declared_node`.
 ## Invariants
 - Account/pair catalogs bind identity; selectors resolve collisions. Paired skips implicit LAN; Open/locators/scan retain it; broken pairs diagnose. Refresh <=2 s; cache logs debug. Unread catalogs prove no absence.
-- Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; resolve relative recorder paths before handoff.
+- Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
 - Paired graphs gate producers with serving_authority; resolve canonical ingress before GO, retain pinned demands, refuse schema/QoS/writer mismatches.
 - Observers pin source/hash/channel; probes use demand-free clients and busy is unknown. Loss re-demands; graph inputs revalidate identity.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.

@@ -177,8 +177,12 @@ impl BagdGuard {
                 }
                 let command = String::from_utf8_lossy(&command.stdout);
                 let args: Vec<_> = command.split_whitespace().collect();
-                if args.windows(3).any(|args| args == ["bagd", "--out", bag])
-                    && process_identity(pid) == Some(identity)
+                let absolute_bag = root.join(bag_path);
+                let absolute_bag = absolute_bag.to_string_lossy();
+                if args.windows(3).any(|args| {
+                    args == ["bagd", "--out", bag]
+                        || args == ["bagd", "--out", absolute_bag.as_ref()]
+                }) && process_identity(pid) == Some(identity)
                 {
                     let mut observed = self.observed.borrow_mut();
                     if !observed.iter().any(|process| process.pid == pid) {
@@ -2124,6 +2128,14 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
     drop(pty);
 
     let log = strip_ansi(&merged_log(&stdout_path, &stderr_path));
+    let displayed_bag = Path::new("recordings").join(bag.file_name().unwrap());
+    assert!(log
+        .lines()
+        .any(|line| { line == format!("recording written to {}", displayed_bag.display()) }));
+    assert!(log.lines().any(|line| {
+        line.contains("spawned bagd recorder")
+            && line.contains(&format!("bag={}", displayed_bag.display()))
+    }));
     assert!(
         log.contains("graph running")
             && log.contains("nodes=2")
@@ -2490,7 +2502,13 @@ fn recorder_guard_accepts_owned_absolute_paths_and_refuses_another_directory() {
     let root_path = std::fs::canonicalize(root.path()).unwrap();
     let stdout = root.path().join("supervisor.stdout");
     let stderr = root.path().join("supervisor.stderr");
-    for (private, live_parent) in [(true, true), (true, false), (false, false)] {
+    for (private, live_parent, relative_log) in [
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+        (true, false, true),
+        (false, false, true),
+    ] {
         let directory = if private {
             root_path.join("recordings")
         } else {
@@ -2508,9 +2526,14 @@ fn recorder_guard_accepts_owned_absolute_paths_and_refuses_another_directory() {
                 .expect("spawn owned recorder-named process"),
         );
         let pid = child.id();
+        let logged_bag = if relative_log {
+            "recordings/apdemo_owned.mcap"
+        } else {
+            bag
+        };
         std::fs::write(
             &stderr,
-            format!("spawned bagd recorder pid={pid} bag={bag}\n"),
+            format!("spawned bagd recorder pid={pid} bag={logged_bag}\n"),
         )
         .unwrap();
         let recorder = if live_parent {

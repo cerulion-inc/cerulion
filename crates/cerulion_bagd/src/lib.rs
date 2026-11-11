@@ -1053,6 +1053,11 @@ pub struct BagdArgs {
     #[arg(long)]
     pub out: PathBuf,
 
+    /// Internal graph-recorder handoff: directory spelling for status only.
+    #[arg(long, hide = true)]
+    #[doc(hidden)]
+    pub status_display_dir: Option<PathBuf>,
+
     /// A topic to record by attaching to it while it is live (repeatable;
     /// spelled with its leading `/`). Mutually exclusive with `--topics-json`;
     /// exactly one of the two is required. The channel learns its wire schema
@@ -2291,6 +2296,7 @@ fn bagd_cli_run(args: BagdArgs) -> Result<(), Box<dyn std::error::Error>> {
     config.flush_interval = Duration::from_millis(args.flush_interval_ms);
     config.ready_file = args.ready_file;
     config.status_period = status_period;
+    config.status_display_dir = args.status_display_dir;
     config.schema_wait = Duration::from_millis(args.schema_wait_timeout_ms);
     // The caller's ARM-ORDERING guarantee, recorded verbatim — the
     // recorder never infers it (see the field's doc).
@@ -2635,6 +2641,9 @@ pub struct BagdConfig {
     /// Output bag path (the first file; rotation appends `.<k>` before the
     /// extension).
     pub out: PathBuf,
+    /// Optional presentation directory for `/bagd/status`, independent of file I/O.
+    #[doc(hidden)]
+    pub status_display_dir: Option<PathBuf>,
     /// Topics to tap (≥1).
     pub taps: Vec<TapSpec>,
     /// Scheduler-trace SHM ring names to drain (Tier-0 accepts N and drains
@@ -3252,6 +3261,7 @@ impl BagdConfig {
     pub fn new(out: impl Into<PathBuf>, taps: Vec<TapSpec>) -> Self {
         Self {
             out: out.into(),
+            status_display_dir: None,
             taps,
             rings: Vec::new(),
             state_rings: Vec::new(),
@@ -10171,6 +10181,51 @@ impl Drop for Recorder {
     }
 }
 
+/// Format status metadata using the caller's directory spelling.
+fn status_bag_path(path: Option<&Path>, display_dir: Option<&Path>) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    // hot-path-alloc-ok: status metadata is emitted at the reporting cadence.
+    let displayed = display_dir.and_then(|dir| path.file_name().map(|name| dir.join(name)));
+    displayed.as_deref().unwrap_or(path).display().to_string()
+}
+
+#[cfg(test)]
+mod status_path_tests {
+    use super::*;
+
+    #[test]
+    fn status_paths_preserve_directory_spelling_without_changing_file_paths() {
+        let actual = Path::new("/work/recordings/demo.mcap");
+        for _ in 0..2 {
+            for (directory, expected) in [
+                (None, "/work/recordings/demo.mcap"),
+                (Some(Path::new("recordings")), "recordings/demo.mcap"),
+                (Some(Path::new("./recordings")), "./recordings/demo.mcap"),
+                (
+                    Some(Path::new("/chosen/recordings")),
+                    "/chosen/recordings/demo.mcap",
+                ),
+            ] {
+                assert_eq!(status_bag_path(Some(actual), directory), expected);
+            }
+            assert_eq!(status_bag_path(None, Some(Path::new("recordings"))), "");
+            assert_eq!(
+                status_bag_path(Some(Path::new("/")), Some(Path::new("recordings"))),
+                "/"
+            );
+            assert_eq!(
+                status_bag_path(
+                    Some(Path::new("/work/recordings/demo.1.mcap")),
+                    Some(Path::new("recordings"))
+                ),
+                "recordings/demo.1.mcap"
+            );
+        }
+    }
+}
+
 /// The `flashback` block of a `/bagd/status` frame. PURE.
 ///
 /// Extracted so the CONTENT is oracle-testable without a status publisher —
@@ -15213,7 +15268,7 @@ impl Recorder {
             .collect();
         let mut payload = serde_json::json!({
             "state": state,
-            "bag_path": self.bag_paths.last().map(|p| p.display().to_string()).unwrap_or_default(),
+            "bag_path": status_bag_path(self.bag_paths.last().map(PathBuf::as_path), self.cfg.status_display_dir.as_deref()),
             "messages": self.messages,
             "bytes": self.bytes,
             "chunks": self.chunks,

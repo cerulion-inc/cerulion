@@ -6,7 +6,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
 
 ## Invariants
 
-- Hold `/bagd/status` exclusion until reaping; on conflict use `--status-period-ms 0`.
+- Exclude `/bagd/status` until reap; conflict: `--status-period-ms 0`. Display: no I/O.
 - bagd NEVER evicts: both `room == 0` arms in the tap drain WAIT. The loss
   boundary is the topic's own provisioned SHM queue depth, not recorder policy.
 - ONE write mode: payloads are copied into the MCAP chunk arena at drain, so
