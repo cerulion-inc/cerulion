@@ -41,7 +41,10 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
   it also pins helper clock/raw delivery during an active node execution gate.
   Node diagnostics replace one pending token per instance; create failures
   replace one library token. New failures invalidate old tokens.
-  run it alone with `--test-threads=1`.
+  Terminal releases refused outside admission stay queued locally; the next
+  admitted invocation flushes them before user code, without reusing the lease.
+  The raw binary also pins retained input/output release and native delivery parity.
+  Run it alone with `--test-threads=1`.
 - Stable node/host tests: `core-transport.md`; readers/writers drop before release.
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
   graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside

@@ -14,6 +14,10 @@ use super::{registry::CallError, HostClient, NodeRegistry};
 /// Generated local node implementation. No Rust trait object crosses C.
 pub trait PluginNode: Sized + Send {
     fn create(client: HostClient, params: &[u8]) -> TransportResult<Self>;
+    /// Complete deferred host releases before an admitted user callback.
+    fn flush_deferred(&self) -> TransportResult<()> {
+        Ok(())
+    }
     fn tick(&mut self) -> TransportResult<()>;
     fn shutdown(&mut self) -> TransportResult<()>;
     fn state_shape() -> u64;
@@ -228,20 +232,38 @@ impl<T: PluginNode> NodeExports<T> {
         })
     }
 
+    fn call_node<R>(
+        &self,
+        handle: u64,
+        call: impl FnOnce(&mut T) -> TransportResult<R>,
+    ) -> Result<R, CallError> {
+        self.registry.call(handle, |node| {
+            node.flush_deferred()?;
+            call(node)
+        })
+    }
+
     pub fn tick(&self, handle: NodeHandle) -> Status {
-        self.guarded_node(handle, || self.registry.call(handle.value, T::tick))
+        self.guarded_node(handle, || self.call_node(handle.value, T::tick))
     }
 
     pub fn shutdown(&self, handle: NodeHandle) -> Status {
-        self.guarded_node(handle, || self.registry.call(handle.value, T::shutdown))
+        self.guarded_node(handle, || self.call_node(handle.value, T::shutdown))
     }
 
     pub fn destroy(&self, handle: NodeHandle) -> Status {
-        let status = self.guarded_node(handle, || self.registry.destroy(handle.value));
+        let invalidated = std::cell::Cell::new(false);
+        let status = self.guarded_node(handle, || {
+            self.registry.destroy_with(
+                handle.value,
+                |node| node.flush_deferred(),
+                || invalidated.set(true),
+            )
+        });
         if let Ok(mut errors) = self.errors.lock() {
             if status.code == status_code::OK {
                 errors.instances.retain(|slot| slot.handle != handle.value);
-            } else if status.code == status_code::PANICKED {
+            } else if status.code == status_code::PANICKED && invalidated.get() {
                 if let Some(slot) = errors
                     .instances
                     .iter_mut()
@@ -355,9 +377,7 @@ impl<T: PluginNode> NodeExports<T> {
                 Ok(sink) => sink,
                 Err(_) => return self.error_for(handle.value, CallError::InvalidArgument),
             };
-            let result = self
-                .registry
-                .call(handle.value, |node| node.capture(&mut sink));
+            let result = self.call_node(handle.value, |node| node.capture(&mut sink));
             match sink.failure() {
                 Some(status) if status.code == status_code::PANICKED => {
                     self.error_for(handle.value, CallError::Panic)
@@ -388,7 +408,7 @@ impl<T: PluginNode> NodeExports<T> {
             // local state cursor borrows it only through this synchronous call.
             let bytes = unsafe { super::bytes::read(payload.ptr, payload.len, 1) }
                 .map_err(|_| CallError::InvalidArgument)?;
-            self.registry.call(handle.value, |node| node.restore(bytes))
+            self.call_node(handle.value, |node| node.restore(bytes))
         })
     }
 
@@ -401,7 +421,7 @@ impl<T: PluginNode> NodeExports<T> {
             return self.error_for(handle.value, CallError::InvalidArgument);
         }
         self.guarded_node(handle, || {
-            self.registry.call(handle.value, |node| {
+            self.call_node(handle.value, |node| {
                 // SAFETY (U12): the caller owns this checked scalar output.
                 unsafe {
                     output.write(u32::from(node.inline_safe()));
@@ -413,7 +433,7 @@ impl<T: PluginNode> NodeExports<T> {
 
     pub fn probe(&self, handle: NodeHandle) -> Status {
         match catch_unwind(AssertUnwindSafe(|| {
-            self.registry.call(handle.value, |node| Ok(node.probe()))
+            self.call_node(handle.value, |node| Ok(node.probe()))
         })) {
             Ok(Ok(true)) => super::status(status_code::OK),
             Ok(Ok(false)) => self.error_for(handle.value, CallError::InvalidState),
@@ -434,7 +454,7 @@ impl<T: PluginNode> NodeExports<T> {
             return self.error_for(handle.value, CallError::InvalidArgument);
         }
         self.guarded_node(handle, || {
-            self.registry.call(handle.value, |node| {
+            self.call_node(handle.value, |node| {
                 let source = node.external_source()?;
                 // SAFETY (U12): caller owns the checked complete scalar descriptor.
                 unsafe {

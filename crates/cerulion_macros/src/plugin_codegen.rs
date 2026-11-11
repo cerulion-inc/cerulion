@@ -106,6 +106,11 @@ pub(crate) fn generate(
                 Ok(instance)
             }
 
+            fn flush_deferred(&self) -> #root::error::TransportResult<()> {
+                self.entry.inner.__cer_plugin.as_ref()
+                    .expect("plugin create installed local callbacks").flush_deferred()
+            }
+
             fn tick(&mut self) -> #root::error::TransportResult<()> {
                 let context = self.context.as_mut().ok_or_else(|| #root::error::TransportError::NodeError {
                     node_id: stringify!(#node).into(), reason: "node not initialized".into(),

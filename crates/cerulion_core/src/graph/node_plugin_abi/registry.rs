@@ -101,25 +101,77 @@ impl<T> NodeRegistry<T> {
     /// Invalidate an instance and drop its state with its own compiler/allocator.
     /// A caught destructor panic still leaves the handle permanently invalid.
     pub fn destroy(&self, handle: u64) -> Result<(), CallError> {
+        self.destroy_with(handle, |_| Ok(()), || ())
+    }
+    pub(super) fn destroy_with(
+        &self,
+        handle: u64,
+        before: impl FnOnce(&mut T) -> TransportResult<()>,
+        invalidated: impl FnOnce(),
+    ) -> Result<(), CallError> {
         let instance = self.instance(handle)?;
         let mut gate = instance.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => CallError::InvalidState,
             TryLockError::Poisoned(_) => CallError::Panic,
         })?;
+        let value = gate.as_mut().ok_or(CallError::InvalidHandle)?;
+        catch_unwind(AssertUnwindSafe(|| before(value)))
+            .map_err(|payload| {
+                super::contain_panic_payload(payload);
+                CallError::Panic
+            })
+            .and_then(|result| result.map_err(CallError::Node))?;
         let value = gate.take().ok_or(CallError::InvalidHandle)?;
         let mut rows = self.rows.lock().map_err(|_| CallError::Panic)?;
         rows.retain(|row| row.handle != handle);
         drop(rows);
+        invalidated();
         catch_unwind(AssertUnwindSafe(|| drop(value))).map_err(|payload| {
             super::contain_panic_payload(payload);
             CallError::Panic
-        })
+        })?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_pre_destroy_refusal_preserves_the_live_instance_and_handle() {
+        let registry = NodeRegistry::default();
+        let handle = registry.insert(17_u64).unwrap();
+        let invalidated = std::cell::Cell::new(false);
+        assert!(matches!(
+            registry.destroy_with(
+                handle,
+                |_| Err(super::super::argument_error("release refused")),
+                || invalidated.set(true)
+            ),
+            Err(CallError::Node(_))
+        ));
+        assert!(!invalidated.get());
+        assert_eq!(registry.call(handle, |value| Ok(*value)).unwrap(), 17);
+        assert!(matches!(
+            registry.destroy_with(
+                handle,
+                |_| panic!("deferred flush panic oracle"),
+                || invalidated.set(true)
+            ),
+            Err(CallError::Panic)
+        ));
+        assert!(!invalidated.get());
+        assert_eq!(registry.call(handle, |value| Ok(*value)).unwrap(), 17);
+        registry
+            .destroy_with(handle, |_| Ok(()), || invalidated.set(true))
+            .unwrap();
+        assert!(invalidated.get());
+        assert!(matches!(
+            registry.call(handle, |_| Ok(())),
+            Err(CallError::InvalidHandle)
+        ));
+    }
 
     #[test]
     fn handles_are_nonzero_distinct_and_never_reused_after_destroy() {

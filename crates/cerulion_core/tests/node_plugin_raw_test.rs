@@ -278,3 +278,193 @@ fn helper_clock_and_raw_publish_deliver_while_node_tick_gate_is_held() {
     with_context(context.value, |host| host.end_node_call()).unwrap();
     remove_context(context.value).unwrap();
 }
+
+#[test]
+fn deferred_releases_free_retained_rows_once_and_match_native_delivery() {
+    use cerulion_core::graph::node::{AnyPublisher, AnySubscriber};
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+
+    for _ in 0..2 {
+        let clock = Arc::new(VirtualClock::new());
+        clock.set(777);
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "node_plugin_deferred_release".into(),
+                clock: clock.clone(),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            iceoryx_test_config(),
+        )
+        .unwrap();
+        let maximum = MaxSliceLen::try_new(64).unwrap();
+        let mut native_publisher = manager
+            .create_publisher("abi/deferred/native", maximum, 1)
+            .unwrap();
+        let mut input_publisher = manager
+            .create_publisher("abi/deferred/input", maximum, 1)
+            .unwrap();
+        let mut native_receiver = manager.create_subscriber("abi/deferred/native").unwrap();
+        let mut receiver = manager.create_subscriber("abi/deferred/plugin").unwrap();
+        let mut publishers = IndexMap::new();
+        publishers.insert(
+            "out".into(),
+            AnyPublisher::Ipc(
+                manager
+                    .create_publisher("abi/deferred/plugin", maximum, 1)
+                    .unwrap(),
+            ),
+        );
+        let mut subscribers = IndexMap::new();
+        subscribers.insert(
+            "input".into(),
+            AnySubscriber::Ipc(manager.create_subscriber("abi/deferred/input").unwrap()),
+        );
+        let env = Arc::new(HashMap::new());
+        let native = NodeContext::with_runtime_env(
+            publishers,
+            subscribers,
+            clock,
+            ShutdownSignal::new(),
+            env.clone(),
+        );
+        let specs = [
+            ("input", LeaseDirection::Read),
+            ("out", LeaseDirection::Write),
+        ]
+        .map(|(name, direction)| HostPortSpec {
+            name: name.into(),
+            direction,
+            layout: PluginWireLayout {
+                schema_hash: Vector3::SCHEMA_HASH,
+                fixed_size: 24,
+                variable_fields: 0,
+                alignment: 8,
+            },
+            read_mode: 0,
+            accumulate_cap: None,
+        });
+        let context = ContextHandle {
+            value: register_context(HostContext::new(native, specs.into(), env, 9).unwrap())
+                .unwrap(),
+        };
+        // SAFETY (U05): actual immutable HOST_API and this registered context
+        // outlive the SDK, retained loans, deferred queue and all frame reads.
+        let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+        let info = DylibNodeEntry::parse_info_json_labeled(&format!(
+        r#"{{"inputs":[{{"name":"input","schema_hash":{0}}}],"outputs":[{{"name":"out","schema_hash":{0},"max_slice_len_default":64}}],"policy":{{"period_ms":1}}}}"#,
+        Vector3::SCHEMA_HASH), "deferred release").unwrap();
+        with_context(context.value, |host| host.begin_node_call()).unwrap();
+        let mut plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+        with_context(context.value, |host| host.begin_fire()).unwrap();
+        let mut frame = [0u8; 64];
+        let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 777);
+        header.total_size = 64;
+        header.offset_table_offset = 64;
+        header.write_to_buf(&mut frame);
+        frame[40..64].copy_from_slice(&[
+            0, 0, 0, 0, 0, 0, 28, 64, 0, 0, 0, 0, 0, 0, 2, 192, 0, 0, 0, 0, 0, 0, 224, 63,
+        ]);
+        let native_retained = native_publisher.loan_raw_uninit(64).unwrap();
+        let retained = plugin
+            .publisher_mut("out")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        assert!(plugin
+            .publisher_mut("out")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .is_err());
+        assert_eq!(client.deferred_release_count(), 0);
+        with_context(context.value, |host| host.end_node_call()).unwrap();
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+            1
+        );
+        assert!(receiver
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .is_none());
+        drop(native_retained);
+        drop(retained);
+        assert_eq!(client.deferred_release_count(), 1);
+        assert!(!client.has_failure());
+        // An attempted flush outside admission keeps exactly the same row pinned.
+        assert!(client.flush_deferred().is_err());
+        assert_eq!(client.deferred_release_count(), 1);
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+            1
+        );
+        with_context(context.value, |host| host.begin_node_call()).unwrap();
+        with_context(context.value, |host| host.begin_fire()).unwrap();
+        client.flush_deferred().unwrap();
+        client.flush_deferred().unwrap();
+        assert_eq!(client.deferred_release_count(), 0);
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+            0
+        );
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.counters().discarded)).unwrap(),
+            1
+        );
+        assert_eq!(native_publisher.publish_raw(&frame).unwrap(), 1);
+        let mut loan = plugin
+            .publisher_mut("out")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        loan.bytes_mut().copy_from_slice(&frame);
+        loan.commit().unwrap();
+        let native_view = native_receiver
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        let view = receiver
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&native_view[..], &frame);
+        assert_eq!(&view[..], &frame);
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.counters().committed)).unwrap(),
+            1
+        );
+        drop(view);
+        drop(native_view);
+        // A retained input export has the same admission and exact-once rule.
+        assert_eq!(input_publisher.publish_raw(&frame).unwrap(), 1);
+        let read = plugin
+            .subscriber_mut("input")
+            .unwrap()
+            .read_raw_frame(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.bytes(), &frame);
+        with_context(context.value, |host| host.end_node_call()).unwrap();
+        assert_eq!(read.bytes(), &frame);
+        drop(read);
+        assert_eq!(client.deferred_release_count(), 1);
+        with_context(context.value, |host| host.begin_node_call()).unwrap();
+        with_context(context.value, |host| host.begin_fire()).unwrap();
+        client.flush_deferred().unwrap();
+        client.flush_deferred().unwrap();
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.counters().released)).unwrap(),
+            1
+        );
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+            0
+        );
+        assert_eq!(client.deferred_release_count(), 0);
+        assert!(!client.has_failure());
+        drop(plugin);
+        drop(client);
+        with_context(context.value, |host| host.end_node_call()).unwrap();
+        remove_context(context.value).unwrap();
+    }
+}

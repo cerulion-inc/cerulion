@@ -79,3 +79,7 @@ remain readable after the extra library owner is dropped.
 Python node diagnostic copies preserve the original traceback or preflight
 reason exactly. The backend retains host error classification separately from
 the Python exception string.
+
+Terminal buffer releases refused outside an admitted node call keep their mappings
+and queue locally. The next admitted callback flushes them before Python runs;
+retained views can release during the following tick without reuse or double release.

@@ -54,6 +54,10 @@ impl AccumulatorSet {
                 node_id: name.into(),
                 reason: "accumulate input has no bound subscriber".into(),
             })?;
+        subscriber.client.extend_deferred_budget(
+            cap.checked_mul(2)
+                .ok_or_else(|| super::argument_error("deferred accumulate budget overflows"))?,
+        )?;
         self.inputs.push(Accumulator {
             name: Arc::clone(&subscriber.name),
             topic: Arc::clone(&subscriber.topic),

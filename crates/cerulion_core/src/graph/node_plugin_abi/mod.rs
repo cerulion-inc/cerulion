@@ -9,6 +9,7 @@ mod accumulate;
 mod bytes;
 mod client;
 mod context;
+mod deferred;
 mod exports;
 mod input;
 mod metadata;
