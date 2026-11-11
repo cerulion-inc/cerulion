@@ -125,9 +125,10 @@ pub(crate) fn generate(
             }
 
             fn shutdown(&mut self) -> #root::error::TransportResult<()> {
-                if self.context.is_none() { return Err(#root::error::TransportError::NodeError {
+                let context = self.context.as_ref().ok_or_else(|| #root::error::TransportError::NodeError {
                     node_id: stringify!(#node).into(), reason: "node already shut down".into(),
-                }); }
+                })?;
+                context.shutdown_signal().request();
                 let result = self.entry.inner.__cer_user_shutdown();
                 self.context = None;
                 if let Some(client) = &self.entry.inner.__cer_plugin {

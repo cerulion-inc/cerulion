@@ -1538,6 +1538,7 @@ mod tests {
             "nodes().shutdown(handle)",
             "nodes().destroy(handle)",
             "nodes().copy_error(token, target, required)",
+            "self.client.flush_deferred()",
         ] {
             assert!(source.contains(callback));
         }
