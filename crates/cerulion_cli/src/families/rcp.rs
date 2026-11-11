@@ -50,7 +50,8 @@ struct RcpCliArgs {
     /// `~/.cerulion/robots.toml`. Omit when using `--eid`.
     #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(crate::completion::robot_names))]
     robot: Option<String>,
-    /// The robot's iroh endpoint id (64-char hex). Overrides a positional name.
+    /// The robot's iroh endpoint id (64-char hex). Use instead of ROBOT;
+    /// passing both is refused.
     #[arg(long, value_name = "HEX")]
     eid: Option<String>,
     /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable.

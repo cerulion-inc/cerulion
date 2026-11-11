@@ -507,7 +507,7 @@ const NO_DESK_NAME_LABEL: &str = "<unpinned robot>";
 /// # Which identity keys the cache
 ///
 /// `desk_robot_name` — the name THIS DESK knows the robot by (`~/.cerulion/robots.toml`,
-/// pinned by `cerulion pair`, resolved by `cerulion connect`) — and NEVER
+/// pinned there, resolved by `cerulion connect`) and NEVER
 /// `peer_reported_name`, the identity the robot puts in its own catalog. The desk dials
 /// an eid it chose and iroh authenticates; the cache is filed under the desk's own name
 /// for that robot. Keying the lookup by peer-supplied text would let the dialed robot

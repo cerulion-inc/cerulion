@@ -367,12 +367,13 @@ pub enum Commands {
         /// The robot: a 64-char-hex endpoint id, OR a name pinned in
         /// `~/.cerulion/robots.toml` (`[robots]` table, one
         /// `name = "<64-hex-eid>"` line per robot). Omit when using `--eid`.
-        // The pins in `robots.toml` are one of `robot_names`' three
+        // The pins in `robots.toml` are one of `robot_names`' two
         // sources, so a pinned robot completes here by construction.
         #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// The robot's iroh endpoint id (64-char hex). Overrides a positional
-        /// name. From the robot's mDNS TXT `eid=`, or the operator.
+        /// The robot's iroh endpoint id (64-char hex). Use instead of ROBOT;
+        /// passing both is refused. From the robot's mDNS TXT `eid=`, or the
+        /// operator.
         #[arg(long, value_name = "HEX")]
         eid: Option<String>,
         /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable. When
@@ -418,7 +419,7 @@ pub enum Commands {
     //
     // No robot-side verb arms a pairing code, so the desk side of the code
     // ceremony cannot complete against a real robot. The verb stays parseable
-    // so a script that calls it gets `main`'s refusal (`PAIR_UNAVAILABLE_MSG`,
+    // so a script that calls it gets `dispatch`'s refusal (`PAIR_UNAVAILABLE_MSG`,
     // exit 2, above the login gate) instead of clap's "unrecognized
     // subcommand". No alias. Hidden from `--help` and from the completion of
     // `cerulion <TAB>`; clap_complete offers a hidden verb only for a word no
@@ -2446,6 +2447,25 @@ mod pair_dispatch_tests {
                 _ => panic!("expected the Commands::Pair stub"),
             }
         }
+    }
+
+    /// `cerulion help pair` is the one spelling clap answers itself: it renders
+    /// the stub's doc comment (the refusal's own words), never the old
+    /// ceremony's flags.
+    #[test]
+    fn help_pair_renders_the_unavailable_notice() {
+        let err = match Cli::try_parse_from(["cerulion", "help", "pair"]) {
+            Ok(_) => panic!("`cerulion help pair` must render help, not parse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = err.to_string();
+        assert!(
+            text.contains("Code pairing is not available in this release"),
+            "{text}"
+        );
+        assert!(text.contains("cerulion login"), "{text}");
+        assert!(!text.contains("--code"), "{text}");
     }
 
     /// `pair` is hidden: `cerulion --help` lists no `pair` row. Completion is

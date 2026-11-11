@@ -1177,6 +1177,16 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
             "{}",
             out.stderr
         );
+        // The refused row is refused, not merely quiet: telemetry sends
+        // nothing under the switch whatever the verb does.
+        if args[0] == "viz" {
+            assert_eq!(out.code, Some(1), "{}", out.stderr);
+            assert!(
+                out.stderr.contains("remote visualization is disabled by"),
+                "{}",
+                out.stderr
+            );
+        }
         assert_nothing_sent(
             &sink,
             &format!("{args:?} ran under CERULION_NETWORK={network:?}"),

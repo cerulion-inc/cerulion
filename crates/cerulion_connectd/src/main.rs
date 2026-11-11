@@ -16,8 +16,10 @@
 //!   ALPN, so the robot's `cerulion-rcpd` serves as a local stdio MCP server.
 //!   STDOUT carries only MCP messages.
 //!
-//! The subcommands are spawned by `cerulion connect` / `cerulion pair` /
-//! `cerulion rcp`; users run those verbs, not this binary directly. All logic
+//! The subcommands are spawned by `cerulion connect`, `cerulion rcp` and the
+//! `--robot` forms of `topic pub`, `topic snapshot` and `service call` (the
+//! hidden `pair` subcommand has no `cerulion` caller); users run those verbs,
+//! not this binary directly. All logic
 //! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
@@ -44,7 +46,7 @@ use cerulion_core::transport::cerulion_q::CatalogReply;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{RelayConfig, RelayUrl};
 
-/// The desk-side iroh sibling `cerulion connect` / `cerulion pair` spawn.
+/// The desk-side iroh sibling `cerulion connect` and `cerulion rcp` spawn.
 //
 // `about` is spelled out here. A bare `about` takes the crate's manifest
 // description, which is written for crates.io, not for a terminal.
@@ -52,7 +54,7 @@ use cerulion_link::{RelayConfig, RelayUrl};
 #[command(
     name = "cerulion-connectd",
     version,
-    about = "The helper that `cerulion connect`, `cerulion rcp` and the `--robot` verbs run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
+    about = "The helper that `cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, `topic snapshot` and `service call` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
     long_about = None
 )]
 struct Cli {
@@ -726,7 +728,9 @@ async fn run_connect_command(cli: ConnectCli) -> ExitCode {
                 ConnectError::Refused(reason) => tracing::error!(
                     reason = %sanitize_peer_text(reason),
                     "cerulion connect: the robot refused the wire plane: this desk's key is not on \
-                     its access list"
+                     its access list; a desk signed in with `cerulion login` to the robot's \
+                     account is added the first time it reads one of the robot's topics, for \
+                     example with `cerulion viz --robot`"
                 ),
                 other => tracing::error!(
                     error = %sanitize_peer_text(&other.to_string()),
@@ -754,8 +758,8 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     // access-lists would vanish the moment this process exits.
     let Some(key_file) = cli.key_file.as_deref() else {
         tracing::error!(
-            "cerulion pair: --key-file is required (a persistent desk device key). Run \
-             `cerulion pair <robot>`, which creates + passes this machine's key."
+            "cerulion pair: --key-file is required (a persistent desk device key): pass this \
+             machine's key, `~/.cerulion/identity/device.key`, which `cerulion login` creates."
         );
         return ExitCode::from(EXIT_USAGE);
     };
@@ -995,6 +999,29 @@ mod tests {
                 assert!(!output.contains(code));
             }
         }
+    }
+
+    /// `pair` is hidden from `cerulion-connectd --help`: no `cerulion` verb runs it.
+    #[test]
+    fn the_pair_subcommand_is_hidden_from_help() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let pair = cmd
+            .find_subcommand("pair")
+            .expect("`pair` stays a subcommand");
+        assert!(
+            pair.is_hide_set(),
+            "`cerulion-connectd pair` must be hidden"
+        );
+        let help = cmd.clone().render_long_help().to_string();
+        assert!(
+            !help.lines().any(|l| l.trim_start().starts_with("pair ")),
+            "{help}"
+        );
+        assert!(
+            help.lines().any(|l| l.trim_start().starts_with("connect ")),
+            "{help}"
+        );
     }
 
     /// The `--label` fallback resolves the desk identity (hostname / override) and

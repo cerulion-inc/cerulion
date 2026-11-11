@@ -277,9 +277,10 @@ fn viz_robot_completes_the_paired_robot_from_the_isolated_home() {
 }
 
 /// Every candidate the engine returns for the last of `words`, hidden ones
-/// included, as `(value, description)`: the shells print exactly these, so
-/// unlike [`complete`] nothing is filtered. The top level reads no local
-/// source, so no fixture is needed.
+/// included, as `(value, description)` exactly as the engine returns them
+/// (the shells print these, bash only the values); unlike [`complete`],
+/// nothing is filtered. The top level reads no local source, so no fixture
+/// is needed.
 fn raw_top_level(words: &[&str]) -> Vec<(String, String)> {
     let mut cmd = cli_command();
     let args: Vec<OsString> = words.iter().map(OsString::from).collect();

@@ -389,7 +389,8 @@ pub(crate) static CASES: &[Case] = &[
         argv: &["pair", "bench-arm"],
         expect: Expect::Runs {
             code: 2,
-            says: "Error: code pairing is not available in this release",
+            says: "Error: code pairing is not available in this release; robots on your \
+                   account are reached by signing in with `cerulion login`",
         },
     },
     // ---- not spawned by the sweep ----

@@ -405,8 +405,11 @@ restriction of its own; it runs wherever the clang engine binary does.
 ### `cerulion connect` / `rcp` / `login` / `logout` / `account`
 
 Reaching a robot that is not on your LAN. See `docs/remote_plane.md`.
-Robots on your account are reached by signing in with `cerulion login`. Code
-pairing is not available in this release: `cerulion pair` is not listed in
+Robots on your account are reached by signing in with `cerulion login`: the
+robot adds this machine to its access list the first time this machine reads
+one of the robot's topics, for example with `cerulion viz --robot`, and
+`connect`, `rcp` and `--robot` are admitted after that. Code pairing is not
+available in this release: `cerulion pair` is not listed in
 `cerulion --help` or offered by `cerulion <TAB>`, and running it with any
 arguments exits 2 with an error that says so, before the login gate.
 

@@ -3,8 +3,9 @@
 Scope: the remote-plane family: `cerulion_remoted` (the robot daemon), `cerud`
 (the robot ops-verb service), `cerulion_pairing` (identity + trust), `cerulion_link`
 (iroh dial-by-key QUIC), `cerulion_wireclient` (desk client substrate),
-`cerulion_connectd` (the `cerulion connect`, `cerulion rcp` and `--robot` worker;
-its hidden `pair` subcommand has no `cerulion` caller),
+`cerulion_connectd` (the worker behind `cerulion connect`, `cerulion rcp` and `--robot`
+on `topic pub`, `topic snapshot` and `service call`; its hidden `pair` subcommand
+has no `cerulion` caller),
 `cerulion_accountd` (the cloud issuer/CA + accounts), `cerulion-wire` (the
 permissive frame decoder), and `cerulion_netd`'s iroh WAN plane. Read this
 alongside `docs/internals/network-daemons.md` (the LAN zenoh half; its §8 and §10
@@ -185,7 +186,7 @@ the same entry instead of running the daemon.
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
-| `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the `cerulion connect`/`rcp`/`--robot` worker binary (session driver; its hidden `pair` subcommand is the CPace initiator) |
+| `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the worker binary behind `cerulion connect`, `cerulion rcp` and `topic pub`/`topic snapshot`/`service call --robot` (session driver; its hidden `pair` subcommand is the CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
 
 Load-bearing boundary contracts:
