@@ -1379,14 +1379,8 @@ pub fn graph_create(graphs_dir: &Path, name: &str, prefix: Option<&str>) -> CliR
 /// leaves no byte either: the bytes are a function of `prefix` alone.
 ///
 /// ONE renderer, two callers: `graph_create` writes this verbatim, and
-/// [`node_stage`] renders it again to recognise a file that is STILL exactly
-/// this ([`is_pristine_scaffold`]). A second template would let the two drift
-/// and turn the README's `graph create` → `node stage` pair back into a
-/// warning.
-///
-/// The pristine check MUST render this for `default_prefix(graph_name)` — the
-/// create-time input — not for a prefix parsed back out of the file: see
-/// [`is_pristine_scaffold`].
+/// [`node_stage`] renders it again as the base of [`is_cli_written_graph`],
+/// which recognises a file holding only what the CLI wrote.
 fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     let config = GraphConfig {
         level_assignments: None,
@@ -1402,26 +1396,35 @@ fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     Ok(serde_yaml::to_string(&config)?)
 }
 
-/// Is `existing` — a graph file's exact bytes — still the untouched
-/// [`render_graph_scaffold`] output?
+/// Is `existing`, a graph file's exact bytes, exactly what the CLI's own
+/// writes produce: [`render_graph_scaffold`] for one of `prefixes`, then each
+/// of `prior_nodes` appended in order through [`append_node_to_nodes_block`]?
 ///
-/// `scaffold` MUST be rendered from a CREATE-TIME input the caller can trust —
-/// `render_graph_scaffold(default_prefix(graph_name))`, the graph name — and
-/// NEVER from a prefix parsed back out of `existing`. Rendering it from the
-/// file's own parsed prefix would let a user who edited ONLY the `prefix:`
-/// value produce bytes that match their own edited scaffold, silently skipping
-/// the backup of a genuine hand edit. Because
-/// the create-time default is the only prefix
-/// that can be reconstructed without reading editable file content, an explicit
-/// `graph create -n <prefix>` conservatively fails this check and backs up.
-///
-/// Byte equality, deliberately: no trimming, no comment stripping, no YAML
-/// re-parse. A trailing comment, a blank line, a re-quoted prefix or a legacy
-/// `name:` line is a hand edit, and a hand edit is exactly what the
-/// backup-and-warn arm of [`write_yaml_atomically`] exists to keep. Only a
-/// file that provably holds nothing of the user's may skip it.
-fn is_pristine_scaffold(existing: &str, scaffold: &str) -> bool {
-    existing == scaffold
+/// Byte equality: no trimming, no comment stripping, no YAML re-parse. A
+/// comment, a blank line, a re-quoted prefix, a `name:` line, a `network:`
+/// block or a node in any spelling [`render_node_entry`] does not produce
+/// fails it, and [`node_stage`] then takes the backup-and-warn arm of
+/// [`write_yaml_atomically`]. A re-render whose append is refused matches
+/// nothing.
+fn is_cli_written_graph(
+    existing: &str,
+    prefixes: &[&str],
+    prior_nodes: &[NodeDef],
+) -> CliResult<bool> {
+    for (i, prefix) in prefixes.iter().enumerate() {
+        if prefixes[..i].contains(prefix) {
+            continue;
+        }
+        let mut rendered = Some(render_graph_scaffold(prefix)?);
+        for node in prior_nodes {
+            rendered = rendered
+                .and_then(|doc| append_node_to_nodes_block(&doc, node, "re-rendered graph").ok());
+        }
+        if rendered.as_deref() == Some(existing) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Read and parse a graph YAML file.
@@ -2009,55 +2012,40 @@ pub fn node_stage(
         .last()
         .expect("a node was just pushed onto the config");
     let rewritten = append_node_to_nodes_block(&raw, staged, &graph_path.display().to_string())?;
-    // A file that is STILL the untouched `graph create` scaffold holds nothing
-    // of the user's, so the README's `graph create` → `node stage` pair gets
-    // no "hand edits were backed up" warning and no `.bak` on every first run.
+    // The splice above copies every byte of the prior file into `rewritten`
+    // (the one rewrite is a scaffold's `nodes: []` becoming `nodes:`), so
+    // neither arm below loses a byte. The `.bak` and its warning mark a prior
+    // file that holds bytes the CLI did not write.
     //
-    // The expected scaffold is rendered from the SAME create-time input
-    // `graph create` derives its default from — the graph NAME, fed through
-    // `default_prefix` — NEVER from the file's parsed `config.prefix`. That
-    // distinction is the whole safety check:
-    // `config.prefix` is parsed FROM the current file,
-    // so a user who edits ONLY the `prefix:` value would make the file match a
-    // scaffold rendered for that same edited prefix — silently suppressing the
-    // backup of a real hand edit. Rendering from `default_prefix(graph_name)`
-    // instead means an edited prefix no longer matches, and the backup+warn
-    // correctly fire.
+    // `is_cli_written_graph` re-renders what the CLI's own writes produce: the
+    // `graph create` scaffold for a candidate prefix, then each node already
+    // in the file appended in file order through `append_node_to_nodes_block`.
+    // The candidates are the create-time default `default_prefix(graph_name)`
+    // and the file's own `prefix:` value, so `graph create -n <prefix>` is
+    // covered. A file byte-identical to one of those renders takes
+    // `PriorFile::Discard`: no `.bak`, no warning, one INFO line. Any other
+    // byte (a comment, a `name:` line, a `network:` block, a blank line, a
+    // node in any spelling `render_node_entry` does not produce) breaks the
+    // equality and takes `PriorFile::BackUp` with the warning.
     //
-    // Consequence, deliberately conservative: `graph create -n <prefix>` (an
-    // explicit prefix that differs from the create-time default) is NOT skipped
-    // — its pristineness could only be proven from the file's editable
-    // `prefix:` line, which is exactly what we refuse to trust. We skip the
-    // backup ONLY when pristineness is provable from the immutable graph name;
-    // any other byte — a comment, a `name:` line, an earlier staged node, or an
-    // edited/explicit prefix — takes the backup arm.
-    // Skipping the `.bak` is a COURTESY, not a correctness lever: the write
-    // above is a surgical append that copies every pre-existing byte
-    // — comments, key order, a `network:` block, an edited `prefix:` — verbatim,
-    // so `node stage` never loses a hand edit whichever arm we take here. The
-    // `.bak` is only a rollback convenience, so we skip it exactly when there is
-    // nothing worth a rollback copy: a graph that (a) has NO staged nodes yet
-    // (this stage is adding the first one — `config` holds only the node we just
-    // pushed) AND (b) is byte-identical to the freshly-rendered scaffold. That
-    // is the README `graph create` → `node stage` pair, which then gets no
-    // "hand edits were backed up" warning and no `.bak` on every first run.
-    //
-    // The moment a graph carries a prior staged node it takes the backup arm —
-    // extending a real graph is where a rollback copy actually matters, and
-    // "no prior nodes" is an immutable fact about the file, independent of the
-    // hostname or the editable `prefix:` line.
-    // `default_prefix` is hostname-derived, so a scaffold created on
-    // another host no longer matches and conservatively backs up; and a
-    // `prefix:` edited to the current host that slips through loses nothing,
-    // because the append preserved it.
-    let is_first_node = config.nodes.len() == 1;
-    let default_scaffold =
-        render_graph_scaffold(&cerulion_core::graph::default_prefix(graph_name))?;
-    let prior_file = if is_first_node && is_pristine_scaffold(&raw, &default_scaffold) {
-        tracing::info!(
-            graph = %graph_name,
-            "graph file is the untouched `graph create` scaffold with no staged nodes; staging the first node without a backup"
-        );
+    // A `prefix:` value edited by hand renders the same bytes as
+    // `graph create -n <that value>` and takes the discard arm; the splice
+    // keeps that line in the new file verbatim.
+    let prior_nodes = &config.nodes[..config.nodes.len() - 1];
+    let default_prefix = cerulion_core::graph::default_prefix(graph_name);
+    let prior_file = if is_cli_written_graph(&raw, &[&default_prefix, &config.prefix], prior_nodes)?
+    {
+        if prior_nodes.is_empty() {
+            tracing::info!(
+                graph = %graph_name,
+                "graph file is the untouched `graph create` scaffold with no staged nodes; staging the first node without a backup"
+            );
+        } else {
+            tracing::info!(
+                graph = %graph_name,
+                "graph file holds only what `graph create` and `node stage` wrote; staging the node without a backup"
+            );
+        }
         PriorFile::Discard
     } else {
         PriorFile::BackUp
@@ -15452,8 +15440,9 @@ pub enum ExpectedPrior<'a> {
 ///   both paths (`file_kind` labels what was overwritten). The backup path is
 ///   returned (`Some`) so the CLI stanza can surface it; `None` = fresh write,
 ///   no backup. ONE exception, reachable only inside this module: `node stage`
-///   over the untouched `graph create` scaffold (`is_pristine_scaffold`) has
-///   nothing of the user's to keep and takes neither the backup nor the warn.
+///   over a file byte-identical to the CLI's own `graph create` and
+///   `node stage` writes (`is_cli_written_graph`) takes neither the backup nor
+///   the warn.
 /// * **Never clobber a CONCURRENT writer** — a caller that
 ///   passes [`ExpectedPrior::Contents`] has its precondition checked twice:
 ///   once before anything is staged, and again immediately before the rename.
@@ -15479,7 +15468,7 @@ pub enum ExpectedPrior<'a> {
 /// Parent directories are created as needed. Pinned by the pure tests in
 /// `tests/graph_profile_test.rs` (fresh-write shape, backup+warn arm, no stray
 /// temp files) and `tests/partition_emit_test.rs` (the graph-rewrite caller,
-/// the concurrent-change refusal, and `node stage`'s pristine-scaffold arm).
+/// the concurrent-change refusal, and `node stage`'s CLI-written-file arm).
 pub fn write_yaml_atomically(
     dest: &Path,
     contents: &str,
@@ -15495,8 +15484,8 @@ pub(crate) enum PriorFile {
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
     /// Drop them, silently. Only for a file the caller has PROVED holds
-    /// nothing a user wrote: [`node_stage`] over the untouched `graph create`
-    /// scaffold ([`is_pristine_scaffold`]). Everything else backs up.
+    /// nothing a user wrote: [`node_stage`] over a file byte-identical to the
+    /// CLI's own writes ([`is_cli_written_graph`]). Everything else backs up.
     Discard,
 }
 
@@ -23283,18 +23272,61 @@ mod tests {
         assert_eq!(on_disk, "prefix: robot1\nnodes: []\n");
     }
 
-    #[test]
-    fn a_byte_identical_scaffold_is_pristine() {
-        let scaffold = "prefix: robot1\nnodes: []\n";
-        assert!(is_pristine_scaffold(scaffold, scaffold));
+    /// `sensor` with one output, as `node stage` builds it.
+    fn sensor_node() -> NodeDef {
+        build_node_def(
+            "sensor",
+            None,
+            &[("image".to_string(), Some("sensor_msgs/Image".to_string()))],
+            &[],
+        )
     }
 
-    /// Every hand edit a user plausibly makes to a fresh file — and every
+    /// The `robot1` scaffold with `sensor` staged into it. Hand-written; the
+    /// shape `append_node_to_nodes_block` gives a `nodes: []`.
+    const ROBOT1_WITH_SENSOR: &str = "prefix: robot1\nnodes:\n  - id: sensor\n    type: sensor\n    \
+                                      outputs:\n      - name: image\n        schema: sensor_msgs/Image\n";
+
+    #[test]
+    fn a_byte_identical_scaffold_is_cli_written() {
+        let scaffold = "prefix: robot1\nnodes: []\n";
+        assert!(is_cli_written_graph(scaffold, &["robot1"], &[]).unwrap());
+    }
+
+    /// Either candidate prefix may match: the create-time default, or the
+    /// file's own `prefix:` value (`graph create -n robot1`).
+    #[test]
+    fn a_scaffold_matches_on_any_candidate_prefix() {
+        let scaffold = "prefix: robot1\nnodes: []\n";
+        assert!(is_cli_written_graph(scaffold, &["host", "robot1"], &[]).unwrap());
+        assert!(is_cli_written_graph(scaffold, &["robot1", "host"], &[]).unwrap());
+        assert!(!is_cli_written_graph(scaffold, &["host", "robot2"], &[]).unwrap());
+        assert!(!is_cli_written_graph(scaffold, &[], &[]).unwrap());
+    }
+
+    /// A file holding the scaffold plus a node the CLI staged is CLI-written
+    /// when that node is the prior node, and only then.
+    #[test]
+    fn a_staged_node_in_cli_spelling_is_cli_written() {
+        let sensor = sensor_node();
+        assert!(is_cli_written_graph(
+            ROBOT1_WITH_SENSOR,
+            &["robot1"],
+            std::slice::from_ref(&sensor)
+        )
+        .unwrap());
+        // The same bytes with no prior node to explain them are a hand edit.
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, &["robot1"], &[]).unwrap());
+        // A prior node the file does not hold matches nothing.
+        let other = build_node_def("camera", None, &[], &[]);
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, &["robot1"], &[other]).unwrap());
+    }
+
+    /// Every hand edit a user plausibly makes to a fresh file, and every
     /// "harmless" difference a looser check (trim, re-parse, comment strip)
-    /// would forgive — is NOT pristine: each of these takes the backup arm.
+    /// would forgive, is NOT CLI-written: each of these takes the backup arm.
     #[test]
     fn any_byte_beyond_the_scaffold_is_a_hand_edit() {
-        let scaffold = "prefix: robot1\nnodes: []\n";
         for edited in [
             "# perception\nprefix: robot1\nnodes: []\n",
             "prefix: robot1\nnodes: []\n\n",
@@ -23305,8 +23337,30 @@ mod tests {
             "",
         ] {
             assert!(
-                !is_pristine_scaffold(edited, scaffold),
-                "must not count as pristine: {edited:?}"
+                !is_cli_written_graph(edited, &["robot1"], &[]).unwrap(),
+                "must not count as CLI-written: {edited:?}"
+            );
+        }
+    }
+
+    /// The same hand-edit classes on a file that already holds a staged node:
+    /// each byte the CLI did not write breaks the match.
+    #[test]
+    fn any_byte_beyond_the_staged_nodes_is_a_hand_edit() {
+        let sensor = vec![sensor_node()];
+        for edited in [
+            format!("# perception\n{ROBOT1_WITH_SENSOR}"),
+            format!("{ROBOT1_WITH_SENSOR}\n"),
+            format!("{ROBOT1_WITH_SENSOR}    # the front camera\n"),
+            format!("name: perception\n{ROBOT1_WITH_SENSOR}"),
+            format!("{ROBOT1_WITH_SENSOR}network:\n  zenoh: {{}}\n"),
+            ROBOT1_WITH_SENSOR.replace("schema: sensor_msgs/Image", "schema: sensor_msgs::Image"),
+            ROBOT1_WITH_SENSOR.replace("  - id: sensor", "- id: sensor"),
+            ROBOT1_WITH_SENSOR.replace("prefix: robot1", "prefix: 'robot1'"),
+        ] {
+            assert!(
+                !is_cli_written_graph(&edited, &["robot1"], &sensor).unwrap(),
+                "must not count as CLI-written: {edited:?}"
             );
         }
     }
