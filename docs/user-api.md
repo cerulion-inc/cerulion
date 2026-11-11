@@ -2261,8 +2261,12 @@ route egress through ONE network gateway that opens the robot's single
 zenoh session and announces every produced topic when LAN access is open;
 one loud breadcrumb prints at start. On the default Unix path that gateway is hosted by the machine's
 `cerulion-netd`, which listens and advertises itself over mDNS only when
-`CERULION_NETD_LISTEN` is set, so a stock robot is not found by a default
-desk. The per-run fallback gateway child listens on the well-known port
+`CERULION_NETD_LISTEN` is set. In a WAN build, the first egress registration
+also starts the authenticated remote server without a listen locator; a saved
+login or established robot pairing permits it, including an expired saved login.
+Query-only desks and local-only runs start no remote server. The last serving
+registration's release or disconnect reaps the server after active shell/exec work,
+an owed e-stop delivery and its latch have cleared. The per-run fallback gateway child listens on the well-known port
 **7683** (bind-probing upward on conflict; override with
 `CERULION_GATEWAY_PORT`) and advertises itself over mDNS. The
 optional top-level `network:` block below RESTRICTS this (a Strict

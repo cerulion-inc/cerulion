@@ -8,6 +8,12 @@ also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
 `cerulion-wire`.
 
 ## Invariants
+- Owned-server idle admission uses `serving_hold::ServingHolds`, installed on
+  daemon `OpsServing`. Acquire a work guard before shell/exec admission and retain
+  it through child drain and final witness; missing daemon manager is an error.
+  Ops/RCP admissions, the e-stop latch and owed delivery retain the native shared
+  fence. Netd's exclusive fence prevents new work racing idle stop; never unlink
+  the file. Shutdown participants still run on explicit SIGTERM while holds exist.
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
   to capability table in `authorizer.rs` is the sacred security surface. An
   unclassified verb is DENIED; a new one must be classified there
