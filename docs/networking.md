@@ -28,7 +28,7 @@ default + gateway, the discovery ladder, and pairing.
   (gossip stays on); `CERULION_MULTICAST_SCOUTING=on` turns it back on. One
   loud breadcrumb prints at start:
 
-  > ``LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.``
+  > `LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.`
 
 - **The `network:` block TIGHTENS.** With an explicit enabled block the
   gateway runs STRICT: it announces + egresses exactly the declared `egress`
