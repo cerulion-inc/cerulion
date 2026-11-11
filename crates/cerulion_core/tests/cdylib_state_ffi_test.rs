@@ -56,7 +56,7 @@
 //!
 //! ```bash
 //! cargo build -p test_node_macro_state_cdylib -p test_node_cdylib \
-//!             -p test_node_state_liar_cdylib
+//!             -p test_node_state_liar_cdylib -p test_node_macro_accumulate_cdylib
 //! cargo test -p cerulion_core --test cdylib_state_ffi_test -- --test-threads=1
 //! ```
 
@@ -66,7 +66,7 @@ use std::time::Duration;
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::{
-    ClosureNodeEntry, DylibNodeEntry, MacroPolicy, NodeEntry, NodeInfo,
+    ClosureNodeEntry, DylibNodeEntry, MacroPolicy, NodeEntry, NodeInfo, ShutdownSignal,
 };
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
@@ -481,15 +481,10 @@ fn a_trailing_byte_in_the_payload_refuses_rather_than_decoding_a_prefix() {
         .expect("probe")
         .restore_state(&blob)
         .expect_err("a trailing byte is a drift signal, not padding");
-    let text = err.to_string();
-    assert!(
-        text.contains("trailing") || text.contains("Trailing"),
-        "names the condition: {text}"
-    );
-    assert!(
-        text.contains("PARTIALLY restored"),
-        "says the run must fail rather than continue: {text}"
-    );
+    let TransportError::GraphError { reason } = err else {
+        panic!("restore must keep the native state error class")
+    };
+    assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: state blob has 1 trailing byte(s) after decode. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", state_cdylib().display()));
 }
 
 #[test]
@@ -1778,4 +1773,72 @@ fn complete_and_empty_diagnostics_survive_the_loader_without_truncation_or_repla
         .to_string();
     assert!(text.contains("node tick failed with status 2"));
     assert!(!text.contains("full reason:"));
+}
+
+#[test]
+#[serial]
+fn a_param_change_capture_preserves_the_full_native_reason_after_delivery() {
+    // SAFETY (U01/U03): trusted same-compiler fixture and exact control symbol;
+    // the library remains live through the callback, reset guard and graph.
+    let (_library, toggle) = unsafe {
+        let library = libloading::Library::new(state_cdylib()).unwrap();
+        let toggle = *library
+            .get::<extern "C" fn(u32)>(b"cerulion_test_set_param_mutation\0")
+            .unwrap();
+        (library, toggle)
+    };
+    struct Reset(extern "C" fn(u32));
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            (self.0)(0);
+        }
+    }
+    let (mut runtime, probe, seen) = built_probe("param_text");
+    let _reset = Reset(toggle);
+    toggle(1);
+    runtime.step(Duration::from_millis(10));
+    toggle(0);
+    // The periodic sink receives the previous tick's published frame.
+    runtime.step(Duration::from_millis(10));
+    assert_eq!(*seen.lock().unwrap(), vec![(0, 0, 0, 7)]);
+    let error = probe
+        .lock()
+        .unwrap()
+        .capture_state(&mut VecSink::new())
+        .unwrap_err();
+    let TransportError::GraphError { reason } = error else {
+        panic!("capture must keep the native state error class")
+    };
+    assert_eq!(reason, format!("node '{}' state capture failed (code -5): the cdylib could not encode this node's state \u{2014} cerulion_node_capture_state: param 'gain' changed after the graph set it. A param is fixed for the run and an anchor does not carry it, so a resume would run on the graph's value. Fix: keep a value the node changes in a field that is not a #[param]", state_cdylib().display()));
+}
+
+#[test]
+#[serial]
+fn an_accumulate_count_mismatch_preserves_the_full_native_reason_and_state() {
+    let path = find_cdylib("test_node_macro_accumulate_cdylib");
+    let mut entry = DylibNodeEntry::load(&path).unwrap();
+    entry
+        .init(NodeContext::with_runtime_env(
+            IndexMap::new(),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::new(std::collections::HashMap::new()),
+        ))
+        .unwrap();
+    let error = entry.restore_state(&[0, 0, 0, 0]).unwrap_err();
+    let TransportError::GraphError { reason } = error else {
+        panic!("restore must keep the native state error class")
+    };
+    assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: accumulate input `tf` cannot be restored: the recording holds 0 accumulate input(s), the node declares 1. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+    let mut sink = VecSink::new();
+    entry.capture_state(&mut sink).unwrap();
+    assert_eq!(
+        sink.into_inner(),
+        [
+            1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0
+        ]
+    );
+    entry.shutdown().unwrap();
 }

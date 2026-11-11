@@ -123,14 +123,21 @@ impl AccumulatorSet {
     }
 
     /// Restore borrowed native per-port records without copying any frame.
+    // hot-path-alloc-ok-fn: canonical restore is a cold lifecycle operation; only refusals format names.
     pub fn restore(&mut self, cursor: &mut StateCursor<'_>) -> TransportResult<()> {
         if self.inputs.is_empty() {
             return Ok(());
         }
         let count = cursor.read_element_count().map_err(super::state_error)?;
         if count != self.inputs.len() {
-            return Err(super::argument_error(
-                "recorded accumulate input count differs",
+            return Err(super::state_error(
+                crate::state::StateError::AccumulateRestore {
+                    input: self.inputs[0].name.to_string(),
+                    reason: format!(
+                        "the recording holds {count} accumulate input(s), the node declares {}",
+                        self.inputs.len()
+                    ),
+                },
             ));
         }
         for input in &mut self.inputs {
@@ -141,15 +148,27 @@ impl AccumulatorSet {
             let name_len = scan.read_payload_len().map_err(super::state_error)?;
             let name = scan.take(name_len).map_err(super::state_error)?;
             if name != input.name.as_bytes() {
-                return Err(super::argument_error(
-                    "recorded accumulate input name differs",
+                return Err(super::state_error(
+                    crate::state::StateError::AccumulateRestore {
+                        input: input.name.to_string(),
+                        reason: format!(
+                            "the recording names input `{}` in its place",
+                            String::from_utf8_lossy(name)
+                        ),
+                    },
                 ));
             }
             let _ = scan.take(16).map_err(super::state_error)?;
             let frames = scan.read_element_count().map_err(super::state_error)?;
             if frames > input.cap {
-                return Err(super::argument_error(
-                    "recorded accumulate count exceeds its bound",
+                return Err(super::state_error(
+                    crate::state::StateError::AccumulateRestore {
+                        input: input.name.to_string(),
+                        reason: format!(
+                            "the recording holds {frames} frame(s), above the cap of {}",
+                            input.cap
+                        ),
+                    },
                 ));
             }
             for _ in 0..frames {
