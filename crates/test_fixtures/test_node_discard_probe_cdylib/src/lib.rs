@@ -52,12 +52,23 @@ fn discard_mode_is_healthy() -> bool {
     std::env::var("CER_DISCARD_MODE").as_deref() == Ok("healthy")
 }
 
+struct DefaultLogProbe;
+
+impl Default for DefaultLogProbe {
+    fn default() -> Self {
+        tracing::info!("discard probe field default ran");
+        Self
+    }
+}
+
 #[cerulion_node(period_ms = 10)]
 #[derive(Default)]
 struct DiscardProbe {
     #[output]
     image_out: Image,
     count: u32,
+    #[cerulion(reconstruct)]
+    _default_log: DefaultLogProbe,
 }
 
 #[cerulion_node_impl]

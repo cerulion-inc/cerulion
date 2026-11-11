@@ -1842,3 +1842,97 @@ fn an_accumulate_count_mismatch_preserves_the_full_native_reason_and_state() {
     );
     entry.shutdown().unwrap();
 }
+
+fn accumulate_state_entry() -> (std::path::PathBuf, DylibNodeEntry) {
+    let path = find_cdylib("test_node_macro_accumulate_cdylib");
+    let mut entry = DylibNodeEntry::load(&path).unwrap();
+    entry
+        .init(NodeContext::with_runtime_env(
+            IndexMap::new(),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::new(std::collections::HashMap::new()),
+        ))
+        .unwrap();
+    (path, entry)
+}
+
+fn one_held_vector_record(schema_hash: u64, total_size: u32, frame_len: usize) -> Vec<u8> {
+    // Hand-written canonical set/name/counters/count, followed by a wire
+    // Vector3 header and its three zero-valued float64 fields.
+    let mut record = vec![1, 0, 0, 0, 2, 0, 0, 0, b't', b'f'];
+    record.extend_from_slice(&[0; 16]);
+    record.extend_from_slice(&[1, 0, 0, 0]);
+    record.extend_from_slice(&(frame_len as u32).to_le_bytes());
+    let mut frame = vec![0; frame_len];
+    frame[..8].copy_from_slice(&schema_hash.to_le_bytes());
+    frame[8..12].copy_from_slice(&total_size.to_le_bytes());
+    record.extend_from_slice(&frame);
+    record
+}
+
+#[test]
+#[serial]
+fn held_accumulate_restore_refusals_preserve_full_native_reasons_and_state() {
+    let (path, mut entry) = accumulate_state_entry();
+    assert_eq!(
+        native_ros2_messages::geometry_msgs::Vector3::SCHEMA_HASH,
+        0xD43E_E559_2039_B9DF
+    );
+    let schema_reason = "Schema mismatch on topic 'tf': expected hash 0xD43EE5592039B9DF, got 0x0000000000000123. Check that publisher and subscriber use the same schema; if you recently changed a schema, rebuild BOTH sides (`cerulion node build <type>`).";
+    for (hash, size, len, detail) in [
+        (0x123, 64, 64, schema_reason),
+        (0x123, 65, 64, schema_reason),
+        (0xD43E_E559_2039_B9DF, 65, 64, "Deserialization error on topic 'tf': wire header total_size 65 out of bounds (frame 64 bytes, header 40 bytes)"),
+        (0xD43E_E559_2039_B9DF, 40, 40, "Deserialization error on topic 'tf': wire header total_size 40 leaves no room for the schema: a 24 byte fixed section plus 0 offset table entry/entries needs 64"),
+        (0xD43E_E559_2039_B9DF, 64, 72, "Deserialization error on topic 'tf': accumulate frame of 72 bytes has no valid wire header"),
+    ] {
+        let error = entry.restore_state(&one_held_vector_record(hash, size, len)).unwrap_err();
+        let TransportError::GraphError { reason } = error else { panic!("restore must keep native state error class") };
+        assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: accumulate input `tf` cannot be restored: a held frame is refused: {detail}. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+        let mut captured = VecSink::new();
+        entry.capture_state(&mut captured).unwrap();
+        assert_eq!(captured.into_inner(), [1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    let healthy = one_held_vector_record(0xD43E_E559_2039_B9DF, 64, 64);
+    entry.restore_state(&healthy).unwrap();
+    let mut captured = VecSink::new();
+    entry.capture_state(&mut captured).unwrap();
+    assert_eq!(captured.into_inner(), healthy);
+    entry.shutdown().unwrap();
+}
+
+#[test]
+#[serial]
+fn truncated_accumulate_drop_counters_keep_native_eight_byte_reads() {
+    let (path, mut entry) = accumulate_state_entry();
+    for record in [
+        vec![1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0],
+        vec![
+            1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    ] {
+        let error = entry.restore_state(&record).unwrap_err();
+        let TransportError::GraphError { reason } = error else {
+            panic!("restore must keep native state error class")
+        };
+        assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: state blob truncated: needed 8 more byte(s), 7 remain. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+    }
+    entry.shutdown().unwrap();
+}
+
+#[test]
+#[serial]
+fn pending_accumulate_drops_above_lifetime_drops_keep_native_acceptance() {
+    let (_, mut entry) = accumulate_state_entry();
+    let record = [
+        1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ];
+    entry.restore_state(&record).unwrap();
+    let mut captured = VecSink::new();
+    entry.capture_state(&mut captured).unwrap();
+    assert_eq!(captured.into_inner(), record);
+    entry.shutdown().unwrap();
+}

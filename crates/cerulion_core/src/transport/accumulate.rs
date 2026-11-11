@@ -378,6 +378,56 @@ impl FrameCheck {
             }
         }
     }
+
+    // hot-path-alloc-ok-fn: canonical restore refusals preserve native typed-reader text.
+    fn check_restored(
+        &self,
+        topic: &str,
+        raw: &[u8],
+        check_alignment: bool,
+    ) -> TransportResult<()> {
+        let Self::Raw(layout) = self else {
+            return self.check(topic, raw);
+        };
+        let (header, payload) =
+            super::input_view::validate_wire_frame_raw(topic, raw, Some(layout.schema_hash))?;
+        let required = crate::wire::frame_prefix_size(
+            layout.fixed_size as usize,
+            layout.variable_fields as usize,
+        )
+        .ok_or_else(|| TransportError::Deserialization {
+            topic: topic.to_string(),
+            reason: format!(
+                "schema fixed size {} with {} variable field(s) overflows a wire frame",
+                layout.fixed_size, layout.variable_fields
+            ),
+        })?;
+        if payload.end < required {
+            return Err(TransportError::Deserialization {
+                topic: topic.to_string(),
+                reason: format!("wire header total_size {} leaves no room for the schema: a {} byte fixed section plus {} offset table entry/entries needs {required}", payload.end, layout.fixed_size, layout.variable_fields),
+            });
+        }
+        if header.total_size as usize != raw.len() {
+            return Err(TransportError::Deserialization {
+                topic: topic.to_string(),
+                reason: format!(
+                    "accumulate frame of {} bytes has no valid wire header",
+                    raw.len()
+                ),
+            });
+        }
+        // Packed canonical records need not align their frames. Check alignment
+        // only after the frame has been copied into the native aligned slot.
+        const WIRE_ALIGN: usize = crate::shm_runtime::FRAME_ALIGN;
+        if check_alignment && raw.as_ptr().align_offset(WIRE_ALIGN) != 0 {
+            return Err(TransportError::Deserialization {
+                topic: topic.to_string(),
+                reason: format!("frame is not {WIRE_ALIGN}-byte aligned, which the wire format requires and a zero-copy reader cannot work around"),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn check_frame<T: ShmMessage>(topic: &str, raw: &[u8]) -> TransportResult<()> {
@@ -613,7 +663,7 @@ impl AccumulatorSet {
             input: name.to_string(),
             reason: reason.to_string(),
         };
-        let FrameCheck::Raw(layout) = acc.check else {
+        let FrameCheck::Raw(_) = acc.check else {
             return Err(refuse("input is not registered for plugin state"));
         };
         let mut src = StateCursor::new(bytes);
@@ -621,11 +671,8 @@ impl AccumulatorSet {
         if src.take(name_len)? != name.as_bytes() {
             return Err(refuse("recorded input name differs"));
         }
-        let total = read_u64(&mut src)?;
-        let pending = read_u64(&mut src)?;
-        if pending > total {
-            return Err(refuse("pending drops exceed lifetime drops"));
-        }
+        let _ = read_u64(&mut src)?;
+        let _ = read_u64(&mut src)?;
         let frames = src.read_element_count()?;
         if frames > acc.buffer.cap() {
             return Err(refuse("recorded frames exceed the input cap"));
@@ -633,13 +680,9 @@ impl AccumulatorSet {
         for _ in 0..frames {
             let len = src.read_payload_len()?;
             let frame = src.take(len)?;
-            let size =
-                u32::try_from(len).map_err(|_| refuse("recorded frame exceeds the wire size"))?;
-            if !layout.accepts(frame, size)
-                || WireHeader::read_from_buf(frame).is_none_or(|header| header.total_size != size)
-            {
-                return Err(refuse("recorded frame does not match the input schema"));
-            }
+            acc.check
+                .check_restored(&acc.topic, frame, false)
+                .map_err(|error| refuse(&format!("a held frame is refused: {error}")))?;
         }
         src.finish()?;
         let mut src = StateCursor::new(bytes);
@@ -784,8 +827,11 @@ impl Accumulator {
             buffer
                 .insert(&self.topic, frame)
                 .and_then(|_| {
-                    self.check
-                        .check(&self.topic, buffer.slots[buffer.held - 1].bytes())
+                    self.check.check_restored(
+                        &self.topic,
+                        buffer.slots[buffer.held - 1].bytes(),
+                        true,
+                    )
                 })
                 .map_err(|e| refuse(&self.name, format!("a held frame is refused: {e}")))?;
         }
