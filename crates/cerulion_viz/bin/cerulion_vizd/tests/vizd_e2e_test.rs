@@ -105,7 +105,7 @@ use cerulion_vizd::{
 // The SHIPPED control client and its request lines: a reply it reads arrives
 // inside its own 5 s deadline or fails with its own error.
 use cerulion_cli_engine::viz_client::{
-    attach_line, detach_line, discover_line, list_line, VizdConn,
+    attach_line, detach_line, discover_line, list_line, status_line, VizdConn,
 };
 use native_ros2_messages::geometry_msgs::Vector3;
 use native_ros2_messages::nav_msgs::Path;
@@ -5552,13 +5552,14 @@ fn an_attached_mirror_is_attributed_to_its_robot_on_list_and_status_e2e() {
     // CONVERGE, THEN ASSERT. A single unpolled
     // `list` immediately after `attach` would assert as though the mirror's
     // attribution were available synchronously. It is not, BY DESIGN:
-    // `attribution_snapshot` unions a CACHED `gather_mirror_provenance()`, and
-    // that cache has a `PROVENANCE_CACHE_TTL` of 3 s (daemon.rs:438). A gather
-    // that misses the record — the SHM read is best-effort and a freshly
-    // attached reader can lag the already-published provenance sample — is then
-    // SERVED STALE for up to the whole TTL, and the tap's own `origin_robot`,
-    // recorded at attach from that same gather, is `None` too. So the row can
-    // legitimately carry no robot for ~3 s.
+    // `attribution_snapshot` unions a CACHED provenance snapshot, which the
+    // attach's own gather refreshed. A gather that misses the record (the SHM
+    // read is best-effort, and a freshly attached reader can lag the
+    // already-published provenance sample) is then SERVED STALE for up to the
+    // whole `PROVENANCE_CACHE_TTL`, and `list` and `status` never gather, so
+    // each `list` retry below asks `discover` first: that is the verb that refreshes
+    // the snapshot on a miss. So the row can legitimately carry no robot for
+    // ~3 s.
     //
     // That transient is not a defect this test is entitled to catch: the daemon's
     // cache docs name it acceptable (the defect is a PERSISTENT mis-group), and the
@@ -5573,6 +5574,8 @@ fn an_attached_mirror_is_attributed_to_its_robot_on_list_and_status_e2e() {
     // ALONE does not cover the attribution its own assertion reads, so that half is
     // exposed to this same transient.)
     let mut list = client.request(r#"{"id":2,"method":"list"}"#);
+    // The refreshing `discover` goes through the shipped client, so its read is bounded.
+    let mut refresher = VizdConn::connect(&socket).expect("the shipped client connects");
     let attribution_deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < attribution_deadline
         && entry_for(&list["attached"], "topic", "/attr/scan")
@@ -5580,6 +5583,7 @@ fn an_attached_mirror_is_attributed_to_its_robot_on_list_and_status_e2e() {
             .is_none()
     {
         std::thread::sleep(Duration::from_millis(100));
+        shipped_request(&mut refresher, &discover_line(2));
         list = client.request(r#"{"id":2,"method":"list"}"#);
     }
     let scan = entry_for(&list["attached"], "topic", "/attr/scan").expect("mirror is attached");
@@ -6177,6 +6181,153 @@ fn attach_ok(conn: &mut VizdConn, topic: &str) {
     assert_eq!(att["ok"].as_bool(), Some(true), "attach {topic}: {att}");
 }
 
+/// `list` and `status` answer from the HELD provenance snapshot while a gather
+/// is in flight, inside the shipped client's reply deadline, and keep that answer
+/// across another topic's detach.
+///
+/// The gather is a `discover` sent past the TTL and parked at the provenance
+/// gate, so it stays in flight for as long as the test needs. A `list` or `status`
+/// that gathered too would park behind the same gate and fail in the shipped
+/// client with its own timeout error.
+#[test]
+fn list_and_status_answer_from_the_held_snapshot_while_a_provenance_gather_is_held_e2e() {
+    let _statics = blueprint_statics_guard();
+    let arm = HeldArm::start("held_list");
+    let (scan, local, spare) = ("/held/scan", "/held/local", "/held/spare");
+    let _scan_pub = arm.mirror(scan, "ubuntu");
+    let _local_pub = Publisher::spawn(Arc::clone(&arm.mgr), local);
+    let _spare_pub = Publisher::spawn(Arc::clone(&arm.mgr), spare);
+    let mut conn = arm.shipped();
+    for topic in [scan, local, spare] {
+        attach_ok(&mut conn, topic);
+    }
+    converge_list_robot(&mut conn, scan, "ubuntu");
+
+    assert!(
+        arm.daemon
+            .age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
+        "precondition: a gather stamped the snapshot"
+    );
+    let started = arm.daemon.provenance_gathers_started();
+    let discarded = arm.daemon.provenance_gathers_discarded();
+    let hold = arm.daemon.hold_provenance_gather_for_test();
+    let held_discover = UnreadReply::send(&arm.socket, &discover_line(10));
+    assert!(
+        hold.wait_parked(1, ATTRIBUTION_CONVERGENCE_BOUND),
+        "precondition: the discover past the TTL gathers and parks at the gate"
+    );
+
+    let oracle = vec![
+        (local.to_string(), None),
+        (scan.to_string(), Some(serde_json::json!("ubuntu"))),
+        (spare.to_string(), None),
+    ];
+    let list = shipped_request(&mut conn, &list_line(11));
+    assert_eq!(robot_column(&list["attached"]), oracle, "{list}");
+    let status = shipped_request(&mut conn, &status_line(12));
+    assert_eq!(robot_column(&status["topics"]), oracle, "{status}");
+    let again = shipped_request(&mut conn, &list_line(13));
+    assert_eq!(
+        robot_column(&again["attached"]),
+        robot_column(&list["attached"]),
+        "two reads of one held snapshot agree"
+    );
+
+    // Another topic's detach marks the snapshot stale and keeps the rest of it.
+    let detached = shipped_request(&mut conn, &detach_line(14, spare));
+    assert_eq!(detached["ok"].as_bool(), Some(true), "{detached}");
+    let after = shipped_request(&mut conn, &list_line(15));
+    assert_eq!(
+        robot_column(&after["attached"]),
+        oracle[..2].to_vec(),
+        "{after}"
+    );
+    assert_eq!(
+        arm.daemon.provenance_gathers_started() - started,
+        1,
+        "only the held discover gathered"
+    );
+
+    drop(hold);
+    let reply = held_discover.read();
+    assert_eq!(reply["ok"].as_bool(), Some(true), "{reply}");
+    assert_eq!(
+        arm.daemon.provenance_gathers_discarded() - discarded,
+        1,
+        "the discover started before the detach, so its answer is not stored"
+    );
+}
+
+/// A `list` before anything has gathered mirror provenance answers at once, with
+/// no robot on a registered mirror, and starts no gather; the first `discover`
+/// then fills the snapshot `list` serves.
+#[test]
+fn a_first_list_before_any_provenance_snapshot_answers_at_once_with_no_robot_e2e() {
+    let _statics = blueprint_statics_guard();
+    let arm = HeldArm::start("held_cold");
+    let mirror = "/cold/scan";
+    let _mirror_pub = arm.mirror(mirror, "ubuntu");
+    let hold = arm.daemon.hold_provenance_gather_for_test();
+    let mut conn = arm.shipped();
+    // `compose_layout` attaches without reading provenance, so nothing has
+    // gathered when `list` and `status` run.
+    let composed = shipped_request(
+        &mut conn,
+        &format!(r#"{{"id":1,"method":"compose_layout","intent":{{"topics":["{mirror}"]}}}}"#),
+    );
+    assert_eq!(composed["ok"].as_bool(), Some(true), "{composed}");
+    assert_eq!(arm.daemon.provenance_gathers_started(), 0, "{composed}");
+
+    let oracle = vec![(mirror.to_string(), None)];
+    let list = shipped_request(&mut conn, &list_line(2));
+    assert_eq!(robot_column(&list["attached"]), oracle, "{list}");
+    let status = shipped_request(&mut conn, &status_line(3));
+    assert_eq!(robot_column(&status["topics"]), oracle, "{status}");
+    assert_eq!(
+        arm.daemon.provenance_gathers_started(),
+        0,
+        "list and status never gather"
+    );
+
+    drop(hold);
+    converge_list_robot(&mut conn, mirror, "ubuntu");
+}
+
+/// A mirror name this daemon detached, then reused by a desk producer, reads no
+/// robot on `list` and `status`: the detach dropped that name from the held
+/// snapshot, and nothing has gathered since.
+#[test]
+fn a_self_detached_mirror_name_reused_by_a_desk_producer_reads_no_robot_on_list_e2e() {
+    let _statics = blueprint_statics_guard();
+    let arm = HeldArm::start("held_reuse");
+    let topic = "/reuse/scan";
+    let retiring = arm.mirror(topic, "ubuntu");
+    let mut conn = arm.shipped();
+    attach_ok(&mut conn, topic);
+    converge_list_robot(&mut conn, topic, "ubuntu");
+
+    let detached = shipped_request(&mut conn, &detach_line(3, topic));
+    assert_eq!(detached["ok"].as_bool(), Some(true), "{detached}");
+    arm.mgr
+        .unregister_mirror_provenance(topic)
+        .expect("unregister the retired mirror's provenance");
+    drop(retiring);
+    let _desk_pub = Publisher::spawn(Arc::clone(&arm.mgr), topic);
+
+    let hold = arm.daemon.hold_provenance_gather_for_test();
+    let composed = shipped_request(
+        &mut conn,
+        &format!(r#"{{"id":4,"method":"compose_layout","intent":{{"topics":["{topic}"]}}}}"#),
+    );
+    assert_eq!(composed["ok"].as_bool(), Some(true), "{composed}");
+    let oracle = vec![(topic.to_string(), None)];
+    let list = shipped_request(&mut conn, &list_line(5));
+    assert_eq!(robot_column(&list["attached"]), oracle, "{list}");
+    let status = shipped_request(&mut conn, &status_line(6));
+    assert_eq!(robot_column(&status["topics"]), oracle, "{status}");
+    drop(hold);
+}
+
 /// A gather that read the registry before a `detach` never puts the detached
 /// topic's robot back: its store is refused, and the next read of that topic
 /// gathers again.
@@ -6243,8 +6394,8 @@ fn a_gather_that_read_before_a_detach_never_resurrects_the_detached_topics_robot
 }
 
 /// A failed provenance gather is counted, attributes nothing in the reply of the
-/// request that ran it, and is stored like an answer; the next refresh past the
-/// TTL brings the robot back.
+/// request that ran it, and is stored like an answer, which `list` then serves
+/// without gathering; the next refresh past the TTL brings the robot back.
 #[test]
 fn a_failed_provenance_gather_answers_without_robots_and_recovers_on_the_next_refresh_e2e() {
     let _statics = blueprint_statics_guard();
@@ -6289,6 +6440,18 @@ fn a_failed_provenance_gather_answers_without_robots_and_recovers_on_the_next_re
             .age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
         "the failed gather stored its empty answer: nothing else could stamp the \
          snapshot the detach cleared"
+    );
+    // `list` serves the stored empty answer at any age and gathers nothing.
+    let list = shipped_request(&mut conn, &list_line(11));
+    assert_eq!(
+        robot_column(&list["attached"]),
+        vec![(topic.to_string(), None)],
+        "{list}"
+    );
+    assert_eq!(
+        arm.daemon.provenance_gathers_started() - started,
+        1,
+        "list gathers nothing, even past the TTL"
     );
     converge_list_robot(&mut conn, topic, "ubuntu");
 }

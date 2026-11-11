@@ -1816,12 +1816,53 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
     let literal = block_at(local, open).expect("the reply literal is balanced");
     let robot = struct_field_value(local, literal, "robot");
     assert!(
-        robot.contains("attribution_snapshot"),
+        robot.contains("attribution_snapshot(ProvenanceRead::RefreshOnMiss)"),
         "the attach reply's `robot` must be COMPUTED from the merged snapshot — that \
          per-call answer is the attribution rule's, and `attribution_snapshot` is also one of the \
          gathering verbs the hint-refresh convergence bound is stated against. A call \
          whose result is discarded beside a `None` robot satisfies a body-wide \
          `contains` and answers nothing.\n\nrobot: {robot}\nliteral: {literal}"
+    );
+}
+
+/// `list` and `status` serve the HELD attribution and never fetch.
+///
+/// Both answer the Studio shell's polls, and a fetch there is a registry open plus up
+/// to `MIRROR_GATHER_WINDOW` on a reply the shipped client bounds at 5 s, so a slow
+/// registry turns a shell poll into a dead connection. Each attribution read names
+/// its policy (`ProvenanceRead`), which is what this walk reads: `Held` here,
+/// `RefreshOnMiss` on `discover`, which stays the verb that keeps the snapshot
+/// current.
+///
+/// Behaviourally pinned by
+/// `vizd_e2e_test::list_and_status_answer_from_the_held_snapshot_while_a_provenance_gather_is_held_e2e`,
+/// which holds a gather in flight and requires both replies inside the shipped
+/// client's deadline.
+#[test]
+fn list_and_status_serve_the_held_attribution_and_never_fetch() {
+    let code = code_containing("fn attribution_snapshot(");
+    for verb in ["fn list(&self", "fn status(&self"] {
+        let body = fn_body(&code, verb);
+        assert!(
+            body.contains("attribution_snapshot(ProvenanceRead::Held)"),
+            "`{verb}` must read the HELD snapshot:\n{body}"
+        );
+        for fetch in ["gather_mirror_provenance", "RefreshOnMiss"] {
+            assert!(
+                !body.contains(fetch),
+                "`{verb}` reaches `{fetch}`, which gathers on a miss: a registry open \
+                 plus up to MIRROR_GATHER_WINDOW on a reply the shipped client bounds \
+                 at 5 s:\n{body}"
+            );
+        }
+    }
+    // ANTI-TAUTOLOGY: the negatives above also pass a daemon in which nothing
+    // refreshes the snapshot at all, so `discover` must still be the verb that does.
+    let discover = fn_body(&code, "fn discover(&self");
+    assert!(
+        discover.contains("attribution_snapshot(ProvenanceRead::RefreshOnMiss)"),
+        "`discover` must refresh the snapshot on a miss, or `list` and `status` serve \
+         a snapshot nothing renews:\n{discover}"
     );
 }
 
