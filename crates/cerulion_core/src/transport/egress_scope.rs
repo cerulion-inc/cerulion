@@ -121,7 +121,26 @@ fn verifier(topic: &str) -> TransportResult<AttributeVerifier> {
     let mut verifier = AttributeVerifier::new()
         .require(&length_key, &length)
         .map_err(|e| error(topic, e))?;
-    let mut remaining = topic;
+    // Native attributes accept ASCII only, even though registration names are UTF-8.
+    // Preserve ASCII marker compatibility and encode every byte of other identities.
+    // A kind attribute distinguishes encoded bytes from a literal ASCII identity.
+    let encoded;
+    let mut remaining = if topic.is_ascii() {
+        topic
+    } else {
+        let key = "topic_kind".try_into().map_err(|e| error(topic, e))?;
+        let kind = "hex".try_into().map_err(|e| error(topic, e))?;
+        verifier = verifier.require(&key, &kind).map_err(|e| error(topic, e))?;
+        use std::fmt::Write;
+        encoded = topic.as_bytes().iter().fold(
+            String::with_capacity(topic.len() * 2),
+            |mut value, byte| {
+                write!(value, "{byte:02x}").expect("writing to a String cannot fail");
+                value
+            },
+        );
+        &encoded
+    };
     let mut index = 0;
     while !remaining.is_empty() {
         let mut end = remaining
