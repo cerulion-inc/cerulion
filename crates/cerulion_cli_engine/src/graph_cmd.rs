@@ -2295,9 +2295,9 @@ pub fn graph_validate(
 /// [`graph_validate`] with the node-library reader chosen by the caller: a
 /// one-shot CLI loads libraries in-process, a standing daemon MUST NOT (a
 /// library that aborts on load would take it down — see
-/// [`crate::node_inspector`]). The input backpressure check, the network-ingress
-/// gate and the params check read libraries; the other checks are source- and
-/// path-based.
+/// [`crate::node_inspector`]). The input backpressure and process groups
+/// checks, the network-ingress gate and the params check read libraries; the
+/// other checks are source- and path-based.
 pub fn graph_validate_with_inspector(
     workspace_root: &Path,
     graph_name: &str,
@@ -2336,10 +2336,10 @@ pub fn graph_validate_with_inspector(
     // the same cache and threads it back in so a validated run walks
     // each `src/` tree exactly once total.
     let cdylib_cache = resolve_cdylib_cache(workspace_root, &config, prefer_release);
-    // Every check that reads a node library (the input backpressure check, the
-    // ingress gate and the params check) goes through ONE memo, so each
-    // library's static initialization and teardown run once per validation,
-    // not once per check and node.
+    // Every check that reads a node library (the input backpressure and process
+    // groups checks, the ingress gate and the params check) goes through ONE
+    // memo, so each library's static initialization and teardown run once per
+    // validation, not once per check and node.
     let inspector = crate::graph_params_check::OncePerLibrary::new(inspector);
     Ok(graph_validate_with_cache(
         workspace_root,
@@ -2364,6 +2364,11 @@ const TOPOLOGY_CHECK_LABEL: &str = "graph topology";
 /// the graph's per-input keys applied to the loaded node metadata, then the
 /// topology built and validated, as `GraphRuntime::build` does on every start.
 const INPUT_BACKPRESSURE_CHECK_LABEL: &str = "input backpressure";
+
+/// The report label for the declared partition check ([`process_groups_check`]):
+/// the verdict `graph levels` prints on a declared `process_groups:` and
+/// `graph run` refuses with before any worker starts.
+const PROCESS_GROUPS_CHECK_LABEL: &str = "process groups";
 
 /// Label prefix for the per-node-type crate check.
 const NODE_CRATE_CHECK_PREFIX: &str = "node crate '";
@@ -2856,14 +2861,13 @@ fn cfg_decided_schema_warning(node_type: &str, port: &str, declared: &str) -> St
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReportFor {
     /// `cerulion graph validate`: every check, including the `network
-    /// ingress` gate and the refusal of a `block_timeout_ms` on an edge split
-    /// across the `process_groups:` the graph declares.
+    /// ingress` gate and the `process groups` verdict on the partition the
+    /// graph declares.
     ValidateVerb,
     /// `graph run`'s pre-run report. The run computes the same gateway plan
-    /// later, through the same resolver, and refuses a `block_timeout_ms` on
-    /// an edge split across the process groups it deploys before any worker
-    /// starts. A `--single-process` run splits no edge, so this report must
-    /// not refuse one.
+    /// later, through the same resolver, and judges the partition it deploys
+    /// before any worker starts. A `--single-process` run deploys no
+    /// partition, so this report must not refuse one.
     RunPreflight,
 }
 
@@ -2874,7 +2878,7 @@ enum ReportFor {
 ///
 /// `report_for` decides the checks [`ReportFor::ValidateVerb`] alone makes:
 /// the ingress schema gate over the infos the queue check reads, and the
-/// split-edge `block_timeout_ms` refusal over the declared process groups.
+/// [`process_groups_check`] over the declared partition.
 fn graph_validate_with_cache(
     workspace_root: &Path,
     graph_name: &str,
@@ -3495,9 +3499,21 @@ fn graph_validate_with_cache(
     // accepts. Not after a `validate_graph` failure: the build judges the
     // topology only of a graph that passes it, and a fault both see would be
     // reported twice.
+    //
+    // The declared partition is judged over the same infos and topology, once
+    // the queues pass (the partition check builds the same topology, so it
+    // would report a queue refusal again), and only by the verb: `graph run`
+    // judges the partition it deploys, and a `--single-process` run deploys
+    // none.
     if topology_valid {
         if let Ok(entry_infos) = &loaded_infos {
-            checks.extend(input_backpressure_check(config, entry_infos, report_for));
+            let built = build_with_graph_input_keys(config, entry_infos);
+            checks.extend(input_backpressure_check(config, &built));
+            if report_for == ReportFor::ValidateVerb && config.has_process_groups() {
+                if let Ok((infos, topology)) = &built {
+                    checks.push(process_groups_check(config, infos, topology));
+                }
+            }
         }
     }
 
@@ -3632,33 +3648,27 @@ fn collect_entry_infos_from_cache(
     Ok(entry_infos)
 }
 
-/// The `input backpressure` line: every input's queue judged as
-/// `GraphRuntime::build` judges it. The graph's per-input `backpressure:` and
-/// `depth:` keys are written into a copy of the loaded metadata with
+/// The node metadata with the graph's input keys written in, and the topology
+/// built from it, or the build's refusal ([`build_with_graph_input_keys`]).
+type BuiltWithInputKeys = Result<
+    (
+        indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+        cerulion_core::graph::GraphTopology,
+    ),
+    String,
+>;
+
+/// The graph's per-input `backpressure:` and `depth:` keys written into a copy
+/// of the loaded metadata with
 /// [`MissingInputMeta::Refuse`](cerulion_core::graph::topology::MissingInputMeta::Refuse),
-/// as the build writes them, then the topology is built and validated with its
-/// `block_timeout_ms` keys. A refusal fails the line in the build's own words:
-/// a depth outside 1 to 64, `block` with no in-graph producer or on a
-/// `network.ingress` topic, a `block_timeout_ms` the build refuses, a ring of
-/// `block` edges, `backpressure: block` or `depth:` on an
-/// `#[input(accumulate)]` input, or `backpressure:` or `depth:` on a port the
-/// node declares no metadata for.
-///
-/// For [`ReportFor::ValidateVerb`], on a graph that declares `process_groups:`,
-/// a `block_timeout_ms` on a creditable `block` edge those groups split then
-/// fails the line with the refusal `graph run` gives before any worker starts
-/// ([`split_edge_timeout_refusal_in_groups`](crate::multiprocess::split_edge_timeout_refusal_in_groups)),
-/// the check `graph levels` runs over the same groups.
-///
-/// `None` when every queue passes and no input sets one of the three keys, so a
-/// graph that sets none gets no line.
-fn input_backpressure_check(
+/// as `GraphRuntime::build` writes them, then the topology built and validated
+/// with its `block_timeout_ms` keys. `Err` is the build's refusal.
+fn build_with_graph_input_keys(
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
-    report_for: ReportFor,
-) -> Option<ValidationCheck> {
+) -> BuiltWithInputKeys {
     let mut infos = entry_infos.clone();
-    let verdict = cerulion_core::graph::topology::apply_input_backpressure_overrides(
+    cerulion_core::graph::topology::apply_input_backpressure_overrides(
         config,
         &mut infos,
         cerulion_core::graph::topology::MissingInputMeta::Refuse,
@@ -3666,28 +3676,27 @@ fn input_backpressure_check(
     .and_then(|()| cerulion_core::graph::GraphTopology::build(config, &infos))
     .and_then(|topology| topology.validate().map(|()| topology))
     .map_err(|e| e.to_string())
-    .and_then(|topology| {
-        if report_for != ReportFor::ValidateVerb || !config.has_process_groups() {
-            return Ok(());
-        }
-        let trigger_edges = cerulion_core::graph::build_trigger_edges(config, &infos);
-        match cerulion_core::graph::creditable_split_block_edges(
-            &config.process_groups,
-            config,
-            &infos,
-            &trigger_edges,
-        )
-        .iter()
-        .find_map(|edge| crate::multiprocess::split_edge_timeout_refusal_in_groups(&topology, edge))
-        {
-            Some(refusal) => Err(refusal),
-            None => Ok(()),
-        }
-    });
-    if let Err(refusal) = verdict {
+    .map(|topology| (infos, topology))
+}
+
+/// The `input backpressure` line: every input's queue judged as
+/// `GraphRuntime::build` judges it ([`build_with_graph_input_keys`]). A
+/// refusal fails the line in the build's own words: a depth outside 1 to 64,
+/// `block` with no in-graph producer or on a `network.ingress` topic, a
+/// `block_timeout_ms` the build refuses, a ring of `block` edges,
+/// `backpressure: block` or `depth:` on an `#[input(accumulate)]` input, or
+/// `backpressure:` or `depth:` on a port the node declares no metadata for.
+///
+/// `None` when every queue passes and no input sets one of the three keys, so a
+/// graph that sets none gets no line.
+fn input_backpressure_check(
+    config: &GraphConfig,
+    built: &BuiltWithInputKeys,
+) -> Option<ValidationCheck> {
+    if let Err(refusal) = built {
         return Some(ValidationCheck::fail(
             INPUT_BACKPRESSURE_CHECK_LABEL,
-            refusal,
+            refusal.clone(),
         ));
     }
     let keyed = config
@@ -3708,6 +3717,81 @@ fn input_backpressure_check(
             ),
         )
     })
+}
+
+/// The `process groups` line: the [`declared_partition_verdict`] on the
+/// graph's `process_groups:`, over `infos` with the graph's input keys
+/// written in and the `topology` built from them. A failing line gives the
+/// refusal `graph run` gives before any worker starts; a passing line names
+/// each split `block` edge that crosses on a credit word the supervisor
+/// mints.
+fn process_groups_check(
+    config: &GraphConfig,
+    infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+    topology: &cerulion_core::graph::GraphTopology,
+) -> ValidationCheck {
+    let trigger_edges = cerulion_core::graph::build_trigger_edges(config, infos);
+    match declared_partition_verdict(config, infos, &trigger_edges, topology) {
+        Ok(creditable) => {
+            let groups = config.process_groups.len();
+            let head = format!(
+                "{groups} process group(s) pass the partition check `graph run` makes before \
+                 any worker starts"
+            );
+            let detail = if creditable.is_empty() {
+                head
+            } else {
+                format!(
+                    "{head}; {} split `block` edge(s) cross on a credit word the supervisor \
+                     mints: {}",
+                    creditable.len(),
+                    creditable
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            ValidationCheck::pass(PROCESS_GROUPS_CHECK_LABEL, detail)
+        }
+        Err(refusal) => ValidationCheck::fail(PROCESS_GROUPS_CHECK_LABEL, refusal),
+    }
+}
+
+/// The verdict on the graph's declared `process_groups:` that `graph levels`
+/// prints and `graph run` refuses with before any worker starts:
+/// [`validate_partition`](cerulion_core::graph::validate_partition) (the
+/// structural group checks, a group a foreign node bridges, a gapped band of
+/// levels, a split `block` edge the supervisor cannot credit), then a
+/// `block_timeout_ms` on a creditable split `block` edge
+/// ([`split_edge_timeout_refusal_in_groups`](crate::multiprocess::split_edge_timeout_refusal_in_groups)).
+/// `Ok` carries the creditable split `block` edges.
+fn declared_partition_verdict(
+    config: &GraphConfig,
+    entry_infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+    trigger_edges: &cerulion_core::graph::TriggerEdges,
+    topology: &cerulion_core::graph::GraphTopology,
+) -> Result<Vec<cerulion_core::graph::CreditableSplitEdge>, String> {
+    cerulion_core::graph::validate_partition(
+        &config.process_groups,
+        config,
+        entry_infos,
+        trigger_edges,
+    )
+    .map_err(|e| e.to_string())?;
+    let creditable = cerulion_core::graph::creditable_split_block_edges(
+        &config.process_groups,
+        config,
+        entry_infos,
+        trigger_edges,
+    );
+    match creditable
+        .iter()
+        .find_map(|edge| crate::multiprocess::split_edge_timeout_refusal_in_groups(topology, edge))
+    {
+        Some(refusal) => Err(refusal),
+        None => Ok(creditable),
+    }
 }
 
 /// The text of [`KILL_SWITCH_SCOPE`], for `concat!`.
@@ -14084,31 +14168,9 @@ pub(crate) fn render_levels_report(
                 group.rank, group.name, band, members
             );
         }
-        // A creditable split edge whose input sets `block_timeout_ms` is the
-        // edge `graph run` refuses before any worker spawns, through the same
-        // check, so the verdict is that refusal.
-        let verdict = cerulion_core::graph::validate_partition(
-            &config.process_groups,
-            config,
-            entry_infos,
-            trigger_edges,
-        )
-        .map_err(|e| e.to_string())
-        .and_then(|()| {
-            let creditable = cerulion_core::graph::creditable_split_block_edges(
-                &config.process_groups,
-                config,
-                entry_infos,
-                trigger_edges,
-            );
-            match creditable.iter().find_map(|edge| {
-                crate::multiprocess::split_edge_timeout_refusal_in_groups(topology, edge)
-            }) {
-                Some(refusal) => Err(refusal),
-                None => Ok(creditable),
-            }
-        });
-        match verdict {
+        // The verdict `graph validate`'s `process groups` line gives, from the
+        // same function, over the source metadata this verb reads.
+        match declared_partition_verdict(config, entry_infos, trigger_edges, topology) {
             Ok(creditable) => {
                 // A credited split and an ordinary
                 // co-located flow must not render the SAME line, or the verb an
@@ -35320,12 +35382,8 @@ nodes:
 
     /// Every queue the graph build refuses, `graph validate` refuses on one
     /// failing `input backpressure` line in the build's own words, with the
-    /// graph's keys applied over the node's declaration, and a
-    /// `block_timeout_ms` on an edge split across the process groups the graph
-    /// declares in the words `graph run` refuses it with before any worker
-    /// starts. The label blocks the run under `--no-validate`: the build
-    /// refuses each queue again, and a multi-process run refuses the split
-    /// edge.
+    /// graph's keys applied over the node's declaration. A failing line also
+    /// blocks the run under `--no-validate`, since the build refuses again.
     #[test]
     fn graph_validate_refuses_every_queue_the_graph_build_refuses() {
         use cerulion_core::graph::node::BackpressurePolicy::{Block, DropOldest};
@@ -35432,19 +35490,6 @@ nodes:
                 chain_infos(None),
                 "Graph validation error: input 'follower.cmd' sets `backpressure:` or `depth:` \
                  in the graph, but node 'follower' declares no input metadata for 'cmd'",
-            ),
-            (
-                "block_timeout_ms on a block edge split across declared process groups",
-                chain_graph(
-                    SPLIT_GROUPS,
-                    "planner/cmd",
-                    "        backpressure: block\n        block_timeout_ms: 40\n",
-                ),
-                drop_oldest_4(),
-                "input 'follower.cmd' on topic '/p/planner/cmd' sets `block_timeout_ms`, but the \
-                 input runs in process group 'back' and its producer 'planner' in process group \
-                 'front', so the two fire on different threads and count the edge on one shared \
-                 credit word.",
             ),
         ];
         for (case, yaml, inspector, head) in rows {
@@ -35677,51 +35722,263 @@ nodes:
         assert_eq!(first, second);
     }
 
-    /// The split-edge `block_timeout_ms` refusal is judged by the `graph
-    /// validate` verb only. `graph run`'s pre-run report of the same graph
-    /// passes the queue line: a `--single-process` run splits no edge, and a
-    /// multi-process run refuses the edge itself before any worker starts.
+    /// `planner` and `second` (both of type `planner`) publish the listed
+    /// multi-publisher topic `/p/shared`, which `follower` reads with
+    /// `backpressure: block`; group `front` holds both producers and group
+    /// `back` holds `follower`.
+    const SPLIT_MULTI_PRODUCER_GRAPH: &str = "prefix: p
+multi_publisher_topics:
+  - /p/shared
+process_groups:
+  front: [planner, second]
+  back: [follower]
+nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        topic: /p/shared
+        schema: geometry_msgs/Vector3
+  - id: second
+    type: planner
+    outputs:
+      - name: cmd
+        topic: /p/shared
+        schema: geometry_msgs/Vector3
+  - id: follower
+    type: follower
+    inputs:
+      - name: cmd
+        source: /p/shared
+        backpressure: block
+";
+
+    /// `planner` feeds `follower`, which feeds `last` (type `follower`), so
+    /// the three sit on levels 0, 1 and 2; group `ends` holds `planner` and
+    /// `last`, and `follower`, in group `middle`, sits between them.
+    const BRIDGED_GROUPS_GRAPH: &str = "prefix: p
+process_groups:
+  ends: [planner, last]
+  middle: [follower]
+nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+  - id: follower
+    type: follower
+    outputs:
+      - name: state
+        schema: geometry_msgs/Vector3
+    inputs:
+      - name: cmd
+        source: planner/cmd
+  - id: last
+    type: follower
+    inputs:
+      - name: cmd
+        source: follower/state
+";
+
+    /// The report's `process groups` line; a report carries at most one.
+    fn process_groups_line(report: &ValidationReport) -> Option<&ValidationCheck> {
+        let lines: Vec<&ValidationCheck> = report
+            .checks
+            .iter()
+            .filter(|c| c.label == "process groups")
+            .collect();
+        assert!(
+            lines.len() <= 1,
+            "more than one process groups line:\n{report}"
+        );
+        lines.first().copied()
+    }
+
+    /// Every declared partition `graph run` refuses before any worker starts,
+    /// `graph validate` refuses on one failing `process groups` line in the
+    /// run's words, the verdict `graph levels` prints: a split multi-producer
+    /// `block` edge, a `block_timeout_ms` on a split `block` edge, and a group
+    /// a foreign node bridges. The `input backpressure` line still passes: the
+    /// graph build accepts each queue. Two validations write the same report.
     #[test]
-    fn graph_runs_report_leaves_the_split_edge_timeout_to_the_run() {
+    fn graph_validate_refuses_every_declared_partition_graph_run_refuses() {
         use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
         let _env = unset_target_dir_for_test();
-        let (_tmp, ws_root) = queue_workspace(&chain_graph(
-            SPLIT_GROUPS,
-            "planner/cmd",
-            "        backpressure: block\n        block_timeout_ms: 40\n",
-        ));
-        let inspector = chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
-        let config = graph_read(&ws_root.join("graphs"), "bp").unwrap();
-        let cache = resolve_cdylib_cache(&ws_root, &config, false);
-        let line = |report_for| {
-            let report = graph_validate_with_cache(
-                &ws_root,
-                "bp",
-                &config,
-                &cache,
-                report_for,
-                &inspector,
-                &cerulion_core::graph::ArgProvenance::default(),
-            );
-            let line = queue_line(&report)
-                .unwrap_or_else(|| panic!("no input backpressure line in\n{report}"));
-            (line.passed, line.detail.clone())
-        };
-        let (verb_passed, verb_detail) = line(ReportFor::ValidateVerb);
-        assert!(!verb_passed, "{verb_detail}");
-        assert!(
-            verb_detail.starts_with(
-                "input 'follower.cmd' on topic '/p/planner/cmd' sets `block_timeout_ms`"
+        let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let rows: Vec<(&str, String, DeclaredInfos, &str, &str)> = vec![
+            (
+                "block on a listed multi-publisher topic whose producers sit in another group",
+                SPLIT_MULTI_PRODUCER_GRAPH.to_string(),
+                drop_oldest_4(),
+                "Graph validation error: this partition SPLITS a `block` edge across process \
+                 groups:\n  - topic '/p/shared': producer 'planner' (group 'front') is split \
+                 from `block` input 'follower.cmd' (group 'back')",
+                "topic '/p/shared' has 2 in-graph producers, and a credit word counts ONE \
+                 producer's outstanding frames",
             ),
-            "{verb_detail}"
+            (
+                "block_timeout_ms on a block edge split across declared process groups",
+                chain_graph(
+                    SPLIT_GROUPS,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+                drop_oldest_4(),
+                "input 'follower.cmd' on topic '/p/planner/cmd' sets `block_timeout_ms`, but the \
+                 input runs in process group 'back' and its producer 'planner' in process group \
+                 'front', so the two fire on different threads and count the edge on one shared \
+                 credit word.",
+                "",
+            ),
+            (
+                "a group a node of another group bridges",
+                BRIDGED_GROUPS_GRAPH.to_string(),
+                drop_oldest_4(),
+                "Graph validation error: process group 'ends': node 'last' owns global level 2 \
+                 (group-local rank 1) but re-levelizes to local level 0 in the group's induced \
+                 subgraph",
+                "foreign bridge node 'follower'",
+            ),
+        ];
+        for (case, yaml, inspector, head, also) in rows {
+            let (_tmp, ws_root) = queue_workspace(&yaml);
+            let report = graph_validate_with_inspector(&ws_root, "bp", false, &inspector).unwrap();
+            let line = process_groups_line(&report)
+                .unwrap_or_else(|| panic!("{case}: no process groups line in\n{report}"));
+            assert!(!line.passed, "{case}: {}", line.detail);
+            assert!(
+                line.detail.starts_with(head),
+                "{case}: expected the run's refusal\n  {head}\ngot\n  {}",
+                line.detail
+            );
+            assert!(line.detail.contains(also), "{case}: {}", line.detail);
+            assert!(
+                queue_line(&report).is_none_or(|queue| queue.passed),
+                "{case}: the graph build accepts every queue:\n{report}"
+            );
+            assert!(!report.all_passed(), "{case}");
+            let again = graph_validate_with_inspector(&ws_root, "bp", false, &inspector).unwrap();
+            assert_eq!(report.to_string(), again.to_string(), "{case}");
+        }
+    }
+
+    /// A declared partition `graph run` deploys passes the `process groups`
+    /// line, which names each split `block` edge that crosses on a credit
+    /// word; a queue the build refuses is reported on the queue line only; a
+    /// graph that declares no groups gets no line.
+    #[test]
+    fn graph_validate_passes_a_declared_partition_graph_run_deploys() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let inspector = chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let two = "2 process group(s) pass the partition check `graph run` makes before any \
+                   worker starts";
+        let one = "1 process group(s) pass the partition check `graph run` makes before any \
+                   worker starts";
+        let rows: Vec<(&str, String, &str)> = vec![
+            (
+                "a split block edge with no block_timeout_ms",
+                chain_graph(SPLIT_GROUPS, "planner/cmd", "        backpressure: block\n"),
+                "2 process group(s) pass the partition check `graph run` makes before any \
+                 worker starts; 1 split `block` edge(s) cross on a credit word the supervisor \
+                 mints: /p/planner/cmd -> follower.cmd (front -> back)",
+            ),
+            (
+                "a split drop_oldest edge",
+                chain_graph(SPLIT_GROUPS, "planner/cmd", ""),
+                two,
+            ),
+            (
+                "block_timeout_ms on a block edge inside one group",
+                chain_graph(
+                    ONE_GROUP,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+                one,
+            ),
+        ];
+        for (case, yaml, detail) in rows {
+            let report = validate_queues(&yaml, &inspector);
+            let line = process_groups_line(&report)
+                .unwrap_or_else(|| panic!("{case}: no process groups line in\n{report}"));
+            assert!(line.passed, "{case}: {}", line.detail);
+            assert_eq!(line.detail, detail, "{case}");
+            assert!(report.all_passed(), "{case}:\n{report}");
+        }
+
+        let refused = validate_queues(
+            &chain_graph(SPLIT_GROUPS, "planner/cmd", "        depth: 65\n"),
+            &inspector,
         );
-        let (run_passed, run_detail) = line(ReportFor::RunPreflight);
-        assert!(run_passed, "{run_detail}");
-        assert_eq!(
-            run_detail,
-            "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's queue \
-             is one the graph build accepts"
+        let queue = queue_line(&refused).expect("a queue line");
+        assert!(!queue.passed, "{refused}");
+        assert!(process_groups_line(&refused).is_none(), "{refused}");
+
+        let ungrouped = validate_queues(
+            &chain_graph("", "planner/cmd", "        backpressure: block\n"),
+            &inspector,
         );
+        assert!(process_groups_line(&ungrouped).is_none(), "{ungrouped}");
+        assert!(ungrouped.all_passed(), "{ungrouped}");
+    }
+
+    /// The declared partition is judged by the `graph validate` verb only.
+    /// `graph run`'s pre-run report of a graph whose partition the run refuses
+    /// writes no `process groups` line and passes the queue line: a
+    /// `--single-process` run deploys no partition, and a multi-process run
+    /// refuses the partition itself before any worker starts.
+    #[test]
+    fn graph_runs_report_leaves_the_declared_partition_to_the_run() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let inspector = chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let one = "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's \
+                   queue is one the graph build accepts";
+        for (case, yaml) in [
+            (
+                "a split multi-producer block edge",
+                SPLIT_MULTI_PRODUCER_GRAPH.to_string(),
+            ),
+            (
+                "block_timeout_ms on a split block edge",
+                chain_graph(
+                    SPLIT_GROUPS,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+            ),
+        ] {
+            let (_tmp, ws_root) = queue_workspace(&yaml);
+            let config = graph_read(&ws_root.join("graphs"), "bp").unwrap();
+            let cache = resolve_cdylib_cache(&ws_root, &config, false);
+            for report_for in [ReportFor::ValidateVerb, ReportFor::RunPreflight] {
+                let report = graph_validate_with_cache(
+                    &ws_root,
+                    "bp",
+                    &config,
+                    &cache,
+                    report_for,
+                    &inspector,
+                    &cerulion_core::graph::ArgProvenance::default(),
+                );
+                let queue = queue_line(&report)
+                    .unwrap_or_else(|| panic!("{case}: no input backpressure line in\n{report}"));
+                assert!(queue.passed, "{case} {report_for:?}: {}", queue.detail);
+                assert_eq!(queue.detail, one, "{case} {report_for:?}");
+                let groups = process_groups_line(&report);
+                match report_for {
+                    ReportFor::ValidateVerb => {
+                        assert!(groups.is_some_and(|g| !g.passed), "{case}:\n{report}");
+                    }
+                    ReportFor::RunPreflight => {
+                        assert!(groups.is_none(), "{case}:\n{report}");
+                        assert!(report.all_passed(), "{case}:\n{report}");
+                    }
+                }
+            }
+        }
     }
 
     /// A graph with no `network:` block gets no `network ingress` line.

@@ -1414,10 +1414,10 @@ pub enum GraphAction {
         time_source: TimeSource,
         /// Skip the pre-flight validation REPORT (not validation as such).
         ///
-        /// The graph topology, the macro trigger wiring and the node libraries
-        /// are re-checked unconditionally when the graph is built, so this flag
-        /// cannot get a run past those: it moves you from one refusal to an
-        /// identical one.
+        /// The graph topology, the input queues, the node params, the macro
+        /// trigger wiring and the node libraries are re-checked unconditionally
+        /// when the graph is built, so this flag cannot get a run past those:
+        /// it moves you from one refusal to an identical one.
         ///
         /// What it does still skip is the `schema:` family: a NON-EMPTY value
         /// that names no resolvable schema, contradicts the producing node's
