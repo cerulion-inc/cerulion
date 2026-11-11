@@ -86,6 +86,9 @@ struct BoundPort {
 }
 
 enum NativeLease {
+    RawWrite {
+        loan: RawShmLoan,
+    },
     Write {
         loan: RawShmLoan,
         header: WireHeader,
@@ -190,8 +193,10 @@ pub struct HostContext {
     // Drop leases before ports: their native refcounts must return while the
     // publisher/subscriber owners still exist, even during initialization failure.
     leases: LeaseArena<NativeLease>,
+    raw_ports: Box<[Option<raw::RawPort>]>,
     native: NodeContext,
     ports: Box<[BoundPort]>,
+    raw_created: usize,
     environment: Arc<HashMap<String, String>>,
     counters: HostLeaseCounters,
     terminal: bool,
@@ -227,7 +232,11 @@ impl HostContext {
         environment: Arc<HashMap<String, String>>,
         lease_budget: usize,
     ) -> Result<Self, HostServiceError> {
-        if specs.len() > u32::MAX as usize {
+        if specs
+            .len()
+            .checked_add(128)
+            .is_none_or(|n| n >= u32::MAX as usize)
+        {
             return Err(HostServiceError::InvalidDescriptor);
         }
         for (index, spec) in specs.iter().enumerate() {
@@ -286,6 +295,11 @@ impl HostContext {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            raw_ports: (0..128)
+                .map(|_| None)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            raw_created: 0,
             environment,
             counters: HostLeaseCounters::default(),
             terminal: false,
@@ -1113,6 +1127,10 @@ impl HostContext {
     pub fn revoke(&mut self) {
         self.terminal = true;
         self.leases.revoke_all();
+        for row in self.raw_ports.iter_mut().flatten() {
+            row.busy = false;
+            row.publisher.take();
+        }
         for port in &mut self.ports {
             port.busy = false;
             port.accumulated_borrows = 0;
@@ -1394,7 +1412,7 @@ pub fn remove_context(handle: u64) -> Result<(), HostServiceError> {
 struct CallerMemory;
 struct Output<T>(*mut T);
 impl<T: Copy> Output<T> {
-    fn write(self, value: T) {
+    fn write(&self, value: T) {
         // SAFETY: output() checked null/alignment/range; the unsafe entry's
         // caller grants exclusive writable storage, initialized or not.
         unsafe { self.0.write(value) };
@@ -1463,7 +1481,7 @@ fn call_status(result: Result<abi::Status, HostCallFailure>) -> abi::Status {
 }
 macro_rules! host_callback {
     ($name:ident($context:ident $(, $arg:ident: $ty:ty)*) |$host:ident, $memory:ident| $body:block) => {
-        unsafe extern "C" fn $name($context: abi::ContextHandle, $($arg: $ty),*) -> abi::Status {
+        pub(super) unsafe extern "C" fn $name($context: abi::ContextHandle, $($arg: $ty),*) -> abi::Status {
             match catch_unwind(AssertUnwindSafe(|| {
                 #[allow(unused_mut)]
                 let mut $memory = CallerMemory;
@@ -1503,6 +1521,10 @@ host_callback!(callback_bind(context, ordinal: u32, direction: u32, out: *mut ab
 });
 host_callback!(callback_loan(context, port: abi::PortHandle, request: abi::LoanRequestV1, out: *mut abi::WriteSlotV1) |host, memory| {
     let out = memory.output(out)?;
+    if host.raw_candidate(context.value, port.value) {
+        out.write(host.loan_raw(context.value, port.value, request)?);
+        return Ok(status(abi::status_code::OK));
+    }
     let index = host.port_index(context.value, port.value, LeaseDirection::Write)?;
     let layout = host.ports[index].spec.layout;
     let prefix = layout.prefix_len().ok_or(HostServiceError::InvalidDescriptor)?;
@@ -1541,7 +1563,8 @@ host_callback!(callback_discard(context, lease: abi::LeaseHandle, reason: u32) |
         abi::discard_reason::INVARIANT => HostDiscardReason::Invariant,
         _ => return Err(HostServiceError::InvalidDescriptor),
     };
-    host.discard_output(context.value, port, lease.value, reason)?;
+    if host.raw_candidate(context.value, port) { host.discard_raw(context.value, port, lease.value, reason)?; }
+    else { host.discard_output(context.value, port, lease.value, reason)?; }
     Ok(status(abi::status_code::OK))
 });
 host_callback!(callback_receive(context, port: abi::PortHandle, mode: u32, out: *mut abi::ReadSlotV1) |host, memory| {
@@ -1848,6 +1871,8 @@ host_callback!(callback_restore(context, port: abi::PortHandle, bytes: abi::Byte
     Ok(status(abi::status_code::OK))
 });
 
+mod raw;
+
 /// Process-lifetime frozen host table. The loader supplies this same table to
 /// every checked node instance; each instance has its own context handle.
 pub static HOST_API: abi::HostApiV1 = abi::HostApiV1 {
@@ -1877,6 +1902,10 @@ pub static HOST_API: abi::HostApiV1 = abi::HostApiV1 {
     capture_accumulate: callback_capture,
     query_extension: callback_extension,
     restore_accumulate: callback_restore,
+    create_raw_publisher: raw::callback_create_raw,
+    finish_raw_output: raw::callback_finish_raw,
+    register_raw_egress: raw::callback_register_raw,
+    destroy_raw_publisher: raw::callback_destroy_raw,
 };
 
 #[cfg(test)]
@@ -2154,7 +2183,7 @@ mod tests {
                 delivered.header().timestamp_ns,
                 delivered.header().total_size
             ),
-            (1, 0, 64)
+            (0, 0, 64)
         );
         assert_eq!(&delivered[40..], &[0; 24]);
         drop(delivered);

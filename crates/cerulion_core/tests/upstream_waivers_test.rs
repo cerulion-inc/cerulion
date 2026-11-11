@@ -460,6 +460,7 @@ const WAIVED_2035: &[(&str, usize)] = &[
         "crates/cerulion_core/tests/accumulate_zero_alloc_test.rs",
         1,
     ),
+    ("crates/cerulion_core/tests/node_host_abi_test.rs", 1),
     ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
     ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
     (
