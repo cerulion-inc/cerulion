@@ -176,8 +176,8 @@ const WAN_USAGE: &str = "    CERULION_NETD_WAN_ROBOTS     iroh WAN robots: a ';'
 
 A serving machine owns its WAN endpoint through remoted from its first egress
 registration, or from explicit LISTEN standing configuration.
-Consuming other robots over WAN from a serving machine is not supported in
-this version; use the LAN plane. WAN demands are refused without a fallback.
+A serving machine reads paired and same-account robots over WAN like any desk,
+sharing its owned device endpoint for serving and consuming.
 Automatic robot state defaults to <CERULION_HOME or ~/.cerulion>/robot-state;
 CERULION_STATE_ROOT preserves an explicit deployment root.
 ";

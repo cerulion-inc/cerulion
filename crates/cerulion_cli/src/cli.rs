@@ -322,9 +322,9 @@ pub enum Commands {
         ///
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
-        /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found over mDNS with no configuration, and
-        /// no schema pin is needed: the daemon resolves each topic's ROS type
+        /// from there, so the robot serves raw bytes and nothing else. A
+        /// same-account or paired robot is found automatically, on one LAN or
+        /// across networks. No schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
         /// `/utlidar/cloud=sensor_msgs/PointCloud2`) to skip the catalog lookup.
@@ -1362,8 +1362,9 @@ pub enum NodeAction {
         /// and no topic visible on the network. The switch keeps Cerulion
         /// service traffic off (robots, relays, hosted Cerulion services and
         /// telemetry); signing in to your account still works. Without a CLI or environment
-        /// kill-switch, a real-clock `node run` starts the network gateway and every produced
-        /// topic is announced on the LAN, viewable by any peer without pairing.
+        /// kill-switch, a real-clock `node run` offers its produced topics with paired access
+        /// by default on every platform: same-account and explicitly paired machines can
+        /// read them, and unpaired LAN peers are refused unless `CERULION_LAN_ACCESS=open` is set.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
     },
@@ -1583,8 +1584,9 @@ pub enum GraphAction {
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// can announce every produced topic when LAN access is open. Android
-        /// defaults to paired-only access, which withholds topic announcements.
+        /// can announce every produced topic when LAN access is open. LAN access
+        /// defaults to paired on every platform, which withholds topic announcements;
+        /// `CERULION_LAN_ACCESS=open` opens it.
         /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
@@ -1874,18 +1876,18 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
-    /// cache and the hostname rung), so robots on the LAN show up with no
-    /// flags and no pairing; when it
-    /// finds nothing the listing ends with one `remote: none discovered` line.
+    /// topics. Remote discovery runs BY DEFAULT: same-account and explicitly
+    /// paired robots are listed on any network with no flags. With explicit open
+    /// LAN access, locators or --scan, the LAN ladder (mDNS, peer cache, hostname)
+    /// also finds robots serving open LAN access. When discovery finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
     /// never under LOCAL. The framework's own channels (the recorder's
     /// `/bagd/status`, anything under `/__cerulion/`) are hidden from the
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
-    /// Pass `--connect` or `--listen` locators to reach
-    /// peers discovery cannot find; pass `--local` to skip the remote
+    /// Pass `--connect` or `--listen` locators for explicit open LAN compatibility;
+    /// account and paired discovery needs neither. Pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
