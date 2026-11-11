@@ -3866,7 +3866,11 @@ pub enum ReplayNodes {
 /// structural trace divergence are a `tracing::info!` under
 /// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
 /// printed by the CLI) states each in full, and a `tracing::warn!` under
-/// [`ReplayPurpose::Resim`], whose neutral summary only counts them. A clean
+/// [`ReplayPurpose::Resim`], whose neutral summary only counts them. Those
+/// `info` levels hold only for a run that returns its outcome, because only
+/// then does the CLI render a verdict or a summary: on a run a rank ABORTS,
+/// which returns the aborting error, the completed ranks' violations, trace
+/// divergence and node failures are each a `tracing::warn!`. A clean
 /// run yields `outcome.passed == true`; data divergences leave it
 /// `false` (the CLI maps that to `EXIT_VIOLATION`). Bag-vs-graph mismatch and
 /// node-load failures short-circuit as typed [`ReplayError`]s (exit 2 / 3).
@@ -5271,13 +5275,15 @@ fn assemble_outcome(
     for d in &env_divergence {
         tracing::warn!(var = %d.name, detail = %d.detail, "replay: environment divergence vs bag env.json");
     }
-    // `--verify`: INFO, because the verdict renders each violation and the
-    // schedule divergence as its own block on the same stderr, so these lines
-    // are for a log pipeline only. A bare `--resim`: WARN, because its neutral
-    // summary only counts the differing topics and says the schedule differs,
-    // so these lines are where the terminal names each topic, frame and
-    // position.
-    let verdict_states_detail = purpose == ReplayPurpose::Verify;
+    // A completed `--verify`: INFO, because the verdict renders each violation
+    // and the schedule divergence as its own block on the same stderr, so these
+    // lines are for a log pipeline only. A bare `--resim`: WARN, because its
+    // neutral summary only counts the differing topics and says the schedule
+    // differs, so these lines are where the terminal names each topic, frame
+    // and position. An ABORTED run renders neither (the CLI prints only the
+    // aborting error), so these lines are the only place the terminal names
+    // what the completed ranks found: WARN under both purposes.
+    let verdict_states_detail = purpose == ReplayPurpose::Verify && aborted.is_none();
     for v in &violations {
         if verdict_states_detail {
             tracing::info!(topic = %v.topic, detail = %v.detail, "replay: data violation");
@@ -5300,14 +5306,23 @@ fn assemble_outcome(
             );
         }
     }
-    // INFO under both purposes: the verdict and the neutral summary each name
-    // every failed node with its reason.
+    // INFO under both purposes on a completed run: the verdict and the neutral
+    // summary each name every failed node with its reason. WARN on an aborted
+    // run, which renders neither.
     for f in &node_failures {
-        tracing::info!(
-            node_id = %f.node_id,
-            reason = %f.reason,
-            "replay: node suffered a panic-class failure (exit-3 root cause)"
-        );
+        if aborted.is_none() {
+            tracing::info!(
+                node_id = %f.node_id,
+                reason = %f.reason,
+                "replay: node suffered a panic-class failure (exit-3 root cause)"
+            );
+        } else {
+            tracing::warn!(
+                node_id = %f.node_id,
+                reason = %f.reason,
+                "replay: node suffered a panic-class failure (exit-3 root cause)"
+            );
+        }
     }
 
     // Surface every engaged ragged-tail tolerance (INFO — a benign,
