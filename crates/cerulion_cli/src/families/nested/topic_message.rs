@@ -210,10 +210,7 @@ fn run(action: TopicMessageAction) -> Result<String, VerbError> {
                 scope: TopicScope::from_local(local),
             };
             match robot {
-                Some(robot) => {
-                    snapshot::topic_snapshot_with_robot(&req, schemas_dir, &running, Some(&robot))
-                        .map(|r| r.json_line())
-                }
+                Some(robot) => cerulion_cli_engine::robot_act::robot_snapshot(&robot, &req),
                 None => {
                     snapshot::topic_snapshot(&req, schemas_dir, &running).map(|r| r.json_line())
                 }

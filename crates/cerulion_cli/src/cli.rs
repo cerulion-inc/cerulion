@@ -1939,7 +1939,7 @@ pub enum TopicAction {
     /// to read genuine local producers without remote discovery or demand.
     Info {
         /// Select a robot by its exact name or account route.
-        #[arg(long, value_name = "NAME", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        #[arg(long, value_name = "NAME", conflicts_with = "local", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
@@ -1958,7 +1958,7 @@ pub enum TopicAction {
     /// to read genuine local producers without remote discovery or demand.
     Echo {
         /// Select a robot by its exact name or account route.
-        #[arg(long, value_name = "NAME", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        #[arg(long, value_name = "NAME", conflicts_with = "local", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
@@ -1988,7 +1988,7 @@ pub enum TopicAction {
     /// to read genuine local producers without remote discovery or demand.
     Hz {
         /// Select a robot by its exact name or account route.
-        #[arg(long, value_name = "NAME", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        #[arg(long, value_name = "NAME", conflicts_with = "local", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror

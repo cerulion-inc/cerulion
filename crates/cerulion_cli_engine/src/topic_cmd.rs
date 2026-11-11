@@ -464,6 +464,8 @@ fn ensure_topic_available_with_selection(
     #[cfg(unix)]
     let mut selected_remote = None;
     #[cfg(unix)]
+    let mut source_catalogs = Vec::new();
+    #[cfg(unix)]
     if let Some(directory) = &remote_directory {
         for diagnostic in &directory.diagnostics {
             tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
@@ -502,16 +504,27 @@ fn ensure_topic_available_with_selection(
                 )));
             }
         }
-        let catalogs: Vec<_> = directory
+        source_catalogs = directory
             .robots
             .iter()
             .filter_map(|robot| robot.catalog.clone())
             .collect();
+        let lan_options = RemoteTopicsOptions {
+            connect: Vec::new(),
+            listen: Vec::new(),
+            scouting: true,
+        };
+        match query_lan_topics_and_catalogs(&lan_options, false) {
+            Ok((_, lan)) => source_catalogs.extend(lan.replies),
+            Err(error) => {
+                tracing::warn!(error = %error, "LAN source catalogs could not be checked");
+            }
+        }
         let selector = selected_robot.map(|robot| robot.route.as_str()).or(robot);
         let selection = crate::account_robot_access::automatic::topic_candidates(
             topic,
             listed_local && mirror_robot.is_none() && !marked_mirror && selected_robot.is_none(),
-            &catalogs,
+            &source_catalogs,
             selector,
         )?;
         selected_remote = selection;
@@ -528,10 +541,9 @@ fn ensure_topic_available_with_selection(
                 tracing::warn!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
             }
         }
-        let catalog = remote_directory
-            .as_ref()
-            .and_then(|directory| directory.robots.iter().find(|robot| robot.route == *route))
-            .and_then(|robot| robot.catalog.as_ref())
+        let catalog = source_catalogs
+            .iter()
+            .find(|catalog| catalog.robot == *route)
             .ok_or_else(|| CliError::Validation("selected robot catalog is unavailable".into()))?;
         let target = automatic_ingress_target(topic, route, schemas_dir, catalog)?;
         let (subscriber, guard) = demand_observer_from_netd(&transport, topic, &target)?;
@@ -547,10 +559,12 @@ fn ensure_topic_available_with_selection(
             },
         ));
     }
-    if matches!(
-        classify_observed_topic(listed_local, mirror_robot.is_some() || marked_mirror),
-        ObserveVia::LocalDirect
-    ) {
+    if robot.is_none()
+        && matches!(
+            classify_observed_topic(listed_local, mirror_robot.is_some() || marked_mirror),
+            ObserveVia::LocalDirect
+        )
+    {
         // Only explicit local scope (including the environment kill-switch)
         // claims a local source for the full observation. Automatic retains its
         // existing local-direct behavior. Acquire before opening the subscriber.
@@ -635,12 +649,13 @@ fn ensure_topic_available_with_selection(
     // Resolving the wire `schema_hash` stays a CONSUMER concern;
     // netd validates every inbound frame against
     // the hash we demand with.
-    let target = match resolve_remote_ingress_target(
+    let target = match resolve_remote_ingress_target_for_robot(
         topic,
         schemas_dir,
         // This IS the absence-claim seam — an empty answer here becomes the
         // UNKNOWN the user reads — so it waits through convergence.
         ResolveWait::first_contact(running),
+        robot,
     ) {
         RemoteResolve::Found(target) => target,
         // Every non-Found outcome routes through ONE place — see
@@ -1672,6 +1687,42 @@ pub fn query_remote_topics_and_catalogs(
 }
 
 pub(crate) fn query_lan_topics_and_catalogs(
+    opts: &RemoteTopicsOptions,
+    scan: bool,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
+    query_lan_when_allowed(
+        cerulion_core::transport::demand_authorizer::LanAccess::from_env(),
+        opts,
+        scan,
+        || query_lan_topics_and_catalogs_allowed(opts, scan),
+    )
+}
+
+fn lan_discovery_allowed(
+    access: cerulion_core::transport::demand_authorizer::LanAccess,
+    opts: &RemoteTopicsOptions,
+    scan: bool,
+) -> bool {
+    access == cerulion_core::transport::demand_authorizer::LanAccess::Open
+        || !opts.connect.is_empty()
+        || !opts.listen.is_empty()
+        || scan
+}
+
+fn query_lan_when_allowed(
+    access: cerulion_core::transport::demand_authorizer::LanAccess,
+    opts: &RemoteTopicsOptions,
+    scan: bool,
+    query: impl FnOnce() -> CliResult<(RemoteDiscovery, CatalogGather)>,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
+    if lan_discovery_allowed(access, opts, scan) {
+        query()
+    } else {
+        Ok((RemoteDiscovery::empty(), CatalogGather::default()))
+    }
+}
+
+fn query_lan_topics_and_catalogs_allowed(
     opts: &RemoteTopicsOptions,
     scan: bool,
 ) -> CliResult<(RemoteDiscovery, CatalogGather)> {
@@ -2757,8 +2808,35 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
     schemas_dir: Option<&std::path::Path>,
     wait: ResolveWait<'_>,
 ) -> RemoteResolve {
-    match resolve_remote_topic_schema_with_opts(topic, connect, listen, scouting, schemas_dir, wait)
-    {
+    remote_ingress_from_schema(resolve_remote_topic_schema_with_opts(
+        topic,
+        connect,
+        listen,
+        scouting,
+        schemas_dir,
+        wait,
+    ))
+}
+
+fn resolve_remote_ingress_target_for_robot(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    wait: ResolveWait<'_>,
+    robot: Option<&str>,
+) -> RemoteResolve {
+    remote_ingress_from_schema(resolve_remote_topic_schema_for_robot(
+        topic,
+        &[],
+        &[],
+        true,
+        schemas_dir,
+        wait,
+        robot,
+    ))
+}
+
+fn remote_ingress_from_schema(resolution: SchemaResolve) -> RemoteResolve {
+    match resolution {
         SchemaResolve::Ambiguous { candidates } => RemoteResolve::Ambiguous { candidates },
         SchemaResolve::NoProducer => RemoteResolve::NoProducer,
         // Carried through DISTINCT — collapsing it into `NoProducer` here
@@ -2859,6 +2937,19 @@ enum CatalogTarget {
     Missing,
 }
 
+fn catalog_target_for_robot(
+    catalogs: &[cerulion_core::CatalogReply],
+    topic: &str,
+    selector: Option<&str>,
+) -> CatalogTarget {
+    let scoped: Vec<_> = catalogs
+        .iter()
+        .filter(|catalog| selector.is_none_or(|robot| catalog.robot == robot))
+        .cloned()
+        .collect();
+    catalog_target(&scoped, topic)
+}
+
 fn catalog_target(catalogs: &[cerulion_core::CatalogReply], topic: &str) -> CatalogTarget {
     let candidates: std::collections::BTreeSet<_> = catalogs
         .iter()
@@ -2942,11 +3033,12 @@ fn try_resolve_remote_topic_schema_via_netd(
     scouting: bool,
     schemas_dir: Option<&std::path::Path>,
     wait: ResolveWait<'_>,
+    selector: Option<&str>,
 ) -> Option<SchemaResolve> {
     if !use_netd_query_plane(connect, listen, scouting) {
         return None;
     }
-    netd_resolve_topic_schema(topic, schemas_dir, wait)
+    netd_resolve_topic_schema(topic, schemas_dir, wait, selector)
 }
 
 /// Unix arm: the netd-backed topic-schema resolve. ONE `NetdClient`
@@ -2959,6 +3051,7 @@ fn netd_resolve_topic_schema(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
     wait: ResolveWait<'_>,
+    selector: Option<&str>,
 ) -> Option<SchemaResolve> {
     let mut client = match cerulion_netd::NetdClient::connect_or_spawn() {
         Ok(c) => c,
@@ -2984,7 +3077,7 @@ fn netd_resolve_topic_schema(
     let gather = {
         let mut sink = emit_convergence_progress;
         let mut ctx = cerulion_netd::FirstContactWait::new(wait.policy, &mut sink, wait.running);
-        match client.query_catalog_converged(None, &mut ctx) {
+        match client.query_catalog_converged(selector, &mut ctx) {
             Ok(converged) => {
                 note_convergence_wait_outcome(converged.outcome, converged.progress_lines);
                 // See the schema twin — a cancelled observation must
@@ -3006,7 +3099,7 @@ fn netd_resolve_topic_schema(
     let catalogs = gather.catalogs;
     warn_on_catalog_refusals(&catalogs);
     // Find the catalog entry for THIS topic that carries a qualified schema name.
-    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+    let (robot, qualified) = match catalog_target_for_robot(&catalogs, topic, selector) {
         CatalogTarget::Ambiguous { candidates } => {
             return Some(SchemaResolve::Ambiguous { candidates })
         }
@@ -3125,6 +3218,7 @@ fn netd_resolve_topic_schema(
     _topic: &str,
     _schemas_dir: Option<&std::path::Path>,
     _wait: ResolveWait<'_>,
+    _selector: Option<&str>,
 ) -> Option<SchemaResolve> {
     None
 }
@@ -3178,6 +3272,18 @@ fn resolve_remote_topic_schema_with_opts(
     schemas_dir: Option<&std::path::Path>,
     wait: ResolveWait<'_>,
 ) -> SchemaResolve {
+    resolve_remote_topic_schema_for_robot(topic, connect, listen, scouting, schemas_dir, wait, None)
+}
+
+fn resolve_remote_topic_schema_for_robot(
+    topic: &str,
+    connect: &[String],
+    listen: &[String],
+    scouting: bool,
+    schemas_dir: Option<&std::path::Path>,
+    wait: ResolveWait<'_>,
+    selector: Option<&str>,
+) -> SchemaResolve {
     use cerulion_core::transport::discovery::{
         query_announce_entries, query_robot_catalogs, query_robot_schema,
     };
@@ -3196,6 +3302,18 @@ fn resolve_remote_topic_schema_with_opts(
         );
         return SchemaResolve::NoProducer;
     }
+    let options = RemoteTopicsOptions {
+        connect: connect.to_vec(),
+        listen: listen.to_vec(),
+        scouting,
+    };
+    if !lan_discovery_allowed(
+        cerulion_core::transport::demand_authorizer::LanAccess::from_env(),
+        &options,
+        false,
+    ) {
+        return SchemaResolve::NoProducer;
+    }
     // Production path — resolve over the shared cerulion-netd query plane
     // (ONE zenoh session per computer). Only fall through to a transient session when
     // netd is not applicable (explicit locators / non-Unix) or UNREACHABLE (a loud
@@ -3207,6 +3325,7 @@ fn resolve_remote_topic_schema_with_opts(
         scouting,
         schemas_dir,
         wait,
+        selector,
     ) {
         return resolved;
     }
@@ -3257,7 +3376,7 @@ fn resolve_remote_topic_schema_with_opts(
     // draw — the same demotion the netd plane applies at its own seam.
     let read_nothing_conclusive = gathered.replies.is_empty() || !gathered.is_complete();
     let catalogs = gathered.replies;
-    let (robot, qualified) = match catalog_target(&catalogs, topic) {
+    let (robot, qualified) = match catalog_target_for_robot(&catalogs, topic, selector) {
         CatalogTarget::Ambiguous { candidates } => {
             mgr.close();
             return SchemaResolve::Ambiguous { candidates };
@@ -4955,6 +5074,38 @@ pub fn topic_info_with_selection(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn paired_discovery_never_calls_the_stranger_lan_boundary() {
+        use cerulion_core::transport::demand_authorizer::LanAccess;
+        let mut opts = RemoteTopicsOptions {
+            connect: vec![],
+            listen: vec![],
+            scouting: true,
+        };
+        let (lan, catalogs) = query_lan_when_allowed(LanAccess::Paired, &opts, false, || {
+            panic!("paired default must not query or warn about stranger catalogs")
+        })
+        .unwrap();
+        assert!(lan.topics.is_empty() && catalogs.replies.is_empty());
+        assert!(
+            opts.scouting,
+            "authenticated automatic discovery stays enabled"
+        );
+        let calls = std::cell::Cell::new(0);
+        let query = || {
+            calls.set(calls.get() + 1);
+            Ok((RemoteDiscovery::empty(), CatalogGather::default()))
+        };
+        query_lan_when_allowed(LanAccess::Open, &opts, false, query).unwrap();
+        query_lan_when_allowed(LanAccess::Paired, &opts, true, query).unwrap();
+        opts.connect.push("tcp/127.0.0.1:7683".into());
+        query_lan_when_allowed(LanAccess::Paired, &opts, false, query).unwrap();
+        opts.connect.clear();
+        opts.listen.push("tcp/127.0.0.1:0".into());
+        query_lan_when_allowed(LanAccess::Paired, &opts, false, query).unwrap();
+        assert_eq!(calls.get(), 4);
+    }
     use super::*;
 
     /// The PURE `CERULION_NETWORK=off` unavailable
@@ -8349,6 +8500,54 @@ mod tests {
             refused_catalog_robot(&mixed),
             Some(("first".to_string(), Some("not authorized".to_string()))),
             "catalog order chooses the first refusal"
+        );
+    }
+
+    #[test]
+    fn a_selected_lan_catalog_resolves_the_robot_without_guessing_other_sources() {
+        let catalogs: Vec<_> = [("a", "std_msgs/String"), ("b", "geometry_msgs/Vector3")]
+            .into_iter()
+            .map(|(robot, name)| {
+                cerulion_core::transport::cerulion_q::build_catalog_reply(
+                    robot,
+                    [cerulion_core::CatalogEntry {
+                        topic: "/state".into(),
+                        schema_name: Some(name.into()),
+                        schema_hash: None,
+                        provenance: cerulion_core::CatalogProvenance::Runtime,
+                        producer_count: None,
+                        liveness: None,
+                    }],
+                )
+            })
+            .collect();
+        assert_eq!(
+            catalog_target_for_robot(&catalogs, "/state", None),
+            CatalogTarget::Ambiguous {
+                candidates: vec!["a".into(), "b".into()]
+            }
+        );
+        assert_eq!(
+            catalog_target_for_robot(&catalogs, "/state", Some("b")),
+            CatalogTarget::Found {
+                robot: "b".into(),
+                qualified: "geometry_msgs/Vector3".into()
+            }
+        );
+        assert_eq!(
+            catalog_target_for_robot(&catalogs, "/state", Some("a")),
+            CatalogTarget::Found {
+                robot: "a".into(),
+                qualified: "std_msgs/String".into()
+            }
+        );
+        assert_eq!(
+            catalog_target_for_robot(&catalogs, "/state", Some("missing")),
+            CatalogTarget::Missing
+        );
+        assert_eq!(
+            catalog_target_for_robot(&catalogs, "/missing", Some("a")),
+            CatalogTarget::Missing
         );
     }
 

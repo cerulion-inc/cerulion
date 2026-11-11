@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The iroh WAN [`IrohMirrorPlane`] / [`DualMirrorPlane`] end-to-end
 //! over REAL loopback iroh endpoints + REAL iceoryx2 (DISTINCT per-test SHM roots for
-//! the robot and the desk — parallel-safe, no `#[serial]`).
+//! the robot and the desk). The automatic CLI case uses the default desk namespace;
+//! run this binary with `-- --test-threads=1`.
 //!
 //! The headline: an in-process ROBOT (`cerulion_remoted::WirePlane` +
 //! `PairingAuthorizer` over SHM root A, a real producer publishing hand-oracle

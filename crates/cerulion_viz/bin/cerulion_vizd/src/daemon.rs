@@ -838,9 +838,18 @@ enum LayoutMode {
     Explicit,
 }
 
+struct RemoteDemandClaim {
+    robot: String,
+    local_channel: Option<String>,
+}
+
 /// The daemon's shared control state (poll thread + every controller thread).
 #[derive(Default)]
 struct DaemonState {
+    /// Serialize remote attach/rollback/detach without holding the poll-state lock.
+    remote_attaches: Arc<Mutex<()>>,
+    /// A demand claim becomes reusable only after its bounded plane call returns.
+    remote_demands: Arc<Mutex<()>>,
     /// The runtime taps.
     taps: TapManager,
     /// Per-attached-topic stats (keyed by absolute topic). A `detach` removes the
@@ -870,7 +879,7 @@ struct DaemonState {
     /// the entry (netd's refcount-0 teardown
     /// fires when the last consumer leaves). The demand is reserve-then-committed
     /// under this state lock so concurrent same-topic attaches demand exactly once.
-    demanded: BTreeMap<String, String>,
+    demanded: BTreeMap<String, RemoteDemandClaim>,
     /// A session-scoped PROVENANCE TOMBSTONE (topic → origin robot) recorded
     /// on every successful remote attach and — unlike [`Self::demanded`] — NEVER
     /// cleared on `detach`. When a remote topic is unchecked in Studio, the shared
@@ -2877,6 +2886,11 @@ impl Ctx {
         if opened.is_empty() {
             return (0, Vec::new());
         }
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return (0, vec![error]),
+        };
         let mut removed_topics = Vec::new();
         let mut retained = Vec::new();
         {
@@ -4002,10 +4016,28 @@ impl Ctx {
         robot: String,
         schema: Option<String>,
     ) -> Response {
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return Response::error_retryable(Some(id), error, Some(topic), None),
+        };
         // Validate before a pinned built-in can bypass catalog/schema lookup.
         // Account identity routes must never become ordinary LAN robot names.
         if let Err(error) = cerulion_netd::account_access::parse_robot_route(&robot) {
             return Response::error(Some(id), error, Some(topic));
+        }
+
+        {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.taps.contains(&topic)
+                && st.demanded.get(&topic).map(|claim| claim.robot.as_str()) != Some(robot.as_str())
+            {
+                return Response::error(
+                    Some(id),
+                    format!("topic '{topic}' is already attached from another source; detach it before selecting robot '{robot}'"),
+                    Some(topic),
+                );
+            }
         }
 
         // Guardrail 5: entity-override stability, checked EARLY (before any
@@ -4067,15 +4099,15 @@ impl Ctx {
         //     per-computer network gateway) ONCE per topic per daemon lifetime,
         //     instead of opening vizd's OWN ingress on the zenoh session. netd owns
         //     the single mirror publisher + the zenoh demand token + the mirror
-        //     PROVENANCE, so two consumers of the same remote topic (vizd + a user
-        //     graph) share ONE mirror and the frame crosses the network ONCE.
+        //     PROVENANCE. LAN readers share the canonical mirror; WAN observers
+        //     share a private source channel, separately from graph ingress.
         //     Each UDS control connection runs on its OWN handler
         //     thread, so RESERVE-THEN-COMMIT closes the concurrent-attach TOCTOU:
         //     atomically CLAIM `(topic → robot)` under ONE state lock, then demand
         //     OUTSIDE the lock (a network call — never held under the state mutex).
-        //     Exactly one thread demands; a concurrent same-topic attach sees the
-        //     claim and SKIPS (idempotent — the tap step below reports
-        //     `already_attached`), and a re-attach after `detach` re-demands cleanly
+        //     Remote attach and detach transactions share an operation lock outside
+        //     the poll-state lock. A concurrent attach reuses a completed demand and
+        //     its returned channel; a re-attach after detach re-demands cleanly
         //     (netd's teardown freed the slot). A demand FAILURE rolls the claim
         //     back so a retry re-demands with no phantom claim left behind.
         let newly_demanded = match perform_remote_demand(
@@ -4097,10 +4129,19 @@ impl Ctx {
                 );
             }
         };
-        let source_channel = match self.demand_plane.local_channel(&robot, &topic) {
+        let channel = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.demanded
+                .get(&topic)
+                .and_then(|claim| claim.local_channel.clone())
+                .ok_or_else(|| "observer demand has no committed local channel".to_string())
+        };
+        let source_channel = match channel {
             Ok(channel) => channel,
             Err(error) => {
-                let _ = perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic);
+                if newly_demanded {
+                    let _ = perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic);
+                }
                 return Response::error(Some(id), error, Some(topic));
             }
         };
@@ -4120,14 +4161,9 @@ impl Ctx {
         //    a `VoxelMap`, an H.264 CompressedImage a `VideoStream`).
         //    `route_key` was resolved at the top (the entity-stability check).
         let archetype = classify_schema(&schema_name);
-        // Attach under the lock, but DROP the guard before any rollback (the release
-        // re-locks `state`). Guardrail 5: the entity-stability decision RE-runs
-        // under this FINAL commit lock (the early check alone cannot close the
-        // concurrent-attach_remote race — two racers both saw route_key None; here one
-        // has committed its route_key, so the other sees the conflict). A conflict
-        // refuses WITHOUT releasing the demand (a Conflict ⟹ AlreadyAttached ⟹ a
-        // surviving attach whose `detach` releases the topic-keyed demand); only a TAP
-        // error rolls the demand back.
+        // Recheck entity/schema/source under the final state lock, then drop it
+        // before rollback. Existing remote taps retain their demand; fresh demands
+        // refused by a surviving local tap are released.
         let commit = {
             let mut st = self.state.lock().unwrap();
             match self
@@ -4217,9 +4253,15 @@ impl Ctx {
         let (already, archetype) = match commit {
             RemoteCommit::Ok { already, archetype } => (already, archetype),
             RemoteCommit::Conflict(msg) => {
-                // Refuse WITHOUT releasing the demand: the surviving attach's `detach`
-                // releases the topic-keyed demand; releasing here would tear down a
-                // mirror still in use by the winner.
+                if newly_demanded {
+                    if let Err(error) =
+                        perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic)
+                    {
+                        tracing::warn!(topic = %topic, robot = %robot, error = %error, "refused remote attach demand could not be released");
+                    }
+                }
+                // A re-attach retains the surviving remote tap's demand. A fresh
+                // rejected demand was released above because no remote tap owns it.
                 return Response::error(Some(id), msg, Some(topic));
             }
             RemoteCommit::TapErr(e) => {
@@ -4320,6 +4362,11 @@ impl Ctx {
     /// detach (the tap is already gone; the demand ages out when vizd's connection
     /// drops at worst).
     fn detach(&self, id: u64, topic: String) -> Response {
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return Response::error_retryable(Some(id), error, Some(topic), None),
+        };
         let detached = {
             let mut st = self.state.lock().unwrap();
             if let Some(route) = st
@@ -5354,7 +5401,7 @@ enum RemoteCommit {
         already: bool,
         archetype: Option<ArchetypeKind>,
     },
-    /// A conflicting override — refuse, do NOT release the demand.
+    /// Refuse a conflicting source/override; retain only a surviving remote tap's demand.
     Conflict(String),
     /// The tap open failed — refuse AND release the demand (rollback).
     TapErr(String),
@@ -6571,6 +6618,12 @@ fn perform_remote_demand(
     topic: &str,
     schema_hash: u64,
 ) -> Result<bool, String> {
+    let gate = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_demands
+        .clone();
+    let _operation = wait_remote_operation(&gate)?;
     use std::collections::btree_map::Entry;
     // Decide under the lock via the ENTRY API (one topic = ONE origin robot — the
     // decision). A plain `insert` would OVERWRITE the stored robot on a
@@ -6578,24 +6631,27 @@ fn perform_remote_demand(
     // would release the WRONG (robot, topic) and leak the real one. The entry API
     // makes each case explicit:
     // - Vacant → claim it here, demand OUTSIDE the lock (rolled back on failure).
-    // - Occupied, SAME robot → idempotent no-op (keep the value, never re-insert).
+    // - Occupied, SAME robot → reuse only after the in-flight demand gate opens.
     // - Occupied, DIFFERENT robot → LOUD refusal: no claim change, no demand, no
     //   release (a pure refusal that leaks nothing).
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         match st.demanded.entry(topic.to_string()) {
             Entry::Vacant(v) => {
-                v.insert(robot.to_string()); // claimed; demand below (outside the lock).
+                v.insert(RemoteDemandClaim {
+                    robot: robot.into(),
+                    local_channel: None,
+                });
             }
             Entry::Occupied(o) => {
-                if o.get() == robot {
-                    return Ok(false); // same robot — idempotent (re-attach / concurrent).
+                if o.get().robot == robot {
+                    return Ok(false); // same robot, with its channel already committed.
                 }
                 return Err(format!(
                     "topic '{topic}' is already mirrored from robot '{}' — one data source = one \
                      topic, so it cannot ALSO be demanded from robot '{robot}'; detach '{topic}' \
                      first if you meant to re-point it to a different robot",
-                    o.get()
+                    o.get().robot
                 ));
             }
         }
@@ -6607,6 +6663,27 @@ fn perform_remote_demand(
         st.demanded.remove(topic);
         return Err(e);
     }
+    let channel = match plane.local_channel(robot, topic) {
+        Ok(channel) => channel,
+        Err(error) => {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .demanded
+                .remove(topic);
+            if let Err(release) = plane.release(robot, topic) {
+                return Err(format!("{error}; demand rollback failed: {release}"));
+            }
+            return Err(error);
+        }
+    };
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .demanded
+        .get_mut(topic)
+        .expect("claim owner retains its demand")
+        .local_channel = Some(channel);
     Ok(true)
 }
 
@@ -6620,14 +6697,46 @@ fn perform_remote_release(
     state: &Mutex<DaemonState>,
     topic: &str,
 ) -> Result<bool, String> {
+    let gate = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_demands
+        .clone();
+    let _operation = wait_remote_operation(&gate)?;
     let robot = {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.demanded.remove(topic)
     };
     match robot {
-        Some(robot) => plane.release(&robot, topic).map(|_| true),
+        Some(claim) => plane.release(&claim.robot, topic).map(|_| true),
         None => Ok(false),
     }
+}
+
+fn wait_remote_operation(gate: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match gate.try_lock() {
+            Ok(operation) => return Ok(operation),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "remote attachment is still in progress; retry after it completes".into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn remote_attach_gate(state: &Mutex<DaemonState>) -> Arc<Mutex<()>> {
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_attaches
+        .clone()
 }
 
 /// How long to wait for a freshly-demanded mirror's `{topic}/data`
@@ -10239,6 +10348,20 @@ mod tests {
                     ctx.attach(1, topic.into(), None),
                     Response::Attach(_)
                 ));
+                let before = spy.demand_count();
+                let refused = ctx.attach_remote(
+                    2,
+                    topic.into(),
+                    None,
+                    "robot".into(),
+                    Some("std_msgs/String".into()),
+                );
+                let Response::Error(error) = refused else {
+                    panic!("local source change must refuse");
+                };
+                assert!(error.error.contains("another source"));
+                assert_eq!(spy.demand_count(), before);
+                assert!(spy.release_keys().is_empty());
                 perform_remote_demand(spy.as_ref(), &ctx.state, "robot", topic, 0).unwrap();
             }
             if with_model {
@@ -13142,6 +13265,143 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_reattach_cannot_read_or_release_an_unfinished_demand() {
+        struct BlockingPlane {
+            entered: std::sync::mpsc::Sender<()>,
+            finish: Mutex<std::sync::mpsc::Receiver<()>>,
+            ready: AtomicBool,
+            releases: AtomicU64,
+        }
+        impl DemandPlane for BlockingPlane {
+            fn query_catalog(&self, _: &str) -> Result<Vec<CatalogReply>, String> {
+                Err("catalog is outside this demand fixture".into())
+            }
+            fn query_catalog_all(&self) -> Result<Vec<CatalogReply>, String> {
+                Err("catalog is outside this demand fixture".into())
+            }
+            fn query_schema(&self, _: &str, _: &str) -> Result<Vec<SchemaReply>, String> {
+                Err("schema is outside this demand fixture".into())
+            }
+            fn demand(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+                self.entered.send(()).unwrap();
+                self.finish
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                self.ready.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release(&self, _: &str, _: &str) -> Result<(), String> {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn local_channel(&self, _: &str, _: &str) -> Result<String, String> {
+                if self.ready.load(Ordering::SeqCst) {
+                    Ok("/__cerulion/observers/oracle".into())
+                } else {
+                    Err("unfinished observer channel".into())
+                }
+            }
+        }
+        for _ in 0..2 {
+            let (entered, entry) = std::sync::mpsc::channel();
+            let (finish, ending) = std::sync::mpsc::channel();
+            let plane = Arc::new(BlockingPlane {
+                entered,
+                finish: Mutex::new(ending),
+                ready: AtomicBool::new(false),
+                releases: AtomicU64::new(0),
+            });
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let first = {
+                let plane = plane.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let fresh = perform_remote_demand(plane.as_ref(), &state, "robot", "/state", 7)
+                        .unwrap();
+                    (fresh, plane.local_channel("robot", "/state").unwrap())
+                })
+            };
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(state
+                .lock()
+                .unwrap()
+                .demanded
+                .get("/state")
+                .unwrap()
+                .local_channel
+                .is_none());
+            let (completed, done) = std::sync::mpsc::channel();
+            let second = {
+                let plane = plane.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let fresh = perform_remote_demand(plane.as_ref(), &state, "robot", "/state", 7)
+                        .unwrap();
+                    let channel = plane.local_channel("robot", "/state").unwrap();
+                    completed.send(()).unwrap();
+                    (fresh, channel)
+                })
+            };
+            assert!(matches!(
+                done.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            finish.send(()).unwrap();
+            assert_eq!(
+                first.join().unwrap(),
+                (true, "/__cerulion/observers/oracle".into())
+            );
+            assert_eq!(
+                second.join().unwrap(),
+                (false, "/__cerulion/observers/oracle".into())
+            );
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .demanded
+                    .get("/state")
+                    .unwrap()
+                    .local_channel
+                    .as_deref(),
+                Some("/__cerulion/observers/oracle")
+            );
+            assert_eq!(plane.releases.load(Ordering::SeqCst), 0);
+            assert!(perform_remote_release(plane.as_ref(), &state, "/state").unwrap());
+            assert_eq!(plane.releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn an_inflight_demand_timeout_keeps_the_owners_claim_and_does_not_release() {
+        let spy = SpyDemandPlane::default();
+        let state = Mutex::new(DaemonState::default());
+        state.lock().unwrap().demanded.insert(
+            "/state".into(),
+            RemoteDemandClaim {
+                robot: "owner".into(),
+                local_channel: None,
+            },
+        );
+        let gate = state.lock().unwrap().remote_demands.clone();
+        let _owner = gate.lock().unwrap();
+        let started = Instant::now();
+        let error = perform_remote_demand(&spy, &state, "owner", "/state", 7).unwrap_err();
+        assert_eq!(
+            error,
+            "remote attachment is still in progress; retry after it completes"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(spy.demand_count(), 0);
+        assert!(spy.release_keys().is_empty());
+        let st = state.lock().unwrap();
+        assert_eq!(st.demanded["/state"].robot, "owner");
+        assert!(st.demanded["/state"].local_channel.is_none());
+    }
+
+    #[test]
     fn concurrent_demand_of_same_topic_demands_exactly_once() {
         // THE TOCTOU pin: N controller
         // threads race to attach the SAME remote topic, each on its own handler
@@ -13190,7 +13450,7 @@ mod tests {
                     .unwrap()
                     .demanded
                     .get(topic)
-                    .map(String::as_str),
+                    .map(|claim| claim.robot.as_str()),
                 Some("go2"),
                 "the winning claim records the (topic → robot) demand"
             );

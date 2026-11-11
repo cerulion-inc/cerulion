@@ -67,7 +67,8 @@ default + gateway, the discovery ladder, and pairing.
   shared-memory channel.
   Duplicate topic names require `--robot NAME` for reads, or `--local` for a local
   producer. Explicit `--connect` and `--listen` remain available for LAN use.
-  The LAN half is the discovery ladder (~1.5 s ceiling), a
+  Paired access skips implicit LAN discovery and stranger catalog queries.
+  Explicit open access, locators or `--scan` enable the LAN half: the discovery ladder (~1.5 s ceiling), a
   connect phase hard-bounded at 1 s, and the demand/announce reply gathers
   (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
   LOCAL list has already printed by then. `--local` (also spelled

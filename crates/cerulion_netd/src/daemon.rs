@@ -348,7 +348,8 @@ impl Ctx {
                 schema_hash,
             } => {
                 let key = TopicKey::observed(&robot, &topic);
-                match self.demand_with_mode(conn, id, robot, topic, schema_hash, true) {
+                let observer = self.plane.local_channel(&key) != key.topic;
+                match self.demand_with_mode(conn, id, robot, topic, schema_hash, observer) {
                     Response::Demand(demand) => {
                         Response::Observed(crate::protocol::ObserveResponse {
                             demand,
@@ -359,7 +360,9 @@ impl Ctx {
                 }
             }
             Request::Unobserve { id, robot, topic } => {
-                self.release_with_mode(conn, id, robot, topic, true)
+                let key = TopicKey::observed(&robot, &topic);
+                let observer = self.plane.local_channel(&key) != key.topic;
+                self.release_with_mode(conn, id, robot, topic, observer)
             }
             Request::Release { id, robot, topic } => self.release(conn, id, robot, topic),
             Request::Status { id } => self.status(id),
@@ -2138,6 +2141,7 @@ mod tests {
         release_calls: Mutex<Vec<TopicKey>>,
         /// When true, `release_mirror` returns `Retired` (models a real teardown).
         retired: bool,
+        canonical_channels: bool,
     }
     impl TestSpy {
         fn release_count(&self) -> usize {
@@ -2150,7 +2154,11 @@ mod tests {
             Ok(())
         }
         fn local_channel(&self, key: &TopicKey) -> String {
-            key.local_topic()
+            if self.canonical_channels {
+                key.topic.clone()
+            } else {
+                key.local_topic()
+            }
         }
         fn release_mirror(&self, key: &TopicKey) -> MirrorRelease {
             self.release_calls.lock().unwrap().push(key.clone());
@@ -2416,6 +2424,92 @@ mod tests {
             conn_waker_total_drain: Arc::new(AtomicU64::new(0)),
             connect_endpoints: Vec::new(),
         }
+    }
+
+    #[test]
+    fn lan_observers_and_canonical_readers_share_one_mirror_until_last_release() {
+        let spy = Arc::new(TestSpy {
+            retired: true,
+            canonical_channels: true,
+            ..Default::default()
+        });
+        let mut ctx = waker_ctx();
+        ctx.plane = spy.clone();
+        let echo = ctx.connect_unless_exiting().unwrap();
+        let viz = ctx.connect_unless_exiting().unwrap();
+        assert!(matches!(
+            ctx.dispatch(
+                echo,
+                Request::Demand {
+                    id: 1,
+                    robot: "lan".into(),
+                    topic: "/state".into(),
+                    schema_hash: 7
+                }
+            ),
+            Response::Demand(_)
+        ));
+        let Response::Observed(reply) = ctx.dispatch(
+            viz,
+            Request::Observe {
+                id: 2,
+                robot: "lan".into(),
+                topic: "/state".into(),
+                schema_hash: 7,
+            },
+        ) else {
+            panic!("viewer must share LAN mirror");
+        };
+        assert_eq!(reply.local_topic, "/state");
+        assert_eq!(reply.demand.refcount, 2);
+        assert!(!reply.demand.mirror_created);
+        assert_eq!(*spy.ensure_calls.lock().unwrap(), 1);
+        let producer = ctx.connect_unless_exiting().unwrap();
+        assert_eq!(
+            ctx.registry
+                .lock()
+                .unwrap()
+                .register_egress(producer, vec!["/state".into()]),
+            RegisterEgressOutcome::LoopConflict {
+                topic: "/state".into(),
+                robot: "lan".into()
+            }
+        );
+        cleanup_connection(&ctx, echo);
+        assert_eq!(spy.release_count(), 0);
+        ctx.dispatch(
+            viz,
+            Request::Unobserve {
+                id: 3,
+                robot: "lan".into(),
+                topic: "/state".into(),
+            },
+        );
+        assert_eq!(
+            *spy.release_calls.lock().unwrap(),
+            vec![TopicKey::new("lan", "/state")]
+        );
+        assert_eq!(ctx.registry.lock().unwrap().mirror_count(), 0);
+        cleanup_connection(&ctx, viz);
+        assert_eq!(spy.release_count(), 1);
+        ctx.registry
+            .lock()
+            .unwrap()
+            .register_egress(producer, vec!["/local".into()]);
+        assert!(matches!(
+            ctx.dispatch(
+                producer,
+                Request::Observe {
+                    id: 4,
+                    robot: "lan".into(),
+                    topic: "/local".into(),
+                    schema_hash: 7
+                }
+            ),
+            Response::Error(_)
+        ));
+        assert_eq!(*spy.ensure_calls.lock().unwrap(), 1);
+        cleanup_connection(&ctx, producer);
     }
 
     #[test]

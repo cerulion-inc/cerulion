@@ -478,8 +478,11 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         // it. A live positive is in `topic hz`'s own e2e transcript.
         "cerulion topic bw::topic",
         "cerulion topic echo::topic",
+        "cerulion topic echo::robot",
         "cerulion topic hz::topic",
+        "cerulion topic hz::robot",
         "cerulion topic info::topic",
+        "cerulion topic info::robot",
         "cerulion topic pub::topic",
         "cerulion topic snapshot::topic",
         "cerulion topic type::topic",
