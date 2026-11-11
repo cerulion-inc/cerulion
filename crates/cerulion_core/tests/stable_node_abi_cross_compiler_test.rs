@@ -100,7 +100,8 @@ fn verify_compiler_and_bootstrap(path: &Path, skew: bool) {
     // SAFETY: this is the explicitly built fixture's library. Its constructors
     // and checked exports obey the frozen Stabby protocol; retain it through all
     // borrowed fingerprint bytes and function calls below.
-    let library = unsafe { libloading::Library::new(path) }.expect("open fixture");
+    let library =
+        unsafe { cerulion_core::node_abi::libloading::Library::new(path) }.expect("open fixture");
     // SAFETY: maintained Stabby discovery checks both known fixture exports'
     // signatures, and library ownership bounds the returned function pointers.
     let (probe, _bootstrap) = unsafe {

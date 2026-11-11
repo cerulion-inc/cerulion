@@ -18,7 +18,58 @@ fi
 build_env=(env -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTUP_TOOLCHAIN
     CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0
     CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only)
-"${build_env[@]}" CARGO_TARGET_DIR="$node_target" cargo "+$node_toolchain" build --locked -p test_node_stable_abi_cross_compiler
+# A standalone workspace freshly resolves its dependency graph. Reusing the
+# root Cargo.lock would hide loader extension-trait version skew.
+fresh_workspace="$abi_target_root/fresh-node"
+abi_python=python3
+if ! "$abi_python" -c 'import tomllib' 2>/dev/null; then
+    abi_python=
+    for candidate in python3.14 python3.13 python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null && "$candidate" -c 'import tomllib' 2>/dev/null; then
+            abi_python=$candidate
+            break
+        fi
+    done
+    if [ -z "$abi_python" ]; then
+        echo 'fresh standalone node generation requires Python 3.11 or newer' >&2
+        exit 1
+    fi
+fi
+"$abi_python" - "$repo_root" "$fresh_workspace" <<'FRESH_NODE'
+import json
+import pathlib
+import re
+import shutil
+import sys
+import tomllib
+repo = pathlib.Path(sys.argv[1])
+fresh = pathlib.Path(sys.argv[2])
+fresh.mkdir(parents=True, exist_ok=True)
+(fresh / "src").mkdir(exist_ok=True)
+source = repo / "crates/test_fixtures/test_node_stable_abi_cross_compiler"
+shutil.copyfile(source / "src/lib.rs", fresh / "src/lib.rs")
+manifest = (source / "Cargo.toml").read_text()
+for name in ["cerulion_core", "native_ros2_messages"]:
+    manifest = manifest.replace(name + ".workspace = true", name + " = { path = " + json.dumps(str(repo / "crates" / name)) + " }")
+manifest = manifest.replace("[lints]\nworkspace = true", "[workspace]")
+root_text = (repo / "Cargo.toml").read_text()
+root = tomllib.loads(root_text)
+for section in re.finditer(r"(?ms)^\[workspace\.lints\.[^\]]+\]\n.*?(?=^\[|\Z)", root_text):
+    manifest += "\n" + section.group()
+manifest += "\n[lints]\nworkspace = true\n\n[patch.crates-io]\n"
+for name, specification in root.get("patch", {}).get("crates-io", {}).items():
+    specification = dict(specification)
+    if "path" in specification:
+        specification["path"] = str(repo / specification["path"])
+    fields = ", ".join(key + " = " + json.dumps(value) for key, value in specification.items())
+    manifest += json.dumps(name) + " = { " + fields + " }\n"
+(fresh / "Cargo.toml").write_text(manifest)
+# Only the isolated copy's lock is removed; the repository locks stay intact.
+(fresh / "Cargo.lock").unlink(missing_ok=True)
+FRESH_NODE
+"${build_env[@]}" cargo "+$node_toolchain" generate-lockfile --manifest-path "$fresh_workspace/Cargo.toml"
+"${build_env[@]}" CARGO_TARGET_DIR="$node_target" cargo "+$node_toolchain" build --locked --manifest-path "$fresh_workspace/Cargo.toml"
+
 case $(uname -s) in
     Darwin) node_library="$node_target/debug/libtest_node_stable_abi_cross_compiler.dylib" ;;
     Linux) node_library="$node_target/debug/libtest_node_stable_abi_cross_compiler.so" ;;

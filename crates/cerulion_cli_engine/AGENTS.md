@@ -1,7 +1,6 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
+CLI engine; the clap binary delegates here. Test without spawning processes.
 Every workspace-file writer (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds

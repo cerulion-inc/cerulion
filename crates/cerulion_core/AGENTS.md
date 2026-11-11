@@ -1,6 +1,6 @@
 # cerulion_core - agent notes
 
-Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial tests.
+Core runtime; test maps and transport ownership: core-testing.md/core-transport.md.
 
 ## Invariants
 
@@ -31,24 +31,8 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
-- `graph/node_plugin_abi/` owns local adapters for the checked C tables. Host
-  samples remain behind integer leases. Ordinary receive owners outlive the entire
-  callback, including an early view drop; local writers drop before release.
-  Adapter oracle tests: `cargo test -p cerulion_core --lib graph::node_plugin_abi`.
-  Bootstrap/metadata/refusal fixture: `node_plugin_exports_test` (build
-  `test_node_macro_cdylib` first; no transport is created).
-  `node_plugin_raw_test` exercises both raw SDK backends with actual SHM delivery;
-  it also pins helper clock/raw delivery during an active node execution gate.
-  Node diagnostics replace one pending token per instance; create failures
-  replace one library token. New failures invalidate old tokens.
-  Terminal releases refused outside admission stay queued locally; the next
-  admitted invocation flushes them before user code, without reusing the lease.
-  The raw binary also pins retained input/output release and native delivery parity.
-  Run it alone with `--test-threads=1`.
-- Stable node/host tests: `core-transport.md`; readers/writers drop before release.
-- Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
-  graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
-  a string literal (a removed dash lowers the file's ledger line).
+
+- Shipped surface: in-code graphs are tests only; apply root public-text gates.
 
 ## Testing
 
@@ -73,6 +57,4 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
 
-Stable node diagnostic copies retain the original reason text. Host callback
-errors use an identity display locally so raw helpers and user transport-error
-wrapping keep the original message. Caller/phase labels are added by the loader.
+Stable diagnostics retain exact text/phase labels (core-dynamic.md); deferred terminal releases flush before user code (`node_plugin_raw_test`, serial).
