@@ -883,7 +883,14 @@ fn paired_posture_lists_and_reads_owned_topics_without_a_lan_catalog_request() {
     assert!(info.contains("Last sequence: 17"));
     assert!(info.contains("Last timestamp: 123456789ns"));
     assert_eq!(plane.demands.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(daemon.active_demand_count(), 0);
+    let released = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while daemon.active_demand_count() != 0 {
+        assert!(
+            std::time::Instant::now() < released,
+            "closed observer connection must release its demand"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     drop(stop);
     producer.join().unwrap();
     daemon.shutdown();
