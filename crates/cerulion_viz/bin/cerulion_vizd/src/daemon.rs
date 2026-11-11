@@ -5725,6 +5725,15 @@ pub trait DemandPlane: Send + Sync {
     }
 }
 
+struct RemoteChannel {
+    local_topic: String,
+    schema_hash: u64,
+    misses: u8,
+    next_retry: Instant,
+    delay: Duration,
+    failures: FailureRegimeLatch,
+}
+
 /// The production demand plane — ONE persistent [`NetdClient`]
 /// connection to `cerulion-netd` for the daemon's lifetime (spawning netd detached
 /// on the first demand if it is not running). Every vizd demand rides this ONE
@@ -5734,7 +5743,8 @@ pub trait DemandPlane: Send + Sync {
 /// self`, and controller threads share it) and opened LAZILY on the first demand, so
 /// a viz daemon that only ever serves LOCAL attaches never connects to netd.
 pub struct NetdDemandPlane {
-    channels: Mutex<BTreeMap<(String, String), (String, u64)>>,
+    channels: Mutex<BTreeMap<(String, String), RemoteChannel>>,
+    probe_failures: Mutex<FailureRegimeLatch>,
     client: Mutex<Option<NetdClient>>,
     /// `Some(socket)` targets a SPECIFIC control socket (the e2e's in-process netd);
     /// `None` uses the well-known default path (production, first-consumer-spawns).
@@ -5748,6 +5758,7 @@ impl NetdDemandPlane {
         Self {
             client: Mutex::new(None),
             channels: Mutex::new(BTreeMap::new()),
+            probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: None,
         }
     }
@@ -5758,6 +5769,7 @@ impl NetdDemandPlane {
         Self {
             client: Mutex::new(None),
             channels: Mutex::new(BTreeMap::new()),
+            probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: Some(socket),
         }
     }
@@ -5805,70 +5817,208 @@ impl Default for NetdDemandPlane {
 
 impl DemandPlane for NetdDemandPlane {
     fn check_remote_readers(&self) -> Result<(), String> {
-        // No local-only attach starts netd. Keep source/schema/channel pinned and
-        // re-demand idempotently on this connection after a retirement or reconnect.
-        let held = self
+        let held: Vec<_> = self
             .channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .iter()
+            .map(|(key, channel)| {
+                (
+                    key.clone(),
+                    channel.local_topic.clone(),
+                    channel.schema_hash,
+                )
+            })
+            .collect();
         if held.is_empty() {
             return Ok(());
         }
-        let missing = match self.with_client(|client| client.status()) {
-            Ok(status) => {
-                held.iter()
-                    .filter(|((robot, topic), _)| {
-                        !status.demands.iter().any(|row| {
-                            &row.robot == robot && &row.topic == topic && row.refcount > 0
-                        })
-                    })
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<Vec<_>>()
+        let (losses, status) = {
+            let Ok(mut holding) = self.client.try_lock() else {
+                return Ok(());
+            };
+            match holding.as_mut() {
+                Some(client) => match client.poll_pushed_losses() {
+                    Ok(()) => (
+                        client.take_mirror_losses(),
+                        Some(
+                            client.probe_status_until(Instant::now() + Duration::from_millis(200)),
+                        ),
+                    ),
+                    Err(_) => {
+                        *holding = None;
+                        (
+                            held.iter()
+                                .map(
+                                    |((robot, topic), _, _)| cerulion_netd::protocol::MirrorLost {
+                                        event: "mirror_lost".into(),
+                                        robot: robot.clone(),
+                                        topic: topic.clone(),
+                                    },
+                                )
+                                .collect(),
+                            None,
+                        )
+                    }
+                },
+                None => (
+                    held.iter()
+                        .map(
+                            |((robot, topic), _, _)| cerulion_netd::protocol::MirrorLost {
+                                event: "mirror_lost".into(),
+                                robot: robot.clone(),
+                                topic: topic.clone(),
+                            },
+                        )
+                        .collect(),
+                    None,
+                ),
             }
-            Err(_) => held.into_iter().collect(),
         };
-        for ((robot, topic), (channel, hash)) in missing {
-            // Attach and detach serialize through the channel map before client I/O;
-            // checking again prevents a heartbeat reviving a detached source.
-            let channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-            if !channels.contains_key(&(robot.clone(), topic.clone())) {
-                continue;
+        if let Some(Err(error)) = &status {
+            let mut latch = self
+                .probe_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match latch.on_failure() {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                    tracing::debug!(error = %error, total_failures = latch.total_failures(), "netd busy during visualization status probe")
+                }
+                RegimeDecision::Suppressed { suppressed } => {
+                    tracing::debug!(suppressed, "visualization status probe remains busy")
+                }
             }
-            let reply = self
-                .with_client(|client| client.observe(&robot, &topic, hash))
-                .map_err(|error| {
-                    format!("remote mirror lost for robot '{robot}' topic '{topic}': {error}")
-                })?;
-            if reply.local_topic != channel {
-                let _release = self.with_client(|client| client.unobserve(&robot, &topic));
-                return Err(format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"));
+        } else {
+            let mut latch = self
+                .probe_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(suppressed) = latch.on_success() {
+                tracing::debug!(suppressed, "visualization status probe recovered");
             }
         }
-        Ok(())
+        let mut errors = Vec::new();
+        for (key, expected_channel, hash) in held {
+            // All recovery intent lives in this map. Detach removes it under the
+            // same mutex before release I/O, so no health entry can revive it.
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(channel) = channels.get_mut(&key) else {
+                continue;
+            };
+            if channel.local_topic != expected_channel || channel.schema_hash != hash {
+                continue;
+            }
+            let lost = losses
+                .iter()
+                .any(|loss| loss.robot == key.0 && loss.topic == key.1);
+            if !lost {
+                match &status {
+                    Some(Ok(status)) => {
+                        let present = status.demands.iter().any(|row| {
+                            row.robot == key.0
+                                && row.topic == key.1
+                                && row.refcount > 0
+                                && row.local_topic.as_deref().unwrap_or(&row.topic)
+                                    == expected_channel
+                        });
+                        if present {
+                            channel.misses = 0;
+                            channel.delay = Duration::from_secs(1);
+                            channel.next_retry = Instant::now();
+                            if let Some(suppressed) = channel.failures.on_success() {
+                                tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
+                            }
+                            continue;
+                        }
+                        channel.misses = channel.misses.saturating_add(1);
+                        if channel.misses < 2 {
+                            continue;
+                        }
+                    }
+                    Some(Err(_)) => {
+                        channel.misses = 0;
+                        continue;
+                    }
+                    None => continue,
+                }
+            }
+            if Instant::now() < channel.next_retry {
+                continue;
+            }
+            channel.next_retry = Instant::now() + channel.delay;
+            channel.delay = (channel.delay * 2).min(Duration::from_secs(30));
+            let (robot, topic) = &key;
+            match self.with_client(|client| client.observe(robot, topic, hash)) {
+                Ok(reply) if reply.local_topic == expected_channel => {
+                    channel.misses = 0;
+                    channel.delay = Duration::from_secs(1);
+                    channel.next_retry = Instant::now();
+                    if let Some(suppressed) = channel.failures.on_success() {
+                        tracing::info!(robot = %robot, topic = %topic, suppressed, "visualization reader recovered");
+                    }
+                }
+                Ok(_) => {
+                    channels.remove(&key);
+                    let cleanup = self.with_client(|client| client.unobserve(robot, topic));
+                    errors.push(match cleanup {
+                        Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                        Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+                    });
+                }
+                Err(error) => {
+                    match channel.failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                            tracing::warn!(robot = %robot, topic = %topic, error = %error, total_failures = channel.failures.total_failures(), "visualization reader re-demand failed")
+                        }
+                        RegimeDecision::Suppressed { suppressed } => {
+                            tracing::debug!(robot = %robot, topic = %topic, suppressed, "visualization reader re-demand still failing")
+                        }
+                    }
+                    errors.push(format!(
+                        "remote mirror lost for robot '{robot}' topic '{topic}': {error}"
+                    ));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
         let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-        let reply = self.with_client(|c| c.observe(robot, topic, schema_hash))?;
+        let reply = self.with_client(|client| client.observe(robot, topic, schema_hash))?;
         channels.insert(
             (robot.into(), topic.into()),
-            (reply.local_topic, schema_hash),
+            RemoteChannel {
+                local_topic: reply.local_topic,
+                schema_hash,
+                misses: 0,
+                next_retry: Instant::now(),
+                delay: Duration::from_secs(1),
+                failures: FailureRegimeLatch::new(),
+            },
         );
         Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
         let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-        self.with_client(|c| c.unobserve(robot, topic).map(|_| ()))?;
         channels.remove(&(robot.into(), topic.into()));
-        Ok(())
+        self.with_client(|c| c.unobserve(robot, topic).map(|_| ()))
+            .map_err(|error| {
+                format!(
+                    "cannot release remote observer for robot '{robot}' topic '{topic}': {error}"
+                )
+            })
     }
     fn local_channel(&self, robot: &str, topic: &str) -> Result<String, String> {
         self.channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(robot.into(), topic.into()))
-            .map(|(channel, _)| channel.clone())
+            .map(|channel| channel.local_topic.clone())
             .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
