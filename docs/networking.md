@@ -66,12 +66,13 @@ compatibility and pairing.
 - **Discovery keeps source and reachability evidence.** Account lookup has a
   two-second deadline; robot catalogs share a four-second budget. Offline and
   unknown robot rows remain visible, and online rows show the actual direct or
-  relay path. Topic rows name their source. `find`, `snapshot` and `viz --robot`
+  relay path. Topic rows name their source. `find` and `viz --robot`
   use these catalogs too; duplicate sources require `--robot NAME` or `--local`
   for local reads. The last observer releases its private shared-memory channel.
   The mDNS/cache/hostname ladder and zenoh gathers describe explicit open LAN,
   locators or `--scan` compatibility; account and saved-pair discovery is the
-  default authenticated route.
+  default authenticated route. Paired access skips implicit LAN discovery and
+  stranger catalog queries. `topic snapshot --robot` uses authenticated ops.
 
 The paired gate stays in front of every installed LAN authorizer. Identity
 beacons may remain visible, but topic announcements are withheld while paired.

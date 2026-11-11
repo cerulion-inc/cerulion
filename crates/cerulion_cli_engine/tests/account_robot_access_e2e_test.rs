@@ -697,3 +697,194 @@ fn automatic_listing_unions_owned_and_paired_robots_and_preserves_the_cached_dir
     assert_eq!(daemon.active_demand_count(), 0);
     daemon.shutdown();
 }
+
+#[test]
+#[serial]
+fn a_broken_saved_pairing_does_not_block_local_or_account_discovery() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.home.path().join("robots.toml"),
+        "[robots]\ninvalid = \"not-a-key\"\n",
+    )
+    .unwrap();
+    assert!(account_robot_access::automatic::paired_robots().is_err());
+    let spy = Arc::new(AccessSpy::default());
+    let mut daemon =
+        cerulion_netd::start(fixture.socket(), spy, cerulion_netd::NetdConfig::default()).unwrap();
+    let listing = account_robot_access::automatic::discover().unwrap();
+    assert_eq!(listing.robots.len(), 1);
+    assert_eq!(listing.robots[0].name, "owned-robot");
+    assert!(!listing.diagnostics.is_empty());
+    drop(listing);
+    let path = fixture.home.path().join("auth.json");
+    std::fs::remove_file(path).unwrap();
+    let local = account_robot_access::automatic::discover().unwrap();
+    assert!(local.robots.is_empty());
+    assert!(!local.diagnostics.is_empty());
+    drop(local);
+    assert_eq!(daemon.active_demand_count(), 0);
+    daemon.shutdown();
+}
+
+#[test]
+#[serial]
+fn paired_posture_lists_and_reads_owned_topics_without_a_lan_catalog_request() {
+    use cerulion_cli_engine::topic_cmd::{self, introspect, TopicScope};
+    use cerulion_core::{CatalogEntry, CatalogProvenance};
+    use cerulion_netd::{MirrorPlane, TopicKey};
+    struct ReadPlane {
+        account: AccessSpy,
+        topic: String,
+        hash: u64,
+        demands: std::sync::atomic::AtomicUsize,
+    }
+    impl MirrorPlane for ReadPlane {
+        fn local_channel(&self, key: &TopicKey) -> String {
+            key.local_topic()
+        }
+        fn ensure_mirror(
+            &self,
+            key: &TopicKey,
+            hash: u64,
+        ) -> Result<(), cerulion_netd::MirrorError> {
+            assert!(key.observer);
+            assert!(key.robot.starts_with("account:"));
+            assert_eq!(key.topic, self.topic);
+            assert_eq!(hash, self.hash);
+            self.demands
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn release_mirror(&self, _: &TopicKey) -> cerulion_netd::MirrorRelease {
+            cerulion_netd::MirrorRelease::Retired
+        }
+        fn paired_catalog(&self, _: &str) -> Option<Result<cerulion_core::CatalogReply, String>> {
+            panic!("paired default uses the authenticated discovery result, without a LAN catalog request")
+        }
+        fn install_paired_robots(
+            &self,
+            robots: &[cerulion_netd::account_access::PairedRobot],
+            reg: &mut cerulion_netd::DemandRegistry,
+        ) -> Result<(), String> {
+            self.account.install_paired_robots(robots, reg)
+        }
+        fn account_access(
+            &self,
+            action: &cerulion_netd::account_access::AccountAccessRequest,
+        ) -> Result<cerulion_netd::account_access::AccountAccessReply, String> {
+            let mut reply = self.account.account_access(action)?;
+            if let cerulion_netd::account_access::AccountAccessReply::Discovery { robots } =
+                &mut reply
+            {
+                for robot in robots {
+                    robot.catalog =
+                        Some(cerulion_core::transport::cerulion_q::build_catalog_reply(
+                            &robot.route,
+                            [CatalogEntry {
+                                topic: self.topic.clone(),
+                                schema_name: Some("geometry_msgs/Vector3".into()),
+                                schema_hash: Some(self.hash),
+                                provenance: CatalogProvenance::Runtime,
+                                producer_count: None,
+                                liveness: None,
+                            }],
+                        ));
+                }
+            }
+            Ok(reply)
+        }
+    }
+    let fixture = Fixture::new();
+    let _paired = EnvGuard::set("CERULION_LAN_ACCESS", "paired");
+    let topic = format!("/account_observer/{}", std::process::id());
+    let schema = cerulion_core::codegen::parse_rosmsg(
+        "float64 x\nfloat64 y\nfloat64 z\n",
+        "Vector3",
+        Some("geometry_msgs"),
+    )
+    .unwrap();
+    let (walker, warnings) = cerulion_core::codegen::FrameWalker::new(vec![schema]);
+    assert!(warnings.is_empty());
+    let hash = walker.schema_hash_for("geometry_msgs/Vector3").unwrap();
+    let plane = Arc::new(ReadPlane {
+        account: AccessSpy::default(),
+        topic: topic.clone(),
+        hash,
+        demands: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut daemon = cerulion_netd::start(
+        fixture.socket(),
+        plane.clone(),
+        cerulion_netd::NetdConfig::default(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    introspect::print_topic_list(
+        false,
+        introspect::TypeColumn::Shown,
+        topic_cmd::remote_discovery_options(false, vec![], vec![]),
+        false,
+        None,
+        &mut out,
+        &mut err,
+    )
+    .unwrap();
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("owned-robot"));
+    assert!(out.contains(&format!(
+        "{topic}  [geometry_msgs/Vector3]  robot=owned-robot"
+    )));
+    let channel = TopicKey::observed(
+        cerulion_netd::account_access::robot_route(&fixture.robot_id),
+        &topic,
+    )
+    .local_topic();
+    let (stop, stopped) = mpsc::channel::<()>();
+    let (ready, started) = mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+        let mut publisher = manager
+            .create_publisher_simple(&channel, cerulion_core::wire::MaxSliceLen::const_new(256))
+            .unwrap();
+        let header = cerulion_core::WireHeader {
+            schema_hash: hash,
+            total_size: (cerulion_core::WireHeader::SIZE + 24) as u32,
+            offset_table_offset: (cerulion_core::WireHeader::SIZE + 24) as u32,
+            offset_table_count: 0,
+            sequence: 17,
+            timestamp_ns: 123_456_789,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        };
+        let mut frame = vec![0; cerulion_core::WireHeader::SIZE + 24];
+        header.write_to_buf(&mut frame);
+        for (index, value) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
+            let offset = cerulion_core::WireHeader::SIZE + index * 8;
+            frame[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        ready.send(()).unwrap();
+        while matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            publisher.publish_raw(&frame).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let info = topic_cmd::topic_info_with_selection(
+        &topic,
+        None,
+        TopicScope::Automatic,
+        Some("owned-robot"),
+    )
+    .unwrap();
+    assert!(info.contains("geometry_msgs/Vector3"));
+    assert!(info.contains("Last sequence: 17"));
+    assert!(info.contains("Last timestamp: 123456789ns"));
+    assert_eq!(plane.demands.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(daemon.active_demand_count(), 0);
+    drop(stop);
+    producer.join().unwrap();
+    daemon.shutdown();
+}

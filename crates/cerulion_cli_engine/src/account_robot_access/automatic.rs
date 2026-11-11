@@ -83,17 +83,23 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
     if crate::graph_cmd::remote_network_suppressed() {
         return Ok(RemoteCatalogs::default());
     }
-    let pins = paired_robots()?;
+    let (pins, pairing_error) = match paired_robots() {
+        Ok(pins) => (pins, None),
+        Err(error) => (Vec::new(), Some(super::display_text(&error.to_string()))),
+    };
     let signed_in = auth::load()
         .state()
         .is_some_and(|state| state.logged_in_ever);
-    if !signed_in && pins.is_empty() {
-        return Ok(RemoteCatalogs::default());
-    }
     let mut result = RemoteCatalogs {
         _paired: pins.clone(),
         ..Default::default()
     };
+    if let Some(error) = pairing_error {
+        result.diagnostics.push(error);
+    }
+    if !signed_in && pins.is_empty() {
+        return Ok(result);
+    }
     let directory = if signed_in {
         match account_robots::fetch_within(account_robots::LISTING_FETCH_BUDGET) {
             Ok(directory) => {
@@ -381,8 +387,10 @@ pub fn topic_candidates(
     if let Some(selector) = selector {
         return if candidates.contains(selector) {
             Ok(Some(selector.into()))
-        } else if local && selector == "local" {
-            Ok(None)
+        } else if (local && selector == "local")
+            || !catalogs.iter().any(|catalog| catalog.robot == selector)
+        {
+            Ok(None) // The selected LAN catalog may still resolve an unknown robot.
         } else {
             Err(CliError::Validation(format!(
                 "topic '{}' is not available on robot '{}'",
@@ -606,7 +614,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("b, local"));
-        assert!(topic_candidates("/state", false, &catalogs, Some("A")).is_err());
+        assert_eq!(
+            topic_candidates("/state", false, &catalogs, Some("A")).unwrap(),
+            None
+        );
         assert!(
             topic_candidates("/state", true, &[catalog("local", "/state")], None)
                 .unwrap_err()

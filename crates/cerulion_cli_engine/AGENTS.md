@@ -1,6 +1,6 @@
 # cerulion_cli_engine
 
-Logic; parser in `cerulion_cli`. Workspace writers (node/graph/schema edits,
+Parser: `cerulion_cli`. Workspace writers (node/graph/schema edits,
 partition and ROS 2 writes) hold
 `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`, kernel flock shared with wsd) across check/write; same-thread reentrant, others wait (one warn); UNIX only, elsewhere no-op.
 Reads use `acquire_read` (creates nothing; refuses a same-thread re-entry); all
@@ -9,7 +9,7 @@ TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
-- Bounded account/pair catalogs; source-qualified observers require collision selectors; offline caches fence identity.
+- Bounded account/pair catalogs; selectors resolve collisions; caches fence identity. Paired skips implicit LAN; Open/locators/scan retain it; broken pairings report diagnostics.
 - Graph/node scope precedes services/workers, also recording: off/inert excludes all topics, strict outputs outside egress. Drop guards after ports/workers.
 - Paired graphs gate producers with serving_authority; resolve canonical ingress before GO, retain pinned demands, refuse schema/QoS/writer mismatches.
 - Engine enforces invariants; CLI aids users.

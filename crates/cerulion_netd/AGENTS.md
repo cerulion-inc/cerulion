@@ -2,7 +2,7 @@
 
 One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies prove wiring, not delivery.
 
-- Protocol10: paired catalogs and isolated `/__cerulion/observers/` mirrors; canonical wire/2 and graph ingress. Last observer releases its source-qualified mirror.
+- Protocol10: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical.
 
 ## Rules
 - LAN defaults to Paired everywhere; explicit Open warns. Delivery fixtures select Open.
@@ -10,7 +10,7 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
 - Singleton is kernel flock on `cerulion_hygiene::NETD` pidfile, released on death; no second scheme. Android uses an abstract same-UID socket.
 - Connection close IS the release (crash-safe refcounts). The LAST release retires
   the mirror and frees the single-writer SHM slot; a re-demand recreates it.
-- ONE mirror per canonical stream across planes. Status uses `MirrorPlane::serving_plane`, pinned at ensure; absent is unknown, not LAN.
+- ONE mirror per source/mode across planes. Status uses `MirrorPlane::serving_plane`, pinned at ensure; absent is unknown, not LAN.
 - WAN default-on; netd outside default-members keeps plain builds iroh-free. Lean consumers use default-features=false; either changes workspace builds.
 - Never answer a cold start with a confident empty: `DiscoveryState::NotConverged`
   until discovery settles (`query::classify_gather`). An additive field whose serde
@@ -41,11 +41,9 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
 - Release removes debug; operator outcomes use info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is reader-only: no peers.json writes.
 
 ## Testing
-- `cargo test -p cerulion_netd` is parallel-safe; keep `--no-default-features` green.
-  Oracles are COUNTS, never wall clocks.
-- `wan_plane_iroh_test owner_pair::controller` wants `-- --test-threads=1`.
-- `wan_plane_iroh_test automatic_cli` needs `cargo build -p cerulion_cli` first;
-  run its real CLI/SHM delivery check with `-- --test-threads=1`.
+- Keep `--no-default-features` green; count oracles, never wall clocks.
+- Build `cerulion_cli` first; `wan_plane_iroh_test` includes the real CLI/default
+  SHM namespace and owner controller: run `-- --test-threads=1` (CI does too).
 - `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
   it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
 

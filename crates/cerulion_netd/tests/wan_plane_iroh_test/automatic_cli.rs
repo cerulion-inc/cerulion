@@ -102,6 +102,7 @@ fn command(home: &std::path::Path, socket: &std::path::Path, args: &[&str]) -> C
         .env("CERULION_NETD_RELAY_DISABLED", "1")
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:9")
         .env("CERULION_TELEMETRY", "off")
+        .env("CERULION_LAN_ACCESS", "paired")
         .env_remove("CERULION_NETWORK")
         .env_remove("CERULION_NETD_NETWORK")
         .stdout(Stdio::piped())
@@ -124,6 +125,12 @@ fn run(mut command: Command) -> Output {
 }
 
 fn successful(output: Output) -> String {
+    assert!(
+        !String::from_utf8_lossy(&output.stderr)
+            .contains("robot refused to serve its topic catalog"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.status.success(),
         "stdout={}, stderr={}",
@@ -223,15 +230,7 @@ fn automatic_paired_cli_delivers_frames_and_selected_sources_never_collide() {
     let snapshot = run(command(
         home.path(),
         &socket,
-        &[
-            "topic",
-            "snapshot",
-            &topic,
-            "--robot",
-            "paired",
-            "--timeout",
-            "15",
-        ],
+        &["topic", "snapshot", &topic, "--timeout", "15"],
     ));
     assert!(!snapshot.status.success());
     assert!(
@@ -295,7 +294,9 @@ fn automatic_paired_cli_delivers_frames_and_selected_sources_never_collide() {
     )));
     let internal = all
         .lines()
-        .find(|line| line.starts_with("/__cerulion/observers/"))
+        .find(|line| {
+            line.starts_with(&cerulion_netd::TopicKey::observed("paired", &topic).local_topic())
+        })
         .expect("live observer channel is listed under --all");
     assert!(
         internal.contains("[internal]")

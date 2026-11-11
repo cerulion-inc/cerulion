@@ -3911,6 +3911,18 @@ fn command_network_refusal(
             connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
                 .map(|refusal| NetworkRefusal::warning(refusal, 0))
         }
+        Commands::Topic { action } => match action {
+            TopicAction::Info { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-info", switch)
+            }
+            TopicAction::Echo { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-echo", switch)
+            }
+            TopicAction::Hz { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-hz", switch)
+            }
+            TopicAction::List { .. } => None,
+        },
         // Dispatched before this check (`main`'s internal workers, `bagd`),
         // or not refused under the switch: the runs and queries go
         // local-only, and the account verbs reach the account service, which
@@ -3920,7 +3932,6 @@ fn command_network_refusal(
         Commands::Workspace { .. }
         | Commands::Node { .. }
         | Commands::Graph { .. }
-        | Commands::Topic { .. }
         | Commands::Ros { .. }
         | Commands::Ros2 { .. }
         | Commands::Login
@@ -3941,6 +3952,19 @@ fn command_network_refusal(
         #[cfg(not(unix))]
         Commands::Bagd => None,
     }
+}
+
+fn topic_observer_network_refusal(
+    robot: Option<&str>,
+    verb: &str,
+    switch: &network_switch::SwitchEnv,
+) -> Option<network_switch::NetworkRefusal> {
+    let robot = robot?;
+    network_switch::robot_refusal(Some(robot), verb, switch).or_else(|| {
+        graph_cmd::netd_network_off_from(switch.netd.as_deref()).then(|| {
+            network_switch::NetworkRefusal::error("remote topic reads are disabled by CERULION_NETD_NETWORK=off; unset CERULION_NETD_NETWORK to read a robot", 2)
+        })
+    })
 }
 
 /// The usage refusal of `cerulion viz --robot` with no TOPIC.
