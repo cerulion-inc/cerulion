@@ -76,7 +76,7 @@ const fn is_format_char(c: char) -> bool {
 /// Printable text, non-ASCII included, passes through unchanged so the name
 /// stays recognisable.
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
-fn terminal_safe(text: &str) -> String {
+pub(crate) fn terminal_safe(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_control() || matches!(c, '\\' | '\'') {

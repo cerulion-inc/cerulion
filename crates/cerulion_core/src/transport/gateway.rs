@@ -1241,6 +1241,10 @@ impl GatewayRuntime {
         let schema_source_for_seam = schema_source.clone();
         #[cfg(any(test, feature = "test-helpers"))]
         let run_source_for_seam = run_source.clone();
+        manager
+            .network()
+            .expect("gateway network checked above")
+            .set_run_scope(Arc::downgrade(&manager));
         let permissive = matches!(plan.egress_policy, GatewayEgressPolicy::AllowAll);
         if !egress_flags.is_empty() || permissive {
             let network = manager.network().expect("network present (checked above)");
@@ -1628,13 +1632,13 @@ impl GatewayRuntime {
                     // ~1 kHz drive pass while the observer only re-attaches once
                     // per 200 ms sweep.
                     self.liveness.release_own_tap(topic);
-                    let attached =
-                        self.manager
-                            .create_data_only_subscriber(topic)
-                            .and_then(|tap| {
-                                self.open_egress_lane(topic, flag, tap.buffer_size())?;
-                                Ok(tap)
-                            });
+                    let attached = self
+                        .manager
+                        .create_remote_data_only_subscriber(topic)
+                        .and_then(|tap| {
+                            self.open_egress_lane(topic, flag, tap.buffer_size())?;
+                            Ok(tap)
+                        });
                     match attached {
                         Ok(tap) => {
                             self.record_attach_success(topic);
