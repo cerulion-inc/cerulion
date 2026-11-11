@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! How a `block` input reports the drains its credit word clipped at 0.
 //!
-//! A drain that removes more frames than its word counts removed frames the
-//! word never counted ([`crate::credit::Drained::clipped`] is how many it
-//! could not take off). Each such drain is one failure of a
-//! [`FailureRegimeLatch`]: the head of a regime is loud, repeats are counted,
-//! and each decade of the running total is loud again.
+//! A drain that removes more frames than its word has queued, its forgiven
+//! backlog included, removed frames the word never counted
+//! ([`crate::credit::Drained::clipped`] is how many it could not take off).
+//! Each such drain is one failure of a [`FailureRegimeLatch`]: the head of a
+//! regime is loud, repeats are counted, and each decade of the running total
+//! is loud again.
 //!
 //! # What closes a regime
 //!

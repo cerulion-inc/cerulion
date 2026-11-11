@@ -78,8 +78,8 @@ recording's per-edge read log offline).
   publishes only, so an out-of-graph writer can fill the consumer's queue
   without raising `outstanding`; the defer then arrives late and the queue can
   evict. That is a property of `block` on a listed topic, co-located or split.
-  A consumer drain that removes more frames than `outstanding` counts warns
-  `block credit drain removed frames its word never counted`, naming the
+  A consumer drain that removes more frames than its credit word has queued
+  warns `block credit drain removed frames its word never counted`, naming the
   topic, at the start of a run of such drains, so the outside writer shows in
   the log; while a run lasts, the drain that takes the running total to each
   power of ten warns a different line,

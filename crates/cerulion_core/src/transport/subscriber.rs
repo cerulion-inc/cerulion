@@ -214,7 +214,8 @@ struct BlockProbe {
     regime_count: u64,
     buffer_capacity: usize,
     /// Flood suppression for drains that removed more frames than the word
-    /// counted, which its saturating subtraction clipped at 0
+    /// had queued, its forgiven backlog included, which its saturating
+    /// subtraction clipped at 0
     /// ([`CerulionSubscriber::block_drains_clipped`]). Every drain
     /// records through `&self`, so the latch sits in a `RefCell`; the
     /// subscriber is used from one thread at a time (it is `Send`, not `Sync`).
@@ -2599,7 +2600,8 @@ impl CerulionSubscriber {
     }
 
     /// `block`: how many drains of this input removed more frames than their
-    /// word counted: drains of frames the word never counted (see
+    /// word had queued, its forgiven backlog included: drains of frames the
+    /// word never counted (see
     /// [`crate::credit::CreditShared::record_drained`]). A
     /// running total, never reset. `0` unless this input is wired `block`.
     /// Hidden from the documented API: tests and the runtime read it, and a

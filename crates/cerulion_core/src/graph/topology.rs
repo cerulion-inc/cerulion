@@ -2466,13 +2466,15 @@ pub enum MissingInputMeta {
 /// tells which later drains pay those frames and which publishes evict them
 /// from its counts alone. That is exact only while the producer and the
 /// consumer fire one at a time on one thread. A publish counts its frame
-/// after sending it and a drain records a pop after making it, so across
-/// threads a read can land before its frame is counted, or a publish can be
-/// counted before an earlier pop is recorded: the slot then counts a frame
-/// that is gone and holds the producer with nothing queued, or misses one and
-/// lets the queue evict a frame published after the release. The multi-process supervisor calls this with
-/// both sides' process group or executor unit; a worker, which sees only its
-/// own subgraph, with "this process" and "another process".
+/// before sending it, and the count takes the forgiven backlog down by the
+/// frame it expects the send to evict from a full queue; a drain records a
+/// pop after making it. Across threads a pop the count could not see (one
+/// not yet recorded, or one landing between the count and the send) leaves
+/// room, so the send evicts nothing: the slot misses a frame and lets the
+/// queue evict a frame published after the release. The multi-process
+/// supervisor calls this with both sides' process group or executor unit; a
+/// worker, which sees only its own subgraph, with "this process" and
+/// "another process".
 // hot-path-alloc-ok-fn: cold: graph build, once per refused edge
 pub fn split_edge_timeout_refusal(
     topic: &str,

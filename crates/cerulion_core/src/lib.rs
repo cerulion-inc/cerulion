@@ -875,7 +875,8 @@ pub mod wire;
 ///   RENUMBERED 31 -> 32 at the merge of `main`. This change and `main`'s
 ///   v31 count before `send()` were developed in parallel and each bumped
 ///   30 -> 31 for a DIFFERENT layout. The merged host is v32 and refuses both
-///   v30 and v31 cdylibs.
+///   v30 and v31 cdylibs at load, so rebuild every node library against this
+///   release (`cerulion node build <type>`) before loading it.
 pub const CERULION_ABI_VERSION: u32 = 32;
 
 // Re-export commonly used types

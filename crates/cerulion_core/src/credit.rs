@@ -90,6 +90,15 @@
 //! after the pop, so a drain never finds the word without the count of a frame
 //! it removes, however the two processes are scheduled.
 //!
+//! While the word still holds the counts the count stored, the take-back puts
+//! back the counts the count replaced in one compare-exchange, so the
+//! forgiven backlog the count lowered comes back too. A local word always
+//! takes that arm: its producer and consumer fire one at a time on one
+//! thread, so nothing moves the word between the count and the take-back.
+//! When another writer moved the word first (a consumer in another process
+//! drained it, or a release zeroed it), the take-back subtracts one queued
+//! frame, which is exact because such a word carries no backlog (see below).
+//!
 //! The take-back is exact under iceoryx2's default safe overflow (on) and
 //! default degradation action (`Warn`): with both, a `send()` that returns
 //! `Err` delivered the frame to no connection. Cerulion sets neither. No
@@ -104,17 +113,33 @@
 //! workspace for a degradation handler, so it pins those defaults and no
 //! operator file.
 //!
+//! Counting first is exact on a word that carries a forgiven backlog only
+//! while no other thread drains it. The count lowers the backlog by the
+//! forgiven frame it expects the push to evict from a full queue
+//! ([`CreditShared::record_published_n`]). A drain on another thread between
+//! the count and the push takes that forgiven frame off first, the push then
+//! evicts nothing, and the word reads one frame below the queue, so a later
+//! publish can evict a frame the word counted. Graph load refuses
+//! `block_timeout_ms`, the only source of a backlog, on a topic with several
+//! producers and on an edge whose producer runs in another process or
+//! executor unit, and a cross-process binding carries no timeout, so only a
+//! local word with one producer keeps a backlog, and no other thread drains
+//! it. `credit_test::counting_before_send_on_a_shared_backlog_word_under_counts`
+//! walks the failure on a model queue.
+//!
 //! What this does NOT cover. Each case leaves the word off by the frames
-//! involved for as long as the edge runs:
+//! involved for as long as the edge runs, except that a local word clears the
+//! two that leave it ABOVE the queue sooner (the paragraph after this list):
 //!
 //! - **Frames the word never counts.** Native history delivered to a late
 //!   joiner (graph build warns about a `block` topic with `history_size > 0`),
 //!   and a writer outside the graph on a `multi_publisher_topics` topic. Their
 //!   drains leave the word BELOW the queue, so the producer can overrun the
-//!   declared depth. A drain that removes more frames than the word counts
-//!   clips the word at 0, and is reported once per regime and counted by the
-//!   consumer (`CerulionSubscriber::block_drains_clipped`); a drain the word's
-//!   count still covers is indistinguishable from a counted drain.
+//!   declared depth. A drain that removes more frames than the word has
+//!   queued, its forgiven backlog included, clips the word at 0, and is
+//!   reported once per regime and counted by the consumer
+//!   (`CerulionSubscriber::block_drains_clipped`); a drain the word's count
+//!   still covers is indistinguishable from a counted drain.
 //! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
 //!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
 //!   without touching the word, so a `block` input read through them leaves
@@ -125,6 +150,14 @@
 //! - **Several in-graph producers across processes on one edge.** Graph
 //!   planning refuses that shape (`CreditBar::MultipleProducers`) rather than
 //!   counting it.
+//!
+//! On a local word, the pops that record no drain and the `Ok` send that
+//! missed this queue leave the word ABOVE the queue only until the consumer's
+//! next drain whose last `receive` finds its queue empty: that drain also
+//! zeroes the queued count and the forgiven backlog
+//! ([`CreditWord::record_drained_to_empty`]). A mapped word keeps the excess,
+//! because a producer in another process can count a frame between that empty
+//! `receive` and the drain's RMW.
 //!
 //! One window is transient rather than lasting: a frame moving from the queue
 //! into a per-set Sync matcher slot is drained at its pop and credited back as
@@ -231,8 +264,9 @@ pub struct CreditShared {
     ///
     /// - bits 0..32, `queued`: frames published and not yet drained, less the
     ///   ones a timeout release forgave. The shared mirror of the consumer's
-    ///   iceoryx2 queue depth: the producer bumps it on every successful send,
-    ///   the consumer's drain takes it down (saturating).
+    ///   iceoryx2 queue depth: the producer bumps it before each send makes a
+    ///   frame visible and takes the bump back when the send errs, and the
+    ///   consumer's drain takes it down (saturating).
     /// - bits 32..48, `backlog`: frames [`Self::forgive_outstanding`] forgave
     ///   that are still in the consumer's queue.
     /// - bits 48..56, `held`: frames the consumer's matcher holds in its slots
@@ -245,8 +279,10 @@ pub struct CreditShared {
     ///
     /// # Memory ordering
     ///
-    /// Every operation is ONE `try_update` (or `store`) on this word, so a
-    /// reader sees the four counts of one instant, and the publish (the
+    /// Every operation writes this word in ONE `try_update`, `store` or
+    /// `compare_exchange` (a take-back whose compare-exchange fails writes
+    /// nothing there and subtracts in one `try_update`), so a reader sees the
+    /// four counts of one instant, and the publish and its take-back (the
     /// producer), the drain and the slot moves (the consumer) and the
     /// releases (the producer, or the supervisor) apply in the word's single
     /// modification order: none can land inside another. Writes are `Release`
@@ -452,10 +488,11 @@ impl Counts {
         u64::from(self.backlog) + u64::from(self.held_forgiven)
     }
 
-    /// `n` frames entered the consumer's queue. Its queues hold `capacity()`
-    /// frames; past that the overflow evicts the oldest queued frames, which
-    /// are the forgiven ones, so the backlog keeps only what fits beside the
-    /// queued count. `capacity` is read only while a backlog exists.
+    /// `n` frames are counted for the consumer's queue, ahead of the push that
+    /// puts them there. Its queues hold `capacity()` frames; past that the
+    /// overflow evicts the oldest queued frames, which are the forgiven ones,
+    /// so the backlog keeps only what fits beside the queued count.
+    /// `capacity` is read only while a backlog exists.
     fn published(self, n: u64, capacity: impl Fn() -> u64) -> Self {
         let queued = self.queued.saturating_add(saturate_u32(n));
         let backlog = if self.backlog == 0 {
@@ -810,7 +847,7 @@ impl CreditShared {
         self.record_published_n(1)
     }
 
-    /// Record that `n` frames were published to this edge's queue: the
+    /// Record that `n` frames are being published to this edge's queue: the
     /// `n`-at-a-time form of [`record_published`](Self::record_published),
     /// which delegates here so there is ONE increment implementation. The
     /// publish path moves one frame at a time.
@@ -830,7 +867,18 @@ impl CreditShared {
     /// queued count and the forgiven backlog together pass that, iceoryx2's
     /// overflow evicts the oldest queued frames, and the forgiven ones are the
     /// oldest, so the same RMW takes the backlog down to
-    /// `depth * connections - queued`. On one connection that is the exact
+    /// `depth * connections - queued`. The publisher counts before `send()`
+    /// pushes the frame, so this runs ahead of the eviction it accounts for,
+    /// which is exact while no other thread drains the word. On a local word
+    /// none can: its producer and consumer fire one at a time on one thread.
+    /// A send that errs restores the backlog the count lowered
+    /// ([`Self::record_unpublished`]). A drain on another thread between the
+    /// count and the push would take a forgiven frame off first, the push
+    /// would then evict nothing while the backlog already counts a forgiven
+    /// frame gone, and the count would read one frame low (see the
+    /// [module docs](self)).
+    ///
+    /// On one connection `depth * connections - queued` is then the exact
     /// eviction count. On several it is a lower bound, because one connection
     /// can overflow while another has room: the backlog can then stay above
     /// the forgiven frames really queued, and later drains pay that excess
@@ -840,12 +888,13 @@ impl CreditShared {
     /// kind with several connections (a split edge with several producers
     /// mints no word), the consumer's next drain that finds its queue empty
     /// zeroes the queued count and the backlog
-    /// ([`CreditWord::record_drained_to_empty`]). The count never reads low,
-    /// so the producer never publishes past `depth`. Graph load refuses
+    /// ([`CreditWord::record_drained_to_empty`]). The count never reads low
+    /// there, so the producer never publishes past `depth`. Graph load refuses
     /// `block_timeout_ms` on a topic with more than one in-graph producer or
     /// listed in `multi_publisher_topics:`, and on an edge that counts on a
     /// [`CreditWord::Mapped`] word, so a graph forgives only a local word with
-    /// one connection, where this bound is exact.
+    /// one connection, where this bound is exact and no other thread drains
+    /// the word.
     ///
     /// Deliberately issues NO wake: nothing ever parks waiting for the count to
     /// RISE (the release direction is [`record_drained`](Self::record_drained),
