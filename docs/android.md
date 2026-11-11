@@ -874,9 +874,11 @@ such a start describes no run and logs a warning.
   app's `publish` and `subscribe` topics as the endpoint `app`, each node's
   trigger, inputs and outputs, and the size and lease of the tick recording.
   When the graph ends on its own (state `finished`), the run is listed as
-  `ending` until `stop`. A run whose graph YAML or `run.json` is above
-  256 KiB is not listed: `runs` names it under `undescribable` with the
-  reason.
+  `ending` until `stop`. A `run.json` above 256 KiB leaves out the nodes
+  and the tick recording, then the endpoint, and names what it left out
+  under `omitted`. A run whose graph YAML is above 256 KiB, or whose
+  `run.json` is above it with all of those left out, is not listed: `runs`
+  names it under `undescribable` with the reason.
 - `fires` returns the node ticks of a listed run after the point the desk
   names: for each tick, the node, what triggered it, when it started, how
   long it ran and which outputs it wrote. The runtime records ticks only
