@@ -109,13 +109,15 @@ impl AccumulatorSet {
         let count = u32::try_from(self.inputs.len())
             .map_err(|_| super::argument_error("accumulate input count exceeds u32"))?;
         sink.write(&count.to_le_bytes())
-            .map_err(|_| super::argument_error("state sink is full"))?;
+            .map_err(|_| super::state_error(crate::state::StateError::SinkFull))?;
         let mut bridge = super::state::SinkBridge::new(sink);
         for input in &self.inputs {
-            input
+            let result = input
                 .client
-                .capture_accumulate(input.port, &bridge.descriptor())?;
+                .capture_accumulate(input.port, &bridge.descriptor());
+            // Preserve the native sink failure before a generic host status.
             bridge.check()?;
+            result?;
         }
         Ok(())
     }

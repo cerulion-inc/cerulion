@@ -140,12 +140,19 @@ pub(crate) fn generate(
             fn inline_safe(&self) -> bool { <#node as #root::state::CerulionState>::INLINE_SAFE }
             fn probe(&self) -> bool { #root::state::CerulionState::cer_probe(&self.entry.inner) }
 
-            fn capture(&self, sink: &mut dyn #root::state::StateSink) -> #root::error::TransportResult<()> {
+            fn prepare_capture(&self) -> #root::error::TransportResult<()> {
                 if let Some(reason) = self.entry.__cer_param_change() {
                     return Err(#root::error::TransportError::GraphError { reason });
                 }
+                Ok(())
+            }
+
+            fn capture(&self, sink: &mut dyn #root::state::StateSink) -> #root::error::TransportResult<()> {
                 #root::state::CerulionState::cer_capture(&self.entry.inner, sink)
-                    .map_err(|error| #root::error::TransportError::GraphError { reason: error.to_string() })?;
+                    .map_err(|error| {
+                        if matches!(error, #root::state::StateError::SinkFull) { sink.refuse(); }
+                        #root::error::TransportError::GraphError { reason: error.to_string() }
+                    })?;
                 self.__cer_accumulators.capture(sink)
             }
 

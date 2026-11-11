@@ -108,13 +108,7 @@ impl<'a> SinkBridge<'a> {
     pub(super) fn check(&self) -> TransportResult<()> {
         match self.failed {
             None => Ok(()),
-            Some(status) if status.code == status_code::PANICKED => {
-                Err(crate::error::TransportError::NodeTickPanicked {
-                    node_id: "state".into(),
-                    reason: "state sink panicked".into(),
-                })
-            }
-            Some(_) => Err(super::argument_error("state sink is full")),
+            Some(_) => Err(super::state_error(crate::state::StateError::SinkFull)),
         }
     }
 }
