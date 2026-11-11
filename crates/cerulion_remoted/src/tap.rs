@@ -182,13 +182,12 @@ impl TapManager {
         // Attach the listener-less tap (opens ONLY the data service; NEVER
         // creates it). A missing topic / exhausted introspection slot surfaces
         // here with an actionable message naming the topic.
-        let tap =
-            manager
-                .create_data_only_subscriber(topic)
-                .map_err(|e| WireError::DemandFailed {
-                    topic: topic.to_string(),
-                    reason: e.to_string(),
-                })?;
+        let tap = manager
+            .create_remote_data_only_subscriber(topic)
+            .map_err(|e| WireError::DemandFailed {
+                topic: topic.to_string(),
+                reason: e.to_string(),
+            })?;
 
         // Open the per-topic uni data stream (robot → desk) and lead it with a
         // JSON preamble naming the topic, so the desk correlates stream ↔ topic.
@@ -428,7 +427,7 @@ pub fn catalog_peek_budget() -> Duration {
 /// cap), so N silent topics can never freeze the control stream for
 /// N×750ms. Blocking (poll + sleep) — the caller runs it under `spawn_blocking`.
 pub fn peek_schema_hash(manager: &TransportManager, topic: &str, deadline: Instant) -> Option<u64> {
-    let mut tap = manager.create_data_only_subscriber(topic).ok()?;
+    let mut tap = manager.create_remote_data_only_subscriber(topic).ok()?;
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(1);
     while Instant::now() < deadline {
         batch.clear();

@@ -89,6 +89,7 @@ struct CallRequest {
     /// Publish even while the e-stop latch is closed (the e-stop itself, and
     /// read-only tools).
     bypass_latch: bool,
+    remote_scope: Vec<cerulion_core::transport::egress_scope::RemoteTopicLease>,
     reply: oneshot::Sender<Result<Value, JournalError>>,
 }
 
@@ -96,11 +97,19 @@ struct CallRequest {
 type NewestState = Arc<Mutex<BTreeMap<String, Option<String>>>>;
 
 /// The handle async code uses to reach the journal thread.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Journal {
     normal: mpsc::Sender<CallRequest>,
     urgent: mpsc::Sender<CallRequest>,
     state: NewestState,
+    manager: Arc<TransportManager>,
+    config: JournalConfig,
+}
+
+impl std::fmt::Debug for Journal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Journal").finish_non_exhaustive()
+    }
 }
 
 impl Journal {
@@ -124,6 +133,8 @@ impl Journal {
         ));
         let thread_newest = Arc::clone(&newest);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let scope_manager = Arc::clone(&manager);
+        let scope_config = config.clone();
         std::thread::Builder::new()
             .name(String::from("rcp-journal"))
             .spawn(move || {
@@ -145,12 +156,27 @@ impl Journal {
                 normal,
                 urgent,
                 state: newest,
+                manager: scope_manager,
+                config: scope_config,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(RcpdError::Session {
                 reason: String::from("the journal thread exited before opening its ports"),
             }),
         }
+    }
+
+    /// Admit a remote operation before its journal ports can reach the graph.
+    pub fn remote_scope(
+        &self,
+    ) -> Result<
+        Vec<cerulion_core::transport::egress_scope::RemoteTopicLease>,
+        cerulion_core::TransportError,
+    > {
+        [&self.config.calls_topic, &self.config.results_topic]
+            .into_iter()
+            .map(|topic| self.manager.acquire_remote_topic_lease(topic))
+            .collect()
     }
 
     /// The serialized frame for one call, as it will be published. Inside a
@@ -180,7 +206,28 @@ impl Journal {
         timeout: Duration,
         latch_gated: bool,
     ) -> Result<Value, JournalError> {
-        Self::submit(&self.normal, call_id, frame, timeout, !latch_gated).await
+        self.call_with_scope(call_id, frame, timeout, latch_gated, Vec::new())
+            .await
+    }
+
+    /// Keep remote admission in the queued request and pending answer, including cancellation.
+    pub(crate) async fn call_with_scope(
+        &self,
+        call_id: u64,
+        frame: String,
+        timeout: Duration,
+        latch_gated: bool,
+        remote_scope: Vec<cerulion_core::transport::egress_scope::RemoteTopicLease>,
+    ) -> Result<Value, JournalError> {
+        Self::submit(
+            &self.normal,
+            call_id,
+            frame,
+            timeout,
+            !latch_gated,
+            remote_scope,
+        )
+        .await
     }
 
     /// Queue the e-stop call on the urgent queue, which is read ahead of
@@ -203,6 +250,7 @@ impl Journal {
             frame,
             timeout,
             bypass_latch: true,
+            remote_scope: Vec::new(),
             reply,
         });
         async move {
@@ -217,6 +265,7 @@ impl Journal {
         frame: String,
         timeout: Duration,
         bypass_latch: bool,
+        remote_scope: Vec<cerulion_core::transport::egress_scope::RemoteTopicLease>,
     ) -> Result<Value, JournalError> {
         let (reply, answer) = oneshot::channel();
         queue
@@ -225,6 +274,7 @@ impl Journal {
                 frame,
                 timeout,
                 bypass_latch,
+                remote_scope,
                 reply,
             })
             .map_err(|_| JournalError::Stopped)?;
@@ -244,6 +294,7 @@ impl Journal {
 }
 
 struct Pending {
+    _remote_scope: Vec<cerulion_core::transport::egress_scope::RemoteTopicLease>,
     deadline: Instant,
     timeout: Duration,
     reply: oneshot::Sender<Result<Value, JournalError>>,
@@ -459,6 +510,7 @@ impl Ports {
                 self.pending.insert(
                     request.call_id,
                     Pending {
+                        _remote_scope: request.remote_scope,
                         deadline: Instant::now() + request.timeout,
                         timeout: request.timeout,
                         reply: request.reply,

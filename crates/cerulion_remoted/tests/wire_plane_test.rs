@@ -2147,3 +2147,126 @@ async fn full_revoke_evicts_both_streams_and_closes_the_connection() {
     let _ = prod_a.join();
     let _ = prod_b.join();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn producer_exclusion_refuses_remote_catalog_schema_and_demand_but_declared_egress_flows() {
+    let manager = test_manager("gate");
+    let allowed_topic = format!("/wire/gate/allowed/{}", unique_id());
+    let denied_topic = format!("/wire/gate/denied/{}", unique_id());
+    // The allowed topic has a real producer (its demand streams); the denied one is
+    // refused BEFORE any tap, so it needs none.
+    let mut publisher = manager
+        .create_publisher_simple(&allowed_topic, MaxSliceLen::const_new(256))
+        .expect("producer");
+
+    let daemon = disabled_endpoint([211; 32]).await;
+    let client = disabled_endpoint([12; 32]).await;
+    let client_key = *client.id().as_bytes();
+    // Accept-admitted (paired CAP_OBSERVE); the per-topic DEMAND gate is a DenyTopic stub.
+    let authz = Arc::new(claimed_paired(client_key));
+    let _exclusion = manager
+        .exclude_remote_topic(&denied_topic)
+        .expect("local-only producer scope");
+    let _private_publisher = manager
+        .create_publisher_simple(&denied_topic, MaxSliceLen::const_new(256))
+        .expect("private live producer");
+    let plane = Arc::new(WirePlane::with_manager("robot-gate", manager.clone()));
+    let daemon_addr = loopback_addr(daemon.id(), &daemon.bound_sockets());
+
+    let daemon_ref = &daemon;
+    let client_ref = &client;
+    let allowed_ref = &allowed_topic;
+    let denied_ref = &denied_topic;
+
+    let daemon_fut = async move {
+        let accepted = bounded("accept_one", accept_one(daemon_ref))
+            .await
+            .expect("accept ok")
+            .expect("incoming");
+        handle_accepted_with_wire(accepted, authz, None, Some(plane)).await;
+    };
+
+    let client_fut = async move {
+        let conn = bounded("dial", dial(client_ref, daemon_addr, alpn::WIRE))
+            .await
+            .expect("dial wire");
+        let (mut send, mut recv) = open_control(&conn).await;
+
+        match request(
+            &mut send,
+            &mut recv,
+            &WireRequest::Schema {
+                topic: denied_ref.clone(),
+            },
+        )
+        .await
+        {
+            WireResponse::Error { message, .. } => {
+                assert!(message.contains("refused"), "{message}")
+            }
+            other => panic!("excluded schema leaked: {other:?}"),
+        }
+        match request(&mut send, &mut recv, &WireRequest::Catalog).await {
+            WireResponse::Catalog(reply) => {
+                assert!(!reply.entries.iter().any(|entry| entry.topic == *denied_ref))
+            }
+            other => panic!("catalog failed: {other:?}"),
+        }
+        // (a) the DENIED topic → a loud Error naming it (never a stream).
+        let denied_resp = request(
+            &mut send,
+            &mut recv,
+            &WireRequest::Demand {
+                topic: denied_ref.clone(),
+            },
+        )
+        .await;
+        match denied_resp {
+            WireResponse::Error { topic, message } => {
+                assert_eq!(
+                    topic.as_deref(),
+                    Some(denied_ref.as_str()),
+                    "the error names the denied topic"
+                );
+                assert!(
+                    message.contains("refused"),
+                    "the error is the gate refusal: {message}"
+                );
+            }
+            other => panic!("a denied topic must be refused, got {other:?}"),
+        }
+
+        // (b) SELECTIVITY / anti-tautology: a DIFFERENT topic is admitted + streams.
+        let allowed_resp = request(
+            &mut send,
+            &mut recv,
+            &WireRequest::Demand {
+                topic: allowed_ref.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            allowed_resp,
+            WireResponse::DemandAccepted {
+                topic: allowed_ref.clone()
+            },
+            "an untargeted topic is admitted through the gate"
+        );
+        for frame in oracle_frames() {
+            publisher.publish_raw(&frame).expect("publish_raw");
+        }
+        let (stream_topic, frames) = read_uni_frames(&conn, 3).await;
+        assert_eq!(&stream_topic, allowed_ref, "the admitted topic streams");
+        assert_eq!(
+            frames,
+            oracle_frames(),
+            "the admitted stream is byte-identical to the hand oracle"
+        );
+
+        let _ = send.finish();
+        drop(conn);
+    };
+
+    tokio::join!(daemon_fut, client_fut);
+    assert!(manager.remote_access_refusals() >= 3);
+}

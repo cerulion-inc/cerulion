@@ -8,6 +8,7 @@ also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
 `cerulion-wire`.
 
 ## Invariants
+- Remote catalog/schema/demand and topic act verbs enforce producer egress scope before a data port opens. Remote taps and mirror injectors retain admission until after their data port drops; capability grants cannot override a local-only run. Safety operations remain independent.
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
   to capability table in `authorizer.rs` is the sacred security surface. An
   unclassified verb is DENIED; a new one must be classified there
