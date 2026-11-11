@@ -2,7 +2,7 @@
 
 Crates: lib/cerulion_viz (render/sink), lib/go2_tf (pure TFMessage), bin/cerulion_vizd (desk daemon). Outside default-members; plain builds stay rerun-free (`default_member_build_is_rerun_free`); use `-p`.
 
-- Remote: netd local_channel; viewer pins channel/topic/schema/robot. Attach/detach lock outside poll state (3 s); refusals release one demand, rollback waits 45 s. Source changes need detach. Each source holds a client; demand-free probes skip busy passes. Recovery pins source/hash/channel with backoff; drop intent before release I/O.
+- Remote: netd local_channel; attach/recovery pin channel/topic/schema/robot. Source changes need detach. Attach/detach lock outside poll state (3 s); refusals release one demand, rollback 45 s. Per-source clients; demand-free busy probes skip. Backoff: timeouts last, stop on timeout. No map lock over I/O; retire before release.
 
 ## Rules
 - Live viz is INSTANT-ONLY: reconnects get statics + blueprint, never replay (`re_grpc_server` fork in

@@ -5981,9 +5981,15 @@ pub trait DemandPlane: Send + Sync {
     }
 }
 
+struct SourceClient {
+    client: Mutex<Option<NetdClient>>,
+    retired: AtomicBool,
+}
+
 struct RemoteChannel {
-    client: Option<NetdClient>,
-    local_topic: String,
+    source: Arc<SourceClient>,
+    local_topic: Option<String>,
+    last_timeout: Option<Instant>,
     schema_hash: u64,
     misses: u8,
     next_retry: Instant,
@@ -6038,6 +6044,25 @@ impl NetdDemandPlane {
         self.run_client(&mut guard, f)
     }
 
+    /// Remove only this source generation before any cleanup I/O. A concurrent
+    /// attach may already have replaced the same logical key with a fresh client.
+    fn remove_source(
+        &self,
+        key: &(String, String),
+        source: &Arc<SourceClient>,
+    ) -> Option<RemoteChannel> {
+        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if !channels
+            .get(key)
+            .is_some_and(|channel| Arc::ptr_eq(&channel.source, source))
+        {
+            return None;
+        }
+        let channel = channels.remove(key)?;
+        source.retired.store(true, Ordering::Release);
+        Some(channel)
+    }
+
     /// One source's holding client or the separate demand-free query client.
     fn run_client<R>(
         &self,
@@ -6074,22 +6099,27 @@ impl Default for NetdDemandPlane {
 
 impl DemandPlane for NetdDemandPlane {
     fn check_remote_readers(&self) -> Result<(), String> {
-        let held: Vec<_> = self
+        let mut held: Vec<_> = self
             .channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(key, channel)| {
-                (
+            .filter_map(|(key, channel)| {
+                Some((
                     key.clone(),
-                    channel.local_topic.clone(),
+                    channel.local_topic.clone()?,
                     channel.schema_hash,
-                )
+                    channel.source.clone(),
+                    channel.last_timeout,
+                ))
             })
             .collect();
         if held.is_empty() {
             return Ok(());
         }
+        // Stable ordering preserves canonical key order for ties. Untimed sources
+        // precede timed-out ones; oldest timeouts go first so offline peers rotate.
+        held.sort_by_key(|row| row.4);
         let deadline = Instant::now() + Duration::from_millis(200);
         let status = match &self.socket {
             Some(socket) => NetdClient::connect_existing_at_until(socket.clone(), deadline),
@@ -6121,97 +6151,147 @@ impl DemandPlane for NetdDemandPlane {
         let absent = matches!(&status, Err(ClientError::Connect { source, .. })
             if matches!(source.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused));
         if status.is_err() && !absent {
-            // Keep pushed losses queued on a busy pass. An absent listener is
-            // different: poll each held socket so dead sources can respawn netd.
+            // Busy passes preserve pushed losses. An absent listener permits
+            // polling dead holding sockets and spawning a replacement daemon.
             return Ok(());
         }
         let status = status.ok();
         let mut errors = Vec::new();
-        for (key, expected_channel, hash) in held {
-            // All recovery intent lives in this map. Detach removes it under the
-            // same mutex before release I/O, so no health entry can revive it.
-            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(channel) = channels.get_mut(&key) else {
-                continue;
+        for (key, expected_channel, hash, source, _) in held {
+            // Never wait for another caller's source operation, or hold the map
+            // over transport I/O. Retirement is recorded before release waits.
+            let mut client = match source.client.try_lock() {
+                Ok(client) => client,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
             };
-            if channel.local_topic != expected_channel || channel.schema_hash != hash {
+            if source.retired.load(Ordering::Acquire) {
                 continue;
             }
-            let lost = match channel.client.as_mut() {
-                Some(client) => match client.poll_pushed_losses() {
-                    Ok(()) => client
+            let lost = match client.as_mut() {
+                Some(holding) => match holding.poll_pushed_losses() {
+                    Ok(()) => holding
                         .take_mirror_losses()
                         .iter()
                         .any(|loss| loss.robot == key.0 && loss.topic == key.1),
                     Err(_) => {
-                        channel.client = None;
+                        *client = None;
                         true
                     }
                 },
                 None => true,
             };
-            if !lost {
-                let Some(status) = &status else {
+            {
+                let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(channel) = channels
+                    .get_mut(&key)
+                    .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                else {
                     continue;
                 };
-                let present = status.demands.iter().any(|row| {
-                    row.robot == key.0
-                        && row.topic == key.1
-                        && row.refcount > 0
-                        && row.local_topic.as_deref().unwrap_or(&row.topic) == expected_channel
-                });
-                if present {
-                    channel.misses = 0;
-                    channel.delay = Duration::from_secs(1);
-                    channel.next_retry = Instant::now();
-                    if let Some(suppressed) = channel.failures.on_success() {
-                        tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
+                if channel.local_topic.as_deref() != Some(&expected_channel)
+                    || channel.schema_hash != hash
+                {
+                    continue;
+                }
+                if !lost {
+                    let Some(status) = &status else {
+                        continue;
+                    };
+                    let present = status.demands.iter().any(|row| {
+                        row.robot == key.0
+                            && row.topic == key.1
+                            && row.refcount > 0
+                            && row.local_topic.as_deref().unwrap_or(&row.topic) == expected_channel
+                    });
+                    if present {
+                        channel.misses = 0;
+                        channel.delay = Duration::from_secs(1);
+                        channel.next_retry = Instant::now();
+                        channel.last_timeout = None;
+                        if let Some(suppressed) = channel.failures.on_success() {
+                            tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
+                        }
+                        continue;
                     }
+                    channel.misses = channel.misses.saturating_add(1);
+                    if channel.misses < 2 {
+                        continue;
+                    }
+                }
+                if Instant::now() < channel.next_retry {
                     continue;
                 }
-                channel.misses = channel.misses.saturating_add(1);
-                if channel.misses < 2 {
-                    continue;
-                }
+                channel.next_retry = Instant::now() + channel.delay;
+                channel.delay = (channel.delay * 2).min(Duration::from_secs(30));
             }
-            if Instant::now() < channel.next_retry {
+            if source.retired.load(Ordering::Acquire) {
                 continue;
             }
-            channel.next_retry = Instant::now() + channel.delay;
-            channel.delay = (channel.delay * 2).min(Duration::from_secs(30));
             let (robot, topic) = &key;
-            match self.run_client(&mut channel.client, |client| {
-                client.observe(robot, topic, hash)
-            }) {
+            let result = self.run_client(&mut client, |client| client.observe(robot, topic, hash));
+            let connection_lost = result.is_err() && client.is_none();
+            if source.retired.load(Ordering::Acquire) {
+                // Detach owns this source and will release its client as soon as
+                // this guard drops. A late reply cannot commit a replacement.
+                if connection_lost {
+                    break;
+                }
+                continue;
+            }
+            match result {
                 Ok(reply) if reply.local_topic == expected_channel => {
-                    channel.misses = 0;
-                    channel.delay = Duration::from_secs(1);
-                    channel.next_retry = Instant::now();
-                    if let Some(suppressed) = channel.failures.on_success() {
-                        tracing::info!(robot = %robot, topic = %topic, suppressed, "visualization reader recovered");
+                    let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(channel) = channels
+                        .get_mut(&key)
+                        .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                    {
+                        channel.misses = 0;
+                        channel.delay = Duration::from_secs(1);
+                        channel.next_retry = Instant::now();
+                        channel.last_timeout = None;
+                        if let Some(suppressed) = channel.failures.on_success() {
+                            tracing::info!(robot = %robot, topic = %topic, suppressed, "visualization reader recovered");
+                        }
                     }
                 }
                 Ok(_) => {
-                    let mut channel = channels.remove(&key).expect("channel is held");
-                    let cleanup = self
-                        .run_client(&mut channel.client, |client| client.unobserve(robot, topic));
+                    if self.remove_source(&key, &source).is_none() {
+                        continue;
+                    }
+                    let cleanup =
+                        self.run_client(&mut client, |client| client.unobserve(robot, topic));
                     errors.push(match cleanup {
                         Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
                         Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
                     });
                 }
                 Err(error) => {
-                    match channel.failures.on_failure() {
-                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                            tracing::warn!(robot = %robot, topic = %topic, error = %error, total_failures = channel.failures.total_failures(), "visualization reader re-demand failed")
+                    let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(channel) = channels
+                        .get_mut(&key)
+                        .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                    {
+                        if connection_lost {
+                            channel.last_timeout = Some(Instant::now());
                         }
-                        RegimeDecision::Suppressed { suppressed } => {
-                            tracing::debug!(robot = %robot, topic = %topic, suppressed, "visualization reader re-demand still failing")
+                        match channel.failures.on_failure() {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                                tracing::warn!(robot = %robot, topic = %topic, error = %error, total_failures = channel.failures.total_failures(), "visualization reader re-demand failed")
+                            }
+                            RegimeDecision::Suppressed { suppressed } => {
+                                tracing::debug!(robot = %robot, topic = %topic, suppressed, "visualization reader re-demand still failing")
+                            }
                         }
                     }
                     errors.push(format!(
                         "remote mirror lost for robot '{robot}' topic '{topic}': {error}"
                     ));
+                    // netd may still own its registry lock after this client
+                    // timed out. Do not send a sibling into that stalled dial.
+                    if connection_lost {
+                        break;
+                    }
                 }
             }
         }
@@ -6223,52 +6303,108 @@ impl DemandPlane for NetdDemandPlane {
     }
 
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
-        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
         let key = (robot.into(), topic.into());
-        if let Some(channel) = channels.get_mut(&key) {
-            let reply = self.run_client(&mut channel.client, |client| {
-                client.observe(robot, topic, schema_hash)
-            })?;
-            if channel.local_topic != reply.local_topic || channel.schema_hash != schema_hash {
-                let mut channel = channels.remove(&key).expect("channel is held");
-                let cleanup =
-                    self.run_client(&mut channel.client, |client| client.unobserve(robot, topic));
-                return Err(match cleanup {
-                    Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
-                    Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
-                });
+        let source = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            match channels.entry(key.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.get().source.clone(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let source = Arc::new(SourceClient {
+                        client: Mutex::new(None),
+                        retired: AtomicBool::new(false),
+                    });
+                    entry.insert(RemoteChannel {
+                        source: source.clone(),
+                        local_topic: None,
+                        last_timeout: None,
+                        schema_hash,
+                        misses: 0,
+                        next_retry: Instant::now(),
+                        delay: Duration::from_secs(1),
+                        failures: FailureRegimeLatch::new(),
+                    });
+                    source
+                }
             }
-            return Ok(());
+        };
+        let mut client = source.client.lock().unwrap_or_else(|e| e.into_inner());
+        if source.retired.load(Ordering::Acquire) {
+            return Err(format!("remote observer for robot '{robot}' topic '{topic}' was canceled before its demand completed"));
         }
-        let mut client = None;
-        let reply = self.run_client(&mut client, |client| {
+        let reply = match self.run_client(&mut client, |client| {
             client.observe(robot, topic, schema_hash)
-        })?;
-        channels.insert(
-            key,
-            RemoteChannel {
-                client,
-                local_topic: reply.local_topic,
-                schema_hash,
-                misses: 0,
-                next_retry: Instant::now(),
-                delay: Duration::from_secs(1),
-                failures: FailureRegimeLatch::new(),
-            },
-        );
+        }) {
+            Ok(reply) => reply,
+            Err(error) => {
+                let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(channel) = channels
+                    .get_mut(&key)
+                    .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                {
+                    // A concurrent attach may have initialized this generation
+                    // before its creator acquired the source lock. Retire only
+                    // an uninitialized demand, never that caller's live reader.
+                    if channel.local_topic.is_none() {
+                        channels.remove(&key);
+                        source.retired.store(true, Ordering::Release);
+                        *client = None;
+                    } else if client.is_none() {
+                        channel.last_timeout = Some(Instant::now());
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let conflict = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(channel) = channels
+                .get_mut(&key)
+                .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+            else {
+                // Release already removed the recovery intent. Closing the client
+                // also retires a demand that completed after that cancellation.
+                *client = None;
+                return Err(format!("remote observer for robot '{robot}' topic '{topic}' was canceled before its demand completed"));
+            };
+            let conflict = channel
+                .local_topic
+                .as_ref()
+                .is_some_and(|topic| topic != &reply.local_topic)
+                || channel.schema_hash != schema_hash;
+            if !conflict {
+                channel.local_topic = Some(reply.local_topic);
+                channel.last_timeout = None;
+            }
+            conflict
+        };
+        if conflict {
+            self.remove_source(&key, &source);
+            let cleanup = self.run_client(&mut client, |client| client.unobserve(robot, topic));
+            return Err(match cleanup {
+                Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+            });
+        }
         Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
-        // Remove recovery intent before the release I/O, including failed release.
-        let channel = self
-            .channels
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(robot.into(), topic.into()));
-        let Some(mut channel) = channel else {
+        let channel = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let channel = channels.remove(&(robot.into(), topic.into()));
+            if let Some(channel) = &channel {
+                channel.source.retired.store(true, Ordering::Release);
+            }
+            channel
+        };
+        let Some(channel) = channel else {
             return Ok(());
         };
-        let result = match channel.client.as_mut() {
+        let mut client = channel
+            .source
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = match client.as_mut() {
             Some(client) => client
                 .unobserve(robot, topic)
                 .map(|_| ())
@@ -6284,7 +6420,7 @@ impl DemandPlane for NetdDemandPlane {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(robot.into(), topic.into()))
-            .map(|channel| channel.local_topic.clone())
+            .and_then(|channel| channel.local_topic.clone())
             .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
