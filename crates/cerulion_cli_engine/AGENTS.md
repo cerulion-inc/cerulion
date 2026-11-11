@@ -1,8 +1,8 @@
 # cerulion_cli_engine
 
-Parser: `cerulion_cli`. Workspace writers (node/graph/schema edits,
-partition and ROS 2 writes) hold
-`workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`, kernel flock shared with wsd) across check/write; same-thread reentrant, others wait (one warn); UNIX only, elsewhere no-op.
+Parser: `cerulion_cli`. Writers (node/graph/schema edits,
+partition/ROS 2 writes) hold
+`workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`, kernel flock shared with wsd) across check/write; thread reentrant, others wait (one warn); UNIX only, elsewhere no-op.
 Reads use `acquire_read` (creates nothing; refuses a same-thread re-entry); all
 refuse a symlinked `.cerulion`. ONLY `acquire_and_track_gitignore` writes a
 TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
@@ -10,15 +10,15 @@ TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
 Stage via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
 - Bounded account/pair catalogs; selectors resolve collisions; caches fence identity. Paired skips implicit LAN; Open/locators/scan retain it; broken pairings report diagnostics.
-- Graph/node scope precedes services/workers, also recording: off/inert excludes all topics, strict outputs outside egress. Drop guards after ports/workers.
+- Graph/node scope precedes services/workers, also recording: off/inert excludes all topics, strict non-egress outputs. Drop guards after ports/workers.
 - Paired graphs gate producers with serving_authority; resolve canonical ingress before GO, retain pinned demands, refuse schema/QoS/writer mismatches.
 - Engine enforces invariants; CLI aids users.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.
-- `account_robot_access`: only netd opens WAN. Probes share 4 s (500 ms/robot), never pair/demand. Automatic catalogs share another 4 s deadline, coalesce by endpoint key. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
+- `account_robot_access`: only netd opens WAN. Probes: 4 s (500 ms/robot), never pair/demand. Catalogs: another 4 s; coalesce by endpoint key. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
 - node build rustc probe is advisory; only load-time cdylib fingerprint counts.
-- Android cdylibs prefer <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn (docs/android.md).
+- Android libs prefer <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn (docs/android.md).
 - Only `node_metadata::parse_node_metadata` supplies ports/triggers; INFO_END before INFO_START is fatal.
 - Never hand-compute pinned schema hashes: run `pinned_hashes`, copy into `topic_cmd.rs`.
 - Completions never hang/spawn/network (`run_bounded`, `completions_test`).

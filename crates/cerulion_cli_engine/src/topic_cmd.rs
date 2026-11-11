@@ -8516,6 +8516,7 @@ mod tests {
                         schema_hash: None,
                         provenance: cerulion_core::CatalogProvenance::Runtime,
                         producer_count: None,
+                        egress_qos: None,
                         liveness: None,
                     }],
                 )

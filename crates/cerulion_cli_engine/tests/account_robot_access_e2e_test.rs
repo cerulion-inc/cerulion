@@ -786,6 +786,7 @@ fn paired_posture_lists_and_reads_owned_topics_without_a_lan_catalog_request() {
                                 schema_hash: Some(self.hash),
                                 provenance: CatalogProvenance::Runtime,
                                 producer_count: None,
+                                egress_qos: None,
                                 liveness: None,
                             }],
                         ));

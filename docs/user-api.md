@@ -171,7 +171,9 @@ refuse with exit 2, name the candidates, and ask for `--robot NAME`. Use `--loca
 to select a genuine local producer. A robot's canonical topic remains unchanged
 on the wire; desk observer channels under `/__cerulion/observers/` keep its data
 separate from a local topic of the same name. These channels share one mirror per
-source and disappear when the last observer releases it. For remote snapshots,
+source and disappear when the last observer releases it. An explicit
+`topic snapshot --robot NAME` uses the authenticated ops snapshot verb, which
+the Android embedded remote host does not support. For automatic remote snapshots,
 connection setup has bounded network waits and `--timeout` starts its frame wait
 after setup. `--local` and the network
 kill switch suppress account requests, remote catalogs and remote demands.
