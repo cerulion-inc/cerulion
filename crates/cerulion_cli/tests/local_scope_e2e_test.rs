@@ -334,36 +334,61 @@ fn schema_info_under_a_kill_switch_opens_no_session_or_daemon() {
     }
 }
 
-#[test]
-fn pair_under_the_network_kill_switch_refuses_before_discovery() {
-    // Control: with no switch, an unpinned robot name is looked up over mDNS
-    // and the miss names that lookup.
-    let root = tempfile::tempdir().unwrap();
-    let control = run_with(root.path(), &["pair", "scope-bot"], &[]);
-    let error = String::from_utf8_lossy(&control.stderr);
-    assert_eq!(control.status.code(), Some(1), "{error}");
-    assert!(error.contains("did not answer mDNS"), "{error}");
+/// The exact refusal `main.rs` prints for the hidden `cerulion pair` stub
+/// (its `PAIR_UNAVAILABLE_MSG`), as the whole of stderr. Kept as a duplicate
+/// literal on purpose: `cerulion_cli` has no lib target, so the duplicate is
+/// what pins the shipped text, and an edit to either side fails here.
+const PAIR_UNAVAILABLE: &str = "Error: code pairing is not available in this release; robots on \
+                                your account are reached by signing in with `cerulion login`\n";
 
-    for value in ["off", "typo"] {
+#[test]
+fn hidden_pair_refuses_every_spelling_before_discovery_the_switch_and_the_gate() {
+    let spellings: [&[&str]; 5] = [
+        &["pair"],
+        &["pair", "scope-bot"],
+        &["pair", "scope-bot", "--code", "SWAN-42"],
+        &["pair", "--eid", "ab", "--relay-disabled"],
+        &["pair", "--help"],
+    ];
+    let quiet_iceoryx2 = ("IOX2_LOG_LEVEL", "error");
+    for args in spellings {
+        // A signed-in machine, with no switch and under two spellings of it:
+        // the same refusal, and `run_with` fails the run had it reached netd.
+        for network in [None, Some("off"), Some("typo")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut env = vec![quiet_iceoryx2];
+            if let Some(value) = network {
+                env.push(("CERULION_NETWORK", value));
+            }
+            let output = run_with(root.path(), args, &env);
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{args:?} {network:?}: {error}"
+            );
+            assert_eq!(error, PAIR_UNAVAILABLE, "{args:?} {network:?}");
+            assert!(output.stdout.is_empty(), "{args:?} {network:?}");
+        }
+        // A machine that never signed in, with no terminal: the login gate
+        // would refuse with exit 7 here, so exit 2 proves the stub answers
+        // above it.
         let root = tempfile::tempdir().unwrap();
+        let fresh = root.path().join("never-signed-in");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let fresh = fresh.to_str().unwrap();
         let output = run_with(
             root.path(),
-            &["pair", "scope-bot"],
-            &[("CERULION_NETWORK", value)],
+            args,
+            &[quiet_iceoryx2, ("CERULION_HOME", fresh)],
         );
         let error = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{value}: {error}");
-        assert!(
-            error.contains(&format!(
-                "cerulion pair reaches the robot over the network, which CERULION_NETWORK={value}"
-            )),
-            "{value}: {error}"
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} never signed in: {error}"
         );
-        assert!(
-            error.contains("unset CERULION_NETWORK to pair"),
-            "{value}: {error}"
-        );
-        assert!(!error.contains("mDNS"), "{value}: {error}");
+        assert_eq!(error, PAIR_UNAVAILABLE, "{args:?} never signed in");
     }
 }
 

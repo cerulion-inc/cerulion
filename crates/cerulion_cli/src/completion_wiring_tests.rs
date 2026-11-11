@@ -468,7 +468,6 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion node run::node_type",
         "cerulion node stage::graph",
         "cerulion node stage::node_type",
-        "cerulion pair::robot",
         "cerulion rcp::robot",
         "cerulion service call::robot",
         "cerulion topic pub::robot",
@@ -627,7 +626,6 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion node run::id",
         "cerulion node run::prefix",
         "cerulion node stage::id",
-        "cerulion pair::label",
         "cerulion ros2 attach::robot_name",
         "cerulion ros2 attach::topic_prefix",
         // ---- Port declarations: `SCHEMA NAME` pairs where NAME is invented.
@@ -641,19 +639,14 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion node modify::output",
         "cerulion node modify::trigger_input",
         "cerulion node stage::input_binding",
-        // ---- Opaque identifiers: hex endpoint ids, account ids, device ids,
-        // pairing codes. Nothing local enumerates them.
+        // ---- Opaque identifiers: hex endpoint ids and device ids. Nothing
+        // local enumerates them.
         "cerulion account devices revoke::device_id",
         "cerulion connect::eid",
-        "cerulion pair::account",
-        "cerulion pair::code",
-        "cerulion pair::eid",
         "cerulion rcp::eid",
         // ---- Network locators, URLs and interface addresses.
         "cerulion connect::addrs",
         "cerulion connect::relay_url",
-        "cerulion pair::addrs",
-        "cerulion pair::relay_url",
         "cerulion rcp::addrs",
         "cerulion rcp::relay_url",
         "cerulion ros2 attach::iface",
@@ -684,6 +677,10 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // shells never offer it — this entry only classifies the swallowing
         // arg for this walk, which visits hidden commands too.
         "cerulion ros::args",
+        // ---- The hidden `cerulion pair` stub, for the same reason: it
+        // swallows the old argv so `main` can print its refusal, and
+        // completing anything would suggest the verb works.
+        "cerulion pair::args",
         // ---- Topics whose set is NOT locally knowable. `connect --topic`
         // names a topic on a robot this desk has not mirrored yet — that is
         // the entire point of the verb — so the local SHM scan would offer

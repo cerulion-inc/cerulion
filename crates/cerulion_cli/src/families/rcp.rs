@@ -47,7 +47,7 @@ enum RcpCmd {
 #[derive(Args)]
 struct RcpCliArgs {
     /// The robot: a 64-char-hex endpoint id, OR a name pinned in
-    /// `~/.cerulion/robots.toml` by `cerulion pair`. Omit when using `--eid`.
+    /// `~/.cerulion/robots.toml`. Omit when using `--eid`.
     #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(crate::completion::robot_names))]
     robot: Option<String>,
     /// The robot's iroh endpoint id (64-char hex). Overrides a positional name.
@@ -108,7 +108,7 @@ impl VerbFamily for Rcp {
         .map(|refusal| NetworkRefusal::error(refusal, rcp_cmd::EXIT_NETWORK_REFUSED))
     }
 
-    /// The same rule as `connect` and `pair`.
+    /// The same rule as `connect`.
     fn needs_identity(&self, _matches: &ArgMatches) -> bool {
         true
     }
