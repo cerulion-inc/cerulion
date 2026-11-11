@@ -846,19 +846,16 @@ simulated obstacle comes within half a meter), and the `drive_base` receives
 velocity commands, all through **zero-copy shared memory**, with a crash in any
 one group contained to its own process.
 
-> **Warnings you will see on this first run, and what they mean.**
+> **Messages on this first run, and what they mean.**
 > - `WARN absolute source is inside this graph's own prefix namespace but matches
 >   no declared output` (twice per consuming worker) suggests a misspelled
 >   `source:`. Nothing is misspelled: in a multi-process run each worker sees only
 >   its own part of the graph, so its upstream looks external to it.
-> - `WARN network egress OPEN BY DEFAULT`: with no `network:` block, the topics
->   are open to every machine on your LAN, with no peer authentication.
->   `--network off` turns off only this run's own gateway; while `cerulion-netd`
->   serves the LAN it still sends a live local topic to a LAN peer that names it.
->   To refuse every LAN peer, set `CERULION_LAN_ACCESS=paired` for every Cerulion
->   command and daemon and restart a running `cerulion-netd`. The first networked
->   run also starts the shared `cerulion-netd` daemon and says so; it exits by
->   itself when idle.
+> - Networking uses paired access by default, with no open-access warning.
+>   Unpaired LAN peers cannot read topics or publish into graph ingress through
+>   the zenoh plane. The first networked run starts the shared `cerulion-netd`
+>   daemon and says so. Explicit `CERULION_LAN_ACCESS=open` permits unpaired
+>   LAN access and prints a warning; unset it to restore paired access.
 
 Leave it running and open a second terminal.
 

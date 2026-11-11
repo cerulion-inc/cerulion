@@ -137,6 +137,9 @@ fn boot_gateway(tag: &str, robot: &str) -> (Arc<TransportManager>, GatewayRuntim
             root.clone(),
         )
         .expect("init gateway manager");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let manager = Arc::clone(&g);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,

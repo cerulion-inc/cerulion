@@ -613,6 +613,10 @@ fn netd_and_vizd_on_one_root(
         root.clone(),
     )
     .expect("init netd manager (reaches G)");
+    netd_mgr
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let vizd_mgr = TransportManager::init_for_test(
         TransportConfig {
             node_name: format!("vizdmgr_{tag}"),
@@ -634,7 +638,7 @@ fn isolated_transport_inner(
     network: Option<NetworkConfig>,
 ) -> Arc<TransportManager> {
     let clock = Arc::new(VirtualClock::new());
-    TransportManager::init_for_test(
+    let manager = TransportManager::init_for_test(
         TransportConfig {
             node_name: node_name.to_string(),
             clock,
@@ -643,7 +647,11 @@ fn isolated_transport_inner(
         },
         cerulion_core::testing::iceoryx_test_config(),
     )
-    .expect("init isolated transport")
+    .expect("init isolated transport");
+    if let Some(network) = manager.network() {
+        network.set_lan_access(cerulion_core::LanAccess::Open);
+    }
+    manager
 }
 
 /// A never-block worker over a fresh in-memory Rerun sink. Returns the worker, a
@@ -3735,6 +3743,9 @@ fn boot_serving_gateway(
             root.clone(),
         )
         .expect("init gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         match GatewayRuntime::new_with_schema_serving(g, plan.clone(), serving.clone()) {
             Ok(gateway) => return (p, clock, gateway, port),
             Err(e) => {

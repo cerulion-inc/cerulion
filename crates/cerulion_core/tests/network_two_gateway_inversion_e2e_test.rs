@@ -173,6 +173,9 @@ fn setup_scoped_rig(tag: &str, egress: GatewayEgressPolicy, excluded: bool) -> R
             root_a.clone(),
         )
         .expect("init G_prod");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: egress.clone(),
             announce: if excluded {
@@ -218,6 +221,10 @@ fn setup_scoped_rig(tag: &str, egress: GatewayEgressPolicy, excluded: bool) -> R
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init G_cons manager");
+    b_mgr
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     b_mgr
         .network()
         .expect("G_cons network")

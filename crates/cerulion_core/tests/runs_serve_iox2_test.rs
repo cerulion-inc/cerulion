@@ -146,6 +146,10 @@ fn gateway_on_isolated_namespace(tag: &str) -> (GatewayRuntime, iceoryx2::config
         root.clone(),
     )
     .expect("init gateway manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     // A minimal permissive plan: the `runs` source is built regardless of the
     // egress set, and this file never touches the egress plane.
     let plan = GatewayPlan {
@@ -779,6 +783,10 @@ fn a_strict_ingress_only_gateway_declares_no_query_surface_at_all() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init strict gateway manager");
+    strict
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let strict_gateway = GatewayRuntime::new(
         strict,
         GatewayPlan {

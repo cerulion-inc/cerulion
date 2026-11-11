@@ -1,12 +1,13 @@
 # cerulion_core - agent notes
 
-Wire/codegen, iceoryx2, scheduler/graph and gateway runtime; 260+ binaries have per-binary serial rules.
+Wire, codegen, iceoryx2, scheduler/graph and gateway; per-binary serial test rules.
 
 ## Invariants
 - Excluded producers hold guards before data ports; remote taps, mirrors and announces retain opposite leases until withdrawal. Remote metadata uses `collect_remote_run_entries`: v2 private/v1 public, local accepts both; hide private ids and counts. No frame-path checks.
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
+- LAN defaults to Paired; fixtures select Open. Locators/login never open it.
 - FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs;
   the loader also refuses a differing `RUSTC_FINGERPRINT`.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two

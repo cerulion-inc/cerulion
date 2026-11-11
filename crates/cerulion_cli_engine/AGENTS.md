@@ -15,6 +15,7 @@ Stage nodes only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
 - Graph/node guards precede services/workers, including recording: off/inert excludes every topic, strict excludes outputs outside egress. Drop guards after all ports/workers.
 - Engine enforces invariants; CLI checks are UX.
+- Paired starts are quiet; Open warns for every plan using the daemon's posture.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
   share 4 s (500 ms/robot); never pair or demand. LAN and account rows merge only on
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
@@ -35,9 +36,9 @@ Stage nodes only via `graph_cmd::stage_declared_node` (declared ports).
 - Waits check `running` after interrupted errors; retry <= `MAX_CONSECUTIVE_WAIT_ERRORS`, never sleep-retry errors. FOREIGN children Cerulion SIGINTs use `child_signals` (SIG_IGN/blocks survive exec); self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-## Workspace dependencies
-Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
-pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
+## Workspace dependency contract
+Dependencies follow the binary, never cwd: checkout paths or exact registry pins.
+Contract/compiler checks: `docs/internals/cli.md` §11.
 ## Testing
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc

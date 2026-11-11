@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- LAN topic access defaults to paired on every platform. Unpaired LAN peers
+  cannot demand topics or publish into graph ingress through the zenoh plane.
+  Paired desks use the authenticated remote plane. Explicit
+  `CERULION_LAN_ACCESS=open` remains available for development and warns at startup.
+
 ### Fixed
 - Local-only graph and node runs exclude their topics, schemas and run metadata from every remote serving plane, including an already running open gateway. An enabled `network:` block's egress list is enforced for that producing run by other daemons too.
 

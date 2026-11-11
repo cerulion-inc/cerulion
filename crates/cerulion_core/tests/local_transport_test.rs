@@ -213,6 +213,10 @@ fn run_gateway_delivery() -> (Vec<Vec<u8>>, u64) {
             root_a.clone(),
         )
         .expect("init gateway");
+        gateway_manager
+            .network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
             announce: vec![topic.clone()],
@@ -246,6 +250,10 @@ fn run_gateway_delivery() -> (Vec<Vec<u8>>, u64) {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init remote reader");
+    reader
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let subscriber = reader
         .create_subscriber(&topic)
         .expect("create remote local subscriber");
