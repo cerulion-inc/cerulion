@@ -575,7 +575,9 @@ impl Ctx {
             }
             Ok(None) => {}
         }
-        if let Some(error) = fires_target_error(&robot, &run_id) {
+        if let Some(error) =
+            cerulion_core::transport::cerulion_q::fires_target_error(&robot, &run_id)
+        {
             return Response::error(Some(id), error, Some(robot), None);
         }
         match self.query_plane.query_fires(&robot, &run_id, after) {
@@ -2029,29 +2031,6 @@ fn process_released_key(registry: &Mutex<DemandRegistry>, plane: &dyn MirrorPlan
     }
 }
 
-/// Why a `query_fires` request cannot be sent as a GET, or `None`.
-///
-/// The robot must be exactly one key chunk: a `/` or a key-expression wildcard
-/// would address other robots, and each answer arms a lease there. The run id
-/// must be the canonical text the run's `runs` entry carries, because the robot
-/// answers only that form and a different spelling would read as silence.
-fn fires_target_error(robot: &str, run_id: &str) -> Option<String> {
-    use cerulion_core::transport::cerulion_q::{format_run_id, parse_run_id};
-    if robot.is_empty() || robot.contains(['/', '*', '$', '?', '#']) {
-        return Some(format!(
-            "query_fires needs one robot name, not {robot:?}: it must be non-empty and \
-             hold no '/', '*', '$', '?' or '#'"
-        ));
-    }
-    if !parse_run_id(run_id).is_some_and(|parsed| format_run_id(parsed) == run_id) {
-        return Some(format!(
-            "query_fires needs the run id in its canonical form, `0x` and 32 lowercase hex \
-             digits as the run's `runs` entry carries it, not {run_id:?}"
-        ));
-    }
-    None
-}
-
 /// Parse + dispatch one request line into its response — a malformed line becomes
 /// a structured error carrying the best-effort correlation id (never a panic).
 fn dispatch_line(line: &str, ctx: &Ctx, conn: ConnId) -> Response {
@@ -2979,34 +2958,5 @@ mod tests {
         };
         assert!(matches!(ctx.dispatch(0, request), Response::Error(_)));
         assert!(spy.calls().is_empty());
-    }
-
-    #[test]
-    fn fires_target_error_accepts_exactly_one_robot_chunk_and_the_canonical_run_id() {
-        assert_eq!(fires_target_error("temi", FIRES_RUN), None);
-        assert_eq!(
-            fires_target_error("go2-robot_7.lan", "0xffffffffffffffffffffffffffffffff"),
-            None
-        );
-        assert_eq!(
-            fires_target_error("temi", "0x00000000000000000000000000000000"),
-            None
-        );
-        for robot in ["", "a/b", "a*", "**", "$*", "a?b", "a#b"] {
-            assert!(fires_target_error(robot, FIRES_RUN).is_some(), "{robot:?}");
-        }
-        for run_id in [
-            "",
-            "0x",
-            "2a",
-            "0x2a",
-            "0X0000000000000000000000000000002a",
-            "0x0000000000000000000000000000002A",
-            "0x00000000000000000000000000000002a",
-            "0x000000000000000000000000000000-2",
-            " 0x0000000000000000000000000000002a",
-        ] {
-            assert!(fires_target_error("temi", run_id).is_some(), "{run_id:?}");
-        }
     }
 }

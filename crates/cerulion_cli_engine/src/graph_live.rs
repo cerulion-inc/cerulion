@@ -1511,6 +1511,12 @@ impl RunsSource for ZenohPlane {
 
 impl FiresSource for ZenohPlane {
     fn fires(&mut self, robot: &str, run_id: &str, after: Option<u64>) -> CliResult<FiresAnswer> {
+        // The same refusal `cerulion-netd` gives: a robot that is not one key
+        // chunk would reach other robots and arm their fire-tap leases.
+        if let Some(error) = cerulion_core::transport::cerulion_q::fires_target_error(robot, run_id)
+        {
+            return Err(CliError::Validation(error));
+        }
         let session = self
             .manager
             .session()
@@ -4958,6 +4964,39 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
                 )
             }
         );
+    }
+
+    /// `graph fires --connect` refuses a robot that is not one key chunk, or
+    /// a run id that is not canonical, before it asks: such a GET would reach
+    /// other robots and arm their fire-tap leases. `cerulion-netd` refuses
+    /// the same values.
+    #[test]
+    fn the_connect_path_refuses_a_fires_target_that_is_not_one_robot() {
+        use cerulion_core::transport::cerulion_q::encode_fires_reply;
+        let asked = format_run_id(TEMI_RUN_ID);
+        let robot = FiresRobot::answering(encode_fires_reply(&FiresReply::new(
+            "temi",
+            TEMI_RUN_ID,
+            FiresOutcome::NotServed,
+        )));
+        let mut plane =
+            ZenohPlane::open(std::slice::from_ref(&robot.locator)).expect("the desk session opens");
+        (0..20)
+            .map(|_| plane.fires("temi", &asked, None).expect("the desk asks"))
+            .find(|answer| *answer != FiresAnswer::Silent)
+            .expect("the robot answers within 20 asks");
+        for target in ["*", "**", "a/b", "temi/**", "$*", "te?mi", "te#mi", ""] {
+            match plane.fires(target, &asked, None) {
+                Err(CliError::Validation(e)) => {
+                    assert!(e.contains("one robot name"), "{target:?}: {e}")
+                }
+                other => panic!("{target:?}: expected a refusal, got {other:?}"),
+            }
+        }
+        match plane.fires("temi", "0x2a", None) {
+            Err(CliError::Validation(e)) => assert!(e.contains("canonical form"), "{e}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     // ---- over the wire -----------------------------------------------------
