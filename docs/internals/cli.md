@@ -1129,18 +1129,24 @@ Checkout dependencies use absolute `path` entries. The result is exposed as
 `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
 and user overrides are rewritten on recreation.
 
-New workspaces pin the CLI's stable `RUSTC_RELEASE` in `rust-toolchain.toml`
-with the minimal profile only after installed-only `rustup run` verifies its
-full `RUSTC_FINGERPRINT`. Missing or mismatching compilers warn and preserve
-ambient selection; workspace creation never downloads a toolchain. Preserve
-existing TOML or legacy toolchain files and symlinks without probing; warn when
-preserving a choice or when nightly or beta metadata cannot name a toolchain.
-Never change rustup defaults.
+New workspaces write no `rust-toolchain` or `rust-toolchain.toml` and leave an
+existing one as it is; any compiler at or above the MSRV builds loadable nodes.
 
-Write and sync the toolchain manifest to a sibling staging file before publishing
-it with a no-replace hard link. Failed writes leave no partial final manifest;
-concurrent choices win. Clean up the staging file and propagate filesystem errors,
-including filesystems without hard-link support; never fall back to overwriting.
+`rust_setup::check_rust` runs before `node build` (for a node that exists) and
+after `workspace create`/`init`. The decision is the pure `rust_readiness` over
+what the probe found (`cargo` on `PATH`, then the `RUSTC`, `CARGO_BUILD_RUSTC` or
+`rustc` release run in the workspace with `RUSTUP_AUTO_INSTALL=0`, the toolchain
+file that selects it, and rustup's `default` exit status when no release reads),
+whether rustup is there, and
+whether stdin and stderr are both terminals; only that last case asks.
+`check_rust` reads that itself and never fails the verb: a terminal error is
+logged and taken as a no. Install routes, after a yes only: `cerulion-install-rust`,
+else the existing rustup (stable added, default set only when unset), else the
+official installer with the release installer's arguments. A route that installs
+into a Cargo home off `PATH` hands that directory to
+`node_build_with_cargo_dir`, which runs its `cargo` with the directory first on
+`PATH`. A declined or non-terminal check prints the command and returns, so
+`node build` reaches its existing error and exit code.
 
 `node build` uses Cargo compiler selection through toolchain files and compiler
 overrides. Cargo enforces the workspace MSRV. Native loading checks the frozen

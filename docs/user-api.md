@@ -78,14 +78,11 @@ follow the same checkout-or-exact-registry selection as an empty workspace.
 fingerprint. The generated README shows both the included graph and explicit
 create/stage/wire commands. The name must be a single directory name.
 
-For a CLI built with a stable Rust release, both commands optionally write
-`rust-toolchain.toml` naming that release and the minimal profile when an exact
-matching rustup toolchain is already installed. The offline check installs
-nothing and changes no rustup default. An existing toolchain file is preserved.
-If no verified stable toolchain is available, the workspace uses the compiler
-selected by its environment. Explicit `RUSTUP_TOOLCHAIN` and rustup overrides
-retain their normal precedence. This pin is a reproducible build default; any
-supported compiler at or above the MSRV can build loadable nodes.
+Neither command writes a `rust-toolchain.toml`, and an existing one is left as
+it is: any Rust at or above the MSRV builds loadable nodes, so Cargo and rustup
+select the compiler as usual. Both then check for Rust as `node build` does
+(see [Rust for building nodes](#rust-for-building-nodes)); off a terminal they
+print the install command to stderr and still succeed.
 
 Native node libraries use boundary major 1 and load when built by any supported
 Rust compiler at or above the workspace MSRV. The compiler need not match the
@@ -114,6 +111,58 @@ with `{ workspace = true }`. Use another published version or a local `path`
 dependency as appropriate. Recreating the workspace rewrites this file; there is
 no command that rewrites an existing workspace's manifest in place.
 
+### Rust for building nodes
+
+`cerulion node build`, `cerulion workspace create` and `cerulion workspace init`
+check for Rust 1.95 or newer, the MSRV: the `cargo` on `PATH` and the compiler it
+uses (`RUSTC`, then `CARGO_BUILD_RUSTC`, else `rustc`, run in the workspace so a
+toolchain file there applies; a `build.rustc` in a Cargo config file is not
+read). It runs with rustup's automatic toolchain install turned off
+(`RUSTUP_AUTO_INSTALL=0`), so a toolchain file naming a missing toolchain is
+not fetched; a rustup too old to read that setting may still fetch it. A
+pre-release or build suffix
+(`1.96.0-nightly`) counts as its release, as Cargo counts it. `node build`
+checks only for a node that exists.
+
+On a terminal (stdin and stderr both TTYs), a missing or older Rust is offered
+for install on stderr:
+
+```text
+Rust 1.95 or newer is needed to build nodes. Install it now? [Y/n]
+```
+
+Enter, `y` or `yes` installs; anything else, or end of input, does not. A yes
+runs `cerulion-install-rust` when it is on `PATH` or beside `cerulion`; without
+it, a rustup already installed adds stable
+(`rustup toolchain install stable --profile minimal --no-self-update`, and
+`rustup default stable` only when there is no default), and otherwise the
+official rustup installer from `https://sh.rustup.rs` runs with `-y`,
+`--profile minimal`, `--default-toolchain stable` and `--no-modify-path`. The
+CLI then checks again and carries on with the command. When the new Cargo is
+only in `${CARGO_HOME:-$HOME/.cargo}/bin`, `node build` runs it from there and
+prints the PATH line to add.
+
+Off a terminal nothing is asked: the CLI prints `Rust 1.95 or newer is needed to
+build nodes.` and the command that installs it. After a no it prints the command.
+Either way nothing is installed, and `node build` then fails with the same error
+and exit code as without the check. When no rustup is found on `PATH` or in Cargo's home, an older Rust is
+not offered an install; the CLI says how to upgrade it. Nor is an older Rust that
+a `rust-toolchain` or `rust-toolchain.toml` in the workspace or above it selects
+(with rustup, and `RUSTUP_TOOLCHAIN` unset): the CLI names the file and says to
+make it name `stable` or remove it. A Cargo found only in Cargo's home gets
+the PATH line instead of an install. A compiler that reports no release is left
+to Cargo's own error, except rustup with no default toolchain, which is offered
+stable like a missing Rust. A terminal the check cannot read or write is logged
+and taken as a no.
+
+`cerulion-install-rust` ships with the Homebrew formula and the Debian package
+and takes no arguments. It runs the release's `install_rust.sh`. The Rust it
+checks is the one in Cargo's home when that directory holds `rustc` and `cargo`,
+else the one on `PATH`; when that is 1.95 or newer it is left as it is
+(`Rust/Cargo <version> is ready.`). Otherwise the helper adds current stable
+through rustup, keeping an existing default, or installs rustup with stable. Put
+`${CARGO_HOME:-$HOME/.cargo}/bin` on your `PATH` after it runs.
+
 ### `cerulion node`
 
 | Command | Effect |
@@ -121,7 +170,7 @@ no command that rewrites an existing workspace's manifest in place.
 | `node create <TYPE> [--lang rust\|python] [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC] [--raw-ffi]` | New node crate at `nodes/<TYPE>/`, written from the `#[cerulion_node]` macro template (`node new` is an alias). `--lang python` instead creates an embedded-CPython `cdylib` whose logic lives in `node.py`; it rejects `--raw-ffi` with `--raw-ffi applies to Rust nodes only; Python nodes always use the embedded-CPython template`, needs a Cerulion checkout (otherwise: `Python nodes need a Cerulion checkout: cerulion_pynode is not published to a registry`), requires `-T` or `--policy`, and accepts only port names that are Python identifiers, not keywords and not runtime-reserved names. (`--raw-ffi` selects an explicit stable C-table template with local state ownership, panic containment and copied error diagnostics. Its initial tick contains no application logic; implement it before running. The macro template generates the typed port and Sync logic.) `-i` declares a regular input; `-T` declares a TRIGGER input (the new field becomes `#[input(trigger)]` and the node's policy becomes `data_trigger=<NAME>`; a Python port is declared with `trigger=True` and `@cerulion.node(trigger="<NAME>")`). At most ONE `-T` per call. A Rust node takes at most ONE `-i` and ONE `-o` per call (repeat the verb, or use `node modify`, to add more ports); a Python node accepts `-i` and `-o` repeatedly (a `sync_window_ms` Python node needs two or more `-i`), because `node modify` refuses Python nodes; both values of each flag are REQUIRED. Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. See `--policy` below for the SPEC grammar and the defaulting rules. |
 | `node delete <TYPE>` | Remove `nodes/<TYPE>/` and its workspace member entry. |
 | `node modify <TYPE> [-i SCHEMA NAME] [-T SCHEMA NAME] [-o SCHEMA NAME] [--policy SPEC]` | Add ports to an existing node and/or change its trigger policy. For macro-form nodes, splices a new `#[input]` / `#[output]` field into the struct directly; the surrounding tick body and any custom helper fields are preserved. A Python node refuses every `node modify` operation: edit `nodes/<TYPE>/node.py` and run `cerulion node build <TYPE>` instead. For an explicit `--raw-ffi` node it regenerates the `INFO_BYTES` JSON instead. `-T SCHEMA NAME` adds a TRIGGER input (equivalent to `-i SCHEMA NAME --policy data_trigger=NAME`). Bare SCHEMA names resolve against workspace schemas and built-in ROS 2 messages; see `Port SCHEMA resolution` below. `--policy SPEC` rewrites the macro's trigger policy atomically; see `--policy` below. |
-| `node build <TYPE> [--release]` | `cargo build` the node crate as a cdylib. For a Python node it first imports `node.py` with the resolved interpreter and regenerates the baked port metadata. Also probes the node's **optional SYSTEM dependencies** and enables each feature whose system library is actually present; see `Optional SYSTEM dependencies` below. The probe report is printed to stderr BEFORE cargo runs (so a build that fails because of an enabled feature still says which feature that was), and a malformed declaration REFUSES the build rather than silently producing a capability-less artifact. Cargo's own output is captured and shown only when the build fails, so one progress line (`Building '<TYPE>'. …`) goes to stderr just before cargo starts; stdout carries only the result line, `Built '<TYPE>'`. The first build of a workspace also compiles the Cerulion runtime and can take a few minutes. |
+| `node build <TYPE> [--release]` | `cargo build` the node crate as a cdylib. For a Python node it first imports `node.py` with the resolved interpreter and regenerates the baked port metadata. Also probes the node's **optional SYSTEM dependencies** and enables each feature whose system library is actually present; see `Optional SYSTEM dependencies` below. The probe report is printed to stderr BEFORE cargo runs (so a build that fails because of an enabled feature still says which feature that was), and a malformed declaration REFUSES the build rather than silently producing a capability-less artifact. Cargo's own output is captured and shown only when the build fails, so one progress line (`Building '<TYPE>'. …`) goes to stderr just before cargo starts; stdout carries only the result line, `Built '<TYPE>'`. The first build of a workspace also compiles the Cerulion runtime and can take a few minutes. Before any of this, a missing or older Rust is offered for install on a terminal, and named with its install command elsewhere; see [Rust for building nodes](#rust-for-building-nodes). |
 | `node stage <TYPE> [-i ID] [-g GRAPH] [-I NAME SOURCE]...` | Add the node as an instance in a graph YAML. Repeated `-I name source` wires inputs (`-I image camera/image`). A staged instance carries no prefix of its own: `prefix:` is a GRAPH-level key (set by `graph create -n PREFIX`), so topic resolution for every instance in the file comes from there. |
 | `node run <TYPE> [-p PREFIX] [-i ID] [--release] [--local] [--network off] [--no-cpu-dma-lock] [--no-monitor-wait]` | Run a single node on its own, which is useful for development without a full graph. Runs through `graph run` (a one-node graph, report skipped), so an output whose `schema:` the workspace defines more than once is refused the same way. `-p` sets the topic prefix (default `standalone`) and `-i` the instance id (default: the type name), so an output lands on `/standalone/<TYPE>/<port>` unless you say otherwise. `--release`, `--local`, `--network off`, `--no-cpu-dma-lock` and `--no-monitor-wait` mean what they mean on `graph run`. |
 | `node list` | List all node types in the workspace. |
@@ -623,7 +672,8 @@ on `PATH` (Rust **1.95+**, the MSRV, via [rustup](https://rustup.rs)) alongside 
 **C linker** (`build-essential` on Ubuntu/Debian, the Xcode Command Line Tools on
 macOS). If `cargo` is missing the build fails with a message naming rustup and
 the linker, rather than a raw "No such file or directory" that reads like a lost
-build artifact.
+build artifact. Before that, a missing or older Rust is offered for install on a
+terminal; see [Rust for building nodes](#rust-for-building-nodes).
 
 Native nodes use stable boundary major 1. Any supported Rust compiler at or
 above the MSRV builds loadable nodes; the compiler need not match the CLI.
@@ -725,7 +775,6 @@ What the notice will and will not claim:
 ```
 my_robot/
 ├── Cargo.toml              # [workspace] members = ["nodes/*"]
-├── rust-toolchain.toml     # the CLI's compiler, when a match is installed
 ├── .cargo/
 │   └── config.toml         # IOX2_LOG_LEVEL=error, RUST_LOG defaults
 ├── .gitignore              # ignores .cerulion/ (the CLI's per-workspace state)
