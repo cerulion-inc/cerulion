@@ -2298,6 +2298,8 @@ path. See [authenticated discovery](networking.md#making-a-robot-discoverable).
 An enabled `network:` block restricts exported topics and declares imported
 topics. Under paired access each import selects a unique authenticated producer;
 schema, QoS, single-writer and recording-plus-ingress checks remain enforced.
+A declared import requires its producer's native service to permit only one
+publisher, even if a multi-publisher service currently has one live writer.
 A machine that serves and imports shares its existing remote endpoint. The graph
 process itself stays network-free and reads or publishes local shared memory.
 

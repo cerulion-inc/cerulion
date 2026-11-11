@@ -41,9 +41,9 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
 - Release removes debug; operator outcomes use info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is reader-only: no peers.json writes.
 
 ## Testing
-- Keep `--no-default-features` green; count oracles, never wall clocks.
+- Tests run `-- --test-threads=1` (CLI shares SHM); keep `--no-default-features` green. Count oracles, never wall clocks.
 - Build `cerulion_cli` first; `wan_plane_iroh_test` includes the real CLI/default
-  SHM namespace and owner controller: run `-- --test-threads=1` (CI does too).
+  SHM namespace and owner controller; CI runs serial too.
 - `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
   it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
 

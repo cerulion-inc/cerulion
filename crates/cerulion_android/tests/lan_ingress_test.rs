@@ -541,23 +541,14 @@ fn lan_run(
 ) {
     let paired = run == "paired";
     let config = if paired {
-        json!({
+        let declared = json!({
             "graph_yaml": graph_yaml("relay"),
             "listen": [format!("tcp/127.0.0.1:{port}")],
             "ingress": [ingress, other],
-        })
-    } else {
-        json!({
-            "graph_yaml": graph_yaml("relay"),
-            "listen": [format!("tcp/127.0.0.1:{port}")],
-            "lan_access": "open",
-            "ingress": [ingress],
-        })
-    };
-    if paired {
+        });
         for _ in 0..2 {
             let error = runtime
-                .start(&config.to_string())
+                .start(&declared.to_string())
                 .expect_err("this embedded host cannot import authenticated graph inputs");
             assert_eq!(error.code(), codes::INVALID_ARGUMENT);
             assert_eq!(
@@ -574,16 +565,19 @@ fn lan_run(
             }
             assert_eq!(demand_set_size(), 0);
         }
-        // The existing paired listener remains closed to this real peer's
-        // catalog queries and attempted writes after the rejected start.
-        touch(dir, &format!("{run}.go"));
-        await_step(&mut desk.0, dir, &format!("{run}.done"), log_path);
-        assert_eq!(
-            fs::read_to_string(signal_path(dir, &format!("{run}.gets"))).unwrap(),
-            ""
-        );
-        return;
-    }
+        // A paired run without imports still refuses unauthenticated LAN data.
+        json!({
+            "graph_yaml": graph_yaml("relay"),
+            "listen": [format!("tcp/127.0.0.1:{port}")],
+        })
+    } else {
+        json!({
+            "graph_yaml": graph_yaml("relay"),
+            "listen": [format!("tcp/127.0.0.1:{port}")],
+            "lan_access": "open",
+            "ingress": [ingress],
+        })
+    };
     runtime.start(&config.to_string()).unwrap();
     let manager = TransportManager::get().expect("initialized app transport manager");
     let ingress_echo = manager
@@ -595,7 +589,7 @@ fn lan_run(
     let mut ingress_echoes = Vec::new();
     let mut other_echoes = Vec::new();
     touch(dir, &format!("{run}.go"));
-    {
+    if !paired {
         // Until the first right-hash frame is echoed and a wrong-hash one
         // was counted.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -635,7 +629,15 @@ fn lan_run(
         "{run}: '{other}' has no bridge"
     );
     let gets = fs::read_to_string(signal_path(dir, &format!("{run}.gets"))).unwrap();
-    {
+    if paired {
+        assert_eq!(ingress_echoes, Vec::<f64>::new(), "{run}: '{ingress}'");
+        assert!(!is_ingress_registered(ingress), "{run}: '{ingress}'");
+        assert!(ingress_stats(ingress).is_none(), "{run}: '{ingress}'");
+        assert_eq!(gets, "", "{run}: a paired app sends no demand GET");
+        // The GET record covers less than one loop interval; the demand set
+        // the loop reads is empty, so no pass would GET a topic either.
+        assert_eq!(demand_set_size(), 0, "{run}: a paired app demands nothing");
+    } else {
         assert!(
             ingress_echoes.iter().all(|&x| x == RIGHT_X),
             "{run}: only right-hash frames reach the node: {ingress_echoes:?}"

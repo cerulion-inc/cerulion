@@ -3139,8 +3139,8 @@ jobs:
       # explicitly, redundant-but-harmless). netd is excluded from default-members, so
       # the default-feature test steps above never build it — this step is its coverage.
       # Runs the netd lib/bin unit tests + the daemon/mirror/client integration tests +
-      # the loopback-iroh WAN-plane e2e (real iceoryx2 + loopback iroh, per-test SHM
-      # roots + per-test iroh identities ⇒ parallel-safe).
+      # the loopback-iroh WAN-plane e2e. CLI fixtures share the process-global
+      # manager, so this package runs one test at a time.
       # doc-pin: cerulion_netd::networking_doc_banner_test reads docs
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
