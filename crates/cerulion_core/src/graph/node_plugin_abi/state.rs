@@ -142,12 +142,18 @@ unsafe extern "C" fn bridge_write(context: *mut u8, chunk: Bytes) -> Status {
         let status = match result {
             Ok(Ok(())) => super::status(status_code::OK),
             Ok(Err(_)) => super::status(status_code::BUFFER_TOO_SMALL),
-            Err(_) => super::status(status_code::PANICKED),
+            Err(payload) => {
+                super::contain_panic_payload(payload);
+                super::status(status_code::PANICKED)
+            }
         };
         if status.code != status_code::OK {
             bridge.failed = Some(status);
         }
         status
     }));
-    result.unwrap_or_else(|_| super::status(status_code::PANICKED))
+    result.unwrap_or_else(|payload| {
+        super::contain_panic_payload(payload);
+        super::status(status_code::PANICKED)
+    })
 }

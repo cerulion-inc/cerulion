@@ -502,8 +502,10 @@ impl HostClient {
             return Ok(None);
         }
         self.check(status)?;
-        if event.port != port || event.kind != kind {
-            return Err(super::argument_error("host event port or kind is invalid"));
+        if event.port != port || event.kind != kind || event.reserved != 0 {
+            return Err(super::argument_error(
+                "host event port, kind or reserved field is invalid",
+            ));
         }
         Ok(Some(event))
     }

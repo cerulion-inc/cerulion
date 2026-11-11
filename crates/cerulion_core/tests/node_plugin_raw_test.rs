@@ -35,7 +35,7 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
     let mut native = NodeContext::with_runtime_env(
         IndexMap::new(),
         IndexMap::new(),
-        clock,
+        clock.clone(),
         ShutdownSignal::new(),
         Arc::clone(&env),
     );
@@ -84,7 +84,12 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
             .view_raw_expecting(Vector3::SCHEMA_HASH)
             .unwrap()
             .is_none());
-        for _ in 0..2 {
+        let scripted = factory.clock_arc();
+        for timestamp in [123_u64, 456] {
+            clock.set(timestamp);
+            assert_eq!(scripted.now_ns(), timestamp);
+            header.timestamp_ns = scripted.now_ns();
+            header.write_to_buf(&mut frame);
             assert_eq!(publisher.publish_raw(&frame).unwrap(), 1);
             let received = receiver
                 .view_raw_expecting(Vector3::SCHEMA_HASH)
@@ -92,7 +97,7 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
                 .expect("SHM downstream frame");
             assert_eq!(&received[..], &frame);
             assert_eq!(received.header().sequence, 41);
-            assert_eq!(received.header().timestamp_ns, 123);
+            assert_eq!(received.header().timestamp_ns, timestamp);
             assert_eq!(&received[40..48], &7.0f64.to_le_bytes());
             assert_eq!(&received[48..56], &(-2.25f64).to_le_bytes());
             assert_eq!(&received[56..64], &0.5f64.to_le_bytes());
@@ -106,6 +111,151 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
     drop(plugin_factory);
     drop(native_factory);
     drop(plugin);
+    drop(client);
+    remove_context(context.value).unwrap();
+}
+
+#[test]
+fn helper_clock_and_raw_publish_deliver_while_node_tick_gate_is_held() {
+    use cerulion_core::graph::node::{AnyPublisher, NodeContext};
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::graph::node_plugin_abi::NodeRegistry;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+    use std::sync::Barrier;
+
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(777);
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "node_plugin_clock_concurrent".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        iceoryx_test_config(),
+    )
+    .unwrap();
+    let mut publishers = IndexMap::new();
+    publishers.insert(
+        "out".into(),
+        AnyPublisher::Ipc(
+            manager
+                .create_publisher("abi/clock/tick", MaxSliceLen::try_new(64).unwrap(), 1)
+                .unwrap(),
+        ),
+    );
+    let mut tick_receiver = manager.create_subscriber("abi/clock/tick").unwrap();
+    let mut raw_receiver = manager.create_subscriber("abi/clock/helper").unwrap();
+    let env = Arc::new(HashMap::new());
+    let mut native = NodeContext::with_runtime_env(
+        publishers,
+        IndexMap::new(),
+        clock,
+        ShutdownSignal::new(),
+        env.clone(),
+    );
+    native.set_transport(manager.clone());
+    let specs = vec![HostPortSpec {
+        name: "out".into(),
+        direction: LeaseDirection::Write,
+        layout: PluginWireLayout {
+            schema_hash: Vector3::SCHEMA_HASH,
+            fixed_size: 24,
+            variable_fields: 0,
+            alignment: 8,
+        },
+        read_mode: 0,
+        accumulate_cap: None,
+    }];
+    let context = ContextHandle {
+        value: register_context(
+            HostContext::new(native, specs, env, 4)
+                .unwrap()
+                .with_raw_publisher_budget(1)
+                .unwrap(),
+        )
+        .unwrap(),
+    };
+    // SAFETY (U05): real immutable host table and registered context outlive both threads and all loans.
+    let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+    let info = DylibNodeEntry::parse_info_json_labeled(&format!(
+        r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":{},"max_slice_len_default":64}}],"policy":{{"period_ms":1}}}}"#,
+        Vector3::SCHEMA_HASH), "clock concurrent").unwrap();
+    let plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+    let factory = plugin.raw_ingress().unwrap();
+    let mut raw_publisher = factory
+        .create_publisher(
+            "abi/clock/helper",
+            Vector3::SCHEMA_HASH,
+            MaxSliceLen::try_new(64).unwrap(),
+            FullQueueSend::Discard,
+        )
+        .unwrap();
+    let scripted = factory.clock_arc();
+    let barrier = Arc::new(Barrier::new(2));
+    let helper_barrier = barrier.clone();
+    let helper = std::thread::spawn(move || {
+        helper_barrier.wait();
+        for sequence in 0..100 {
+            let timestamp = scripted.now_ns();
+            assert_eq!(timestamp, 777);
+            let mut frame = [0u8; 64];
+            let mut header = WireHeader::new(Vector3::SCHEMA_HASH, sequence, timestamp);
+            header.total_size = 64;
+            header.write_to_buf(&mut frame);
+            frame[40..48].copy_from_slice(&7.0f64.to_le_bytes());
+            frame[48..56].copy_from_slice(&(-2.25f64).to_le_bytes());
+            frame[56..64].copy_from_slice(&0.5f64.to_le_bytes());
+            assert_eq!(raw_publisher.publish_raw(&frame).unwrap(), 1);
+            let view = raw_receiver
+                .view_raw_expecting(Vector3::SCHEMA_HASH)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&view[..], &frame);
+            assert_eq!(view.header().timestamp_ns, 777);
+        }
+    });
+    let registry = NodeRegistry::default();
+    let handle = registry.insert(plugin).unwrap();
+    with_context(context.value, |host| host.begin_fire()).unwrap();
+    registry
+        .call(handle, |node| {
+            barrier.wait();
+            for sequence in 0..100 {
+                let mut loan = node
+                    .publisher_mut("out")
+                    .unwrap()
+                    .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+                    .unwrap();
+                let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
+                header.total_size = 64;
+                header.write_to_buf(loan.bytes_mut());
+                loan.bytes_mut()[40..64].copy_from_slice(&[
+                    0, 0, 0, 0, 0, 0, 28, 64, 0, 0, 0, 0, 0, 0, 2, 192, 0, 0, 0, 0, 0, 0, 224, 63,
+                ]);
+                loan.commit().unwrap();
+                let view = tick_receiver
+                    .view_raw_expecting(Vector3::SCHEMA_HASH)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(view.header().sequence, sequence);
+                assert_eq!(view.header().timestamp_ns, 777);
+                assert_eq!(&view[40..48], &7.0f64.to_le_bytes());
+                assert_eq!(&view[48..56], &(-2.25f64).to_le_bytes());
+                assert_eq!(&view[56..64], &0.5f64.to_le_bytes());
+            }
+            // Keep the node's execution gate held for every helper callback.
+            helper.join().unwrap();
+            Ok(())
+        })
+        .unwrap();
+    assert!(!client.has_failure());
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+        0
+    );
+    registry.destroy(handle).unwrap();
+    drop(factory);
     drop(client);
     remove_context(context.value).unwrap();
 }

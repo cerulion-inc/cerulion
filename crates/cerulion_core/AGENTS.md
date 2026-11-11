@@ -38,6 +38,9 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
   Bootstrap/metadata/refusal fixture: `node_plugin_exports_test` (build
   `test_node_macro_cdylib` first; no transport is created).
   `node_plugin_raw_test` exercises both raw SDK backends with actual SHM delivery;
+  it also pins helper clock/raw delivery during an active node execution gate.
+  Node diagnostics replace one pending token per instance; create failures
+  replace one library token. New failures invalidate old tokens.
   run it alone with `--test-threads=1`.
 - Stable node/host tests: `core-transport.md`; readers/writers drop before release.
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
