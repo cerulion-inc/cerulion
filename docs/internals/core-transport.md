@@ -5,6 +5,38 @@ anything under `src/transport/`, `src/wire.rs`, `src/wake.rs`, or the network/ga
 code. Companion: `core-scheduler-graph.md` (execution side), `core-testing.md` (full test
 map). Code on `main` beats this document; when they disagree, fix the document.
 
+## Host-owned node leases
+
+`transport/plugin_lease.rs` provisions fixed lease rows before execution. Tokens
+use process-wide lease generations that wrap and skip zero; context identities
+remain nonwrapping. Each active row checks its generation, owner and direction
+before a token can change a port or consume a frame. A row is claimed before
+loan or receive, so budget refusal has no transport effect. Native sample owners
+stay in the host and are returned exactly once.
+
+`graph/node_host_abi.rs` validates cached schema layout facts before lending the
+native mapping address. Accepted publish and receive calls borrow wire bytes in
+place. Adaptive variable outputs may explicitly submit a node-owned spill payload
+for a synchronous host copy. Submission retains the original loan on every result
+until the writer is destroyed and `SPILL_RELEASE` returns its storage. A normal
+finish consumes its admitted lease; malformed frames never publish or consume a sequence.
+After any spill submission, only `SPILL_RELEASE` may terminate the lease. Malformed
+submissions and releases without an attempt count one invariant failure; teardown
+reclaims each leaked owner once. `INVALID_STATE` admission refusal preserves leases.
+Read leases exclude snapshot, head mutation and restore of their port. Native
+replay suppression returns output storage before writer validation or discard
+accounting, preserving the existing sequence and replay-discard signal behavior.
+
+Raw accumulation uses `AccumulatorSet`'s existing gather, order, loss, event and
+state machinery. A fire offers one repeatable batch; indexed immutable frame
+leases retain it until release. Per-port capture omits the outer input count and
+restore preflights the entire canonical record before applying native restore.
+Unwired declarations still bind: plain reads are empty, accumulation reports zero
+frames, and an output loan refuses with its declaration name. Unbound output
+bindings carry zero capacity; no native port or lease is created for them.
+`node_host_abi_test` asserts downstream wire bytes, discard/sequence behavior,
+spill lifetime, repeat views, state refusal and allocation-detector controls.
+
 ## Transport model
 
 - ONE LONG-LIVED iceoryx2 node per process, owned by the `TransportManager`
@@ -191,6 +223,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `info!` only when something was suppressed (`OutputDiscardLatch`). The unconditional
   `total_discards` / `CerulionPublisher::output_discard_count()` counter never resets on
   recovery and is readable off-thread via `NodeHandle::output_discard_count(output)`.
+  Native and stable nodes share the exact `OutputProxy` log messages and that same
+  per-output latch: missing variable writes and nested flush failures retain their
+  distinct messages, including schema, nested error detail and suppressed count.
+  Stable nested detail is copied from an output-port diagnostic before its terminal
+  discard; staging emits no log and changes no discard counter. The terminal logs
+  once and clears its own detail. Admission refusals retain both lease and detail.
+  A complete normal or adaptive-spill publish reports the native recovery line.
 
 ## Provisioning
 
@@ -648,3 +687,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 | `failure_regime_latch_test.rs` | shared latch decisions, decade ladder, frame-drop reporting layer |
 | `network_ingress_test.rs` / `network_ingress_e2e_test.rs` | byte-identical re-inject; loop exclusion; cross-session hop |
 | `iceoryx2_version_lockstep_test.rs` | exact-pin + single-version workspace resolution |
+
+### Raw node ingress services
+
+Host contexts provision 128 raw publisher rows at construction. The host can set a different fixed budget with `with_raw_publisher_budget` before registration. Raw rows are never reused during the context lifetime; destroy drops the native publisher after its leases return and retains topic storage until context teardown. Each raw publisher provisions its own fixed sample arena, with disjoint token indices and the context's configured ordinary lease budget. Exhausted raw or sample budgets return FAILED before transport effects. Raw creation uses the context-carried transport manager, never a second session.
+
+Raw and injected-clock callbacks are callable from any thread, independently of the node-call gate. Raw operations synchronize on a short per-publisher mutex; clock reads use the same injected Clock object directly. Retained ordinary or raw leases do not prevent a fire. Each retains its mapping, row and port exclusion until its own release; loan budgets and all other admission guards remain active. Runtime drain, refill and sync helpers exclude only their named borrowed input; publisher history and immutable stamp reads do not mutate input mappings. Unscoped mutable native access conservatively excludes all borrowed inputs. Ordinary port, state and sync callbacks require the admitted node-call thread; outside or concurrent calls return INVALID_STATE, count a violation, and preserve all borrowed leases. BUSY means only destruction while leases remain outstanding. The host serializes NodeApi, StateApi and ExternalApi entries on each node handle.
+
+`create_raw_publisher` accepts native ConfigDefault (0) and Discard (1); reserved Block (2) and unknown tags are refused. `loan_output` on a raw handle takes the schema hash, fixed size/count zero, frame alignment, and exact complete frame size as minimum capacity. Its slot has a 40-byte initialized header prefix; the caller initializes the complete frame. `finish_raw_output` consumes the lease, validates header/schema/length and offset bounds, preserves original wire stamps, and returns actual recipient count. Every writable recipient output is zero on refusal. Raw sends share native raw publish trace, promise and structural notify effects. `register_raw_egress` uses the existing dynamic registration channel; a refusal preserves the local publisher.
+
+Host lease tests: `cargo test -p cerulion_core --test node_host_abi_test -- --test-threads=1`, parallel-safe on isolated SHM roots, without fixture prerequisites. Pure host filters are `graph::node_host_abi::tests` and `transport::plugin_lease::tests`; adapter oracles use `graph::node_plugin_abi`. The loader brackets each foreign entry with `begin_node_call()` and `end_node_call()`, calls `begin_fire()` once before tick, releases the context mutex across foreign execution, and returns all helper/accessor borrows before removing a context. Raw accumulator hooks share the typed gather/drop/event/state path.

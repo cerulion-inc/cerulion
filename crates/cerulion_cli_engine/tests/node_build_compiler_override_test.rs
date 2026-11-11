@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Hand-written subprocess oracles prove that a PATH compiler warning never
-//! prevents Cargo from running with its inherited RUSTC override. No toolchains
+//! Hand-written subprocess oracles prove that compiler provenance never
+//! overrides Cargo's inherited RUSTC selection. No toolchains
 //! are compiled or installed; this tests command selection and error propagation.
 
 #![cfg(unix)]

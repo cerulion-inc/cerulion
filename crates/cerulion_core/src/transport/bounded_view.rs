@@ -67,7 +67,6 @@ use crate::message::ShmMessage;
 use crate::wire::WireHeader;
 
 use super::input_view::{validate_wire_frame, InputView};
-use super::shm_sample::SampleHandle;
 
 /// The marker that makes a [`BoundedFrame`] invariant in its lifetime and
 /// neither `Send` nor `Sync`.
@@ -193,15 +192,7 @@ impl<'brand> BoundedFrame<'brand> {
         &self,
         f: impl FnOnce(InputView<'_, T>) -> R,
     ) -> TransportResult<R> {
-        let (header, payload) = validate_wire_frame::<T>(self.topic, self.raw)?;
-        let reader = T::build_reader(&self.raw[payload]);
-        // The checks above parsed this frame's header; the view carries that copy,
-        // so a node body asking for it reads no bytes a second time.
-        let view = InputView::new(
-            SampleHandle::ScheduledBytes { bytes: self.raw },
-            reader,
-            header,
-        );
+        let view = InputView::from_borrowed(self.topic, self.raw)?;
         Ok(f(view))
     }
 }

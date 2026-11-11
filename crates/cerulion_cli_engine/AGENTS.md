@@ -1,7 +1,6 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
+CLI engine; the clap binary delegates here. Test without spawning processes.
 Every workspace-file writer (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
@@ -21,7 +20,8 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
-- `node build`'s rustc probe is advisory; only the cdylib fingerprint, checked at load, counts.
+- `node build` uses Cargo compiler selection/MSRV; load checks the frozen boundary,
+  never compiler provenance.
 - Android: cdylib lookup prefers `<target>/<triple>/<profile>`, then `<target>/<profile>`;
   `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
 - `node_metadata::parse_node_metadata` is the sole port/trigger source; only `INFO_END`

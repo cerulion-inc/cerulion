@@ -9796,15 +9796,11 @@ impl GraphRuntime {
         if !latest_unprobed.is_empty() {
             tracing::warn!(
                 inputs = %latest_unprobed.join(","),
-                "consume = latest inputs read through two subscribers, each on a node \
-                 that cannot tell whether its read will find a frame. Each fires on \
-                 every arrival its trigger subscriber counts, including a frame an \
-                 earlier read already took, and that fire reads nothing. A node built \
-                 with `#[cerulion_node]` answers; a raw-FFI node library answers by \
-                 exporting `cerulion_node_probes_trigger_input` returning a positive \
-                 value beside `cerulion_node_sync_head_op`, whose op code 0 then \
-                 answers for the input; a hand-written entry answers by implementing \
-                 `NodeEntry::probes_trigger_input` and `probe_trigger_input`."
+                "consume = latest inputs on a hand-written NodeEntry lack the body probe. \
+                 Each fires on every counted arrival, including a frame an earlier read \
+                 already took, and that fire reads nothing. Implement \
+                 NodeEntry::probes_trigger_input and probe_trigger_input. \
+                 The host probes every stable node library through its own head operations."
             );
         }
         if !refill_incapable.is_empty() {
@@ -19893,25 +19889,9 @@ fn node_fire_burst_bound(policy: Option<&super::node::MacroPolicy>) -> FireBurst
 /// So the second half is the ENTRY CAPABILITY, and it is the SAME gate that
 /// decides the borrow-3 provisioning: `NodeEntry::holds_input_snapshot`
 /// — "does `snapshot_inputs` actually freeze and HOLD?" — true for in-process
-/// macro nodes and for symbol-exporting macro cdylibs, false for closures and
-/// raw-FFI. Reusing that gate rather than inventing a predicate is deliberate:
-/// the borrow floor and the staging capacity are two consequences of one fact,
-/// and they must not be able to disagree.
-///
-/// # Residual: a cdylib whose FFI `set_snapshot_inputs` FAILED
-///
-/// `holds_input_snapshot` reports the DECLARED capability, so a macro cdylib
-/// that exports the symbols is sized as frozen even if the one-time
-/// `cerulion_node_set_snapshot_inputs` call later FAILS
-/// (`SnapshotState::Failed` — the node then runs unheld for the rest of the
-/// run). That is deliberate. Such a node is already a loud fault: the failure
-/// logs at `error!`, the terminal state exists precisely so a poisoned `set`
-/// can never masquerade as a healthy snapshot, and the node's reads already
-/// diverge from any recording. The read log then truncating LOUDLY (overflow
-/// marker + `dropped` + warn) is the SECOND signal of that same fault, not a
-/// healthy-edge regression. Sizing for the failure instead would return every
-/// macro-cdylib `Period` input to the ceiling — the 80x over-allocation this
-/// chunk exists to delete — to buy nothing on a run that is already broken.
+/// macro nodes and stable node libraries, false for closures. Reusing that
+/// gate keeps the borrow floor and staging capacity consistent: both follow
+/// whether the input holds its frozen sample across steps.
 ///
 /// A [`crate::read_outcome::ReadStageRole::Drain`] stage is never frozen: it
 /// exists only for a TRIGGER input, which is by construction not in the

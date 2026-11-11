@@ -115,7 +115,7 @@ cargo ndk -t arm64-v8a --platform 30 build -p cerulion_cli -p cerulion_netd
 ```
 
 Use `-t x86_64` for an x86_64 device. Build node cdylibs from their workspace
-on the same host, with the same Rust compiler used for the CLI:
+on that host with Rust 1.95 or newer:
 
 ```sh
 cd path/to/node-workspace
@@ -134,21 +134,17 @@ into `target/<profile>`.
 
 Workspaces created by `cerulion workspace create` or `cerulion workspace init`
 already carry the complete iceoryx2 family `[patch.crates-io]` block. A
-workspace written by hand must add the complete block from Cerulion's root
-`Cargo.toml`, with every entry pinned to the same fork revision. Without it,
-the node cdylib can link an iceoryx2 build whose Android shared-memory calls
-return `ENOSYS`. Node initialization refuses that library with:
+hand-written node workspace must carry the same complete fork patch block from
+the root `Cargo.toml`, as must the CLI build. The host owns the shared-memory
+transport, but each macro node also probes its own linked iceoryx2 copy during
+create. Without Android shared-memory support, create refuses the node:
 
 ```text
-node library <name>: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
+Node '<Type>' error: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
 ```
-The check runs in two places: the host-side loader probes the host's
-iceoryx2, and it then calls the library's own `cerulion_node_platform_check`
-export, because a cdylib statically links its own copy of iceoryx2 and the
-host's probe proves nothing about it. `#[cerulion_node]` and the generated
-`--raw-ffi` template both emit that export. On Android a library without it is
-refused at load, so a hand-written raw-FFI library must export it too (copy it
-from the template).
+
+Nodes call the host through opaque handles and borrowed slots. Their Rust
+compiler may differ from the CLI's; both builds still need Android support.
 
 For an adb shell session, provide writable home and temporary directories:
 

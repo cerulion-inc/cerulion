@@ -348,6 +348,7 @@ to the same default namespace would change under them",
 /// no lane can run is a real state and hiding it would defeat the inventory;
 /// what must not happen is that state arriving SILENTLY.
 const IGNORE_CLASSES: &[(&str, &str)] = &[
+    ("compiler-skew", "every CI pass: stable-node compiler compatibility builds the real node with a different rustc and asserts downstream oracle bytes"),
     (
         "child",
         "every CI pass — a parent test in the same file re-execs the binary and reads this child's exit code",
@@ -416,6 +417,7 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 /// an arm added without an entry fails, and an entry naming an arm that no
 /// longer exists fails.
 const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
+    ("stable_node_abi_cross_compiler_test.rs", "different_compiler_delivers_oracle_frames_in_two_identical_runs", "compiler-skew", "tools/scripts/check_stable_node_compiler_skew.sh, Stable node compiler compatibility CI job"),
     (
         "barrier_level_gate_subprocess_iox2_test.rs",
         "box_two_process_split_merges_to_oracle",

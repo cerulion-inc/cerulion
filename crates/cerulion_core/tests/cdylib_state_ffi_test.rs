@@ -56,7 +56,7 @@
 //!
 //! ```bash
 //! cargo build -p test_node_macro_state_cdylib -p test_node_cdylib \
-//!             -p test_node_state_liar_cdylib
+//!             -p test_node_state_liar_cdylib -p test_node_macro_accumulate_cdylib
 //! cargo test -p cerulion_core --test cdylib_state_ffi_test -- --test-threads=1
 //! ```
 
@@ -66,7 +66,7 @@ use std::time::Duration;
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::{
-    ClosureNodeEntry, DylibNodeEntry, MacroPolicy, NodeEntry, NodeInfo,
+    ClosureNodeEntry, DylibNodeEntry, MacroPolicy, NodeEntry, NodeInfo, ShutdownSignal,
 };
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
@@ -481,15 +481,10 @@ fn a_trailing_byte_in_the_payload_refuses_rather_than_decoding_a_prefix() {
         .expect("probe")
         .restore_state(&blob)
         .expect_err("a trailing byte is a drift signal, not padding");
-    let text = err.to_string();
-    assert!(
-        text.contains("trailing") || text.contains("Trailing"),
-        "names the condition: {text}"
-    );
-    assert!(
-        text.contains("PARTIALLY restored"),
-        "says the run must fail rather than continue: {text}"
-    );
+    let TransportError::GraphError { reason } = err else {
+        panic!("restore must keep the native state error class")
+    };
+    assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: state blob has 1 trailing byte(s) after decode. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", state_cdylib().display()));
 }
 
 #[test]
@@ -933,18 +928,12 @@ fn a_capture_the_host_sink_refused_is_refused_even_though_the_cdylib_reported_su
         "blames the exporter, not the buffer: {text}"
     );
     assert!(
-        text.contains("-6"),
+        text.contains("BUFFER_TOO_SMALL (8)"),
         "names the code the exporter owed us: {text}"
     );
-    // (c2) And whatever the cdylib left in its FFI error slot is SURFACED, not
-    //      thrown away: it is the only thing the exporter had to say about a
-    //      capture it got wrong. (Draining it is also what stops it resurfacing
-    //      against a later, unrelated failure — the slot is process-global for
-    //      the life of the loaded library.)
-    assert!(
-        text.contains("ignored 2 sink rejection(s) and reported success"),
-        "surfaces the cdylib's own message: {text}"
-    );
+    // Stable success has no diagnostic token. The host's independent sink
+    // observation supplies the complete refusal even when the node lies.
+    assert!(!text.contains("ignored 2 sink rejection(s)"));
 
     // (d) And the host's own sink is latched, so nothing downstream can read
     //     its prefix back as accepted bytes.
@@ -1366,7 +1355,7 @@ fn a_refused_shape_export_leaves_nothing_behind_to_explain_the_next_failure() {
         "the tick failure must NOT be explained by the load-time shape refusal: {text}"
     );
     assert!(
-        text.contains("cerulion_node_tick returned 9") && text.contains("no detail provided"),
+        text.contains("node tick failed with status 2"),
         "it reports its own condition and admits it has no detail: {text}"
     );
 }
@@ -1404,7 +1393,7 @@ fn a_healthy_shape_export_logs_no_refusal_and_leaves_the_error_slot_alone() {
         .expect_err("the tick was told to fail")
         .to_string();
     assert!(
-        text.contains("cerulion_node_tick returned 9"),
+        text.contains("node tick failed with status 2"),
         "reports its own condition: {text}"
     );
 }
@@ -1428,13 +1417,34 @@ fn panic_cdylib() -> std::path::PathBuf {
 fn two_panic_nodes() -> (DylibNodeEntry, DylibNodeEntry) {
     let mut a = DylibNodeEntry::load(&panic_cdylib()).expect("the panic cdylib loads");
     let mut b = DylibNodeEntry::load(&panic_cdylib()).expect("the panic cdylib loads twice");
-    for entry in [&mut a, &mut b] {
-        entry
-            .init(cerulion_core::graph::node::NodeContext::for_tests(
-                IndexMap::new(),
-                IndexMap::new(),
-            ))
-            .expect("the panic fixture inits");
+    let clock = Arc::new(VirtualClock::new());
+    let manager = cerulion_core::transport::TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: "state_panic_context".into(),
+            clock,
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("isolated transport");
+    for (index, entry) in [&mut a, &mut b].into_iter().enumerate() {
+        let mut outputs = IndexMap::new();
+        outputs.insert(
+            "out".into(),
+            cerulion_core::AnyPublisher::Ipc(
+                manager
+                    .create_publisher(
+                        &format!("/state_panic/{index}"),
+                        cerulion_core::wire::MaxSliceLen::const_new(4096),
+                        0,
+                    )
+                    .expect("declared publisher"),
+            ),
+        );
+        let mut context = NodeContext::for_tests(outputs, IndexMap::new());
+        context.set_transport(manager.clone());
+        entry.init(context).expect("the panic fixture inits");
     }
     (a, b)
 }
@@ -1461,6 +1471,10 @@ fn a_panicking_state_encoder_fails_its_own_capture_without_poisoning_the_cdylibs
             sink.is_empty(),
             "and nothing was captured — a partial encoding is not an anchor"
         );
+        assert!(
+            !matches!(err, cerulion_core::TransportError::NodeTickPanicked { .. }),
+            "state capture did not execute a tick"
+        );
         err.to_string()
     };
 
@@ -1481,6 +1495,10 @@ fn a_panicking_state_encoder_fails_its_own_capture_without_poisoning_the_cdylibs
     assert!(
         refusal.contains("encoder panicked"),
         "names what happened, not merely that something did: {refusal}"
+    );
+    assert!(
+        refusal.contains("(code -4)"),
+        "preserves the native encoder panic code: {refusal}"
     );
 
     // And the node that panicked is not itself dead: it captures again as soon
@@ -1504,9 +1522,17 @@ fn a_panicking_state_decoder_fails_its_own_restore_without_poisoning_the_cdylibs
 
     let refusal = {
         let _panic = EnvGuard::set("STATE_PANIC_MODE", "restore");
-        a.restore_state(&payload)
-            .expect_err("a panicking decoder cannot report success")
-            .to_string()
+        let error = a
+            .restore_state(&payload)
+            .expect_err("a panicking decoder cannot report success");
+        assert!(
+            !matches!(
+                error,
+                cerulion_core::TransportError::NodeTickPanicked { .. }
+            ),
+            "state restore did not execute a tick"
+        );
+        error.to_string()
     };
 
     // The same no-poison pin on the restore half, and again BEFORE the wording: the
@@ -1517,6 +1543,10 @@ fn a_panicking_state_decoder_fails_its_own_restore_without_poisoning_the_cdylibs
     assert!(
         refusal.contains("decoder panicked"),
         "names what happened, not merely that something did: {refusal}"
+    );
+    assert!(
+        refusal.contains("(code -4)"),
+        "preserves the native decoder panic code: {refusal}"
     );
     assert!(
         refusal.contains("PARTIALLY restored"),
@@ -1710,4 +1740,199 @@ fn a_symbol_less_cdylib_forks_and_is_believed_quiescent() {
         "the raw-FFI fixture declares no state either — if it did, this is the \
          wrong library"
     );
+}
+
+#[test]
+#[serial]
+fn complete_and_empty_diagnostics_survive_the_loader_without_truncation_or_replacement() {
+    use cerulion_core::TransportError;
+    let mut entry = init_liar();
+    for (mode, expected) in [
+        (
+            "fail_long",
+            format!("full reason:{}:end", "x".repeat(1024 * 1024 + 17)),
+        ),
+        ("fail_empty", String::new()),
+    ] {
+        let _mode = EnvGuard::set("STATE_TICK_MODE", mode);
+        let TransportError::NodeError { reason, .. } = entry
+            .tick()
+            .expect_err("fixture supplies an exact failure reason")
+        else {
+            panic!("untyped error kind must remain untyped");
+        };
+        assert_eq!(
+            reason, expected,
+            "complete and empty node-owned reasons must be copied exactly"
+        );
+    }
+    let _mode = EnvGuard::set("STATE_TICK_MODE", "fail_silent");
+    let text = entry
+        .tick()
+        .expect_err("new failure has no diagnostic")
+        .to_string();
+    assert!(text.contains("node tick failed with status 2"));
+    assert!(!text.contains("full reason:"));
+}
+
+#[test]
+#[serial]
+fn a_param_change_capture_preserves_the_full_native_reason_after_delivery() {
+    // SAFETY (U01/U03): trusted same-compiler fixture and exact control symbol;
+    // the library remains live through the callback, reset guard and graph.
+    let (_library, toggle) = unsafe {
+        let library = libloading::Library::new(state_cdylib()).unwrap();
+        let toggle = *library
+            .get::<extern "C" fn(u32)>(b"cerulion_test_set_param_mutation\0")
+            .unwrap();
+        (library, toggle)
+    };
+    struct Reset(extern "C" fn(u32));
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            (self.0)(0);
+        }
+    }
+    let (mut runtime, probe, seen) = built_probe("param_text");
+    let _reset = Reset(toggle);
+    toggle(1);
+    runtime.step(Duration::from_millis(10));
+    toggle(0);
+    // The periodic sink receives the previous tick's published frame.
+    runtime.step(Duration::from_millis(10));
+    assert_eq!(*seen.lock().unwrap(), vec![(0, 0, 0, 7)]);
+    let error = probe
+        .lock()
+        .unwrap()
+        .capture_state(&mut VecSink::new())
+        .unwrap_err();
+    let TransportError::GraphError { reason } = error else {
+        panic!("capture must keep the native state error class")
+    };
+    assert_eq!(reason, format!("node '{}' state capture failed (code -5): the cdylib could not encode this node's state \u{2014} cerulion_node_capture_state: param 'gain' changed after the graph set it. A param is fixed for the run and an anchor does not carry it, so a resume would run on the graph's value. Fix: keep a value the node changes in a field that is not a #[param]", state_cdylib().display()));
+}
+
+#[test]
+#[serial]
+fn an_accumulate_count_mismatch_preserves_the_full_native_reason_and_state() {
+    let path = find_cdylib("test_node_macro_accumulate_cdylib");
+    let mut entry = DylibNodeEntry::load(&path).unwrap();
+    entry
+        .init(NodeContext::with_runtime_env(
+            IndexMap::new(),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::new(std::collections::HashMap::new()),
+        ))
+        .unwrap();
+    let error = entry.restore_state(&[0, 0, 0, 0]).unwrap_err();
+    let TransportError::GraphError { reason } = error else {
+        panic!("restore must keep the native state error class")
+    };
+    assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: accumulate input `tf` cannot be restored: the recording holds 0 accumulate input(s), the node declares 1. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+    let mut sink = VecSink::new();
+    entry.capture_state(&mut sink).unwrap();
+    assert_eq!(
+        sink.into_inner(),
+        [
+            1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0
+        ]
+    );
+    entry.shutdown().unwrap();
+}
+
+fn accumulate_state_entry() -> (std::path::PathBuf, DylibNodeEntry) {
+    let path = find_cdylib("test_node_macro_accumulate_cdylib");
+    let mut entry = DylibNodeEntry::load(&path).unwrap();
+    entry
+        .init(NodeContext::with_runtime_env(
+            IndexMap::new(),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::new(std::collections::HashMap::new()),
+        ))
+        .unwrap();
+    (path, entry)
+}
+
+fn one_held_vector_record(schema_hash: u64, total_size: u32, frame_len: usize) -> Vec<u8> {
+    // Hand-written canonical set/name/counters/count, followed by a wire
+    // Vector3 header and its three zero-valued float64 fields.
+    let mut record = vec![1, 0, 0, 0, 2, 0, 0, 0, b't', b'f'];
+    record.extend_from_slice(&[0; 16]);
+    record.extend_from_slice(&[1, 0, 0, 0]);
+    record.extend_from_slice(&(frame_len as u32).to_le_bytes());
+    let mut frame = vec![0; frame_len];
+    frame[..8].copy_from_slice(&schema_hash.to_le_bytes());
+    frame[8..12].copy_from_slice(&total_size.to_le_bytes());
+    record.extend_from_slice(&frame);
+    record
+}
+
+#[test]
+#[serial]
+fn held_accumulate_restore_refusals_preserve_full_native_reasons_and_state() {
+    let (path, mut entry) = accumulate_state_entry();
+    assert_eq!(
+        native_ros2_messages::geometry_msgs::Vector3::SCHEMA_HASH,
+        0xD43E_E559_2039_B9DF
+    );
+    let schema_reason = "Schema mismatch on topic 'tf': expected hash 0xD43EE5592039B9DF, got 0x0000000000000123. Check that publisher and subscriber use the same schema; if you recently changed a schema, rebuild BOTH sides (`cerulion node build <type>`).";
+    for (hash, size, len, detail) in [
+        (0x123, 64, 64, schema_reason),
+        (0x123, 65, 64, schema_reason),
+        (0xD43E_E559_2039_B9DF, 65, 64, "Deserialization error on topic 'tf': wire header total_size 65 out of bounds (frame 64 bytes, header 40 bytes)"),
+        (0xD43E_E559_2039_B9DF, 40, 40, "Deserialization error on topic 'tf': wire header total_size 40 leaves no room for the schema: a 24 byte fixed section plus 0 offset table entry/entries needs 64"),
+        (0xD43E_E559_2039_B9DF, 64, 72, "Deserialization error on topic 'tf': accumulate frame of 72 bytes has no valid wire header"),
+    ] {
+        let error = entry.restore_state(&one_held_vector_record(hash, size, len)).unwrap_err();
+        let TransportError::GraphError { reason } = error else { panic!("restore must keep native state error class") };
+        assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: accumulate input `tf` cannot be restored: a held frame is refused: {detail}. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+        let mut captured = VecSink::new();
+        entry.capture_state(&mut captured).unwrap();
+        assert_eq!(captured.into_inner(), [1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    let healthy = one_held_vector_record(0xD43E_E559_2039_B9DF, 64, 64);
+    entry.restore_state(&healthy).unwrap();
+    let mut captured = VecSink::new();
+    entry.capture_state(&mut captured).unwrap();
+    assert_eq!(captured.into_inner(), healthy);
+    entry.shutdown().unwrap();
+}
+
+#[test]
+#[serial]
+fn truncated_accumulate_drop_counters_keep_native_eight_byte_reads() {
+    let (path, mut entry) = accumulate_state_entry();
+    for record in [
+        vec![1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0],
+        vec![
+            1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    ] {
+        let error = entry.restore_state(&record).unwrap_err();
+        let TransportError::GraphError { reason } = error else {
+            panic!("restore must keep native state error class")
+        };
+        assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: state blob truncated: needed 8 more byte(s), 7 remain. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+    }
+    entry.shutdown().unwrap();
+}
+
+#[test]
+#[serial]
+fn pending_accumulate_drops_above_lifetime_drops_keep_native_acceptance() {
+    let (_, mut entry) = accumulate_state_entry();
+    let record = [
+        1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ];
+    entry.restore_state(&record).unwrap();
+    let mut captured = VecSink::new();
+    entry.capture_state(&mut captured).unwrap();
+    assert_eq!(captured.into_inner(), record);
+    entry.shutdown().unwrap();
 }

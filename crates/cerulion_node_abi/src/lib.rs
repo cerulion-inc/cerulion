@@ -6,15 +6,24 @@
 
 mod checker;
 mod host;
+#[cfg(feature = "loader")]
+mod loader;
 mod node;
 mod types;
+mod validation;
 
 pub use checker::*;
 pub use host::*;
+/// Native loader dependency matched to the maintained Stabby integration.
+#[cfg(feature = "loader")]
+pub use libloading;
+#[cfg(feature = "loader")]
+pub use loader::*;
 pub use node::*;
 /// The maintained layout checker, available through the runtime re-export.
 pub use stabby;
 pub use types::*;
+pub use validation::*;
 
 /// Boundary major supported by these permanently frozen records.
 pub const BOUNDARY_MAJOR: u32 = 1;
@@ -28,6 +37,8 @@ pub type BootstrapFn = extern "C" fn() -> *const NodeApiV1;
 /// protocol, and its complete report ID is checked before exposing the function.
 /// The constructor returns immutable library-lifetime storage and may allocate
 /// only during its first, cold invocation. Constructor panics return null.
+/// Host checks _stabbied_v3 discovery before invoking the raw bootstrap; the
+/// constructor executes before its returned table header can be inspected.
 #[macro_export]
 macro_rules! export_node_api {
     ($constructor:path) => {
