@@ -157,8 +157,9 @@ wording depends on how the CLI was installed (see **Dependency selection** below
 
 > **Note:** One-shot CLI commands print only their output by default; operational
 > `INFO` log lines are suppressed. Pass `-v` (or set `RUST_LOG=info`) to see the
-> structured `tracing` breadcrumbs, e.g. `INFO workspace created ...`. Long-running
-> commands like `cerulion graph run` keep their `INFO` lifecycle lines by default.
+> structured `tracing` breadcrumbs, e.g. `INFO workspace created ...`.
+> `cerulion graph run` and `bag play` print their result, any warning and your
+> nodes' own log lines by default; `RUST_LOG=info` shows their lifecycle lines.
 
 **What was generated:**
 
@@ -826,22 +827,18 @@ the graph does not start.
 
 **Expected output:** the supervisor spawns one worker process
 per group, waits for each worker's READY, starts the recorder, then releases them
-together. Representative lines (timestamps, pids and paths vary; long lines are
-cut at `...`):
+together, and says so in one line. Representative lines (the ranges vary):
 
 ```
-INFO graph validation complete graph=obstacle_avoidance
-INFO spawned worker process group=grp_lidar_sensor pid=... nodes=1
-INFO worker READY observed group=grp_lidar_sensor ready=...
-INFO spawned worker process group=grp_safety_controller pid=... nodes=1
-INFO worker READY observed group=grp_safety_controller ready=...
-INFO spawned worker process group=grp_drive_base pid=... nodes=1
-INFO worker READY observed group=grp_drive_base ready=...
-INFO spawned bagd recorder graph=obstacle_avoidance pid=... bag=recordings/obstacle_avoidance_<timestamp>.mcap
-INFO all workers spawned + READY ...
+WARN network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only. graph=obstacle_avoidance
+graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es); press Ctrl+C to stop
 INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2
 ```
+
+Each step of the bring-up (worker spawned, worker READY, recorder started) is
+logged at `info`, which `graph run` does not print by default; run it with
+`RUST_LOG=info` to see them.
 
 The graph is now running as three free-running worker processes. The `lidar_sensor`
 publishes at 10 Hz, the `safety_controller` reacts to each reading (the
@@ -850,16 +847,12 @@ simulated obstacle comes within half a meter), and the `drive_base` receives
 velocity commands, all through **zero-copy shared memory**, with a crash in any
 one group contained to its own process.
 
-> **Messages on this first run, and what they mean.**
-> - `WARN absolute source is inside this graph's own prefix namespace but matches
->   no declared output` (twice per consuming worker) suggests a misspelled
->   `source:`. Nothing is misspelled: in a multi-process run each worker sees only
->   its own part of the graph, so its upstream looks external to it.
-> - Networking uses paired access by default, with no open-access warning.
->   Unpaired LAN peers cannot read topics or publish into graph ingress through
->   the zenoh plane. The first networked run starts the shared `cerulion-netd`
->   daemon and says so. Explicit `CERULION_LAN_ACCESS=open` permits unpaired
->   LAN access and prints a warning; unset it to restore paired access.
+> **Networking on this first run.**
+> Networking uses paired access by default, with no open-access warning.
+> Unpaired LAN peers cannot read topics or publish into graph ingress through
+> the zenoh plane. The first networked run starts the shared `cerulion-netd`
+> daemon. Explicit `CERULION_LAN_ACCESS=open` permits unpaired
+> LAN access and prints a warning; unset it to restore paired access.
 
 Leave it running and open a second terminal.
 
@@ -1036,17 +1029,21 @@ and press **Ctrl+C**. The workers drain, the recorder finalizes the bag, and the
 run prints where it went:
 
 ```
-INFO live loop delivery telemetry node_id=lidar_sensor fires=387
-INFO live loop delivery telemetry node_id=safety_controller input=scan fires=387 drop_oldest=0
-INFO live loop delivery telemetry node_id=drive_base input=cmd_vel fires=387 drop_oldest=0
-...
 recording written to recordings/obstacle_avoidance_<timestamp>.mcap
 ```
 
-The telemetry lines are the run's own delivery account: how often each node
-fired, and how many queued frames its inputs lost. `drop_oldest=0` on both
-inputs means no frame was evicted from a full queue. To check what actually
-crossed, read the recorded frames of the topic itself.
+With `RUST_LOG=info` set, the run also prints its own delivery account before
+that line:
+
+```
+INFO live loop delivery telemetry node_id=lidar_sensor fires=387
+INFO live loop delivery telemetry node_id=safety_controller input=scan fires=387 drop_oldest=0
+INFO live loop delivery telemetry node_id=drive_base input=cmd_vel fires=387 drop_oldest=0
+```
+
+They say how often each node fired, and how many queued frames its inputs lost.
+`drop_oldest=0` on both inputs means no frame was evicted from a full queue. To
+check what actually crossed, read the recorded frames of the topic itself.
 
 The bag is a standard MCAP file that holds the frames, the graph, the environment
 and the scheduler's trace. `cerulion bag info` summarizes it:

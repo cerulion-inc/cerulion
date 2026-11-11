@@ -54,7 +54,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   co-tenant topics; the only bounds are `DISCOVERY_MAX_TAPS` + the env switch.
 - MULTI-PROCESS trace rings ride `!no_rings`, not `record` (single-process ones ride
   `--record`); either way read `run.json`/`trace_rings`, never infer one from the run shape.
-- Mid-run ring attach MUST use `open_at_live`; plain `open` refuses a lapped
-  ring. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
+- Mid-run attach MUST use `open_at_live` (`open` refuses a lapped ring); a from-start recorder
+  opens EVERY state ring with `open`. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
 Deep reference: docs/internals/recording.md - read before touching drain
 pacing, discovery/settle, coverage fields, or run binding.

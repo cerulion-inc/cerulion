@@ -1314,7 +1314,7 @@ at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
    - `command`: `derived_verb::<YourCmd>()`, the family's one verb. The family never
      sees the root command, so it cannot change a built-in verb, a root argument or the
      root's help text.
-   - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
+   - `log_class`: `OneShot` or `QuietRuntime` (quiet `warn` default) or `LongRunning` (`info`), per verb.
    - `network_refusal`: the refusal of an invocation that would reach a robot or a
      daemon over the network while the kill switch in the `SwitchEnv` is engaged, built
      from the engine's own refusal so the text and exit code match; `None` for a verb

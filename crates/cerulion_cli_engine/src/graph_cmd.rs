@@ -6917,6 +6917,7 @@ pub fn graph_run(
                 monitor_wait_active: false,
             }));
             tracing::info!(graph = %graph_name, time_source = ?time_source, "graph running (deterministic VirtualClock) — press Ctrl+C to stop");
+            announce_running(&running_line(graph_name, RunStatus::OneProcess));
             while running.load(Ordering::Relaxed) {
                 if runtime.shutdown_requested() {
                     tracing::info!(graph = %graph_name, "node requested graph shutdown");
@@ -7286,6 +7287,7 @@ pub fn graph_run(
                 ),
             );
             tracing::info!(graph = %graph_name, time_source = ?time_source, "starting graph (live) — press Ctrl+C to stop");
+            announce_running(&running_line(graph_name, RunStatus::OneProcessStarting));
             // `run_live` REFUSES the live run (returns
             // Err) if ANY external node is provably inert at launch — the full
             // `InertReason` class (host-driven / no-source / invalid-or-duplicate
@@ -12600,10 +12602,7 @@ fn graph_run_supervisor(
                 })?,
             })?;
         } else {
-            tracing::info!(
-                graph = %config.identity(),
-                "Ctrl-C during spawn phase — recording not started (no data was recorded)"
-            );
+            warn_recording_not_started(config.identity(), RecordingNotStarted::DuringSpawn);
         }
     }
 
@@ -12655,6 +12654,13 @@ fn graph_run_supervisor(
             mode = "multi-process",
             "graph running - GO signaled; deployment live; press Ctrl+C to stop"
         );
+        announce_running(&running_line(
+            config.identity(),
+            RunStatus::Deployed {
+                nodes: embed_config.nodes.len(),
+                processes: guards.len(),
+            },
+        ));
     } else {
         tracing::info!(
             graph = %config.identity(),
@@ -18760,6 +18766,148 @@ struct FlashbackSpawnSpec<'a> {
     record_cpu: RecordCpu,
 }
 
+/// What `graph run` can truthfully say about its run when it prints its
+/// status line ([`running_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunStatus {
+    /// A multi-process deployment: every worker is READY and GO is signalled.
+    Deployed {
+        /// Nodes in the deployed graph.
+        nodes: usize,
+        /// Worker processes running them.
+        processes: usize,
+    },
+    /// A one-process run whose loop is stepping (`--time-source virtual`,
+    /// after its launch refusal check).
+    OneProcess,
+    /// A one-process LIVE run about to enter `run_live`, which can still
+    /// refuse it at launch (an inert external node), so the line says
+    /// "starting", never "running".
+    OneProcessStarting,
+}
+
+/// The line `graph run` prints on stderr when its graph starts: which graph,
+/// in how many processes when it is split, and how to stop it.
+///
+/// It is the run's own output, printed at every filter: `graph run` defaults to
+/// `warn`, which hides the `info` lifecycle line logged beside it, and a run
+/// that prints nothing between its start and Ctrl+C reads as a hang.
+fn running_line(graph: &str, status: RunStatus) -> String {
+    match status {
+        RunStatus::Deployed { nodes, processes } => format!(
+            "graph '{graph}' running: {nodes} node(s) in {processes} process(es); press Ctrl+C to \
+             stop"
+        ),
+        RunStatus::OneProcess => {
+            format!("graph '{graph}' running in one process; press Ctrl+C to stop")
+        }
+        RunStatus::OneProcessStarting => {
+            format!("graph '{graph}' starting in one process; press Ctrl+C to stop")
+        }
+    }
+}
+
+/// Print [`running_line`]'s line on stderr.
+// `print_stderr` exception: this is CLI output (the run's status line), the
+// stderr twin of `recording written to <path>`'s stdout line, and it must
+// print under the quiet default that filters the `info` line beside it.
+#[allow(clippy::print_stderr)]
+fn announce_running(line: &str) {
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod running_line_tests {
+    use super::{running_line, RunStatus};
+
+    /// Hand-written oracles for every status: the multi-process line names the
+    /// node and process counts, the one-process lines name neither, and a live
+    /// one-process run that can still refuse says it is starting.
+    #[test]
+    fn the_running_line_names_the_graph_its_processes_and_how_to_stop() {
+        assert_eq!(
+            running_line(
+                "obstacle_avoidance",
+                RunStatus::Deployed {
+                    nodes: 2,
+                    processes: 2
+                }
+            ),
+            "graph 'obstacle_avoidance' running: 2 node(s) in 2 process(es); press Ctrl+C to stop"
+        );
+        assert_eq!(
+            running_line("demo", RunStatus::OneProcess),
+            "graph 'demo' running in one process; press Ctrl+C to stop"
+        );
+        assert_eq!(
+            running_line("demo", RunStatus::OneProcessStarting),
+            "graph 'demo' starting in one process; press Ctrl+C to stop"
+        );
+    }
+}
+
+/// Where a `--record` run was when Ctrl+C stopped it before its recorder was
+/// armed ([`warn_recording_not_started`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingNotStarted {
+    /// The multi-process supervisor was still spawning its workers, so the
+    /// recorder was never spawned.
+    DuringSpawn,
+    /// The recorder was spawned and had not reported ready.
+    DuringRecorderStartup,
+}
+
+/// Say that a `--record` run wrote no bag because Ctrl+C arrived before its
+/// recorder was armed.
+///
+/// A `warn`: the run was asked to record and ends with no
+/// `recording written to <path>` line, and `graph run`'s quiet default hides
+/// `info`, so this is the line that says no bag exists.
+#[cfg(unix)]
+fn warn_recording_not_started(graph_name: &str, when: RecordingNotStarted) {
+    match when {
+        RecordingNotStarted::DuringSpawn => tracing::warn!(
+            graph = %graph_name,
+            "Ctrl-C during spawn phase: recording not started (no data was recorded)"
+        ),
+        RecordingNotStarted::DuringRecorderStartup => tracing::warn!(
+            graph = %graph_name,
+            "recording cancelled before start (Ctrl-C during recorder startup): no data \
+             was recorded"
+        ),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod recording_not_started_tests {
+    use super::{warn_recording_not_started, RecordingNotStarted};
+
+    /// Both cancel points say at `warn`, which `graph run`'s quiet default
+    /// prints, that no bag was written; an `info` twin would be hidden.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_recording_stopped_before_its_recorder_is_armed_warns_that_nothing_was_recorded() {
+        warn_recording_not_started("demo", RecordingNotStarted::DuringSpawn);
+        warn_recording_not_started("demo", RecordingNotStarted::DuringRecorderStartup);
+        logs_assert(|lines: &[&str]| {
+            let at =
+                |level: &str, marker: &str| cerulion_core::testing::count_at(lines, level, marker);
+            match (
+                at("WARN", "recording not started (no data was recorded)"),
+                at("WARN", "recording cancelled before start"),
+                at("INFO", "no data"),
+            ) {
+                (1, 1, 0) => Ok(()),
+                (spawn, startup, infos) => Err(format!(
+                    "expected one WARN per cancel point and no INFO twin, got {spawn} and \
+                     {startup} WARN, {infos} INFO"
+                )),
+            }
+        });
+    }
+}
+
 /// PURE — the argv an always-on recorder is spawned with.
 ///
 /// Split out and pinned for the same reason `bagd_argv` is: it is the whole
@@ -21887,11 +22035,7 @@ fn start_supervisor_recording(
             bagd.signal_term();
             let _ = wait_for_child_bounded(&mut bagd, RECORDING_FINALIZE_DEADLINE);
             bagd.kill_and_reap();
-            tracing::info!(
-                graph = %graph_name,
-                "recording cancelled before start (Ctrl-C during recorder startup) — no data \
-                 was recorded"
-            );
+            warn_recording_not_started(graph_name, RecordingNotStarted::DuringRecorderStartup);
             return Ok(None);
         }
     }
@@ -22221,15 +22365,14 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
             guard.signal_term();
             let _ = wait_for_child_bounded(&mut guard, RECORDING_FINALIZE_DEADLINE);
             guard.kill_and_reap();
-            tracing::info!(
-                graph = %graph_name,
-                "recording cancelled before start (Ctrl-C during recorder startup) — no data \
-                 was recorded"
-            );
+            warn_recording_not_started(graph_name, RecordingNotStarted::DuringRecorderStartup);
             return Ok(());
         }
     }
     tracing::info!(graph = %graph_name, "bagd ready — starting recorded graph run (press Ctrl+C to stop)");
+    // `run_live` below can still refuse the run at launch, as on the
+    // unrecorded live arm.
+    announce_running(&running_line(graph_name, RunStatus::OneProcessStarting));
 
     // ---- (8) C-state cap (mirrors the live arm) + the live wall-following loop.
     let env_lock = std::env::var(CPU_DMA_LOCK_ENV).ok();

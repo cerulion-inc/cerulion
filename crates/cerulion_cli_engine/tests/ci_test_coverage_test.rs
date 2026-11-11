@@ -2021,10 +2021,19 @@ fn shard_matrices(job: &str) -> Vec<Vec<String>> {
 /// test is where a reader learns that is intended.
 #[test]
 fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
+    let root = repo_root();
+    assert!(
+        workspace_member_dirs()
+            .iter()
+            .any(|dir| is_test_fixture(&root, dir)),
+        "is_test_fixture matched no workspace member, so an empty set below \
+         would prove nothing: the member paths are not below the repository \
+         root, or the fixtures left crates/test_fixtures/"
+    );
     let with_tests = packages_with_tests();
     let fixtures: BTreeSet<&String> = with_tests
         .iter()
-        .filter(|(_, dir)| dir.to_string_lossy().contains("test_fixtures/"))
+        .filter(|(_, dir)| is_test_fixture(&root, dir))
         .map(|(name, _)| name)
         .collect();
     assert!(
@@ -2032,6 +2041,62 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         "these test_fixtures crates now carry their own tests and so need a CI \
          step (or an exemption): {fixtures:?}"
     );
+}
+
+/// Whether the member directory `dir` is a test fixture crate: a component of
+/// its path BELOW the repository `root` is `test_fixtures`. The components of
+/// `root` never count, so a checkout beneath a directory named
+/// `test_fixtures` classifies the same members as any other. A path outside
+/// `root` is not a member of this repository.
+fn is_test_fixture(root: &Path, dir: &Path) -> bool {
+    dir.strip_prefix(root)
+        .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == "test_fixtures"))
+}
+
+#[test]
+fn a_test_fixture_member_is_judged_below_the_checkout_root() {
+    const VECTORS: &[(&str, &str, bool)] = &[
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/test_fixtures/f",
+            true,
+        ),
+        ("/work/cerulion", "/work/cerulion/crates/x", false),
+        (
+            "/work/test_fixtures/cerulion",
+            "/work/test_fixtures/cerulion/crates/test_fixtures/f",
+            true,
+        ),
+        (
+            "/work/test_fixtures/cerulion",
+            "/work/test_fixtures/cerulion/crates/x",
+            false,
+        ),
+        // A name that only ends in `test_fixtures` is not the directory.
+        (
+            "/work/old_test_fixtures/cerulion",
+            "/work/old_test_fixtures/cerulion/crates/x",
+            false,
+        ),
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/old_test_fixtures/f",
+            false,
+        ),
+        // Outside the root, even with a `test_fixtures` component of its own.
+        (
+            "/work/cerulion",
+            "/work/other/crates/test_fixtures/f",
+            false,
+        ),
+    ];
+    for (root, dir, want) in VECTORS {
+        assert_eq!(
+            is_test_fixture(Path::new(root), Path::new(dir)),
+            *want,
+            "is_test_fixture(root = {root}, dir = {dir}) should be {want}"
+        );
+    }
 }
 
 /// The two PR-blocking classifiers, pinned on BOTH sides against hand-written
