@@ -83,6 +83,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use cerulion_core::graph::RunTopology;
+use cerulion_core::transport::cerulion_q::{RunEntryError, MAX_RUN_ARTIFACT_LEN};
 use cerulion_core::transport::run_registry::{RunHandle, RunRecord, RunState};
 
 /// Minting a run's IDENTITY and PERSISTING its description are two
@@ -1810,6 +1812,179 @@ fn render_chain_summary(summary: Option<&ChainSummary>) -> serde_json::Value {
     })
 }
 
+/// A participant in a hosted run that is not a graph node (the app that embeds
+/// the runtime), with the graph topics it feeds and the ones it reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunEndpoint {
+    /// The endpoint's name, unique within the run.
+    pub id: String,
+    /// Topics the endpoint publishes into the graph.
+    pub publishes: Vec<EndpointPort>,
+    /// Topics the endpoint subscribes to from the graph.
+    pub subscribes: Vec<EndpointPort>,
+}
+
+/// One topic an endpoint publishes or subscribes to, with its schema name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EndpointPort {
+    /// The resolved topic.
+    pub topic: String,
+    /// The topic's schema name, as the run's config declares it.
+    pub schema: String,
+}
+
+/// The node fire telemetry a hosted run serves. A desk asks a run for fires
+/// only when its manifest declares a `version` the desk speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FireTelemetryDecl {
+    /// The `fires` query wire version the run answers.
+    pub version: u32,
+    /// Fire records the run retains.
+    pub capacity: usize,
+    /// How long one `fires` query keeps recording on, in milliseconds.
+    pub lease_ms: u64,
+}
+
+/// The inputs [`render_hosted_run_manifest`] needs.
+pub struct HostedRunSpec<'a> {
+    /// The run's identity, minted once per start.
+    pub run_id: u128,
+    /// The run's graph name. Rendered as both `graph_name` and `graph_file`,
+    /// as `graph run` does.
+    pub graph_name: &'a str,
+    /// Wall-clock ns since the Unix epoch at run start.
+    pub run_started_at_ns: u64,
+    /// The hosting process; rendered as `supervisor_pid`.
+    pub pid: u32,
+    /// The host's LAN access label.
+    pub lan_access: &'a str,
+    /// The run's non-node participants.
+    pub endpoints: &'a [RunEndpoint],
+    /// The built runtime's topology, nodes in fire-record index order. Take it
+    /// after `GraphRuntime::install_fire_tap`: the install sets each node's
+    /// `reports_writes`, so an earlier snapshot says false for every node.
+    pub topology: &'a RunTopology,
+    /// `None` when the run serves no fire telemetry; the manifest then has no
+    /// `telemetry` key.
+    pub fires: Option<FireTelemetryDecl>,
+}
+
+/// Render the `run.json` of a run whose host serves its description from
+/// memory instead of a run directory.
+///
+/// Same [`RUN_MANIFEST_VERSION`] and base keys as a `graph run` manifest
+/// (`version`, `run_id`, `graph_name`, `graph_file`, `supervisor_pid`,
+/// `run_started_at_ns`), then `host` (`"embedded"`), `lan_access`,
+/// `endpoints`, `topology` and, when the run serves fires, `telemetry`. The
+/// keys that describe a run directory (`run_dir`, `network`, `partition`,
+/// `gating`, `shm`, `chains`) are absent, which every run-directory reader
+/// reads as undeclared.
+///
+/// The `runs` verb serves at most [`MAX_RUN_ARTIFACT_LEN`] bytes of
+/// `run.json`, and `topology` and `endpoints` grow with the graph. So a render
+/// above the cap drops keys until it fits, and names them in `omitted`:
+/// first `topology` and `telemetry` (fire records index into
+/// `topology.nodes`, so fires without it name no node), then `endpoints`.
+/// `omitted.full_len` is the byte length of the full render. Each size check
+/// counts the `omitted` key itself. The run is still served with its base
+/// keys and its `graph.yaml`.
+///
+/// # Errors
+///
+/// [`HostedRunManifestTooLarge`] when the render is above the cap with every
+/// key dropped that can be dropped: the base keys alone (a very long
+/// `graph_name` or `lan_access`) are too large. The result is never above the
+/// cap.
+pub fn render_hosted_run_manifest(
+    spec: &HostedRunSpec<'_>,
+) -> Result<Vec<u8>, HostedRunManifestTooLarge> {
+    let full = render_hosted_doc(spec, &[], None);
+    if full.len() <= MAX_RUN_ARTIFACT_LEN {
+        return Ok(full);
+    }
+    let mut dropped = vec!["telemetry", "topology"];
+    let mut slim = render_hosted_doc(spec, &dropped, Some(full.len()));
+    if slim.len() > MAX_RUN_ARTIFACT_LEN {
+        dropped.insert(0, "endpoints");
+        slim = render_hosted_doc(spec, &dropped, Some(full.len()));
+    }
+    if slim.len() > MAX_RUN_ARTIFACT_LEN {
+        return Err(HostedRunManifestTooLarge {
+            len: slim.len(),
+            cap: MAX_RUN_ARTIFACT_LEN,
+        });
+    }
+    Ok(slim)
+}
+
+/// A hosted `run.json` that is above the served cap with every key dropped
+/// that [`render_hosted_run_manifest`] can drop.
+///
+/// It converts to [`RunEntryError::RunJsonTooLong`], the reason the `runs`
+/// verb gives for a run it cannot describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the hosted run.json is {len} bytes with only its base keys, above the {cap}-byte served cap"
+)]
+pub struct HostedRunManifestTooLarge {
+    /// The byte length of the smallest render.
+    pub len: usize,
+    /// The served cap, [`MAX_RUN_ARTIFACT_LEN`].
+    pub cap: usize,
+}
+
+impl From<HostedRunManifestTooLarge> for RunEntryError {
+    fn from(error: HostedRunManifestTooLarge) -> Self {
+        RunEntryError::RunJsonTooLong { len: error.len }
+    }
+}
+
+/// The hosted `run.json` without the keys in `drop`. With `full_len`, it also
+/// has the `omitted` key that names them.
+fn render_hosted_doc(spec: &HostedRunSpec<'_>, drop: &[&str], full_len: Option<usize>) -> Vec<u8> {
+    let mut doc = serde_json::json!({
+        "version": RUN_MANIFEST_VERSION,
+        "run_id": format!("0x{:032x}", spec.run_id),
+        "graph_name": spec.graph_name,
+        "graph_file": spec.graph_name,
+        "supervisor_pid": spec.pid,
+        "run_started_at_ns": spec.run_started_at_ns,
+        "host": "embedded",
+        "lan_access": spec.lan_access,
+        "endpoints": spec.endpoints,
+        "topology": spec.topology,
+    });
+    if let Some(fires) = spec.fires {
+        doc["telemetry"] = serde_json::json!({
+            "fires": {
+                "version": fires.version,
+                "capacity": fires.capacity,
+                "lease_ms": fires.lease_ms,
+            },
+        });
+    }
+    let map = doc
+        .as_object_mut()
+        .expect("the hosted run.json is an object");
+    let mut omitted = Vec::new();
+    for key in drop {
+        if map.remove(*key).is_some() {
+            omitted.push(*key);
+        }
+    }
+    if let Some(full_len) = full_len {
+        doc["omitted"] = serde_json::json!({ "keys": omitted, "full_len": full_len });
+    }
+    to_manifest_bytes(&doc)
+}
+
+fn to_manifest_bytes(doc: &serde_json::Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(doc)
+        .expect("the hosted run.json has only string keys; serialization cannot fail");
+    bytes.push(b'\n');
+    bytes
+}
+
 /// The run directory's permission bits: OWNER ONLY (`rwx------`).
 ///
 /// Matching the repo's config-dir rule rather than the process umask, because
@@ -2140,6 +2315,8 @@ pub fn begin_run_descriptor(spec: RunDescriptorSpec<'_>) -> Option<RunDescriptor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerulion_core::graph::{TopologyNode, TopologyPort, TopologyTrigger};
+    use cerulion_core::transport::cerulion_q::RunEntry;
 
     /// `CERULION_HOME` is PROCESS-global, so every arm that redirects it takes
     /// the CRATE-WIDE env lock — not a private one.
@@ -3653,5 +3830,593 @@ mod tests {
         }
         assert!(doc["paused"].is_boolean(), "the paused key survives: {doc}");
         assert_eq!(doc["run_id"], serde_json::json!("0x1"));
+    }
+
+    fn lobby_topology() -> RunTopology {
+        RunTopology {
+            version: 1,
+            nodes: vec![
+                TopologyNode {
+                    id: "beat".into(),
+                    node_type: "lobby_beat".into(),
+                    trigger: TopologyTrigger::Period {
+                        interval_ns: 1_000_000_000,
+                    },
+                    inputs: vec![],
+                    outputs: vec![TopologyPort {
+                        name: "count".into(),
+                        topic: "/lobby/beat/count".into(),
+                    }],
+                    reports_writes: true,
+                },
+                TopologyNode {
+                    id: "logic".into(),
+                    node_type: "lobby_logic".into(),
+                    trigger: TopologyTrigger::Data {
+                        topics: vec!["/lobby/in".into()],
+                        ambiguous: false,
+                    },
+                    inputs: vec![TopologyPort {
+                        name: "in".into(),
+                        topic: "/lobby/in".into(),
+                    }],
+                    outputs: vec![
+                        TopologyPort {
+                            name: "edge".into(),
+                            topic: "/lobby/logic/edge".into(),
+                        },
+                        TopologyPort {
+                            name: "pulse".into(),
+                            topic: "/lobby/logic/pulse".into(),
+                        },
+                    ],
+                    reports_writes: false,
+                },
+            ],
+        }
+    }
+
+    fn lobby_endpoints() -> Vec<RunEndpoint> {
+        vec![RunEndpoint {
+            id: "app".into(),
+            publishes: vec![EndpointPort {
+                topic: "/lobby/in".into(),
+                schema: "std_msgs/String".into(),
+            }],
+            subscribes: vec![EndpointPort {
+                topic: "/lobby/logic/edge".into(),
+                schema: "std_msgs/String".into(),
+            }],
+        }]
+    }
+
+    fn hosted_spec<'a>(
+        endpoints: &'a [RunEndpoint],
+        topology: &'a RunTopology,
+        fires: Option<FireTelemetryDecl>,
+    ) -> HostedRunSpec<'a> {
+        HostedRunSpec {
+            run_id: 0x0123_4567_89ab_cdef_0011_2233_4455_6677,
+            graph_name: "lobby",
+            run_started_at_ns: 1_762_264_931_000_000_000,
+            pid: 4711,
+            lan_access: "open",
+            endpoints,
+            topology,
+            fires,
+        }
+    }
+
+    const LOBBY_FIRES: FireTelemetryDecl = FireTelemetryDecl {
+        version: 1,
+        capacity: 4096,
+        lease_ms: 5000,
+    };
+
+    fn render_fitting(spec: &HostedRunSpec<'_>) -> Vec<u8> {
+        render_hosted_run_manifest(spec).expect("the hosted run.json fits the served cap")
+    }
+
+    fn hosted_doc(spec: &HostedRunSpec<'_>) -> serde_json::Value {
+        serde_json::from_slice(&render_fitting(spec)).expect("hosted run.json parses")
+    }
+
+    /// THE hosted `run.json` oracle, byte for byte: the keys sort the way
+    /// `render_run_manifest`'s do, and a second render is identical.
+    #[test]
+    fn a_hosted_manifest_renders_the_exact_documented_json() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        let expected = r#"{
+  "endpoints": [
+    {
+      "id": "app",
+      "publishes": [
+        {
+          "schema": "std_msgs/String",
+          "topic": "/lobby/in"
+        }
+      ],
+      "subscribes": [
+        {
+          "schema": "std_msgs/String",
+          "topic": "/lobby/logic/edge"
+        }
+      ]
+    }
+  ],
+  "graph_file": "lobby",
+  "graph_name": "lobby",
+  "host": "embedded",
+  "lan_access": "open",
+  "run_id": "0x0123456789abcdef0011223344556677",
+  "run_started_at_ns": 1762264931000000000,
+  "supervisor_pid": 4711,
+  "telemetry": {
+    "fires": {
+      "capacity": 4096,
+      "lease_ms": 5000,
+      "version": 1
+    }
+  },
+  "topology": {
+    "nodes": [
+      {
+        "id": "beat",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "count",
+            "topic": "/lobby/beat/count"
+          }
+        ],
+        "reports_writes": true,
+        "trigger": {
+          "interval_ns": 1000000000,
+          "kind": "period"
+        },
+        "type": "lobby_beat"
+      },
+      {
+        "id": "logic",
+        "inputs": [
+          {
+            "name": "in",
+            "topic": "/lobby/in"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "edge",
+            "topic": "/lobby/logic/edge"
+          },
+          {
+            "name": "pulse",
+            "topic": "/lobby/logic/pulse"
+          }
+        ],
+        "reports_writes": false,
+        "trigger": {
+          "ambiguous": false,
+          "kind": "data",
+          "topics": [
+            "/lobby/in"
+          ]
+        },
+        "type": "lobby_logic"
+      }
+    ],
+    "version": 1
+  },
+  "version": 1
+}
+"#;
+        let rendered = render_fitting(&spec);
+        assert_eq!(String::from_utf8(rendered.clone()).unwrap(), expected);
+        assert_eq!(
+            render_fitting(&spec),
+            rendered,
+            "two renders of one spec must be byte-identical"
+        );
+    }
+
+    /// A host without a fire tap declares no telemetry at all, so a desk never
+    /// asks it for fires; an empty graph still renders its empty lists.
+    #[test]
+    fn a_hosted_manifest_without_a_fire_tap_omits_telemetry() {
+        let topology = RunTopology {
+            version: 1,
+            nodes: vec![],
+        };
+        let doc = hosted_doc(&hosted_spec(&[], &topology, None));
+        let keys: Vec<&str> = doc
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "endpoints",
+                "graph_file",
+                "graph_name",
+                "host",
+                "lan_access",
+                "run_id",
+                "run_started_at_ns",
+                "supervisor_pid",
+                "topology",
+                "version",
+            ]
+        );
+        assert_eq!(doc["endpoints"], serde_json::json!([]));
+        assert_eq!(
+            doc["topology"],
+            serde_json::json!({"version": 1, "nodes": []})
+        );
+    }
+
+    /// `telemetry` carries each of the host's own three fires numbers, never a
+    /// default, and the manifest's own `version` stays the run.json version.
+    #[test]
+    fn a_hosted_manifest_declares_the_fire_telemetry_the_host_gives() {
+        let topology = lobby_topology();
+        let fires = FireTelemetryDecl {
+            version: 7,
+            capacity: 64,
+            lease_ms: 1234,
+        };
+        let doc = hosted_doc(&hosted_spec(&[], &topology, Some(fires)));
+        assert_eq!(
+            doc["telemetry"],
+            serde_json::json!({"fires": {"version": 7, "capacity": 64, "lease_ms": 1234}})
+        );
+        assert_eq!(
+            doc["version"],
+            serde_json::json!(1),
+            "the manifest version stays the run.json version"
+        );
+    }
+
+    /// The six keys every `run.json` opens with carry the same values whether
+    /// `graph run` or an embedded host wrote the manifest, and none of the run
+    /// directory's own keys leak into the hosted one.
+    #[test]
+    fn a_hosted_manifest_shares_the_base_keys_of_a_graph_run_manifest() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let mut hosted = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        hosted.graph_name = "go2 attach";
+        hosted.run_started_at_ns = 1_753_000_000_000_000_000;
+        hosted.pid = std::process::id();
+        let graph_run: serde_json::Value = serde_json::from_slice(&render_run_manifest(
+            &spec("name: solo\n", false),
+            hosted.run_id,
+            Path::new("/runs/go2_attach"),
+        ))
+        .expect("graph run's run.json parses");
+        let doc = hosted_doc(&hosted);
+        for key in [
+            "version",
+            "run_id",
+            "graph_name",
+            "graph_file",
+            "supervisor_pid",
+            "run_started_at_ns",
+        ] {
+            assert!(graph_run.get(key).is_some(), "graph run writes `{key}`");
+            assert_eq!(doc[key], graph_run[key], "`{key}` differs");
+        }
+        for key in ["run_dir", "network", "partition", "gating", "shm", "chains"] {
+            assert!(graph_run.get(key).is_some(), "graph run writes `{key}`");
+            assert!(doc.get(key).is_none(), "a hosted run has no `{key}`: {doc}");
+        }
+    }
+
+    /// Every run-directory reader treats the hosted manifest's missing keys
+    /// as undeclared, never as an error or a claim.
+    #[test]
+    fn run_directory_readers_read_a_hosted_manifest_as_undeclared() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let bytes = render_fitting(&hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES)));
+        assert_eq!(run_manifest_trace_rings(&bytes), TraceRingsReport::Absent);
+        assert_eq!(
+            run_manifest_state_ring_consumer(&bytes),
+            StateRingConsumerReport::Absent
+        );
+        assert!(run_manifest_declared_unavailable(&bytes).is_empty());
+        assert!(run_manifest_shm(&bytes).is_empty());
+        assert_eq!(run_manifest_gating(&bytes), None);
+    }
+
+    /// The `runs` verb's only minting path accepts the hosted manifest, and the
+    /// entry's canonical run id is the manifest's, zero padding included.
+    #[test]
+    fn a_hosted_manifest_mints_a_runs_entry_for_the_same_run() {
+        use cerulion_core::transport::cerulion_q::format_run_id;
+
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        for run_id in [0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128, 0xbeef] {
+            let mut spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+            spec.run_id = run_id;
+            let run_json = String::from_utf8(render_fitting(&spec)).unwrap();
+            let entry = RunEntry::new(
+                run_id,
+                spec.graph_name,
+                spec.run_started_at_ns,
+                RunState::Live,
+                "name: lobby\nprefix: lobby\n",
+                run_json.clone(),
+            )
+            .expect("RunEntry::new accepts a hosted run.json");
+            assert_eq!(entry.run_json, run_json, "served verbatim");
+            let doc: serde_json::Value = serde_json::from_str(&run_json).unwrap();
+            assert_eq!(doc["run_id"], serde_json::json!(entry.run_id));
+            assert_eq!(entry.run_id, format_run_id(run_id));
+        }
+        assert_eq!(
+            hosted_doc(&HostedRunSpec {
+                run_id: 0xbeef,
+                ..hosted_spec(&endpoints, &topology, None)
+            })["run_id"],
+            serde_json::json!("0x0000000000000000000000000000beef")
+        );
+    }
+
+    /// A desk decodes `topology` back into the runtime's own type, for every
+    /// trigger kind, with nothing added or lost.
+    #[test]
+    fn a_hosted_manifest_topology_reads_back_as_the_runtime_topology() {
+        let mut topology = lobby_topology();
+        topology.nodes.extend([
+            TopologyNode {
+                id: "join".into(),
+                node_type: "lobby_join".into(),
+                trigger: TopologyTrigger::Sync {
+                    topics: vec!["/lobby/beat/count".into(), "/lobby/logic/pulse".into()],
+                    window_ns: None,
+                },
+                inputs: vec![
+                    TopologyPort {
+                        name: "count".into(),
+                        topic: "/lobby/beat/count".into(),
+                    },
+                    TopologyPort {
+                        name: "pulse".into(),
+                        topic: "/lobby/logic/pulse".into(),
+                    },
+                ],
+                outputs: vec![],
+                reports_writes: false,
+            },
+            TopologyNode {
+                id: "bell".into(),
+                node_type: "lobby_bell".into(),
+                trigger: TopologyTrigger::External,
+                inputs: vec![],
+                outputs: vec![],
+                reports_writes: true,
+            },
+        ]);
+        let doc = hosted_doc(&hosted_spec(&[], &topology, None));
+        let back: RunTopology =
+            serde_json::from_value(doc["topology"].clone()).expect("topology decodes");
+        assert_eq!(back, topology);
+        assert_eq!(
+            doc["topology"]["nodes"][2]["trigger"].get("window_ns"),
+            Some(&serde_json::Value::Null),
+            "an unbounded sync window is an explicit null"
+        );
+        assert_eq!(
+            doc["topology"]["nodes"][3]["trigger"],
+            serde_json::json!({"kind": "external"})
+        );
+    }
+
+    /// Names the host does not control are escaped, never spliced: each reads
+    /// back as exactly the string handed in.
+    #[test]
+    fn a_hosted_manifest_escapes_names_it_does_not_control() {
+        let hostile = "lo\"bby\\\n\u{0}\u{1f916}";
+        let endpoints = [RunEndpoint {
+            id: hostile.into(),
+            publishes: vec![EndpointPort {
+                topic: hostile.into(),
+                schema: hostile.into(),
+            }],
+            subscribes: vec![],
+        }];
+        let topology = lobby_topology();
+        let mut spec = hosted_spec(&endpoints, &topology, None);
+        spec.graph_name = hostile;
+        spec.lan_access = hostile;
+        let doc = hosted_doc(&spec);
+        for value in [
+            &doc["graph_name"],
+            &doc["graph_file"],
+            &doc["lan_access"],
+            &doc["endpoints"][0]["id"],
+            &doc["endpoints"][0]["publishes"][0]["topic"],
+            &doc["endpoints"][0]["publishes"][0]["schema"],
+        ] {
+            assert_eq!(value, &serde_json::json!(hostile));
+        }
+    }
+
+    /// A topology big enough to push the full render past the served cap.
+    fn oversized_topology() -> RunTopology {
+        let node = lobby_topology().nodes[1].clone();
+        let nodes: Vec<TopologyNode> = (0..2000)
+            .map(|i| TopologyNode {
+                id: format!("logic_{i}"),
+                ..node.clone()
+            })
+            .collect();
+        RunTopology { version: 1, nodes }
+    }
+
+    fn served_entry(spec: &HostedRunSpec<'_>, run_json: String) -> RunEntry {
+        RunEntry::new(
+            spec.run_id,
+            spec.graph_name,
+            spec.run_started_at_ns,
+            RunState::Live,
+            "name: lobby\nprefix: lobby\n",
+            run_json,
+        )
+        .expect("the runs verb accepts the render")
+    }
+
+    /// A topology past the served cap is dropped with the fires that index
+    /// into it, and `omitted` names both, so the run is still served.
+    #[test]
+    fn a_hosted_manifest_past_the_cap_omits_its_topology_and_still_serves() {
+        let endpoints = lobby_endpoints();
+        let topology = oversized_topology();
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        let full_len = render_hosted_doc(&spec, &[], None).len();
+        assert!(
+            full_len > MAX_RUN_ARTIFACT_LEN,
+            "the fixture is past the cap"
+        );
+
+        let rendered = render_fitting(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN);
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert!(doc.get("topology").is_none(), "{doc}");
+        assert!(doc.get("telemetry").is_none(), "{doc}");
+        assert_eq!(
+            doc["omitted"],
+            serde_json::json!({"keys": ["telemetry", "topology"], "full_len": full_len})
+        );
+        assert_eq!(doc["endpoints"], serde_json::json!(&endpoints));
+        assert_eq!(doc["graph_name"], serde_json::json!("lobby"));
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+
+        let doc = hosted_doc(&hosted_spec(&endpoints, &topology, None));
+        assert_eq!(doc["omitted"]["keys"], serde_json::json!(["topology"]));
+    }
+
+    /// Endpoints past the cap on their own are dropped too, after the topology.
+    #[test]
+    fn a_hosted_manifest_past_the_cap_without_topology_omits_its_endpoints() {
+        let ports: Vec<EndpointPort> = (0..8000)
+            .map(|i| EndpointPort {
+                topic: format!("/lobby/in_{i}"),
+                schema: "std_msgs/String".into(),
+            })
+            .collect();
+        let endpoints = [RunEndpoint {
+            id: "app".into(),
+            publishes: ports,
+            subscribes: vec![],
+        }];
+        let topology = lobby_topology();
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        let rendered = render_fitting(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN);
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            doc["omitted"]["keys"],
+            serde_json::json!(["endpoints", "telemetry", "topology"])
+        );
+        assert!(doc.get("endpoints").is_none(), "{doc}");
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+    }
+
+    /// A render that fits only without `omitted` drops its endpoints too, so
+    /// the `omitted` key never pushes run.json past the cap.
+    #[test]
+    fn a_hosted_manifest_counts_its_omitted_key_against_the_cap() {
+        let endpoints_with = |topic: String| {
+            [RunEndpoint {
+                id: "app".into(),
+                publishes: vec![EndpointPort {
+                    topic,
+                    schema: "std_msgs/String".into(),
+                }],
+                subscribes: vec![],
+            }]
+        };
+        let topology = lobby_topology();
+        let slim = ["telemetry", "topology"];
+        let short = endpoints_with(String::new());
+        let base = render_hosted_doc(
+            &hosted_spec(&short, &topology, Some(LOBBY_FIRES)),
+            &slim,
+            None,
+        )
+        .len();
+        let endpoints = endpoints_with("t".repeat(MAX_RUN_ARTIFACT_LEN - 10 - base));
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        assert_eq!(
+            render_hosted_doc(&spec, &slim, None).len(),
+            MAX_RUN_ARTIFACT_LEN - 10,
+            "the render without topology and without omitted fits"
+        );
+        assert!(render_hosted_doc(&spec, &slim, Some(1)).len() > MAX_RUN_ARTIFACT_LEN);
+
+        let rendered = render_fitting(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN, "{}", rendered.len());
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            doc["omitted"]["keys"],
+            serde_json::json!(["endpoints", "telemetry", "topology"])
+        );
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+    }
+
+    /// A render under the cap has no `omitted` key.
+    #[test]
+    fn a_hosted_manifest_under_the_cap_omits_nothing() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let doc = hosted_doc(&hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES)));
+        assert!(doc.get("omitted").is_none(), "{doc}");
+    }
+
+    /// Base keys above the cap on their own are an error, never a render
+    /// above the cap, and the error converts to the reason the `runs` verb
+    /// gives for a run it cannot describe.
+    #[test]
+    fn a_hosted_manifest_whose_base_keys_pass_the_cap_is_an_error() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let long = "n".repeat(MAX_RUN_ARTIFACT_LEN / 2);
+        let lan = "l".repeat(MAX_RUN_ARTIFACT_LEN);
+        for (graph_name, lan_access) in [(long.as_str(), "open"), ("lobby", lan.as_str())] {
+            let mut spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+            spec.graph_name = graph_name;
+            spec.lan_access = lan_access;
+            let slim = render_hosted_doc(
+                &spec,
+                &["endpoints", "telemetry", "topology"],
+                Some(render_hosted_doc(&spec, &[], None).len()),
+            );
+            assert!(
+                slim.len() > MAX_RUN_ARTIFACT_LEN,
+                "the fixture is past the cap"
+            );
+
+            let error = render_hosted_run_manifest(&spec).expect_err("no render fits the cap");
+            assert_eq!(
+                error,
+                HostedRunManifestTooLarge {
+                    len: slim.len(),
+                    cap: MAX_RUN_ARTIFACT_LEN,
+                }
+            );
+            assert_eq!(
+                RunEntryError::from(error),
+                RunEntryError::RunJsonTooLong { len: slim.len() }
+            );
+            let text = error.to_string();
+            assert!(text.contains(&slim.len().to_string()), "{text}");
+            assert!(text.contains(&MAX_RUN_ARTIFACT_LEN.to_string()), "{text}");
+        }
     }
 }

@@ -16931,12 +16931,37 @@ fn resolve_recording_paths(record_dir: &Path, graph_name: &str, now: Duration) -
 /// file, which is never touched by recording. The round trip is pinned by
 /// `the_effective_graph_yaml_round_trips_through_the_replay_parser`.
 ///
-/// `pub(crate)` because `bag_migrate` re-renders the graph it strips
-/// through THIS renderer, so a migrated bag's `graph.yaml` is byte-for-byte the
-/// shape `graph run --record` writes rather than a second normalization that
-/// could drift from it.
+/// Public because an embedded host serves THIS render as its hosted run's
+/// `graph.yaml`, and `bag_migrate` re-renders the graph it strips through it
+/// too, so a hosted run, a migrated bag and `graph run --record` carry one
+/// normalization rather than several that could drift apart.
+///
+/// # Errors
+///
+/// [`CliError::Validation`] when `serde_yaml` cannot serialize the config.
+///
+/// # Examples
+///
+/// Render `graphs/lobby.yaml` of the workspace at `workspace_dir`, read by
+/// name the way every `cerulion graph` verb reads it:
+///
+/// ```
+/// use cerulion_cli_engine::graph_cmd::{graph_read, render_effective_graph_yaml};
+/// use cerulion_cli_engine::workspace::CerulionWorkspace;
+/// # use cerulion_cli_engine::{graph_cmd::graph_create, workspace::workspace_create};
+/// # let tmp = tempfile::tempdir()?;
+/// # let created = workspace_create(tmp.path(), "lobby_ws")?;
+/// # graph_create(&created.graphs_dir, "lobby", Some("lobby"))?;
+/// # let workspace_dir = created.root;
+///
+/// let workspace = CerulionWorkspace::discover(&workspace_dir)?;
+/// let config = graph_read(&workspace.graphs_dir, "lobby")?;
+/// let graph_yaml = render_effective_graph_yaml(&config)?;
+/// assert_eq!(graph_yaml, "prefix: lobby\nnodes: []\n");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[cfg(unix)]
-pub(crate) fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
+pub fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
     serde_yaml::to_string(config).map_err(|e| {
         CliError::Validation(format!(
             "recording: cannot render the effective graph config for the bag's `graph.yaml` \
@@ -28879,6 +28904,109 @@ process_groups:
             rendered,
             "the render must be idempotent"
         );
+    }
+
+    /// A hosted run serves this render as its `graph.yaml`, so a reader that
+    /// re-parses it with `parse_graph` gets the same graph: its `name:` (the
+    /// identity on a stemless parse), prefix and wiring come back, and a
+    /// second render is identical.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_graph_yaml_round_trips_parse_graph_with_its_name() {
+        let config = cerulion_core::graph::parse_graph(
+            "\
+name: lobby
+prefix: lobby
+nodes:
+  - id: logic
+    type: lobby_logic
+    inputs:
+      - {name: in, source: /lobby/in}
+    outputs:
+      - {name: edge, schema: std_msgs/String}
+      - {name: pulse, schema: std_msgs/String, topic: /lobby/logic/pulse}
+",
+        )
+        .expect("parse");
+        let rendered = render_effective_graph_yaml(&config).expect("render");
+        let back =
+            cerulion_core::graph::parse_graph(&rendered).expect("parse_graph reads the render");
+
+        assert_eq!(back.identity(), "lobby");
+        assert_eq!(back.name.as_deref(), Some("lobby"));
+        assert_eq!(back.prefix, "lobby");
+        assert_eq!(back.nodes.len(), 1);
+        assert_eq!(back.nodes[0].id, "logic");
+        assert_eq!(back.nodes[0].node_type, "lobby_logic");
+        assert_eq!(
+            back.nodes[0]
+                .inputs
+                .iter()
+                .map(|i| (i.name.as_str(), i.source.as_str()))
+                .collect::<Vec<_>>(),
+            [("in", "/lobby/in")]
+        );
+        assert_eq!(
+            back.nodes[0]
+                .outputs
+                .iter()
+                .map(|o| (o.name.as_str(), o.schema.as_str(), o.topic.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("edge", "std_msgs/String", None),
+                ("pulse", "std_msgs/String", Some("/lobby/logic/pulse")),
+            ]
+        );
+        assert_eq!(
+            render_effective_graph_yaml(&back).expect("render again"),
+            rendered
+        );
+    }
+
+    /// AGENTS.md: rustdoc shows a graph only as a workspace `graphs/*.yaml`
+    /// read by name; a graph built in code is for tests only. Rustdoc is
+    /// published, so a reader copies its examples into application code.
+    #[test]
+    fn rustdoc_examples_read_graphs_from_the_workspace_not_from_code() {
+        let mut fence: Option<bool> = None;
+        let mut example_lines = Vec::new();
+        for line in include_str!("graph_cmd.rs").lines() {
+            let trimmed = line.trim_start();
+            let Some(doc) = trimmed
+                .strip_prefix("///")
+                .or_else(|| trimmed.strip_prefix("//!"))
+            else {
+                continue;
+            };
+            let doc = doc.trim();
+            if let Some(info) = doc.strip_prefix("```") {
+                fence = match fence {
+                    Some(_) => None,
+                    None => Some(!matches!(info.trim(), "text" | "yaml" | "json" | "console")),
+                };
+                continue;
+            }
+            if fence == Some(true) {
+                example_lines.push(doc);
+            }
+        }
+
+        assert!(
+            example_lines
+                .iter()
+                .any(|l| l.contains("graph_read(") && !l.starts_with('#')),
+            "the public renderer's example must show reading `graphs/<name>.yaml` by name"
+        );
+        for banned in ["parse_graph", "GraphConfig {", "GraphRuntime"] {
+            let hits: Vec<&&str> = example_lines
+                .iter()
+                .filter(|l| l.contains(banned))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "a rustdoc example builds a graph in code with `{banned}`: {hits:?}"
+            );
+        }
     }
 
     /// The rendered attachment is SCRATCH: it must be cleaned up like every other
