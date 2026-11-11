@@ -675,6 +675,90 @@ fn local_observers_refuse_missing_topics_without_remote_search_or_daemon() {
     }
 }
 
+/// `graph live` and `graph fires` ask robots for runs and fires, and a fires
+/// read arms recording on the robot. Under a kill switch neither may reach
+/// the running netd ([`run_with`] fails the run if it connected) nor a
+/// `--connect` locator. The locator is a closed port, not a listener, since a
+/// desktop tool may probe any new local listener: a command that probed it
+/// before refusing would fail with the probe's "nothing accepted a
+/// connection" instead of the refusal.
+#[test]
+fn graph_live_and_fires_under_a_kill_switch_contact_no_daemon_or_robot() {
+    let locator = {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("tcp/{}", closed.local_addr().unwrap())
+    };
+    // Control: with no switch, each verb probes the locator and fails on it.
+    for verb in ["live", "fires"] {
+        let root = tempfile::tempdir().unwrap();
+        let control = run_with(
+            root.path(),
+            &["graph", verb, "--connect", locator.as_str()],
+            &[],
+        );
+        let error = String::from_utf8_lossy(&control.stderr);
+        assert_eq!(control.status.code(), Some(1), "{verb}: {error}");
+        assert!(
+            error.contains(&format!("nothing accepted a connection at {locator}")),
+            "{verb}: {error}"
+        );
+    }
+    for (switches, labels, remedy) in [
+        (
+            &[("CERULION_NETWORK", "off")][..],
+            "CERULION_NETWORK=off",
+            "unset CERULION_NETWORK",
+        ),
+        (
+            &[("CERULION_NETWORK", "typo")][..],
+            "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)",
+            "unset CERULION_NETWORK",
+        ),
+        (
+            &[("CERULION_NETD_NETWORK", "off")][..],
+            "CERULION_NETD_NETWORK=off",
+            "unset CERULION_NETD_NETWORK",
+        ),
+        (
+            &[
+                ("CERULION_NETWORK", "off"),
+                ("CERULION_NETD_NETWORK", "off"),
+            ][..],
+            "CERULION_NETWORK=off and CERULION_NETD_NETWORK=off",
+            "unset CERULION_NETWORK and CERULION_NETD_NETWORK",
+        ),
+    ] {
+        for verb in ["live", "fires"] {
+            for args in [
+                vec!["graph", verb],
+                vec!["graph", verb, "--connect", locator.as_str()],
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let output = run_with(root.path(), &args, switches);
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{args:?} {switches:?}: {error}"
+                );
+                assert!(
+                    error.contains(&format!(
+                        "cerulion graph {verb}: asking robots is disabled by {labels}, so this \
+                         command stays local-only and contacts no robot; {remedy} to ask robots \
+                         through cerulion-netd or --connect"
+                    )),
+                    "{args:?} {switches:?}: {error}"
+                );
+                assert!(
+                    !error.contains("nothing accepted a connection"),
+                    "{args:?} {switches:?}: {error}"
+                );
+                assert!(output.stdout.is_empty(), "{args:?} {switches:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn local_list_and_legacy_alias_override_scan_and_explicit_locators() {
     for flag in ["--local", "--no-network"] {

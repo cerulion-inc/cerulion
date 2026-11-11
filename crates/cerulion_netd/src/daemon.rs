@@ -68,8 +68,9 @@ use crate::hygiene::{acquire_socket, SocketGuard};
 use crate::mirror::MirrorPlane;
 use crate::protocol::{
     parse_request, CatalogQueryResponse, DemandEntry, DemandResponse, EgressReleaseResponse,
-    EgressResponse, Hello, ReleaseResponse, Request, Response, RunsQueryResponse,
-    SchemaQueryResponse, StatusResponse, SubscribeCatalogResponse, MAX_REQUEST_LINE_BYTES,
+    EgressResponse, FiresQueryResponse, Hello, ReleaseResponse, Request, Response,
+    RunsQueryResponse, SchemaQueryResponse, StatusResponse, SubscribeCatalogResponse,
+    MAX_REQUEST_LINE_BYTES,
 };
 use crate::query::{NoopQueryPlane, QueryPlane};
 use crate::registry::{
@@ -349,6 +350,12 @@ impl Ctx {
                 requested,
             } => self.query_schema(id, robot, requested),
             Request::QueryRuns { id, robot } => self.query_runs(id, robot),
+            Request::QueryFires {
+                id,
+                robot,
+                run_id,
+                after,
+            } => self.query_fires(id, robot, run_id, after),
             Request::SubscribeCatalog { id } => self.subscribe_catalog(conn, id),
         }
     }
@@ -546,6 +553,43 @@ impl Ctx {
             Err(e) => {
                 tracing::debug!(error = %e, "netd: query_runs could not run");
                 Response::error(Some(id), format!("runs query failed: {e}"), robot, None)
+            }
+        }
+    }
+
+    /// Handle a `query_fires`: one `fires` GET to the named robot over netd's
+    /// ONE zenoh session via the query plane. STATELESS: no registry lock, no
+    /// refcount, no mirror. A request that does not name one robot and a
+    /// canonical run id is refused before any GET; a plane error becomes a
+    /// structured error.
+    fn query_fires(&self, id: u64, robot: String, run_id: String, after: Option<u64>) -> Response {
+        match crate::account_access::parse_robot_route(&robot) {
+            Err(error) => return Response::error(Some(id), error, Some(robot), None),
+            Ok(Some(_)) => {
+                return Response::error(
+                    Some(id),
+                    "node fire queries are not supported over account robot access",
+                    Some(robot),
+                    None,
+                )
+            }
+            Ok(None) => {}
+        }
+        if let Some(error) =
+            cerulion_core::transport::cerulion_q::fires_target_error(&robot, &run_id)
+        {
+            return Response::error(Some(id), error, Some(robot), None);
+        }
+        match self.query_plane.query_fires(&robot, &run_id, after) {
+            Ok(answer) => Response::FiresQuery(FiresQueryResponse { id, answer }),
+            Err(e) => {
+                tracing::debug!(error = %e, "netd: query_fires could not run");
+                Response::error(
+                    Some(id),
+                    format!("fires query failed: {e}"),
+                    Some(robot),
+                    None,
+                )
             }
         }
     }
@@ -2728,4 +2772,191 @@ mod tests {
     // live with the SHARED impl in `cerulion_core::transport::uds_write` (used by both
     // netd and vizd); the netd big-line round-trip regression + dead-consumer pins are
     // in `tests/daemon_e2e_test.rs`.
+
+    /// A `QueryPlane` double for the `query_fires` handler: records each call
+    /// and answers with a canned result. Only the fires verb is reachable.
+    struct FiresSpy {
+        calls: Mutex<Vec<(String, String, Option<u64>)>>,
+        answer: fn() -> Result<crate::protocol::FiresAnswer, crate::query::QueryError>,
+    }
+    impl FiresSpy {
+        fn answering(
+            answer: fn() -> Result<crate::protocol::FiresAnswer, crate::query::QueryError>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                answer,
+            })
+        }
+        fn calls(&self) -> Vec<(String, String, Option<u64>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl QueryPlane for FiresSpy {
+        fn query_catalog(
+            &self,
+            _: Option<&str>,
+        ) -> Result<crate::query::CatalogGather, crate::query::QueryError> {
+            unreachable!("only the fires verb is driven")
+        }
+        fn query_schema(
+            &self,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<crate::query::SchemaGather, crate::query::QueryError> {
+            unreachable!("only the fires verb is driven")
+        }
+        fn query_runs(
+            &self,
+            _: Option<&str>,
+        ) -> Result<crate::query::RunsGather, crate::query::QueryError> {
+            unreachable!("only the fires verb is driven")
+        }
+        fn query_fires(
+            &self,
+            robot: &str,
+            run_id: &str,
+            after: Option<u64>,
+        ) -> Result<crate::protocol::FiresAnswer, crate::query::QueryError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((robot.to_string(), run_id.to_string(), after));
+            (self.answer)()
+        }
+    }
+
+    fn fires_ctx(plane: Arc<FiresSpy>) -> Ctx {
+        Ctx {
+            query_plane: plane,
+            ..waker_ctx()
+        }
+    }
+
+    const FIRES_RUN: &str = "0x0000000000000000000000000000002a";
+
+    fn unknown_run() -> Result<crate::protocol::FiresAnswer, crate::query::QueryError> {
+        Ok(crate::protocol::FiresAnswer::Reply {
+            reply: cerulion_core::transport::cerulion_q::FiresReply::new(
+                "temi",
+                0x2a,
+                cerulion_core::transport::cerulion_q::FiresOutcome::UnknownRun,
+            ),
+        })
+    }
+
+    #[test]
+    fn a_fires_request_reaches_the_plane_and_its_answer_is_this_line() {
+        let spy = FiresSpy::answering(unknown_run);
+        let ctx = fires_ctx(Arc::clone(&spy));
+        let line = format!(
+            r#"{{"method":"query_fires","id":3,"robot":"temi","run_id":"{FIRES_RUN}","after":5119}}"#
+        );
+        assert_eq!(
+            dispatch_line(&line, &ctx, 0).to_json_line(),
+            format!(
+                r#"{{"id":3,"answer":{{"kind":"reply","reply":{{"version":1,"robot":"temi","run_id":"{FIRES_RUN}","outcome":{{"kind":"unknown_run"}}}}}}}}"#
+            )
+        );
+        assert_eq!(
+            spy.calls(),
+            vec![("temi".to_string(), FIRES_RUN.to_string(), Some(5119))]
+        );
+
+        let spy = FiresSpy::answering(|| Ok(crate::protocol::FiresAnswer::Silent));
+        let ctx = fires_ctx(Arc::clone(&spy));
+        let line =
+            format!(r#"{{"method":"query_fires","id":4,"robot":"temi","run_id":"{FIRES_RUN}"}}"#);
+        assert_eq!(
+            dispatch_line(&line, &ctx, 0).to_json_line(),
+            r#"{"id":4,"answer":{"kind":"silent"}}"#
+        );
+        assert_eq!(
+            spy.calls(),
+            vec![("temi".to_string(), FIRES_RUN.to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn a_fires_plane_error_is_a_structured_error_naming_the_robot() {
+        let spy = FiresSpy::answering(|| Err(crate::query::QueryError::NoNetwork));
+        let ctx = fires_ctx(Arc::clone(&spy));
+        let line =
+            format!(r#"{{"method":"query_fires","id":5,"robot":"temi","run_id":"{FIRES_RUN}"}}"#);
+        match dispatch_line(&line, &ctx, 0) {
+            Response::Error(e) => {
+                assert_eq!(e.id, Some(5));
+                assert_eq!(e.robot.as_deref(), Some("temi"));
+                assert!(
+                    e.error.starts_with("fires query failed: ")
+                        && e.error.contains("not network-configured"),
+                    "{}",
+                    e.error
+                );
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(spy.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_fires_request_naming_no_single_robot_or_no_canonical_run_is_refused_before_any_get() {
+        let account = format!(
+            "{}{}",
+            crate::account_access::ACCOUNT_ROUTE_PREFIX,
+            "ab".repeat(32)
+        );
+        let cases: [(&str, &str, &str); 9] = [
+            ("", FIRES_RUN, "one robot name"),
+            ("temi/sub", FIRES_RUN, "one robot name"),
+            ("*", FIRES_RUN, "one robot name"),
+            ("te$mi", FIRES_RUN, "one robot name"),
+            ("temi?x=1", FIRES_RUN, "one robot name"),
+            ("temi", "0x2a", "canonical form"),
+            (
+                "temi",
+                "0x000000000000000000000000000000AB",
+                "canonical form",
+            ),
+            ("temi", "0000000000000000000000000000002a", "canonical form"),
+            (
+                &account,
+                FIRES_RUN,
+                "not supported over account robot access",
+            ),
+        ];
+        for (id, (robot, run_id, says)) in cases.into_iter().enumerate() {
+            let spy = FiresSpy::answering(|| Ok(crate::protocol::FiresAnswer::Silent));
+            let ctx = fires_ctx(Arc::clone(&spy));
+            let request = Request::QueryFires {
+                id: id as u64,
+                robot: robot.to_string(),
+                run_id: run_id.to_string(),
+                after: None,
+            };
+            match ctx.dispatch(0, request) {
+                Response::Error(e) => {
+                    assert_eq!(e.id, Some(id as u64));
+                    assert_eq!(e.robot.as_deref(), Some(robot));
+                    assert!(e.error.contains(says), "{robot:?} {run_id:?}: {}", e.error);
+                }
+                other => panic!("{robot:?} {run_id:?}: expected a refusal, got {other:?}"),
+            }
+            assert!(
+                spy.calls().is_empty(),
+                "{robot:?} {run_id:?}: refused before the plane is asked"
+            );
+        }
+        // A malformed account route is refused by the route parser.
+        let spy = FiresSpy::answering(|| Ok(crate::protocol::FiresAnswer::Silent));
+        let ctx = fires_ctx(Arc::clone(&spy));
+        let request = Request::QueryFires {
+            id: 20,
+            robot: "account:zz".to_string(),
+            run_id: FIRES_RUN.to_string(),
+            after: None,
+        };
+        assert!(matches!(ctx.dispatch(0, request), Response::Error(_)));
+        assert!(spy.calls().is_empty());
+    }
 }
