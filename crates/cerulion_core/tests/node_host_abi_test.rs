@@ -86,7 +86,7 @@ fn vector_layout() -> PluginWireLayout {
         schema_hash: Vector3::SCHEMA_HASH,
         fixed_size: Vector3::WIRE_FIXED_SIZE as u32,
         variable_fields: Vector3::VARIABLE_FIELD_COUNT as u32,
-        alignment: Vector3::FRAME_ALIGN as u32,
+        alignment: cerulion_core::shm_runtime::FRAME_ALIGN as u32,
     }
 }
 fn request(layout: PluginWireLayout) -> abi::LoanRequestV1 {
@@ -121,7 +121,7 @@ impl Harness {
         )
         .unwrap();
         let publisher = manager
-            .create_publisher("abi/oracle", MaxSliceLen::new(4096).unwrap(), 0)
+            .create_publisher("abi/oracle", MaxSliceLen::try_new(4096).unwrap(), 0)
             .unwrap();
         let subscriber = manager.create_subscriber("abi/oracle").unwrap();
         let env = Arc::new(HashMap::from([(
@@ -516,10 +516,29 @@ fn spill_retains_original_mapping_on_success_and_refusal_until_release() {
         schema_hash: Text::SCHEMA_HASH,
         fixed_size: Text::WIRE_FIXED_SIZE as u32,
         variable_fields: Text::VARIABLE_FIELD_COUNT as u32,
-        alignment: Text::FRAME_ALIGN as u32,
+        alignment: cerulion_core::shm_runtime::FRAME_ALIGN as u32,
     };
     let h = Harness::new(layout, None, 2);
+    let warmup = cerulion_core::transport::adaptive_sizer::WINDOW_SIZE as u32;
+    for sequence in 1..=warmup {
+        let small = h.loan();
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(h.context, small.lease, 48)).code,
+            0
+        );
+        let read = h.receive();
+        inspect(&read, |frame| {
+            let header = WireHeader::read_from_buf(frame).unwrap();
+            assert_eq!(
+                (header.schema_hash, header.total_size, header.sequence),
+                (Text::SCHEMA_HASH, 48, sequence)
+            );
+            assert_eq!(&frame[40..], &[0; 8]);
+        });
+        h.release(read);
+    }
     let loan = h.loan();
+    assert!(loan.capacity < 3040);
     let mut payload = vec![0; 3000];
     payload[0..4].copy_from_slice(&8u32.to_le_bytes());
     payload[4..8].copy_from_slice(&2992u32.to_le_bytes());
@@ -567,7 +586,7 @@ fn spill_retains_original_mapping_on_success_and_refusal_until_release() {
                 header.timestamp_ns,
                 header.step_tag
             ),
-            (3040, 1, 777, StepTag::UNTAGGED)
+            (3040, warmup + 1, 777, StepTag::UNTAGGED)
         );
         assert_eq!(&frame[40..], payload);
     });
@@ -593,7 +612,7 @@ fn spill_retains_original_mapping_on_success_and_refusal_until_release() {
     let counters = with_context(h.context.value, |host| Ok(host.counters())).unwrap();
     assert_eq!(
         (counters.committed, counters.spills, counters.discarded),
-        (1, 1, 0)
+        (u64::from(warmup) + 1, 1, 0)
     );
 }
 
@@ -1002,5 +1021,234 @@ fn diagnostic_and_empty_event_calls_validate_all_scalar_and_pointer_arms() {
         .code,
         5
     );
+    for port in [h.input, h.output, abi::PortHandle { value: 0 }] {
+        assert_eq!(
+            with_context(h.context.value, |host| host
+                .diagnostic_failures(h.context.value, port.value)),
+            Ok(2)
+        );
+    }
+    let mut extension = MaybeUninit::<abi::ExtensionDescriptorV1>::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.query_extension)(
+            h.context,
+            u64::MAX,
+            1,
+            extension.as_mut_ptr()
+        ))
+        .code,
+        7
+    );
+    assert_eq!(
+        abi_call!((HOST_API.query_extension)(
+            h.context,
+            u64::MAX,
+            1,
+            std::ptr::null_mut()
+        ))
+        .code,
+        5
+    );
     assert_eq!(abi_call!((HOST_API.request_shutdown)(h.context)).code, 0);
+}
+
+#[test]
+fn malformed_normal_finish_retires_without_delivery_or_sequence_gap() {
+    let h = Harness::new(vector_layout(), None, 2);
+    for size in [0, 39, 63, 65, u32::MAX] {
+        let loan = h.loan();
+        write_values(&loan, [7.0, 8.0, 9.0]);
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(h.context, loan.lease, size)).code,
+            5
+        );
+        assert_eq!(
+            with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+            Ok(0)
+        );
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(h.context, loan.lease, 64)).code,
+            4
+        );
+        h.empty();
+    }
+    h.publish([20.0, 30.0, 40.0]);
+    let read = h.receive();
+    inspect(&read, |frame| {
+        assert_eq!(frame, oracle_frame(1, 777, [20.0, 30.0, 40.0]))
+    });
+    h.release(read);
+}
+#[test]
+fn accumulator_loss_event_preserves_native_observations_and_surviving_delivery() {
+    let h = Harness::new(vector_layout(), Some(1), 2);
+    h.publish([1.0, 2.0, 3.0]);
+    h.publish([4.0, 5.0, 6.0]);
+    h.publish([7.0, 8.0, 9.0]);
+    collect(&h);
+    let mut event = MaybeUninit::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.poll_event)(
+            h.context,
+            h.input,
+            abi::event_kind::BACKPRESSURE,
+            event.as_mut_ptr()
+        ))
+        .code,
+        0
+    );
+    // SAFETY: successful event callback initialized the record.
+    let event: abi::EventV1 = unsafe { event.assume_init() };
+    assert_eq!(
+        (event.port, event.kind, event.detail),
+        (
+            h.input,
+            abi::event_kind::BACKPRESSURE,
+            abi::event_detail::DROP_OLDEST
+        )
+    );
+    assert_eq!(
+        (
+            event.timestamp_ns,
+            event.total,
+            event.in_regime,
+            event.dropped,
+            event.capacity
+        ),
+        (777, 2, 2, 2, 1)
+    );
+    assert_eq!(
+        (
+            event.window_ms,
+            event.elapsed_ms,
+            event.policy_value,
+            event.cause
+        ),
+        (0, 0, 0, 0)
+    );
+    begin_fire(&h);
+    let info = accumulated_info(&h);
+    assert_eq!((info.count, info.dropped, info.dropped_total), (1, 2, 2));
+    let read = accumulated_frame(&h, 0);
+    inspect(&read, |frame| {
+        assert_eq!(frame, oracle_frame(3, 777, [7.0, 8.0, 9.0]))
+    });
+    h.release(read);
+}
+
+fn change_publisher(
+    h: &Harness,
+    action: impl FnOnce(&mut cerulion_core::transport::publisher::CerulionPublisher),
+) {
+    with_context(h.context.value, |host| {
+        host.with_native(|native| {
+            let AnyPublisher::Ipc(publisher) = native.publisher_mut("out").unwrap();
+            action(publisher);
+        })
+    })
+    .unwrap();
+}
+#[test]
+fn native_loan_and_send_failures_retire_owners_and_preserve_delivery_accounting() {
+    let h = Harness::new(vector_layout(), None, 2);
+    change_publisher(&h, |publisher| publisher.force_discard_next_fire());
+    let mut slot = MaybeUninit::<abi::WriteSlotV1>::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.loan_output)(
+            h.context,
+            h.output,
+            request(h.layout),
+            slot.as_mut_ptr()
+        ))
+        .code,
+        2
+    );
+    assert_eq!(
+        with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+        Ok(0)
+    );
+    h.empty();
+    change_publisher(&h, |publisher| publisher.fault_inject_send_raw_loan());
+    let loan = h.loan();
+    write_values(&loan, [1.0, 2.0, 3.0]);
+    assert_eq!(
+        abi_call!((HOST_API.finish_output)(h.context, loan.lease, 64)).code,
+        2
+    );
+    assert_eq!(
+        with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+        Ok(0)
+    );
+    h.empty();
+    let mut counters = MaybeUninit::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.publisher_counters)(
+            h.context,
+            h.output,
+            counters.as_mut_ptr()
+        ))
+        .code,
+        0
+    );
+    // SAFETY: OK initialized counters completely.
+    let counters: abi::PublisherCountersV1 = unsafe { counters.assume_init() };
+    assert_eq!((counters.committed, counters.send_failures), (1, 1));
+    h.publish([9.0, 8.0, 7.0]);
+    let read = h.receive();
+    inspect(&read, |frame| {
+        assert_eq!(frame, oracle_frame(2, 777, [9.0, 8.0, 7.0]))
+    });
+    h.release(read);
+}
+#[test]
+fn failed_trigger_drain_is_explicit_and_cannot_vouch_for_an_empty_queue() {
+    let h = Harness::new(vector_layout(), None, 2);
+    h.publish([2.0, 4.0, 6.0]);
+    with_context(h.context.value, |host| {
+        host.with_native(|native| {
+            let AnySubscriber::Ipc(subscriber) = native.subscriber_mut("in").unwrap();
+            subscriber.fault_inject_receive_after_for_test(0);
+        })
+    })
+    .unwrap();
+    let mut head = MaybeUninit::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.input_head)(
+            h.context,
+            h.input,
+            abi::head_op::DRAIN,
+            head.as_mut_ptr()
+        ))
+        .code,
+        0
+    );
+    // SAFETY: successful callback initialized the complete head record.
+    let failed: abi::HeadOutcomeV1 = unsafe { head.assume_init() };
+    assert_eq!(failed.kind, abi::head_kind::FAILED);
+    let mut read = MaybeUninit::<abi::ReadSlotV1>::uninit();
+    assert_eq!(
+        abi_call!((HOST_API.receive_input)(
+            h.context,
+            h.input,
+            abi::read_mode::ONE,
+            read.as_mut_ptr()
+        ))
+        .code,
+        2
+    );
+    assert_eq!(
+        abi_call!((HOST_API.input_head)(
+            h.context,
+            h.input,
+            abi::head_op::DRAIN,
+            head.as_mut_ptr()
+        ))
+        .code,
+        0
+    );
+    let read = h.receive();
+    inspect(&read, |frame| {
+        assert_eq!(frame, oracle_frame(1, 777, [2.0, 4.0, 6.0]))
+    });
+    h.release(read);
 }

@@ -5446,12 +5446,20 @@ impl CerulionSubscriber {
 
     /// Same trigger drain with its existing admission cause made explicit.
     /// Does not consult the read plan twice or change native recording sites.
-    pub(crate) fn plugin_trigger_drain(&mut self, site: SyncAlignSite) -> (u64, Option<u64>, bool, bool) {
+    pub(crate) fn plugin_trigger_drain(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> (u64, Option<u64>, bool, bool) {
         let (popped, stamp, withheld) = self.drain_for_trigger_observed(match site {
             SyncAlignSite::Boundary => TriggerDrainSite::Boundary,
             SyncAlignSite::Refill => TriggerDrainSite::Refill,
         });
-        (popped, stamp, withheld, matches!(self.frozen, Some(FrozenSlot::Err(_))))
+        (
+            popped,
+            stamp,
+            withheld,
+            matches!(self.frozen, Some(FrozenSlot::Err(_))),
+        )
     }
 
     fn drain_for_trigger_observed(&mut self, site: TriggerDrainSite) -> (u64, Option<u64>, bool) {

@@ -483,7 +483,9 @@ this section is the opt-out's machinery.)
 and independent context execution gates. The frozen `HOST_API` contains C
 function pointers and primitive records; context maps, environment snapshots,
 ports, clocks, event queues and diagnostic owners remain host-local. All callbacks
-contain unwinds before returning across C. The loader calls `begin_fire()` once
+contain unwinds before returning across C. Context admission refuses BUSY instead
+of waiting on a concurrent or reentrant callback. Never hold the host context
+gate across node API execution. The loader calls `begin_fire()` once
 before each invocation, waits for node helpers before teardown, then revokes all
 leases before removing the context.
 

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::error::TransportError;
@@ -307,6 +307,19 @@ impl HostContext {
         // Context generations occupy the upper half; the descriptor index is
         // the lower half. The dispatcher validates the full ContextHandle first.
         Ok((context & 0xffff_ffff_0000_0000) | (u64::from(index) + 1))
+    }
+
+    /// Borrow host runtime services for scheduler maintenance. This hook
+    /// never crosses the node ABI and excludes every outstanding accessor.
+    pub fn with_native<R>(
+        &mut self,
+        operation: impl FnOnce(&mut NodeContext) -> R,
+    ) -> Result<R, HostServiceError> {
+        self.admit()?;
+        if self.leases.active() != 0 {
+            return Err(HostServiceError::Busy);
+        }
+        Ok(operation(&mut self.native))
     }
 
     /// Return cold binding facts using direction-scoped declaration order.
@@ -665,8 +678,16 @@ impl HostContext {
         }
         *spill_attempted = true;
         let header = *header;
-        let next_count = self.counters.committed.checked_add(1).ok_or(LeaseError::GenerationExhausted)?;
-        let next_spills = self.counters.spills.checked_add(1).ok_or(LeaseError::GenerationExhausted)?;
+        let next_count = self
+            .counters
+            .committed
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
+        let next_spills = self
+            .counters
+            .spills
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
         let layout = self.ports[index].spec.layout;
         let max_capacity = self.output_publisher(index)?.max_slice_len().get();
         if payload.len().checked_add(WireHeader::SIZE) != Some(size as usize)
@@ -793,12 +814,9 @@ impl HostContext {
             lease: token,
             size,
         };
-        let owner = match view.into_owned() {
-            Ok(owner) => Some(owner),
-            // No forged static borrow: the subscriber owns the held sample;
-            // busy excludes every mutation of that port until lease release.
-            Err(_held_view) => None,
-        };
+        // No forged static borrow: the subscriber owns the held sample;
+        // busy excludes every mutation of that port until lease release.
+        let owner = view.into_owned().ok();
         self.leases.insert(
             token,
             NativeLease::Read {
@@ -1033,8 +1051,12 @@ impl HostContext {
     /// independently of whether the tracing subscriber records a log line.
     pub fn diagnostic_failures(&self, context: u64, port: u64) -> Result<u64, HostServiceError> {
         self.admit()?;
-        if port == 0 { return Ok(self.diagnostics.total_failures()); }
-        let index = (port as u32).checked_sub(1).ok_or(LeaseError::InvalidHandle)? as usize;
+        if port == 0 {
+            return Ok(self.diagnostics.total_failures());
+        }
+        let index = (port as u32)
+            .checked_sub(1)
+            .ok_or(LeaseError::InvalidHandle)? as usize;
         let bound = self.ports.get(index).ok_or(LeaseError::InvalidHandle)?;
         self.port_index(context, port, bound.spec.direction)?;
         Ok(bound.diagnostics.total_failures())
@@ -1186,11 +1208,7 @@ pub struct HostCallFailure {
 /// Register a context at graph build; its raw Rust allocation stays host-local.
 // hot-path-alloc-ok-fn: graph construction only; callbacks never grow this registry
 pub fn register_context(context: HostContext) -> Result<u64, HostServiceError> {
-    let generation = NEXT_CONTEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| LeaseError::GenerationExhausted)?;
+    let generation = crate::transport::plugin_lease::mint_generation(&NEXT_CONTEXT)?;
     let mut rows = CONTEXTS
         .get_or_init(|| RwLock::new(Vec::new()))
         .write()
@@ -1230,14 +1248,19 @@ fn context_owner(handle: u64) -> Result<Arc<Mutex<HostContext>>, HostServiceErro
 }
 
 /// Execute a host operation inside its context gate; independent contexts
-/// run concurrently. Unwinds are caught before the mutex guard can poison.
+/// run concurrently. Concurrent/reentrant calls refuse BUSY without waiting.
+/// Unwinds are caught before the mutex guard can poison. Never hold this gate
+/// across NodeApi execution, which synchronously calls back into HOST_API.
 pub fn with_context<R>(
     handle: u64,
     operation: impl FnOnce(&mut HostContext) -> Result<R, HostServiceError>,
 ) -> Result<R, HostCallFailure> {
     let owner = context_owner(handle).map_err(|error| classify_failure(&error, 0))?;
-    let mut context = owner.lock().map_err(|_| HostCallFailure {
-        status: 3,
+    let mut context = owner.try_lock().map_err(|error| HostCallFailure {
+        status: match error {
+            std::sync::TryLockError::WouldBlock => abi::status_code::BUSY,
+            std::sync::TryLockError::Poisoned(_) => abi::status_code::PANICKED,
+        },
         kind: 0,
         error_token: 0,
     })?;
@@ -1248,10 +1271,10 @@ pub fn with_context<R>(
         Err(payload) => {
             // The payload and its destructor remain host-owned. Destruction
             // cannot unwind across C; abort/double-panic profile limits remain.
-            drop(payload);
+            context.terminal = true;
+            contain_panic_payload(payload);
             // Stop admission but preserve every live borrowed mapping until
             // the node invocation has returned and the loader revokes it.
-            context.terminal = true;
             HostServiceError::Panicked
         }
     };
@@ -1268,6 +1291,16 @@ pub fn with_context<R>(
     let failure = classify_failure(&error, token);
     context.diagnostic = Some(error);
     Err(failure)
+}
+
+fn contain_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        // A fatal host panic already stops admissions. A payload destructor
+        // that itself panics must not unwind across C or poison the context.
+        // Keep the secondary payload host-local without running another
+        // potentially panicking destructor; at most one per terminal context.
+        std::mem::forget(secondary);
+    }
 }
 
 fn classify_failure(error: &HostServiceError, error_token: u64) -> HostCallFailure {
@@ -1306,9 +1339,16 @@ pub fn copy_context_diagnostic(
     target: &mut [u8],
 ) -> Result<usize, HostServiceError> {
     let owner = context_owner(handle)?;
-    let context = owner.lock().map_err(|_| HostServiceError::Panicked)?;
-    catch_unwind(AssertUnwindSafe(|| context.copy_diagnostic(token, target)))
-        .map_err(|_| HostServiceError::Panicked)?
+    let context = owner.try_lock().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => HostServiceError::Busy,
+        std::sync::TryLockError::Poisoned(_) => HostServiceError::Panicked,
+    })?;
+    catch_unwind(AssertUnwindSafe(|| context.copy_diagnostic(token, target))).map_err(
+        |payload| {
+            contain_panic_payload(payload);
+            HostServiceError::Panicked
+        },
+    )?
 }
 
 /// Remove only after node calls/helpers have finished and pollers are revoked.
@@ -1348,7 +1388,7 @@ impl<T: Copy> Output<T> {
 impl CallerMemory {
     fn output<T>(&self, ptr: *mut T) -> Result<Output<T>, HostServiceError> {
         if ptr.is_null()
-            || (ptr as usize) % std::mem::align_of::<T>() != 0
+            || !(ptr as usize).is_multiple_of(std::mem::align_of::<T>())
             || (ptr as usize)
                 .checked_add(std::mem::size_of::<T>())
                 .is_none()
@@ -1415,7 +1455,7 @@ macro_rules! host_callback {
                 call_status(with_context($context.value, |$host| $body))
             })) {
                 Ok(result) => result,
-                Err(payload) => { drop(payload); status(abi::status_code::PANICKED) }
+                Err(payload) => { contain_panic_payload(payload); status(abi::status_code::PANICKED) }
             }
         }
     };
@@ -1696,7 +1736,7 @@ unsafe extern "C" fn callback_copy_error(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => call_status(Err(classify_failure(&error, 0))),
         Err(payload) => {
-            drop(payload);
+            contain_panic_payload(payload);
             status(abi::status_code::PANICKED)
         }
     }
@@ -1987,6 +2027,49 @@ mod tests {
     }
 
     #[test]
+    fn panicking_payload_destructor_is_contained_before_the_gate_can_poison() {
+        struct DropPanic;
+        impl Drop for DropPanic {
+            fn drop(&mut self) {
+                panic!("panic payload destructor oracle");
+            }
+        }
+        let handle = register_context(clock_context(900)).unwrap();
+        let failure = with_context::<()>(handle, |_| std::panic::panic_any(DropPanic)).unwrap_err();
+        assert_eq!(failure.status, abi::status_code::PANICKED);
+        let mut text = [0; 32];
+        assert_eq!(
+            copy_context_diagnostic(handle, failure.error_token, &mut text).unwrap(),
+            8
+        );
+        assert_eq!(&text[..8], b"Panicked");
+        remove_context(handle).unwrap();
+    }
+
+    #[test]
+    fn reentrant_callback_refuses_busy_without_waiting_on_its_own_gate() {
+        let handle = register_context(clock_context(321)).unwrap();
+        with_context(handle, |context| {
+            let mut out = std::mem::MaybeUninit::<abi::ClockValueV1>::uninit();
+            // SAFETY: the output record is live and exclusive. Reentrancy is
+            // deliberately exercised and must refuse before accessing state.
+            let result = unsafe {
+                (HOST_API.clock)(
+                    abi::ContextHandle { value: handle },
+                    abi::clock_source::ACTIVE,
+                    out.as_mut_ptr(),
+                )
+            };
+            assert_eq!(result.code, abi::status_code::BUSY);
+            assert_eq!(context.clock_now().unwrap(), 321);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(with_context(handle, |context| context.clock_now()), Ok(321));
+        remove_context(handle).unwrap();
+    }
+
+    #[test]
     fn status_classification_preserves_every_refusal_family() {
         for (error, status) in [
             (HostServiceError::Lease(LeaseError::InvalidHandle), 4),
@@ -1996,6 +2079,16 @@ mod tests {
             (HostServiceError::Lease(LeaseError::BudgetExhausted), 6),
             (HostServiceError::Lease(LeaseError::GenerationExhausted), 6),
             (HostServiceError::Busy, 6),
+            (HostServiceError::InvalidDescriptor, 5),
+            (HostServiceError::BufferTooSmall(17), 8),
+            (
+                HostServiceError::State(crate::state::StateError::SinkFull),
+                8,
+            ),
+            (
+                HostServiceError::State(crate::state::StateError::TrailingBytes { remaining: 1 }),
+                2,
+            ),
             (HostServiceError::Panicked, 3),
             (HostServiceError::MissingCapability, 7),
             (HostServiceError::Terminal, 4),
