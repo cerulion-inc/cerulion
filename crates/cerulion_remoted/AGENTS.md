@@ -40,7 +40,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
 - Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Metadata per-call; refusals keep readers and idle fence. Retire only outbound.
 
-## Testing
+## Tests
 - Run `wire_plane_test` with `-- --test-threads=1`: at the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
 - Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct

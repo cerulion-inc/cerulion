@@ -1,4 +1,4 @@
-# cerulion_cli - agent notes
+# cerulion_cli
 
 Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.md`; behavior lives there.
 
@@ -25,7 +25,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   `Commands` variant (cli.md §14)
 - Create verbs (`node|graph|schema create`) complete nothing.
 
-## Testing
+## Tests
 - `network_gateway_e2e_test`: local switches/egress exclusion, independent open TCP peer, local and allowed delivery.
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
   They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field (Rust
