@@ -642,9 +642,13 @@ impl VerbHandler for CodePairFinishVerb {
 /// On the `cerulion-remoted` daemon each engage also sends an `estop` tool
 /// call to the robot's `cerulion-rcpd`, which closes rcpd's own latch, and
 /// sends it again until rcpd answers that it did ([`crate::rcp`]). The
-/// delivery starts after the lease has flipped, runs on a task of its own,
-/// and the verb answers without waiting for it; an engage while a delivery
-/// is in flight starts none.
+/// engage is counted with `RcpdEstop::send` after the lease has flipped and
+/// before the verb writes its `e-stop ENGAGED` line; the delivery runs on a
+/// task of its own, and the verb answers without waiting for it. An engage
+/// while a delivery runs starts none: that delivery covers it, and sends
+/// once more when the engage came after the attempt rcpd answers began. An
+/// engager that is not a device key sends nothing, and that is logged at
+/// warn.
 pub struct EngageEstopVerb {
     lease: EstopLease,
     /// Who to tell that an incident was declared.
@@ -723,10 +727,13 @@ impl VerbHandler for EngageEstopVerb {
         _args: &serde_json::Value,
     ) -> CerudResult<serde_json::Value> {
         let safe = self.lease.engage(&caller.id);
-        tracing::warn!(by = %caller.id, "cerulion_remoted: e-stop ENGAGED (safety floor)");
         // rcpd's own latch closes on an `estop` tool call. The delivery runs
         // on a task of its own and `send` returns at once, after the lease
-        // has flipped; nothing the delivery does reaches this verb's answer.
+        // has flipped and before the ENGAGED line below is written. In the
+        // daemon every `tracing` line is queued for the log writer's own
+        // thread (`crate::log_writer`), so a full stderr holds neither this
+        // verb nor an attempt of the delivery. Nothing the delivery does
+        // reaches this verb's answer.
         if let Some(rcpd) = &self.rcpd {
             match caller_device_key(caller) {
                 Ok(engager) => {
@@ -739,6 +746,7 @@ impl VerbHandler for EngageEstopVerb {
                 ),
             }
         }
+        tracing::warn!(by = %caller.id, "cerulion_remoted: e-stop ENGAGED (safety floor)");
         // A human declared an incident; ask the machine's
         // recorder for the moment.
         //

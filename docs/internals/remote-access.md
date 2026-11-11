@@ -56,6 +56,106 @@ the same entry instead of running the daemon.
   whether to serve), and still runs the epoch poll on its state root. Pinned by
   `remote_plane_library_test.rs` and the verb-name pin in `ops.rs`.
 
+- **Stopping** (`main.rs`, `shutdown.rs`). Before it binds, the binary installs
+  its SIGINT (Ctrl-C) and SIGTERM handlers on a thread with a tokio runtime of
+  its own, so they still answer while the serving runtime tears down. On the
+  first stop signal that thread arms the deadline, then hands serving the
+  signal's name; serving logs one info line naming it (`signal`), and the
+  accept loop stops. Every `tracing` line is queued for the log writer
+  (below), so no such line holds the stop thread or serving: the stop thread
+  queues its deadline or second-signal line and waits at most
+  `EXIT_LOG_GRACE` (100 ms) for the queue before `_exit(4)`, and `main` waits
+  as long for it once the serving runtime is dropped. A stderr that stays full
+  delays neither the graceful stop nor the hard exit past the deadline and
+  that 100 ms. The accept loop also stops when
+  the endpoint closes on its own. Either way `serve_planes` drops its shutdown
+  future before it logs anything, which arms the deadline when no signal did,
+  so a blocked log write cannot hold it back, then runs the ops plane's
+  `ShutdownStage` (`OpsServing::shutdown_stage`) before it returns, so every
+  serving entry runs it once. Each registered `ShutdownParticipant` is driven
+  to settlement on a task of its own, one after another in registration order,
+  with no timeout, while the receipt sink is alive; after a stop signal the
+  endpoint and its connections are alive too and keep serving while the stage
+  runs, and when the endpoint closed on its own they are already gone. The
+  participants are the ones the host registered on the ops serving's stage. A
+  participant that returns an error, panics or is cancelled never stops a later
+  one; `serve_planes` returns `RemotedError::Shutdown` naming each. `serve_core`
+  then ends the rcpd e-stop delivery in flight (at most 5 s) and stops the
+  epoch poller, failed stage or not, and logs that it did; the entry closes the
+  endpoint (about 3 s with default parameters, longer on a high round-trip
+  path), and the runtime teardown waits for the work left on the blocking pool,
+  such as a running ops verb. The exit status is 0, also when the stop started
+  because the accept loop stopped on its own, or 3 with one error line per
+  participant (`participant`, `kind`) that failed, panicked or was cancelled;
+  `cerulion-remoted` registers none of its own.
+  `CERULION_REMOTED_HARD_EXIT_MS` (default 30000 ms) bounds all of it from the
+  first stop signal, or from the moment serving dropped its shutdown future
+  without one: past it an error line is logged and the process ends with
+  `_exit(4)`, the explicit failure exit. A second stop signal during the stop
+  also ends it with status 4, after the same wait of at most 100 ms for the
+  log queue; after the accept loop stopped on its own, the first stop signal
+  already counts as that second one. The default was chosen as a sum of
+  nominal shares: 18 s reserved for the participants the host registers, 5 s for
+  the wait for the task of an rcpd delivery that the stop has already ended,
+  which gives the delivery no more time, about 3 s for the endpoint close and
+  4 s of scheduling. The shares bound no real work: a
+  participant may keep awaiting work past its share, and that work stays
+  pending until the process exits; a participant that needs more than its share
+  needs the deadline raised with it. The deadline is a separate failure policy:
+  it ends the process and proves nothing finished. The daemon's own work ends
+  with the process, except a thread in an uninterruptible kernel wait, such as
+  an fsync on a stalled disk, which holds the exit until that wait returns; a
+  child process keeps running. An ops request still running past the deadline
+  (its own limit is 120 s) is cut by the hard exit. SIGKILL runs none of this
+  and logs nothing. Under `cerulion-netd`'s robot supervisor, a netd stop ends
+  `cerulion-remoted` with SIGKILL unless it has already exited, so its
+  graceful stop can be cut short there. Pinned by `daemon_stop_signal_test.rs`,
+  `shutdown_stage_test.rs` and the stage tests in `shutdown.rs`.
+
+- **Logging** (`log_writer.rs`, `main.rs`). The binary's fmt subscriber writes
+  through a `LogWriter`: fmt formats each event on the thread that logs it,
+  with that event's timestamp; the writer (`EventLine`) gathers the bytes and,
+  when fmt drops it, hands them to a queue as one owned line, under the
+  queue's lock for one push. One thread, `remoted-log`, pops each line in
+  order and does the blocking `write_all` to stderr with the lock released;
+  that lock is the only one the `tracing` path shares with it. The iceoryx2
+  console logger (remoted installs no tracing bridge for it) and the default
+  panic hook still write to stderr directly. A line that `admits` refuses
+  (`QUEUE_LINES` 4096 lines, `QUEUE_BYTES` 1 MiB) is dropped and counted, as
+  is a line whose write fails; `log_writer::lines_dropped` reads the count
+  since the start, and the wire plane's `status` reply sends it as
+  `log_lines_dropped` (`None`, not serialized, without an installed writer:
+  a library host keeps its own subscriber). After each write, and when a drop
+  wakes it while it waits for a line, the writer thread feeds the drops since
+  its last report to one `FailureRegimeLatch`, one failure per line
+  (`drop_report`): a batch that opens the regime or crosses a decade of the
+  total logs at warn (`dropped`, `total_dropped`), any other at debug; with
+  the queue empty and no drop since that report, `on_success` ends an open
+  regime with one info line (the regime's `dropped`, `total_dropped`), silent
+  for a regime of one line. `writing` stays set until the report is written,
+  and the queue's `reported` count, which only the writer thread stores,
+  shows a drop it has not reported yet, so a drain waits for both.
+  The writer thread formats those lines through the same subscriber, and a
+  thread-local makes its `EventLine` write them straight to stderr, never
+  into the queue; a report line whose write fails is not counted.
+  `LogWriter::drain` is each exit's wait: until the queue is empty, no write
+  or report is in flight and no drop is left unreported, for at most four
+  fifths of the grace; then
+  all but the newest `KEPT_AT_EXIT` (8) queued lines are discarded, one error
+  line (`discarded`) is queued after them when there are any, and it waits
+  for the rest of the grace or until the queue is written. A line the stop
+  thread queues behind a full queue is dropped like any other. A writer
+  thread that cannot start, or a runtime that cannot be built, exits the
+  binary 1 after one error line. In a build with the test seam only,
+  `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a smaller line bound
+  (`test_queue_lines`: a positive whole number, at most `QUEUE_LINES`), as
+  the crate's other `_FOR_TEST` variables set their seams; it takes effect
+  once the daemon has logged that it listens (`shrink_queue_for_test`,
+  called right after that line), so the lines before it are queued under the
+  full bound. Pinned by the
+  unit tests in `log_writer.rs`, `estop_full_stderr_test.rs` and
+  `daemon_stop_signal_test.rs`.
+
 - **Always-on from boot.** Ops + pairing must be reachable when NO graph is
   running, so the endpoint host is a robot-level service, not the per-run
   gateway. *This is a deployment requirement, not a runtime check: no test
@@ -79,7 +179,7 @@ the same entry instead of running the daemon.
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
 | `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, and the protocol-only `OpsClient`; depends on serde, serde_json and thiserror only |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
-| `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust |
+| `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
 | `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the `cerulion connect`/`pair` worker binary (session driver + CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
@@ -311,8 +411,13 @@ snapshot (`topic-snapshot`).
   AND role ≥ VIEWER (non-vacuous: `Role` is an open `u16`, so a role less
   privileged than VIEWER holding `CAP_OBSERVE` is representable, and denied);
   lifecycle mutation needs role ≥ OPERATOR; `teleop` needs `CAP_TELEOP` AND
-  role ≥ OPERATOR; an UNCLASSIFIED verb is DENIED, never fail-open. Lower
-  `Role` value = higher privilege.
+  role ≥ OPERATOR; `clear-estop` needs the OPERATOR role or higher and is
+  refused to a row whose principal is cloud whether the allow-from-cloud switch
+  is on or off (class `NonCloud`: the authorizer refuses it before dispatch, so
+  the refusal is receipted `Denied`); `estop-status` needs `CAP_OBSERVE` AND the
+  VIEWER role or higher; no host registers either e-stop verb yet, so a caller
+  the authorizer admits gets `unknown_verb`; an UNCLASSIFIED verb is DENIED,
+  never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read
   from client args (`pairing_verbs.rs` module docs; `ops_loopback_test.rs`).
   Validity, anti-rollback and the CPace TTL are evaluated against the robot's
@@ -338,7 +443,10 @@ snapshot (`topic-snapshot`).
   incident capture request onto the machine-local flashback channel
   (`remoted/src/flashback.rs`), best-effort by design: a failed ask never
   fails the e-stop, and the verb type cannot be built without a real ask in a
-  production build (`estop_flashback_test.rs`).
+  production build (`estop_flashback_test.rs`). On the daemon it also counts
+  the engage with `rcp::RcpdEstop::send`, whose delivery sends an `estop` into
+  the robot's `cerulion-rcpd` until rcpd answers (see the rcp plane, section
+  6); the verb's answer never waits for it.
 - **Lease over reconnects**: the holder/engager token is the stable
   TLS-authenticated device key, not the QUIC connection id; e-stop is robot
   state persisting across reconnects until cleared, and a different paired key
@@ -385,7 +493,8 @@ or call checks the latch every 10 ms and stops when it engages, a call
 stopped before its request goes out sends none, and a publish sends each
 frame, and a call its request, only while it holds the lease's lock and reads
 the latch clear. The rcp plane shares this latch: an rcp `estop` engages it,
-and while it is engaged rcp tool calls are refused (the rcp plane below). A
+and while it is engaged rcp tool calls other than `estop` are refused (the rcp
+plane below). A
 publish is
 refused when its subscriber wait plus its frames at the rate exceed 90 s, and
 is stopped if it is still running 100 s after it started (a frame that takes
@@ -499,16 +608,33 @@ frame cut off, or a robot frame over the 16 MiB cap;
 boundary) each end the desk process with status 1 and an error line, the
 break's cause passed through `sanitize_peer_text`.
 
-One e-stop latch covers the ops act verbs and the rcp plane (`restart` does
-not read it): the ops plane's
-`cerud::lease::ControlLease` behind one `EstopLease` (the lease plus the
-count of e-stop engages waiting for its lock). The daemon builds it once
+One e-stop latch covers the ops act verbs, `restart` and the rcp plane: the
+ops plane's `cerud::lease::ControlLease` behind one `EstopLease` (the lease
+plus the count of e-stop engages waiting for its lock). The daemon builds it once
 (`OpsHost::daemon`); `serve_core` hands it to `OpsServing` (for
-`engage-estop` and the act verbs) and a clone to `RcpPlane`, so both planes
+`engage-estop`, `restart` and the act verbs) and a clone to `RcpPlane`, so both planes
 share the latch and the count. `serve_core` also gives the daemon host an
 `rcp::RcpdEstop` over the same `RcpLink` (`OpsHost::with_rcpd_estop`), which
 `EngageEstopVerb` holds. A library host has no lease, no `RcpdEstop` and
-serves no rcp plane. The session reader engages it through `EstopLease::engage` for an
+serves no rcp plane. `EstopLease::holds` is the blocking read of the latch that the act verbs'
+refusal, the rcp plane's Act check and `restart` share: an engage is counted
+(read without the lock, and again under it, so an engage that counts itself
+in while the read waits for the lock is not missed), or the latch reads
+engaged under the lock, held for those reads only, and a poisoned lock reads
+engaged. The act verbs' 10 ms
+watcher and their send path read the latch themselves (above). The daemon
+registers `restart` as `RestartVerb::new().with_gate(..)` over an
+`ops::EstopRestartGate`, and cerud asks the gate before each step. It asks
+for `RestartStep::Stop` before it parses the args, so the refusal reads the
+same on every host and nothing runs. It asks for `RestartStep::Start` after
+the stop command and before the start command, so after an engage during
+`systemctl stop` the start command does not run; that refusal is
+`unavailable: ` followed by `ops::RESTART_STOPPED_NOT_STARTED`. The pure
+decision is `estop_policy::restart_check`. Each check takes the lease's lock
+at most once, for one read, and never holds it across a command, so an engage
+after the second check does not stop the graph that `systemd-run` starts. A
+library host still refuses `restart` by name. The session reader engages the
+latch through `EstopLease::engage` for an
 authorized `RcpClass::Estop` message right after `rcp_authorize`, before the
 upstream check and the e-stop bound, so an unreachable rcpd or a spent bound
 still leaves it engaged; a forward failure never undoes it. The engage is
@@ -516,7 +642,7 @@ counted before it waits for the lease's lock, so an act verb sends nothing
 more once it is counted. The engager is the session's caller string. A
 direct engage writes no ops receipt; rcpd still receipts the forwarded
 `estop`. For an `RcpClass::Act` message the reader reads the count, then the
-latch under the lock (a poisoned lock reads engaged), and while an engage is
+count and the latch under the lock (a poisoned lock reads engaged), and while an engage is
 counted or the latch is engaged answers `-32001` `refused: the robot's
 e-stop is engaged`, or for `estop_clear` (still `RcpClass::Act`) `refused:
 the robot's ops e-stop is engaged; it clears when cerulion-remoted
@@ -525,35 +651,73 @@ never across an `.await` and never with a connection, session, trust or
 receipt lock. The latch is read when a desk's message arrives and again on
 the open connection to rcpd just before the plane sends it. A call already
 sent to rcpd is stopped by rcpd's own latch, which an rcp `estop` closes in
-its stream and an ops `engage-estop` closes through `RcpdEstop::send`: after
-`EstopLease::engage` and its warning, the verb decodes the caller's device
-key and calls `send`, which returns at once. `send` takes the in-flight flag
-(one `AtomicBool`, compare-and-swap); when a delivery holds it, the engage
-starts none and logs that at info. Otherwise it spawns, on the runtime handle
-`serve_core` captured, a task that owns the flag's guard and runs
-`Delivery::run`, a loop of `estop_rcpd` attempts until one returns `Ok`.
-Each attempt reads the token through `load_token`, then sends `initialize`,
+its stream and an ops `engage-estop` closes through `RcpdEstop::send`:
+right after `EstopLease::engage`, and before its `e-stop ENGAGED` warning,
+the verb decodes the caller's device key and calls `send`, which returns
+at once (in the daemon every `tracing` line, the delivery's failure and
+closed-latch lines included, is queued for the log writer, so a full stderr
+holds neither the verb nor an attempt); a caller id that is not
+a device key sends nothing and logs that at warn. `RcpdEstop` shares an
+`Owing` with its delivery: a `period` mutex over the period's first engager
+and the last delivery id, an `engages` count and the `running` delivery
+id (0 for none). Under `period`, `send` names the first engager of the
+period, adds one to `engages`, and, when `running` is 0, sets it to a new id
+and builds the delivery; it then releases `period`, spawns `Delivery::run`
+on the runtime handle `serve_core` captured, in the engage's span, and
+keeps the handle of the delivery with the larger id. Otherwise it releases
+`period` and logs at info that the running delivery covers the engage.
+`period` is held only for those steps, never across an `.await`, and
+no log line is written under it. Each attempt reads `engages` as it
+begins, reads the token through `load_token`, then sends `initialize`,
 `notifications/initialized` and `tools/call` `estop` with `reason`
-`rcp::OPS_ESTOP_REASON`, each POST on a fresh loopback connection with the
-headers `Upstream::request` builds (`x-cerulion-caller` is
-`caller_identity(key, account_for_key(key))`), its response head within
-`RcpLimits::head_timeout` and its answer within the target's answer timeout
-(`OPS_ESTOP_ANSWER`, 10 s) after it, then a `DELETE` of the session it
-opened. It returns `Ok` only when the call's result says `"estopped": true`
-(`estop_outcome`). After a failed attempt the loop sleeps `retry_in`
-(`OPS_ESTOP_RETRY_FIRST`, 100 ms, doubled after each failure up to
-`OPS_ESTOP_RETRY_CAP`, 2 s), logs the first failure at error with `reason`
-and then at most one line per `OPS_ESTOP_LOG_EVERY` (30 s) with `attempts`
-(rcpd's text through `sanitize_peer_text`), and logs the closed latch at
-warn. Both the attempt and the sleep race the stop flag, a `watch` that
+`rcp::OPS_ESTOP_REASON` (`estop_session`), each POST on a fresh loopback
+connection with the headers `Upstream::request` builds (`x-cerulion-caller`
+is `caller_identity(key, account_for_key(key))` of the period's first
+engager), its response head within `estop_policy::estop_head_bound` of
+`RcpLimits::head_timeout` (at least `OPS_ESTOP_HEAD_FLOOR`, 1 s) and its
+answer within `OPS_ESTOP_ANSWER` (10 s) after it, then a `DELETE` of the
+session rcpd issued it, within `OPS_ESTOP_DELETE` (2 s), also after a
+stop by Ctrl-C or SIGTERM. It succeeds only when the call's result says
+`"estopped": true` (`estop_outcome`); the delivery records the answer on
+its `Running` guard as soon as the call returns, before the `DELETE`, logs
+it at warn with `failed_attempts` after the `DELETE`, then calls
+`Owing::finish` on its own task. `finish`, under `period`, writes no log line and asks
+`estop_policy::after_answer` of the count at the attempt's start and
+now: `Done` ends the period and clears `running` while it still holds
+the delivery's id, so the next engage starts a delivery, and `Again`
+(an engage came during the answered attempt) sends at once again.
+After a failed attempt the loop logs through one `FailureRegimeLatch`
+per delivery (the first failure and each decade of failures at warn with
+`reason`, rcpd's text through `sanitize_peer_text`, the others at debug
+with `suppressed`), then sleeps `retry_in` (`OPS_ESTOP_RETRY_FIRST`, 100 ms,
+doubled after each failure up to `OPS_ESTOP_RETRY_CAP`, 2 s).
+Both the attempt and the sleep race the stop flag, a `watch` that
 `RcpdEstop::shut_down` sets once `serve_planes` returns; `shut_down` then
-waits for the task within `CONNECT_TIMEOUT`, and a delivery cut short logs
-at warn. Nothing the delivery does reaches the verb's answer or the
-lease. rcpd refuses each mutating call it holds that it
-has not yet published once its latch closes; the one it is running was
-already published. `ControlLease::clear_estop` has no caller, so the latch
-clears only when `cerulion-remoted` restarts; then rcpd's own latch clears
-through its `estop_clear` (`limits.estop_clear: agent`) or by deleting
+waits for the task within `CONNECT_TIMEOUT`; a delivery whose `send` has
+not yet stored its handle is not awaited, and it reads the stop and ends
+as on any stop. A `Running` guard in the delivery clears `running` on
+any other end, by compare-and-swap of its own id, and logs at error unless
+rcpd had answered the attempt in flight: a stop by Ctrl-C or SIGTERM
+(`serve_core`'s teardown calls `RcpdEstop::shut_down`), a panic, or a runtime
+dropped with the task. A delivery ended during the `DELETE` of an attempt rcpd
+answered logs nothing; one that reaches `finish`'s `Done` has its mark cleared
+there, so its guard reads no flag. An error answer leaves `answered` unset.
+A `cerulion-remoted` that is killed (SIGKILL), crashes, or ends at the
+hard-exit deadline or a second stop signal (`_exit(4)`) runs no destructor,
+so it may end with no line and no `DELETE`. A `send` that reads `running`
+just before an ending delivery's guard clears it logs the engage as covered
+and starts nothing; unless rcpd had answered the attempt in flight, the guard logs
+its error line as well. A delivery that ends before `finish` answers
+`Done`, answered or not, leaves its period open, so the next delivery still names the period's first engager
+and rcpd's journal can name an earlier device for a later engage. Every
+delivery line names the engager as `by` (the device key, hex); the warn
+failure lines and the closed-latch line also carry rcpd's caller identity as
+`caller`. Nothing the delivery does reaches the verb's answer or the lease.
+rcpd refuses each mutating call it holds when the `estop` reaches it and has
+not yet published once its latch closes; the one it is running was already
+published. `ControlLease::clear_estop` has no caller outside tests, so the
+latch clears only when `cerulion-remoted` restarts; then rcpd's own latch
+clears through its `estop_clear` (`limits.estop_clear: agent`) or by deleting
 `<receipts>.estop` and restarting rcpd.
 
 When rcpd answers HTTP 404 to a request that carried its session id (rcpd
@@ -903,6 +1067,9 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/device_index_test.rs` | Side-map MAC integrity: no forged key→owner binding |
 | `crates/cerulion_remoted/tests/beacon_facts_test.rs` | Beacon-facts atomic write/round-trip/claimable flip |
 | `crates/cerulion_remoted/tests/daemon_wiring_test.rs` | Kill-switch + loud provisioning-gap errors before any endpoint binds |
+| `crates/cerulion_remoted/tests/daemon_stop_signal_test.rs` | The real binary: SIGTERM and Ctrl-C stop it gracefully with exit 0 and the teardown line; a test-seam stage participant that never finishes is ended by `CERULION_REMOTED_HARD_EXIT_MS` with status 4, also when the endpoint's own close (a test seam) started the stop with no signal; a second signal during the stop exits 4 long before the deadline; after the endpoint's own close, the first stop signal exits 4 as a second one does; a participant that fails exits 3 after the teardown ran; the stage runs before the rcpd e-stop sender is stopped; with stderr full the deadline still exits 4, a graceful stop exits 0, and a graceful stop waits for its queued lines until the pipe drains |
+| `crates/cerulion_remoted/tests/estop_full_stderr_test.rs` | The real binary with its stderr pipe full and a log queue of one line (test seam): an rcp `estop` and an ops `engage-estop` each reach a stand-in rcpd within 5 s, with the desk's caller; `status` counts two or more dropped lines while the pipe is full; once it drains, the warn drop line and the info caught-up line are written, and every line `status` then counts is named by them or by a later drop or caught-up line |
+| `crates/cerulion_remoted/tests/shutdown_stage_test.rs` | `serve_planes` drops its shutdown future before the stage, on a stop request (endpoint open during the stage) and when the endpoint closes on its own (endpoint closed), and before the line that says the loop stopped; `run` under the kill switch drops it before its warn line; the drop before the endpoint-closed stop line and before the kill-switch warn is pinned against a log writer that blocks |
 | `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
 | `crates/cerulion_connectd/tests/act_network_switch_test.rs` | The real `cerulion-connectd act` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same call dials it |
 | `crates/cerulion_connectd/tests/rcp_network_switch_test.rs` | The real `cerulion-connectd rcp` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same command dials it |

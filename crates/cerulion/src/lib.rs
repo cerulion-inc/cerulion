@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Cerulion: zero-copy middleware for real-time robotics.
+//! Cerulion: a zero-copy runtime for real-time robotics.
 //!
 //! This is the umbrella crate. It carries no logic of its own: it re-exports
 //! the three crates a Cerulion project uses, held at one version, so that a

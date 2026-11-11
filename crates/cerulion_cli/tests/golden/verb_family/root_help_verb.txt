@@ -1,6 +1,6 @@
 exit: Some(0)
 --- stdout
-Cerulion robotics middleware CLI
+Cerulion robot runtime CLI
 
 Usage: cerulion [OPTIONS] <COMMAND>
 
