@@ -19,6 +19,12 @@ pub enum CallError {
     InvalidState,
     /// Node code unwound; the unwind was caught inside the execution gate.
     Panic(&'static str),
+    /// The canonical state encoder unwound inside its own guard.
+    EncoderPanic,
+    /// The canonical state decoder unwound inside its own guard.
+    DecoderPanic,
+    /// A host state sink refused a write, including a caught host sink panic.
+    StateSinkFull(String),
     /// A poisoned registry or instance mutex prevented admission.
     Poisoned {
         operation: &'static str,
@@ -108,6 +114,14 @@ impl<T> NodeRegistry<T> {
         handle: u64,
         call: impl FnOnce(&mut T) -> TransportResult<R>,
     ) -> Result<R, CallError> {
+        self.call_with(handle, |node| call(node).map_err(CallError::Node))
+    }
+
+    pub(super) fn call_with<R>(
+        &self,
+        handle: u64,
+        call: impl FnOnce(&mut T) -> Result<R, CallError>,
+    ) -> Result<R, CallError> {
         let instance = self.instance(handle)?;
         let mut gate = instance.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => CallError::InvalidState,
@@ -117,12 +131,10 @@ impl<T> NodeRegistry<T> {
             },
         })?;
         let value = gate.as_mut().ok_or(CallError::InvalidHandle)?;
-        catch_unwind(AssertUnwindSafe(|| call(value)))
-            .map_err(|payload| {
-                super::contain_panic_payload(payload);
-                CallError::Panic("")
-            })?
-            .map_err(CallError::Node)
+        catch_unwind(AssertUnwindSafe(|| call(value))).map_err(|payload| {
+            super::contain_panic_payload(payload);
+            CallError::Panic("")
+        })?
     }
 
     /// Invalidate an instance and drop its state with its own compiler/allocator.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Actual downstream delivery through both local raw SDK backends.
+//! Raw delivery and native state/refusal parity through both SDK backends.
+//! Prerequisites: build test_node_macro_cdylib and test_node_state_panic_cdylib.
 //! Run this binary alone with --test-threads=1 under the build desk lock.
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::node::{DylibNodeEntry, NodeContext, ShutdownSignal};
@@ -16,6 +17,23 @@ use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+mod unwired_native {
+    use cerulion_core::prelude::*;
+    use native_ros2_messages::geometry_msgs::Vector3;
+    #[cerulion_node(period_ms = 1)]
+    pub struct UnwiredProbe {
+        #[output]
+        pub cmd_out: Vector3,
+    }
+    #[cerulion_node_impl]
+    impl UnwiredProbe {
+        fn tick(&mut self) -> Result<(), NodeError> {
+            self.cmd_out.x = 1.0;
+            Ok(())
+        }
+    }
+}
 
 #[test]
 fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames() {
@@ -645,7 +663,7 @@ fn native_and_stable_output_discard_logs_match_exactly_and_recover_after_deliver
 }
 
 #[test]
-fn unwired_rust_outputs_are_absent_and_the_loaded_graph_can_tick() {
+fn unwired_rust_outputs_preserve_native_init_and_named_tick_refusal() {
     use cerulion_core::graph::node::NodeEntry;
     use cerulion_core::graph::node_host_abi::HostPortSpec;
     use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
@@ -691,18 +709,127 @@ fn unwired_rust_outputs_are_absent_and_the_loaded_graph_can_tick() {
     drop(client);
     with_context(context.value, |host| host.end_node_call()).unwrap();
     remove_context(context.value).unwrap();
-    let path = cerulion_core::testing::find_fixture_cdylib("test_node_macro_cdylib");
-    let mut node = DylibNodeEntry::load(&path).unwrap();
-    node.init(NodeContext::with_runtime_env(
-        IndexMap::new(),
-        IndexMap::new(),
-        clock,
-        ShutdownSignal::new(),
-        env,
-    ))
-    .unwrap();
     for _ in 0..2 {
-        node.tick().unwrap();
+        let empty = || {
+            NodeContext::with_runtime_env(
+                IndexMap::new(),
+                IndexMap::new(),
+                clock.clone(),
+                ShutdownSignal::new(),
+                env.clone(),
+            )
+        };
+        let mut native = unwired_native::UnwiredProbeEntry::new();
+        native.init(empty()).unwrap();
+        let path = cerulion_core::testing::find_fixture_cdylib("test_node_macro_cdylib");
+        let mut stable = DylibNodeEntry::load(&path).unwrap();
+        stable.init(empty()).unwrap();
+        for error in [native.tick().unwrap_err(), stable.tick().unwrap_err()] {
+            let cerulion_core::error::TransportError::NodeError { reason, .. } = error else {
+                panic!("unwired tick must keep the native untyped node error class: {error}");
+            };
+            assert_eq!(
+                reason,
+                "zero-copy tick: missing publisher for output `cmd_out`"
+            );
+        }
+        native.shutdown().unwrap();
+        stable.shutdown().unwrap();
     }
-    node.shutdown().unwrap();
+}
+
+#[test]
+fn host_sink_panic_keeps_native_minus_six_detail_without_latching() {
+    use cerulion_core::graph::node::NodeEntry;
+    use cerulion_core::state::{SinkFull, StateSink};
+    struct PanicSink {
+        writes: usize,
+        refused: usize,
+    }
+    impl StateSink for PanicSink {
+        fn write(&mut self, _: &[u8]) -> Result<(), SinkFull> {
+            self.writes += 1;
+            panic!("host sink panic oracle");
+        }
+        fn refuse(&mut self) {
+            self.refused += 1;
+        }
+    }
+    extern "C" fn panicking_native_sink(_: *mut std::ffi::c_void, _: *const u8, _: usize) -> i32 {
+        match std::panic::catch_unwind(|| panic!("native host sink panic oracle")) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }
+    let path = cerulion_core::testing::find_fixture_cdylib("test_node_state_panic_cdylib");
+    let detail =
+        "cerulion_node_capture_state: state sink is full: the capture exceeds the boundary budget";
+    for _ in 0..2 {
+        let empty = || {
+            NodeContext::with_runtime_env(
+                IndexMap::new(),
+                IndexMap::new(),
+                Arc::new(VirtualClock::new()),
+                ShutdownSignal::new(),
+                Arc::new(HashMap::new()),
+            )
+        };
+        // SAFETY (U01/U03/U12): trusted same-compiler native control fixture,
+        // exact generated signatures, transferred boxed context, library kept
+        // live through shutdown and diagnostic copy/free; callback retains no bytes.
+        unsafe {
+            let library = libloading::Library::new(&path).unwrap();
+            let init = library
+                .get::<extern "C" fn(*mut NodeContext) -> u64>(b"cerulion_node_init\0")
+                .unwrap();
+            type SinkFn = extern "C" fn(*mut std::ffi::c_void, *const u8, usize) -> i32;
+            let capture = library
+                .get::<extern "C" fn(u64, Option<SinkFn>, *mut std::ffi::c_void, u64) -> i32>(
+                    b"cerulion_node_capture_state\0",
+                )
+                .unwrap();
+            let take = library
+                .get::<extern "C" fn() -> *mut std::ffi::c_char>(b"cerulion_take_last_error\0")
+                .unwrap();
+            let free = library
+                .get::<unsafe extern "C" fn(*mut std::ffi::c_char)>(b"cerulion_free_error\0")
+                .unwrap();
+            let shutdown = library
+                .get::<extern "C" fn(u64) -> i32>(b"cerulion_node_shutdown\0")
+                .unwrap();
+            let handle = init(Box::into_raw(Box::new(empty())));
+            assert_ne!(handle, 0);
+            assert_eq!(
+                capture(
+                    handle,
+                    Some(panicking_native_sink),
+                    std::ptr::null_mut(),
+                    u64::MAX
+                ),
+                -6
+            );
+            let text = take();
+            assert!(!text.is_null());
+            assert_eq!(std::ffi::CStr::from_ptr(text).to_str().unwrap(), detail);
+            free(text);
+            assert_eq!(shutdown(handle), 0);
+        }
+        let mut node = DylibNodeEntry::load(&path).unwrap();
+        node.init(empty()).unwrap();
+        let mut sink = PanicSink {
+            writes: 0,
+            refused: 0,
+        };
+        let error = node.capture_state(&mut sink).unwrap_err();
+        let cerulion_core::error::TransportError::GraphError { reason } = error else {
+            panic!("sink panic must preserve native state error class: {error}");
+        };
+        assert!(
+            reason.contains("state capture failed (code -6):"),
+            "{reason}"
+        );
+        assert!(reason.ends_with(detail), "{reason}");
+        assert_eq!((sink.writes, sink.refused), (1, 0));
+        node.shutdown().unwrap();
+    }
 }

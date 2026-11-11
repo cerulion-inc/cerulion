@@ -21,6 +21,10 @@ pub trait PluginNode: Sized + Send {
     fn tick(&mut self) -> TransportResult<()>;
     fn shutdown(&mut self) -> TransportResult<()>;
     fn state_shape() -> u64;
+    /// Validate capture preconditions outside the canonical encoder guard.
+    fn prepare_capture(&self) -> TransportResult<()> {
+        Ok(())
+    }
     fn capture(&self, sink: &mut dyn StateSink) -> TransportResult<()>;
     fn restore(&mut self, payload: &[u8]) -> TransportResult<()>;
     fn inline_safe(&self) -> bool;
@@ -121,6 +125,17 @@ impl<T: PluginNode> NodeExports<T> {
                 0,
                 format!("{operation}: panic caught by catch_unwind"),
             ),
+            CallError::EncoderPanic => (
+                status_code::PANICKED,
+                0,
+                "cerulion_node_capture_state: the node's state encoder panicked; nothing was captured".into(),
+            ),
+            CallError::DecoderPanic => (
+                status_code::PANICKED,
+                0,
+                "cerulion_node_restore_state: the node's state decoder panicked; the node is PARTIALLY restored and the run must fail".into(),
+            ),
+            CallError::StateSinkFull(text) => (status_code::BUFFER_TOO_SMALL, 0, text),
             CallError::Poisoned { operation, mutex } => (
                 status_code::FAILED,
                 0,
@@ -147,17 +162,6 @@ impl<T: PluginNode> NodeExports<T> {
             code,
             kind,
             error: token,
-        }
-    }
-    fn clear_instance_diagnostic(&self, owner: u64) {
-        if let Ok(mut errors) = self.errors.lock() {
-            if let Some(slot) = errors
-                .instances
-                .iter_mut()
-                .find(|slot| slot.handle == owner)
-            {
-                slot.pending = None;
-            }
         }
     }
     fn guarded(
@@ -265,6 +269,31 @@ impl<T: PluginNode> NodeExports<T> {
         self.registry.call(handle, |node| {
             node.flush_deferred()?;
             call(node)
+        })
+    }
+
+    fn call_state(
+        &self,
+        handle: u64,
+        capture: bool,
+        call: impl FnOnce(&mut T) -> TransportResult<()>,
+    ) -> Result<(), CallError> {
+        self.registry.call_with(handle, |node| {
+            // Admission and deferred releases retain the outer entry guard.
+            node.flush_deferred().map_err(CallError::Node)?;
+            if capture {
+                node.prepare_capture().map_err(CallError::Node)?;
+            }
+            catch_unwind(AssertUnwindSafe(|| call(node)))
+                .map_err(|payload| {
+                    super::contain_panic_payload(payload);
+                    if capture {
+                        CallError::EncoderPanic
+                    } else {
+                        CallError::DecoderPanic
+                    }
+                })?
+                .map_err(CallError::Node)
         })
     }
 
@@ -406,27 +435,29 @@ impl<T: PluginNode> NodeExports<T> {
                 Ok(sink) => sink,
                 Err(_) => return self.error_for(handle.value, CallError::InvalidArgument),
             };
-            let result = self.call_node(handle.value, |node| node.capture(&mut sink));
-            match sink.failure() {
-                Some(status) if status.code == status_code::PANICKED => self.error_for(
-                    handle.value,
-                    CallError::Panic("cerulion_node_capture_state"),
-                ),
-                Some(status) if status.code == status_code::BUFFER_TOO_SMALL => {
-                    self.clear_instance_diagnostic(handle.value);
-                    super::status(status_code::BUFFER_TOO_SMALL)
-                }
-                Some(_) => self.error_for(
-                    handle.value,
-                    CallError::Node(super::argument_error("state sink refused the capture")),
-                ),
-                None => match result {
-                    Ok(()) => super::status(status_code::OK),
-                    Err(error) => self.error_for(
-                        handle.value,
-                        error.at_operation("cerulion_node_capture_state"),
-                    ),
-                },
+            let result = self.call_state(handle.value, true, |node| node.capture(&mut sink));
+            // An encoder unwind wins even when it followed a refused write.
+            if matches!(result, Err(CallError::EncoderPanic)) {
+                return self.error_for(handle.value, CallError::EncoderPanic);
+            }
+            if sink.failure().is_some() {
+                let text = match result {
+                    Err(CallError::Node(error)) => {
+                        let reason = match &error {
+                            crate::error::TransportError::GraphError { reason } => std::borrow::Cow::Borrowed(reason.as_str()),
+                            _ => super::diagnostic_reason(&error),
+                        };
+                        // hot-path-alloc-ok: canonical state failure formats one diagnostic only after a refused sink write.
+                        format!("cerulion_node_capture_state: {reason}")
+                    },
+                    Ok(()) => "cerulion_node_capture_state: the host sink refused a write, so the capture is partial".into(),
+                    Err(error) => return self.error_for(handle.value, error.at_operation("cerulion_node_capture_state")),
+                };
+                return self.error_for(handle.value, CallError::StateSinkFull(text));
+            }
+            match result {
+                Ok(()) => super::status(status_code::OK),
+                Err(error) => self.error_for(handle.value, error.at_operation("cerulion_node_capture_state")),
             }
         })
     }
@@ -441,7 +472,7 @@ impl<T: PluginNode> NodeExports<T> {
             // local state cursor borrows it only through this synchronous call.
             let bytes = unsafe { super::bytes::read(payload.ptr, payload.len, 1) }
                 .map_err(|_| CallError::InvalidArgument)?;
-            self.call_node(handle.value, |node| node.restore(bytes))
+            self.call_state(handle.value, false, |node| node.restore(bytes))
         })
     }
 
@@ -639,7 +670,9 @@ mod tests {
 
     #[test]
     fn every_execution_panic_keeps_its_legacy_entry_name_and_the_gate_recovers() {
-        struct Panics;
+        struct Panics {
+            prepare: bool,
+        }
         impl PluginNode for Panics {
             fn create(_: HostClient, _: &[u8]) -> TransportResult<Self> {
                 panic!("create panic oracle")
@@ -653,7 +686,12 @@ mod tests {
             fn state_shape() -> u64 {
                 panic!("shape panic oracle")
             }
-            fn capture(&self, _: &mut dyn StateSink) -> TransportResult<()> {
+            fn prepare_capture(&self) -> TransportResult<()> {
+                assert!(!self.prepare, "capture precondition panic oracle");
+                Ok(())
+            }
+            fn capture(&self, sink: &mut dyn StateSink) -> TransportResult<()> {
+                let _ = sink.write(b"x");
                 panic!("capture panic oracle")
             }
             fn restore(&mut self, _: &[u8]) -> TransportResult<()> {
@@ -670,7 +708,7 @@ mod tests {
             }
         }
         let exports = NodeExports::<Panics>::default();
-        let value = exports.registry.insert(Panics).unwrap();
+        let value = exports.registry.insert(Panics { prepare: false }).unwrap();
         exports.register_diagnostic(value).unwrap();
         let handle = NodeHandle { value };
         let check = |status: Status, oracle: &str| {
@@ -708,12 +746,23 @@ mod tests {
                 "cerulion_node_state_shape: panic caught by catch_unwind",
             );
             check(
-                exports.capture(handle, &descriptor, 8),
-                "cerulion_node_capture_state: panic caught by catch_unwind",
+                exports.capture(handle, &descriptor, 0),
+                "cerulion_node_capture_state: the node's state encoder panicked; nothing was captured",
             );
             check(
                 exports.restore(handle, super::super::client::bytes_span(b"")),
-                "cerulion_node_restore_state: panic caught by catch_unwind",
+                "cerulion_node_restore_state: the node's state decoder panicked; the node is PARTIALLY restored and the run must fail",
+            );
+            exports
+                .registry
+                .call(handle.value, |node| {
+                    node.prepare = true;
+                    Ok(())
+                })
+                .unwrap();
+            check(
+                exports.capture(handle, &descriptor, 8),
+                "cerulion_node_capture_state: panic caught by catch_unwind",
             );
             check(
                 exports.inline_safe(handle, &mut inline),
@@ -1166,15 +1215,22 @@ mod tests {
             }
         }
         let (exports, handle) = installed();
-        let mut sink = PanicSink;
-        let mut bridge = super::super::state::SinkBridge::new(&mut sink);
-        let descriptor = bridge.descriptor();
-        // SAFETY: node-owned synchronous bridge remains live; it catches the
-        // panicking Rust sink before returning through its extern C callback.
-        assert_eq!(
-            unsafe { exports.capture(handle, &descriptor, 8) }.code,
-            status_code::PANICKED
-        );
-        assert_eq!(exports.tick(handle).code, status_code::OK);
+        for _ in 0..2 {
+            let mut sink = PanicSink;
+            let mut bridge = super::super::state::SinkBridge::new(&mut sink);
+            let descriptor = bridge.descriptor();
+            // SAFETY: node-owned synchronous bridge remains live; it catches the
+            // panicking Rust sink before returning through its extern C callback.
+            let status = unsafe { exports.capture(handle, &descriptor, 8) };
+            assert_eq!(status.code, status_code::BUFFER_TOO_SMALL);
+            assert!(
+                matches!(bridge.check().unwrap_err(), TransportError::GraphError { reason } if reason == "state sink is full: the capture exceeds the boundary budget")
+            );
+            assert_eq!(
+                copied_reason(&exports, status.error),
+                "cerulion_node_capture_state: state sink is full"
+            );
+            assert_eq!(exports.tick(handle).code, status_code::OK);
+        }
     }
 }
