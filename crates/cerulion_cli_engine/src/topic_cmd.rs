@@ -361,7 +361,7 @@ enum ObservationGuard {
         _lease: Box<cerulion_core::transport::mirror_origin::LocalObservationLease>,
     },
     RemoteDemand {
-        _demand: DemandGuard,
+        _demand: Box<DemandGuard>,
     },
 }
 
@@ -563,7 +563,10 @@ fn ensure_topic_available_with_selection(
             transport,
             ScopedSubscriber {
                 subscriber,
-                _guard: ObservationGuard::RemoteDemand { _demand: guard },
+                _guard: ObservationGuard::RemoteDemand {
+                    // hot-path-alloc-ok: cold remote observer lifetime setup.
+                    _demand: Box::new(guard),
+                },
             },
             TopicSource::Remote {
                 robot: target.robot,
@@ -710,7 +713,10 @@ fn ensure_topic_available_with_selection(
         transport,
         ScopedSubscriber {
             subscriber,
-            _guard: ObservationGuard::RemoteDemand { _demand: guard },
+            _guard: ObservationGuard::RemoteDemand {
+                // hot-path-alloc-ok: cold remote observer lifetime setup.
+                _demand: Box::new(guard),
+            },
         },
         TopicSource::Remote {
             robot: target.robot,
@@ -818,19 +824,41 @@ pub struct DemandGuard {
     #[cfg(unix)]
     last_check: std::sync::Mutex<std::time::Instant>,
     #[cfg(unix)]
+    health: std::sync::Mutex<(
+        u8,
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    )>,
+    #[cfg(unix)]
     robot: String,
     #[cfg(unix)]
     topic: String,
+    #[cfg(unix)]
+    schema_hash: u64,
+    #[cfg(unix)]
+    local_topic: String,
+    #[cfg(unix)]
+    observer: bool,
 }
 
 #[cfg(unix)]
 impl DemandGuard {
-    fn new(client: cerulion_netd::NetdClient, robot: &str, topic: &str) -> Self {
+    fn new(
+        client: cerulion_netd::NetdClient,
+        robot: &str,
+        topic: &str,
+        schema_hash: u64,
+        local_topic: &str,
+        observer: bool,
+    ) -> Self {
         Self {
             client: std::sync::Mutex::new(client),
             last_check: std::sync::Mutex::new(std::time::Instant::now()),
+            health: std::sync::Mutex::new((0, Default::default())),
             robot: robot.into(),
             topic: topic.into(),
+            schema_hash,
+            local_topic: local_topic.into(),
+            observer,
         }
     }
 
@@ -844,27 +872,81 @@ impl DemandGuard {
             return Ok(());
         }
         *checked = std::time::Instant::now();
-        let status = self
+        let mut client = self
             .client
             .lock()
-            .map_err(|_| CliError::Validation("remote observer client is poisoned".into()))?
-            .status()
-            .map_err(|error| {
-                CliError::Validation(format!(
-                    "remote observer robot '{}' topic '{}': {error}",
-                    self.robot, self.topic
-                ))
-            })?;
-        if !status
-            .demands
-            .iter()
-            .any(|row| row.robot == self.robot && row.topic == self.topic && row.refcount > 0)
-        {
-            return Err(CliError::Validation(format!(
-                "remote mirror lost for robot '{}' topic '{}'; restart the observer",
+            .map_err(|_| CliError::Validation("remote observer client is poisoned".into()))?;
+        let named = |error| {
+            CliError::Validation(format!(
+                "remote observer robot '{}' topic '{}': {error}",
                 self.robot, self.topic
-            )));
+            ))
+        };
+        client
+            .poll_pushed_losses()
+            .map_err(|error| named(error.to_string()))?;
+        let lost = client
+            .take_mirror_losses()
+            .iter()
+            .any(|event| event.robot == self.robot && event.topic == self.topic);
+        let mut health = self
+            .health
+            .lock()
+            .map_err(|_| named("remote observer health state is poisoned".into()))?;
+        if !lost {
+            match client.probe_status_until(std::time::Instant::now() + Duration::from_millis(200))
+            {
+                Ok(status)
+                    if status.demands.iter().any(|row| {
+                        row.robot == self.robot
+                            && row.topic == self.topic
+                            && row.refcount > 0
+                            && row.local_topic.as_deref().unwrap_or(&row.topic) == self.local_topic
+                    }) =>
+                {
+                    health.0 = 0;
+                    if let Some(suppressed) = health.1.on_success() {
+                        tracing::debug!(robot = %self.robot, topic = %self.topic, suppressed, "remote observer status probe recovered");
+                    }
+                    return Ok(());
+                }
+                Ok(_) => {
+                    health.1.on_success();
+                    health.0 = health.0.saturating_add(1);
+                    if health.0 < 2 {
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    health.0 = 0;
+                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                    match health.1.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                            tracing::debug!(robot = %self.robot, topic = %self.topic, error = %error, "netd busy during remote observer status probe")
+                        }
+                        RegimeDecision::Suppressed { suppressed } => {
+                            tracing::debug!(robot = %self.robot, topic = %self.topic, suppressed, "remote observer status probe still busy")
+                        }
+                    }
+                    return Ok(());
+                }
+            }
         }
+        if self.observer {
+            let reply = client
+                .observe(&self.robot, &self.topic, self.schema_hash)
+                .map_err(|error| named(error.to_string()))?;
+            if reply.local_topic != self.local_topic {
+                let _release = client.unobserve(&self.robot, &self.topic);
+                return Err(named("remote channel changed; restart the observer".into()));
+            }
+        } else {
+            client
+                .demand(&self.robot, &self.topic, self.schema_hash)
+                .map_err(|error| named(error.to_string()))?;
+        }
+        tracing::info!(robot = %self.robot, topic = %self.topic, "remote topic reader re-demanded after mirror loss");
+        health.0 = 0;
         Ok(())
     }
 }
@@ -908,7 +990,17 @@ fn demand_remote_from_netd(
     );
 
     let subscriber = open_mirror_after_demand(transport, topic)?;
-    Ok((subscriber, DemandGuard::new(client, &target.robot, topic)))
+    Ok((
+        subscriber,
+        DemandGuard::new(
+            client,
+            &target.robot,
+            topic,
+            target.schema_hash,
+            topic,
+            false,
+        ),
+    ))
 }
 
 /// Authenticated account/pair observation uses a private source channel.
@@ -924,7 +1016,17 @@ fn demand_observer_from_netd(
         .observe(&target.robot, topic, target.schema_hash)
         .map_err(|e| CliError::Validation(e.to_string()))?;
     let subscriber = open_mirror_after_demand(transport, &reply.local_topic)?;
-    Ok((subscriber, DemandGuard::new(client, &target.robot, topic)))
+    Ok((
+        subscriber,
+        DemandGuard::new(
+            client,
+            &target.robot,
+            topic,
+            target.schema_hash,
+            &reply.local_topic,
+            true,
+        ),
+    ))
 }
 
 /// Non-Unix stub: the netd demand plane is a UDS daemon, unavailable
@@ -4656,6 +4758,28 @@ pub fn topic_echo_with_selection(
         Err(e) => return Err(e),
     };
 
+    echo_observed(
+        topic,
+        schemas_dir,
+        running,
+        writer,
+        truncate_length,
+        scope,
+        (subscriber, source),
+    )
+}
+
+#[allow(clippy::print_stderr)] // Observer diagnostics survive tracing filters.
+fn echo_observed(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    truncate_length: usize,
+    scope: TopicScope,
+    observation: (ScopedSubscriber, TopicSource),
+) -> CliResult<()> {
+    let (subscriber, source) = observation;
     // Build a LOCAL walker from the desk's built-in types +
     // (when present) the workspace `.msg` store + `schemas/*.yaml`, so a frame
     // carrying a WORKSPACE type decodes LOCALLY (no network). The remote walker
@@ -5167,6 +5291,193 @@ pub fn topic_info_with_selection(
 #[cfg(test)]
 mod tests {
 
+    #[cfg(unix)]
+    #[test]
+    fn held_observers_redemand_the_pinned_schema_after_named_loss() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        for changed in [false, true] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let socket = directory.path().join("netd.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut methods = Vec::new();
+                let mut observes = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        return methods;
+                    }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    methods.push(method.to_owned());
+                    let id = request["id"].as_u64().unwrap();
+                    let reply = match method {
+                        "status" => {
+                            writeln!(stream, "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}").unwrap();
+                            serde_json::json!({"id":id,"demands":[],"active_connections":1,"idle":false})
+                        }
+                        "observe" => {
+                            observes += 1;
+                            if observes == 1 {
+                                writeln!(stream, "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}").unwrap();
+                            }
+                            assert_eq!(request["robot"], "arm");
+                            assert_eq!(request["topic"], "/vector");
+                            assert_eq!(request["schema_hash"], 7);
+                            let channel = if changed && observes > 1 {
+                                "/__cerulion/observers/e756c0190570ccb5/70c0eb8e1f85cdd5"
+                            } else {
+                                "/vector"
+                            };
+                            serde_json::json!({"id":id,"robot":"arm","topic":"/vector",
+                                "refcount":1,"mirror_created":true,"local_topic":channel})
+                        }
+                        "unobserve" => serde_json::json!({"id":id,"robot":"arm","topic":"/vector",
+                            "refcount":0,"last_release":true}),
+                        other => panic!("unexpected method {other}"),
+                    };
+                    writeln!(stream, "{reply}").unwrap();
+                }
+            });
+            let mut client = cerulion_netd::NetdClient::connect_existing_at(socket).unwrap();
+            client.observe("arm", "/vector", 7).unwrap();
+            let guard = super::DemandGuard::new(client, "arm", "/vector", 7, "/vector", true);
+            *guard.last_check.lock().unwrap() = std::time::Instant::now() - Duration::from_secs(1);
+            let result = guard.check_remote();
+            drop(guard);
+            let methods = server.join().unwrap();
+            if changed {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("arm") && error.contains("/vector"),
+                    "{error}"
+                );
+                assert_eq!(methods, ["observe", "observe", "unobserve"]);
+            } else {
+                result.unwrap();
+                assert_eq!(methods, ["observe", "observe"]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observer_loops_exit_with_the_named_loss_when_redemand_is_refused() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let manager = cerulion_core::TransportManager::init_for_test(
+            Default::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        for verb in ["echo", "bw", "type"] {
+            for repeat in 0..2 {
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
+                let topic = format!("/observer-loss/{verb}/{repeat}");
+                let socket = directory.path().join("netd.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                let remote_topic = topic.clone();
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    for attempt in [1, 2] {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(request["method"], "observe");
+                        assert_eq!(request["robot"], "arm");
+                        assert_eq!(request["topic"], remote_topic);
+                        assert_eq!(request["schema_hash"], 7);
+                        let id = request["id"].as_u64().unwrap();
+                        let reply = if attempt == 1 {
+                            writeln!(stream, "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"{remote_topic}\"}}").unwrap();
+                            serde_json::json!({"id":id,"robot":"arm","topic":remote_topic,
+                                "refcount":1,"mirror_created":true,"local_topic":remote_topic})
+                        } else {
+                            serde_json::json!({"id":id,"error":"source disconnected","robot":"arm","topic":remote_topic})
+                        };
+                        writeln!(stream, "{reply}").unwrap();
+                    }
+                    let mut final_line = String::new();
+                    assert_eq!(reader.read_line(&mut final_line).unwrap(), 0);
+                });
+                let _publisher = manager
+                    .create_publisher(&topic, cerulion_core::wire::MaxSliceLen::const_new(64), 0)
+                    .unwrap();
+                let mut client = cerulion_netd::NetdClient::connect_existing_at(socket).unwrap();
+                client.observe("arm", &topic, 7).unwrap();
+                let guard = super::DemandGuard::new(client, "arm", &topic, 7, &topic, true);
+                *guard.last_check.lock().unwrap() =
+                    std::time::Instant::now() - Duration::from_secs(1);
+                let subscriber = super::ScopedSubscriber {
+                    subscriber: manager.create_subscriber_open_only(&topic).unwrap(),
+                    _guard: super::ObservationGuard::RemoteDemand {
+                        _demand: Box::new(guard),
+                    },
+                };
+                let source = super::TopicSource::Remote {
+                    robot: "arm".into(),
+                    walker: super::local_walker_from_workspace(None),
+                };
+                let running = Arc::new(AtomicBool::new(true));
+                let error = match verb {
+                    "echo" => super::echo_observed(
+                        &topic,
+                        None,
+                        running,
+                        &mut Vec::new(),
+                        8,
+                        TopicScope::Automatic,
+                        (subscriber, source),
+                    )
+                    .unwrap_err(),
+                    "bw" => super::introspect::bw_observed(
+                        &topic,
+                        running,
+                        &mut Vec::new(),
+                        std::num::NonZeroUsize::new(8).unwrap(),
+                        subscriber,
+                        source,
+                    )
+                    .unwrap_err(),
+                    "type" => super::introspect::type_observed(
+                        &topic,
+                        None,
+                        TopicScope::Automatic,
+                        subscriber,
+                        source,
+                    )
+                    .unwrap_err(),
+                    _ => unreachable!(),
+                }
+                .to_string();
+                assert!(
+                    error.contains("arm")
+                        && error.contains(&topic)
+                        && error.contains("source disconnected"),
+                    "{error}"
+                );
+                server.join().unwrap();
+            }
+        }
+        let code = code_only(TOPIC_CMD_SRC);
+        assert!(fn_body(&code, "pub fn topic_echo_with_selection(").contains("echo_observed("));
+        let code = code_only(include_str!("topic_cmd/introspect.rs"));
+        assert!(fn_body(&code, "pub fn topic_bw_with_scope(").contains("bw_observed("));
+        assert!(fn_body(&code, "pub fn topic_type_with_scope(").contains("type_observed("));
+    }
+
     #[test]
     fn paired_discovery_never_calls_the_stranger_lan_boundary() {
         use cerulion_core::transport::demand_authorizer::LanAccess;
@@ -5585,10 +5896,10 @@ mod tests {
         // satisfied by prose. The ALLOW marker scan further down
         // deliberately uses RAW lines — the marker IS a comment by construction.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo_with_selection(").to_string();
+        let echo = fn_body(&src, "fn echo_observed(").to_string();
         let hz = fn_body(&src, "pub fn topic_hz_with_selection(").to_string();
         let info = fn_body(&src, "pub fn topic_info_with_selection(").to_string();
-        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo_with_selection(");
+        let raw_echo = fn_body(TOPIC_CMD_SRC, "fn echo_observed(");
         let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz_with_selection(");
 
         // Extractor sanity: real, non-trivial bodies (a broken extractor
@@ -5767,7 +6078,7 @@ mod tests {
         // justifying the marker, so a raw-source walk could satisfy the
         // anti-vacuity assert from prose alone.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo_with_selection(").to_string();
+        let echo = fn_body(&src, "fn echo_observed(").to_string();
         let hz = fn_body(&src, "pub fn topic_hz_with_selection(").to_string();
 
         for (name, body) in [("topic_echo", echo), ("topic_hz", hz)] {

@@ -1,23 +1,21 @@
 # cerulion_cli_engine
 
-Parser: `cerulion_cli`. Writers hold
-`workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) across check/write: kernel flock shared with wsd, thread reentrant, others wait (one warn); UNIX only, elsewhere no-op.
+Parser: `cerulion_cli`. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) across check/write: kernel flock shared with wsd, reentrant, others wait (one warn); UNIX flock, no-op elsewhere.
 Reads use `acquire_read` (creates nothing; refuses same-thread re-entry); all
 refuse a symlinked `.cerulion`. Only `acquire_and_track_gitignore` writes
 a tracked `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
 Stage declared ports via `graph_cmd::stage_declared_node`.
 ## Invariants
-- Account/pair catalogs bind identity; selectors resolve collisions. Paired skips implicit LAN; Open/locators/scan retain it; broken pairings diagnose. Refresh on caller within 2 s; cache logs debug. Unread catalogs prove no absence.
-- Run/recording scope precedes ports: off/inert excludes all topics, strict non-egress outputs. Drop guards after ports/workers.
-- Resolve relative recording paths before child handoff.
+- Account/pair catalogs bind identity; selectors resolve collisions. Paired skips implicit LAN; Open/locators/scan retain it; broken pairs diagnose. Refresh <=2 s; cache logs debug. Unread catalogs prove no absence.
+- Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; resolve relative recorder paths before handoff.
 - Paired graphs gate producers with serving_authority; resolve canonical ingress before GO, retain pinned demands, refuse schema/QoS/writer mismatches.
-- Observer heartbeats report named mirror loss; graph inputs revalidate pinned identity before re-demand.
+- Observers pin source/hash/channel; probes use demand-free clients and busy is unknown. Loss re-demands; graph inputs revalidate identity.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.
 - `account_robot_access`: only netd opens WAN. Probes: 4 s (500 ms/robot), never pair/demand. Catalogs: another 4 s; coalesce by endpoint key. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
-- node build rustc probe advises; only load-time cdylib fingerprint counts.
+- node build rustc probe advises; load-time cdylib fingerprint counts.
 - Android libs prefer <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn (docs/android.md).
 - Only `node_metadata::parse_node_metadata` supplies ports/triggers; INFO_END before INFO_START is fatal.
 - Never hand-compute pinned schema hashes: run `pinned_hashes`, copy into `topic_cmd.rs`.
@@ -30,9 +28,9 @@ Stage declared ports via `graph_cmd::stage_declared_node`.
 - Interrupted waits check running; retry <= MAX_CONSECUTIVE_WAIT_ERRORS, never sleep-retry errors. SIGINT foreign children via child_signals (exec inherits ignore/blocks), self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-## Workspace dependencies
+## Dependencies
 Dependencies follow the binary, never cwd: checkout paths or exact registry pins.
-Contract/compiler checks: `docs/internals/cli.md` §11.
+Contract checks: `docs/internals/cli.md` §11.
 ## Testing
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc

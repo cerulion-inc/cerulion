@@ -1108,15 +1108,33 @@ pub fn topic_type_with_scope(
 ) -> CliResult<String> {
     let (_transport, subscriber, source) =
         super::ensure_topic_available(topic, schemas_dir, None, scope)?;
+    type_observed(topic, schemas_dir, scope, subscriber, source)
+}
+
+pub(super) fn type_observed(
+    topic: &str,
+    schemas_dir: Option<&Path>,
+    scope: TopicScope,
+    subscriber: super::ScopedSubscriber,
+    source: TopicSource,
+) -> CliResult<String> {
+    subscriber.check_remote()?;
     let wait = match &source {
         TopicSource::Remote { .. } => REMOTE_FRAME_WAIT,
         TopicSource::Local => LOCAL_FRAME_WAIT,
     };
-    let hash = match first_schema_hash(&subscriber, wait) {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return Err(silent_topic_error(topic, wait)),
-        Err(e) => return Err(receive_failed_error(topic, &e)),
+    let deadline = Instant::now() + wait;
+    let hash = loop {
+        subscriber.check_remote()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match first_schema_hash(&subscriber, remaining.min(super::OBSERVER_HEARTBEAT)) {
+            Ok(Some(hash)) => break hash,
+            Ok(None) if remaining.is_zero() => return Err(silent_topic_error(topic, wait)),
+            Ok(None) => {}
+            Err(error) => return Err(receive_failed_error(topic, &error)),
+        }
     };
+    subscriber.check_remote()?;
     let local_walker = super::local_walker_from_workspace(schemas_dir);
     let mut ty = TopicType::of_hash(hash, &[&local_walker]);
     if matches!(ty, TopicType::Unnamed(_)) {
@@ -1214,6 +1232,17 @@ pub fn topic_bw_with_scope(
             Err(_) if super::interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
             Err(e) => return Err(e),
         };
+    bw_observed(topic, running, writer, window, subscriber, source)
+}
+
+pub(super) fn bw_observed(
+    topic: &str,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    window: NonZeroUsize,
+    subscriber: super::ScopedSubscriber,
+    source: TopicSource,
+) -> CliResult<()> {
     let source_desc = super::observer_source_description(&source);
     // The one allocation of the loop: the full window, before any frame.
     let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(window.get());
@@ -1224,6 +1253,7 @@ pub fn topic_bw_with_scope(
     let mut idle_churn: u32 = 0;
 
     while running.load(Ordering::Relaxed) {
+        subscriber.check_remote()?;
         let until_report = super::HZ_REPORT_INTERVAL.saturating_sub(last_report.elapsed());
         let wait = until_report.min(super::OBSERVER_HEARTBEAT);
         let wait_started = Instant::now();

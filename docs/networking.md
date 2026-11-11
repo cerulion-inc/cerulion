@@ -85,9 +85,11 @@ Authenticated ops keep their capability and e-stop checks; a graph import pulls
 an allowed producer stream and does not grant an arbitrary remote publish verb.
 
 Held remote reads survive a serving endpoint start or stop. If a reader cannot be
-restored, netd reports the robot and topic. CLI observers stop with an error;
+restored within the transition's five-second budget, netd reports the robot and
+topic. CLI observers re-demand their pinned source and schema, or stop with a
+named error if recovery fails;
 graph imports revalidate the pinned producer before reconnecting, and
-visualization re-demands its pinned source and schema outside frame draining.
+visualization re-demands its pinned source and schema outside frame draining. Status checks use separate connections, so a busy daemon does not release healthy readers. Visualization retries each lost source with backoff independently.
 
 ## The decision matrix
 
@@ -925,14 +927,15 @@ and remote sources separate. The `topic list` presentation folds mirrors into RE
 Studio sidebar parses the same rows: the topic path stays the row's first
 whitespace token, with the `● streaming` marker + robot in the trailing columns.
 
-- **Remote discovery is ON by default** (the ladder, gossip on; multicast
-  scouting only under `CERULION_MULTICAST_SCOUTING=on`): an unpaired robot on
-  the LAN shows up with no flags.
+- **Remote discovery is ON by default** for same-account and explicitly paired
+  robots on any network. Under explicit open LAN access, locators or `--scan`,
+  the LAN ladder also discovers robots offering open access. Multicast scouting
+  is enabled only under `CERULION_MULTICAST_SCOUTING=on`.
   `--no-network` opts out of the whole remote half, ladder included.
 - **Extra locators are additive**: `--connect` /
-  `--listen` add to the default discovery session (both repeatable) to reach
-  a peer the ladder cannot find (remote discovery is the default, so there is
-  no flag to turn it on). Ladder-found gateway locators fold into the
+  `--listen` add to an explicit open LAN discovery session (both repeatable) to
+  reach a peer the ladder cannot find. Account and paired access needs neither.
+  Ladder-found gateway locators fold into the
   same session the same way.
 - **`--scan` opts into the subnet sweep (rung 4)** for a network that blocks
   BOTH multicast and mDNS reflection. OFF by default and structurally
@@ -945,9 +948,9 @@ whitespace token, with the `● streaming` marker + robot in the trailing column
   a remote session/query failure is a LOUD one-line note on stderr (`remote:
   discovery unavailable (<error>; pass --no-network to skip it)`) and exit 0:
   never a fake-success, never a hang. An empty ladder run names the escape
-  (`--connect tcp/<host>:7683`). An isolated network with no LAN discovery has
-  no automatic answer: there is no rendezvous tier, so pass the robot's
-  locator with `--connect`.
+  (`--connect tcp/<host>:7683`) for explicit open LAN access. Account and paired
+  robots use their authenticated remote route automatically, including on an
+  isolated LAN; iroh uses a direct path when available and a relay otherwise.
 
 ## The catalog updates itself: change PUSHES
 

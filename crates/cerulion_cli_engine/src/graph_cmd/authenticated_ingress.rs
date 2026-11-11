@@ -333,6 +333,8 @@ fn watch_session(
 ) {
     let expected = session.producers.clone();
     let mut failures = FailureRegimeLatch::new();
+    let mut probe_failures = FailureRegimeLatch::new();
+    let mut missing = 0u8;
     loop {
         let Ok(stopped) = control.stopped.lock() else {
             fail(
@@ -354,7 +356,33 @@ fn watch_session(
             return;
         }
         drop(stopped);
-        let status = session.client.status();
+        let holding_error = session.client.poll_pushed_losses().err();
+        let lost = session.client.take_mirror_losses().iter().any(|loss| {
+            expected
+                .iter()
+                .any(|producer| loss.robot == producer.route && loss.topic == producer.topic)
+        });
+        let status = session
+            .client
+            .probe_status_until(Instant::now() + Duration::from_millis(200));
+        if holding_error.is_none() && !lost {
+            if let Err(error) = &status {
+                missing = 0;
+                match probe_failures.on_failure() {
+                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                        tracing::debug!(graph = %registration.graph, error = %error, total_failures = probe_failures.total_failures(), "netd busy during graph status probe")
+                    }
+                    RegimeDecision::Suppressed { suppressed } => {
+                        tracing::debug!(graph = %registration.graph, suppressed, "graph status probe remains busy")
+                    }
+                }
+                continue;
+            }
+            if let Some(suppressed) = probe_failures.on_success() {
+                tracing::debug!(graph = %registration.graph, suppressed, "graph status probe recovered");
+            }
+        }
+
         if status
             .as_ref()
             .is_ok_and(|status| status.lan_access != Some(LanAccess::Paired))
@@ -366,20 +394,30 @@ fn watch_session(
             );
             return;
         }
-        let ready = status.as_ref().is_ok_and(|status| {
-            expected.iter().all(|producer| {
-                status.demands.iter().any(|row| {
-                    row.robot == producer.route
-                        && row.topic == producer.topic
-                        && row.refcount > 0
-                        && row
-                            .local_topic
-                            .as_deref()
-                            .is_none_or(|topic| topic == producer.topic)
-                        && row.plane == Some(ServingPlane::Iroh)
+        let ready = holding_error.is_none()
+            && !lost
+            && status.as_ref().is_ok_and(|status| {
+                expected.iter().all(|producer| {
+                    status.demands.iter().any(|row| {
+                        row.robot == producer.route
+                            && row.topic == producer.topic
+                            && row.refcount > 0
+                            && row
+                                .local_topic
+                                .as_deref()
+                                .is_none_or(|topic| topic == producer.topic)
+                            && row.plane == Some(ServingPlane::Iroh)
+                    })
                 })
-            })
-        });
+            });
+        if ready {
+            missing = 0;
+        } else if holding_error.is_none() && !lost {
+            missing = missing.saturating_add(1);
+            if missing < 2 {
+                continue;
+            }
+        }
         let result = if ready {
             Ok(())
         } else {
