@@ -156,6 +156,18 @@ impl cerulion_netd::MirrorPlane for AccessSpy {
     fn release_mirror(&self, _: &cerulion_netd::TopicKey) -> cerulion_netd::MirrorRelease {
         panic!("listing and preparing a target hold no mirrors")
     }
+    fn install_paired_robots(
+        &self,
+        robots: &[cerulion_netd::account_access::PairedRobot],
+        _: &mut cerulion_netd::DemandRegistry,
+    ) -> Result<(), String> {
+        self.0.lock().unwrap().push(
+            cerulion_netd::account_access::AccountAccessRequest::InstallPaired {
+                robots: robots.to_vec(),
+            },
+        );
+        Ok(())
+    }
     fn account_access(
         &self,
         action: &cerulion_netd::account_access::AccountAccessRequest,
@@ -187,7 +199,57 @@ impl cerulion_netd::MirrorPlane for AccessSpy {
                     },
                 })
             }
-            _ => panic!("listing and target preparation must not fetch metadata or pair"),
+            AccountAccessRequest::Discover { .. } => {
+                let actions = self.0.lock().unwrap();
+                let snapshot = actions
+                    .iter()
+                    .rev()
+                    .find_map(|action| match action {
+                        AccountAccessRequest::Install { snapshot } => Some(snapshot),
+                        _ => None,
+                    })
+                    .unwrap();
+                let mut robots: Vec<_> = snapshot
+                    .robots
+                    .iter()
+                    .map(|robot| cerulion_netd::account_access::RobotCatalog {
+                        route: cerulion_netd::account_access::robot_route(&robot.robot_id),
+                        name: robot.hostname.clone(),
+                        endpoint_key: robot.endpoint_key,
+                        trust: cerulion_netd::account_access::RobotTrustSource::Account,
+                        presence: RobotPresence::Unknown {
+                            reason: "test plane made no reachability observation".into(),
+                        },
+                        path: cerulion_netd::account_access::RobotPath::Unknown,
+                        catalog: None,
+                    })
+                    .collect();
+                if let Some(pins) = actions.iter().rev().find_map(|action| match action {
+                    AccountAccessRequest::InstallPaired { robots } => Some(robots),
+                    _ => None,
+                }) {
+                    for pin in pins {
+                        if !robots
+                            .iter()
+                            .any(|robot| robot.endpoint_key == Some(pin.endpoint_key))
+                        {
+                            robots.push(cerulion_netd::account_access::RobotCatalog {
+                                route: pin.name.clone(),
+                                name: pin.name.clone(),
+                                endpoint_key: Some(pin.endpoint_key),
+                                trust: cerulion_netd::account_access::RobotTrustSource::Paired,
+                                presence: RobotPresence::Unknown {
+                                    reason: "test plane made no reachability observation".into(),
+                                },
+                                path: cerulion_netd::account_access::RobotPath::Unknown,
+                                catalog: None,
+                            });
+                        }
+                    }
+                }
+                Ok(AccountAccessReply::Discovery { robots })
+            }
+            _ => panic!("unexpected account operation"),
         }
     }
 }
@@ -225,12 +287,17 @@ fn actual_http_directory_installs_public_membership_and_keeps_viewer_daemon_aliv
         "target holds the daemon until vizd takes its own demand"
     );
     let actions = spy.0.lock().unwrap();
-    assert_eq!(actions.len(), 3);
+    assert_eq!(actions.len(), 5);
     assert!(matches!(&actions[0], AccountAccessRequest::Install { .. }));
     assert!(
         matches!(&actions[1], AccountAccessRequest::Probe { robot_id, .. } if *robot_id == fixture.robot_id)
     );
     assert!(matches!(&actions[2], AccountAccessRequest::Install { .. }));
+    assert!(matches!(
+        &actions[3],
+        AccountAccessRequest::InstallPaired { .. }
+    ));
+    assert!(matches!(&actions[4], AccountAccessRequest::Discover { .. }));
     drop(actions);
     assert_eq!(daemon.active_demand_count(), 0);
     drop(target);
@@ -556,4 +623,60 @@ fn a_listing_waits_out_a_busy_controller_and_installs() {
         listing.diagnostic
     );
     assert_eq!(listing.rows.len(), 1);
+}
+
+#[test]
+#[serial]
+fn automatic_listing_unions_owned_and_paired_robots_and_preserves_the_cached_directory() {
+    let fixture = Fixture::new();
+    let paired_key = ed25519_dalek::SigningKey::from_bytes(&[0x75; 32])
+        .verifying_key()
+        .to_bytes();
+    std::fs::write(
+        fixture.home.path().join("robots.toml"),
+        format!("[robots]\npaired = \"{}\"\n", hex::encode(paired_key)),
+    )
+    .unwrap();
+    let spy = Arc::new(AccessSpy::default());
+    let mut daemon =
+        cerulion_netd::start(fixture.socket(), spy, cerulion_netd::NetdConfig::default()).unwrap();
+    let listing = account_robot_access::automatic::discover().unwrap();
+    assert!(listing.diagnostics.is_empty(), "{:?}", listing.diagnostics);
+    assert_eq!(
+        listing
+            .robots
+            .iter()
+            .map(|robot| robot.name.as_str())
+            .collect::<Vec<_>>(),
+        ["owned-robot", "paired"]
+    );
+    assert_eq!(
+        listing.robots[0].trust,
+        cerulion_netd::account_access::RobotTrustSource::Account
+    );
+    assert_eq!(
+        listing.robots[1].trust,
+        cerulion_netd::account_access::RobotTrustSource::Paired
+    );
+    drop(listing);
+    let offline = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:9");
+    let cached = account_robot_access::automatic::discover().unwrap();
+    assert_eq!(
+        cached
+            .robots
+            .iter()
+            .map(|robot| robot.name.as_str())
+            .collect::<Vec<_>>(),
+        ["owned-robot", "paired"]
+    );
+    assert!(!cached.diagnostics.is_empty());
+    drop(cached);
+    let killed = EnvGuard::set("CERULION_NETWORK", "off");
+    let local = account_robot_access::automatic::discover().unwrap();
+    assert!(local.robots.is_empty() && local.diagnostics.is_empty());
+    drop(local);
+    drop(killed);
+    drop(offline);
+    assert_eq!(daemon.active_demand_count(), 0);
+    daemon.shutdown();
 }

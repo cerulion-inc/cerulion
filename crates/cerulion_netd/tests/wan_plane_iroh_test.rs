@@ -186,12 +186,30 @@ struct RobotFixture {
 
 impl RobotFixture {
     fn start(tag: &str, authz: Arc<PairingAuthorizer>) -> Self {
+        Self::start_with_schema(tag, authz, None)
+    }
+
+    fn start_with_schema(
+        tag: &str,
+        authz: Arc<PairingAuthorizer>,
+        schema: Option<(String, cerulion_core::SchemaDoc)>,
+    ) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("robot runtime");
         let manager = test_manager(&format!("robot_{tag}"));
-        let plane = Arc::new(WirePlane::with_manager(
-            format!("robot-{tag}"),
-            manager.clone(),
-        ));
+        let mut plane = WirePlane::with_manager(format!("robot-{tag}"), manager.clone());
+        if let Some((topic, doc)) = schema {
+            let serving = cerulion_core::SchemaServing {
+                topic_schemas: vec![cerulion_core::TopicSchema {
+                    topic: topic.clone(),
+                    schema_name: doc.qualified.clone(),
+                }],
+                schema_docs: vec![doc],
+                schema_hashes: Vec::new(),
+                served_topics: vec![topic],
+            };
+            plane = plane.with_in_process_schema_provider(Arc::new(move || serving.clone()));
+        }
+        let plane = Arc::new(plane);
         let daemon = rt.block_on(disabled_endpoint(unique_secret()));
         let eid = daemon.id();
         let addrs = loopback_sockets(&daemon.bound_sockets());
@@ -2047,3 +2065,6 @@ mod poison_retirement;
 
 #[path = "wan_plane_iroh_test/serving_plane.rs"]
 mod serving_plane;
+
+#[path = "wan_plane_iroh_test/automatic_cli.rs"]
+mod automatic_cli;
