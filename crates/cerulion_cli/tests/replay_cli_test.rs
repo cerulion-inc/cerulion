@@ -2551,6 +2551,12 @@ fn resim_namespace_files() -> std::collections::BTreeMap<u32, std::collections::
 /// first's, and the second leaves exactly as many files as the first. No other
 /// resim namespace gains or loses a file.
 ///
+/// Before each run a file named with slot 0's prefix is planted in
+/// `/dev/shm`, and the run removes it: the resim's own slot claim walks the
+/// segment names, so a leftover segment no node accounts for goes too. A
+/// reused slot reopens its management segment under the same name, so the
+/// counts alone hold even with no walk.
+///
 /// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
 #[test]
 #[serial]
@@ -2570,11 +2576,23 @@ fn two_resims_in_a_row_reuse_slot_0_and_leave_one_namespaces_files() {
     let before = other_slots(resim_namespace_files());
     let mut left = Vec::new();
     for run in ["first", "second"] {
+        let planted = PathBuf::from(format!(
+            "/dev/shm/cer_resim_00000000_planted_{run}_{}",
+            std::process::id()
+        ));
+        std::fs::write(&planted, b"").expect("plant a leftover segment name on slot 0");
         let out = run_replay_bin_in_workspace(root, &bag);
+        let planted_left = planted.exists();
+        let _ = std::fs::remove_file(&planted);
         assert_eq!(
             out.status.code(),
             Some(0),
             "the {run} resim; stderr: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            !planted_left,
+            "the {run} resim's slot claim left the planted slot 0 segment {planted:?}; stderr: {}",
             stderr_of(&out)
         );
         let mut files = resim_namespace_files();

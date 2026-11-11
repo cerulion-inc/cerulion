@@ -361,20 +361,20 @@ The answer topic has no producer inside the graph, so
 their recorded steps, whatever the re-executed graph asks, and makes no Jev
 request itself. A gate that reads them with its own ask text sees an answer
 given for another ask text as `not_recorded`, and `--resim all --verify`
-reports a changed ask as a divergence on the ask topic. A running daemon's
-eye reads the same topics, and tells a played recording by where its frames
-come from: `bag play` publishes from the transport node `cerulion_bag_play`
-and `bag play --resim` from `cerulion_replay_` and the recording's identity,
-on a private shared-memory namespace the daemon never sees.
-An ask from either gets no request, no answer and no receipt, with Jev on
-or off, and a wrist frame from either is never held, whatever their wire
-timestamps say, so an unpaced resim whose replay clock passes the host's
-time is dropped as surely as a recording from another boot. So are an ask
-and a frame whose publisher's node cannot be named. The first such ask is
-logged, later ones are counted, and `jev status` reports them. A live graph
-whose own node name takes one of those forms (a graph named `bag_play`, one
-whose name begins `replay_`, or a multi-process graph named `replay`) reads
-as a replay, and the log names the node.
+reports a changed ask as a divergence on the ask topic. A resim runs on a
+private shared-memory namespace a running daemon's eye never sees, so its
+asks and wrist frames never reach the eye: they are neither answered nor
+counted. Plain `bag play` publishes onto the topics the eye reads, from the
+transport node `cerulion_bag_play`, and the eye tells a played recording by
+that node: an ask from it gets no request, no answer and no receipt, with
+Jev on or off, and a wrist frame from it is never held, whatever their wire
+timestamps say. The eye drops an ask and a frame the same way when their
+publisher's node name begins `cerulion_replay_`, or when that node cannot
+be named. The first such ask is logged, later ones are counted, and
+`jev status` reports them. A live graph whose own node name takes one of
+those forms (a graph named `bag_play`, one whose name begins `replay_`, or
+a multi-process graph named `replay`) reads as a replay, and the log names
+the node.
 `--verify-bag` checks that every answer in a recording has its receipt,
 names an ask the recording holds and carries the SHA-256 of that ask's
 text, and, where the recording holds the frame, that the image and request

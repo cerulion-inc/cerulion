@@ -242,71 +242,183 @@ struct ResimSlot {
     _lock: std::fs::File,
 }
 
+/// Why a claim passed over a slot whose lock a running resim does not hold.
+#[derive(Debug)]
+enum SlotPassedOver {
+    /// Its lock file could not be opened or locked: the path and the error.
+    Lock(String),
+    /// The slot's private iceoryx2 config could not be built.
+    Config(String),
+    /// Its namespace did not reclaim clean: what the reclaim found, and
+    /// [`SlotReclaim::refusal`].
+    Reclaim {
+        reclaim: SlotReclaim,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SlotPassedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(failure) => {
+                write!(f, "its lock file could not be opened or locked: {failure}")
+            }
+            Self::Config(reason) | Self::Reclaim { reason, .. } => f.write_str(reason),
+        }
+    }
+}
+
+/// Log one slot a claim passed over, through the claim's `latch`: the first
+/// at warn, the repeats at debug, and the slot that takes the count across a
+/// power of ten at warn again.
+fn log_passed_over_slot(
+    latch: &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    slot: u32,
+    passed: &SlotPassedOver,
+) {
+    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+    let reclaim = match passed {
+        SlotPassedOver::Reclaim { reclaim, .. } => Some(reclaim),
+        SlotPassedOver::Lock(_) | SlotPassedOver::Config(_) => None,
+    };
+    let nodes_left = reclaim.and_then(|r| r.nodes_left.as_ref().ok().copied());
+    let cleanups = reclaim.map(|r| r.cleaned.cleanups);
+    let failed_cleanups = reclaim.map(|r| r.cleaned.failed_cleanups);
+    let deferred = reclaim.map(|r| r.cleaned.deferred);
+    let segments_failed = reclaim.map(|r| r.segments_failed);
+    match latch.on_failure() {
+        RegimeDecision::Loud => tracing::warn!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            error = %passed,
+            "replay: passed over a resim namespace slot whose lock could not be taken or whose \
+             namespace did not reclaim clean; the slot keeps its files and the resim tries the \
+             next one"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            total_failures = total,
+            suppressed,
+            error = %passed,
+            "replay: still passing over resim namespace slots"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            suppressed,
+            error = %passed,
+            "replay: passed over another resim namespace slot (suppressed)"
+        ),
+    }
+}
+
 /// Claim the lowest slot below `slots` whose lock file in `lock_dir`
 /// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
 /// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
 /// the lock is held.
 ///
-/// A slot whose lock another process holds, whose lock file cannot be opened
-/// (another user's, say) or that `ready` refuses is passed over, its lock
-/// released. With no slot left the claim is [`ReplayError::Internal`] (exit
-/// 5), naming the directory and the first failure to open or lock a file.
+/// A slot whose lock another process holds is skipped. A slot whose lock file
+/// cannot be opened or locked (another user's, say) or that `ready` refuses
+/// is passed over, its lock released, and logged through one
+/// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
+/// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
+/// suppressed repeats logs how many. With no slot left the claim is
+/// [`ReplayError::Internal`] (exit 5), naming the directory, the first failure
+/// to open or lock a file and the last slot `ready` refused, with its reason.
 fn claim_resim_slot(
     lock_dir: &Path,
     slots: u32,
-    mut ready: impl FnMut(u32) -> bool,
+    mut ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
 ) -> Result<ResimSlot, ReplayError> {
     use std::os::unix::fs::OpenOptionsExt;
+    let mut latch = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
     let mut first_failure: Option<String> = None;
+    let mut last_refusal: Option<(u32, SlotPassedOver)> = None;
     for slot in 0..slots {
         let path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
-        let lock = match std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
             .open(&path)
-        {
-            Ok(lock) => lock,
-            Err(e) => {
-                first_failure.get_or_insert_with(|| format!("{}: {e}", path.display()));
+            .map_err(|e| format!("{}: {e}", path.display()))
+            .and_then(|lock| {
+                match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                {
+                    Ok(()) => Ok(Some(lock)),
+                    Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+                    Err(e) => Err(format!("{}: {e}", path.display())),
+                }
+            });
+        let lock = match opened {
+            Ok(Some(lock)) => lock,
+            // Held by a running resim.
+            Ok(None) => continue,
+            Err(failure) => {
+                first_failure.get_or_insert_with(|| failure.clone());
+                log_passed_over_slot(&mut latch, slot, &SlotPassedOver::Lock(failure));
                 continue;
             }
         };
-        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(e) if e == rustix::io::Errno::WOULDBLOCK => continue,
-            Err(e) => {
-                first_failure.get_or_insert_with(|| format!("{}: {e}", path.display()));
-                continue;
+        match ready(slot) {
+            Ok(()) => {
+                if let Some(suppressed) = latch.on_success() {
+                    tracing::info!(
+                        slot,
+                        suppressed,
+                        total_failures = latch.total_failures(),
+                        "replay: claimed a resim namespace slot after passing over others"
+                    );
+                }
+                return Ok(ResimSlot { slot, _lock: lock });
             }
-        }
-        if ready(slot) {
-            return Ok(ResimSlot { slot, _lock: lock });
+            Err(passed) => {
+                log_passed_over_slot(&mut latch, slot, &passed);
+                last_refusal = Some((slot, passed));
+            }
         }
     }
     Err(ReplayError::Internal {
         reason: format!(
             "no resim namespace slot is free: none of the {slots} slot locks in '{}' could be \
              taken by this process (each is held by a running resim, could not be opened or \
-             locked, or its namespace still holds a node){}",
+             locked, or its namespace did not reclaim clean){}{}",
             lock_dir.display(),
             first_failure
                 .map(|failure| format!("; the first that could not be opened or locked: {failure}"))
+                .unwrap_or_default(),
+            last_refusal
+                .map(|(slot, passed)| format!(
+                    "; the last whose namespace was refused: slot {slot}, {passed}"
+                ))
                 .unwrap_or_default()
         ),
     })
 }
 
 /// What reclaiming one slot's namespace found and did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SlotReclaim {
     /// The dead-node sweep's counts.
     cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
-    /// Nodes still registered after the sweep; `None` when the registry could
-    /// not be listed.
-    nodes_left: Option<u64>,
+    /// Nodes still registered after the sweep, or why the registry could not
+    /// be listed.
+    nodes_left: Result<u64, String>,
     /// Leftover segments removed.
     segments_removed: u64,
     /// Leftover segments that could not be removed.
@@ -314,10 +426,28 @@ struct SlotReclaim {
 }
 
 impl SlotReclaim {
-    /// A resim may start on the slot: its namespace holds no node, and every
-    /// leftover segment the walk reached was removed.
-    fn is_clean(&self) -> bool {
-        self.nodes_left == Some(0) && self.segments_failed == 0
+    /// Why a resim may not start on the slot, or `None` when it may: its
+    /// namespace holds no node, and every leftover segment the walk reached
+    /// was removed.
+    fn refusal(&self) -> Option<String> {
+        let cleaned = &self.cleaned;
+        match &self.nodes_left {
+            Err(error) => Some(format!(
+                "its namespace's node registry could not be listed after the dead-node sweep \
+                 ({error})"
+            )),
+            Ok(0) if self.segments_failed == 0 => None,
+            Ok(0) => Some(format!(
+                "leftover segments of its namespace that could not be removed: {}",
+                self.segments_failed
+            )),
+            Ok(left) => Some(format!(
+                "nodes still registered in its namespace after the dead-node sweep: {left} (the \
+                 sweep removed {}, failed on {} and deferred {}; it removes only the nodes of \
+                 processes that have ended and that this user can inspect)",
+                cleaned.cleanups, cleaned.failed_cleanups, cleaned.deferred
+            )),
+        }
     }
 }
 
@@ -343,24 +473,38 @@ fn reclaim_resim_slot(
     // Startup hygiene only: the elapsed time bounds how long the reclaim may
     // delay the resim and never reaches anything the run executes or reports.
     let started = std::time::Instant::now();
-    let mut reclaim = SlotReclaim {
-        cleaned: cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(
-            ix_config, budget,
-        ),
-        ..SlotReclaim::default()
-    };
+    let cleaned =
+        cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(ix_config, budget);
     let mut nodes = 0u64;
     let listed =
         iceoryx2::node::Node::<iceoryx2::service::ipc_threadsafe::Service>::list(ix_config, |_| {
             nodes += 1;
             iceoryx2::prelude::CallbackProgression::Continue
         });
-    reclaim.nodes_left = listed.is_ok().then_some(nodes);
-    if reclaim.nodes_left != Some(0) {
+    let mut reclaim = SlotReclaim {
+        cleaned,
+        nodes_left: listed.map(|()| nodes).map_err(|e| e.to_string()),
+        segments_removed: 0,
+        segments_failed: 0,
+    };
+    if reclaim.nodes_left != Ok(0) {
         return reclaim;
     }
-    let Some(entries) = segment_dir.and_then(|dir| std::fs::read_dir(dir).ok()) else {
+    let Some(dir) = segment_dir else {
         return reclaim;
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                slot,
+                error = %error,
+                "replay: could not list the shared-memory segment names to reclaim a resim \
+                 namespace slot; its leftover segments stay until a later resim on the slot \
+                 lists them"
+            );
+            return reclaim;
+        }
     };
     for entry in entries.flatten() {
         if started.elapsed() >= budget {
@@ -439,29 +583,32 @@ fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayErro
     // The iceoryx2 root a fallback names may not exist before the first node;
     // a directory that cannot be made fails the claim's first open, by name.
     let _ = std::fs::create_dir_all(&lock_dir);
-    let mut reclaimed = SlotReclaim::default();
-    let claimed = claim_resim_slot(
-        &lock_dir,
-        RESIM_NAMESPACE_SLOTS,
-        |slot| match resim_ix_config(base, slot) {
-            Ok(ix_config) => {
-                reclaimed = reclaim_resim_slot(
-                    &ix_config,
-                    slot,
-                    SEGMENT_NAME_DIR.map(Path::new),
-                    budget.saturating_sub(started.elapsed()),
-                );
-                reclaimed.is_clean()
-            }
-            Err(_) => false,
-        },
-    )?;
+    // Summed over every slot whose namespace the claim reclaimed.
+    let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
+    let claimed = claim_resim_slot(&lock_dir, RESIM_NAMESPACE_SLOTS, |slot| {
+        let ix_config =
+            resim_ix_config(base, slot).map_err(|e| SlotPassedOver::Config(e.to_string()))?;
+        let reclaim = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            budget.saturating_sub(started.elapsed()),
+        );
+        cleanups += reclaim.cleaned.cleanups;
+        deferred += reclaim.cleaned.deferred;
+        segments += reclaim.segments_removed;
+        total_failures += reclaim.cleaned.failed_cleanups + reclaim.segments_failed;
+        match reclaim.refusal() {
+            None => Ok(()),
+            Some(reason) => Err(SlotPassedOver::Reclaim { reclaim, reason }),
+        }
+    })?;
     tracing::debug!(
         slot = claimed.slot,
-        cleanups = reclaimed.cleaned.cleanups,
-        deferred = reclaimed.cleaned.deferred,
-        segments = reclaimed.segments_removed,
-        total_failures = reclaimed.cleaned.failed_cleanups,
+        cleanups,
+        deferred,
+        segments,
+        total_failures,
         "replay: claimed and reclaimed a resim namespace slot"
     );
     let slot = claimed.slot;
@@ -33149,7 +33296,7 @@ mod unlisted_macro_output_tests {
 mod resim_namespace_tests {
     use super::{
         claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
-        resim_namespace_slot, ResimSlot, SlotReclaim, RESIM_NAMESPACE_MARKER,
+        resim_namespace_slot, ResimSlot, SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER,
         RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
@@ -33214,7 +33361,7 @@ mod resim_namespace_tests {
 
     /// The claim every caller below makes: any slot the lock admits is ready.
     fn claim(dir: &Path, slots: u32) -> ResimSlot {
-        claim_resim_slot(dir, slots, |_| true).expect("a free slot")
+        claim_resim_slot(dir, slots, |_| Ok(())).expect("a free slot")
     }
 
     /// Hand oracles: the marker, the slot in exactly eight lowercase hex
@@ -33345,26 +33492,122 @@ mod resim_namespace_tests {
         let mut tried = Vec::new();
         let claimed = claim_resim_slot(dir.path(), 4, |slot| {
             tried.push(slot);
-            slot != 0
+            if slot == 0 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
         })
         .expect("slot 1 is ready");
         assert_eq!((claimed.slot, tried), (1, vec![0, 1]));
         assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
     }
 
+    /// A reclaim that leaves a node: what the dead-node sweep did, from
+    /// `cleaned`, and the nodes left.
+    fn holding(left: u64, cleaned: BoundedCleanup) -> SlotReclaim {
+        SlotReclaim {
+            cleaned,
+            nodes_left: Ok(left),
+            segments_removed: 0,
+            segments_failed: 0,
+        }
+    }
+
+    /// Hand oracles: each way a reclaim does not come back clean gives its
+    /// own reason, with the counts it read; a clean reclaim gives none.
+    #[test]
+    fn a_reclaim_that_is_not_clean_names_its_cause() {
+        let clean = holding(0, BoundedCleanup::default());
+        assert_eq!(clean.refusal(), None);
+
+        let left = holding(
+            1,
+            BoundedCleanup {
+                cleanups: 2,
+                failed_cleanups: 3,
+                deferred: 4,
+            },
+        );
+        assert_eq!(
+            left.refusal().as_deref(),
+            Some(
+                "nodes still registered in its namespace after the dead-node sweep: 1 (the sweep \
+                 removed 2, failed on 3 and deferred 4; it removes only the nodes of processes \
+                 that have ended and that this user can inspect)"
+            )
+        );
+
+        let unlisted = SlotReclaim {
+            nodes_left: Err("NodeListFailure::InsufficientPermissions".to_string()),
+            ..clean.clone()
+        };
+        assert_eq!(
+            unlisted.refusal().as_deref(),
+            Some(
+                "its namespace's node registry could not be listed after the dead-node sweep \
+                 (NodeListFailure::InsufficientPermissions)"
+            )
+        );
+
+        let stuck = SlotReclaim {
+            segments_removed: 1,
+            segments_failed: 2,
+            ..clean
+        };
+        assert_eq!(
+            stuck.refusal().as_deref(),
+            Some("leftover segments of its namespace that could not be removed: 2")
+        );
+    }
+
+    /// Every slot refused by its reclaim: exit 5, naming the LAST slot passed
+    /// over and its reason, and no open failure, since every lock file opened.
+    #[test]
+    fn a_claim_with_every_slot_refused_names_the_last_refusal_in_its_exit_5_text() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let err = claim_resim_slot(dir.path(), 3, |slot| {
+            let reclaim = holding(u64::from(slot) + 1, BoundedCleanup::default());
+            let reason = reclaim.refusal().expect("a node is left");
+            Err(SlotPassedOver::Reclaim { reclaim, reason })
+        })
+        .expect_err("every slot refused");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(
+            text.contains(
+                "; the last whose namespace was refused: slot 2, nodes still registered in its \
+                 namespace after the dead-node sweep: 3 (the sweep removed 0, failed on 0 and \
+                 deferred 0;"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("could not be opened or locked:"), "{text}");
+        assert_eq!(
+            claim(dir.path(), 3).slot,
+            0,
+            "every refused lock was released"
+        );
+    }
+
     /// Every slot held: exit 5, naming the directory and the slot count, and
-    /// no open failure, since every lock file opened.
+    /// neither an open failure, since every lock file opened, nor a refusal,
+    /// since no namespace was reclaimed.
     #[test]
     fn a_claim_with_every_slot_held_is_refused_with_exit_5() {
         let dir = tempfile::tempdir().expect("a lock directory");
         let _first = claim(dir.path(), 2);
         let _second = claim(dir.path(), 2);
-        let err = claim_resim_slot(dir.path(), 2, |_| true).expect_err("no free slot");
+        let err = claim_resim_slot(dir.path(), 2, |_| Ok(())).expect_err("no free slot");
         assert_eq!(err.exit_code(), 5);
         let text = err.to_string();
         assert!(text.contains("none of the 2 slot locks"), "{text}");
         assert!(text.contains(&dir.path().display().to_string()), "{text}");
         assert!(!text.contains("could not be opened or locked:"), "{text}");
+        assert!(
+            !text.contains("the last whose namespace was refused"),
+            "{text}"
+        );
     }
 
     /// A lock directory that does not exist: exit 5, naming the first lock
@@ -33373,7 +33616,7 @@ mod resim_namespace_tests {
     fn a_missing_lock_directory_is_refused_naming_the_first_open_failure() {
         let dir = tempfile::tempdir().expect("a parent directory");
         let missing = dir.path().join("absent");
-        let err = claim_resim_slot(&missing, 2, |_| true).expect_err("nothing opens");
+        let err = claim_resim_slot(&missing, 2, |_| Ok(())).expect_err("nothing opens");
         assert_eq!(err.exit_code(), 5);
         let text = err.to_string();
         let first = missing.join("cer_resim_00000000.lock");
@@ -33429,12 +33672,12 @@ mod resim_namespace_tests {
             untouched,
             SlotReclaim {
                 cleaned: BoundedCleanup::default(),
-                nodes_left: Some(0),
+                nodes_left: Ok(0),
                 segments_removed: 0,
                 segments_failed: 0,
             }
         );
-        assert!(untouched.is_clean());
+        assert_eq!(untouched.refusal(), None);
         assert_eq!(
             left().len(),
             kept.len() + 2,
@@ -33451,12 +33694,12 @@ mod resim_namespace_tests {
             reclaimed,
             SlotReclaim {
                 cleaned: BoundedCleanup::default(),
-                nodes_left: Some(0),
+                nodes_left: Ok(0),
                 segments_removed: 2,
                 segments_failed: 0,
             }
         );
-        assert!(reclaimed.is_clean());
+        assert_eq!(reclaimed.refusal(), None);
         assert_eq!(left(), kept);
     }
 
@@ -33489,12 +33732,12 @@ mod resim_namespace_tests {
             held,
             SlotReclaim {
                 cleaned: BoundedCleanup::default(),
-                nodes_left: Some(1),
+                nodes_left: Ok(1),
                 segments_removed: 0,
                 segments_failed: 0,
             }
         );
-        assert!(!held.is_clean());
+        assert!(held.refusal().is_some());
         assert!(
             segment.exists(),
             "a namespace with a node keeps its segments"
@@ -33508,8 +33751,8 @@ mod resim_namespace_tests {
             SEGMENT_NAME_DIR.map(Path::new),
             Duration::from_secs(10),
         );
-        assert_eq!(reclaimed.nodes_left, Some(0));
-        assert!(reclaimed.is_clean());
+        assert_eq!(reclaimed.nodes_left, Ok(0));
+        assert_eq!(reclaimed.refusal(), None);
         if SEGMENT_NAME_DIR.is_some() {
             assert_eq!(reclaimed.segments_removed, 1, "the management segment");
         }
@@ -33578,8 +33821,8 @@ mod resim_namespace_tests {
             },
             "the dead node is reaped"
         );
-        assert_eq!(reclaimed.nodes_left, Some(0));
-        assert!(reclaimed.is_clean());
+        assert_eq!(reclaimed.nodes_left, Ok(0));
+        assert_eq!(reclaimed.refusal(), None);
         assert_eq!(namespace_files(&root, slot), BTreeSet::new());
     }
 }
