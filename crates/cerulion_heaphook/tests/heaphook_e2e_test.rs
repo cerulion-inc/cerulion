@@ -205,6 +205,70 @@ fn shim_so() -> PathBuf {
     p
 }
 
+/// Compile the non-PIE C fixture once per test process. A Rust PIE probe cannot
+/// exercise glibc's canonical-PLT import, so the fixture verifies that ELF shape
+/// itself before reporting the handshake and an actual in-slot allocation.
+fn canonical_probe_bin() -> &'static Path {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/canonical_plt.c");
+        let bin = profile_dir().join(format!("heaphook_canonical_plt_{}", std::process::id()));
+        let output = Command::new("cc")
+            .args(["-O0", "-fno-pie", "-no-pie", "-Wall", "-Wextra", "-Werror"])
+            .arg(source)
+            .args(["-o"])
+            .arg(&bin)
+            .arg("-ldl")
+            .output()
+            .expect("compile canonical PLT fixture with cc");
+        assert!(
+            output.status.success(),
+            "canonical PLT fixture did not compile:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        bin
+    })
+    .as_path()
+}
+
+/// The C fixture never forks and emits only a bounded set of fact lines, so
+/// drain after exit and, on timeout, signal only the child we started.
+fn run_canonical_probe(ld_preload: Option<String>, debug: bool) -> Run {
+    let mut cmd = Command::new(canonical_probe_bin());
+    cmd.env_remove("LD_PRELOAD")
+        .env_remove("CERULION_HEAPHOOK_DEBUG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(value) = ld_preload {
+        cmd.env("LD_PRELOAD", value);
+    }
+    if debug {
+        cmd.env("CERULION_HEAPHOOK_DEBUG", "1");
+    }
+    let mut child = cmd.spawn().expect("spawn canonical PLT fixture");
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    while child
+        .try_wait()
+        .expect("try_wait canonical PLT fixture")
+        .is_none()
+    {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("canonical PLT fixture did not exit within {CHILD_TIMEOUT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("drain canonical PLT fixture");
+    Run {
+        stdout: String::from_utf8(output.stdout).expect("fixture stdout UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("fixture stderr UTF-8"),
+        ok: output.status.success(),
+    }
+}
+
 /// A finished probe run.
 struct Run {
     stdout: String,
@@ -372,6 +436,32 @@ fn handshake_present_reports_version_and_won_malloc() {
     run.assert_fact("present", "1");
     run.assert_fact("version", &HEAPHOOK_ABI_VERSION.to_string());
     run.assert_fact("status_won", "1");
+}
+
+#[test]
+fn a_canonical_malloc_plt_import_keeps_the_hook_active_and_allocates_in_slot() {
+    let expected_stdout = concat!(
+        "canonical_plt=1\npresent=1\nstatus_won=1\nat_slot_base=1\n",
+        "range_test=1\ndisarm_rc=0\nretire_rc=0\nPROBE_DONE\n"
+    );
+    for _ in 0..2 {
+        let run = run_canonical_probe(Some(hook_so().display().to_string()), true);
+        assert_completed(&run, "canonical_plt");
+        run.assert_fact("canonical_plt", "1");
+        run.assert_fact("present", "1");
+        run.assert_fact("status_won", "1");
+        run.assert_fact("at_slot_base", "1");
+        run.assert_fact("range_test", "1");
+        run.assert_fact("disarm_rc", "0");
+        run.assert_fact("retire_rc", "0");
+        assert_eq!(run.stdout, expected_stdout, "deterministic fact bytes");
+        assert!(
+            !run.stderr.contains("another allocator won malloc"),
+            "{}",
+            run.stderr
+        );
+        assert!(run.stderr.contains("won_malloc=1"), "{}", run.stderr);
+    }
 }
 
 /// The fixture is clean: with NO preload the handshake symbol is genuinely

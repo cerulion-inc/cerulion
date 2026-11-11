@@ -335,7 +335,7 @@ fn on_load() {
     let debug = env_truthy(c"CERULION_HEAPHOOK_DEBUG");
     state::set_debug_enabled(debug);
 
-    let won = won_malloc();
+    let won = state::with_control_guard(won_malloc);
     // set_status emits the ALWAYS-ON won-malloc degrade line when !won.
     state::set_status(if won { HEAPHOOK_STATUS_WON_MALLOC } else { 0 });
 
@@ -374,7 +374,7 @@ extern "C" fn atfork_child() {
 
 /// Did this library resolve as the process's `malloc` (first-in-load-order)?
 ///
-/// It compares the MODULE the process-resolved `malloc` lives in against OUR
+/// It compares the MODULE defining the process-resolved `malloc` against OUR
 /// module. An ADDRESS compare against our own `malloc` symbol would be WRONG:
 /// taking the address of an EXPORTED symbol goes through the GOT and is itself
 /// preemptible, so under `LD_PRELOAD=libjemalloc.so:libcerulion_heaphook.so`
@@ -382,20 +382,150 @@ extern "C" fn atfork_child() {
 /// compare EQUAL — reporting "won" for exactly the foreign-allocator case the
 /// status bit exists to catch. Module identity via `dladdr` is preemption-proof:
 /// `heaphook_ctor` is a PRIVATE (non-exported, `dso_local`) symbol, so `dladdr`
-/// on its address always yields OUR module's base.
+/// on its address always yields OUR module's base. A non-PIE executable can
+/// expose an UNDEFINED `malloc` symbol with a canonical PLT address: glibc's
+/// `dlsym` returns that stub for pointer equality, even when its calls bind to
+/// our definition. For that case only, find the first defining loaded module.
 fn won_malloc() -> bool {
     // SAFETY: RTLD_DEFAULT + a valid C string is defined on glibc.
     let resolved = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"malloc".as_ptr() as *const c_char) };
     if resolved.is_null() {
         return false;
     }
+    // SAFETY: Dl_info consists of pointers, for which zero is valid.
     let mut ours: libc::Dl_info = unsafe { core::mem::zeroed() };
-    let mut theirs: libc::Dl_info = unsafe { core::mem::zeroed() };
     let ours_addr = heaphook_ctor as *const () as *const c_void;
     // SAFETY: dladdr with a valid code address and a Dl_info out-pointer.
     let ok_ours = unsafe { libc::dladdr(ours_addr, &mut ours) };
-    let ok_theirs = unsafe { libc::dladdr(resolved, &mut theirs) };
-    ok_ours != 0 && ok_theirs != 0 && ours.dli_fbase == theirs.dli_fbase
+    if ok_ours == 0 {
+        return false;
+    }
+    match malloc_location(resolved) {
+        Some(MallocLocation::CanonicalPlt) => first_malloc_definition() == Some(ours.dli_fbase),
+        Some(MallocLocation::Definition(module)) => module == ours.dli_fbase,
+        None => false,
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+type ElfSym = libc::Elf64_Sym;
+#[cfg(target_pointer_width = "32")]
+type ElfSym = libc::Elf32_Sym;
+
+enum MallocLocation {
+    Definition(*mut c_void),
+    CanonicalPlt,
+}
+
+/// Distinguish a definition's owning module from an undefined canonical PLT.
+fn malloc_location(addr: *const c_void) -> Option<MallocLocation> {
+    // glibc's dlfcn.h: request the ELF symbol table entry from dladdr1.
+    const RTLD_DL_SYMENT: c_int = 1;
+    const SHN_UNDEF: u16 = 0;
+    // SAFETY: Dl_info is a struct of nullable pointers.
+    let mut info: libc::Dl_info = unsafe { core::mem::zeroed() };
+    let mut sym = core::ptr::null_mut();
+    // SAFETY: dladdr1 accepts any address for lookup, valid out-pointers, and
+    // RTLD_DL_SYMENT returns a pointer to the loaded object's native ElfW(Sym).
+    if unsafe { libc::dladdr1(addr, &mut info, &mut sym, RTLD_DL_SYMENT) } == 0 {
+        return None;
+    }
+    // SAFETY: a non-null RTLD_DL_SYMENT result is a loader-owned ElfW(Sym).
+    // Preload definitions remain loaded; the fallback holds a NOLOAD reference
+    // and the loader lock while inspecting other objects.
+    if !sym.is_null() && unsafe { (*sym.cast::<ElfSym>()).st_shndx == SHN_UNDEF } {
+        Some(MallocLocation::CanonicalPlt)
+    } else {
+        Some(MallocLocation::Definition(info.dli_fbase))
+    }
+}
+
+/// Skip canonical imports and dependency results, stopping at the first
+/// loaded object that itself defines malloc. glibc enumerates objects in
+/// loader order, including preloads before the executable's dependencies.
+fn first_malloc_definition() -> Option<*mut c_void> {
+    let mut module = None;
+    // SAFETY: glibc calls the callback synchronously with valid dl_phdr_info
+    // pointers while holding its loader lock; data is our live Option out-slot.
+    unsafe {
+        libc::dl_iterate_phdr(
+            Some(find_malloc_definition),
+            (&mut module as *mut Option<*mut c_void>).cast(),
+        );
+    }
+    module
+}
+
+unsafe extern "C" fn find_malloc_definition(
+    info: *mut libc::dl_phdr_info,
+    _size: usize,
+    data: *mut c_void,
+) -> c_int {
+    // SAFETY: dl_iterate_phdr supplies a valid info and passes through the
+    // live Option out-slot from first_malloc_definition unchanged.
+    let (info, found) = unsafe { (&*info, &mut *data.cast::<Option<*mut c_void>>()) };
+    if info.dlpi_name.is_null() {
+        return 1; // Unidentifiable object: fail closed.
+    }
+    // SAFETY: dlpi_name is a loader-owned NUL-terminated string. An empty
+    // name denotes the main executable, whose canonical import we must skip.
+    if unsafe { *info.dlpi_name } == 0 {
+        return 0;
+    }
+    // hot-path-alloc-ok: handle lookup is confined to the load constructor.
+    // SAFETY: the name is loader-owned; NOLOAD forbids loading another object,
+    // and LAZY does not force eager binding of the object's other PLT entries.
+    let handle = unsafe { libc::dlopen(info.dlpi_name, libc::RTLD_NOLOAD | libc::RTLD_LAZY) };
+    if handle.is_null() {
+        return 1; // Cannot establish load order: fail closed.
+    }
+    // SAFETY: handle is a live dlopen handle and malloc is a valid C string.
+    let addr = unsafe { libc::dlsym(handle, c"malloc".as_ptr()) };
+    let location = (!addr.is_null()).then(|| malloc_location(addr));
+    // SAFETY: balance the successful NOLOAD dlopen's reference; the loader's
+    // enumeration keeps this already-loaded object live during the callback.
+    if unsafe { libc::dlclose(handle) } != 0 {
+        return 1;
+    }
+    match location {
+        Some(Some(MallocLocation::Definition(module)))
+            // SAFETY: dl_iterate_phdr keeps info's program-header array valid
+            // for the callback, including across the balanced NOLOAD lookup.
+            if unsafe { loaded_object_contains(info, addr as usize) } =>
+        {
+            *found = Some(module);
+            1
+        }
+        Some(None) => 1, // Unidentifiable symbol: fail closed.
+        _ => 0,          // No definition here, or dlsym found one in a dependency.
+    }
+}
+
+/// Whether the address belongs to this object's mapped load segments. The
+/// load bias is not necessarily its mapping base: a DSO may have a nonzero
+/// first virtual address, so comparing dlpi_addr to dli_fbase would skip it.
+///
+/// # Safety
+/// A non-null, non-empty array in `info` must remain live for the call.
+unsafe fn loaded_object_contains(info: &libc::dl_phdr_info, addr: usize) -> bool {
+    if info.dlpi_phdr.is_null() || info.dlpi_phnum == 0 {
+        return false;
+    }
+    // SAFETY: the caller keeps the dlpi_phnum-entry program-header array live.
+    let headers = unsafe { core::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize) };
+    headers.iter().any(|header| {
+        if header.p_type != libc::PT_LOAD {
+            return false;
+        }
+        (info.dlpi_addr as usize)
+            .checked_add(header.p_vaddr as usize)
+            .and_then(|start| {
+                start
+                    .checked_add(header.p_memsz as usize)
+                    .map(|end| (start, end))
+            })
+            .is_some_and(|(start, end)| addr >= start && addr < end)
+    })
 }
 
 /// The `debug!`-once load breadcrumb naming the ABI version. Also written raw to
@@ -502,6 +632,98 @@ fn write_u32_dec(out: &mut [u8], val: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    type ElfPhdr = libc::Elf64_Phdr;
+    #[cfg(target_pointer_width = "32")]
+    type ElfPhdr = libc::Elf32_Phdr;
+
+    #[test]
+    fn object_ownership_uses_load_segments_even_with_a_nonzero_virtual_address() {
+        let headers = [ElfPhdr {
+            p_type: libc::PT_LOAD,
+            p_flags: 0,
+            p_offset: 0,
+            p_vaddr: 0x1000,
+            p_paddr: 0,
+            p_filesz: 0x80,
+            p_memsz: 0x80,
+            p_align: 0x1000,
+        }];
+        // SAFETY: all integer and pointer fields in dl_phdr_info admit zero.
+        let mut info: libc::dl_phdr_info = unsafe { core::mem::zeroed() };
+        info.dlpi_addr = 0x2000;
+        info.dlpi_phdr = headers.as_ptr();
+        info.dlpi_phnum = 1;
+        for (addr, expected) in [
+            (0x2000, false),
+            (0x3000, true),
+            (0x307f, true),
+            (0x3080, false),
+        ] {
+            // SAFETY: info points at the live one-entry headers array above.
+            assert_eq!(unsafe { loaded_object_contains(&info, addr) }, expected);
+        }
+    }
+
+    #[test]
+    fn absent_non_load_and_overflowed_segments_cannot_own_a_malloc_definition() {
+        // SAFETY: dl_phdr_info's integer and pointer fields admit zero.
+        let mut info: libc::dl_phdr_info = unsafe { core::mem::zeroed() };
+        // SAFETY: an absent array is rejected before it is dereferenced.
+        assert!(!unsafe { loaded_object_contains(&info, 0) });
+        info.dlpi_phnum = 1;
+        for (kind, bias, virtual_addr, size, address) in [
+            (libc::PT_DYNAMIC, 0x2000, 0x1000, 0x80, 0x3000),
+            (libc::PT_LOAD, 0x2000, 0x1000, 0, 0x3000),
+            (libc::PT_LOAD, usize::MAX, 1, 1, 0),
+            (libc::PT_LOAD, 0, usize::MAX - 1, 2, usize::MAX - 1),
+        ] {
+            info.dlpi_addr = bias as _;
+            let header = ElfPhdr {
+                p_type: kind,
+                p_flags: 0,
+                p_offset: 0,
+                p_vaddr: virtual_addr as _,
+                p_paddr: 0,
+                p_filesz: 0,
+                p_memsz: size as _,
+                p_align: 0x1000,
+            };
+            info.dlpi_phdr = &header;
+            // SAFETY: info points at the live one-entry header above.
+            assert!(!unsafe { loaded_object_contains(&info, address) });
+        }
+    }
+
+    #[test]
+    fn an_unmapped_malloc_address_has_no_trusted_definition() {
+        assert!(malloc_location(core::ptr::null()).is_none());
+    }
+
+    #[test]
+    fn an_unidentifiable_loaded_object_stops_the_definition_search() {
+        // SAFETY: dl_phdr_info's integer and pointer fields admit zero values.
+        let mut info: libc::dl_phdr_info = unsafe { core::mem::zeroed() };
+        let mut found = None;
+        for name in [
+            core::ptr::null(),
+            c"cerulion_missing_malloc_definition.so".as_ptr(),
+        ] {
+            info.dlpi_name = name;
+            // SAFETY: the callback receives live info and Option out-slots;
+            // its name is either null or a valid C string for the error seam.
+            let rc = unsafe {
+                find_malloc_definition(
+                    &mut info,
+                    core::mem::size_of::<libc::dl_phdr_info>(),
+                    (&mut found as *mut Option<*mut c_void>).cast(),
+                )
+            };
+            assert_eq!(rc, 1, "an uninspectable object cannot be skipped");
+            assert!(found.is_none(), "lookup failure never reports a winner");
+        }
+    }
 
     // The zero-capacity boundary: `base == tail_limit` is
     // the documented ZERO-CAPACITY window — the rmw's minimum-slice-ceiling
