@@ -13,15 +13,11 @@
 //!
 //! This file pins that contract behaviorally, through the real binary, using
 //! the decision's own example command (`topic list`) and its
-//! `cerulion_cli_engine::discovery_ladder` INFO breadcrumb. The ladder runs
-//! UNCONDITIONALLY on the default (scouting-on) path and logs an INFO line at
-//! the end of the gather in EITHER of two branches — "discovery ladder
-//! gathered peers=N" when a peer is found, or "discovery ladder found no
-//! robots …" when none is (the offline / clean-sandbox case). Both share the
-//! **`discovery ladder` prefix**, so matching that prefix is environment- and
-//! branch-independent (an oracle of the longer
-//! `"discovery ladder gathered"` would be the found-a-peer branch only, and so
-//! vacuous in a peerless CI). Each subprocess also runs with an ISOLATED
+//! INFO breadcrumb. The ladder reports one of three outcomes: gathered peers,
+//! found no robots, or skipped LAN discovery under paired access. All share
+//! the **`discovery ladder` prefix**. The fixture pins paired access and the
+//! skipped outcome, which requires no reachable LAN robot. Each subprocess
+//! also runs with an ISOLATED
 //! `HOME` + no `CERULION_PEERS`, so the host's `~/.cerulion/peers.json` peer
 //! cache can never steer which branch fires. `topic list` needs no live topic,
 //! no workspace, and no reachable robot, and self-exits after the bounded
@@ -48,11 +44,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// The branch-independent prefix of the `cerulion_cli_engine::discovery_ladder`
-/// INFO breadcrumb — matches BOTH "discovery ladder gathered peers=N" (peer
-/// found) and "discovery ladder found no robots …" (peerless). One of the two
-/// ALWAYS fires on the default `topic list` path, so this substring is a
-/// hermetic one-shot INFO oracle regardless of what is on the LAN.
+/// INFO prefix shared by gathered peers, found no robots, and skipped LAN
+/// discovery under paired access. The fixture pins the skipped branch.
 const LADDER_BREADCRUMB: &str = "discovery ladder";
 
 /// Run `cerulion [-v] topic list` with the given `RUST_LOG` override (or the
@@ -72,6 +65,8 @@ fn run_topic_list(home: &Path, verbose: bool, rust_log: Option<&str>) -> Output 
     // `~/.cerulion/peers.json` cache) + no CERULION_PEERS override, so neither
     // the host's cache nor the runner's env can steer which ladder branch fires.
     cmd.env("HOME", home);
+    cmd.env("CERULION_HOME", home.join(".cerulion"));
+    cmd.env("CERULION_LAN_ACCESS", "paired");
     cmd.env_remove("CERULION_PEERS");
     // Isolate from the ambient RUST_LOG the test runner may set.
     match rust_log {
@@ -146,6 +141,7 @@ fn verbose_flag_shows_breadcrumbs() {
         stderr.contains(LADDER_BREADCRUMB),
         "`-v` must SHOW the '{LADDER_BREADCRUMB}' breadcrumb; stderr was:\n{stderr}"
     );
+    assert!(stderr.contains("discovery ladder skipped:"), "{stderr}");
 }
 
 /// An explicit global `RUST_LOG=info` RESTORES the breadcrumbs a one-shot
@@ -165,6 +161,7 @@ fn rust_log_info_restores_breadcrumbs() {
         "`RUST_LOG=info` must RESTORE the '{LADDER_BREADCRUMB}' breadcrumb the \
          quiet default suppresses; stderr was:\n{stderr}"
     );
+    assert!(stderr.contains("discovery ladder skipped:"), "{stderr}");
 }
 
 /// A TARGET-SCOPED `RUST_LOG=cerulion_cli_engine=info` also restores the
@@ -187,6 +184,7 @@ fn rust_log_target_scoped_info_restores_breadcrumbs() {
          '{LADDER_BREADCRUMB}' breadcrumb (RUST_LOG governs the cerulion target, \
          not the warn default); stderr was:\n{stderr}"
     );
+    assert!(stderr.contains("discovery ladder skipped:"), "{stderr}");
 }
 
 /// An explicit `RUST_LOG=warn` is HONORED (not silently force-raised to

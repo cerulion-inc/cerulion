@@ -218,6 +218,33 @@ pub(crate) static CASES: &[Case] = &[
             by: By::Flag,
         },
     },
+    Case {
+        verb: &["topic", "echo"],
+        argv: &["topic", "echo", "/camera", "--robot", "bench-arm"],
+        expect: Expect::Refused {
+            code: 2,
+            says: &["Error: --robot bench-arm reaches the robot over the network, which ", " disables; unset CERULION_NETWORK to call its topic-echo verb (without --robot the command runs on this machine)"],
+            by: By::Network,
+        },
+    },
+    Case {
+        verb: &["topic", "hz"],
+        argv: &["topic", "hz", "/camera", "--robot", "bench-arm"],
+        expect: Expect::Refused {
+            code: 2,
+            says: &["Error: --robot bench-arm reaches the robot over the network, which ", " disables; unset CERULION_NETWORK to call its topic-hz verb (without --robot the command runs on this machine)"],
+            by: By::Network,
+        },
+    },
+    Case {
+        verb: &["topic", "info"],
+        argv: &["topic", "info", "/camera", "--robot", "bench-arm"],
+        expect: Expect::Refused {
+            code: 2,
+            says: &["Error: --robot bench-arm reaches the robot over the network, which ", " disables; unset CERULION_NETWORK to call its topic-info verb (without --robot the command runs on this machine)"],
+            by: By::Network,
+        },
+    },
     // ---- the same verbs without --robot are not refused ----
     gated(
         &["topic", "pub"],

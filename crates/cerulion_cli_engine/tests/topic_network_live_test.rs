@@ -420,7 +420,8 @@ fn endpoint_less_discovery_opens_isolated_and_returns_empty() {
 }
 
 /// An ISOLATED transient resolve (no peer, no locators,
-/// scouting off) must report `DiscoveryNotConverged`, NOT `NoProducer`.
+/// scouting off) reports `DiscoveryNotConverged` with Open access, or
+/// `LanNotQueried` with Paired access, never `NoProducer`.
 ///
 /// This is the CALL-SITE pin for `classify_transient_miss`. `NoProducer` routes to
 /// "topic 'X' not found locally or on any discovered robot", i.e. an assertion about
@@ -444,7 +445,17 @@ fn an_isolated_transient_resolve_is_not_converged_never_a_false_absence() {
     // isolated, so nothing can answer.
     let resolved = resolve_remote_ingress_target_with_opts("/nobody", &[], &[], false, None);
     match resolved {
-        RemoteResolve::DiscoveryNotConverged => {}
+        RemoteResolve::Ambiguous { candidates } => {
+            panic!("isolated session has no candidates: {candidates:?}")
+        }
+        RemoteResolve::DiscoveryNotConverged => assert_eq!(
+            cerulion_core::transport::demand_authorizer::LanAccess::from_env(),
+            cerulion_core::transport::demand_authorizer::LanAccess::Open
+        ),
+        RemoteResolve::LanNotQueried => assert_eq!(
+            cerulion_core::transport::demand_authorizer::LanAccess::from_env(),
+            cerulion_core::transport::demand_authorizer::LanAccess::Paired
+        ),
         RemoteResolve::NoProducer => panic!(
             "an isolated resolve read NO robot's catalog — reporting NoProducer makes the CLI \
              claim the topic is absent from every discovered robot, which is exactly the \
@@ -2012,8 +2023,10 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             resolve_remote_ingress_target_with_opts(custom_topic, &connect, &[], false, None);
         if matches!(known, RemoteResolve::Found(_)) {
             let custom_label = match &custom {
+                RemoteResolve::Ambiguous { .. } => "Ambiguous",
                 RemoteResolve::Found(_) => "Found",
                 RemoteResolve::NoProducer => "NoProducer",
+                RemoteResolve::LanNotQueried => "LanNotQueried",
                 // Unreachable on THIS path (an explicit `--connect` locator
                 // bypasses netd entirely — see `use_netd_query_plane` — so the
                 // transient resolve never reports a netd discovery state), but the

@@ -878,6 +878,14 @@ impl DualMirrorPlane {
 }
 
 impl crate::mirror::MirrorPlane for DualMirrorPlane {
+    fn local_channel(&self, key: &TopicKey) -> String {
+        if matches!(pick_plane(key, &self.registry), Ok(Plane::Iroh)) {
+            key.local_topic()
+        } else {
+            key.topic.clone()
+        }
+    }
+
     /// The picker is pure over `(key, registry)` and this registry is fixed for the
     /// daemon's lifetime, so the plane it names here is the one that ensured the
     /// mirror, not a fresh guess: the same argument that lets `release_mirror`

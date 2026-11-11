@@ -915,6 +915,64 @@ impl NetdClient {
         }
     }
 
+    /// Hold a source-qualified observer mirror until this connection closes.
+    pub fn observe(
+        &mut self,
+        robot: &str,
+        topic: &str,
+        schema_hash: u64,
+    ) -> Result<crate::protocol::ObserveResponse, ClientError> {
+        let id = self.next_request_id();
+        match self.round_trip(&Request::Observe {
+            id,
+            robot: robot.into(),
+            topic: topic.into(),
+            schema_hash,
+        })? {
+            Response::Observed(reply) => {
+                let key = crate::registry::TopicKey::observed(robot, topic);
+                if reply.demand.id != id
+                    || reply.demand.robot != key.robot
+                    || reply.demand.topic != key.topic
+                    || (reply.local_topic != key.local_topic() && reply.local_topic != key.topic)
+                {
+                    return Err(ClientError::Protocol(
+                        "observer reply does not match its requested source".into(),
+                    ));
+                }
+                Ok(reply)
+            }
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "unexpected observer reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// Release this connection's observer refcount before connection close.
+    pub fn unobserve(&mut self, robot: &str, topic: &str) -> Result<ReleaseResponse, ClientError> {
+        let id = self.next_request_id();
+        match self.round_trip(&Request::Unobserve {
+            id,
+            robot: robot.into(),
+            topic: topic.into(),
+        })? {
+            Response::Release(reply) => Ok(reply),
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "unexpected observer release reply: {other:?}"
+            ))),
+        }
+    }
+
     /// One bounded account operation. Never respawns or retries implicitly.
     /// The running daemon must support protocol v9; upgrade and restart it otherwise.
     pub fn account_access_once(

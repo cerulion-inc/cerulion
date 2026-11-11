@@ -13,6 +13,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.
+  Paired LAN skip: INFO.
 - Multi-value flags use exact `num_args = N`, never a range (clap's Append flattens repeats
   into one Vec). Length guards run BEFORE any positional access.
 - Optional-value flags (`--record`, `--run`) use `require_equals`: a bare flag takes its

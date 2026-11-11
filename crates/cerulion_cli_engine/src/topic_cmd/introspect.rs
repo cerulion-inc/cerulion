@@ -853,7 +853,8 @@ fn write_topic_list(
     err: &mut dyn Write,
 ) -> CliResult<()> {
     let mirrors = super::gather_mirror_identities()?;
-    let (local, streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    let (local, mut streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    streaming.retain(|stream| show_all || !stream.topic.starts_with("/__cerulion/observers/"));
     let shown = types == TypeColumn::Shown;
     let walker = shown.then(|| super::local_walker_from_workspace(schemas_dir));
     let local_section = match &walker {
@@ -872,13 +873,39 @@ fn write_topic_list(
     out.flush()?;
     // The account directory is a remote source: every scope that skips the
     // remote query (`--no-network`, `--local`, the kill switch) skips it too.
-    let account_rows = match &remote {
-        Some(_) => account_robot_rows(err)?,
-        None => String::new(),
+    #[cfg(unix)]
+    let directory = if remote.is_some() {
+        crate::account_robot_access::automatic::discover()?
+    } else {
+        Default::default()
     };
+    #[cfg(unix)]
+    if !directory.diagnostics.is_empty() {
+        writeln!(
+            err,
+            "cerulion topic list: {}",
+            directory.diagnostics.join("; ")
+        )?;
+    }
+    #[cfg(unix)]
+    let account_rows =
+        crate::account_robot_access::automatic::render_robots(&directory.robots, show_all);
+    #[cfg(not(unix))]
+    let account_rows = String::new();
     let remote_section = |disc: &super::RemoteDiscovery,
                           had_endpoints: bool,
                           catalogs: &[cerulion_core::CatalogReply]| {
+        #[cfg(unix)]
+        if !directory.robots.is_empty() {
+            return crate::account_robot_access::automatic::render_listing(
+                &directory.robots,
+                disc,
+                catalogs,
+                &streaming,
+                show_all,
+                shown,
+            );
+        }
         match &walker {
             Some(walker) => render_remote_typed_topics_section_with_robot_rows(
                 disc,
@@ -898,7 +925,7 @@ fn write_topic_list(
     if let Some(opts) = remote {
         // `--scan` is the sole producer of a `true` scan, so the subnet
         // sweep never runs on a default listing.
-        match super::query_remote_topics_and_catalogs(&opts, scan) {
+        match super::query_lan_topics_and_catalogs(&opts, scan) {
             Ok((disc, catalogs)) => {
                 write!(
                     out,
@@ -913,7 +940,7 @@ fn write_topic_list(
     // Mirror and account rows are independent of LAN discovery, so they print
     // when the query was skipped or failed; neither is evidence of an empty
     // LAN, so no none-discovered line is written for them.
-    if !streaming.is_empty() {
+    if !streaming.is_empty() || !account_rows.is_empty() {
         write!(
             out,
             "{}",
@@ -927,23 +954,6 @@ fn write_topic_list(
         )?;
     }
     Ok(())
-}
-
-/// The account directory's `ROBOTS` rows, rendered and sanitized; diagnostics
-/// and a failed listing are `cerulion topic list:` lines on `err`
-/// ([`crate::account_robot_access::listing_rows`]).
-#[cfg(unix)]
-fn account_robot_rows(err: &mut dyn Write) -> CliResult<String> {
-    Ok(crate::account_robot_access::listing_rows(
-        "cerulion topic list",
-        err,
-    )?)
-}
-
-/// No account directory client off Unix.
-#[cfg(not(unix))]
-fn account_robot_rows(_err: &mut dyn Write) -> CliResult<String> {
-    Ok(String::new())
 }
 
 /// What `topic find` found.

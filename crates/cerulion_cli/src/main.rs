@@ -424,10 +424,11 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
 
 /// The process exit status for an error a verb returned, built-in or family:
 /// `EXIT_NODE_FATAL` (3) for a run that stopped a node on a fatal error, in
-/// process or in a worker group, and 1 for every other error.
+/// process or in a worker group, 2 for an ambiguous topic, and 1 otherwise.
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
+        CliError::AmbiguousTopic(_) => 2,
         CliError::NodeFatal { .. }
         | CliError::WorkerNodeFatal { .. }
         | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
@@ -2193,17 +2194,22 @@ fn run(cli: Cli) -> CliResult<()> {
                     &mut std::io::stderr(),
                 )
             }
-            TopicAction::Info { topic, local } => {
+            TopicAction::Info {
+                topic,
+                local,
+                robot,
+            } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info_with_scope(
+                let info = topic_cmd::topic_info_with_selection(
                     &topic,
                     schemas_dir,
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )?;
                 println!("{}", info);
                 Ok(())
@@ -2212,6 +2218,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 topic,
                 truncate_length,
                 local,
+                robot,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -2224,16 +2231,21 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo_with_scope(
+                topic_cmd::topic_echo_with_selection(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )
             }
-            TopicAction::Hz { topic, local } => {
+            TopicAction::Hz {
+                topic,
+                local,
+                robot,
+            } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -2242,12 +2254,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz_with_scope(
+                topic_cmd::topic_hz_with_selection(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )
             }
         },
@@ -3898,6 +3911,18 @@ fn command_network_refusal(
             connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
                 .map(|refusal| NetworkRefusal::warning(refusal, 0))
         }
+        Commands::Topic { action } => match action {
+            TopicAction::Info { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-info", switch)
+            }
+            TopicAction::Echo { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-echo", switch)
+            }
+            TopicAction::Hz { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-hz", switch)
+            }
+            TopicAction::List { .. } => None,
+        },
         // Dispatched before this check (`main`'s internal workers, `bagd`),
         // or not refused under the switch: the runs and queries go
         // local-only, and the account verbs reach the account service, which
@@ -3907,7 +3932,6 @@ fn command_network_refusal(
         Commands::Workspace { .. }
         | Commands::Node { .. }
         | Commands::Graph { .. }
-        | Commands::Topic { .. }
         | Commands::Ros { .. }
         | Commands::Ros2 { .. }
         | Commands::Login
@@ -3928,6 +3952,19 @@ fn command_network_refusal(
         #[cfg(not(unix))]
         Commands::Bagd => None,
     }
+}
+
+fn topic_observer_network_refusal(
+    robot: Option<&str>,
+    verb: &str,
+    switch: &network_switch::SwitchEnv,
+) -> Option<network_switch::NetworkRefusal> {
+    let robot = robot?;
+    network_switch::robot_refusal(Some(robot), verb, switch).or_else(|| {
+        graph_cmd::netd_network_off_from(switch.netd.as_deref()).then(|| {
+            network_switch::NetworkRefusal::error("remote topic reads are disabled by CERULION_NETD_NETWORK=off; unset CERULION_NETD_NETWORK to read a robot", 2)
+        })
+    })
 }
 
 /// The usage refusal of `cerulion viz --robot` with no TOPIC.
@@ -5346,9 +5383,9 @@ mod cli_error_exit_code_tests {
     use cerulion_cli_engine::error::CliError;
 
     /// A run that stopped a node on a fatal error exits 3, in process or in
-    /// a worker group; every other error exits 1.
+    /// a worker group; ambiguous topics exit 2 and other errors exit 1.
     #[test]
-    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+    fn fatal_nodes_exit_3_ambiguous_topics_exit_2_and_other_errors_exit_1() {
         let in_process = CliError::NodeFatal {
             nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
         };
@@ -5358,6 +5395,10 @@ mod cli_error_exit_code_tests {
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
         assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::AmbiguousTopic("candidates".into())),
+            2
+        );
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1

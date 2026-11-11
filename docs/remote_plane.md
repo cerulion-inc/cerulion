@@ -74,6 +74,19 @@ access can:
   `cerulion-remoted` dropped (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
+The topic CLI and `viz --robot` also use this plane automatically for account-owned
+and explicitly paired robots. `topic list` shows the robot's reachability and its
+catalog without a manual connect command. Desk observers use private channels
+under `/__cerulion/observers/`, keeping a robot's topic separate from a local topic
+with the same canonical name; wire/2 still names the original topic. Observers of
+one source share a demand, and the last observer releases the channel. Graph
+ingress keeps canonical names and the single-writer contract.
+
+An expired session is refreshed and saved before account discovery, with a 2 s
+budget. If the service is unavailable, the saved account directory remains
+usable. Topic reads keep cache diagnostics at debug; `topic list` reports them
+on one stderr line, and an explicit `--robot` reports unavailable robot topics.
+
 A desk cannot write a topic on the robot or send it teleop commands over
 `cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
 never reads a data stream from the desk. The `teleop` and `deploy` verbs

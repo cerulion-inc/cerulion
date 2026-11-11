@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The iroh WAN [`IrohMirrorPlane`] / [`DualMirrorPlane`] end-to-end
 //! over REAL loopback iroh endpoints + REAL iceoryx2 (DISTINCT per-test SHM roots for
-//! the robot and the desk — parallel-safe, no `#[serial]`).
+//! the robot and the desk). The automatic CLI case uses the default desk namespace;
+//! run this binary with `-- --test-threads=1`.
 //!
 //! The headline: an in-process ROBOT (`cerulion_remoted::WirePlane` +
 //! `PairingAuthorizer` over SHM root A, a real producer publishing hand-oracle
@@ -164,10 +165,9 @@ fn claimed_unpaired() -> PairingAuthorizer {
 /// Serve wire connections in a LOOP until aborted — so a demand→release (which drops
 /// the connection) can be followed by a re-demand (a fresh dial the loop accepts).
 async fn robot_serve_loop(daemon: Endpoint, authz: Arc<PairingAuthorizer>, plane: Arc<WirePlane>) {
-    // A non-`Ok(Some(..))` (Err / Ok(None)) ends the loop — the desk went away.
-    while let Ok(Some(accepted)) = accept_one(&daemon).await {
-        handle_accepted_with_wire(accepted, authz.clone(), None, Some(plane.clone())).await;
-    }
+    cerulion_remoted::serve_with_wire(&daemon, authz, None, Some(plane), std::future::pending())
+        .await
+        .expect("robot wire accept loop");
 }
 
 /// A live in-process robot: its own tokio runtime + iroh endpoint + a WirePlane over
@@ -186,12 +186,30 @@ struct RobotFixture {
 
 impl RobotFixture {
     fn start(tag: &str, authz: Arc<PairingAuthorizer>) -> Self {
+        Self::start_with_schema(tag, authz, None)
+    }
+
+    fn start_with_schema(
+        tag: &str,
+        authz: Arc<PairingAuthorizer>,
+        schema: Option<(String, cerulion_core::SchemaDoc)>,
+    ) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("robot runtime");
         let manager = test_manager(&format!("robot_{tag}"));
-        let plane = Arc::new(WirePlane::with_manager(
-            format!("robot-{tag}"),
-            manager.clone(),
-        ));
+        let mut plane = WirePlane::with_manager(format!("robot-{tag}"), manager.clone());
+        if let Some((topic, doc)) = schema {
+            let serving = cerulion_core::SchemaServing {
+                topic_schemas: vec![cerulion_core::TopicSchema {
+                    topic: topic.clone(),
+                    schema_name: doc.qualified.clone(),
+                }],
+                schema_docs: vec![doc],
+                schema_hashes: Vec::new(),
+                served_topics: vec![topic],
+            };
+            plane = plane.with_in_process_schema_provider(Arc::new(move || serving.clone()));
+        }
+        let plane = Arc::new(plane);
         let daemon = rt.block_on(disabled_endpoint(unique_secret()));
         let eid = daemon.id();
         let addrs = loopback_sockets(&daemon.bound_sockets());
@@ -429,6 +447,9 @@ fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         .expect("iroh plane")
         .with_dial_timeout(DIAL_TIMEOUT);
     let key = TopicKey::new("ubuntu", &topic);
+    assert!(plane
+        .local_channel(&TopicKey::observed("ubuntu", &topic))
+        .starts_with("/__cerulion/observers/"));
 
     plane
         .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
@@ -627,6 +648,13 @@ fn dual_plane_routes_wan_robot_to_iroh_and_delivers() {
         .with_dial_timeout(DIAL_TIMEOUT);
     let zenoh = GatewayMirrorPlane::new(manager_b.clone());
     let dual = DualMirrorPlane::new(zenoh, iroh, Arc::clone(&registry));
+    assert!(dual
+        .local_channel(&TopicKey::observed("ubuntu", &topic))
+        .starts_with("/__cerulion/observers/"));
+    assert_eq!(
+        dual.local_channel(&TopicKey::observed("not-configured", &topic)),
+        topic
+    );
 
     // The routing decision (the picker through the DualMirrorPlane surface).
     assert_eq!(
@@ -2047,3 +2075,6 @@ mod poison_retirement;
 
 #[path = "wan_plane_iroh_test/serving_plane.rs"]
 mod serving_plane;
+
+#[path = "wan_plane_iroh_test/automatic_cli.rs"]
+mod automatic_cli;
