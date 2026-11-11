@@ -67,6 +67,8 @@ pub(super) fn run(manager: &TransportManager, path: &str) -> Result<ExitCode, St
         len: 0,
     };
     let mut first = NodeHandle { value: 0 };
+    with_context(context.value, |host| host.begin_node_call())
+        .map_err(|error| format!("{error:?}"))?;
     // SAFETY (U06): callbacks were fully checked, aligned outputs are local,
     // host context remains registered and each node call is strictly serial.
     unsafe {
@@ -110,7 +112,7 @@ pub(super) fn run(manager: &TransportManager, path: &str) -> Result<ExitCode, St
     // SAFETY (U05): real process table, registered context, aligned caller storage.
     let refused = unsafe {
         assert_eq!(
-            (HOST_API.bind_port)(context, abi::direction::OUTPUT, 0, &mut binding).code,
+            (HOST_API.bind_port)(context, 0, abi::direction::OUTPUT, &mut binding).code,
             0
         );
         (HOST_API.loan_output)(context, binding.port, request, &mut slot)
@@ -140,6 +142,8 @@ pub(super) fn run(manager: &TransportManager, path: &str) -> Result<ExitCode, St
         1
     );
     println!("pinned after_unload=1 bytes=d4c3b2a1 outstanding=1");
+    with_context(context.value, |host| host.end_node_call())
+        .map_err(|error| format!("{error:?}"))?;
     // The escaped view intentionally remains in builtins until child exit.
     // Retain its registered host context as required while that lease is live.
     Ok(ExitCode::SUCCESS)

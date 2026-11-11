@@ -55,6 +55,7 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
         "raw SDK",
     )
     .unwrap();
+    with_context(context.value, |host| host.begin_node_call()).unwrap();
     let plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
     let native_factory = RawIngress::native(Arc::clone(&manager));
     let plugin_factory = plugin.raw_ingress().unwrap();
@@ -112,6 +113,7 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
     drop(native_factory);
     drop(plugin);
     drop(client);
+    with_context(context.value, |host| host.end_node_call()).unwrap();
     remove_context(context.value).unwrap();
 }
 
@@ -181,6 +183,7 @@ fn helper_clock_and_raw_publish_deliver_while_node_tick_gate_is_held() {
     let info = DylibNodeEntry::parse_info_json_labeled(&format!(
         r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":{},"max_slice_len_default":64}}],"policy":{{"period_ms":1}}}}"#,
         Vector3::SCHEMA_HASH), "clock concurrent").unwrap();
+    with_context(context.value, |host| host.begin_node_call()).unwrap();
     let plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
     let factory = plugin.raw_ingress().unwrap();
     let mut raw_publisher = factory
@@ -257,5 +260,6 @@ fn helper_clock_and_raw_publish_deliver_while_node_tick_gate_is_held() {
     registry.destroy(handle).unwrap();
     drop(factory);
     drop(client);
+    with_context(context.value, |host| host.end_node_call()).unwrap();
     remove_context(context.value).unwrap();
 }
