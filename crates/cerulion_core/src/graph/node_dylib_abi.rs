@@ -698,7 +698,7 @@ impl NodeEntry for DylibNodeEntry {
         if answer == SyncOpAnswer::Failed {
             match self.head_errors.on_failure() {
                 RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                    tracing::error!(node = %self.label, input = %name, op = ?op, code, total_failures = self.head_errors.total_failures(), "cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here — no set member fabricated (suppressing further to debug until it recovers)");
+                    tracing::error!(node = %self.label, input = %name, op = ?op, code, total_failures = self.head_errors.total_failures(), "cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here \u{2014} no set member fabricated (suppressing further to debug until it recovers)");
                     // dash-ok: native sync failure text kept byte-identical
                 }
                 RegimeDecision::Suppressed { .. } => {

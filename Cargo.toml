@@ -366,6 +366,7 @@ default-members = [
     # in this set, so it adds nothing to a plain build.
     "crates/cerulion",
     "crates/cerulion_core",
+    "crates/cerulion_node_abi",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_discovery",
