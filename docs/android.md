@@ -700,8 +700,8 @@ describes to desks (see
 [What a desk reads about the app's graph](#what-a-desk-reads-about-the-apps-graph)).
 It is `null` when no run serves its ticks: before a start, after `stop`, for
 a start with no graph or with an empty `listen` and `connect`, and for a run
-the runtime describes to no desk or names undescribable, which logs a
-warning. Otherwise it is an
+the runtime describes to no desk or names undescribable, and for a run
+whose `run.json` left out the nodes, which each log a warning. Otherwise it is an
 object: `armed` is true while a desk's `fires` requests keep the recording
 on, `recorded` counts the ticks recorded while armed, lost ones included,
 and `capacity` is the number of ticks the runtime keeps:
@@ -884,7 +884,8 @@ such a start describes no run and logs a warning.
   long it ran and which outputs it wrote. The runtime records ticks only
   while a desk asks. A request turns the recording on, it stops 5 s after
   the last request, and the newest 4096 ticks are kept. For a run named
-  `undescribable` it answers `not_served`.
+  `undescribable`, or one whose `run.json` left out the nodes, it answers
+  `not_served`: a tick names its node by the nodes in the `run.json`.
 
 Under `open`, any host that reaches the gateway can read the graph YAML, the
 `run.json` and the node ticks, and can turn the recording on. Like the
