@@ -89,6 +89,7 @@ fn expected(dir: &Path) -> Vec<(&'static str, Option<PathBuf>)> {
 
 #[test]
 fn cerulion_home_moves_every_machine_file_and_unset_means_dot_cerulion() {
+    src_is_judged_below_the_checkout_root();
     let home = tempfile::tempdir().unwrap();
     let rig = tempfile::tempdir().unwrap();
     // This is the only test in this binary, so no other test reads the
@@ -145,7 +146,7 @@ fn no_new_home_dir_resolver() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut found: Vec<String> = Vec::new();
     let mut files = Vec::new();
-    collect_rs(&root.join("crates"), &mut files);
+    collect_rs(&root, &root.join("crates"), &mut files);
     assert!(
         files.len() > 100,
         "the walk found only {} files",
@@ -191,7 +192,7 @@ fn joins_home_with_dot_cerulion(text: &str) -> bool {
     })
 }
 
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_rs(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy();
@@ -199,9 +200,89 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
             if name == "target" || name.starts_with('.') {
                 continue;
             }
-            collect_rs(&path, out);
-        } else if name.ends_with(".rs") && path.components().any(|c| c.as_os_str() == "src") {
+            collect_rs(root, &path, out);
+        } else if name.ends_with(".rs") && is_under_src(root, &path) {
             out.push(path);
         }
+    }
+}
+
+/// Whether `path` sits in a `src` directory: a component of its path BELOW
+/// the repository `root` is `src`. The components of `root` never count, so a
+/// checkout beneath a directory named `src` audits the same files as any
+/// other, and a `tests/*.rs` integration test stays outside the audit. A path
+/// outside `root` is not in this repository.
+fn is_under_src(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == "src"))
+}
+
+/// `is_under_src` on hand-written paths, under checkout roots with and
+/// without a `src` component. Runs first in the one test of this binary, so a
+/// failure here stops the test before it changes the environment or walks the
+/// tree.
+fn src_is_judged_below_the_checkout_root() {
+    const VECTORS: &[(&str, &str, bool)] = &[
+        ("/work/cerulion", "/work/cerulion/crates/x/src/lib.rs", true),
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/x/src/transport/m.rs",
+            true,
+        ),
+        // A name that only starts with `src` is not the directory.
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/x/srcgen/a.rs",
+            false,
+        ),
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/x/tests/t.rs",
+            false,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/src/lib.rs",
+            true,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/lib/y/src/lib.rs",
+            true,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/tests/t.rs",
+            false,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/build.rs",
+            false,
+        ),
+        // The root as this test spells it: the crate directory, then `../..`.
+        (
+            "/work/src/cerulion/crates/cerulion_cli/../..",
+            "/work/src/cerulion/crates/cerulion_cli/../../crates/x/src/lib.rs",
+            true,
+        ),
+        (
+            "/work/src/cerulion/crates/cerulion_cli/../..",
+            "/work/src/cerulion/crates/cerulion_cli/../../crates/x/tests/t.rs",
+            false,
+        ),
+        // Outside the root, even with a `src` component of its own.
+        (
+            "/work/src/cerulion",
+            "/work/src/other/crates/x/src/lib.rs",
+            false,
+        ),
+    ];
+    for (root, path, want) in VECTORS {
+        assert_eq!(
+            is_under_src(Path::new(root), Path::new(path)),
+            *want,
+            "is_under_src(root = {root}, path = {path}) should be {want}"
+        );
     }
 }
