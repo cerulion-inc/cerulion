@@ -695,9 +695,13 @@ Staged 'safety_controller' into graph 'obstacle_avoidance'
 Staged 'drive_base' into graph 'obstacle_avoidance'
 ```
 
-Each is preceded by a `WARN overwriting an existing graph file` line that names a
-`.bak` path. That is expected: the verb rewrites the graph file and keeps the
-previous version beside it as `graphs/obstacle_avoidance.yaml.bak`.
+While every byte of the graph file is what `graph create` and `node stage`
+would write for its prefix and nodes, each stage rewrites it with no warning and
+no backup. After a hand edit the CLI would not write the same way (a comment, a
+blank line, reordered keys), the next `node stage` prints a
+`WARN overwriting an existing graph file` line and keeps the previous version
+beside it as `graphs/obstacle_avoidance.yaml.bak`. Either way, staging keeps
+every line you wrote.
 
 ### Read the graph YAML
 
