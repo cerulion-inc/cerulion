@@ -73,6 +73,13 @@ cerulion_discovery = { workspace = true }
 cerulion_hygiene = { workspace = true }
 thiserror = "2"
 tracing = "0.1"
+# zenoh's own endpoint parser, for the `graph live` / `graph fires`
+# `--connect` check (`graph_live::locator_check`): a locator keeps zenoh's
+# full `<protocol>/<address>[?<metadata>][#<config>]` form, for example
+# `udp/<ip>:<port>?rel=1;mixed_rel=1`. Same version as `cerulion_core`'s
+# zenoh, which already builds it; no features of its own (they unify with
+# the core's).
+zenoh = { version = "1.10.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 # Replaces the hand-rolled
