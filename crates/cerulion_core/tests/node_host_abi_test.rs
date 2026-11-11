@@ -734,7 +734,10 @@ fn accumulator_repeat_views_and_state_use_native_order_and_exact_bytes() {
             let first = accumulated_frame(&h, 0);
             let second = accumulated_frame(&h, 1);
             assert_eq!(accumulated_info(&h).count, 2);
-            assert_eq!(abi_call!((HOST_API.snapshot_inputs)(h.context)).code, 6);
+            assert_eq!(
+                abi_call!((HOST_API.snapshot_inputs)(h.context)).code,
+                abi::status_code::INVALID_STATE
+            );
             for slot in [&first, &second] {
                 assert_eq!(
                     abi_call!((HOST_API.mark_served)(h.context, slot.lease)).code,
@@ -1435,18 +1438,32 @@ fn raw_ingress_preserves_original_wire_bytes_and_recipient_count_in_two_runs() {
 fn raw_creation_refuses_reserved_tags_and_budget_reuse_before_native_creation() {
     let h = RawHarness::new(1);
     let mut out = MaybeUninit::uninit();
-    for tag in [abi::full_queue::RESERVED_BLOCK, 3, u32::MAX] {
+    for (tag, expected) in [
+        (abi::full_queue::RESERVED_BLOCK, "UnsupportedRawStrategy(2)"),
+        (3, "UnsupportedRawStrategy(3)"),
+        (u32::MAX, "UnsupportedRawStrategy(4294967295)"),
+    ] {
         let mut request = raw_request("abi/raw/refusal");
         request.full_queue = tag;
+        let refused = abi_call!((HOST_API.create_raw_publisher)(
+            h.context,
+            request,
+            out.as_mut_ptr()
+        ));
+        assert_eq!(refused.code, abi::status_code::INVALID_ARGUMENT);
+        let mut diagnostic = [0; 64];
+        let mut written = 0;
         assert_eq!(
-            abi_call!((HOST_API.create_raw_publisher)(
+            abi_call!((HOST_API.copy_error)(
                 h.context,
-                request,
-                out.as_mut_ptr()
+                refused.error,
+                mutable(&mut diagnostic),
+                &mut written
             ))
             .code,
-            abi::status_code::INVALID_ARGUMENT
+            0
         );
+        assert_eq!(&diagnostic[..written as usize], expected.as_bytes());
     }
     for topic in ["", "abi/raw/refusal"] {
         let mut request = raw_request(topic);

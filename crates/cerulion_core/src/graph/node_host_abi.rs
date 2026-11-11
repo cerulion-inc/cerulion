@@ -32,6 +32,8 @@ pub enum HostServiceError {
     Lease(LeaseError),
     /// Invalid port descriptor or wire-frame shape.
     InvalidDescriptor,
+    /// Raw ingress supports only ConfigDefault and Discard queue strategies.
+    UnsupportedRawStrategy(u32),
     /// Native transport failure, distinct from an empty receive.
     Transport(TransportError),
     /// A port has an outstanding read or write accessor.
@@ -1566,6 +1568,7 @@ fn classify_failure(error: &HostServiceError, error_token: u64) -> HostCallFailu
         HostServiceError::Lease(LeaseError::InvalidHandle | LeaseError::WrongOwner)
         | HostServiceError::Terminal => 4,
         HostServiceError::InvalidDescriptor
+        | HostServiceError::UnsupportedRawStrategy(_)
         | HostServiceError::Lease(LeaseError::InvalidBudget | LeaseError::InvalidTransition) => 5,
         HostServiceError::InvalidState => abi::status_code::INVALID_STATE,
         HostServiceError::DestroyBusy => abi::status_code::BUSY,
@@ -2479,6 +2482,7 @@ mod tests {
             (HostServiceError::InvalidState, 9),
             (HostServiceError::DestroyBusy, 6),
             (HostServiceError::InvalidDescriptor, 5),
+            (HostServiceError::UnsupportedRawStrategy(2), 5),
             (HostServiceError::BufferTooSmall(17), 8),
             (
                 HostServiceError::State(crate::state::StateError::SinkFull),

@@ -150,7 +150,7 @@ impl RawServices {
         let strategy = match request.full_queue {
             abi::full_queue::CONFIG_DEFAULT => FullQueueSend::ConfigDefault,
             abi::full_queue::DISCARD => FullQueueSend::Discard,
-            _ => return Err(HostServiceError::InvalidDescriptor),
+            tag => return Err(HostServiceError::UnsupportedRawStrategy(tag)),
         };
         if topic.is_empty() || request.configured_capacity < WireHeader::SIZE as u32 {
             return Err(HostServiceError::InvalidDescriptor);
@@ -368,16 +368,15 @@ impl RawServices {
             .diagnostic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        diagnostic.token = diagnostic
-            .token
-            .checked_add(1)
-            .filter(|n| *n < (1 << 63))
-            .unwrap_or(0);
-        let token = if diagnostic.token == 0 {
-            self.retired.store(true, Ordering::Release);
-            0
-        } else {
-            diagnostic.token | (1 << 63)
+        let token = match diagnostic.token.checked_add(1).filter(|n| *n < (1 << 63)) {
+            Some(next) => {
+                diagnostic.token = next;
+                next | (1 << 63)
+            }
+            None => {
+                self.retired.store(true, Ordering::Release);
+                0
+            }
         };
         let result = classify_failure(&error, token);
         diagnostic.error = Some(error);
@@ -512,6 +511,25 @@ mod tests {
     use crate::clock::VirtualClock;
     use crate::graph::node::ShutdownSignal;
     use indexmap::IndexMap;
+
+    #[test]
+    fn exhausted_raw_diagnostics_never_restart_the_token_generation() {
+        let raw = RawServices::new(None, Arc::new(VirtualClock::new()), 0, 0, 0).unwrap();
+        raw.diagnostic.lock().unwrap().token = (1 << 63) - 1;
+        for _ in 0..2 {
+            assert_eq!(
+                raw.record_error(HostServiceError::InvalidDescriptor)
+                    .error_token,
+                0
+            );
+            assert_eq!(raw.diagnostic.lock().unwrap().token, (1 << 63) - 1);
+            assert!(raw.retired.load(Ordering::Acquire));
+            assert!(matches!(
+                raw.copy_error((1 << 63) | 1, &mut []),
+                Err(HostServiceError::Lease(LeaseError::InvalidHandle))
+            ));
+        }
+    }
 
     #[test]
     fn native_raw_send_failure_retires_the_lease_and_next_frame_is_delivered() {
