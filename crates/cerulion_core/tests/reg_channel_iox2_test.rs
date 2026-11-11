@@ -813,6 +813,11 @@ fn announce_failure_at_drain_defers_not_rejects_and_heals() {
         deferred,
         "the announce failure at the drain bumped reg_announce_deferred"
     );
+    assert_eq!(
+        gateway.runtime_topic_schema_hash(&topic),
+        Some(0xFEED),
+        "catalog identity is published before the fallible announcement",
+    );
     // It is a DEFERRAL, not a rejection, and not malformed.
     assert_eq!(
         gateway.registration_rejected_count(),
@@ -871,7 +876,7 @@ fn announce_failure_at_drain_defers_not_rejects_and_heals() {
         healed,
         "the announce self-heals on a later drain (idempotent re-attempt)"
     );
-    // Exactly ONE deferred blip — the Ok heal path stores the hash without
+    // Exactly ONE deferred blip: the Ok heal path retains the hash without
     // bumping the counter again, and never a rejection.
     assert_eq!(
         gateway.registration_announce_deferred_count(),
@@ -879,12 +884,38 @@ fn announce_failure_at_drain_defers_not_rejects_and_heals() {
         "exactly one deferred blip — the heal (Ok path) does not re-count it"
     );
     assert_eq!(gateway.registration_rejected_count(), 0);
-    // The advertised hash is now stored (the heal's Ok drain stored it).
+    // The advertised hash remains stored after the successful retry.
     assert_eq!(
         gateway.runtime_topic_schema_hash(&topic),
         Some(0xFEED),
-        "the heal's successful drain stored the advertised hash"
+        "the successful retry retained the advertised hash"
     );
+}
+
+#[test]
+fn an_excluded_runtime_registration_has_no_catalog_hash_or_name() {
+    let root = cerulion_core::testing::iceoryx_test_config();
+    let mut gateway = gateway_on("excluded_hash", &root);
+    let worker = worker_manager("excluded_hash", &root);
+    let topic = format!("/rt/excluded_hash/{}", unique_id());
+    let _scope = worker.exclude_remote_topic(&topic).unwrap();
+    worker
+        .register_dynamic_egress_topic(&topic, 0xFEED)
+        .unwrap();
+    for _ in 0..30 {
+        worker.republish_dynamic_egress_for_test();
+        gateway.drive_once().unwrap();
+        if gateway.registration_rejected_count() > 0 {
+            break;
+        }
+    }
+    assert!(gateway.registration_rejected_count() > 0);
+    assert_eq!(gateway.runtime_topic_schema_hash(&topic), None);
+    assert!(!gateway.is_runtime_registered(&topic).unwrap());
+    assert!(gateway
+        .catalog_serve_for_test("excluded_hash")
+        .entries
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,8 @@ compatibility and pairing.
   local-only run remain unavailable off-machine through an already-running
   gateway, remote server or mirror. Other daemons also refuse outputs omitted
   from that run's declared egress before opening a tap. Local reads and recording
-  keep working. Opaque `ros2:` children inherit the run scope, including topics
+  keep working. Recorder status follows the same scope; if another run already
+  exports the shared status topic, this recording disables status publication. Opaque `ros2:` children inherit the run scope, including topics
   registered later; config-mapped raw DDS outputs obey it too. A separately
   launched third-party DDS participant has its own transport settings.
 - **Producer policy survives a topic restart.** Remote taps, mirrors and open-LAN
