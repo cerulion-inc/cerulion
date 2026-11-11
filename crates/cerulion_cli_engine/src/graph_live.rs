@@ -1471,10 +1471,12 @@ fn connect_set(connect: &[String], reachable: &HashSet<String>) -> CliResult<Vec
 }
 
 /// Ask until `answered` holds for the answer, or the first-contact budget
-/// is spent. A cleared `running` ends the wait with an error; an error from
-/// `ask` is returned at once, never retried.
+/// is spent. Each ask gets the part of the budget that is left, and a retry
+/// never sleeps past it, so a slow ask cannot stretch the wait. A cleared
+/// `running` ends the wait with an error; an error from `ask` is returned at
+/// once, never retried.
 fn first_contact<T>(
-    mut ask: impl FnMut() -> CliResult<T>,
+    mut ask: impl FnMut(Duration) -> CliResult<T>,
     answered: impl Fn(&T) -> bool,
     running: &AtomicBool,
     pacer: &mut dyn Pacer,
@@ -1485,14 +1487,15 @@ fn first_contact<T>(
         if !running.load(Ordering::Relaxed) {
             return Err(interrupted());
         }
-        let answer = ask()?;
-        if answered(&answer) || pacer.elapsed() >= FIRST_CONTACT_BUDGET {
+        let answer = ask(FIRST_CONTACT_BUDGET.saturating_sub(pacer.elapsed()))?;
+        let left = FIRST_CONTACT_BUDGET.saturating_sub(pacer.elapsed());
+        if answered(&answer) || left.is_zero() {
             return Ok(answer);
         }
         if !running.load(Ordering::Relaxed) {
             return Err(interrupted());
         }
-        pacer.sleep(FIRST_CONTACT_RETRY);
+        pacer.sleep(FIRST_CONTACT_RETRY.min(left));
     }
 }
 
@@ -1541,10 +1544,11 @@ impl RunsSource for ZenohPlane {
             .manager
             .session()
             .map_err(|e| CliError::Validation(format!("the session closed: {e}")))?;
-        let ask = || -> CliResult<RunsHarvest> {
+        let ask = |left: Duration| -> CliResult<RunsHarvest> {
+            let announce = ANNOUNCE_WINDOW.min(left);
             let robots: Vec<String> = match robot {
                 Some(robot) => vec![robot.to_string()],
-                None => query_announce_entries(session, ANNOUNCE_WINDOW)
+                None => query_announce_entries(session, announce)
                     .map_err(|e| {
                         CliError::Validation(format!(
                             "could not ask which robots announce themselves: {e}"
@@ -1559,7 +1563,11 @@ impl RunsSource for ZenohPlane {
             Ok(if robots.is_empty() {
                 RunsHarvest::default()
             } else {
-                query_robot_runs_all(session, &robots, RUNS_GET_WINDOW)
+                let left = match robot {
+                    Some(_) => left,
+                    None => left.saturating_sub(announce),
+                };
+                query_robot_runs_all(session, &robots, RUNS_GET_WINDOW.min(left))
             })
         };
         first_contact(ask, reached_a_robot, running, &mut WallPacer::start())
@@ -1639,7 +1647,7 @@ impl NetdPlane {
 impl RunsSource for NetdPlane {
     fn runs(&mut self, robot: Option<&str>, running: &AtomicBool) -> CliResult<RunsHarvest> {
         let gather = first_contact(
-            || netd_gather(&mut self.client, robot),
+            |_| netd_gather(&mut self.client, robot),
             netd_contact_made,
             running,
             &mut WallPacer::start(),
@@ -4242,7 +4250,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         let stopped = AtomicBool::new(false);
         let mut asked = 0;
         let result = first_contact(
-            || {
+            |_| {
                 asked += 1;
                 Ok(RunsHarvest::default())
             },
@@ -4256,7 +4264,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         let mut asked = 0;
         let mut p = pacer();
         let result = first_contact(
-            || {
+            |_| {
                 asked += 1;
                 Err(CliError::Validation("announce failed".to_string()))
             },
@@ -4271,7 +4279,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
 
         let mut asked = 0;
         let result = first_contact(
-            || {
+            |_| {
                 asked += 1;
                 running.store(false, Ordering::Relaxed);
                 Ok(RunsHarvest::default())
@@ -4286,7 +4294,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         let mut asked = 0;
         let mut p = pacer();
         let result = first_contact(
-            || {
+            |_| {
                 asked += 1;
                 Ok(RunsHarvest::default())
             },
@@ -4297,10 +4305,29 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         assert!(result.expect("an empty harvest").replies.is_empty());
         assert_eq!((asked, p.now), (21, FIRST_CONTACT_BUDGET));
 
+        // Each ask is bounded by what is left of the budget, down to nothing
+        // on the last one, so no ask can run past the first-contact deadline.
+        let mut given = Vec::new();
+        let mut p = pacer();
+        first_contact(
+            |left| {
+                given.push(left);
+                Ok(RunsHarvest::default())
+            },
+            reached_a_robot,
+            &running,
+            &mut p,
+        )
+        .expect("an empty harvest");
+        assert_eq!(given.first(), Some(&FIRST_CONTACT_BUDGET));
+        assert_eq!(given.last(), Some(&Duration::ZERO));
+        assert!(given.windows(2).all(|pair| pair[1] < pair[0]));
+        assert_eq!(p.now, FIRST_CONTACT_BUDGET);
+
         let mut asked = 0;
         let mut p = pacer();
         let result = first_contact(
-            || {
+            |_| {
                 asked += 1;
                 Ok(if asked < 3 {
                     RunsHarvest::default()
