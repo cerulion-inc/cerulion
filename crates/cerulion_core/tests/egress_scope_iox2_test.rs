@@ -203,6 +203,8 @@ fn full_registration_names_and_utf8_boundaries_preserve_scope_identity() {
         for topic in [
             format!("/{}", "z".repeat(511)),
             format!("/{}", "é".repeat(128)),
+            format!("/{}é/tail", "z".repeat(254)),
+            format!("/{}x", "é".repeat(255)),
         ] {
             drop(remote.acquire_remote_topic_lease(&topic).unwrap());
             let scope = producer.exclude_remote_topic(&topic).unwrap();
@@ -210,6 +212,57 @@ fn full_registration_names_and_utf8_boundaries_preserve_scope_identity() {
             assert!(!remote.remote_topic_allowed(&topic).unwrap());
             drop(scope);
             assert!(remote.acquire_remote_topic_lease(&topic).is_ok());
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn a_hex_looking_ascii_identity_cannot_impersonate_encoded_topic_bytes() {
+    use iceoryx2::prelude::*;
+    use iceoryx2::service::attribute::AttributeVerifier;
+    for _ in 0..2 {
+        for kind in [None, Some("ascii"), Some("hex")] {
+            let config = cerulion_core::testing::iceoryx_test_config();
+            let node = NodeBuilder::new()
+                .config(&config)
+                .create::<iceoryx2::service::ipc_threadsafe::Service>()
+                .unwrap();
+            let topic = "/é";
+            let name: ServiceName =
+                cerulion_core::transport::egress_scope::marker_service_name(topic)
+                    .as_str()
+                    .try_into()
+                    .unwrap();
+            // Handwritten UTF-8 byte oracle: slash 2f, e-acute c3 a9.
+            let mut attributes = AttributeVerifier::new()
+                .require(&"topic_len".try_into().unwrap(), &"3".try_into().unwrap())
+                .unwrap()
+                .require(&"topic".try_into().unwrap(), &"2fc3a9".try_into().unwrap())
+                .unwrap();
+            if let Some(kind) = kind {
+                attributes = attributes
+                    .require(&"topic_kind".try_into().unwrap(), &kind.try_into().unwrap())
+                    .unwrap();
+            }
+            let _service = node
+                .service_builder(&name)
+                .event()
+                .max_notifiers(64)
+                .max_listeners(64)
+                .open_or_create_with_attributes(&attributes)
+                .unwrap();
+            let manager =
+                TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+            assert_eq!(
+                manager.acquire_remote_topic_lease(topic).is_ok(),
+                kind == Some("hex")
+            );
+            assert_eq!(
+                manager.remote_topic_allowed(topic).is_ok(),
+                kind == Some("hex")
+            );
+            assert!(manager.acquire_remote_topic_lease("2fc3a9").is_ok());
         }
     }
 }
