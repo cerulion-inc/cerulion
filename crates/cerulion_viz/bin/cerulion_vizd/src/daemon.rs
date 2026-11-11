@@ -5805,7 +5805,6 @@ impl NetdDemandPlane {
             }
         }
     }
-
 }
 
 /// Whether the idle control connection on `fd` can no longer carry a request:

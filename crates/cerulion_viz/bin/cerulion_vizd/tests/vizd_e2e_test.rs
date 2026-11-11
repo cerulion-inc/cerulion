@@ -2857,7 +2857,9 @@ fn remote_attach_tap_failure_rolls_back_the_netd_demand() {
 // persistent connection RECONNECTS after the daemon dies, so a netd crash does NOT
 // permanently wedge vizd's remote arm. Drives the
 // PRODUCTION NetdDemandPlane directly against a real in-process netd. Hand oracle on
-// the demand outcomes: [Ok (netd1), Err (dead socket), Ok (reconnect to netd2)].
+// the demand outcomes: [Ok (netd1), Ok (reconnect to netd2)]. The replacement starts
+// before the next demand: the plane drops a kept connection netd closed before it
+// uses it, so a demand with no daemon on the socket would spawn a real netd there.
 
 #[test]
 fn netd_demand_plane_reconnects_after_the_daemon_dies() {
@@ -2888,18 +2890,8 @@ fn netd_demand_plane_reconnects_after_the_daemon_dies() {
     // Kill netd1 (synchronous shutdown joins its threads + closes the socket).
     drop(netd1);
 
-    // T2: the held client hits the dead socket → Err. Internally this DROPS the
-    // client (should_drop_client_on_error is true for the Io error), which T3 proves.
-    let err = plane
-        .demand("go2", "/tf", 1)
-        .expect_err("a demand against a dead netd errors, not hangs");
-    assert!(
-        !err.is_empty(),
-        "the error is surfaced, not swallowed: {err}"
-    );
-
-    // T3: a FRESH netd on the SAME socket → the plane RECONNECTS + succeeds. A plane
-    // that did NOT drop the wedged client would reuse the dead socket and fail here.
+    // T2: a FRESH netd on the SAME socket → the plane RECONNECTS + succeeds. A plane
+    // that kept the client netd1 closed would send on the dead socket and fail here.
     let netd2 = start_netd_ok_plane(sock.clone());
     plane
         .demand("go2", "/tf", 1)
