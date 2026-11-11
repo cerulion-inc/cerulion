@@ -4061,7 +4061,7 @@ fn render_remote_none_discovered(reachable: bool) -> String {
         )
     } else {
         format!(
-            "remote: none discovered in {window_ms} ms (sign in or pair a robot; \
+            "remote: none discovered in {window_ms} ms (sign in with the robot's account using cerulion login; \
              account and paired robots are reached automatically)\n"
         )
     }
@@ -7119,7 +7119,7 @@ mod tests {
         );
         // …but the hint is the UNREACHABLE arm: the --connect escape survives.
         assert!(
-            out.contains("sign in or pair a robot"),
+            out.contains("sign in with the robot's account using cerulion login"),
             "unverified candidates retain the automatic account/pairing hint; got: {out}"
         );
         // The whole shape, exactly: the candidates line, a blank line, then
@@ -7184,7 +7184,7 @@ mod tests {
     /// `--connect` escape for a robot scouting cannot reach. Hand oracle.
     fn unreachable_none_line() -> String {
         format!(
-            "remote: none discovered in {} ms (sign in or pair a robot; \
+            "remote: none discovered in {} ms (sign in with the robot's account using cerulion login; \
              account and paired robots are reached automatically)\n",
             REMOTE_QUERY_GATHER_WINDOW.as_millis()
         )
@@ -7236,7 +7236,8 @@ mod tests {
         );
         let window = format!("{} ms", REMOTE_QUERY_GATHER_WINDOW.as_millis());
         assert!(
-            out.contains(&window) && out.contains("sign in or pair a robot"),
+            out.contains(&window)
+                && out.contains("sign in with the robot's account using cerulion login"),
             "endpoint-less empty arm names the bounded window and automatic pairing; \
              got: {out}"
         );

@@ -357,7 +357,7 @@ pub enum RobotPath {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairedRobot {
-    /// Local name recorded by `cerulion pair`.
+    /// Persisted local robot name for a saved pairing.
     pub name: String,
     /// Robot endpoint key authenticated by TLS.
     pub endpoint_key: [u8; 32],

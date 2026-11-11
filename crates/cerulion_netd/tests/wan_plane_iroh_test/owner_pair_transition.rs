@@ -400,6 +400,93 @@ fn many_stalled_restorations_finish_within_one_budget_and_notify_every_holder() 
 }
 
 #[test]
+fn failed_initial_sync_does_not_retire_readers_restored_on_a_fresh_connection() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    let robot = OwnerRobot::start_with_robot_id("sync_retry", ROBOT, None, None);
+    let login = Login::new();
+    let _home = EnvGuard::set("CERULION_HOME", login.directory.path());
+    let _state = EnvGuard::set("CERULION_STATE_ROOT", login.directory.path());
+    let desk = Desk::start(&login, &[(ROBOT, &robot)], true, false);
+    let route = robot_route(&ROBOT.0);
+    let topic = "/wan/sync/retry";
+    let mut producers = Producers::new();
+    producers.start(&robot, topic);
+    desk.install(login.snapshot(&[(ROBOT, &robot)]));
+    let mut canonical = desk.client();
+    canonical.demand(&route, topic, ORACLE_SCHEMA_HASH).unwrap();
+    let mut observer = desk.client();
+    let channel = observer
+        .observe(&route, topic, ORACLE_SCHEMA_HASH)
+        .unwrap()
+        .local_topic;
+    let mut canonical_tap = desk.manager.create_data_only_subscriber(topic).unwrap();
+    let mut observer_tap = desk.manager.create_data_only_subscriber(&channel).unwrap();
+    let mut a = read_after(&mut canonical_tap, None).0;
+    let mut b = read_after(&mut observer_tap, None).0;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for _ in 0..2 {
+        desk.controller.begin_serving().unwrap();
+        let endpoint = runtime.block_on(disabled_endpoint(login.seed));
+        let socket = cerulion_netd::shared_endpoint::socket_path(login.directory.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_endpoint = endpoint.clone();
+        let handle = runtime.handle().clone();
+        let seed = login.seed;
+        let manager = desk.manager.clone();
+        let server = std::thread::spawn(move || {
+            // Close the first real framed Sync without a reply, then serve the
+            // same socket with the authentic owner-aware outbound endpoint.
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).unwrap();
+            let length = u32::from_le_bytes(length) as usize;
+            assert!(length < 256 * 1024);
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["operation"]["op"], "sync");
+            assert!(request["configuration"]["owner"].is_array());
+            drop(stream);
+            drop(listener);
+            std::fs::remove_file(&socket).unwrap();
+            cerulion_netd::shared_endpoint::OutboundServer::start(
+                socket,
+                server_endpoint,
+                handle,
+                seed,
+                manager,
+            )
+            .unwrap()
+        });
+        let ready = desk.controller.serving_ready();
+        let server = server.join().unwrap();
+        assert!(
+            ready.is_ok(),
+            "fresh Sync and restored readers reported loss: {ready:?}"
+        );
+        assert_eq!(desk.daemon.active_demand_count(), 2);
+        a = read_after(&mut canonical_tap, Some(a)).0;
+        b = read_after(&mut observer_tap, Some(b)).0;
+        for holder in [&mut canonical, &mut observer] {
+            let rows = holder.status().unwrap().demands;
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.refcount == 1));
+            assert!(holder.take_mirror_losses().is_empty());
+        }
+        drop(server);
+        runtime.block_on(endpoint.close());
+        desk.controller.end_serving();
+        a = read_after(&mut canonical_tap, Some(a)).0;
+        b = read_after(&mut observer_tap, Some(b)).0;
+    }
+}
+
+#[test]
 fn stopped_reader_release_does_not_block_another_robot_or_leave_a_stale_row() {
     let mut observed = Vec::new();
     for _ in 0..2 {

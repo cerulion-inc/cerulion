@@ -28,7 +28,7 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring on
   `serving.hold`; guards/sources share it, never unlink. Own process group, direct
   TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
 - Lifecycle I/O runs off verbs and unlocked; outbound readers fence idle reap.
-  begin/ready/end restore pins in 5 s or name losses; `discovery::robot_state`.
+  begin/ready/end restore live pins in 5 s or name losses; no empty migration.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY
@@ -36,7 +36,7 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring on
   a phantom mirror. Validate `account:` before `TopicKey` trims ordinary names.
 - Bounded same-user `outbound.sock` shares endpoint/runtime; key/namespace
   gate before dial. Metadata per-call; validation refusals keep reader holds; cleanup errors fence.
-  Transport loss retires keys; account fences keep postcard owner; never bind key twice.
+  Loss retires readers; pre-Ensure Sync retries own none. Postcard owner; one key bind.
 - Public identity bytes are auth-locked across reads; busy writers refuse. Expiry gates enrollment, not durable bindings; account/key changes fence it.
 - Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery never writes peers.json.
 

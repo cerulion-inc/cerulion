@@ -402,7 +402,7 @@ pub fn paired_robots() -> CliResult<Vec<PairedRobot>> {
             .map_err(|error| CliError::Validation(error.to_string()))?
             .ok_or_else(|| {
                 CliError::Validation(
-                    "paired device identity is missing; pair the robot again".into(),
+                    "paired device identity is missing; run cerulion login with the account that owns the robot".into(),
                 )
             })?;
     }

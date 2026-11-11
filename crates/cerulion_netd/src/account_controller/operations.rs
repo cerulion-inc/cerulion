@@ -166,9 +166,22 @@ impl AccountWanController {
     }
 
     fn restore_readers(&self, state: &mut State, deadline: Instant) -> Result<(), String> {
-        let Some(readers) = state.handover.take() else {
+        let Some(mut readers) = state.handover.take() else {
             return Ok(());
         };
+        {
+            let pins = self.pins()?;
+            readers.retain(|(key, hash)| {
+                pins.get(key).is_some_and(|pin| {
+                    pin.route == Route::Wan && pin.live && pin.schema_hash == *hash
+                })
+            });
+        }
+        // A producer with no outbound readers has nothing to migrate. Its child
+        // serves incoming access independently; outbound control opens on demand.
+        if readers.is_empty() {
+            return Ok(());
+        }
         let mut sync_failures = FailureRegimeLatch::new();
         let ready = match self.sync_identity(state) {
             Err(error) => Err(error),
@@ -198,6 +211,14 @@ impl AccountWanController {
         let mut first_error = None;
         let mut failed = BTreeSet::new();
         let mut restored_keys: BTreeSet<TopicKey> = BTreeSet::new();
+        if ready.is_ok() {
+            // Sync precedes every Ensure on this new endpoint. A failed earlier
+            // Sync owned no restored readers; its recovered framing loss must not
+            // retire readers that will be admitted on the fresh connection below.
+            if let Some(plane) = &state.plane {
+                plane.take_shared_transport_loss();
+            }
+        }
         for (key, hash) in readers {
             if !self
                 .pins()?
@@ -324,7 +345,7 @@ impl MirrorPlane for AccountWanController {
                         ));
                     }
                 }
-                return Err(first.unwrap_or_else(|| "controller busy during restoration".into()));
+                return first.map_or(Ok(()), Err);
             }
         };
         self.restore_readers(&mut state, deadline)

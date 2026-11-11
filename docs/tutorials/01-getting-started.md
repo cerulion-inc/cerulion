@@ -879,7 +879,7 @@ TOPIC
 /demo/lidar_sensor/scan
 /demo/safety_controller/cmd_vel
 1 internal topic hidden (--all shows it)
-remote: none discovered in 500 ms (sign in or pair a robot; account and paired robots are reached automatically)
+remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)
 ```
 
 The hidden topic is `/bagd/status`, the recorder's own status channel (it is
@@ -891,7 +891,7 @@ TOPIC
 /bagd/status  internal
 /demo/lidar_sensor/scan
 /demo/safety_controller/cmd_vel
-remote: none discovered in 500 ms (sign in or pair a robot; account and paired robots are reached automatically)
+remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)
 ```
 
 The `remote:` line is the LAN discovery half of the verb; with no other

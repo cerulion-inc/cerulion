@@ -41,6 +41,49 @@ const ACCOUNT: [u8; 32] = [5; 32];
 const SEED: [u8; 32] = [9; 32];
 
 #[test]
+fn serving_without_outbound_readers_needs_no_migration_connection() {
+    for _ in 0..2 {
+        let login = Login::new();
+        let controller = login.controller(true, false);
+        controller.begin_serving().unwrap();
+        let started = Instant::now();
+        assert!(controller.serving_ready().is_ok());
+        let state = controller.state.lock().unwrap();
+        assert!(state.plane.is_none());
+        assert!(state.handover.is_none());
+        assert!(!state.pending_all);
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn busy_serving_without_wan_readers_keeps_lan_readers_and_reports_no_loss() {
+    for _ in 0..2 {
+        let login = Login::new();
+        let controller = login.controller(true, false);
+        let lan = TopicKey::new("lan", "/local");
+        controller.pins().unwrap().insert(
+            lan.clone(),
+            Pin {
+                route: Route::Lan,
+                schema_hash: 7,
+                live: true,
+            },
+        );
+        controller.begin_serving().unwrap();
+        let mut state = controller.state.lock().unwrap();
+        assert!(controller.serving_ready().is_ok());
+        assert!(controller.pending_keys(&state).unwrap().is_empty());
+        let mut registry = DemandRegistry::new(Instant::now());
+        controller
+            .retire_pending(&mut state, &mut registry)
+            .unwrap();
+        assert!(state.handover.is_none());
+        assert!(controller.pins().unwrap()[&lan].live);
+    }
+}
+
+#[test]
 fn serving_ready_cancels_each_wan_pin_without_waiting_for_a_busy_controller() {
     let login = Login::new();
     let controller = login.controller(true, false);

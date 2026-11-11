@@ -889,8 +889,8 @@ than folded in, and if the open still fails (a tarpit that accepts TCP but
 never speaks zenoh) it is retried ONCE with the reachable-explicit locators only,
 so a discovered false positive never sinks the gather. With nothing discovered
 the `ROBOTS` section is omitted and the `REMOTE TOPICS` section collapses to one
-line, `remote: none discovered in 500 ms (sign in or pair a robot; account and
-paired robots are reached automatically)`; a peer that is reachable (a given locator, a discovered
+line, `remote: none discovered in 500 ms (sign in with the robot's account using cerulion login;
+account and paired robots are reached automatically)`; a peer that is reachable (a given locator, a discovered
 robot) but advertised no topic in time gets `retry` instead.
 
 **Mirror provenance: one data source = one topic.** When a desk

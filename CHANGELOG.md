@@ -13,7 +13,7 @@ Semantic Versioning covers the graph YAML format, the `cerulion` command line an
 
 ### Migration
 
-1. Sign the robot and desk in to the same account with `cerulion login`, or pair them with `cerulion pair`. Upgrade the CLI and daemons together and restart `cerulion-netd`.
+1. Sign the robot and desk in to the same account with `cerulion login`. Existing saved pairings continue to work. Upgrade the CLI and daemons together and restart `cerulion-netd`.
 2. To keep unauthenticated LAN access, set `CERULION_LAN_ACCESS=open` for every Cerulion command and daemon on the serving machine and restart `cerulion-netd`.
 3. For zenoh LAN access, `listen` and `connect` locators, `CERULION_NETD_LISTEN`, `CERULION_NETD_CONNECT` and `topic list --connect` take effect only under explicit open access. Account and paired discovery needs none of these settings.
 
@@ -97,6 +97,7 @@ Semantic Versioning covers the graph YAML format, the `cerulion` command line an
 - `cerulion_remoted::shutdown::ShutdownStage` is the stage `serve_planes` runs when its accept loop stops, after it drops its shutdown future: each `ShutdownParticipant` registered on `OpsServing::shutdown_stage` is driven to settlement in order while the ops receipt log is alive, and after a stop signal the endpoint too. One that fails, panics or is cancelled is returned as `RemotedError::Shutdown`.
 
 ### Fixed
+- A robot starting without outbound reads performs no reader migration. Reads restored after an interrupted initial connection remain active; failed restorations still report named losses and recover automatically.
 - After a `detach`, `cerulion-vizd`'s `attach`, `list`, `status` and `discover` replies no longer name the retired mirror's robot for a topic a desk producer took over. A mirror-provenance read that started before a `detach` or a remote `attach` and finished after it was stored over the newer state; it is now refused.
 - Remote schema reads accept producer registrations made after a reader connects, without creating temporary privacy services for topics that have no data. Privacy changes while metadata is pending still refuse the response.
 - An ops `engage-estop` delivery in `cerulion-remoted` can end, on a panic or a dropped runtime, while it deletes the MCP session of an attempt rcpd answered that its latch closed. When an `engage-estop` came after that attempt began, the delivery now logs at error that the `estop` it still owed that `engage-estop` was not sent; the next `engage-estop` sends it. Before, it logged nothing.
