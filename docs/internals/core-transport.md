@@ -219,6 +219,13 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   `info!` only when something was suppressed (`OutputDiscardLatch`). The unconditional
   `total_discards` / `CerulionPublisher::output_discard_count()` counter never resets on
   recovery and is readable off-thread via `NodeHandle::output_discard_count(output)`.
+  Native and stable nodes share the exact `OutputProxy` log messages and that same
+  per-output latch: missing variable writes and nested flush failures retain their
+  distinct messages, including schema, nested error detail and suppressed count.
+  Stable nested detail is copied from an output-port diagnostic before its terminal
+  discard; staging emits no log and changes no discard counter. The terminal logs
+  once and clears its own detail. Admission refusals retain both lease and detail.
+  A complete normal or adaptive-spill publish reports the native recovery line.
 
 ## Provisioning
 

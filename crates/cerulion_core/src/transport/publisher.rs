@@ -1677,7 +1677,7 @@ impl CerulionPublisher {
             return Err(error);
         }
         self.record_payload_size(total_size);
-        self.complete_plugin_output();
+        self.complete_plugin_output(header.schema_hash, false);
         if let Err(error) = self.notify_sent_sample() {
             tracing::trace!(topic = %self.topic, error = %error, "plugin output notification failed after delivery");
         }
@@ -1701,13 +1701,21 @@ impl CerulionPublisher {
             self.record_dropped_overflow_frame();
             return Err(error);
         }
-        self.complete_plugin_output();
+        self.complete_plugin_output(header.schema_hash, true);
         Ok(())
     }
 
-    fn complete_plugin_output(&mut self) {
+    fn complete_plugin_output(&mut self, schema_hash: u64, spill: bool) {
         if let Some(suppressed) = self.record_output_complete() {
-            tracing::info!(topic = %self.topic, suppressed_count = suppressed, "plugin output recovered after incomplete frames");
+            if spill {
+                super::output_proxy::log_spill_output_recovered(
+                    self.topic(),
+                    schema_hash,
+                    suppressed,
+                );
+            } else {
+                super::output_proxy::log_output_recovered(self.topic(), schema_hash, suppressed);
+            }
         }
     }
 
