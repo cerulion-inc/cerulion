@@ -1,7 +1,6 @@
 # cerulion_core - agent notes
 
-Core runtime: wire format, codegen, iceoryx2 transport, scheduler/level executor, graph
-runtime, gateway plane; 260+ test binaries with per-binary serial rules.
+Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial tests.
 
 ## Invariants
 
@@ -9,7 +8,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   a fused chain may serve a frame it just committed, in-process.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- Native plugins use the checked stable node table. Refuse a different boundary major or incompatible complete layout; compiler provenance does not decide compatibility.
+- Native plugins: check boundary major and complete stable layout; ignore compiler provenance.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
 - Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
@@ -32,12 +31,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
-- `graph/node_plugin_abi/` owns local adapters for the checked C tables. Host
-  samples remain behind integer leases. Ordinary receive owners outlive the entire
-  callback, including an early view drop; local writers drop before release.
-  Adapter oracle tests: `cargo test -p cerulion_core --lib graph::node_plugin_abi`.
-  Bootstrap/metadata/refusal fixture: `node_plugin_exports_test` (build
-  `test_node_macro_cdylib` first; no transport is created).
+- Stable node/host tests: `core-transport.md`; readers/writers drop before release.
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
   graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
   a string literal (a removed dash lowers the file's ledger line).
@@ -58,23 +52,9 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 ## Gotchas
 
 - `#[traced_test]` needs tracing-test's `no-env-filter` feature (on the dev-dep) or
-  production events silently vanish. `GraphRuntime` is `!Debug` - use `match`.
+  events vanish. `GraphRuntime` is `!Debug`: use `match`.
 - macOS iceoryx2 select() aborts when any fd NUMBER >= 1024 enters a WaitSet.
 - Per-frame byte-identity: publish in lockstep + `try_receive_one` (drain-all keeps newest).
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
-
-## Host node ABI services
-
-- `graph/node_host_abi.rs` owns native contexts, ports and sample leases. The loader
-  must call `begin_fire()` once per invocation and return all helper/accessor
-  borrows before `remove_context`. Never hand a Rust owner to a node callback.
-- `transport/plugin_lease.rs` is a fixed arena; no callback may grow it. Preserve
-  adaptive spill and retain the original mapping through writer destruction.
-- Run `cargo test -p cerulion_core --test node_host_abi_test -- --test-threads=1`
-  alone under the shared build lock. It has real native delivery, bounded-buffer
-  refusal and thread-local allocation controls; no cdylib build prerequisite.
-- Host unit filters: `transport::plugin_lease::tests` and
-  `graph::node_host_abi::tests`. Shared raw accumulator hooks must reuse the
-  existing typed gather/drop/event/state path, with no parallel policy.

@@ -66,7 +66,10 @@ impl PluginWireLayout {
             return false;
         }
         let table_start = self.fixed_size as usize;
-        for entry in payload[table_start..prefix as usize - WireHeader::SIZE].chunks_exact(8) {
+        for entry in payload[table_start..prefix as usize - WireHeader::SIZE]
+            .as_chunks::<8>()
+            .0
+        {
             let offset = u32::from_le_bytes(entry[..4].try_into().expect("four-byte offset"));
             let len = u32::from_le_bytes(entry[4..].try_into().expect("four-byte length"));
             // OffsetEntry measures from payload[0]. Empty fields may carry
@@ -300,12 +303,17 @@ fn check_owner<T>(row: &Row<T>, port: u64, direction: LeaseDirection) -> Result<
     Ok(())
 }
 
-fn mint_generation(counter: &AtomicU32) -> Result<u32, LeaseError> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| LeaseError::GenerationExhausted)
+pub(crate) fn mint_generation(counter: &AtomicU32) -> Result<u32, LeaseError> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(value) => return Ok(value),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[cfg(test)]

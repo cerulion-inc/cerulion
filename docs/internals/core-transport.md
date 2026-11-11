@@ -19,7 +19,9 @@ place. Adaptive variable outputs may explicitly submit a node-owned spill payloa
 for a synchronous host copy. Submission retains the original loan on every result
 until the writer is destroyed and `SPILL_RELEASE` returns its storage. A normal
 finish consumes its lease; malformed frames never publish or consume a sequence.
-Read leases exclude snapshot, head mutation and restore of their port.
+Read leases exclude snapshot, head mutation and restore of their port. Native
+replay suppression returns output storage before writer validation or discard
+accounting, preserving the existing sequence and replay-discard signal behavior.
 
 Raw accumulation uses `AccumulatorSet`'s existing gather, order, loss, event and
 state machinery. A fire offers one repeatable batch; indexed immutable frame
@@ -671,3 +673,11 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
 | `failure_regime_latch_test.rs` | shared latch decisions, decade ladder, frame-drop reporting layer |
 | `network_ingress_test.rs` / `network_ingress_e2e_test.rs` | byte-identical re-inject; loop exclusion; cross-session hop |
 | `iceoryx2_version_lockstep_test.rs` | exact-pin + single-version workspace resolution |
+
+### Raw node ingress services
+
+Host contexts provision 128 raw publisher rows at construction. The host can set a different fixed budget with `with_raw_publisher_budget` before registration. Raw rows are never reused during the context lifetime; destroy drops the native publisher after its leases return and retains topic storage until context teardown. Exhausted raw or sample budgets return BUSY before transport effects. Raw creation uses the context-carried transport manager, never a second session.
+
+`create_raw_publisher` accepts native ConfigDefault (0) and Discard (1); reserved Block (2) and unknown tags are refused. `loan_output` on a raw handle takes the schema hash, fixed size/count zero, frame alignment, and exact complete frame size as minimum capacity. Its slot has a 40-byte initialized header prefix; the caller initializes the complete frame. `finish_raw_output` consumes the lease, validates header/schema/length and offset bounds, preserves original wire stamps, and returns actual recipient count. Every writable recipient output is zero on refusal. Raw sends share native raw publish trace, promise and structural notify effects. `register_raw_egress` uses the existing dynamic registration channel; a refusal preserves the local publisher.
+
+Host lease tests: `cargo test -p cerulion_core --test node_host_abi_test -- --test-threads=1`, alone under the desk lock, without fixture prerequisites. Pure host filters are `graph::node_host_abi::tests` and `transport::plugin_lease::tests`; adapter oracles use `graph::node_plugin_abi`. The loader calls `begin_fire()` once per invocation and returns all helper/accessor borrows before removing a context. Raw accumulator hooks share the typed gather/drop/event/state path.

@@ -369,11 +369,9 @@ impl FrameCheck {
                 if !layout.accepts(raw, header.total_size)
                     || raw.as_ptr().align_offset(layout.alignment as usize) != 0
                 {
-                    // hot-path-alloc-ok: malformed-frame refusal only, never accepted delivery
                     return Err(TransportError::Deserialization {
                         topic: topic.to_string(),
-                        reason: "accumulate frame does not match its plugin schema layout"
-                            .to_string(),
+                        reason: "invalid plugin accumulate frame".to_string(),
                     });
                 }
                 Ok(())
@@ -458,7 +456,6 @@ impl AccumulatorSet {
         layout: super::plugin_lease::PluginWireLayout,
     ) -> TransportResult<()> {
         if layout.prefix_len().is_none() {
-            // hot-path-alloc-ok: invalid descriptor is refused during graph construction
             return Err(TransportError::InvalidTransportConfig {
                 reason: "accumulate plugin layout is invalid".to_string(),
             });
@@ -592,9 +589,8 @@ impl AccumulatorSet {
         self.inputs
             .iter()
             .find(|acc| &*acc.name == name)
-            // hot-path-alloc-ok: invalid capture binding only, never a configured input
             .ok_or_else(|| StateError::AccumulateRestore {
-                input: name.to_string(),
+                input: name.to_string(), // hot-path-alloc-ok: unknown capture binding refusal only
                 reason: "unknown accumulate input".to_string(),
             })?
             .capture(out)
@@ -610,7 +606,7 @@ impl AccumulatorSet {
             .iter_mut()
             .find(|acc| &*acc.name == name)
             .ok_or_else(|| StateError::AccumulateRestore {
-                input: name.to_string(),
+                input: name.to_string(), // hot-path-alloc-ok: unknown capture binding refusal only
                 reason: "unknown accumulate input".to_string(),
             })?;
         let refuse = |reason: &str| StateError::AccumulateRestore {
