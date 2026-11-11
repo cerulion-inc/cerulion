@@ -524,21 +524,19 @@ pub struct ResimReport {
     /// say that a bounded remainder exists and where the bound is, and the
     /// per-topic breakdown is in the `--report` JSON for a reader who wants it.
     pub covered_range: Option<(u64, usize)>,
-    /// The COORDINATION PROVENANCE line, already
-    /// rendered.
+    /// The COORDINATION caveat line, already rendered, or `None` when the
+    /// contract applied needs no word on the terminal.
     ///
-    /// The rule is that the contract a replay APPLIED is always visible, and
-    /// a neutral resim is a surface like any other — it makes no verdict, but
-    /// "which contract did you re-execute this under" is not a verdict, it is
-    /// what makes the re-execution readable at all. The verify-mode verdict
-    /// prints it (`replay_engine::render_verdict`), and the neutral summary
-    /// prints it too.
+    /// A recording stamped `free_run` or `lockstep` re-executes under exactly
+    /// that contract, which a reader cannot act on, so it is `None`; the
+    /// INFERRED lockstep of a bag with no stamp is an assumption the replay
+    /// made, so it is carried and printed. The verify-mode verdict
+    /// (`replay_engine::render_verdict`) applies the same rule.
     ///
-    /// Carried as the RENDERED line rather than as the two fields: the text is
-    /// the canonical vocabulary and lives in exactly one function
+    /// Carried as the RENDERED line rather than as the two fields: the text and
+    /// the rule live in exactly one function
     /// (`replay_engine::render_coordination_line`), which is Unix-only, while
-    /// everything that consumes a `ResimReport` is not. `None` only for a
-    /// hand-built report; [`ResimReport::from_outcome`] always fills it.
+    /// everything that consumes a `ResimReport` is not.
     pub coordination: Option<String>,
     /// Every bag-fed injection ANOMALY, as
     /// `(rank, topic, detail)`.
@@ -594,9 +592,7 @@ impl ResimReport {
                 .covered_range
                 .as_ref()
                 .map(|c| (c.through_ns, c.trailing_frames.values().sum())),
-            coordination: Some(crate::replay_engine::render_coordination_line(
-                &o.coordination,
-            )),
+            coordination: crate::replay_engine::render_coordination_line(&o.coordination),
             injection_anomalies: o
                 .injection_anomalies
                 .iter()
@@ -1745,10 +1741,10 @@ mod tests {
             // did, and the covered-range line stays absent unless an arm asks
             // for it.
             covered_range: None,
-            // The provenance line, as
-            // `replay_engine::render_coordination_line` renders it for the
-            // ordinary shape — a bag carrying an explicit lockstep stamp.
-            coordination: Some("coordination: lockstep".to_string()),
+            // The ordinary shape: a bag carrying an explicit coordination
+            // stamp, which `replay_engine::render_coordination_line` renders as
+            // no line at all.
+            coordination: None,
             // The two harness-side reports are additive and the
             // arms that are not about them keep rendering what they always did.
             injection_anomalies: vec![],
@@ -1756,30 +1752,19 @@ mod tests {
         }
     }
 
-    /// The rule is that the contract a re-execution
-    /// APPLIED is always visible, on every surface that reports one — and a
-    /// NEUTRAL resim is one. It makes no verdict, but "which contract
-    /// did you re-execute this under" is not a verdict: without it a free-run
-    /// bag and an older, unstamped bag produce the same summary, and the operator
-    /// cannot tell an EXPLICIT lockstep stamp from an INFERRED one.
+    /// The neutral summary prints the coordination caveat the projection
+    /// carries, and nothing when it carries none.
     ///
-    /// The line is rendered upstream by
-    /// `replay_engine::render_coordination_line` and printed verbatim here, so
-    /// the neutral summary and the verify verdict speak ONE vocabulary.
+    /// The line (and the rule that only an INFERRED contract has one) is
+    /// rendered upstream by `replay_engine::render_coordination_line` and
+    /// printed verbatim here, so the neutral summary and the verify verdict
+    /// speak ONE vocabulary.
     #[test]
     fn the_neutral_summary_states_the_coordination_provenance() {
         let bag = Path::new("/tmp/x.mcap");
 
-        let mut lockstep = report(true, 0, false);
-        lockstep.coordination = Some("coordination: lockstep".to_string());
-        let out = render_resim_summary(&lockstep, bag);
-        assert!(
-            out.contains("coordination: lockstep"),
-            "the neutral summary must state which contract it re-executed under: {out}"
-        );
-
         // The INFERRED suffix is what separates "the recorder said lockstep"
-        // from "nothing said, so lockstep was assumed" — the distinction the whole
+        // from "nothing said, so lockstep was assumed": the distinction the whole
         // `Option<CoordinationMode>` stamp exists to preserve.
         let mut inferred = report(true, 0, false);
         inferred.coordination =
@@ -1790,14 +1775,13 @@ mod tests {
             "an inferred contract must be rendered as inferred: {out}"
         );
 
-        // A hand-built report with no provenance prints no line at all rather
-        // than inventing one — absence is never rendered as a claim.
-        let mut none = report(true, 0, false);
-        none.coordination = None;
-        let out = render_resim_summary(&none, bag);
+        // A stamped contract carries no line, and none is invented.
+        let mut stamped = report(true, 0, false);
+        stamped.coordination = None;
+        let out = render_resim_summary(&stamped, bag);
         assert!(
             !out.contains("coordination:"),
-            "an absent provenance must render NOTHING, never a default: {out}"
+            "a stamped contract renders NOTHING, never a default: {out}"
         );
     }
 
