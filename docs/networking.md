@@ -56,7 +56,8 @@ compatibility and pairing.
   local-only run remain unavailable off-machine through an already-running
   gateway, remote server or mirror. Other daemons also refuse outputs omitted
   from that run's declared egress before opening a tap. Local reads and recording
-  keep working. Opaque `ros2:` children inherit the run scope, including topics
+  keep working. Recorder status follows the same scope; if another run already
+  exports the shared status topic, this recording disables status publication. Opaque `ros2:` children inherit the run scope, including topics
   registered later; config-mapped raw DDS outputs obey it too. A separately
   launched third-party DDS participant has its own transport settings.
 - **Producer policy survives a topic restart.** Remote taps, mirrors and open-LAN
@@ -81,6 +82,11 @@ Android apps retain the same default through their `lan_access` runtime key and
 host their authenticated remote plane through `remote`; see [Android](android.md).
 Authenticated ops keep their capability and e-stop checks; a graph import pulls
 an allowed producer stream and does not grant an arbitrary remote publish verb.
+
+Held remote reads survive a serving endpoint start or stop. If a reader cannot be
+restored, netd reports the robot and topic. CLI observers stop with an error;
+graph imports revalidate the pinned producer before reconnecting, and
+visualization re-demands its pinned source and schema outside frame draining.
 
 ## The decision matrix
 
@@ -682,10 +688,15 @@ and preserves queued frames, with `wan_refused` distinct from `wan_dropped`.
 A missing policy is unverified; best-effort datagram graph ingress is refused
 on the authenticated wire path. Before releasing graph workers, the CLI resolves
 each declared ingress topic to exactly one authenticated account or paired
-producer and checks its schema, reliable policy and single live writer.
+producer and checks its schema, reliable policy and single live writer. The
+producer's native service must also allow at most one publisher; a
+multi-publisher service with one live writer is refused for graph import.
 Missing or ambiguous producers fail startup. Held demands reconnect to the
 same pinned producer and release when the run stops. Observer reads retain
 their best-effort queue and can read every writer of a multi-publisher topic.
+Imported topics retain the source robot's access policy. A serving consumer
+exports its local producers; read its imported topics on their source robot.
+Metadata discovery and refused demands preserve other running ingress readers.
 
 The graph file stays the single source of truth: under a
 Strict block, which topics cross the machine boundary is declared in YAML.

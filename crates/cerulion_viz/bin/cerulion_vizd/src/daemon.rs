@@ -5615,6 +5615,10 @@ pub trait DemandPlane: Send + Sync {
     /// against `schema_hash`. Called ONCE per topic (the reserve-then-commit
     /// guarantees it). A `String` error is surfaced to the controller verbatim.
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String>;
+    /// Cold control heartbeat, separate from frame draining. Re-demand lost readers.
+    fn check_remote_readers(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// Local channel provided by the observer demand. Legacy test planes remain canonical.
     fn local_channel(&self, _robot: &str, topic: &str) -> Result<String, String> {
         Ok(topic.into())
@@ -5730,7 +5734,7 @@ pub trait DemandPlane: Send + Sync {
 /// self`, and controller threads share it) and opened LAZILY on the first demand, so
 /// a viz daemon that only ever serves LOCAL attaches never connects to netd.
 pub struct NetdDemandPlane {
-    channels: Mutex<BTreeMap<(String, String), String>>,
+    channels: Mutex<BTreeMap<(String, String), (String, u64)>>,
     client: Mutex<Option<NetdClient>>,
     /// `Some(socket)` targets a SPECIFIC control socket (the e2e's in-process netd);
     /// `None` uses the well-known default path (production, first-consumer-spawns).
@@ -5800,20 +5804,63 @@ impl Default for NetdDemandPlane {
 }
 
 impl DemandPlane for NetdDemandPlane {
-    fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
-        let reply = self.with_client(|c| c.observe(robot, topic, schema_hash))?;
-        self.channels
+    fn check_remote_readers(&self) -> Result<(), String> {
+        // No local-only attach starts netd. Keep source/schema/channel pinned and
+        // re-demand idempotently on this connection after a retirement or reconnect.
+        let held = self
+            .channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((robot.into(), topic.into()), reply.local_topic);
+            .clone();
+        if held.is_empty() {
+            return Ok(());
+        }
+        let missing = match self.with_client(|client| client.status()) {
+            Ok(status) => {
+                held.iter()
+                    .filter(|((robot, topic), _)| {
+                        !status.demands.iter().any(|row| {
+                            &row.robot == robot && &row.topic == topic && row.refcount > 0
+                        })
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            }
+            Err(_) => held.into_iter().collect(),
+        };
+        for ((robot, topic), (channel, hash)) in missing {
+            // Attach and detach serialize through the channel map before client I/O;
+            // checking again prevents a heartbeat reviving a detached source.
+            let channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            if !channels.contains_key(&(robot.clone(), topic.clone())) {
+                continue;
+            }
+            let reply = self
+                .with_client(|client| client.observe(&robot, &topic, hash))
+                .map_err(|error| {
+                    format!("remote mirror lost for robot '{robot}' topic '{topic}': {error}")
+                })?;
+            if reply.local_topic != channel {
+                let _release = self.with_client(|client| client.unobserve(&robot, &topic));
+                return Err(format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"));
+            }
+        }
+        Ok(())
+    }
+
+    fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
+        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        let reply = self.with_client(|c| c.observe(robot, topic, schema_hash))?;
+        channels.insert(
+            (robot.into(), topic.into()),
+            (reply.local_topic, schema_hash),
+        );
         Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
+        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
         self.with_client(|c| c.unobserve(robot, topic).map(|_| ()))?;
-        self.channels
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(robot.into(), topic.into()));
+        channels.remove(&(robot.into(), topic.into()));
         Ok(())
     }
     fn local_channel(&self, robot: &str, topic: &str) -> Result<String, String> {
@@ -5821,7 +5868,7 @@ impl DemandPlane for NetdDemandPlane {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(robot.into(), topic.into()))
-            .cloned()
+            .map(|(channel, _)| channel.clone())
             .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
@@ -7134,6 +7181,8 @@ pub struct RunningDaemon {
     /// The catalog-change forwarder thread (`None` when it could not be
     /// spawned — the daemon runs without pushes rather than failing to start).
     events_handle: Option<JoinHandle<()>>,
+    /// Cold mirror recovery worker; never blocks the frame drain.
+    demand_health_handle: Option<JoinHandle<()>>,
     /// The event hub, for observability (Principle #3) and the e2e.
     events: Arc<crate::events::EventHub>,
     /// The controller read-loop iteration counter (Principle #3) — see
@@ -7577,6 +7626,9 @@ impl RunningDaemon {
         if let Some(h) = self.events_handle.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.demand_health_handle.take() {
+            let _ = h.join();
+        }
         let handles = std::mem::take(&mut *self.conns.lock().unwrap());
         for h in handles {
             let _ = h.join();
@@ -7817,6 +7869,38 @@ pub fn start_on_socket(
         }
     };
 
+    let demand_health_handle = {
+        let plane = Arc::clone(&ctx.demand_plane);
+        let sd = Arc::clone(&shutdown);
+        match std::thread::Builder::new().name("viz-demand-health".into()).spawn(move || {
+            use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+            let mut failures = FailureRegimeLatch::default();
+            while !sd.load(Ordering::Acquire) {
+                match plane.check_remote_readers() {
+                    Ok(()) => { if let Some(suppressed) = failures.on_success() {
+                        tracing::info!(suppressed, total_failures = failures.total_failures(), "remote visualization readers recovered");
+                    } }
+                    Err(error) => match failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote visualization reader recovery failed"),
+                        RegimeDecision::Suppressed { .. } => {}
+                    }
+                }
+                for _ in 0..10 {
+                    if sd.load(Ordering::Acquire) { break; }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                worker_control.close(); shutdown.store(true, Ordering::SeqCst);
+                let _ = accept_handle.join(); let _ = poll_handle.join();
+                if let Some(handle) = events_handle { let _ = handle.join(); }
+                return Err(error);
+            }
+        }
+    };
+
     tracing::info!(socket = %socket_path.display(), "cerulion-vizd listening (NDJSON control protocol)");
     Ok(RunningDaemon {
         #[cfg(test)]
@@ -7825,6 +7909,7 @@ pub fn start_on_socket(
         accept_handle: Some(accept_handle),
         poll_handle: Some(poll_handle),
         events_handle,
+        demand_health_handle,
         events: Arc::clone(&ctx.events),
         conn_loop_iterations: Arc::clone(&ctx.conn_loop_iterations),
         poll_period_ns: Arc::clone(&ctx.poll_period_ns),

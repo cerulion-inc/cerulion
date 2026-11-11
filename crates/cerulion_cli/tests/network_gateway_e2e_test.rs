@@ -716,6 +716,38 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
         )
     });
 
+    // A normal recording still emits the recorder's own status, including its bag path.
+    let status_manager = cerulion_core::TransportManager::init_for_test(
+        cerulion_core::TransportConfig::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let mut status_subscriber = status_manager
+        .create_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+        .unwrap();
+    let mut status_frames = Vec::new();
+    assert!(
+        wait_until(
+            || {
+                status_frames.clear();
+                status_subscriber
+                    .drain_owned(1, &mut status_frames)
+                    .unwrap();
+                let matches_recording = status_frames.iter().any(|sample| {
+                    serde_json::from_slice::<serde_json::Value>(
+                        &sample.payload()[cerulion_core::wire::WireHeader::SIZE..],
+                    )
+                    .is_ok_and(|value| {
+                        value["bag_path"].as_str() == Some(bag.to_string_lossy().as_ref())
+                    })
+                });
+                status_frames.clear();
+                matches_recording
+            },
+            Duration::from_secs(10)
+        ),
+        "permissive recording emitted no matching status frame"
+    );
     // Network stays UP while recording: the gateway child exists + the
     // permissive breadcrumb fired.
     let run_pid = guard.id();
@@ -1062,7 +1094,7 @@ fn cli_producer_scope_arm(tag: &str, env_off: bool, flags: &[&str], strict: bool
     let topic = format!("/{prefix}/ticker/cmd");
     let block = if strict {
         format!(
-            "network:\n  enabled: true\n  egress: [{}]\n",
+            "network:\n  mode: peer\n  egress: [{}]\n",
             if allowed { topic.as_str() } else { "" }
         )
     } else {

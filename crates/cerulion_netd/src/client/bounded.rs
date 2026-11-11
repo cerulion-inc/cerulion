@@ -21,7 +21,10 @@ use super::{
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 use crate::account_access::{AccountAccessReply, AccountAccessRequest};
-use crate::protocol::{Request, Response, ServingSchemaSnapshot, MAX_REQUEST_LINE_BYTES};
+use crate::protocol::{
+    classify_control_line, ControlLine, Request, Response, ServingSchemaSnapshot,
+    MAX_REQUEST_LINE_BYTES,
+};
 
 /// Connect to the control socket at `path` before `deadline`. With
 /// `abstract_namespace` the path bytes name an abstract socket, as the daemon
@@ -323,17 +326,36 @@ impl NetdClient {
         let result = (|| {
             write_line(&mut self.stream, &request.to_json_line(), deadline)
                 .map_err(ClientError::Io)?;
-            let line = read_line(&mut self.reader, deadline, MAX_RESPONSE_BYTES)
-                .map_err(ClientError::Io)?;
-            let response = serde_json::from_str::<Response>(line.trim())
-                .map_err(|_| ClientError::Protocol("unparseable netd control response".into()))?;
+            let mut lost = None;
+            let response = loop {
+                let line = read_line(&mut self.reader, deadline, MAX_RESPONSE_BYTES)
+                    .map_err(ClientError::Io)?;
+                match classify_control_line(&line) {
+                    ControlLine::MirrorLost(event) => {
+                        lost.get_or_insert(event);
+                    }
+                    ControlLine::Response(text) => {
+                        break serde_json::from_str::<Response>(&text).map_err(|_| {
+                            ClientError::Protocol("unparseable netd control response".into())
+                        })?
+                    }
+                    _ => {
+                        return Err(ClientError::Protocol(
+                            "unexpected netd control record".into(),
+                        ))
+                    }
+                }
+            };
             remaining(deadline).map_err(ClientError::Io)?;
             self.stream
                 .set_nonblocking(false)
                 .map_err(ClientError::Io)?;
-            Ok(response)
+            lost.map_or(Ok(response), |event| Err(ClientError::MirrorLost(event)))
         })();
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !matches!(error, ClientError::MirrorLost(_)))
+        {
             self.poison();
         }
         result

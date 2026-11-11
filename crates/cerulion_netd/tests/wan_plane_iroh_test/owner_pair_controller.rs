@@ -131,6 +131,7 @@ impl Drop for Producers {
 }
 
 struct Desk {
+    controller: Arc<AccountWanController>,
     daemon: cerulion_netd::daemon::RunningNetd,
     manager: Arc<TransportManager>,
     socket: std::path::PathBuf,
@@ -172,7 +173,7 @@ impl Desk {
         let socket = directory.path().join("netd.sock");
         let daemon = cerulion_netd::start(
             socket.clone(),
-            controller,
+            controller.clone(),
             NetdConfig {
                 account_identity_watch: true,
                 ..NetdConfig::default()
@@ -180,6 +181,7 @@ impl Desk {
         )
         .unwrap();
         Self {
+            controller,
             daemon,
             manager,
             socket,
@@ -534,3 +536,6 @@ fn rekey_retires_only_changed_robot_and_preserves_other_robot_delivery() {
     assert_eq!(replacement.binding(&login.seed), Some(OWNER));
     assert_eq!(pairs(&b), 1);
 }
+
+#[path = "owner_pair_transition.rs"]
+mod transition;

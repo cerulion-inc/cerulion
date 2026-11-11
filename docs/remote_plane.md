@@ -86,6 +86,11 @@ with the same canonical name; wire/2 still names the original topic. Observers o
 one source share a demand, and the last observer releases the channel. Graph
 ingress keeps canonical names and the single-writer contract.
 
+An expired session is refreshed and saved before account discovery, with a 2 s
+budget. If the service is unavailable, the saved account directory remains
+usable. Topic reads keep cache diagnostics at debug; `topic list` reports them
+on one stderr line, and an explicit `--robot` reports unavailable robot topics.
+
 A desk cannot write a topic on the robot or send it teleop commands over
 `cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
 never reads a data stream from the desk. The `teleop` and `deploy` verbs
@@ -114,10 +119,19 @@ While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 A graph with declared `ingress:` can pull an exported topic from a unique
 same-account or explicitly paired producer over the authenticated remote plane.
 The receiving graph checks the declared topic, schema, QoS and single-writer
-rules. The producer serves its stream; the consumer does not send arbitrary data
+rules. Declared imports require a native service provisioned for one publisher;
+a multi-publisher service is refused even with only one live writer. The
+producer serves its stream; the consumer does not send arbitrary data
 frames to the producer. A machine can serve and consume through the same owned
 endpoint. This is distinct from the ops `topic-publish` verb and its capability
 and e-stop checks.
+
+Each robot exports its own local producers. Imported graph topics and private
+observer channels keep their source robot's access policy: read them on that
+source robot. A refused outbound demand or an unavailable robot during metadata
+discovery preserves the machine's other active readers. Outbound readers retain
+the owned server against idle shutdown; new admission returns a retryable
+refusal while shutdown is already committed.
 
 The zenoh LAN ingress compatibility path proves no identity per peer and is
 closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires
@@ -206,9 +220,12 @@ time.
 exhaustion and network delivery still decide whether a remote `engage-estop`
 arrives. Each session is bounded by a 120 s deadline that closes an
 authenticated-then-stalled connection, which is a per-session resource guard
-rather than a serialization point. Two caps that would bound the total footprint
-under a distributed flood, a global concurrency cap with a reserved safety-floor
-slot and the daemon's accept-loop cap, are **not implemented**.
+rather than a serialization point. At most 32 TLS handshakes are pending, each
+for at most 10 s. Once 16 are pending, an unvalidated address must answer a
+QUIC Retry before admission. A validated IP holds at most four pending slots;
+relay arrivals share eight per relay URL, and custom transports share four.
+A flood from many validated addresses or many relay URLs can still exhaust
+the handshake capacity. Established sessions are not globally capped.
 
 ## A dropped connection does not drop the lease
 

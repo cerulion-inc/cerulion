@@ -92,6 +92,26 @@ impl Daemon {
         wan: Option<&str>,
         standing: bool,
     ) -> Self {
+        Self::start_with(
+            ix,
+            network_off,
+            expired_login,
+            wan,
+            standing,
+            None,
+            |_, _| {},
+        )
+    }
+
+    fn start_with(
+        ix: &IsolatedRoot,
+        network_off: bool,
+        expired_login: bool,
+        wan: Option<&str>,
+        standing: bool,
+        binary: Option<&Path>,
+        configure: impl FnOnce(&mut Command, &Path),
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         paired_state(root.path());
         if expired_login {
@@ -107,9 +127,10 @@ impl Daemon {
         )
         .unwrap();
         let socket = root.path().join("netd.sock");
-        let binary = std::env::var_os("CERULION_TEST_NETD_BINARY")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_cerulion-netd").into());
-        let mut command = Command::new(binary);
+        let selected = binary
+            .map(Path::to_path_buf)
+            .unwrap_or_else(test_netd_binary);
+        let mut command = Command::new(selected);
         command
             .current_dir(root.path())
             .env("CERULION_HOME", root.path())
@@ -142,6 +163,7 @@ impl Daemon {
                 .env("CERULION_NETD_DESK_KEY", key)
                 .env_remove("CERULION_NETD_DEVICE_CERT");
         }
+        configure(&mut command, root.path());
         let child = command.spawn().unwrap();
         let mut daemon = Self {
             child,
@@ -588,4 +610,666 @@ fn engaged_ops_estop_survives_last_egress_disconnect_and_remains_observable() {
         );
     }
     daemon.stop();
+}
+
+#[test]
+fn a_stalled_tls_handshake_cannot_block_a_second_clients_estop_delivery() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let ix = IsolatedRoot::mint("h2");
+    let mut daemon = Daemon::start(&ix, false, false, None, false);
+    let mut producer = daemon.connect();
+    assert!(matches!(
+        request(&mut producer, register(1, TOPIC)),
+        Response::Egress(_)
+    ));
+    let facts_path = daemon
+        .root
+        .path()
+        .join("robot-state/remoted/beacon_facts.json");
+    until(|| facts_path.exists());
+    let facts: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(facts_path).unwrap()).unwrap();
+    let robot: std::net::SocketAddr = format!("127.0.0.1:{}", facts["iroh_port"].as_u64().unwrap())
+        .parse()
+        .unwrap();
+    let id = cerulion_link::EndpointId::from_bytes(
+        &DeviceIdentity::from_seed(&ROBOT_SEED).public_key().0,
+    )
+    .unwrap();
+    // Forward genuine client datagrams but withhold the robot's replies. Seeing
+    // a reply proves the real server began TLS; no protocol bytes are fabricated.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let proxy_address = socket.local_addr().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let replied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct Proxy {
+        running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            self.running
+                .store(false, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+    let live = std::sync::Arc::clone(&running);
+    let response_seen = std::sync::Arc::clone(&replied);
+    let proxy = Proxy {
+        running,
+        thread: Some(std::thread::spawn(move || {
+            let mut packet = [0; 65536];
+            while live.load(std::sync::atomic::Ordering::Acquire) {
+                match socket.recv_from(&mut packet) {
+                    Ok((_, from)) if from == robot => {
+                        response_seen.store(true, std::sync::atomic::Ordering::Release)
+                    }
+                    Ok((len, _)) => {
+                        socket.send_to(&packet[..len], robot).unwrap();
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("handshake proxy failed: {error}"),
+                }
+            }
+        })),
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let stalled_peer =
+            build_endpoint(EndpointConfig::new([0x91; 32]).with_relay(RelayConfig::Disabled))
+                .await
+                .unwrap();
+        let peer = stalled_peer.clone();
+        let stalled = tokio::spawn(async move {
+            dial(
+                &peer,
+                EndpointAddr::new(id).with_ip_addr(proxy_address),
+                alpn::OPS,
+            )
+            .await
+        });
+        tokio::time::timeout(LIMIT, async {
+            while !replied.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let desk = build_endpoint(EndpointConfig::new(DESK_SEED).with_relay(RelayConfig::Disabled))
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            let connection = dial(&desk, EndpointAddr::new(id).with_ip_addr(robot), alpn::OPS)
+                .await
+                .unwrap();
+            let (mut send, mut recv) = open_frame_stream(&connection).await.unwrap();
+            let ack = ops_exchange(
+                &mut send,
+                &mut recv,
+                br#"{"min_version":1,"max_version":1}"#,
+            )
+            .await;
+            assert_eq!(ack["type"], "ack");
+            let engaged = ops_exchange(
+                &mut send,
+                &mut recv,
+                br#"{"id":0,"verb":"engage-estop","args":{}}"#,
+            )
+            .await;
+            (engaged, connection, send, recv)
+        })
+        .await;
+        assert!(
+            !stalled.is_finished(),
+            "first peer is still waiting for TLS"
+        );
+        stalled.abort();
+        let _ = stalled.await;
+        stalled_peer.close().await;
+        let (engaged, connection, _send, _recv) =
+            delivered.expect("a pending TLS peer cannot delay e-stop delivery beyond two seconds");
+        assert_eq!(engaged["status"], "ok", "{engaged}");
+        assert_eq!(engaged["result"]["engaged"], true);
+        connection.close(0u32.into(), b"done");
+        desk.close().await;
+    });
+    drop(proxy);
+    drop(producer);
+    daemon.stop();
+}
+
+#[test]
+fn a_stalled_flood_cannot_refuse_an_estop_dial() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let ix = IsolatedRoot::mint("flood");
+    // This also raises this process's file limit before creating 33 endpoints.
+    let _manager =
+        TransportManager::init_for_test(TransportConfig::default(), ix.config()).unwrap();
+    let mut daemon = Daemon::start(&ix, false, false, None, false);
+    let mut producer = daemon.connect();
+    assert!(matches!(
+        request(&mut producer, register(1, TOPIC)),
+        Response::Egress(_)
+    ));
+    let facts = daemon
+        .root
+        .path()
+        .join("robot-state/remoted/beacon_facts.json");
+    until(|| facts.exists());
+    let facts: serde_json::Value = serde_json::from_slice(&std::fs::read(facts).unwrap()).unwrap();
+    let robot: std::net::SocketAddr = format!("127.0.0.1:{}", facts["iroh_port"].as_u64().unwrap())
+        .parse()
+        .unwrap();
+    let id = cerulion_link::EndpointId::from_bytes(
+        &DeviceIdentity::from_seed(&ROBOT_SEED).public_key().0,
+    )
+    .unwrap();
+    struct WithheldReplies {
+        live: Arc<AtomicBool>,
+        replied: Arc<AtomicBool>,
+        address: std::net::SocketAddr,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl WithheldReplies {
+        fn new(robot: std::net::SocketAddr) -> Self {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let address = socket.local_addr().unwrap();
+            let live = Arc::new(AtomicBool::new(true));
+            let replied = Arc::new(AtomicBool::new(false));
+            let running = Arc::clone(&live);
+            let response_seen = Arc::clone(&replied);
+            let thread = std::thread::spawn(move || {
+                let mut packet = [0; 65536];
+                while running.load(Ordering::Acquire) {
+                    match socket.recv_from(&mut packet) {
+                        Ok((_, sender)) if sender == robot => {
+                            response_seen.store(true, Ordering::Release);
+                        }
+                        Ok((len, _)) => {
+                            socket.send_to(&packet[..len], robot).unwrap();
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => panic!("reply-withholding proxy failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                live,
+                replied,
+                address,
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for WithheldReplies {
+        fn drop(&mut self) {
+            self.live.store(false, Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+    let proxies: Vec<_> = (0..33).map(|_| WithheldReplies::new(robot)).collect();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut builders = tokio::task::JoinSet::new();
+            for seed in 0x80..=0xa0 {
+                builders.spawn(build_endpoint(
+                    EndpointConfig::new([seed; 32]).with_relay(RelayConfig::Disabled),
+                ));
+            }
+            let mut peers = Vec::new();
+            while let Some(peer) = builders.join_next().await {
+                peers.push(peer.unwrap().unwrap());
+            }
+            assert_eq!(peers.len(), 33);
+            let desk =
+                build_endpoint(EndpointConfig::new(DESK_SEED).with_relay(RelayConfig::Disabled))
+                    .await
+                    .unwrap();
+            let mut stalled = tokio::task::JoinSet::new();
+            for (peer, proxy) in peers.iter().zip(&proxies) {
+                let peer = peer.clone();
+                let address = EndpointAddr::new(id).with_ip_addr(proxy.address);
+                stalled.spawn(async move { dial(&peer, address, alpn::OPS).await });
+            }
+            // All 33 genuine Initials have reached remoted and received a response.
+            // Their replies are withheld, so none can complete TLS or address retry.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !proxies
+                    .iter()
+                    .all(|proxy| proxy.replied.load(Ordering::Acquire))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("all stalled dials must reach the real robot before its TLS deadline");
+            let started = Instant::now();
+            let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+                let connection = dial(&desk, EndpointAddr::new(id).with_ip_addr(robot), alpn::OPS)
+                    .await
+                    .unwrap();
+                let (mut send, mut recv) = open_frame_stream(&connection).await.unwrap();
+                let ack = ops_exchange(
+                    &mut send,
+                    &mut recv,
+                    br#"{"min_version":1,"max_version":1}"#,
+                )
+                .await;
+                assert_eq!(ack["type"], "ack");
+                let engaged = ops_exchange(
+                    &mut send,
+                    &mut recv,
+                    br#"{"id":0,"verb":"engage-estop","args":{}}"#,
+                )
+                .await;
+                assert_eq!(engaged["status"], "ok", "{engaged}");
+                assert_eq!(engaged["result"]["engaged"], true);
+                (connection, send, recv)
+            })
+            .await
+            .expect("33 stalled dials cannot refuse or delay a paired e-stop beyond five seconds");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            // These are our client tasks; the server never evicts pending TLS work.
+            stalled.shutdown().await;
+            for peer in peers {
+                peer.close().await;
+            }
+            let (connection, _send, _recv) = delivered;
+            connection.close(0u32.into(), b"done");
+            desk.close().await;
+        });
+    drop(proxies);
+    drop(producer);
+    daemon.stop();
+}
+
+fn test_netd_binary() -> std::path::PathBuf {
+    std::env::var_os("CERULION_TEST_NETD_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_cerulion-netd").into())
+}
+
+struct ServerFixture {
+    root: tempfile::TempDir,
+    netd: std::path::PathBuf,
+}
+
+impl ServerFixture {
+    fn new(script: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let netd = root.path().join("cerulion-netd");
+        std::fs::copy(test_netd_binary(), &netd).unwrap();
+        let remoted = root.path().join("cerulion-remoted");
+        std::fs::write(&remoted, script).unwrap();
+        std::fs::set_permissions(remoted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self { root, netd }
+    }
+}
+
+#[test]
+fn registration_during_a_six_second_reap_replies_promptly_and_serves_one_replacement() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    // The wrapper delays TERM forwarding to its own real remoted child. Its
+    // marker proves the parent has committed a stop, without guessed timing.
+    let fixture = ServerFixture::new(
+        r#"#!/bin/sh
+rm -f "$CERULION_TEST_FACTS"
+"$CERULION_TEST_REAL_REMOTED" "$@" &
+server_pid=$!
+printf '%s' "$server_pid" > "$CERULION_TEST_CHILD_PID"
+trap '
+    : > "$CERULION_TEST_STOP_ENTERED"
+    sleep 6
+    kill -TERM "$server_pid"
+    wait "$server_pid"
+    exit 0
+' TERM
+wait "$server_pid"
+"#,
+    );
+    let ix = IsolatedRoot::mint("reap");
+    let manager = TransportManager::init_for_test(TransportConfig::default(), ix.config()).unwrap();
+    let next_topic = "/automatic/replacement";
+    let _publisher = manager
+        .create_publisher_simple(next_topic, MaxSliceLen::const_new(64))
+        .unwrap();
+    let remoted = test_netd_binary().with_file_name("cerulion-remoted");
+    let mut daemon = Daemon::start_with(
+        &ix,
+        false,
+        false,
+        None,
+        false,
+        Some(&fixture.netd),
+        |command, root| {
+            command
+                .env("CERULION_TEST_REAL_REMOTED", remoted)
+                .env("CERULION_TEST_STOP_ENTERED", root.join("stop-entered"))
+                .env("CERULION_TEST_CHILD_PID", root.join("child-pid"))
+                .env(
+                    "CERULION_TEST_FACTS",
+                    root.join("robot-state/remoted/beacon_facts.json"),
+                )
+                .env("CERULION_REMOTED_HARD_EXIT_MS", "9000");
+        },
+    );
+    let mut first = daemon.connect();
+    let mut next = daemon.connect();
+    assert!(matches!(
+        request(&mut first, register(1, TOPIC)),
+        Response::Egress(_)
+    ));
+    let facts = daemon
+        .root
+        .path()
+        .join("robot-state/remoted/beacon_facts.json");
+    let child_pid = daemon.root.path().join("child-pid");
+    until(|| facts.exists() && child_pid.exists());
+    let old = children(daemon.child.id());
+    assert_eq!(old.len(), 1);
+    let old_actual = std::fs::read_to_string(&child_pid).unwrap();
+    assert!(matches!(
+        request(&mut first, Request::ReleaseEgress { id: 2 }),
+        Response::EgressRelease(_)
+    ));
+    until(|| daemon.root.path().join("stop-entered").exists());
+    next.1
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        request(&mut next, register(3, next_topic)),
+        Response::Egress(_)
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "registration exceeded the control roundtrip budget"
+    );
+    assert_eq!(
+        children(daemon.child.id()),
+        old,
+        "a replacement cannot overlap the stopping owner"
+    );
+    until(|| {
+        let current = children(daemon.child.id());
+        current.len() == 1
+            && current != old
+            && std::fs::read_to_string(&child_pid).is_ok_and(|pid| pid != old_actual)
+            && facts.exists()
+    });
+    let replacement = children(daemon.child.id());
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(
+        children(replacement[0]).len(),
+        1,
+        "exactly one real remoted serves behind the wrapper"
+    );
+    let facts: serde_json::Value = serde_json::from_slice(&std::fs::read(facts).unwrap()).unwrap();
+    let address = EndpointAddr::new(
+        cerulion_link::EndpointId::from_bytes(
+            &DeviceIdentity::from_seed(&ROBOT_SEED).public_key().0,
+        )
+        .unwrap(),
+    )
+    .with_ip_addr(
+        format!("127.0.0.1:{}", facts["iroh_port"].as_u64().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let desk = build_endpoint(EndpointConfig::new(DESK_SEED).with_relay(RelayConfig::Disabled))
+            .await
+            .unwrap();
+        let connection = tokio::time::timeout(LIMIT, dial(&desk, address, alpn::WIRE))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut send, mut recv) = open_frame_stream(&connection).await.unwrap();
+        write_frame(
+            &mut send,
+            &serde_json::to_vec(&WireRequest::Catalog).unwrap(),
+        )
+        .await
+        .unwrap();
+        let bytes = tokio::time::timeout(LIMIT, read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN))
+            .await
+            .unwrap()
+            .unwrap();
+        let WireResponse::Catalog(catalog) = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("replacement refused authenticated catalog")
+        };
+        assert!(catalog
+            .entries
+            .iter()
+            .any(|entry| entry.topic == next_topic));
+        connection.close(0u32.into(), b"done");
+        desk.close().await;
+    });
+    daemon.stop();
+    drop(fixture.root);
+}
+
+#[test]
+fn registration_replies_while_endpoint_transfer_waits_on_the_controller() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture_root = tempfile::tempdir().unwrap();
+    let netd = fixture_root.path().join("cerulion-netd");
+    std::fs::copy(std::env::current_exe().unwrap(), &netd).unwrap();
+    std::os::unix::fs::symlink(
+        test_netd_binary().with_file_name("cerulion-remoted"),
+        fixture_root.path().join("cerulion-remoted"),
+    )
+    .unwrap();
+    let ix = IsolatedRoot::mint("busy");
+    let mut daemon =
+        Daemon::start_with(&ix, false, false, None, false, Some(&netd), |command, _| {
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "endpoint_controller_fixture_process",
+                ])
+                .env(
+                    "CERULION_TEST_IX_CONFIG",
+                    serde_json::to_string(&ix.config()).unwrap(),
+                );
+        });
+    let mut first = daemon.connect();
+    let mut second = daemon.connect();
+    first
+        .1
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    second
+        .1
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        first.0,
+        "{}",
+        serde_json::to_string(&register(1, TOPIC)).unwrap()
+    )
+    .unwrap();
+    until(|| daemon.root.path().join("transfer-entered").exists());
+    let mut line = String::new();
+    first.1.read_line(&mut line).unwrap();
+    assert!(matches!(
+        serde_json::from_str::<Response>(&line).unwrap(),
+        Response::Egress(_)
+    ));
+    let started = Instant::now();
+    assert!(matches!(
+        request(&mut second, register(2, TOPIC)),
+        Response::Egress(_)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!daemon.root.path().join("release-controller").exists());
+    assert!(children(daemon.child.id()).is_empty());
+    std::fs::write(daemon.root.path().join("release-controller"), b"").unwrap();
+    until(|| {
+        children(daemon.child.id()).len() == 1
+            && daemon
+                .root
+                .path()
+                .join("robot-state/remoted/beacon_facts.json")
+                .exists()
+    });
+    daemon.stop();
+}
+
+#[test]
+#[ignore = "subprocess fixture driven by registration_replies_while_endpoint_transfer_waits_on_the_controller"]
+fn endpoint_controller_fixture_process() {
+    use cerulion_netd::mirror::{GatewayMirrorPlane, MirrorError, MirrorPlane, MirrorRelease};
+    use cerulion_netd::registry::TopicKey;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    struct HeldController {
+        inner: GatewayMirrorPlane,
+        gate: Arc<Mutex<()>>,
+        root: std::path::PathBuf,
+    }
+    impl MirrorPlane for HeldController {
+        fn begin_serving(&self) -> Result<(), String> {
+            std::fs::write(self.root.join("transfer-entered"), b"").unwrap();
+            let _controller = self.gate.lock().unwrap();
+            self.inner.begin_serving()
+        }
+        fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
+            self.inner.ensure_mirror(key, schema_hash)
+        }
+        fn release_mirror(&self, key: &TopicKey) -> MirrorRelease {
+            self.inner.release_mirror(key)
+        }
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CERULION_HOME").unwrap());
+    let ix = serde_json::from_str(&std::env::var("CERULION_TEST_IX_CONFIG").unwrap()).unwrap();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            network: Some(cerulion_core::NetworkConfig {
+                robot_identity: Some("controller-fixture".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ix,
+    )
+    .unwrap();
+    let gate = Arc::new(Mutex::new(()));
+    let guard = gate.lock().unwrap();
+    let mirror: Arc<dyn MirrorPlane> = Arc::new(HeldController {
+        inner: GatewayMirrorPlane::new(Arc::clone(&manager)),
+        gate: Arc::clone(&gate),
+        root: root.clone(),
+    });
+    let egress = Arc::new(
+        cerulion_netd::supervised_egress::SupervisedEgressPlane::new(
+            Arc::new(cerulion_netd::egress::GatewayEgressPlane::new(manager)),
+            Arc::clone(&mirror),
+            false,
+        ),
+    );
+    let running = Arc::new(AtomicBool::new(true));
+    let signalled = Arc::clone(&running);
+    ctrlc::set_handler(move || signalled.store(false, Ordering::Release)).unwrap();
+    let mut daemon = cerulion_netd::daemon::start_with_planes(
+        root.join("netd.sock"),
+        mirror,
+        egress.clone(),
+        Arc::new(cerulion_netd::query::NoopQueryPlane),
+        cerulion_netd::daemon::NetdConfig {
+            idle_self_exit: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    while running.load(Ordering::Acquire) && !root.join("release-controller").exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(guard);
+    while running.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    daemon.shutdown();
+    egress.shutdown();
+}
+
+#[test]
+fn a_failed_server_spawn_keeps_registration_and_releases_endpoint_fencing() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = ServerFixture::new("#!/nonexistent/cerulion-test-interpreter\n");
+    let ix = IsolatedRoot::mint("spawn");
+    let mut daemon = Daemon::start_with(
+        &ix,
+        false,
+        false,
+        None,
+        false,
+        Some(&fixture.netd),
+        |_, _| {},
+    );
+    let mut first = daemon.connect();
+    first
+        .1
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(matches!(
+        request(&mut first, register(1, TOPIC)),
+        Response::Egress(_)
+    ));
+    until(|| {
+        std::fs::read_to_string(daemon.root.path().join("stderr"))
+            .unwrap()
+            .contains("starting robot server")
+    });
+    assert!(children(daemon.child.id()).is_empty());
+    let fence = cerulion_netd::serving_hold::IdleFence::try_acquire(
+        &cerulion_netd::serving_hold::fence_path(&daemon.root.path().join("robot-state")),
+    )
+    .unwrap();
+    assert!(
+        fence.is_some(),
+        "failed spawn must release its native transfer fence"
+    );
+    drop(fence);
+    let mut second = daemon.connect();
+    assert!(matches!(
+        request(&mut second, register(2, TOPIC)),
+        Response::Egress(_)
+    ));
+    let snapshot = request(&mut first, Request::ServingSchemaSnapshot { id: 3 });
+    assert!(matches!(snapshot, Response::ServingSchemaSnapshot(_)));
+    drop(first);
+    drop(second);
+    daemon.stop();
+    drop(fixture.root);
 }

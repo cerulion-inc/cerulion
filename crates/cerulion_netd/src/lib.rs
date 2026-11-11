@@ -148,8 +148,8 @@ pub use mirror::{GatewayMirrorPlane, MirrorError, MirrorPlane, MirrorRelease};
 pub use net::network_config_from_env;
 pub use protocol::{
     classify_control_line, CatalogChanged, CatalogQueryResponse, ControlLine, DiscoveryState,
-    Hello, Request, Response, SchemaQueryResponse, SubscribeCatalogResponse, CATALOG_CHANGED_EVENT,
-    PROTOCOL_VERSION,
+    Hello, MirrorLost, Request, Response, SchemaQueryResponse, SubscribeCatalogResponse,
+    CATALOG_CHANGED_EVENT, PROTOCOL_VERSION,
 };
 pub use query::{
     CatalogGather, GatewayQueryPlane, NoopQueryPlane, QueryError, QueryPlane, RunsAnswer,

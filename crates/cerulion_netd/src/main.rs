@@ -86,10 +86,11 @@ ENVIRONMENT:
     CERULION_NETD_IDLE_GRACE_MS  Idle grace before self-exit, in ms (default 30000).
     CERULION_NETD_HARD_EXIT_MS   Deadline for graceful shutdown before the daemon
                                  HARD-exits (nonzero) to avoid a zombie, in ms
-                                 (default 5000). A WAN daemon also budgets
-                                 CERULION_REMOTED_HARD_EXIT_MS (default 30000),
-                                 a 500 ms margin, and
-                                 CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S.
+                                 (default 5000). A network-enabled daemon in a
+                                 WAN build, whether or not it is serving, adds
+                                 CERULION_REMOTED_HARD_EXIT_MS (default 30000)
+                                 plus 500 ms and
+                                 CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S (default 35).
     CERULION_NETD_CONNECT        Zenoh locators to CONNECT to for remote robots
                                  the boot-time mDNS browse and the peer cache
                                  can't reach (comma/space separated).
@@ -175,8 +176,8 @@ const WAN_USAGE: &str = "    CERULION_NETD_WAN_ROBOTS     iroh WAN robots: a ';'
 
 A serving machine owns its WAN endpoint through remoted from its first egress
 registration, or from explicit LISTEN standing configuration.
-Consuming other robots over WAN from a serving machine is not supported in
-this version; use the LAN plane. WAN demands are refused without a fallback.
+A serving machine reads paired and same-account robots over WAN like any desk,
+sharing its owned device endpoint for serving and consuming.
 Automatic robot state defaults to <CERULION_HOME or ~/.cerulion>/robot-state;
 CERULION_STATE_ROOT preserves an explicit deployment root.
 ";
@@ -510,8 +511,9 @@ fn lifecycle_status_line(standing_gateway: bool) -> &'static str {
 }
 
 /// The watchdog deadline for a shutdown: the robot supervisor's stop grace
-/// (zero without WAN serving), during which its stop may wait for a running
-/// revocation fetch, plus the hard-exit deadline for the rest of teardown.
+/// (zero with networking off or in a build without WAN), during which its stop
+/// may wait for a running revocation fetch, plus the hard-exit deadline for the
+/// rest of teardown.
 fn shutdown_deadline(hard_exit: Duration, supervisor_grace: Duration) -> Duration {
     hard_exit + supervisor_grace
 }

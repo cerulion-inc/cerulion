@@ -321,7 +321,14 @@ async fn wire_demand_is_deterministic() {
     assert_eq!(b, oracle, "run B == hand oracle");
 }
 
-async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_effort: bool) {
+async fn graph_policy_case(
+    tag: &str,
+    graph_ingress: bool,
+    multi: bool,
+    best_effort: bool,
+    single_writer_multi: bool,
+    metadata_unknown: bool,
+) {
     use cerulion_core::transport::{PublisherProvisioning, TopicServiceConfig};
     use cerulion_core::{EgressQos, EgressReliability, SchemaServing};
     let manager = test_manager(tag);
@@ -330,7 +337,7 @@ async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_eff
         manager.default_topic_config(),
         8,
         0,
-        if multi {
+        if multi || single_writer_multi {
             PublisherProvisioning::Multi
         } else {
             PublisherProvisioning::SingleWriter
@@ -348,15 +355,19 @@ async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_eff
             .unwrap()
     });
     let schemas = SchemaServing {
-        egress_qos: vec![EgressQos {
-            topic: topic.clone(),
-            reliability: if best_effort {
-                EgressReliability::BestEffort
-            } else {
-                EgressReliability::Reliable
-            },
-            send_queue: std::num::NonZeroUsize::new(2),
-        }],
+        egress_qos: if metadata_unknown {
+            Vec::new()
+        } else {
+            vec![EgressQos {
+                topic: topic.clone(),
+                reliability: if best_effort {
+                    EgressReliability::BestEffort
+                } else {
+                    EgressReliability::Reliable
+                },
+                send_queue: std::num::NonZeroUsize::new(2),
+            }]
+        },
         ..SchemaServing::default()
     };
     let daemon = disabled_endpoint([73; 32]).await;
@@ -388,7 +399,7 @@ async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_eff
             },
         )
         .await;
-        if graph_ingress {
+        if graph_ingress && !metadata_unknown {
             let reason = if best_effort {
                 "authenticated wire ingress requires a matching reliable producer policy"
             } else {
@@ -407,6 +418,27 @@ async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_eff
                 assert!(status.topics.is_empty(), "a refused import retains no tap");
             } else {
                 panic!("status reply missing");
+            }
+            if single_writer_multi {
+                assert_eq!(
+                    request(
+                        &mut send,
+                        &mut recv,
+                        &WireRequest::Demand {
+                            topic: topic.clone(),
+                            graph_ingress: false,
+                        },
+                    )
+                    .await,
+                    WireResponse::DemandAccepted {
+                        topic: topic.clone()
+                    }
+                );
+                let oracle = oracle_frames();
+                first.publish_raw(&oracle[0]).unwrap();
+                let (actual_topic, delivered) = read_uni_frames(&connection, 1).await;
+                assert_eq!(actual_topic, topic);
+                assert_eq!(delivered, oracle[..1]);
             }
         } else {
             assert_eq!(
@@ -429,7 +461,7 @@ async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_eff
                 oracle[..if multi { 2 } else { 1 }],
                 "every writer delivers its handwritten frame"
             );
-            if !best_effort && !multi {
+            if !graph_ingress && !best_effort && !multi {
                 let changed = request(
                     &mut send,
                     &mut recv,
@@ -455,27 +487,37 @@ async fn graph_policy_case(tag: &str, graph_ingress: bool, multi: bool, best_eff
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_policy_observer_best_effort_delivers() {
-    graph_policy_case("observer_best_effort", false, false, true).await;
+    graph_policy_case("observer_best_effort", false, false, true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_policy_observer_multi_publisher_delivers_every_writer() {
-    graph_policy_case("observer_multi", false, true, false).await;
+    graph_policy_case("observer_multi", false, true, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_policy_import_best_effort_is_refused() {
-    graph_policy_case("graph_best_effort", true, false, true).await;
+    graph_policy_case("graph_best_effort", true, false, true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_policy_import_multi_publisher_is_refused() {
-    graph_policy_case("graph_multi", true, true, false).await;
+    graph_policy_case("graph_multi", true, true, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_policy_import_multi_with_one_writer_is_refused_but_observer_delivers() {
+    graph_policy_case("graph_multi_one", true, false, false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_policy_unknown_raw_import_keeps_multi_one_writer_compatibility() {
+    graph_policy_case("graph_raw_multi_one", true, false, false, true, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_policy_retained_observer_cannot_change_mode() {
-    graph_policy_case("observer_mode", false, false, false).await;
+    graph_policy_case("observer_mode", false, false, false, false, false).await;
 }
 
 // ---------------------------------------------------------------------------

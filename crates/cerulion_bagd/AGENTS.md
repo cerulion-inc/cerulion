@@ -6,6 +6,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
 
 ## Invariants
 
+- Hold `/bagd/status` exclusion until reaping; on conflict use `--status-period-ms 0`.
 - bagd NEVER evicts: both `room == 0` arms in the tap drain WAIT. The loss
   boundary is the topic's own provisioned SHM queue depth, not recorder policy.
 - ONE write mode: payloads are copied into the MCAP chunk arena at drain, so
@@ -55,6 +56,5 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   `--record`); either way read `run.json`/`trace_rings`, never infer one from the run shape.
 - Mid-run ring attach MUST use `open_at_live`; plain `open` refuses a lapped
   ring. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
-
 Deep reference: docs/internals/recording.md - read before touching drain
 pacing, discovery/settle, coverage fields, or run binding.

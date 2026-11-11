@@ -1008,8 +1008,12 @@ pub fn run_logout() -> CliResult<LogoutOutcome> {
 /// the hosted issuer retires the session by its `refresh_token`,
 /// `cerulion-accountd` by `token` (either of the pair).
 fn revoke_session(state: &AuthState) -> CliResult<()> {
+    revoke_session_with_timeout(state, HTTP_TIMEOUT)
+}
+
+fn revoke_session_with_timeout(state: &AuthState, timeout: Duration) -> CliResult<()> {
     let base = account_service_base();
-    let client = http_client()?;
+    let client = build_http_client_with_timeout(reqwest::redirect::Policy::default(), timeout)?;
     let path = "/v1/auth/revoke";
     let resp = client
         .post(format!("{base}{path}"))
@@ -1051,11 +1055,27 @@ fn revoke_session(state: &AuthState) -> CliResult<()> {
 /// ([`ensure_login_gate`]): the local proceed path stays ZERO-network (no
 /// offline horizon), and a refresh failure here NEVER blocks local operation.
 ///
-/// Its production caller is `account_cmd::require_session` — the one
-/// cloud-dial seam (do not re-implement
-/// staleness handling a second way there). The e2e
+/// Account commands use this companion; automatic topic discovery uses
+/// [`refresh_session_if_stale_within`] to keep the same rotation protocol bounded.
+/// The e2e
 /// (`stale_session_refreshes_against_the_real_service`) is its live proof.
 pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
+    refresh_session_until(None)
+}
+
+/// Refresh and persist a stale session on the calling thread within `budget`.
+/// The refresh token is single-use: never abandon this exchange on a worker thread.
+pub fn refresh_session_if_stale_within(budget: Duration) -> CliResult<Option<AuthState>> {
+    refresh_session_until(Some(std::time::Instant::now() + budget))
+}
+
+fn refresh_remaining(deadline: Option<std::time::Instant>, fallback: Duration) -> Duration {
+    deadline.map_or(fallback, |deadline| {
+        deadline.saturating_duration_since(std::time::Instant::now())
+    })
+}
+
+fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Option<AuthState>> {
     let loaded = auth::load();
     let Some(state) = loaded.state() else {
         // Never logged in (or corrupt) — nothing to refresh (the gate handles it).
@@ -1073,8 +1093,14 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
             "no home directory (set CERULION_HOME) to store ~/.cerulion/auth.json".to_string(),
         )
     })?;
-    let _refreshing = auth::hold_refresh_lock(&auth_path)
-        .map_err(|e| CliError::Login(format!("could not refresh the session: {e}")))?;
+    let refresh_lock = match deadline {
+        Some(_) => {
+            auth::hold_refresh_lock_within(&auth_path, refresh_remaining(deadline, HTTP_TIMEOUT))
+        }
+        None => auth::hold_refresh_lock(&auth_path),
+    };
+    let _refreshing =
+        refresh_lock.map_err(|e| CliError::Login(format!("could not refresh the session: {e}")))?;
     let loaded = auth::load_from(&auth_path);
     let Some(state) = loaded.state() else {
         return Ok(None);
@@ -1083,7 +1109,13 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
         return Ok(None);
     }
     let base = account_service_base();
-    let client = http_client()?;
+    let remaining = refresh_remaining(deadline, HTTP_TIMEOUT);
+    if remaining.is_zero() {
+        return Err(CliError::Login(
+            "session refresh exceeded its time budget".into(),
+        ));
+    }
+    let client = build_http_client_with_timeout(reqwest::redirect::Policy::default(), remaining)?;
     let refreshed: TokenResponse = post_json(
         &client,
         &base,
@@ -1109,20 +1141,24 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
     // So the exchange runs unlocked and the publication is conditional — a peer
     // that signed out or logged in while we were refreshing is NOT overwritten
     // with the session it just retired.
-    let publication = auth::with_store_lock(&auth_path, || {
-        let current = auth::load_from(&auth_path);
-        let current_refresh = current.state().map(|c| c.refresh_token.as_str());
-        match refresh_publication(
-            current_refresh,
-            &state.refresh_token,
-            &new_state.refresh_token,
-        ) {
-            RefreshPublication::Publish => {
-                auth::write_to(&auth_path, &new_state).map(|()| RefreshPublication::Publish)
+    let publication = auth::with_store_lock_within(
+        &auth_path,
+        refresh_remaining(deadline, Duration::from_secs(1)),
+        || {
+            let current = auth::load_from(&auth_path);
+            let current_refresh = current.state().map(|c| c.refresh_token.as_str());
+            match refresh_publication(
+                current_refresh,
+                &state.refresh_token,
+                &new_state.refresh_token,
+            ) {
+                RefreshPublication::Publish => {
+                    auth::write_to(&auth_path, &new_state).map(|()| RefreshPublication::Publish)
+                }
+                other => Ok(other),
             }
-            other => Ok(other),
-        }
-    })
+        },
+    )
     .map_err(|e| CliError::Login(format!("could not persist the refreshed session: {e}")))?;
     if publication == RefreshPublication::AlreadyStored {
         // A peer writer (Studio's team page) stored this same pair first: the
@@ -1136,7 +1172,15 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
         // revoked only the pair we exchanged, and a login or a peer's refresh
         // holds a different session. Retire it whatever replaced it, so no
         // session stays live at the service that this machine cannot sign out.
-        if let Err(e) = revoke_session(&new_state) {
+        let remaining = refresh_remaining(deadline, HTTP_TIMEOUT);
+        let revoked = if remaining.is_zero() {
+            Err(CliError::Login(
+                "session refresh exceeded its time budget".into(),
+            ))
+        } else {
+            revoke_session_with_timeout(&new_state, remaining)
+        };
+        if let Err(e) = revoked {
             tracing::warn!(error = %e, "could not revoke the unpublished refreshed session");
         }
         tracing::warn!(
@@ -1385,6 +1429,13 @@ pub(crate) fn http_client_without_redirects() -> CliResult<reqwest::blocking::Cl
 }
 
 fn build_http_client(redirect: reqwest::redirect::Policy) -> CliResult<reqwest::blocking::Client> {
+    build_http_client_with_timeout(redirect, HTTP_TIMEOUT)
+}
+
+fn build_http_client_with_timeout(
+    redirect: reqwest::redirect::Policy,
+    timeout: Duration,
+) -> CliResult<reqwest::blocking::Client> {
     // `install_default` refuses a second install and hands the provider back in
     // the Err — the already-installed case (an earlier client here, or a host
     // that set one), not a failure.
@@ -1397,7 +1448,7 @@ fn build_http_client(redirect: reqwest::redirect::Policy) -> CliResult<reqwest::
     reqwest::blocking::Client::builder()
         .redirect(redirect)
         .default_headers(headers)
-        .timeout(HTTP_TIMEOUT)
+        .timeout(timeout)
         .user_agent(concat!("cerulion-cli/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| CliError::Login(format!("could not build the HTTP client: {e}")))
@@ -1771,6 +1822,29 @@ mod tests {
         let _home = EnvGuard::set("CERULION_HOME", dir.path().to_str().unwrap());
         let _svc = EnvGuard::set(ACCOUNT_SERVICE_ENV, "http://127.0.0.1:1");
         assert!(super::refresh_session_if_stale().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_refresh_does_not_wait_thirty_seconds_on_a_peer_exchange() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        auth::seed_logged_in_at(dir.path(), "acct").unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", dir.path().to_str().unwrap());
+        let _svc = EnvGuard::set(ACCOUNT_SERVICE_ENV, "http://127.0.0.1:1");
+        let path = dir.path().join("auth.json");
+        let mut state = auth::load_from(&path).state().unwrap().clone();
+        state.expires_at_ns = 1;
+        auth::write_to(&path, &state).unwrap();
+        let _held = auth::hold_refresh_lock(&path).unwrap();
+        let started = std::time::Instant::now();
+        let error = refresh_session_if_stale_within(Duration::from_millis(50)).unwrap_err();
+        assert!(
+            error.to_string().contains("did not finish within 50ms"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(auth::load_from(&path).state().unwrap(), &state);
     }
 
     #[test]

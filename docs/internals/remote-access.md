@@ -107,9 +107,9 @@ the same entry instead of running the daemon.
   an fsync on a stalled disk, which holds the exit until that wait returns; a
   child process keeps running. An ops request still running past the deadline
   (its own limit is 120 s) is cut by the hard exit. SIGKILL runs none of this
-  and logs nothing. Under `cerulion-netd`'s robot supervisor, a netd stop ends
-  `cerulion-remoted` with SIGKILL unless it has already exited, so its
-  graceful stop can be cut short there. Pinned by `daemon_stop_signal_test.rs`,
+  and logs nothing. Under `cerulion-netd`'s robot supervisor, a netd stop sends
+  SIGTERM and waits `CERULION_REMOTED_HARD_EXIT_MS` plus 500 ms before SIGKILL,
+  so the graceful stop runs within its own deadline. Pinned by `daemon_stop_signal_test.rs`,
   `shutdown_stage_test.rs` and the stage tests in `shutdown.rs`.
 
 - **Logging** (`log_writer.rs`, `main.rs`). The binary's fmt subscriber writes

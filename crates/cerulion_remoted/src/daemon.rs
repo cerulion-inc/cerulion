@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use cerulion_core::TransportManager;
 use cerulion_link::{
-    accept_frame_stream, accept_one, read_frame, write_frame, Accepted, Connection, Endpoint,
-    LinkError,
+    accept_frame_stream, read_frame, write_frame, Accepted, Connection, Endpoint, IncomingAddr,
+    LinkError, RelayUrl,
 };
 use cerulion_pairing::format::PublicKey;
 use cerulion_pairing::verify::TrustStore;
@@ -42,7 +42,7 @@ use crate::wire::WirePlane;
 /// Cap on the skeleton control-frame handshake (hello + reply are tiny).
 const MAX_HELLO_LEN: usize = 4096;
 
-/// Per-connection deadline for the whole skeleton control-frame handshake
+/// Deadline for incoming TLS and, separately, the skeleton control-frame handshake
 /// (accept the bidi stream + read the hello + write the decision + drain to
 /// EOF). A peer that completes the QUIC handshake then STALLS must not hold the
 /// spawned task + connection indefinitely (an unauthenticated resource-hold DoS
@@ -50,11 +50,90 @@ const MAX_HELLO_LEN: usize = 4096;
 /// generous for a hello+reply even over a relay; the ops and wire planes' protocols
 /// carry their own tighter budgets.
 ///
-/// NOTE: this bounds each connection's HANDSHAKE, not the
-/// GLOBAL number of concurrent connections. A global concurrency cap (a bounded
-/// semaphore acquired before `spawn`, released on the handler's completion) is a
-/// defensible additional guard and is not implemented.
+/// At most 32 TLS handshakes are pending. Unvalidated addresses are retried at
+/// half capacity; validated IPs hold at most four slots and each relay at most
+/// eight. Established connections carry their own protocol deadlines.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Bound unauthenticated work without serializing one peer ahead of safety ops.
+const MAX_PENDING_HANDSHAKES: usize = 32;
+const PER_SOURCE_PENDING: usize = 4;
+const PER_RELAY_PENDING: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Admit,
+    Retry,
+    Refuse,
+}
+
+fn handshake_admission(pending: usize, pending_from_source: usize, validated: bool) -> Admission {
+    if pending >= MAX_PENDING_HANDSHAKES {
+        Admission::Refuse
+    } else if !validated && pending >= MAX_PENDING_HANDSHAKES / 2 {
+        Admission::Retry
+    } else if validated && pending_from_source >= PER_SOURCE_PENDING {
+        Admission::Refuse
+    } else {
+        Admission::Admit
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SourceKey {
+    Ip(std::net::IpAddr),
+    Relay(RelayUrl),
+    Custom,
+}
+
+fn handshake_source(address: IncomingAddr, validated: bool) -> Option<SourceKey> {
+    match address {
+        IncomingAddr::Ip(address) => validated.then_some(SourceKey::Ip(address.ip())),
+        IncomingAddr::Relay { url, .. } => Some(SourceKey::Relay(url)),
+        IncomingAddr::Custom(_) => Some(SourceKey::Custom),
+        _ => Some(SourceKey::Custom),
+    }
+}
+
+fn source_admission(
+    pending: usize,
+    pending_from_source: usize,
+    validated: bool,
+    source: Option<&SourceKey>,
+) -> Admission {
+    let ip_pending = if matches!(source, Some(SourceKey::Ip(_))) {
+        pending_from_source
+    } else {
+        0
+    };
+    match handshake_admission(pending, ip_pending, validated) {
+        Admission::Admit => match source {
+            Some(SourceKey::Relay(_)) if pending_from_source >= PER_RELAY_PENDING => {
+                Admission::Refuse
+            }
+            Some(SourceKey::Custom) if pending_from_source >= PER_SOURCE_PENDING => {
+                Admission::Refuse
+            }
+            _ => Admission::Admit,
+        },
+        admission => admission,
+    }
+}
+
+fn release_handshake_source(
+    id: tokio::task::Id,
+    task_sources: &mut indexmap::IndexMap<tokio::task::Id, SourceKey>,
+    sources: &mut indexmap::IndexMap<SourceKey, u8>,
+) {
+    if let Some(source) = task_sources.shift_remove(&id) {
+        if let Some(count) = sources.get_mut(&source) {
+            *count -= 1;
+            if *count == 0 {
+                sources.shift_remove(&source);
+            }
+        }
+    }
+}
 
 /// Build the daemon from config and serve until `shutdown` resolves (or the
 /// endpoint closes). `shutdown` is dropped as soon as the accept loop stops,
@@ -433,11 +512,16 @@ pub async fn serve_planes(
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
     let mut admission_failures =
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    // accept_one owns an Incoming while its handshake completes. A refresh tick
-    // must not cancel it and close an otherwise valid new ops/wire connection.
-    let mut accepting = Box::pin(accept_one(endpoint));
+    let mut handshakes = tokio::task::JoinSet::<Result<Accepted, LinkError>>::new();
+    let mut handshake_admission_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut handshake_retry_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut sources = indexmap::IndexMap::<SourceKey, u8>::new();
+    let mut task_sources = indexmap::IndexMap::<tokio::task::Id, SourceKey>::new();
     let closed_on_its_own = loop {
         tokio::select! {
+            biased;
             _ = &mut shutdown => break false,
             _ = refresh.tick() => {
                 if let Some(holds) = &holds {
@@ -453,13 +537,23 @@ pub async fn serve_planes(
                     }
                 }
             },
-            accepted = &mut accepting => {
-                accepting.set(accept_one(endpoint));
+            // join_next is cancellation-safe; a tick cannot lose a completed
+            // handshake. Deliver it before consuming another new arrival.
+            completed = handshakes.join_next_with_id(), if !handshakes.is_empty() => {
+                let accepted = match completed {
+                    Some(Ok((id, accepted))) => {
+                        release_handshake_source(id, &mut task_sources, &mut sources);
+                        accepted
+                    }
+                    Some(Err(error)) => {
+                        release_handshake_source(error.id(), &mut task_sources, &mut sources);
+                        tracing::error!(error = %error, "remote handshake worker failed; continuing to serve");
+                        continue;
+                    }
+                    None => continue,
+                };
                 match accepted {
-                    // The endpoint's accept stream ended → the daemon is closing.
-                    // This is the ONLY per-accept signal that terminates the loop.
-                    Ok(None) => break true,
-                    Ok(Some(a)) => {
+                    Ok(a) => {
                         let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
                             match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
                                 Ok(hold) => {
@@ -496,8 +590,8 @@ pub async fn serve_planes(
                     // mid-handshake). This is per-connection, NOT the endpoint
                     // closing — an unauthenticated peer must NEVER be able to
                     // terminate the robot's always-on remote plane. Log loudly and
-                    // keep serving. `accept_one` returns `Ok(None)` (handled above)
-                    // when the endpoint itself is gone, so this arm never hot-loops.
+                    // keep serving. Only the endpoint accept stream ending below
+                    // terminates serving; one failed handshake cannot do that.
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -509,13 +603,69 @@ pub async fn serve_planes(
                     }
                 }
             }
+            // Endpoint::accept has not consumed an Incoming until it resolves;
+            // cancelling this wait on a refresh tick is safe. TLS completes in
+            // bounded independent workers so a stalled peer cannot block ops.
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break true; };
+                let validated = incoming.remote_addr_validated();
+                let source = handshake_source(incoming.remote_addr(), validated);
+                let pending_from_source = source.as_ref().and_then(|key| sources.get(key)).copied().unwrap_or(0);
+                use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                match source_admission(handshakes.len(), usize::from(pending_from_source), validated, source.as_ref()) {
+                    Admission::Refuse => {
+                        match handshake_admission_failures.on_failure() {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(pending = handshakes.len(), total_failures = handshake_admission_failures.total_failures(), "remote handshake refused because pending admission capacity is full"),
+                            RegimeDecision::Suppressed { .. } => tracing::debug!(pending = handshakes.len(), total_failures = handshake_admission_failures.total_failures(), "remote handshake refused because pending admission capacity is full"),
+                        }
+                        incoming.refuse();
+                        continue;
+                    }
+                    Admission::Retry => {
+                        let _decision = handshake_retry_failures.on_failure();
+                        tracing::debug!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry");
+                        if let Err(error) = incoming.retry() {
+                            match handshake_admission_failures.on_failure() {
+                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, pending = handshakes.len(), total_failures = handshake_admission_failures.total_failures(), "remote handshake retry unavailable; refusing incoming connection"),
+                                RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, pending = handshakes.len(), total_failures = handshake_admission_failures.total_failures(), "remote handshake retry unavailable; refusing incoming connection"),
+                            }
+                            error.into_incoming().refuse();
+                        }
+                        continue;
+                    }
+                    Admission::Admit => {}
+                }
+                if handshakes.len() < MAX_PENDING_HANDSHAKES / 2 {
+                    if let Some(suppressed) = handshake_admission_failures.on_success() {
+                        tracing::info!(suppressed, "remote handshake admission recovered");
+                    }
+                    if let Some(suppressed) = handshake_retry_failures.on_success() {
+                        tracing::debug!(suppressed, "remote handshake address retry recovered");
+                    }
+                }
+                let task = handshakes.spawn(async move {
+                    let connection = tokio::time::timeout(HANDSHAKE_DEADLINE, async { incoming.await })
+                        .await
+                        .map_err(|error| LinkError::Accept(Box::new(error)))?
+                        .map_err(|error| LinkError::Accept(Box::new(error)))?;
+                    Ok(Accepted {
+                        remote_id: connection.remote_id(),
+                        alpn: connection.alpn().to_vec(),
+                        connection,
+                    })
+                });
+                if let Some(source) = source {
+                    *sources.entry(source.clone()).or_insert(0) += 1;
+                    task_sources.insert(task.id(), source);
+                }
+            }
         }
     };
     // Dropped before anything is logged or awaited, so a host that watches it
     // learns the accept loop stopped even when a log write blocks; the binary
     // arms its hard-exit deadline then.
     drop(shutdown);
-    drop(accepting);
+    handshakes.shutdown().await;
     if closed_on_its_own {
         tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
     } else {
@@ -870,6 +1020,97 @@ pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, Remot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_admission_reserves_capacity_at_every_boundary() {
+        for (pending, from_source, validated, expected) in [
+            (0, 0, false, Admission::Admit),
+            (15, 0, false, Admission::Admit),
+            (16, 0, false, Admission::Retry),
+            (17, 0, false, Admission::Retry),
+            (31, 4, false, Admission::Retry),
+            (32, 0, false, Admission::Refuse),
+            (33, 0, false, Admission::Refuse),
+            (15, 4, false, Admission::Admit),
+            (0, 3, true, Admission::Admit),
+            (0, 4, true, Admission::Refuse),
+            (0, 5, true, Admission::Refuse),
+            (16, 3, true, Admission::Admit),
+            (31, 3, true, Admission::Admit),
+            (32, 0, true, Admission::Refuse),
+            (33, 0, true, Admission::Refuse),
+            (32, 4, true, Admission::Refuse),
+        ] {
+            assert_eq!(
+                handshake_admission(pending, from_source, validated),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn validated_sources_cannot_claim_another_ips_bucket() {
+        let address = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(handshake_source(IncomingAddr::Ip(address), false), None);
+        let ip = handshake_source(IncomingAddr::Ip(address), true).unwrap();
+        assert_eq!(ip, SourceKey::Ip("127.0.0.1".parse().unwrap()));
+        let relay = SourceKey::Relay("https://relay.example.invalid".parse().unwrap());
+        for (source, bound) in [(&relay, 8), (&SourceKey::Custom, 4), (&ip, 4)] {
+            assert_eq!(
+                source_admission(15, bound - 1, true, Some(source)),
+                Admission::Admit
+            );
+            assert_eq!(
+                source_admission(15, bound, true, Some(source)),
+                Admission::Refuse
+            );
+            assert_eq!(
+                source_admission(15, bound + 1, true, Some(source)),
+                Admission::Refuse
+            );
+        }
+        assert_eq!(source_admission(15, 100, false, None), Admission::Admit);
+        assert_eq!(source_admission(16, 0, false, None), Admission::Retry);
+    }
+
+    #[tokio::test]
+    async fn completed_and_failed_handshakes_release_source_counts() {
+        let source = SourceKey::Custom;
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut ids = indexmap::IndexMap::new();
+        let mut counts = indexmap::IndexMap::new();
+        let success = tasks.spawn(async { 1 });
+        let failure = tasks.spawn(async { panic!("handshake task failed") });
+        let pending = tasks.spawn(std::future::pending::<i32>());
+        for task in [&success, &failure, &pending] {
+            ids.insert(task.id(), source.clone());
+        }
+        counts.insert(source.clone(), 3);
+        pending.abort();
+        let mut successes = 0;
+        let mut failures = 0;
+        while let Some(result) = tasks.join_next_with_id().await {
+            let id = match result {
+                Ok((id, 1)) => {
+                    successes += 1;
+                    id
+                }
+                Ok(_) => panic!("unexpected handshake value"),
+                Err(error) => {
+                    failures += 1;
+                    error.id()
+                }
+            };
+            release_handshake_source(id, &mut ids, &mut counts);
+            assert_eq!(ids.len(), tasks.len());
+            assert_eq!(
+                counts.values().map(|n| usize::from(*n)).sum::<usize>(),
+                tasks.len()
+            );
+        }
+        assert_eq!((successes, failures), (1, 2));
+        assert!(ids.is_empty() && counts.is_empty());
+    }
 
     #[test]
     fn matching_store_device_key_is_accepted() {

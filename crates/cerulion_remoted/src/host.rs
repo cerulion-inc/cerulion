@@ -442,12 +442,25 @@ impl BoundPlane {
                 })?
                 .join("outbound.sock");
             Some(
-                cerulion_netd::shared_endpoint::OutboundServer::start(
+                cerulion_netd::shared_endpoint::OutboundServer::start_with_holds(
                     socket,
                     endpoint.clone(),
                     tokio::runtime::Handle::current(),
                     device_key,
                     manager,
+                    cerulion_netd::serving_hold::ServingHolds::open(
+                        &cerulion_netd::serving_hold::fence_path(
+                            plane
+                                .files
+                                .store_file
+                                .parent()
+                                .and_then(Path::parent)
+                                .ok_or_else(|| {
+                                    RemotedError::Config("remote state root is unavailable".into())
+                                })?,
+                        ),
+                    )
+                    .map_err(|error| RemotedError::Config(error.to_string()))?,
                 )
                 .map_err(RemotedError::Config)?,
             )

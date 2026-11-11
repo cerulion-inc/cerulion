@@ -159,9 +159,12 @@ explicit pairing directory. Each robot shows `online, direct`, `online, relayed`
 complete. `--all` also shows whether its trust comes from the account or a pairing.
 Each remote topic row names its robot; identical topic names remain separate rows.
 The local section prints and flushes before account or robot requests. Account
-listing waits at most two seconds, and the robot metadata sweep has one four-second
-budget regardless of the number of robots. A saved directory and authenticated
-direct-address hints preserve paired access when the account service is unavailable.
+directory fetches wait at most two seconds. An expired session first gets another
+two-second budget to refresh and save its tokens. The robot metadata sweep has one
+four-second budget regardless of the number of robots. A saved directory and
+authenticated direct-address hints preserve paired access when the account service
+is unavailable. Cache-backed reads keep service diagnostics at debug; `topic list`
+reports them on one stderr line.
 
 `topic echo`, `hz`, `info`, `find`, `snapshot`, and `viz --robot` use the existing
 authenticated remote plane automatically for those robots. Reads demand the topic
@@ -2295,11 +2298,19 @@ iroh uses a direct connection when possible, including on one LAN, and a relay
 otherwise. No listen setting, IP address or `--connect` flag is required for that
 path. See [authenticated discovery](networking.md#making-a-robot-discoverable).
 
+If a held remote mirror is retired, netd names its robot and topic. CLI observers
+exit with an error. Graph imports revalidate their pinned producer before
+reconnecting; visualization re-demands its pinned source and schema.
+
 An enabled `network:` block restricts exported topics and declares imported
 topics. Under paired access each import selects a unique authenticated producer;
 schema, QoS, single-writer and recording-plus-ingress checks remain enforced.
+A declared import requires its producer's native service to permit only one
+publisher, even if a multi-publisher service currently has one live writer.
 A machine that serves and imports shares its existing remote endpoint. The graph
 process itself stays network-free and reads or publishes local shared memory.
+Imported topics retain the source robot's access policy and are read remotely
+on that source robot, including when the consuming machine also serves graphs.
 
 The zenoh LAN plane refuses topic reads, catalog/schema requests and inbound
 frames while paired. `CERULION_LAN_ACCESS=open` explicitly enables unauthenticated
@@ -3766,7 +3777,7 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_TLS_CERTIFICATE` | Absolute path of the PEM certificate a `quic/` or `tls/` listen locator presents (graph `tls.certificate`). It must not be marked `CA:TRUE`. |
 | `CERULION_NETD_TLS_PRIVATE_KEY` | Absolute path of the PEM private key for `CERULION_NETD_TLS_CERTIFICATE` (graph `tls.private_key`). A `quic/` or `tls/` listen locator needs both, and both are refused when no listen locator is `quic/` or `tls/`. `cerulion-netd` applies the graph-load carrier rules to these variables and to `CERULION_NETD_CONNECT` / `CERULION_NETD_LISTEN` at start-up, and refuses to start, naming the variable, on a setting that cannot work. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
-| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
+| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A network-enabled daemon in a WAN build, whether or not it is serving, adds `CERULION_REMOTED_HARD_EXIT_MS` (default 30000) plus 500 ms and `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` (default 35) to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
 
 WSD graph and node reads include a `version` field containing the lowercase

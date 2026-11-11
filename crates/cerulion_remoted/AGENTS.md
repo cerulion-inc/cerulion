@@ -1,4 +1,4 @@
-# cerulion_remoted - agent notes (the remote-access family's scoped file)
+# cerulion_remoted
 
 One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
@@ -19,6 +19,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
+  TLS: 32; retry at 16; 4/IP; 8/relay.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
@@ -27,7 +28,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
-- Bound/sanitize peer error/log text at entry (`sanitize_peer_text`).
+- Sanitize/bound peer text at entry (`sanitize_peer_text`).
 - Desk key files are exactly 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
@@ -36,16 +37,15 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
-- Graph imports require Reliable/send_queue and one writer. Observers keep best-effort/all writers; proxies preserve the import flag.
-- Same-user outbound reuses endpoint/runtime/node; refuse key/namespace mismatch before dialing, retire only outbound sessions.
+- Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
+- Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Metadata per-call; refusals keep readers and idle fence. Retire only outbound.
 
 ## Testing
-- Run `wire_plane_test` and `rcp_forward_e2e_test` with `-- --test-threads=1`: under
-  the macOS 256-file soft limit a parallel run hits open-file and iceoryx
-  service/port errors.
-- The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
-  e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
-- remoted/link cold-compile iroh. remoted/connectd/wireclient/link/accountd are OUT of default-members: build with `-p`.
+- Run `wire_plane_test` and `rcp_forward_e2e_test` with `-- --test-threads=1`: at the
+  macOS 256-file soft limit a parallel run hits fd and iceoryx port errors.
+- Family tests parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
+  e2e: loopback iroh only, relay off, direct dial, bounded awaits.
+- remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p` (not default-members).
 
-Deep reference: docs/internals/remote-access.md, before touching the verb table,
-trust persistence, the wire plane, pairing formats or epoch delivery.
+Read docs/internals/remote-access.md before verb table, trust persistence, wire,
+pairing formats or epoch changes.

@@ -365,6 +365,16 @@ enum ObservationGuard {
     },
 }
 
+impl ScopedSubscriber {
+    fn check_remote(&self) -> CliResult<()> {
+        #[cfg(unix)]
+        if let ObservationGuard::RemoteDemand { _demand } = &self._guard {
+            _demand.check_remote()?;
+        }
+        Ok(())
+    }
+}
+
 impl std::ops::Deref for ScopedSubscriber {
     type Target = cerulion_core::CerulionSubscriber;
 
@@ -467,9 +477,7 @@ fn ensure_topic_available_with_selection(
     let mut source_catalogs = Vec::new();
     #[cfg(unix)]
     if let Some(directory) = &remote_directory {
-        for diagnostic in &directory.diagnostics {
-            tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
-        }
+        directory.log_diagnostics();
         let selected_robot = robot
             .map(|selector| directory.select(selector))
             .transpose()?
@@ -538,7 +546,11 @@ fn ensure_topic_available_with_selection(
     if let Some(route) = &selected_remote {
         if let Some(directory) = &remote_directory {
             if let Err(error) = directory.sync_selected_epoch(route) {
-                tracing::warn!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+                if directory.serves_cached_directory() {
+                    tracing::debug!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+                } else {
+                    tracing::warn!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+                }
             }
         }
         let catalog = source_catalogs
@@ -802,8 +814,59 @@ fn classify_observed_topic(listed_local: bool, is_netd_mirror: bool) -> ObserveV
 /// constructs a `DemandGuard` (the remote-observe path errors first).
 pub struct DemandGuard {
     #[cfg(unix)]
-    #[allow(dead_code)] // held ONLY for its Drop (connection-close = release).
-    client: cerulion_netd::NetdClient,
+    client: std::sync::Mutex<cerulion_netd::NetdClient>,
+    #[cfg(unix)]
+    last_check: std::sync::Mutex<std::time::Instant>,
+    #[cfg(unix)]
+    robot: String,
+    #[cfg(unix)]
+    topic: String,
+}
+
+#[cfg(unix)]
+impl DemandGuard {
+    fn new(client: cerulion_netd::NetdClient, robot: &str, topic: &str) -> Self {
+        Self {
+            client: std::sync::Mutex::new(client),
+            last_check: std::sync::Mutex::new(std::time::Instant::now()),
+            robot: robot.into(),
+            topic: topic.into(),
+        }
+    }
+
+    // Cold observer heartbeat; never called inside the frame callback.
+    fn check_remote(&self) -> CliResult<()> {
+        let mut checked = self
+            .last_check
+            .lock()
+            .map_err(|_| CliError::Validation("remote observer check state is poisoned".into()))?;
+        if checked.elapsed() < Duration::from_secs(1) {
+            return Ok(());
+        }
+        *checked = std::time::Instant::now();
+        let status = self
+            .client
+            .lock()
+            .map_err(|_| CliError::Validation("remote observer client is poisoned".into()))?
+            .status()
+            .map_err(|error| {
+                CliError::Validation(format!(
+                    "remote observer robot '{}' topic '{}': {error}",
+                    self.robot, self.topic
+                ))
+            })?;
+        if !status
+            .demands
+            .iter()
+            .any(|row| row.robot == self.robot && row.topic == self.topic && row.refcount > 0)
+        {
+            return Err(CliError::Validation(format!(
+                "remote mirror lost for robot '{}' topic '{}'; restart the observer",
+                self.robot, self.topic
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Unix arm: demand `target`'s shared mirror from `cerulion-netd` and open
@@ -845,7 +908,7 @@ fn demand_remote_from_netd(
     );
 
     let subscriber = open_mirror_after_demand(transport, topic)?;
-    Ok((subscriber, DemandGuard { client }))
+    Ok((subscriber, DemandGuard::new(client, &target.robot, topic)))
 }
 
 /// Authenticated account/pair observation uses a private source channel.
@@ -861,7 +924,7 @@ fn demand_observer_from_netd(
         .observe(&target.robot, topic, target.schema_hash)
         .map_err(|e| CliError::Validation(e.to_string()))?;
     let subscriber = open_mirror_after_demand(transport, &reply.local_topic)?;
-    Ok((subscriber, DemandGuard { client }))
+    Ok((subscriber, DemandGuard::new(client, &target.robot, topic)))
 }
 
 /// Non-Unix stub: the netd demand plane is a UDS daemon, unavailable
@@ -1654,9 +1717,7 @@ pub fn query_remote_topics_and_catalogs(
     let mut result = query_lan_topics_and_catalogs(opts, scan);
     #[cfg(unix)]
     {
-        for diagnostic in &directory.diagnostics {
-            tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
-        }
+        directory.log_diagnostics();
         if !directory.robots.is_empty() {
             if let Err(error) = &result {
                 tracing::warn!(error = %error, "LAN discovery unavailable while remote catalogs remain readable");
@@ -4655,6 +4716,7 @@ pub fn topic_echo_with_selection(
         // returned early with nothing (progress-free churn — see
         // `decide_observer_pacing`).
         let wait_started = std::time::Instant::now();
+        subscriber.check_remote()?;
         let received = subscriber.wait_for_message(OBSERVER_HEARTBEAT, |msg| {
             let header = msg.header();
             let payload = msg.payload();
@@ -4863,6 +4925,7 @@ pub fn topic_hz_with_selection(
         // wait that spent its budget from one that returned early with nothing.
         let wait_started = std::time::Instant::now();
         let before = timestamps.len();
+        subscriber.check_remote()?;
         if let Err(e) = subscriber.wait_for_message(wait, |msg| {
             timestamps.push(msg.header().timestamp_ns);
         }) {
@@ -5037,11 +5100,13 @@ pub fn topic_info_with_selection(
         TopicSource::Local => Duration::from_secs(1),
     };
     let mut captured: Option<(u64, u32, u64)> = None;
+    subscriber.check_remote()?;
     let _ = subscriber.wait_for_message(wait, |msg| {
         let header = msg.header();
         captured = Some((header.schema_hash, header.sequence, header.timestamp_ns));
     });
 
+    subscriber.check_remote()?;
     let Some((schema_hash, sequence, timestamp_ns)) = captured else {
         return Ok(format!("Topic: {topic}\nStatus: active (no messages yet)"));
     };

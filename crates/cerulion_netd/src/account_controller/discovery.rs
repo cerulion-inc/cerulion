@@ -6,6 +6,9 @@ use crate::account_access::{
     PairedRobot, RobotCatalog, RobotPath, RobotPresence, RobotTrustSource,
 };
 
+const DISCOVERY_BATCH_WIDTH: usize = 16;
+const _: () = assert!(DISCOVERY_BATCH_WIDTH <= crate::shared_endpoint::MAX_CLIENTS);
+
 impl AccountWanController {
     pub(super) fn install_paired(
         &self,
@@ -81,7 +84,7 @@ impl AccountWanController {
         let keys: BTreeSet<_> = self
             .pins()?
             .iter()
-            .filter(|(key, route)| **route == Route::Wan && changed.contains(&key.robot))
+            .filter(|(key, route)| route.route == Route::Wan && changed.contains(&key.robot))
             .map(|(key, _)| key.clone())
             .collect();
         if keys.iter().any(|key| demands.is_tearing(key)) {
@@ -264,7 +267,7 @@ impl AccountWanController {
         // Address candidates do not change endpoint identity or retire live readers.
         state.registry.replace_membership(membership)?;
         let plane = self.ensure_plane(&mut state)?;
-        for batch in rows.chunks_mut(16) {
+        for batch in rows.chunks_mut(DISCOVERY_BATCH_WIDTH) {
             if Instant::now() >= deadline {
                 break;
             }

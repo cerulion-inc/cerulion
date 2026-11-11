@@ -472,6 +472,8 @@ pub enum ClientError {
     /// A protocol violation: a bad/mismatched [`Hello`] banner, an unexpected
     /// response shape, or an unparseable line.
     Protocol(String),
+    /// A previously acknowledged mirror was retired; re-demand or stop.
+    MirrorLost(crate::protocol::MirrorLost),
     /// A wire I/O error (broken pipe, timeout) exchanging a request/response.
     Io(io::Error),
 }
@@ -544,6 +546,9 @@ impl std::fmt::Display for ClientError {
                 }
                 _ => write!(f, "cerulion-netd error: {error}"),
             },
+            ClientError::MirrorLost(event) => write!(f,
+                "remote mirror lost for robot '{}' topic '{}'; re-demand the topic or restart the observer",
+                event.robot, event.topic),
             ClientError::Protocol(msg) => write!(f, "cerulion-netd protocol error: {msg}"),
             ClientError::Io(e) => write!(f, "cerulion-netd I/O error: {e}"),
         }
@@ -1724,14 +1729,7 @@ impl NetdClient {
     /// a v1 daemon that would fail to parse it; it surfaces a precise, actionable
     /// version error instead.
     fn round_trip(&mut self, req: &Request) -> Result<Response, ClientError> {
-        self.ensure_usable()?;
-        if let Some(msg) = verb_compat_error(self.daemon_protocol, req) {
-            return Err(ClientError::Protocol(msg));
-        }
-        self.write_line(&req.to_json_line())?;
-        let line = self.read_line()?;
-        serde_json::from_str::<Response>(line.trim())
-            .map_err(|e| ClientError::Protocol(format!("unparseable response: {e}")))
+        self.bounded_round_trip(req, Instant::now() + ROUNDTRIP_TIMEOUT)
     }
 
     /// Write one NDJSON line + newline.
@@ -1796,6 +1794,7 @@ impl NetdClient {
             let line = self.read_line()?;
             match classify_control_line(&line) {
                 ControlLine::Event(event) => queued.push(event),
+                ControlLine::MirrorLost(event) => return Err(ClientError::MirrorLost(event)),
                 ControlLine::Response(text) => {
                     match serde_json::from_str::<Response>(&text) {
                         Ok(Response::SubscribeCatalog(r)) if r.id == id => break r,
@@ -1901,6 +1900,7 @@ impl NetdEventClient {
             ))),
             Ok(_) => match classify_control_line(&line) {
                 ControlLine::Event(event) => Ok(NextEvent::Changed(Box::new(event))),
+                ControlLine::MirrorLost(event) => Err(ClientError::MirrorLost(event)),
                 // A subscribed connection sends no further requests, so a RESPONSE
                 // here is netd talking about something we did not ask for. Skipping it
                 // keeps the stream in sync (the alternative — treating it as an event —
@@ -3045,6 +3045,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mirror_loss_consumes_the_matching_response_and_preserves_re_demand_connection() {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut requests = BufReader::new(server.try_clone().unwrap());
+            let mut request = String::new();
+            requests.read_line(&mut request).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
+                99
+            );
+            server.write_all(b"{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}\n{\"id\":99,\"demands\":[],\"active_connections\":1,\"idle\":false}\n").unwrap();
+            request.clear();
+            requests.read_line(&mut request).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
+                100
+            );
+            server
+                .write_all(b"{\"id\":100,\"demands\":[],\"active_connections\":1,\"idle\":false}\n")
+                .unwrap();
+        });
+        let mut client = NetdClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            next_id: 99,
+            socket_path: PathBuf::new(),
+            daemon_protocol: PROTOCOL_VERSION,
+            poisoned: false,
+        };
+        let error = client.status().unwrap_err();
+        assert!(
+            matches!(&error, ClientError::MirrorLost(event) if event.robot == "arm" && event.topic == "/vector")
+        );
+        assert!(error.to_string().contains("arm"));
+        assert!(error.to_string().contains("/vector"));
+        assert!(!client.poisoned);
+        assert_eq!(client.status().unwrap().id, 100);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn mirror_loss_records_validate_shape_and_observer_version_floor() {
+        let line = "{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}";
+        let oracle = crate::protocol::MirrorLost {
+            event: "mirror_lost".into(),
+            robot: "arm".into(),
+            topic: "/vector".into(),
+        };
+        assert_eq!(
+            classify_control_line(line),
+            ControlLine::MirrorLost(oracle.clone())
+        );
+        assert_eq!(
+            classify_control_line(&oracle.to_json_line()),
+            ControlLine::MirrorLost(oracle)
+        );
+        for bad in [
+            "{\"event\":\"mirror_lost\"}",
+            "{\"event\":\"mirror_lost\",\"robot\":1,\"topic\":\"/vector\"}",
+            "{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\",\"id\":99}",
+        ] {
+            assert!(matches!(
+                classify_control_line(bad),
+                ControlLine::Unknown(_)
+            ));
+        }
+        let observe = Request::Observe {
+            id: 1,
+            robot: "arm".into(),
+            topic: "/vector".into(),
+            schema_hash: 7,
+        };
+        assert_eq!(
+            observe.min_daemon_version(),
+            crate::protocol::MIRROR_LOSS_MIN_DAEMON_VERSION
+        );
+        assert!(verb_compat_error(10, &observe).is_some());
+        assert!(verb_compat_error(PROTOCOL_VERSION, &observe).is_none());
+    }
+
     /// The CLASSIFIER that keeps a subscribed connection in sync, against a
     /// hand-written table. A push carries `event` and no `id`; a response carries `id`
     /// and no `event`. Getting this wrong in either direction IS the desync the opt-in
@@ -3101,10 +3189,10 @@ mod tests {
                 "must not be guessed at: {bad}"
             );
         }
-        // An unrecognized event NAME is not ours — it falls through to the id check.
+        // A mixed discriminator cannot be mistaken for a response.
         assert!(matches!(
             classify_control_line("{\"event\":\"something_else\",\"id\":4}"),
-            ControlLine::Response(_)
+            ControlLine::Unknown(_)
         ));
     }
 

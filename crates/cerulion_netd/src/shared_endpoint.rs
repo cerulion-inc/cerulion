@@ -21,10 +21,11 @@ use serde::{Deserialize, Serialize};
 use crate::iroh_plane::{IrohMirrorPlane, RobotProbeOutcome};
 use crate::mirror::{MirrorPlane, MirrorRelease};
 use crate::registry::TopicKey;
+use crate::serving_hold::{HoldReason, ServingHold, ServingHolds};
 use crate::wan::{WanRegistry, WanRobot};
 
 const MAX_MESSAGE: usize = 256 * 1024;
-const MAX_CLIENTS: usize = 32;
+pub(crate) const MAX_CLIENTS: usize = 32;
 const MAX_ROBOTS: usize = 256;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -113,6 +114,19 @@ enum Answer {
     Retired(Vec<(String, String, bool)>),
 }
 
+enum RequestError {
+    Transport(String),
+    Refused(String),
+}
+
+impl RequestError {
+    fn message(self) -> String {
+        match self {
+            Self::Transport(message) | Self::Refused(message) => message,
+        }
+    }
+}
+
 fn topic_key(robot: String, topic: String, observer: bool) -> TopicKey {
     if observer {
         TopicKey::observed(robot, topic)
@@ -121,15 +135,23 @@ fn topic_key(robot: String, topic: String, observer: bool) -> TopicKey {
     }
 }
 
-fn write_message(stream: &mut UnixStream, value: &impl Serialize) -> Result<(), String> {
+fn encode_message(value: &impl Serialize) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec(value).map_err(|_| "outbound control encoding failed")?;
     if bytes.len() > MAX_MESSAGE {
         return Err("outbound control message exceeds its byte limit".into());
     }
+    Ok(bytes)
+}
+
+fn write_encoded(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), String> {
     stream
         .write_all(&(bytes.len() as u32).to_le_bytes())
-        .and_then(|()| stream.write_all(&bytes))
+        .and_then(|()| stream.write_all(bytes))
         .map_err(|_| "outbound control connection write failed".into())
+}
+
+fn write_message(stream: &mut UnixStream, value: &impl Serialize) -> Result<(), String> {
+    write_encoded(stream, &encode_message(value)?)
 }
 
 fn read_message<T: for<'a> Deserialize<'a>>(
@@ -232,6 +254,7 @@ pub(crate) struct SharedMirrorPlane {
     registry: Arc<WanRegistry>,
     connection: Mutex<Option<UnixStream>>,
     invalidated: AtomicBool,
+    transport_lost: AtomicBool,
 }
 
 impl SharedMirrorPlane {
@@ -246,6 +269,7 @@ impl SharedMirrorPlane {
             registry,
             connection: Mutex::new(None),
             invalidated: AtomicBool::new(false),
+            transport_lost: AtomicBool::new(false),
         }
     }
 
@@ -281,19 +305,19 @@ impl SharedMirrorPlane {
         stream: &mut UnixStream,
         configuration: Configuration,
         operation: Operation,
-    ) -> Result<Answer, String> {
-        write_message(
-            stream,
-            &Request {
-                configuration,
-                operation,
-            },
-        )
-        .and_then(|()| read_message::<Result<Answer, String>>(stream, false))
-        .and_then(|answer| answer)
+    ) -> Result<Answer, RequestError> {
+        let bytes = encode_message(&Request {
+            configuration,
+            operation,
+        })
+        .map_err(RequestError::Refused)?;
+        write_encoded(stream, &bytes).map_err(RequestError::Transport)?;
+        read_message::<Result<Answer, String>>(stream, false)
+            .map_err(RequestError::Transport)?
+            .map_err(RequestError::Refused)
     }
 
-    fn call(&self, operation: Operation) -> Result<Answer, String> {
+    fn call(&self, mut operation: Operation) -> Result<Answer, String> {
         let started = Instant::now();
         let budget = match &operation {
             Operation::Probe { budget_ms, .. }
@@ -301,21 +325,49 @@ impl SharedMirrorPlane {
             | Operation::Schema { budget_ms, .. } => Some(Duration::from_millis(*budget_ms)),
             _ => None,
         };
-        let configuration = self.configuration()?;
-        // Metadata never waits behind another control operation beyond its
-        // caller's budget. The account adapter already retries this busy regime.
-        let mut connection = if budget.is_some() {
-            self.connection
-                .try_lock()
-                .map_err(|_| crate::account_access::CONTROLLER_BUSY)?
-        } else {
-            self.connection
-                .lock()
-                .map_err(|_| "outbound control state is poisoned")?
-        };
         if self.invalidated.load(Ordering::Acquire) {
             return Err("outbound account changed; recreate the mirror plane".into());
         }
+        if let Some(budget) = budget {
+            // Discovery rows own no mirrors and cannot fence the persistent
+            // connection on an offline peer, refusal or read timeout.
+            let configuration = self.configuration()?;
+            let mut stream = UnixStream::connect(&self.socket)
+                .map_err(|_| "owned remote endpoint is not ready for outbound access")?;
+            configure_stream(&stream)?;
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err("outbound metadata operation exceeded its time budget".into());
+            }
+            let remote_budget = remaining.saturating_sub(Duration::from_millis(250));
+            match &mut operation {
+                Operation::Probe { budget_ms, .. }
+                | Operation::Catalog { budget_ms, .. }
+                | Operation::Schema { budget_ms, .. } => {
+                    *budget_ms = remote_budget.as_millis() as u64;
+                }
+                _ => unreachable!("only metadata operations have a time budget"),
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .and_then(|()| stream.set_write_timeout(Some(remaining)))
+                .map_err(|_| "outbound control deadline setup failed")?;
+            if self.invalidated.load(Ordering::Acquire) {
+                return Err("outbound account changed; recreate the mirror plane".into());
+            }
+            let result =
+                Self::request(&mut stream, configuration, operation).map_err(RequestError::message);
+            let _closed = stream.shutdown(Shutdown::Both);
+            return result;
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "outbound control state is poisoned")?;
+        if self.invalidated.load(Ordering::Acquire) {
+            return Err("outbound account changed; recreate the mirror plane".into());
+        }
+        let configuration = self.configuration()?;
         if connection.is_none() {
             let stream = UnixStream::connect(&self.socket)
                 .map_err(|_| "owned remote endpoint is not ready for outbound access")?;
@@ -325,28 +377,28 @@ impl SharedMirrorPlane {
         let stream = connection
             .as_mut()
             .ok_or("outbound connection was not constructed")?;
-        let timeout = budget.map_or(CONTROL_TIMEOUT, |budget| {
-            budget.saturating_sub(started.elapsed())
-        });
-        if timeout.is_zero() {
-            return Err("outbound metadata operation exceeded its time budget".into());
-        }
         let deadline_setup = stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|()| stream.set_write_timeout(Some(timeout)));
+            .set_read_timeout(Some(CONTROL_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(CONTROL_TIMEOUT)));
         if deadline_setup.is_err() {
             // macOS can reject timeout setup on a disconnected socket before
             // the first write. Retire that socket just like any framing error.
             connection.take();
+            self.transport_lost.store(true, Ordering::Release);
             return Err("outbound control deadline setup failed".into());
         }
         let result = Self::request(stream, configuration, operation);
-        if result.is_err() {
+        if matches!(result, Err(RequestError::Transport(_))) {
             // A framing failure fences the whole connection; never retry an operation
             // whose result may have been committed on the old endpoint.
             connection.take();
+            self.transport_lost.store(true, Ordering::Release);
         }
-        result
+        result.map_err(RequestError::message)
+    }
+
+    pub(crate) fn take_transport_loss(&self) -> bool {
+        self.transport_lost.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn invalidate(&self) -> Result<(), String> {
@@ -359,7 +411,9 @@ impl SharedMirrorPlane {
         self.invalidated.store(true, Ordering::Release);
         let retired = match connection.as_mut() {
             Some(stream) => self.configuration().and_then(|configuration| {
-                Self::request(stream, configuration, Operation::Invalidate).map(|_| ())
+                Self::request(stream, configuration, Operation::Invalidate)
+                    .map(|_| ())
+                    .map_err(RequestError::message)
             }),
             None => Ok(()),
         };
@@ -488,6 +542,29 @@ impl OutboundServer {
         seed: [u8; 32],
         manager: Arc<TransportManager>,
     ) -> Result<Self, String> {
+        Self::start_inner(socket, endpoint, runtime, seed, manager, None)
+    }
+
+    /// Start owned outbound control with atomic admission against idle teardown.
+    pub fn start_with_holds(
+        socket: PathBuf,
+        endpoint: Endpoint,
+        runtime: tokio::runtime::Handle,
+        seed: [u8; 32],
+        manager: Arc<TransportManager>,
+        holds: ServingHolds,
+    ) -> Result<Self, String> {
+        Self::start_inner(socket, endpoint, runtime, seed, manager, Some(holds))
+    }
+
+    fn start_inner(
+        socket: PathBuf,
+        endpoint: Endpoint,
+        runtime: tokio::runtime::Handle,
+        seed: [u8; 32],
+        manager: Arc<TransportManager>,
+        holds: Option<ServingHolds>,
+    ) -> Result<Self, String> {
         if endpoint.id().as_bytes() != &DeviceIdentity::from_seed(&seed).public_key().0 {
             return Err("owned endpoint does not match its device key".into());
         }
@@ -537,8 +614,9 @@ impl OutboundServer {
                             let endpoint = endpoint.clone();
                             let runtime = runtime.clone();
                             let manager = manager.clone();
+                            let holds = holds.clone();
                             workers.push(std::thread::spawn(move || {
-                                serve_connection(stream, endpoint, runtime, seed, manager);
+                                serve_connection(stream, endpoint, runtime, seed, manager, holds);
                                 if let Ok(mut sockets) = active.lock() {
                                     sockets.remove(&id);
                                 }
@@ -590,11 +668,15 @@ fn serve_connection(
     runtime: tokio::runtime::Handle,
     seed: [u8; 32],
     manager: Arc<TransportManager>,
+    holds: Option<ServingHolds>,
 ) {
+    let mut reader_hold: Option<ServingHold> = None;
     let mut plane: Option<IrohMirrorPlane> = None;
+    let mut readers = std::collections::BTreeSet::new();
     let mut identity = None;
     while let Ok(request) = read_message::<Request>(&mut stream, true) {
         let configuration = request.configuration;
+        let mut operation_started = false;
         let answer = (|| {
             if configuration.key != *endpoint.id().as_bytes() || endpoint.is_closed() {
                 return Err("shared endpoint does not match the current device key".into());
@@ -633,32 +715,81 @@ fn serve_connection(
                 Vec::new()
             };
             let mirror = plane.as_ref().ok_or("outbound plane was not constructed")?;
+            for key in &retired {
+                readers.remove(key);
+            }
+            if readers.is_empty() {
+                reader_hold.take();
+            }
+            operation_started = true;
             match request.operation {
                 Operation::Ensure {
                     robot,
                     topic,
                     schema_hash,
                     observer,
-                } => mirror
-                    .ensure_mirror(&topic_key(robot, topic, observer), schema_hash)
-                    .map(|()| Answer::Done)
-                    .map_err(|error| error.to_string()),
+                } => {
+                    let admission = if reader_hold.is_none() {
+                        holds
+                            .as_ref()
+                            .map(|holds| {
+                                holds.acquire(HoldReason::Session).map_err(|_| {
+                                    "owned remote endpoint is stopping; retry outbound demand"
+                                        .to_owned()
+                                })
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    let key = topic_key(robot, topic, observer);
+                    mirror
+                        .ensure_mirror(&key, schema_hash)
+                        .map_err(|error| error.to_string())?;
+                    readers.insert(key);
+                    if reader_hold.is_none() {
+                        reader_hold = admission;
+                    }
+                    Ok(Answer::Done)
+                }
                 Operation::Release {
                     robot,
                     topic,
                     observer,
-                } => Ok(Answer::Released(
-                    mirror.release_mirror(&topic_key(robot, topic, observer))
-                        == MirrorRelease::Retired,
-                )),
+                } => {
+                    let key = topic_key(robot, topic, observer);
+                    let released = mirror.release_mirror(&key);
+                    if released == MirrorRelease::Retired {
+                        readers.remove(&key);
+                        if readers.is_empty() {
+                            reader_hold.take();
+                        }
+                    }
+                    Ok(Answer::Released(released == MirrorRelease::Retired))
+                }
                 Operation::HasReader {
                     robot,
                     topic,
                     observer,
-                } => mirror
-                    .has_reader(&topic_key(robot, topic, observer))
-                    .map(Answer::Present),
-                Operation::Retire { robot } => mirror.retire_robot(&robot).map(|()| Answer::Done),
+                } => {
+                    let key = topic_key(robot, topic, observer);
+                    let present = mirror.has_reader(&key)?;
+                    if !present {
+                        readers.remove(&key);
+                        if readers.is_empty() {
+                            reader_hold.take();
+                        }
+                    }
+                    Ok(Answer::Present(present))
+                }
+                Operation::Retire { robot } => {
+                    mirror.retire_robot(&robot)?;
+                    readers.retain(|key| key.robot != robot);
+                    if readers.is_empty() {
+                        reader_hold.take();
+                    }
+                    Ok(Answer::Done)
+                }
                 Operation::Probe { robot, budget_ms } => mirror
                     .probe_robot(&robot, Duration::from_millis(budget_ms.min(15_000)))
                     .map(|outcome| {
@@ -677,17 +808,31 @@ fn serve_connection(
                 } => mirror
                     .query_schema(&robot, &topic, Duration::from_millis(budget_ms.min(15_000)))
                     .map(Answer::Schema),
-                Operation::Sync => Ok(Answer::Retired(
-                    retired
-                        .into_iter()
-                        .map(|key| (key.robot, key.topic, key.observer))
-                        .collect(),
-                )),
-                Operation::Invalidate => mirror.invalidate_account().map(|()| Answer::Done),
+                Operation::Sync => {
+                    for key in &retired {
+                        readers.remove(key);
+                    }
+                    if readers.is_empty() {
+                        reader_hold.take();
+                    }
+                    Ok(Answer::Retired(
+                        retired
+                            .into_iter()
+                            .map(|key| (key.robot, key.topic, key.observer))
+                            .collect(),
+                    ))
+                }
+                Operation::Invalidate => {
+                    mirror.invalidate_account()?;
+                    readers.clear();
+                    reader_hold.take();
+                    Ok(Answer::Done)
+                }
             }
         })();
-        let failed = answer.is_err();
-        if write_message(&mut stream, &answer).is_err() || failed {
+        // Refused operations keep the admitted connection and every other
+        // reader alive. Only validation or framing failures retire its plane.
+        if write_message(&mut stream, &answer).is_err() || !operation_started {
             break;
         }
     }

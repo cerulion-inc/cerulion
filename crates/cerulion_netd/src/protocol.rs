@@ -131,7 +131,12 @@ use serde::{Deserialize, Serialize};
 /// gateway's accumulated bindings without network discovery. Older daemons must
 /// be restarted before these operations.
 /// `10`: bounded automatic catalogs for owned and explicitly paired robots.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// `11`: held mirror retirement events, including observer readers.
+pub const PROTOCOL_VERSION: u32 = 11;
+
+/// First daemon version that reports retirement of a held mirror.
+pub const MIRROR_LOSS_MIN_DAEMON_VERSION: u32 = 11;
+const _: () = assert!(MIRROR_LOSS_MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
 
 const _: () = assert!(crate::account_access::MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
 
@@ -527,9 +532,8 @@ impl Request {
                 ..
             } => crate::account_access::REMOTE_DISCOVERY_MIN_DAEMON_VERSION,
             Request::AccountAccess { .. } => crate::account_access::MIN_DAEMON_VERSION,
-            Request::Observe { .. } | Request::Unobserve { .. } => {
-                crate::account_access::REMOTE_DISCOVERY_MIN_DAEMON_VERSION
-            }
+            Request::Observe { .. } => MIRROR_LOSS_MIN_DAEMON_VERSION,
+            Request::Unobserve { .. } => crate::account_access::REMOTE_DISCOVERY_MIN_DAEMON_VERSION,
             Request::SubscribeCatalog { .. } => 6,
             // The `runs` verb needs a v7 daemon. A v<7 daemon has no
             // `runs` handler and would answer the generic unknown-method error, which
@@ -1148,6 +1152,33 @@ impl CatalogChanged {
     }
 }
 
+/// A held mirror was retired. The consumer must re-demand or stop loudly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorLost {
+    /// Event discriminator.
+    pub event: String,
+    /// Pinned source robot whose reader was retired.
+    pub robot: String,
+    /// Canonical topic whose reader was retired.
+    pub topic: String,
+}
+
+impl MirrorLost {
+    /// Construct a loss event from the exact retired demand key.
+    pub fn new(key: &crate::registry::TopicKey) -> Self {
+        Self {
+            event: "mirror_lost".into(),
+            robot: key.robot.clone(),
+            topic: key.topic.clone(),
+        }
+    }
+    /// Encode one NDJSON record, without its trailing newline.
+    pub fn to_json_line(&self) -> String {
+        serde_json::to_string(self).expect("MirrorLost serializes")
+    }
+}
+
 /// Classify ONE line read from a netd control connection.
 ///
 /// A subscribed connection's stream carries BOTH responses and unsolicited
@@ -1160,6 +1191,8 @@ impl CatalogChanged {
 pub enum ControlLine {
     /// An unsolicited catalog-change push.
     Event(CatalogChanged),
+    /// Retirement of a mirror held by this connection.
+    MirrorLost(MirrorLost),
     /// A response to a request (correlate on its `id`).
     Response(String),
     /// Neither — the caller decides whether to warn or skip. Carries the raw line.
@@ -1180,7 +1213,13 @@ pub fn classify_control_line(line: &str) -> ControlLine {
             Err(_) => ControlLine::Unknown(trimmed.to_string()),
         };
     }
-    if value.get("id").is_some() {
+    if value.get("event").and_then(serde_json::Value::as_str) == Some("mirror_lost") {
+        return match serde_json::from_str::<MirrorLost>(trimmed) {
+            Ok(event) => ControlLine::MirrorLost(event),
+            Err(_) => ControlLine::Unknown(trimmed.to_string()),
+        };
+    }
+    if value.get("id").is_some() && value.get("event").is_none() {
         return ControlLine::Response(trimmed.to_string());
     }
     ControlLine::Unknown(trimmed.to_string())

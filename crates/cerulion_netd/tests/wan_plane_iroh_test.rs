@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The iroh WAN [`IrohMirrorPlane`] / [`DualMirrorPlane`] end-to-end
-//! over REAL loopback iroh endpoints + REAL iceoryx2 (DISTINCT per-test SHM roots for
-//! the robot and the desk). The automatic CLI case uses the default desk namespace;
-//! run this binary with `-- --test-threads=1`.
+//! over real loopback iroh and iceoryx2 with distinct robot and desk SHM roots.
+//! CLI fixtures share the global manager; run with `-- --test-threads=1`.
 //!
 //! The headline: an in-process ROBOT (`cerulion_remoted::WirePlane` +
 //! `PairingAuthorizer` over SHM root A, a real producer publishing hand-oracle
@@ -20,7 +19,7 @@
 //! Whole file `#![cfg(feature = "wan")]`. `wan` is DEFAULT-ON, so `cargo test -p
 //! cerulion_netd` already compiles this file; `--no-default-features` compiles it to
 //! nothing. Run it explicitly with
-//! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test`.
+//! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- --test-threads=1`.
 #![cfg(feature = "wan")]
 
 use std::collections::HashMap;
@@ -601,12 +600,15 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
     ));
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("outbound.sock");
-    let service = cerulion_netd::shared_endpoint::OutboundServer::start(
+    let fence = cerulion_netd::serving_hold::fence_path(directory.path());
+    let holds = cerulion_netd::serving_hold::ServingHolds::open(&fence).unwrap();
+    let service = cerulion_netd::shared_endpoint::OutboundServer::start_with_holds(
         socket.clone(),
         endpoint.clone(),
         rt.handle().clone(),
         seed,
         manager.clone(),
+        holds.clone(),
     )
     .unwrap();
     let wrong_identity = IrohMirrorPlane::new_shared(
@@ -700,18 +702,58 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
     assert!(remote
         .addrs
         .contains(&direct.expect("selected loopback path")));
+    let idle = cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+        .unwrap()
+        .expect("metadata connections hold no outbound readers");
+    let refusal = plane
+        .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("stopping; retry outbound demand"),
+        "{refusal}"
+    );
+    assert!(!plane.has_reader(&key).unwrap());
+    drop(idle);
     for _ in 0..2 {
         plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
         plane
             .ensure_mirror(&observed_key, ORACLE_SCHEMA_HASH)
             .unwrap();
         assert_ne!(plane.local_channel(&observed_key), topic);
+        assert!(cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+            .unwrap()
+            .is_none());
+        let catalog = observer
+            .query_catalog("serving-consumer", Duration::from_secs(3))
+            .unwrap();
+        for hidden in [&topic, &observed_key.local_topic()] {
+            assert!(!catalog.entries.iter().any(|entry| &entry.topic == hidden));
+            let leaked = TopicKey::new("serving-consumer", hidden);
+            let refusal = observer
+                .ensure_mirror(&leaked, ORACLE_SCHEMA_HASH)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refusal.contains(&format!(
+                    "'{hidden}' is a network mirror of another robot; read it on its source robot"
+                )),
+                "{refusal}"
+            );
+            assert!(observer
+                .query_schema("serving-consumer", hidden, Duration::from_secs(3))
+                .unwrap_err()
+                .contains("network mirror of another robot"));
+        }
         assert_oracle_and_gap_free(&collect_frames(&manager, &topic, 3));
         assert_oracle_and_gap_free(&collect_frames(&manager, &observed_key.local_topic(), 3));
         assert_eq!(plane.release_mirror(&observed_key), MirrorRelease::Retired);
         assert!(plane.has_reader(&key).unwrap());
         assert!(!plane.has_reader(&observed_key).unwrap());
         assert_eq!(plane.release_mirror(&key), MirrorRelease::Retired);
+        assert!(cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+            .unwrap()
+            .is_some());
         assert_oracle_and_gap_free(&collect_frames(&observer_manager, &served_topic, 3));
     }
     plane
@@ -729,12 +771,13 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
         )]))
         .unwrap();
     drop(service);
-    let service = cerulion_netd::shared_endpoint::OutboundServer::start(
+    let service = cerulion_netd::shared_endpoint::OutboundServer::start_with_holds(
         directory.path().join("outbound.sock"),
         endpoint.clone(),
         rt.handle().clone(),
         seed,
         manager.clone(),
+        holds,
     )
     .unwrap();
     assert!(
@@ -766,10 +809,12 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
         .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
         .expect("dropping a shared mirror synchronously frees its writer slot");
     drop(freed);
+    // Release while the producer is live; its shutdown can naturally end the stream.
+    assert!(observer.has_reader(&served_key).unwrap());
+    assert_eq!(observer.release_mirror(&served_key), MirrorRelease::Retired);
     stop.store(true, Ordering::Relaxed);
     producer.join().unwrap();
     served_producer.join().unwrap();
-    assert_eq!(observer.release_mirror(&served_key), MirrorRelease::Retired);
     drop(service);
     serve.abort();
     rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), endpoint.close()).await })
@@ -2404,3 +2449,6 @@ mod authenticated_graph;
 #[cfg(unix)]
 #[path = "wan_plane_iroh_test/authenticated_supervisor.rs"]
 mod authenticated_supervisor;
+
+#[path = "wan_plane_iroh_test/shared_endpoint_regressions.rs"]
+mod shared_endpoint_regressions;

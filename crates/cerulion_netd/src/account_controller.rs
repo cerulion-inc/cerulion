@@ -62,6 +62,13 @@ enum Route {
     Wan,
 }
 
+#[derive(Clone, Copy)]
+struct Pin {
+    route: Route,
+    schema_hash: u64,
+    live: bool,
+}
+
 struct State {
     serving_gateway: bool,
     registry: Arc<WanRegistry>,
@@ -72,6 +79,8 @@ struct State {
     catalogs: HashMap<[u8; 32], CatalogReply>,
     pending_all: bool,
     pending_robots: BTreeSet<String>,
+    pending_restores: BTreeSet<TopicKey>,
+    handover: Option<Vec<(TopicKey, u64)>>,
     busy_since: Option<Instant>,
 }
 
@@ -83,7 +92,7 @@ pub struct AccountWanController {
     config: AccountControllerConfig,
     manual: HashMap<String, WanRobot>,
     paired: Mutex<HashMap<String, WanRobot>>,
-    pins: Mutex<BTreeMap<TopicKey, Route>>,
+    pins: Mutex<BTreeMap<TopicKey, Pin>>,
     state: Mutex<State>,
 }
 
@@ -127,6 +136,8 @@ impl AccountWanController {
                 catalogs: HashMap::new(),
                 pending_all: false,
                 pending_robots: BTreeSet::new(),
+                pending_restores: BTreeSet::new(),
+                handover: None,
                 busy_since: None,
             }),
         })
@@ -139,7 +150,7 @@ impl AccountWanController {
         })
     }
 
-    fn pins(&self) -> Result<MutexGuard<'_, BTreeMap<TopicKey, Route>>, String> {
+    fn pins(&self) -> Result<MutexGuard<'_, BTreeMap<TopicKey, Pin>>, String> {
         self.pins
             .lock()
             .map_err(|_| "account robot route state is poisoned".into())
@@ -150,7 +161,7 @@ impl AccountWanController {
         // through to LAN, including before an account snapshot has been installed.
         let account = account_access::parse_robot_route(&key.robot)?.is_some();
         if let Some(route) = self.pins()?.get(key) {
-            return Ok(*route);
+            return Ok(route.route);
         }
         Ok(
             if account
@@ -186,7 +197,10 @@ impl AccountWanController {
 
     fn ensure_plane<'a>(&self, state: &'a mut State) -> Result<&'a IrohMirrorPlane, String> {
         self.network_allowed()?;
-        if state.pending_all || !state.pending_robots.is_empty() {
+        if state.pending_all
+            || !state.pending_robots.is_empty()
+            || !state.pending_restores.is_empty()
+        {
             return Err("previous WAN mirrors are awaiting registry retirement".into());
         }
         if state.account_mode && state.identity.is_none() {
@@ -215,6 +229,8 @@ impl AccountWanController {
     fn invalidate(state: &mut State) -> Result<(), String> {
         state.pending_all = true;
         state.pending_robots.clear();
+        state.pending_restores.clear();
+        state.handover = None;
         state.identity = None;
         state.snapshot = None;
         state.catalogs.clear();
@@ -229,8 +245,11 @@ impl AccountWanController {
             .pins()?
             .iter()
             .filter(|(key, route)| {
-                **route == Route::Wan
-                    && (state.pending_all || state.pending_robots.contains(&key.robot))
+                route.route == Route::Wan
+                    && (state.pending_all
+                        || state.pending_robots.contains(&key.robot)
+                        || state.pending_restores.contains(*key)
+                        || !route.live)
             })
             .map(|(key, _)| key.clone())
             .collect())
@@ -241,7 +260,40 @@ impl AccountWanController {
         state: &mut State,
         registry: &mut DemandRegistry,
     ) -> Result<(), String> {
-        let keys = self.pending_keys(state)?;
+        if state
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.take_shared_transport_loss())
+        {
+            state.pending_all = true;
+        }
+        let mut keys = self.pending_keys(state)?;
+        if keys.iter().any(|key| registry.is_tearing(key)) {
+            return Err("previous WAN mirrors are still being retired; retry the operation".into());
+        }
+        // Full transport loss and failed-robot cleanup already closed readers.
+        // A dead controller must still notify holders even if Release cannot dial.
+        if !state.pending_all {
+            if let Some(plane) = &state.plane {
+                for key in &keys {
+                    if state.pending_robots.contains(&key.robot) {
+                        continue;
+                    }
+                    if plane.release_mirror(key) == crate::mirror::MirrorRelease::Lingering {
+                        if plane.take_shared_transport_loss() {
+                            state.pending_all = true;
+                            break;
+                        }
+                        return Err(
+                            "previous WAN reader could not be retired; retry the operation".into(),
+                        );
+                    }
+                }
+            }
+        }
+        if state.pending_all {
+            keys = self.pending_keys(state)?;
+        }
         registry.invalidate_mirrors(&keys).map_err(|_| {
             "previous WAN mirrors are still being retired; retry the operation".to_owned()
         })?;
@@ -251,6 +303,7 @@ impl AccountWanController {
         }
         state.pending_all = false;
         state.pending_robots.clear();
+        state.pending_restores.clear();
         Ok(())
     }
 
@@ -373,7 +426,7 @@ impl AccountWanController {
             let keys: BTreeSet<_> = self
                 .pins()?
                 .iter()
-                .filter(|(key, route)| **route == Route::Wan && changed.contains(&key.robot))
+                .filter(|(key, route)| route.route == Route::Wan && changed.contains(&key.robot))
                 .map(|(key, _)| key.clone())
                 .collect();
             if keys.iter().any(|key| registry.is_tearing(key)) {

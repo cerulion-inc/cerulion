@@ -21,7 +21,7 @@ use crate::{account_cmd, account_identity, login_cmd};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The deadline on the whole directory fetch (session refresh included) when a
+/// The deadline on the read-only directory fetch when a
 /// listing such as `topic list` asks for the account's robots. The fetch is one
 /// HTTPS request; the listing must not wait on an unreachable account service
 /// longer than it waits on the LAN, so this is half of the 4 s presence-probe
@@ -83,6 +83,11 @@ impl std::fmt::Debug for AccountRobotDirectory {
 }
 
 impl AccountRobotDirectory {
+    /// Whether this directory was recovered from the account-bound disk cache.
+    pub fn is_cached(&self) -> bool {
+        self.cached
+    }
+
     /// Build the public daemon message under one auth-store transaction lock.
     ///
     /// The HTTP directory remains bound to its original login/session/account/key.

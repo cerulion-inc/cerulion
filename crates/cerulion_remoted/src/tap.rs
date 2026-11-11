@@ -214,6 +214,10 @@ impl TapManager {
         // Attach the listener-less tap (opens ONLY the data service; NEVER
         // creates it). A missing topic / exhausted introspection slot surfaces
         // here with an actionable message naming the topic.
+        crate::wire::wire_servable(manager, topic).map_err(|reason| WireError::DemandFailed {
+            topic: topic.to_owned(),
+            reason,
+        })?;
         let tap = manager
             .create_remote_data_only_subscriber(topic)
             .map_err(|e| WireError::DemandFailed {
@@ -221,7 +225,11 @@ impl TapManager {
                 reason: e.to_string(),
             })?;
 
-        if graph_ingress && tap.publisher_count() != 1 {
+        // Principle #4: declared imports need a service that prevents a second
+        // writer joining after admission. Keep policy-unknown raw compatibility.
+        if graph_ingress
+            && (tap.publisher_count() != 1 || (qos.is_some() && tap.max_publishers() != 1))
+        {
             return Err(WireError::DemandFailed {
                 topic: topic.to_owned(),
                 reason: "authenticated graph ingress requires exactly one live producer".into(),
@@ -496,6 +504,7 @@ pub fn catalog_peek_budget() -> Duration {
 /// cap), so N silent topics can never freeze the control stream for
 /// N×750ms. Blocking (poll + sleep) — the caller runs it under `spawn_blocking`.
 pub fn peek_schema_hash(manager: &TransportManager, topic: &str, deadline: Instant) -> Option<u64> {
+    crate::wire::wire_servable(manager, topic).ok()?;
     let mut tap = manager.create_remote_data_only_subscriber(topic).ok()?;
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(1);
     while Instant::now() < deadline {

@@ -3,10 +3,10 @@
 Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
 
 ## Invariants
-- Producers exclude before ports; remote taps/mirrors/announces hold opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame-path checks.
+- Producers exclude before ports; exports pin local source/policy leases, mirrors/announces opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame checks.
 
-- ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
-  a fused chain may serve a frame it just committed, in-process.
+- ONE read path: iceoryx2 queue receive, no bypass/raw-handle read;
+  fused chains may serve their just-committed frame in-process.
 - LAN defaults to Paired; fixtures select Open. Locators/login never open it.
 - FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs;
   the loader also refuses a differing `RUSTC_FINGERPRINT`.
@@ -35,8 +35,8 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
 
 ## Testing
 
-- Binaries taking the global TransportManager singleton run ALONE (`-- --test-threads=1`
-  locally, a nextest fence in CI); per-test SHM roots isolate data, but process-global counters serialize.
+- Global TransportManager binaries run ALONE (`-- --test-threads=1` locally,
+  nextest-fenced in CI); per-test SHM roots isolate data, but global counters serialize.
 - CI shards 4 ways: `./tools/scripts/ci_test_shard.sh cerulion_core <n> 4` runs one leg
   (`cargo nextest run`, NOT `--test-threads=1`); fence `.config/nextest.toml`, `serial_discipline_test`.
 - cdylib tests dlopen prebuilt fixtures (`cargo build -p test_node_*` first); after ANY core
@@ -55,5 +55,5 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
-- Declared ingress precreates a SingleWriter service at full consumer capacity;
-  ordinary producerless absolute sources remain External.
+- Declared ingress precreates SingleWriter at full consumer capacity; imports
+  require native capacity one. Ordinary producerless absolute sources remain External.
