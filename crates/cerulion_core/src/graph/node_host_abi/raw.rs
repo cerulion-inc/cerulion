@@ -276,7 +276,7 @@ fn raw_frame_valid(header: &WireHeader, frame: &[u8]) -> bool {
         variable_fields: header.offset_table_count,
         alignment: crate::shm_runtime::FRAME_ALIGN as u32,
     };
-    layout.accepts(frame, header.total_size)
+    layout.accepts_payload(&frame[WireHeader::SIZE..], header.total_size)
 }
 
 host_callback!(callback_create_raw(context, request: abi::RawPublisherRequestV1, out: *mut abi::PortBindingV1) |host, memory| {
@@ -323,3 +323,121 @@ host_callback!(callback_destroy_raw(context, port: abi::PortHandle) |host, _memo
     host.destroy_raw(context.value, port.value)?;
     Ok(status(abi::status_code::OK))
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::VirtualClock;
+    use crate::graph::node::ShutdownSignal;
+    use indexmap::IndexMap;
+
+    #[test]
+    fn native_raw_send_failure_retires_the_lease_and_next_frame_is_delivered() {
+        let clock = Arc::new(VirtualClock::new());
+        let manager = crate::transport::TransportManager::init_for_test(
+            crate::transport::TransportConfig {
+                node_name: "raw_failure_oracle".into(),
+                clock: clock.clone(),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let env = Arc::new(HashMap::new());
+        let mut native = NodeContext::with_runtime_env(
+            IndexMap::new(),
+            IndexMap::new(),
+            clock,
+            ShutdownSignal::new(),
+            env.clone(),
+        );
+        native.set_transport(manager.clone());
+        let host = HostContext::new(native, Vec::new(), env, 1)
+            .unwrap()
+            .with_raw_publisher_budget(1)
+            .unwrap();
+        let context = register_context(host).unwrap();
+        let topic = b"abi/raw/fault";
+        let schema_hash = 0x1122_3344_5566_7788;
+        let binding = with_context(context, |host| {
+            host.create_raw(
+                context,
+                "abi/raw/fault",
+                abi::RawPublisherRequestV1 {
+                    topic: abi::Bytes {
+                        ptr: topic.as_ptr(),
+                        len: topic.len() as u64,
+                    },
+                    schema_hash,
+                    configured_capacity: 64,
+                    full_queue: abi::full_queue::DISCARD,
+                },
+            )
+        })
+        .unwrap();
+        let mut subscriber = manager.create_subscriber("abi/raw/fault").unwrap();
+        with_context(context, |host| {
+            let index = host.raw_index(context, binding.port.value)?;
+            host.raw_ports[index]
+                .as_mut()
+                .unwrap()
+                .publisher
+                .as_mut()
+                .unwrap()
+                .fault_inject_send_raw_loan();
+            Ok(())
+        })
+        .unwrap();
+        for (sequence, fail) in [(100, true), (101, false)] {
+            let mut expected = [0; 64];
+            WireHeader {
+                schema_hash,
+                total_size: 64,
+                offset_table_offset: 64,
+                offset_table_count: 0,
+                sequence,
+                timestamp_ns: 777,
+                step_tag: crate::wire::StepTag::UNTAGGED,
+            }
+            .write_to_buf(&mut expected);
+            expected[40..].copy_from_slice(&[1; 24]);
+            let result = with_context(context, |host| {
+                let slot = host.loan_raw(
+                    context,
+                    binding.port.value,
+                    abi::LoanRequestV1 {
+                        schema_hash,
+                        minimum_capacity: 64,
+                        wire_fixed_size: 0,
+                        variable_count: 0,
+                        alignment: crate::shm_runtime::FRAME_ALIGN as u32,
+                    },
+                )?;
+                let NativeLease::RawWrite { loan } = host.leases.get_mut(
+                    slot.lease.value,
+                    binding.port.value,
+                    LeaseDirection::Write,
+                )?
+                else {
+                    panic!("native raw owner");
+                };
+                loan.bytes_mut().copy_from_slice(&expected);
+                host.finish_raw(context, binding.port.value, slot.lease.value, 64)
+            });
+            if fail {
+                assert_eq!(result.unwrap_err().status, abi::status_code::FAILED);
+                assert!(subscriber.view_raw().unwrap().is_none());
+            } else {
+                assert_eq!(result, Ok(1));
+                let frame = subscriber.view_raw_expecting(schema_hash).unwrap().unwrap();
+                assert_eq!(&frame[..], &expected);
+            }
+            assert_eq!(
+                with_context(context, |host| Ok(host.outstanding_leases())),
+                Ok(0)
+            );
+        }
+        remove_context(context).unwrap();
+    }
+}
