@@ -22,6 +22,17 @@ else:
         out2 = cerulion.output(Probe)
 
         def init(self, ctx):
+            if os.environ.get("CERULION_PYNODE_CASE") == "retain_after_destroy":
+                import builtins
+
+                view = getattr(builtins, "_cerulion_pinned_view", None)
+                if getattr(builtins, "_cerulion_pin_initialized", False) and view is None:
+                    raise RuntimeError("destroyed node buffer disappeared")
+                builtins._cerulion_pin_initialized = True
+                self.retained_verified = view is not None
+                if view is not None and bytes(view)[:4] != bytes((0xD4, 0xC3, 0xB2, 0xA1)):
+                    raise RuntimeError("destroyed node buffer bytes changed")
+
             if os.environ.get("CERULION_PYNODE_CASE") == "import_foreign_helpers":
                 # No `helpers.py` lies beside this node: the import resolves
                 # through CERULION_PY_PATH and is cached in `sys.modules` as
@@ -61,6 +72,12 @@ else:
 
         def tick(self):
             case = os.environ.get("CERULION_PYNODE_CASE")
+            if case == "retain_after_destroy":
+                import builtins
+
+                self.out.value = 0xA1B2C3D4
+                builtins._cerulion_pinned_view = memoryview(self.out._payload)
+                return
             if case == "import_foreign_helpers":
                 import helpers
 
