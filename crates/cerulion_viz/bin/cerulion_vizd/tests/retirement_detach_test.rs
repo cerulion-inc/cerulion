@@ -48,6 +48,153 @@ fn changed_channel_cancellation_removes_recovery_before_release_io() {
 }
 
 #[test]
+fn detach_during_reobserve_removes_intent_before_the_pending_reply() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    for _ in 0..2 {
+        let root = Directory::new();
+        let socket = root.0.join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let finish = Arc::new(AtomicBool::new(false));
+        let (server_started, server_finish) = (started.clone(), finish.clone());
+        let observes = AtomicUsize::new(0);
+        let (server, methods) = spy(listener, move |request, stream| {
+            let id = request["id"].as_u64().unwrap();
+            match request["method"].as_str().unwrap() {
+                "observe" => {
+                    if observes.fetch_add(1, Ordering::AcqRel) == 0 {
+                        writeln!(
+                            stream,
+                            "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}"
+                        )
+                        .unwrap();
+                    } else {
+                        server_started.store(true, Ordering::Release);
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while !server_finish.load(Ordering::Acquire) && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    json!({"id":id,"robot":"arm","topic":"/vector","refcount":1,
+                        "mirror_created":true,"local_topic":"/vector"})
+                }
+                "unobserve" => json!({"id":id,"robot":"arm","topic":"/vector",
+                    "refcount":0,"last_release":true}),
+                "status" => json!({"id":id,"demands":[],"active_connections":1,"idle":false}),
+                other => panic!("unexpected source request {other}"),
+            }
+        });
+        let plane = Arc::new(NetdDemandPlane::with_socket(socket));
+        plane.demand("arm", "/vector", 7).unwrap();
+        let recovery_plane = plane.clone();
+        let recovery = std::thread::spawn(move || recovery_plane.check_remote_readers());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "re-observe never reached the spy"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let release_plane = plane.clone();
+        let release = std::thread::spawn(move || release_plane.release("arm", "/vector"));
+        let (sent, received) = std::sync::mpsc::channel();
+        let lookup_plane = plane.clone();
+        let lookup = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while lookup_plane.local_channel("arm", "/vector").is_ok() {
+                if Instant::now() >= deadline {
+                    sent.send(false).unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            sent.send(true).unwrap();
+        });
+        let removed = received
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap_or(false);
+        finish.store(true, Ordering::Release);
+        recovery.join().unwrap().unwrap();
+        release.join().unwrap().unwrap();
+        lookup.join().unwrap();
+        plane.check_remote_readers().unwrap();
+        plane.check_remote_readers().unwrap();
+        drop(plane);
+        server.finish();
+        assert!(
+            removed,
+            "detach waited for observe before removing recovery intent"
+        );
+        let calls: Vec<_> = methods
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, _)| method.clone())
+            .collect();
+        assert_eq!(calls, ["observe", "observe", "unobserve"]);
+    }
+}
+
+#[test]
+fn demand_refusal_rolls_back_only_an_uninitialized_source() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for initial_refusal in [true, false] {
+        for _ in 0..2 {
+            let root = Directory::new();
+            let socket = root.0.join("control.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let observes = AtomicUsize::new(0);
+            let (server, methods) = spy(listener, move |request, _| {
+                let id = request["id"].as_u64().unwrap();
+                match request["method"].as_str().unwrap() {
+                    "observe" => {
+                        let first = observes.fetch_add(1, Ordering::AcqRel) == 0;
+                        if first == initial_refusal {
+                            json!({"id":id,"error":"source policy refused"})
+                        } else {
+                            json!({"id":id,"robot":"arm","topic":"/vector","refcount":1,
+                                "mirror_created":true,"local_topic":"/vector"})
+                        }
+                    }
+                    "unobserve" => json!({"id":id,"robot":"arm","topic":"/vector",
+                        "refcount":0,"last_release":true}),
+                    other => panic!("unexpected source request {other}"),
+                }
+            });
+            let plane = NetdDemandPlane::with_socket(socket);
+            let first = plane.demand("arm", "/vector", 7);
+            if initial_refusal {
+                assert!(first.unwrap_err().contains("source policy refused"));
+                assert!(plane.local_channel("arm", "/vector").is_err());
+                plane.check_remote_readers().unwrap();
+                plane.demand("arm", "/vector", 7).unwrap();
+            } else {
+                first.unwrap();
+                assert!(plane
+                    .demand("arm", "/vector", 7)
+                    .unwrap_err()
+                    .contains("source policy refused"));
+            }
+            assert_eq!(plane.local_channel("arm", "/vector").unwrap(), "/vector");
+            plane.release("arm", "/vector").unwrap();
+            drop(plane);
+            server.finish();
+            let calls: Vec<_> = methods
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(method, _)| method.clone())
+                .collect();
+            assert_eq!(calls, ["observe", "observe", "unobserve"]);
+        }
+    }
+}
+
+#[test]
 fn loss_during_fresh_observe_preserves_both_committed_demands() {
     let root = Directory::new();
     let socket = root.0.join("control.sock");
