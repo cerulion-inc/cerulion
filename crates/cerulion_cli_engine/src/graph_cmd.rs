@@ -1397,34 +1397,33 @@ fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
 }
 
 /// Is `existing`, a graph file's exact bytes, exactly what the CLI's own
-/// writes produce: [`render_graph_scaffold`] for one of `prefixes`, then each
-/// of `prior_nodes` appended in order through [`append_node_to_nodes_block`]?
+/// writes produce: [`render_graph_scaffold`] for `prefix`, then each of
+/// `prior_nodes` appended in order through [`append_node_to_nodes_block`]?
 ///
-/// Byte equality: no trimming, no comment stripping, no YAML re-parse. A
-/// comment, a blank line, a re-quoted prefix, a `name:` line, a `network:`
-/// block or a node in any spelling [`render_node_entry`] does not produce
-/// fails it, and [`node_stage`] then takes the backup-and-warn arm of
+/// `prefix` is the value parsed from `existing`, so a file `graph create`
+/// wrote with the default prefix and one written with `-n <prefix>` are both
+/// recognised. Byte equality: no trimming, no comment stripping, no YAML
+/// re-parse. A comment, a blank line, a re-quoted prefix, a `name:` line, a
+/// `network:` block or a node in any spelling [`render_node_entry`] does not
+/// produce fails it, and [`node_stage`] then takes the backup-and-warn arm of
 /// [`write_yaml_atomically`]. A re-render whose append is refused matches
 /// nothing.
-fn is_cli_written_graph(
-    existing: &str,
-    prefixes: &[&str],
-    prior_nodes: &[NodeDef],
-) -> CliResult<bool> {
-    for (i, prefix) in prefixes.iter().enumerate() {
-        if prefixes[..i].contains(prefix) {
-            continue;
-        }
-        let mut rendered = Some(render_graph_scaffold(prefix)?);
-        for node in prior_nodes {
-            rendered = rendered
-                .and_then(|doc| append_node_to_nodes_block(&doc, node, "re-rendered graph").ok());
-        }
-        if rendered.as_deref() == Some(existing) {
-            return Ok(true);
-        }
+fn is_cli_written_graph(existing: &str, prefix: &str, prior_nodes: &[NodeDef]) -> CliResult<bool> {
+    let mut rendered = render_graph_scaffold(prefix)?;
+    for node in prior_nodes {
+        rendered = match append_node_to_nodes_block(&rendered, node, "re-rendered graph") {
+            Ok(next) => next,
+            Err(e) => {
+                tracing::debug!(
+                    node_id = %node.id,
+                    error = %e,
+                    "re-rendering the graph file as the CLI writes it was refused; staging keeps a backup"
+                );
+                return Ok(false);
+            }
+        };
     }
-    Ok(false)
+    Ok(rendered == existing)
 }
 
 /// Read and parse a graph YAML file.
@@ -2013,28 +2012,26 @@ pub fn node_stage(
         .expect("a node was just pushed onto the config");
     let rewritten = append_node_to_nodes_block(&raw, staged, &graph_path.display().to_string())?;
     // The splice above copies every byte of the prior file into `rewritten`
-    // (the one rewrite is a scaffold's `nodes: []` becoming `nodes:`), so
-    // neither arm below loses a byte. The `.bak` and its warning mark a prior
-    // file that holds bytes the CLI did not write.
+    // (the one rewrite is an empty `nodes: []` becoming `nodes:`), so neither
+    // arm below loses a byte. The `.bak` and its warning mark a prior
+    // file the re-render below does not reproduce byte for byte.
     //
     // `is_cli_written_graph` re-renders what the CLI's own writes produce: the
-    // `graph create` scaffold for a candidate prefix, then each node already
-    // in the file appended in file order through `append_node_to_nodes_block`.
-    // The candidates are the create-time default `default_prefix(graph_name)`
-    // and the file's own `prefix:` value, so `graph create -n <prefix>` is
-    // covered. A file byte-identical to one of those renders takes
-    // `PriorFile::Discard`: no `.bak`, no warning, one INFO line. Any other
+    // `graph create` scaffold for the file's own `prefix:` value (the default
+    // prefix or a `-n <prefix>` alike), then each node already in the file
+    // appended in file order through `append_node_to_nodes_block`. A file
+    // byte-identical to that render takes `PriorFile::Discard`: no `.bak`, no
+    // warning, one INFO line. Any other
     // byte (a comment, a `name:` line, a `network:` block, a blank line, a
     // node in any spelling `render_node_entry` does not produce) breaks the
     // equality and takes `PriorFile::BackUp` with the warning.
     //
-    // A `prefix:` value edited by hand renders the same bytes as
-    // `graph create -n <that value>` and takes the discard arm; the splice
-    // keeps that line in the new file verbatim.
+    // A value edited, or a node field added, by hand in the spelling
+    // `render_node_entry` writes (a `prefix:` value, a `schema:`, a `topic:`
+    // under an output) renders the same bytes and takes the discard arm; the
+    // splice keeps it in the new file verbatim.
     let prior_nodes = &config.nodes[..config.nodes.len() - 1];
-    let default_prefix = cerulion_core::graph::default_prefix(graph_name);
-    let prior_file = if is_cli_written_graph(&raw, &[&default_prefix, &config.prefix], prior_nodes)?
-    {
+    let prior_file = if is_cli_written_graph(&raw, &config.prefix, prior_nodes)? {
         if prior_nodes.is_empty() {
             tracing::info!(
                 graph = %graph_name,
@@ -15483,9 +15480,11 @@ pub(crate) enum PriorFile {
     /// Copy them to `<path>.bak` and `warn!` — the contract every hand-edit
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
-    /// Drop them, silently. Only for a file the caller has PROVED holds
-    /// nothing a user wrote: [`node_stage`] over a file byte-identical to the
-    /// CLI's own writes ([`is_cli_written_graph`]). Everything else backs up.
+    /// Drop them, silently. Only for a write whose new contents keep every
+    /// byte of the prior file except the ` []` of an empty `nodes: []`, over
+    /// a file the caller has PROVED is
+    /// byte-identical to what the CLI's own writes produce: [`node_stage`]
+    /// ([`is_cli_written_graph`]). Everything else backs up.
     Discard,
 }
 
@@ -23290,18 +23289,17 @@ mod tests {
     #[test]
     fn a_byte_identical_scaffold_is_cli_written() {
         let scaffold = "prefix: robot1\nnodes: []\n";
-        assert!(is_cli_written_graph(scaffold, &["robot1"], &[]).unwrap());
+        assert!(is_cli_written_graph(scaffold, "robot1", &[]).unwrap());
+        // `graph create -n ""` drops the prefix line.
+        assert!(is_cli_written_graph("nodes: []\n", "", &[]).unwrap());
     }
 
-    /// Either candidate prefix may match: the create-time default, or the
-    /// file's own `prefix:` value (`graph create -n robot1`).
+    /// The scaffold is rendered for the prefix handed in and no other.
     #[test]
-    fn a_scaffold_matches_on_any_candidate_prefix() {
+    fn a_scaffold_matches_only_its_own_prefix() {
         let scaffold = "prefix: robot1\nnodes: []\n";
-        assert!(is_cli_written_graph(scaffold, &["host", "robot1"], &[]).unwrap());
-        assert!(is_cli_written_graph(scaffold, &["robot1", "host"], &[]).unwrap());
-        assert!(!is_cli_written_graph(scaffold, &["host", "robot2"], &[]).unwrap());
-        assert!(!is_cli_written_graph(scaffold, &[], &[]).unwrap());
+        assert!(!is_cli_written_graph(scaffold, "robot2", &[]).unwrap());
+        assert!(!is_cli_written_graph(scaffold, "", &[]).unwrap());
     }
 
     /// A file holding the scaffold plus a node the CLI staged is CLI-written
@@ -23309,22 +23307,20 @@ mod tests {
     #[test]
     fn a_staged_node_in_cli_spelling_is_cli_written() {
         let sensor = sensor_node();
-        assert!(is_cli_written_graph(
-            ROBOT1_WITH_SENSOR,
-            &["robot1"],
-            std::slice::from_ref(&sensor)
-        )
-        .unwrap());
+        assert!(
+            is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", std::slice::from_ref(&sensor))
+                .unwrap()
+        );
         // The same bytes with no prior node to explain them are a hand edit.
-        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, &["robot1"], &[]).unwrap());
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", &[]).unwrap());
         // A prior node the file does not hold matches nothing.
         let other = build_node_def("camera", None, &[], &[]);
-        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, &["robot1"], &[other]).unwrap());
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", &[other]).unwrap());
     }
 
-    /// Every hand edit a user plausibly makes to a fresh file, and every
-    /// "harmless" difference a looser check (trim, re-parse, comment strip)
-    /// would forgive, is NOT CLI-written: each of these takes the backup arm.
+    /// Each edit below, a byte `graph create` never writes or a difference a
+    /// looser check (trim, re-parse, comment strip) would forgive, is NOT
+    /// CLI-written: each of these takes the backup arm.
     #[test]
     fn any_byte_beyond_the_scaffold_is_a_hand_edit() {
         for edited in [
@@ -23334,10 +23330,13 @@ mod tests {
             "prefix: 'robot1'\nnodes: []\n",
             "name: perception\nprefix: robot1\nnodes: []\n",
             "prefix: robot1\nnodes:\n  - id: a\n    type: a\n",
+            "prefix: robot1\r\nnodes: []\r\n",
+            "nodes: []\nprefix: robot1\n",
+            "args:\n  ns: robot1\nprefix: ${ns}\nnodes: []\n",
             "",
         ] {
             assert!(
-                !is_cli_written_graph(edited, &["robot1"], &[]).unwrap(),
+                !is_cli_written_graph(edited, "robot1", &[]).unwrap(),
                 "must not count as CLI-written: {edited:?}"
             );
         }
@@ -23357,9 +23356,19 @@ mod tests {
             ROBOT1_WITH_SENSOR.replace("schema: sensor_msgs/Image", "schema: sensor_msgs::Image"),
             ROBOT1_WITH_SENSOR.replace("  - id: sensor", "- id: sensor"),
             ROBOT1_WITH_SENSOR.replace("prefix: robot1", "prefix: 'robot1'"),
+            ROBOT1_WITH_SENSOR.replace('\n', "\r\n"),
+            ROBOT1_WITH_SENSOR.replace("  - id: sensor", "\t- id: sensor"),
+            ROBOT1_WITH_SENSOR.replace(
+                "    type: sensor\n",
+                "    type: sensor\n    isolate: true\n",
+            ),
+            ROBOT1_WITH_SENSOR.replace(
+                "  - id: sensor\n    type: sensor\n",
+                "  - type: sensor\n    id: sensor\n",
+            ),
         ] {
             assert!(
-                !is_cli_written_graph(&edited, &["robot1"], &sensor).unwrap(),
+                !is_cli_written_graph(&edited, "robot1", &sensor).unwrap(),
                 "must not count as CLI-written: {edited:?}"
             );
         }

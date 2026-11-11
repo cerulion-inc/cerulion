@@ -1981,14 +1981,14 @@ fn code_only_strips_comments_and_keeps_code() {
 }
 
 // ==========================================================================
-// Section F — `node stage` over a graph file only the CLI has written.
+// Section F: `node stage` over a graph file only the CLI has written.
 //
-// The README quick start is `graph create perception` then `node stage sensor
-// -g perception`; the docs-site quick start adds `-n perception` and a second
-// `node stage detector -g perception -I image sensor/image`. No stage on
-// either route may warn "overwriting an existing graph file — the previous
-// file (including any hand edits) was backed up" or leave a `.bak` when no
-// byte of the file is a hand edit. Every arm drives the
+// The `docs/user-api.md` quick start is `graph create perception` then
+// `node stage sensor -g perception`; the docs-site quick start adds
+// `-n perception` and a second `node stage detector -g perception -I image
+// sensor/image`. No stage on either route may log the "overwriting an
+// existing graph file" warning or leave a `.bak` while the file holds only
+// what `graph create` and `node stage` write. Every arm drives the
 // real verbs over a real scratch workspace (a `graphs/` dir; the workspace
 // lock lands beside it) — still parallel-safe: no transport, no clock. The
 // oracles are the LOG and the DIRECTORY LISTING: a warning that fires, or a
@@ -2214,6 +2214,41 @@ fn a_hand_edit_after_the_first_stage_warns_and_backs_up_on_the_second() {
     );
 }
 
+/// A value edited in the spelling the CLI writes (here the sensor's
+/// `schema:`) renders the same bytes as staging a node that declares it, so
+/// the next stage takes no backup, and the splice keeps the edited value.
+#[tracing_test::traced_test]
+#[test]
+fn a_value_edit_in_cli_spelling_stages_without_a_backup_and_is_kept() {
+    let (_tmp, graphs) = scratch_graphs_dir();
+    graph_create(&graphs, "perception", Some("perception")).expect("graph create");
+    node_stage(&graphs, "perception", camera_sensor_def()).expect("stage sensor");
+
+    let after_first = std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable");
+    let edited = after_first.replace(
+        "schema: sensor_msgs/Image",
+        "schema: sensor_msgs/CompressedImage",
+    );
+    assert_ne!(
+        edited, after_first,
+        "the edit must actually change the file"
+    );
+    std::fs::write(graphs.join("perception.yaml"), &edited).expect("value edit");
+
+    node_stage(&graphs, "perception", detector_def()).expect("stage detector");
+
+    assert!(!logs_contain(OVERWRITE_WARNING));
+    assert_eq!(listing(&graphs), vec!["perception.yaml".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable"),
+        PERCEPTION_QUICKSTART.replace(
+            "schema: sensor_msgs/Image",
+            "schema: sensor_msgs/CompressedImage"
+        ),
+        "the edited schema survives the splice"
+    );
+}
+
 /// ONE hand edit — a comment — and the file is no longer the scaffold: the
 /// backup + warn contract applies unchanged, and the `.bak` carries the
 /// edited bytes.
@@ -2251,8 +2286,9 @@ fn a_hand_edited_scaffold_still_warns_and_backs_up() {
     );
 }
 
-/// THE README path continued: a second stage onto the default-prefix graph
-/// the first stage wrote is CLI-written too, so it neither warns nor backs up.
+/// The `docs/user-api.md` quick start continued: a second stage onto the
+/// default-prefix graph the first stage wrote is CLI-written too, so it
+/// neither warns nor backs up.
 #[tracing_test::traced_test]
 #[test]
 fn a_second_stage_onto_a_cli_written_graph_neither_warns_nor_backs_up() {
