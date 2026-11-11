@@ -80,6 +80,12 @@ pub(crate) fn generate(
                 use #root::graph::node::NodeEntry as _;
                 #root::graph::node::cdylib_platform_check().map_err(|reason|
                     #root::error::TransportError::NodeError { node_id: stringify!(#node).into(), reason })?;
+                let rust_log = client.environment("RUST_LOG");
+                #root::graph::node::install_cdylib_stderr_tracing(
+                    rust_log.as_deref().filter(|value| !value.is_empty()));
+                let iox2_log = client.environment("IOX2_LOG_LEVEL");
+                #root::iceoryx_logger::init_iceoryx_log_level(
+                    iox2_log.as_deref().filter(|value| !value.is_empty()));
                 let mut entry = #entry::new();
                 if !params.is_empty() {
                     let values = ::std::str::from_utf8(params).map_err(|error|
@@ -91,12 +97,6 @@ pub(crate) fn generate(
                 }
                 entry.__cer_params_at_init = Some(entry.inner.__cer_param_values());
                 let mut context = #root::graph::node_plugin_abi::NodeContext::new(client.clone(), &entry.info()?)?;
-                let rust_log = context.env_str("RUST_LOG", "");
-                #root::graph::node::install_cdylib_stderr_tracing(
-                    if rust_log.is_empty() { None } else { Some(rust_log.as_str()) });
-                let iox2_log = context.env_str("IOX2_LOG_LEVEL", "");
-                #root::iceoryx_logger::init_iceoryx_log_level(
-                    if iox2_log.is_empty() { None } else { Some(iox2_log.as_str()) });
                 entry.inner.__cer_rt.clock = ::std::sync::Arc::clone(context.clock());
                 entry.inner.__cer_rt.shutdown_signal = context.shutdown_signal().clone();
                 entry.inner.__cer_plugin = Some(client);

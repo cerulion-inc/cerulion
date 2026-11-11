@@ -690,3 +690,24 @@ fn graph_rust_log_off_does_not_silence_host_output_diagnostics() {
         assert!(!out.stderr.contains(DEBUG_PROBE));
     }
 }
+
+#[test]
+#[serial]
+fn field_default_info_reaches_stderr_before_user_initialization() {
+    let out = run_child(Some("info"), Some("healthy"), 2);
+    assert!(out.success, "child must exit cleanly: {}", out.stderr);
+    assert_eq!(
+        count_at(&out.stderr, "INFO", "discard probe field default ran"),
+        2
+    );
+    assert_eq!(out.stderr.matches(BREADCRUMB).count(), 1);
+    let install = out.stderr.find(BREADCRUMB).unwrap();
+    let default = out.stderr.find("discard probe field default ran").unwrap();
+    assert!(
+        install < default,
+        "the subscriber is installed before field Defaults"
+    );
+    let off = run_child(Some("off"), Some("healthy"), 1);
+    assert!(off.success, "child must exit cleanly: {}", off.stderr);
+    assert!(!off.stderr.contains("discard probe field default ran"));
+}
