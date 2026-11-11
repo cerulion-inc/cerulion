@@ -533,7 +533,8 @@ fn native_callback_publish_and_receive_add_no_heap_allocation() {
         h.release(read);
     }
     let actual = count.finish();
-    assert_eq!(actual.checked_sub(upstream_2035_publish_allocs(8)), Some(0));
+    let upstream = upstream_2035_publish_allocs(8);
+    assert_eq!(actual.checked_sub(upstream), Some(0));
     // Allocation detector control: copying a delivered frame onto the heap
     // must be visible, so a copied adapter cannot pass the zero-allocation gate.
     h.publish([21.0, 22.0, 23.0]);
@@ -1462,10 +1463,18 @@ fn raw_ingress_preserves_original_wire_bytes_and_recipient_count_in_two_runs() {
 fn raw_creation_refuses_reserved_tags_and_budget_reuse_before_native_creation() {
     let h = RawHarness::new(1);
     let mut out = MaybeUninit::uninit();
-    for (tag, expected) in [
-        (abi::full_queue::RESERVED_BLOCK, "UnsupportedRawStrategy(2)"),
-        (3, "UnsupportedRawStrategy(3)"),
-        (u32::MAX, "UnsupportedRawStrategy(4294967295)"),
+    for (tag, code, expected) in [
+        (
+            abi::full_queue::RESERVED_BLOCK,
+            7,
+            "raw ingress full-queue strategy 2 is reserved and unsupported",
+        ),
+        (3, 5, "raw ingress full-queue tag 3 is invalid"),
+        (
+            u32::MAX,
+            5,
+            "raw ingress full-queue tag 4294967295 is invalid",
+        ),
     ] {
         let mut request = raw_request("abi/raw/refusal");
         request.full_queue = tag;
@@ -1474,7 +1483,7 @@ fn raw_creation_refuses_reserved_tags_and_budget_reuse_before_native_creation() 
             request,
             out.as_mut_ptr()
         ));
-        assert_eq!(refused.code, abi::status_code::INVALID_ARGUMENT);
+        assert_eq!(refused.code, code);
         let mut diagnostic = [0; 64];
         let mut written = 0;
         assert_eq!(
@@ -3022,5 +3031,407 @@ fn staged_nested_diagnostic_is_copied_without_logging_and_consumed_once() {
             host.counters().discarded
         ))),
         Ok((0, 3))
+    );
+}
+
+struct GraphUnboundEntry {
+    stable: bool,
+    native: Option<NodeContext>,
+    host: Option<(abi::ContextHandle, [abi::PortHandle; 5])>,
+    accumulation: cerulion_core::transport::accumulate::AccumulatorSet,
+}
+impl cerulion_core::graph::node::NodeEntry for GraphUnboundEntry {
+    fn info(&self) -> cerulion_core::TransportResult<cerulion_core::graph::node::NodeInfo> {
+        Ok(cerulion_core::graph::node::NodeInfo::from_names(
+            vec!["in".into(), "absent".into(), "acc".into()],
+            vec!["out".into(), "unlisted".into()],
+        )
+        .with_policy(cerulion_core::MacroPolicy::Period { period_ms: 1 }))
+    }
+    fn init(&mut self, mut native: NodeContext) -> cerulion_core::TransportResult<()> {
+        if !self.stable {
+            assert!(native.subscriber("absent").is_none());
+            assert!(native.subscriber("acc").is_none());
+            assert!(native.publisher("unlisted").is_none());
+            self.accumulation
+                .register::<Vector3>(&mut native, "acc", 8)?;
+            self.native = Some(native);
+            return Ok(());
+        }
+        let mut specs = Vec::new();
+        for (name, direction, cap) in [
+            ("out", LeaseDirection::Write, None),
+            ("unlisted", LeaseDirection::Write, None),
+            ("in", LeaseDirection::Read, None),
+            ("absent", LeaseDirection::Read, None),
+            ("acc", LeaseDirection::Read, Some(8)),
+        ] {
+            specs.push(HostPortSpec {
+                name: name.into(),
+                direction,
+                layout: vector_layout(),
+                read_mode: if direction == LeaseDirection::Read {
+                    abi::read_mode::ONE
+                } else {
+                    0
+                },
+                accumulate_cap: cap,
+            });
+        }
+        let context = abi::ContextHandle {
+            value: register_context(
+                HostContext::new(native, specs, Arc::new(HashMap::new()), 4).unwrap(),
+            )
+            .unwrap(),
+        };
+        with_context(context.value, |host| host.begin_node_call()).unwrap();
+        let mut ports = [abi::PortHandle::default(); 5];
+        for (slot, ordinal, direction) in [(0, 0, 1), (1, 1, 1), (2, 0, 0), (3, 1, 0), (4, 2, 0)] {
+            let mut binding = MaybeUninit::uninit();
+            assert_eq!(
+                abi_call!((HOST_API.bind_port)(
+                    context,
+                    ordinal,
+                    direction,
+                    binding.as_mut_ptr()
+                ))
+                .code,
+                0
+            );
+            // SAFETY: OK initialized this complete binding; its bytes stay host-owned.
+            let binding = unsafe { binding.assume_init() };
+            if slot == 1 {
+                assert_eq!(binding.configured_capacity, 0);
+            }
+            ports[slot] = binding.port;
+        }
+        with_context(context.value, |host| {
+            host.configure_snapshots(br#"["in","absent","acc"]"#)?;
+            host.end_node_call()
+        })
+        .unwrap();
+        self.host = Some((context, ports));
+        Ok(())
+    }
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        if let Some(native) = &mut self.native {
+            assert_eq!(self.accumulation.view::<Vector3>("acc").len(), 0);
+            assert!(native.subscriber("absent").is_none());
+            assert!(native.publisher("unlisted").is_none());
+            let values = native
+                .subscriber_mut("in")
+                .unwrap()
+                .try_view::<Vector3, _>(|view| [view.x, view.y, view.z])?
+                .unwrap();
+            let mut output = native
+                .publisher_mut("out")
+                .unwrap()
+                .loan_proxy::<Vector3>()?;
+            output.x = values[0] + 10.0;
+            output.y = values[1];
+            output.z = values[2];
+            return Ok(());
+        }
+        let (context, ports) = self.host.unwrap();
+        with_context(context.value, |host| {
+            host.begin_node_call()?;
+            host.begin_fire()?;
+            host.snapshot_configured()?;
+            assert_eq!(host.runtime_drain_trigger_input("absent")?, (0, None));
+            assert_eq!(host.runtime_refill_trigger_input("acc")?, (0, None));
+            assert!(matches!(
+                host.runtime_sync_head_op(
+                    "absent",
+                    cerulion_core::scheduler::SyncHeadOp::ProbeNext
+                )?,
+                cerulion_core::scheduler::SyncOpAnswer::Nothing
+            ));
+            Ok(())
+        })
+        .unwrap();
+        let mut read = MaybeUninit::<abi::ReadSlotV1>::uninit();
+        assert_eq!(
+            abi_call!((HOST_API.receive_input)(
+                context,
+                ports[3],
+                abi::read_mode::ONE,
+                read.as_mut_ptr()
+            ))
+            .code,
+            1
+        );
+        for operation in [
+            abi::head_op::DRAIN,
+            abi::head_op::REFILL,
+            abi::head_op::PROBE_NEXT,
+            abi::head_op::VOID,
+        ] {
+            let mut head = MaybeUninit::uninit();
+            assert_eq!(
+                abi_call!((HOST_API.input_head)(
+                    context,
+                    ports[3],
+                    operation,
+                    head.as_mut_ptr()
+                ))
+                .code,
+                0
+            );
+            // SAFETY: OK initialized all head facts; no frame or lease is lent.
+            let head = unsafe { head.assume_init() };
+            assert_eq!(
+                (head.kind, head.popped, head.has_timestamp),
+                (abi::head_kind::NOTHING, 0, 0)
+            );
+        }
+        let mut info = MaybeUninit::uninit();
+        assert_eq!(
+            abi_call!((HOST_API.accumulate_count)(
+                context,
+                ports[4],
+                info.as_mut_ptr()
+            ))
+            .code,
+            0
+        );
+        // SAFETY: the successful callback initialized all primitive batch facts.
+        let info = unsafe { info.assume_init() };
+        assert_eq!((info.count, info.dropped, info.dropped_total), (0, 0, 0));
+        let mut output = MaybeUninit::uninit();
+        let refused = abi_call!((HOST_API.loan_output)(
+            context,
+            ports[1],
+            request(vector_layout()),
+            output.as_mut_ptr()
+        ));
+        assert_eq!(refused.code, 2);
+        let mut reason = [0; 128];
+        let written = cerulion_core::graph::node_host_abi::copy_context_diagnostic(
+            context.value,
+            refused.error,
+            &mut reason,
+        )
+        .unwrap();
+        assert_eq!(
+            &reason[..written],
+            b"output port 'unlisted' is not wired in the graph"
+        );
+        assert_eq!(
+            abi_call!((HOST_API.receive_input)(
+                context,
+                ports[2],
+                abi::read_mode::ONE,
+                read.as_mut_ptr()
+            ))
+            .code,
+            0
+        );
+        // SAFETY: OK initialized a live host-held immutable read lease.
+        let read = unsafe { read.assume_init() };
+        let mut values = [0.0; 3];
+        inspect(&read, |frame| {
+            for (index, offset) in [40, 48, 56].into_iter().enumerate() {
+                values[index] = f64::from_le_bytes(frame[offset..offset + 8].try_into().unwrap());
+            }
+        });
+        assert_eq!(
+            abi_call!((HOST_API.release_input)(context, read.lease)).code,
+            0
+        );
+        assert_eq!(
+            abi_call!((HOST_API.loan_output)(
+                context,
+                ports[0],
+                request(vector_layout()),
+                output.as_mut_ptr()
+            ))
+            .code,
+            0
+        );
+        // SAFETY: OK initialized a live exclusive native write lease.
+        let output = unsafe { output.assume_init() };
+        write_values(&output, [values[0] + 10.0, values[1], values[2]]);
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(context, output.lease, 64)).code,
+            0
+        );
+        with_context(context.value, |host| {
+            assert_eq!(host.outstanding_leases(), 0);
+            host.end_node_call()
+        })
+        .unwrap();
+        Ok(())
+    }
+    fn shutdown(&mut self) -> cerulion_core::TransportResult<()> {
+        self.native = None;
+        if let Some((context, _)) = self.host.take() {
+            remove_context(context.value).unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn graph_runtime_unbound_declarations_preserve_native_and_host_downstream_delivery() {
+    use cerulion_core::graph::node::{ClosureNodeEntry, NodeEntry, NodeInfo};
+    use cerulion_core::graph::{parse_graph, GraphRuntime};
+    for _ in 0..2 {
+        for stable in [false, true] {
+            let clock = Arc::new(VirtualClock::new());
+            let manager = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: "graph_unbound_oracle".into(),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                iceoryx_test_config(),
+            )
+            .unwrap();
+            let config = parse_graph(
+                r#"
+name: unbound
+prefix: abi/unbound
+nodes:
+  - id: source
+    type: source
+    outputs:
+      - name: out
+        schema: Vector3
+        max_slice_len: 64
+  - id: relay
+    type: relay
+    inputs:
+      - name: in
+        source: source/out
+    outputs:
+      - name: out
+        schema: Vector3
+        max_slice_len: 64
+  - id: sink
+    type: sink
+    inputs:
+      - name: in
+        source: relay/out
+"#,
+            )
+            .unwrap();
+            let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = delivered.clone();
+            let source = ClosureNodeEntry::new(
+                NodeInfo::from_names(vec![], vec!["out".into()])
+                    .with_policy(cerulion_core::MacroPolicy::Period { period_ms: 1 }),
+                |ctx| {
+                    let mut output = ctx.publisher_mut("out").unwrap().loan_proxy::<Vector3>()?;
+                    output.x = 7.0;
+                    output.y = 8.0;
+                    output.z = 9.0;
+                    Ok(())
+                },
+            );
+            let sink = ClosureNodeEntry::new(
+                NodeInfo::from_names(vec!["in".into()], vec![])
+                    .with_policy(cerulion_core::MacroPolicy::Period { period_ms: 1 }),
+                move |ctx| {
+                    let values = ctx
+                        .subscriber_mut("in")
+                        .unwrap()
+                        .try_view::<Vector3, _>(|view| [view.x, view.y, view.z])?
+                        .unwrap();
+                    observed.lock().unwrap().push(values);
+                    Ok(())
+                },
+            );
+            let entries: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::from([
+                ("source".into(), Box::new(source) as Box<dyn NodeEntry>),
+                (
+                    "relay".into(),
+                    Box::new(GraphUnboundEntry {
+                        stable,
+                        native: None,
+                        host: None,
+                        accumulation: cerulion_core::transport::accumulate::AccumulatorSet::new(),
+                    }) as Box<dyn NodeEntry>,
+                ),
+                ("sink".into(), Box::new(sink) as Box<dyn NodeEntry>),
+            ]);
+            let mut runtime = GraphRuntime::build(config, entries, &manager, clock).unwrap();
+            // Period inputs may snapshot before the producer's first tick.
+            // Prime both edges using the graph's real existing entries, then
+            // leave a real source frame queued for the first scheduled relay.
+            for id in ["source", "relay", "source"] {
+                let entry = runtime.node_entry_arc_for_test(id).unwrap();
+                entry.lock().unwrap().tick().unwrap();
+            }
+            for _ in 0..3 {
+                runtime.step(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(&*delivered.lock().unwrap(), &[[17.0, 8.0, 9.0]; 3]);
+            runtime.shutdown();
+        }
+    }
+}
+
+#[test]
+fn reserved_raw_strategy_is_loud_suppressed_and_rearmed_without_native_creation() {
+    let h = RawHarness::new(1);
+    let capture = OutputLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(capture.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let mut out = MaybeUninit::uninit();
+        let mut request = raw_request("abi/raw/strategy");
+        request.full_queue = abi::full_queue::RESERVED_BLOCK;
+        for _ in 0..2 {
+            assert_eq!(
+                abi_call!((HOST_API.create_raw_publisher)(
+                    h.context,
+                    request,
+                    out.as_mut_ptr()
+                ))
+                .code,
+                7
+            );
+        }
+        let valid = h.create("abi/raw/strategy");
+        assert_eq!(
+            abi_call!((HOST_API.destroy_raw_publisher)(h.context, valid.port)).code,
+            0
+        );
+        assert_eq!(
+            abi_call!((HOST_API.create_raw_publisher)(
+                h.context,
+                request,
+                out.as_mut_ptr()
+            ))
+            .code,
+            7
+        );
+    });
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("WARN raw ingress full-queue strategy refused")
+            .count(),
+        2
+    );
+    assert_eq!(
+        logs.matches("DEBUG raw ingress full-queue strategy refusal repeated")
+            .count(),
+        1
+    );
+    assert_eq!(
+        logs.matches("INFO raw ingress full-queue strategy recovered")
+            .count(),
+        1
+    );
+    assert!(logs.contains("full_queue=2"));
+    assert_eq!(
+        with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+        Ok(0)
     );
 }

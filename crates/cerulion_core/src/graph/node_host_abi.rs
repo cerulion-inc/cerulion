@@ -34,6 +34,10 @@ pub enum HostServiceError {
     InvalidDescriptor,
     /// Raw ingress supports only ConfigDefault and Discard queue strategies.
     UnsupportedRawStrategy(u32),
+    /// Unknown raw-ingress queue tag, distinct from a reserved strategy.
+    UnknownRawStrategy(u32),
+    /// Declared output has no publisher in this graph.
+    UnboundOutput(String),
     /// Native transport failure, distinct from an empty receive.
     Transport(TransportError),
     /// A port has an outstanding read or write accessor.
@@ -98,6 +102,7 @@ struct BoundPort {
 enum NativeLease {
     Write {
         loan: RawShmLoan,
+        capacity: u32,
         header: WireHeader,
         spill_attempted: bool,
         spill_submitted: bool,
@@ -304,6 +309,9 @@ impl HostContext {
         name: &str,
     ) -> Result<(u64, Option<u64>), HostServiceError> {
         self.runtime_input_index(name)?;
+        if self.native.subscriber(name).is_none() {
+            return Ok((0, None));
+        }
         Ok(self.native.drain_trigger_input(name))
     }
 
@@ -313,6 +321,9 @@ impl HostContext {
         name: &str,
     ) -> Result<(u64, Option<u64>), HostServiceError> {
         self.runtime_input_index(name)?;
+        if self.native.subscriber(name).is_none() {
+            return Ok((0, None));
+        }
         Ok(self.native.refill_trigger_input(name))
     }
 
@@ -323,6 +334,9 @@ impl HostContext {
         operation: SyncHeadOp,
     ) -> Result<SyncOpAnswer, HostServiceError> {
         self.runtime_input_index(name)?;
+        if self.native.subscriber(name).is_none() {
+            return Ok(SyncOpAnswer::Nothing);
+        }
         Ok(self.native.sync_head_op(name, operation))
     }
 
@@ -367,15 +381,12 @@ impl HostContext {
             if specs[..index].iter().any(|prior| prior.name == spec.name) || spec.name.is_empty() {
                 return Err(HostServiceError::InvalidDescriptor);
             }
-            let exists = match spec.direction {
-                LeaseDirection::Read => native.subscriber(&spec.name).is_some(),
-                LeaseDirection::Write => native.publisher(&spec.name).is_some_and(|publisher| {
-                    let AnyPublisher::Ipc(publisher) = publisher;
-                    publisher.max_slice_len().get() >= prefix
-                }),
-            };
-            if !exists {
-                return Err(HostServiceError::InvalidDescriptor);
+            if spec.direction == LeaseDirection::Write {
+                if let Some(AnyPublisher::Ipc(publisher)) = native.publisher(&spec.name) {
+                    if publisher.max_slice_len().get() < prefix {
+                        return Err(HostServiceError::InvalidDescriptor);
+                    }
+                }
             }
             if spec.direction == LeaseDirection::Read
                 && !matches!(
@@ -498,21 +509,21 @@ impl HostContext {
             bound.spec.layout.schema_hash,
             direction,
         )?;
+        // Unbound declarations keep a valid handle and their immutable name;
+        // a zero output capacity explicitly means no native publisher exists.
         let (topic, configured_capacity) = match direction {
             LeaseDirection::Read => (
                 self.native
                     .subscriber(&bound.spec.name)
-                    .ok_or(HostServiceError::InvalidDescriptor)?
-                    .topic(),
+                    .map_or(bound.spec.name.as_str(), |subscriber| subscriber.topic()),
                 0,
             ),
-            LeaseDirection::Write => {
-                let Some(AnyPublisher::Ipc(publisher)) = self.native.publisher(&bound.spec.name)
-                else {
-                    return Err(HostServiceError::InvalidDescriptor);
-                };
-                (publisher.topic(), publisher.max_slice_len().get())
-            }
+            LeaseDirection::Write => match self.native.publisher(&bound.spec.name) {
+                Some(AnyPublisher::Ipc(publisher)) => {
+                    (publisher.topic(), publisher.max_slice_len().get())
+                }
+                None => (bound.spec.name.as_str(), 0),
+            },
         };
         Ok(abi::PortBindingV1 {
             port: abi::PortHandle { value: handle },
@@ -552,7 +563,10 @@ impl HostContext {
                 return Err(HostServiceError::InvalidDescriptor);
             }
         }
-        self.snapshot_names = names;
+        self.snapshot_names = names
+            .into_iter()
+            .filter(|name| self.native.subscriber(name).is_some())
+            .collect();
         Ok(())
     }
 
@@ -717,6 +731,7 @@ impl HostContext {
     ) -> Result<HostWriteSlot, HostServiceError> {
         let index = self.port_index(context, port, LeaseDirection::Write)?;
         self.unborrowed(index)?;
+        self.output_publisher(index)?;
         let token = self.leases.claim(port, LeaseDirection::Write)?;
         let bound = &self.ports[index];
         let layout = bound.spec.layout;
@@ -751,6 +766,7 @@ impl HostContext {
             token,
             NativeLease::Write {
                 loan,
+                capacity: slot.capacity,
                 header,
                 spill_attempted: false,
                 spill_submitted: false,
@@ -826,7 +842,7 @@ impl HostContext {
         let suppressed = self.output_publisher(index)?.replay_suppress_active();
         let NativeLease::Write {
             header,
-            loan,
+            capacity,
             spill_submitted,
             ..
         } = self.leases.get_mut(token, port, LeaseDirection::Write)?
@@ -838,7 +854,7 @@ impl HostContext {
         }
         *spill_submitted = true;
         let header = *header;
-        let capacity = loan.bytes_mut().len();
+        let capacity = *capacity as usize;
         if suppressed {
             return Ok(());
         }
@@ -1015,6 +1031,13 @@ impl HostContext {
             return Err(HostServiceError::InvalidDescriptor);
         }
         self.unborrowed(index)?;
+        if self
+            .native
+            .subscriber(&self.ports[index].spec.name)
+            .is_none()
+        {
+            return Ok(None);
+        }
         let token = self.leases.claim(port, LeaseDirection::Read)?;
         let bound = &self.ports[index];
         let layout = bound.spec.layout;
@@ -1100,6 +1123,13 @@ impl HostContext {
     ) -> Result<SyncOpAnswer, HostServiceError> {
         let index = self.port_index(context, port, LeaseDirection::Read)?;
         self.unborrowed(index)?;
+        if self
+            .native
+            .subscriber(&self.ports[index].spec.name)
+            .is_none()
+        {
+            return Ok(SyncOpAnswer::Nothing);
+        }
         Ok(self
             .native
             .sync_head_op(&self.ports[index].spec.name, operation))
@@ -1118,10 +1148,16 @@ impl HostContext {
         }
         for &port in inputs {
             let index = self.port_index(context, port, LeaseDirection::Read)?;
-            self.accumulators.snapshot(
-                &mut self.native,
-                std::slice::from_ref(&self.ports[index].spec.name),
-            );
+            if self
+                .native
+                .subscriber(&self.ports[index].spec.name)
+                .is_some()
+            {
+                self.accumulators.snapshot(
+                    &mut self.native,
+                    std::slice::from_ref(&self.ports[index].spec.name),
+                );
+            }
         }
         Ok(())
     }
@@ -1243,6 +1279,11 @@ impl HostContext {
             },
         )?;
         let name = &self.ports[index].spec.name;
+        if (output && self.native.publisher(name).is_none())
+            || (!output && self.native.subscriber(name).is_none())
+        {
+            return Ok(0);
+        }
         if output {
             let Some(AnyPublisher::Ipc(publisher)) = self.native.publisher(name) else {
                 return Err(HostServiceError::InvalidDescriptor);
@@ -1416,7 +1457,10 @@ impl HostContext {
         let Some(AnyPublisher::Ipc(publisher)) =
             self.native.publisher_mut(&self.ports[index].spec.name)
         else {
-            return Err(HostServiceError::InvalidDescriptor);
+            return Err(HostServiceError::UnboundOutput(
+                // hot-path-alloc-ok: an unwired output is a cold named loan refusal.
+                self.ports[index].spec.name.clone(),
+            ));
         };
         Ok(publisher)
     }
@@ -1451,6 +1495,16 @@ fn write_diagnostic(
     match error {
         HostServiceError::Transport(error) => write!(target, "{error}"),
         HostServiceError::State(error) => write!(target, "{error}"),
+        HostServiceError::UnsupportedRawStrategy(tag) => write!(
+            target,
+            "raw ingress full-queue strategy {tag} is reserved and unsupported"
+        ),
+        HostServiceError::UnknownRawStrategy(tag) => {
+            write!(target, "raw ingress full-queue tag {tag} is invalid")
+        }
+        HostServiceError::UnboundOutput(name) => {
+            write!(target, "output port '{name}' is not wired in the graph")
+        }
         other => write!(target, "{other:?}"),
     }
 }
@@ -1640,14 +1694,15 @@ fn classify_failure(error: &HostServiceError, error_token: u64) -> HostCallFailu
     let status = match error {
         HostServiceError::Transport(_) => 2,
         HostServiceError::Panicked => 3,
-        HostServiceError::MissingCapability => 7,
+        HostServiceError::MissingCapability | HostServiceError::UnsupportedRawStrategy(_) => 7,
+        HostServiceError::UnboundOutput(_) => 2,
         HostServiceError::BufferTooSmall(_) => 8,
         HostServiceError::State(crate::state::StateError::SinkFull) => 8,
         HostServiceError::State(_) => 2,
         HostServiceError::Lease(LeaseError::InvalidHandle | LeaseError::WrongOwner)
         | HostServiceError::Terminal => 4,
         HostServiceError::InvalidDescriptor
-        | HostServiceError::UnsupportedRawStrategy(_)
+        | HostServiceError::UnknownRawStrategy(_)
         | HostServiceError::Lease(LeaseError::InvalidBudget | LeaseError::InvalidTransition) => 5,
         HostServiceError::InvalidState => abi::status_code::INVALID_STATE,
         HostServiceError::DestroyBusy => abi::status_code::BUSY,
@@ -1924,7 +1979,7 @@ host_callback!(callback_head(context, port: abi::PortHandle, operation: u32, out
     if matches!(operation, abi::head_op::DRAIN | abi::head_op::REFILL) {
         let index = host.port_index(context.value, port.value, LeaseDirection::Read)?;
         host.unborrowed(index)?;
-        let Some(super::node::AnySubscriber::Ipc(subscriber)) = host.native.subscriber_mut(&host.ports[index].spec.name) else { return Err(HostServiceError::InvalidDescriptor); };
+        let Some(super::node::AnySubscriber::Ipc(subscriber)) = host.native.subscriber_mut(&host.ports[index].spec.name) else { out.write(value); return Ok(status(abi::status_code::OK)); };
         let site = if operation == abi::head_op::DRAIN { SyncAlignSite::Boundary } else { SyncAlignSite::Refill };
         let (popped, stamp, withheld, failed) = subscriber.plugin_trigger_drain(site);
         value.popped = popped;
@@ -2068,6 +2123,10 @@ host_callback!(callback_event(context, port: abi::PortHandle, kind: u32, out: *m
 host_callback!(callback_counters(context, port: abi::PortHandle, out: *mut abi::PublisherCountersV1) |host, memory| {
     let out = memory.output(out)?;
     let index = host.port_index(context.value, port.value, LeaseDirection::Write)?;
+    if host.native.publisher(&host.ports[index].spec.name).is_none() {
+        out.write(abi::PublisherCountersV1 { committed: 0, discarded: 0, send_failures: 0 });
+        return Ok(status(abi::status_code::OK));
+    }
     let publisher = host.output_publisher(index)?;
     out.write(abi::PublisherCountersV1 { committed: u64::from(publisher.committed_frames()), discarded: publisher.output_discard_count(), send_failures: publisher.frames_dropped_send_fail() });
     Ok(status(abi::status_code::OK))
@@ -2571,7 +2630,9 @@ mod tests {
             (HostServiceError::InvalidState, 9),
             (HostServiceError::DestroyBusy, 6),
             (HostServiceError::InvalidDescriptor, 5),
-            (HostServiceError::UnsupportedRawStrategy(2), 5),
+            (HostServiceError::UnsupportedRawStrategy(2), 7),
+            (HostServiceError::UnknownRawStrategy(3), 5),
+            (HostServiceError::UnboundOutput("missing".into()), 2),
             (HostServiceError::BufferTooSmall(17), 8),
             (
                 HostServiceError::State(crate::state::StateError::SinkFull),

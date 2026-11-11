@@ -8,8 +8,9 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 ## Host-owned node leases
 
 `transport/plugin_lease.rs` provisions fixed lease rows before execution. Tokens
-use nonwrapping generations shared across contexts; a stale, foreign or wrong
-direction token cannot change a port or consume a frame. A row is claimed before
+use process-wide lease generations that wrap and skip zero; context identities
+remain nonwrapping. Each active row checks its generation, owner and direction
+before a token can change a port or consume a frame. A row is claimed before
 loan or receive, so budget refusal has no transport effect. Native sample owners
 stay in the host and are returned exactly once.
 
@@ -30,6 +31,9 @@ Raw accumulation uses `AccumulatorSet`'s existing gather, order, loss, event and
 state machinery. A fire offers one repeatable batch; indexed immutable frame
 leases retain it until release. Per-port capture omits the outer input count and
 restore preflights the entire canonical record before applying native restore.
+Unwired declarations still bind: plain reads are empty, accumulation reports zero
+frames, and an output loan refuses with its declaration name. Unbound output
+bindings carry zero capacity; no native port or lease is created for them.
 `node_host_abi_test` asserts downstream wire bytes, discard/sequence behavior,
 spill lifetime, repeat views, state refusal and allocation-detector controls.
 

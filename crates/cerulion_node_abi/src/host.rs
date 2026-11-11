@@ -111,6 +111,8 @@ pub struct HostApiV1 {
     /// Cold create of a bounded host-owned raw-ingress publisher. All topic
     /// bytes are borrowed only for this call; returned topic borrows immutable
     /// context-lifetime storage. Exhausted publisher budget returns FAILED.
+    /// RESERVED_BLOCK returns UNSUPPORTED (7); unknown queue tags return
+    /// INVALID_ARGUMENT (5), with a named diagnostic and cold warning.
     pub create_raw_publisher:
         unsafe extern "C" fn(ContextHandle, RawPublisherRequestV1, *mut PortBindingV1) -> Status,
     /// Consume a raw write lease once, including on failure. Preserve the complete

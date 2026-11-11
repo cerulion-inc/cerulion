@@ -29,6 +29,7 @@ pub(super) struct RawServices {
     normal_ports: usize,
     lease_budget: usize,
     diagnostic: Mutex<RawDiagnostic>,
+    queue_diagnostics: [Mutex<crate::transport::failure_regime_latch::FailureRegimeLatch>; 2],
     pub(super) active: AtomicUsize,
     pub(super) committed: AtomicU64,
     pub(super) discarded: AtomicU64,
@@ -61,6 +62,9 @@ impl RawServices {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             next: Mutex::new(0),
+            queue_diagnostics: std::array::from_fn(|_| {
+                Mutex::new(crate::transport::failure_regime_latch::FailureRegimeLatch::new())
+            }),
             manager,
             clock,
             normal_ports,
@@ -150,7 +154,32 @@ impl RawServices {
         let strategy = match request.full_queue {
             abi::full_queue::CONFIG_DEFAULT => FullQueueSend::ConfigDefault,
             abi::full_queue::DISCARD => FullQueueSend::Discard,
-            tag => return Err(HostServiceError::UnsupportedRawStrategy(tag)),
+            tag => {
+                use crate::transport::failure_regime_latch::RegimeDecision;
+                let reserved = tag == abi::full_queue::RESERVED_BLOCK;
+                let mut latch = crate::transport::failure_regime_latch::lock_regime_latch(
+                    &self.queue_diagnostics[usize::from(!reserved)],
+                );
+                match latch.on_failure() {
+                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(
+                        topic,
+                        full_queue = tag,
+                        total_failures = latch.total_failures(),
+                        "raw ingress full-queue strategy refused"
+                    ),
+                    RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                        topic,
+                        full_queue = tag,
+                        suppressed_count = suppressed,
+                        "raw ingress full-queue strategy refusal repeated"
+                    ),
+                }
+                return Err(if reserved {
+                    HostServiceError::UnsupportedRawStrategy(tag)
+                } else {
+                    HostServiceError::UnknownRawStrategy(tag)
+                });
+            }
         };
         if topic.is_empty() || request.configured_capacity < WireHeader::SIZE as u32 {
             return Err(HostServiceError::InvalidDescriptor);
@@ -187,6 +216,17 @@ impl RawServices {
             .map_err(|_| HostServiceError::InvalidDescriptor)?;
         *next += 1;
         let row = self.row(index)?;
+        for latch in &self.queue_diagnostics {
+            if let Some(suppressed) =
+                crate::transport::failure_regime_latch::lock_regime_latch(latch).on_success()
+            {
+                tracing::info!(
+                    topic = %row.topic,
+                    suppressed_count = suppressed,
+                    "raw ingress full-queue strategy recovered"
+                );
+            }
+        }
         Ok(abi::PortBindingV1 {
             port: abi::PortHandle {
                 value: self.port_handle(context, index),
@@ -223,7 +263,7 @@ impl RawServices {
                 return Err(HostServiceError::InvalidDescriptor);
             }
             let token = state.leases.claim(port, LeaseDirection::Write)?;
-            let loan = match publisher.loan_plugin_raw_frame(request.minimum_capacity) {
+            let mut loan = match publisher.loan_plugin_raw_frame(request.minimum_capacity) {
                 Ok(loan) => loan,
                 Err(error) => {
                     state.leases.cancel(token)?;
@@ -231,7 +271,7 @@ impl RawServices {
                 }
             };
             let slot = abi::WriteSlotV1 {
-                data: loan.as_ptr().cast_mut(),
+                data: loan.bytes_mut().as_mut_ptr(),
                 lease: abi::LeaseHandle { value: token },
                 schema_hash: row.schema_hash,
                 capacity: request.minimum_capacity,
