@@ -5,6 +5,7 @@ use super::*;
 use crate::account_access::{AccountAccessReply, AccountAccessRequest, RobotPresence};
 use crate::iroh_plane::RobotProbeOutcome;
 use crate::mirror::{MirrorError, MirrorRelease};
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 
 impl AccountWanController {
     fn account_robot<'a>(
@@ -168,6 +169,7 @@ impl AccountWanController {
         let Some(readers) = state.handover.take() else {
             return Ok(());
         };
+        let mut sync_failures = FailureRegimeLatch::new();
         let ready = match self.sync_identity(state) {
             Err(error) => Err(error),
             Ok(()) if state.serving_gateway => loop {
@@ -179,7 +181,16 @@ impl AccountWanController {
                 match result {
                     Ok(()) => break Ok(()),
                     Err(error) if Instant::now() >= deadline => break Err(error),
-                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(error) => {
+                        if !matches!(
+                            sync_failures.on_failure(),
+                            RegimeDecision::Suppressed { .. }
+                        ) {
+                            tracing::debug!(error = %error, total_failures = sync_failures.total_failures(),
+                                "outbound shared endpoint synchronization is waiting");
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                 }
             },
             Ok(()) => Ok(()),

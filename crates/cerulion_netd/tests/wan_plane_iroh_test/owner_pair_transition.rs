@@ -205,6 +205,17 @@ fn actual_child_fixture() {
         ),
     )
     .unwrap();
+    // iceoryx2 resolves the project config from cwd, independently of CERULION_HOME.
+    // The real child inherits this private directory and loads the same namespace.
+    let previous_cwd = std::env::current_dir().unwrap();
+    struct RestoreCwd(std::path::PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+    let _cwd = RestoreCwd(previous_cwd);
+    std::env::set_current_dir(login.directory.path()).unwrap();
     let _socket = EnvGuard::set("CERULION_NETD_SOCK", &desk.socket);
     let _relay = EnvGuard::set("CERULION_NETD_RELAY_DISABLED", "1");
     let gateway = Arc::new(cerulion_netd::GatewayEgressPlane::new(desk.manager.clone()));
