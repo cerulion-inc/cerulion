@@ -17,7 +17,7 @@ rerun), `bin/cerulion_vizd` (desk viz daemon). NOT default-members: a plain `car
 - `account:<robot-id>` routes keep netd's refusals and never fall back to LAN; validate before
   pinned-schema fast paths (`account_route_test`).
 - The four topic surfaces (discover/list/status/attach) read ONE attribution map
-  (`Ctx::attribution_snapshot`); post-attach attribution is cached - poll, never read once.
+  (`Ctx::attribution_snapshot`); only discover/local attach refresh it, so poll discover then list.
 - Dump-companion panes are gated on `RenderProof` (per input, sticky); a new layout-affecting
   signal joins the drain-loop comparison or it never reflows.
 - MarkerArray is a stateful mutation stream: never auto-clear absent markers, never coalesce
