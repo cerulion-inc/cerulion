@@ -34,10 +34,11 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
-- Metadata reads namespace-checked netd snapshots (no startup) or in-process
-  `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
+- Metadata: namespace-checked netd snapshots or in-process `SchemaSource`; no startup.
+  Recheck CAP_OBSERVE/privacy after awaits. Schema-only reads use no leases.
 - Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
-- Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Validation refusals retain readers; failed cleanup fences. Retire only outbound.
+- Outbound shares endpoint/runtime/node; key/namespace gate before dial. Refusals
+  keep readers; cleanup failure fences. Retire only outbound.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft

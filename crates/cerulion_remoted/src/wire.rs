@@ -589,14 +589,9 @@ impl WirePlane {
         topic: &str,
         taps: &mut TapManager,
     ) -> Result<SchemaReply, WireError> {
-        let _source = self
-            .manager()?
-            .acquire_local_topic_lease(topic)
-            .map_err(|error| WireError::SchemaSource(error.to_string()))?;
-        let _scope = self
-            .manager()?
-            .acquire_remote_topic_lease(topic)
-            .map_err(|error| WireError::SchemaSource(error.to_string()))?;
+        // Metadata has no data port to protect. Creating temporary policy
+        // services here races their final destruction with later policy reads.
+        // Header inspection owns its leases with its actual tap instead.
         let Some(source) = &self.local_schemas else {
             return Ok(self.serve_schema(topic));
         };
@@ -954,7 +949,21 @@ async fn handle_request(
                 return refusal;
             }
             match schema {
-                Ok(reply) => WireResponse::Schema(reply),
+                Ok(reply) => {
+                    match plane
+                        .manager()
+                        .map_err(|error| error.to_string())
+                        .and_then(|manager| {
+                            wire_servable(&manager, &topic)
+                                .map_err(|refusal| refusal.message(&topic))
+                        }) {
+                        Ok(()) => WireResponse::Schema(reply),
+                        Err(message) => WireResponse::Error {
+                            topic: Some(topic),
+                            message,
+                        },
+                    }
+                }
                 Err(error) => WireResponse::Error {
                     topic: Some(topic),
                     message: error.to_string(),

@@ -2293,6 +2293,11 @@ iroh uses a direct connection when possible, including on one LAN, and a relay
 otherwise. No listen setting, IP address or `--connect` flag is required for that
 path. See [authenticated discovery](networking.md#making-a-robot-discoverable).
 
+Remote schema reads use current producer registrations, including a registration
+that arrives after the reader connects. A schema lookup without topic data
+opens no data reader and does not prevent a local producer from starting.
+Authorization and producer privacy are checked again before returning metadata.
+
 An enabled `network:` block restricts exported topics and declares imported
 topics. Under paired access each import selects a unique authenticated producer;
 schema, QoS, single-writer and recording-plus-ingress checks remain enforced.
