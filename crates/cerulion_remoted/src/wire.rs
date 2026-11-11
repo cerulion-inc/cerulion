@@ -191,11 +191,18 @@ pub enum WireResponse {
     },
 }
 
-/// The `status` reply payload: one row per demanded topic.
+/// The `status` reply payload: one row per demanded topic, and the daemon's
+/// count of dropped log lines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReply {
     /// Per-topic WAN counter rows, sorted by topic.
     pub topics: Vec<TopicStatus>,
+    /// The log lines the `cerulion-remoted` daemon dropped since it started
+    /// ([`crate::log_writer::lines_dropped`]): refused by its log queue (full,
+    /// or a line longer than its byte bound), or lost to a failed write to
+    /// stderr. Absent, and `None`, from a host that runs no daemon log writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_lines_dropped: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
@@ -834,6 +841,7 @@ async fn handle_request(
         }
         WireRequest::Status => WireResponse::Status(StatusReply {
             topics: taps.status(),
+            log_lines_dropped: crate::log_writer::lines_dropped(),
         }),
         // The desk pushed the robot's latest revocation epoch. Applying it
         // may revoke the VERY desk that pushed it — that is correct and expected (a
@@ -1069,6 +1077,28 @@ mod tests {
             })
             .unwrap(),
             r#"{"reply":"epoch_synced","epoch":7,"applied":true}"#
+        );
+    }
+
+    /// A status reply names `log_lines_dropped` only when it has a count.
+    /// Hand oracle.
+    #[test]
+    fn a_status_reply_names_its_log_count_only_when_it_has_one() {
+        assert_eq!(
+            serde_json::to_string(&WireResponse::Status(StatusReply {
+                topics: vec![],
+                log_lines_dropped: None,
+            }))
+            .unwrap(),
+            r#"{"reply":"status","topics":[]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WireResponse::Status(StatusReply {
+                topics: vec![],
+                log_lines_dropped: Some(7),
+            }))
+            .unwrap(),
+            r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
         );
     }
 

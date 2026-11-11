@@ -404,12 +404,7 @@ unsafe fn publish_serialized_live(
                 // frame natively for late joiners (see rmw_publish). Drain
                 // events so a SubscriberConnected delivers it via
                 // update_connections.
-                inner.publisher.check_subscriber_events();
-                if let Err(e) = inner.publisher.notify_sent_sample() {
-                    // Best-effort wake (frame is on the wire + in history);
-                    // log at debug like the rmw_publish / loaned siblings.
-                    tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                }
+                super::pubsub::wake_after_send(&mut inner.publisher, &data.topic);
                 RMW_RET_OK
             }
             Err(e) => {
@@ -468,7 +463,8 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
 
         let mut frame: Option<Vec<u8>> = None;
         let mut info_out: Option<(u64, u64, u128)> = None;
-        let receive = inner.subscriber.try_receive_one(|msg| {
+        let sub = &inner.subscriber;
+        let receive = sub.try_receive_one_with(super::pubsub::TAKE_LISTENER_DRAIN, |msg| {
             let origin = msg.origin();
             // Reassemble the full frame (header + payload) — "cerulion"
             // serialization format IS the wire frame.

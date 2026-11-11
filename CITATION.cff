@@ -1,6 +1,11 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: Cerulion
+abstract: >-
+  Cerulion is the operating system for physical AI. This repository holds the
+  open-source runtime: a zero-copy robot runtime that records runs to MCAP and
+  re-runs supported native recordings against new code, and rmw_cerulion for
+  ROS 2 (validated on Jazzy).
 # Founders as personal authors (citation credit), then the entity;
 # further individual contributors are credited in docs/legal/AUTHORS.
 authors:
@@ -10,13 +15,14 @@ authors:
     given-names: Raveen
   - name: "Cerulion Inc. and contributors"
 version: 2.0.0
-date-released: "2026-09-21"
+date-released: "2026-11-11"
 url: "https://github.com/cerulion-inc/cerulion"
 repository-code: "https://github.com/cerulion-inc/cerulion"
 license: AGPL-3.0-only
 keywords:
   - robotics
-  - middleware
+  - ai-agents
+  - mcp
   - zero-copy
   - ROS2
   - iceoryx2

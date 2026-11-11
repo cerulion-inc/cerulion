@@ -78,6 +78,59 @@
 //! overwhelmingly common shape) get this word. [`CreditShared::try_claim`] is
 //! sound as a CLAIM only under that fence; see its docs.
 //!
+//! # When the count is exact, and where it stops
+//!
+//! A producer counts a frame on the word BEFORE the frame becomes visible:
+//! every send path of `CerulionPublisher` counts on each block word, then
+//! sends, and takes the count back when the send errs
+//! ([`CreditShared::record_published`], [`CreditShared::record_unpublished`]).
+//! iceoryx2 publishes a frame to a consumer with a `Release` store inside
+//! `send()`, the consumer's pop is an `Acquire` load of it and its drain comes
+//! after the pop, so a drain never finds the word without the count of a frame
+//! it removes, however the two processes are scheduled.
+//!
+//! The take-back is exact under iceoryx2's default safe overflow (on) and
+//! default degradation action (`Warn`): with both, a `send()` that returns
+//! `Err` delivered the frame to no connection. Cerulion sets neither. No
+//! publisher sets a degradation handler, and safe overflow comes from the
+//! iceoryx2 configuration the process loads, which an operator `iceoryx2.toml`
+//! can change: with `enable-safe-overflow = false`, a `send()` to several
+//! consumers can return `Err` after some of their queues took the frame, and
+//! the take-back then leaves each of those words one frame below its queue.
+//! `credit_block_iox2_test::the_block_publisher_keeps_safe_overflow_and_the_default_degradation`
+//! reads safe overflow from a block topic's service built under the test
+//! configuration, which carries iceoryx2's compiled-in defaults, and scans the
+//! workspace for a degradation handler, so it pins those defaults and no
+//! operator file.
+//!
+//! What this does NOT cover. Each case leaves the word off by the frames
+//! involved for as long as the edge runs:
+//!
+//! - **Frames the word never counts.** Native history delivered to a late
+//!   joiner (graph build warns about a `block` topic with `history_size > 0`),
+//!   and a writer outside the graph on a `multi_publisher_topics` topic. Their
+//!   drains leave the word BELOW the queue, so the producer can overrun the
+//!   declared depth. A drain that removes more frames than the word counts
+//!   clips the word at 0, and is reported once per regime and counted by the
+//!   consumer (`CerulionSubscriber::block_drains_clipped`); a drain the word's
+//!   count still covers is indistinguishable from a counted drain.
+//! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
+//!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
+//!   without touching the word, so a `block` input read through them leaves
+//!   the word ABOVE the queue.
+//! - **A send that returns `Ok` without reaching this consumer's queue**, such
+//!   as one to a consumer whose port connected after the send updated its
+//!   connections: the frame stays counted and no drain ever pays for it.
+//! - **Several in-graph producers across processes on one edge.** Graph
+//!   planning refuses that shape (`CreditBar::MultipleProducers`) rather than
+//!   counting it.
+//!
+//! One window is transient rather than lasting: a frame moving from the queue
+//! into a per-set Sync matcher slot is drained at its pop and credited back as
+//! held by the slot re-derivation just after, so between the two the word reads
+//! one frame low. A publish admitted in that instant cannot evict a counted
+//! frame, because the frame being moved has already left the queue.
+//!
 //! # Scope of this module
 //!
 //! The primitive ONLY. The runtime, the scheduler and the plan
@@ -391,9 +444,19 @@ impl CreditShared {
         !self.is_full()
     }
 
-    /// Record that one frame was published to this edge's topic — the consumer's
-    /// queue just gained a sample. Returns the `outstanding` count THIS publish
-    /// created.
+    /// Record that one frame is being published to this edge's topic. Returns
+    /// the `outstanding` count THIS publish created.
+    ///
+    /// The publisher calls this BEFORE `send()` makes the frame visible
+    /// (`CerulionPublisher::send_counted`), and takes the count back with
+    /// [`record_unpublished`](Self::record_unpublished) when the send reaches
+    /// no queue. The order is what keeps a consumer in another process exact:
+    /// the count is sequenced before the queue push, the push is a `Release`
+    /// store and the consumer's pop an `Acquire` load of it, and the drain is
+    /// sequenced after the pop, so the drain of a frame always finds that
+    /// frame's count on the word. A count taken after `send()` returns can land
+    /// after the drain of the frame it counts; the drain then saturates at 0
+    /// and the late count leaves the word one frame above an empty queue.
     ///
     /// `Release` so the producer's own subsequent `Acquire` defer-read, and the
     /// consumer's, see a consistent count. Deliberately issues NO wake: nothing
@@ -460,6 +523,33 @@ impl CreditShared {
             .wrapping_add(n)
     }
 
+    /// Take back the count one [`record_published`](Self::record_published)
+    /// took for a send that reached no queue. Returns the `outstanding` count
+    /// after the take-back.
+    ///
+    /// The inverse of the count, for the one publish whose `send()` returned
+    /// an error: with safe overflow on and the default degradation action, an
+    /// iceoryx2 send that errs pushed the frame to no connection, so no
+    /// consumer can ever drain it and the count it took must not stand.
+    ///
+    /// Saturating, like [`record_drained`](Self::record_drained): a drain of a
+    /// frame the word never counted can take the count away before this runs,
+    /// and a wrapping subtraction would then read `u64::MAX`, which defers the
+    /// producer forever. Issues no wake: the frame never reached a queue, so no
+    /// room a producer could be parked for has been freed.
+    pub fn record_unpublished(&self) -> u64 {
+        // INFALLIBLE: the closure always returns `Some`, so `try_update`
+        // returns `Ok(previous)`; the `Err` arm carries the same value and is
+        // matched only to read it without a discard.
+        match self
+            .outstanding
+            .try_update(Ordering::Release, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            }) {
+            Ok(previous) | Err(previous) => previous.saturating_sub(1),
+        }
+    }
+
     /// Record that `removed` samples were drained from the consumer's queue —
     /// decrement the mirror and FREE the credit (bumping the wake epoch and
     /// waking any parked producer).
@@ -473,20 +563,34 @@ impl CreditShared {
     /// idle drain pass never taxes a parked producer with a spurious wake.
     /// Under k-fires-per-step this is called PER POPPED FRAME by the post-FIFO
     /// drain, which is why the epoch bump has to be cheap when nobody parks.
-    pub fn record_drained(&self, removed: u64) {
+    ///
+    /// Returns how many of the `removed` frames the subtraction could NOT take
+    /// off because the word had already reached 0: 0 for every drain whose
+    /// frames the word counted. Since the publisher counts a frame before its
+    /// send makes it visible, a clip means the drain removed frames the word
+    /// never counted (a late joiner's history replay, a writer outside the
+    /// graph on a `multi_publisher_topics` topic, or a count another drain
+    /// already took). The consumer's block probe reports it once per regime
+    /// (`CerulionSubscriber::block_drains_clipped`); a force-release through a
+    /// mapping (`record_drained(u64::MAX)`, see the [module docs](self))
+    /// clips by design and may ignore it.
+    pub fn record_drained(&self, removed: u64) -> u64 {
         if removed == 0 {
-            return;
+            return 0;
         }
-        // The result is INFALLIBLE by construction: `try_update` returns `Err`
-        // only when the closure returns `None`, and this closure always returns
-        // `Some`. So the discard drops a `Result` that cannot be `Err`, never a
-        // failure signal.
-        let _ = self
-            .outstanding
-            .try_update(Ordering::Release, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(removed))
-            });
+        // INFALLIBLE: the closure always returns `Some`, so `try_update`
+        // returns `Ok(previous)`; the `Err` arm carries the same value and is
+        // matched only to read it without a discard.
+        let previous =
+            match self
+                .outstanding
+                .try_update(Ordering::Release, Ordering::Acquire, |v| {
+                    Some(v.saturating_sub(removed))
+                }) {
+                Ok(previous) | Err(previous) => previous,
+            };
         self.note_credit_freed();
+        removed.saturating_sub(previous)
     }
 
     // ==================== the producer park's wake word ====================
@@ -1940,6 +2044,75 @@ mod tests {
         // wrapping to u64::MAX and deferring the producer forever.
         w.record_drained(99);
         assert_eq!(w.outstanding(), 0);
+    }
+
+    /// `record_unpublished` takes back one count and returns the count it
+    /// left. Oracle, by hand, on a depth-4 word: three counts read 3, a
+    /// take-back leaves 2, two more leave 1 and 0, and a take-back on the word
+    /// at 0 leaves it at 0 and returns 0. A wrapping subtraction there would
+    /// read `u64::MAX`, which no drain brings back below the depth.
+    #[test]
+    fn a_take_back_removes_one_count_and_stops_at_zero() {
+        let w = CreditShared::new(4);
+        assert_eq!(w.record_published_n(3), 3);
+        assert_eq!(w.record_unpublished(), 2, "3 -> 2");
+        assert_eq!(w.outstanding(), 2);
+        assert_eq!(w.record_unpublished(), 1, "2 -> 1");
+        assert_eq!(w.record_unpublished(), 0, "1 -> 0");
+        assert_eq!(w.outstanding(), 0);
+        assert_eq!(w.record_unpublished(), 0, "a take-back on a word at 0");
+        assert_eq!(w.outstanding(), 0, "leaves the word at 0, never u64::MAX");
+        assert!(w.try_claim(), "so the producer is admitted");
+    }
+
+    /// A take-back rings no wake: the frame never reached a queue, so it freed
+    /// no room a parked producer waits for. Oracle: `wake_seq` reads the same
+    /// before and after, where a drain of the same count bumps it by one.
+    #[test]
+    fn a_take_back_rings_no_wake() {
+        let w = CreditShared::new(2);
+        w.record_published();
+        let before = w.wake_seq_snapshot();
+        assert_eq!(w.record_unpublished(), 0);
+        assert_eq!(w.wake_seq_snapshot(), before, "no ring on a take-back");
+        w.record_published();
+        assert_eq!(w.record_drained(1), 0);
+        assert_eq!(
+            w.wake_seq_snapshot(),
+            before.wrapping_add(1),
+            "the control: a drain of the same count rings once"
+        );
+    }
+
+    /// `record_drained` returns the frames its subtraction could not take off
+    /// because the word reached 0. Oracle vectors, by hand, as `(word before,
+    /// removed) -> (returned, word after)`: `(2, 1) -> (0, 1)`, `(1, 1) -> (0,
+    /// 0)`, `(1, 99) -> (98, 0)`, `(0, 1) -> (1, 0)`, `(3, 0) -> (0, 3)`, and
+    /// the force-release `(3, u64::MAX) -> (u64::MAX - 3, 0)`.
+    #[test]
+    fn a_drain_returns_the_frames_it_could_not_take_off() {
+        let vectors: [(u64, u64, u64, u64); 6] = [
+            (2, 1, 0, 1),
+            (1, 1, 0, 0),
+            (1, 99, 98, 0),
+            (0, 1, 1, 0),
+            (3, 0, 0, 3),
+            (3, u64::MAX, u64::MAX - 3, 0),
+        ];
+        for (before, removed, clipped, after) in vectors {
+            let w = CreditShared::new(4);
+            assert_eq!(w.record_published_n(before), before);
+            assert_eq!(
+                w.record_drained(removed),
+                clipped,
+                "a drain of {removed} on a word at {before} clips {clipped}"
+            );
+            assert_eq!(
+                w.outstanding(),
+                after,
+                "and leaves the word at {after} (drain of {removed} on {before})"
+            );
+        }
     }
 
     /// Two clones of one LOCAL word are one word — the property every wiring
