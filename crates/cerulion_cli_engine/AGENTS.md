@@ -1,7 +1,6 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
+CLI logic; `cerulion_cli` is the thin clap binary. Testable in-process.
 Every workspace-file writer (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
@@ -16,6 +15,7 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
 - Enforce invariants at the engine boundary; CLI checks are UX.
+- Paired starts are quiet; Open warns for every plan using the daemon's posture.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
   share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
@@ -39,8 +39,8 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
 ## Workspace dependency contract
-Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
-pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
+Dependencies follow the binary, never cwd: checkout paths or exact registry pins.
+Contract/compiler checks: `docs/internals/cli.md` §11.
 ## Testing
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc

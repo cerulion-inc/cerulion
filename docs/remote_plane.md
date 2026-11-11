@@ -101,7 +101,8 @@ While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 
 The only other desk to robot topic path today is LAN ingress (an `ingress:`
 block in a graph), which proves no identity per peer and is closed when
-`CERULION_LAN_ACCESS=paired`.
+`CERULION_LAN_ACCESS=paired`, the default on every platform. Open LAN access
+requires an explicit `CERULION_LAN_ACCESS=open` selection and warns at startup.
 
 ## The deadman: a quiet operator loses the lease
 

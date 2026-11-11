@@ -360,6 +360,10 @@ fn gateway_on_default_root(tag: &str) -> GatewayRuntime {
         iceoryx2::config::Config::global_config().clone(),
     )
     .expect("gateway manager on the default iceoryx2 root");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![],

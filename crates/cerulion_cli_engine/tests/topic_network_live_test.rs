@@ -78,6 +78,7 @@ fn remote_discovery_over_loopback_finds_advertised_topics() {
             listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -147,6 +148,7 @@ fn remote_discovery_finds_announced_topics() {
             listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -223,6 +225,7 @@ fn remote_discovery_catalog_get_enriches_with_catalog_only_topics() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -326,6 +329,7 @@ fn remote_discovery_catalog_union_preserves_announce_only_topics() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -500,6 +504,7 @@ fn announce_presence_surfaces_a_robots_row_over_loopback() {
             robot_identity: Some("e2e".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -601,6 +606,7 @@ fn bare_identity_token_alone_surfaces_a_zero_topic_row() {
             robot_identity: Some("bare".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -672,6 +678,7 @@ fn bounded_connect_never_stalls_on_a_black_hole_locator() {
             robot_identity: Some("bh".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -752,6 +759,7 @@ fn tarpit_ladder_candidate_does_not_sink_the_gather() {
             robot_identity: Some("tarpit".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -866,6 +874,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -927,6 +936,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // HAND oracle frame: Widget { x: 3.5, y: -7.25 } — a fixed-only frame is the
@@ -1038,6 +1048,7 @@ fn catalog_verb_carries_per_topic_schema_name() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -1079,6 +1090,7 @@ fn catalog_verb_carries_per_topic_schema_name() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let dsession = desk.session().expect("desk session");
     for _ in 0..40 {
         if let Some(catalog) = query_robot_catalog(dsession, robot, Duration::from_millis(300)) {
@@ -1108,6 +1120,7 @@ fn bind_listening_robot(robot: &str, base: u16) -> (NetworkManager, u16) {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             return (mgr, port);
         }
@@ -1176,6 +1189,7 @@ fn schema_verb_serves_package_less_yaml_type() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // Fetch the BARE name over the 1-chunk `schema/{Name}` selector.
@@ -1298,6 +1312,7 @@ fn schema_verb_nested_custom_frame_decodes_via_fetched_dependency() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // HAND oracle frame: Widget { scale: 1.5, gadget: Gadget { count: 42 } }.
@@ -1703,6 +1718,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -1899,6 +1915,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -2084,6 +2101,7 @@ fn a_runtime_builtin_row_named_through_hash_bindings_resolves_found_locally() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;

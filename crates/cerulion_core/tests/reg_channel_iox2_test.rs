@@ -79,6 +79,9 @@ fn gateway_on(tag: &str, root: &iceoryx2::config::Config) -> GatewayRuntime {
         root.clone(),
     )
     .expect("init gateway manager");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![],
@@ -2020,6 +2023,10 @@ fn a_restarted_gateway_records_runtime_hashes_into_the_latched_catalog() {
         root.clone(),
     )
     .expect("init gateway manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = || GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![],
@@ -2071,6 +2078,10 @@ fn a_restarted_gateway_serves_its_schemas_through_the_latched_surface() {
         root,
     )
     .expect("init gateway manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let serving = |topic: &str, schema: &str, hash: u64| SchemaServing {
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
@@ -2150,6 +2161,10 @@ fn a_restarted_gateway_withdraws_the_prior_runs_announcements() {
         root,
     )
     .expect("init gateway manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let kept = format!("/rt/withdraw/kept/{}", unique_id());
     let dropped = format!("/rt/withdraw/dropped/{}", unique_id());
     let plan = |announce: Vec<String>| GatewayPlan {
@@ -2213,6 +2228,10 @@ fn a_restarted_gateway_does_not_drive_the_prior_runs_unregistered_topics() {
         root,
     )
     .expect("init gateway manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let kept = format!("/rt/unregister/kept/{}", unique_id());
     let dropped = format!("/rt/unregister/dropped/{}", unique_id());
     let plan = |announce: Vec<String>| GatewayPlan {
