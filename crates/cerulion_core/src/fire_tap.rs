@@ -401,7 +401,9 @@ impl FireTap {
             let seq = batch.next + 1;
             let slot = &self.slots[((seq - 1) as usize) & (self.slots.len() - 1)];
             // Only drops raise `settled`: reaching `seq` means `seq` was dropped
-            // or a later claim on this slot lapped it.
+            // or a later claim on this slot lapped it. A lapped `seq` is out of
+            // the window even if its writer still commits, so every later page
+            // counts it lost through `floor` too. Loss is counted once.
             let settled = slot.settled.load(Ordering::Acquire);
             let stamp = slot.stamp.load(Ordering::SeqCst);
             let committed = 2 * seq + 2;
@@ -860,6 +862,46 @@ mod tests {
         assert_eq!(next.records[0].at_ns, 65);
         assert_eq!(next.next, 66);
         assert_eq!(next.lost, 0);
+    }
+
+    #[test]
+    fn a_later_drop_on_a_writing_slot_counts_each_sequence_once() {
+        let (tap, _) = tap(64);
+        tap.serve(Cursor::Now, 0);
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (raced, rest) = std::thread::scope(|scope| {
+            let tap_ref = &tap;
+            let writer = scope.spawn(move || {
+                tap_ref.push_with(body(0), |seq| {
+                    claimed_tx.send(seq).unwrap();
+                    resume_rx.recv_timeout(PAUSE_LIMIT).unwrap();
+                })
+            });
+            assert_eq!(claimed_rx.recv().unwrap(), 1);
+            // Seq 65 finds seq 1 still writing slot 0 and drops.
+            for id in 1..65 {
+                tap.push(body(id));
+            }
+            assert_eq!(tap.slots[0].settled.load(Ordering::Relaxed), 65);
+            // Replays a reader that loaded head before seq 65 was reserved.
+            tap.head.store(64, Ordering::Relaxed);
+            let raced = tap.serve(Cursor::After(0), 512);
+            tap.head.store(65, Ordering::Relaxed);
+            resume_tx.send(()).unwrap();
+            writer.join().unwrap();
+            let rest = tap.serve(Cursor::After(raced.next), 512);
+            (raced, rest)
+        });
+        assert_eq!((raced.next, raced.lost, raced.records.len()), (64, 1, 63));
+        assert_eq!((rest.next, rest.lost, rest.records.len()), (65, 1, 0));
+        // Seq 1 has now committed, but seq 65 superseded it. A reader that
+        // starts after the commit also counts it lost, so the raced page did
+        // not inflate loss: each sequence counts once in either order.
+        assert_eq!(tap.slots[0].stamp.load(Ordering::Relaxed), 4);
+        let fresh = tap.serve(Cursor::After(0), 512);
+        assert_eq!((fresh.next, fresh.lost, fresh.records.len()), (65, 2, 63));
+        assert_eq!(fresh.records, raced.records);
     }
 
     #[test]
