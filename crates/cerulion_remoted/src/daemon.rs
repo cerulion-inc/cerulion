@@ -20,8 +20,7 @@ use std::time::Duration;
 
 use cerulion_core::TransportManager;
 use cerulion_link::{
-    accept_frame_stream, accept_one, read_frame, write_frame, Accepted, Connection, Endpoint,
-    LinkError,
+    accept_frame_stream, read_frame, write_frame, Accepted, Connection, Endpoint, LinkError,
 };
 use cerulion_pairing::format::PublicKey;
 use cerulion_pairing::verify::TrustStore;
@@ -55,6 +54,9 @@ const MAX_HELLO_LEN: usize = 4096;
 /// semaphore acquired before `spawn`, released on the handler's completion) is a
 /// defensible additional guard and is not implemented.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Bound unauthenticated work without serializing one peer ahead of safety ops.
+const MAX_PENDING_HANDSHAKES: usize = 32;
 
 /// Build the daemon from config and serve until `shutdown` resolves (or the
 /// endpoint closes). `shutdown` is dropped as soon as the accept loop stops,
@@ -433,11 +435,12 @@ pub async fn serve_planes(
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
     let mut admission_failures =
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    // accept_one owns an Incoming while its handshake completes. A refresh tick
-    // must not cancel it and close an otherwise valid new ops/wire connection.
-    let mut accepting = Box::pin(accept_one(endpoint));
+    let mut handshakes = tokio::task::JoinSet::<Result<Accepted, LinkError>>::new();
+    let mut handshake_admission_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
     let closed_on_its_own = loop {
         tokio::select! {
+            biased;
             _ = &mut shutdown => break false,
             _ = refresh.tick() => {
                 if let Some(holds) = &holds {
@@ -453,13 +456,19 @@ pub async fn serve_planes(
                     }
                 }
             },
-            accepted = &mut accepting => {
-                accepting.set(accept_one(endpoint));
+            // join_next is cancellation-safe; a tick cannot lose a completed
+            // handshake. Deliver it before consuming another new arrival.
+            completed = handshakes.join_next(), if !handshakes.is_empty() => {
+                let accepted = match completed {
+                    Some(Ok(accepted)) => accepted,
+                    Some(Err(error)) => {
+                        tracing::error!(error = %error, "remote handshake worker failed; continuing to serve");
+                        continue;
+                    }
+                    None => continue,
+                };
                 match accepted {
-                    // The endpoint's accept stream ended → the daemon is closing.
-                    // This is the ONLY per-accept signal that terminates the loop.
-                    Ok(None) => break true,
-                    Ok(Some(a)) => {
+                    Ok(a) => {
                         let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
                             match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
                                 Ok(hold) => {
@@ -496,8 +505,8 @@ pub async fn serve_planes(
                     // mid-handshake). This is per-connection, NOT the endpoint
                     // closing — an unauthenticated peer must NEVER be able to
                     // terminate the robot's always-on remote plane. Log loudly and
-                    // keep serving. `accept_one` returns `Ok(None)` (handled above)
-                    // when the endpoint itself is gone, so this arm never hot-loops.
+                    // keep serving. Only the endpoint accept stream ending below
+                    // terminates serving; one failed handshake cannot do that.
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -509,13 +518,42 @@ pub async fn serve_planes(
                     }
                 }
             }
+            // Endpoint::accept has not consumed an Incoming until it resolves;
+            // cancelling this wait on a refresh tick is safe. TLS completes in
+            // bounded independent workers so a stalled peer cannot block ops.
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break true; };
+                if handshakes.len() >= MAX_PENDING_HANDSHAKES {
+                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                    match handshake_admission_failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(pending = handshakes.len(), total_failures = handshake_admission_failures.total_failures(), "remote handshake refused because pending capacity is full"),
+                        RegimeDecision::Suppressed { .. } => tracing::debug!(pending = handshakes.len(), total_failures = handshake_admission_failures.total_failures(), "remote handshake refused because pending capacity is full"),
+                    }
+                    incoming.refuse();
+                    continue;
+                }
+                if let Some(suppressed) = handshake_admission_failures.on_success() {
+                    tracing::info!(suppressed, "remote handshake admission recovered");
+                }
+                handshakes.spawn(async move {
+                    let connection = tokio::time::timeout(HANDSHAKE_DEADLINE, async { incoming.await })
+                        .await
+                        .map_err(|error| LinkError::Accept(Box::new(error)))?
+                        .map_err(|error| LinkError::Accept(Box::new(error)))?;
+                    Ok(Accepted {
+                        remote_id: connection.remote_id(),
+                        alpn: connection.alpn().to_vec(),
+                        connection,
+                    })
+                });
+            }
         }
     };
     // Dropped before anything is logged or awaited, so a host that watches it
     // learns the accept loop stopped even when a log write blocks; the binary
     // arms its hard-exit deadline then.
     drop(shutdown);
-    drop(accepting);
+    handshakes.shutdown().await;
     if closed_on_its_own {
         tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
     } else {

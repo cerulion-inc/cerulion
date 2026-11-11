@@ -23,6 +23,7 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
+  TLS handshakes: bounded, concurrent.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - `cerulion_pairing`'s canonical signing bytes are pinned by INDEPENDENT

@@ -589,3 +589,138 @@ fn engaged_ops_estop_survives_last_egress_disconnect_and_remains_observable() {
     }
     daemon.stop();
 }
+
+#[test]
+fn a_stalled_tls_handshake_cannot_block_a_second_clients_estop_delivery() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let ix = IsolatedRoot::mint("h2");
+    let mut daemon = Daemon::start(&ix, false, false, None, false);
+    let mut producer = daemon.connect();
+    assert!(matches!(
+        request(&mut producer, register(1, TOPIC)),
+        Response::Egress(_)
+    ));
+    let facts_path = daemon
+        .root
+        .path()
+        .join("robot-state/remoted/beacon_facts.json");
+    until(|| facts_path.exists());
+    let facts: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(facts_path).unwrap()).unwrap();
+    let robot: std::net::SocketAddr = format!("127.0.0.1:{}", facts["iroh_port"].as_u64().unwrap())
+        .parse()
+        .unwrap();
+    let id = cerulion_link::EndpointId::from_bytes(
+        &DeviceIdentity::from_seed(&ROBOT_SEED).public_key().0,
+    )
+    .unwrap();
+    // Forward genuine client datagrams but withhold the robot's replies. Seeing
+    // a reply proves the real server began TLS; no protocol bytes are fabricated.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let proxy_address = socket.local_addr().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let replied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct Proxy {
+        running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            self.running
+                .store(false, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+    let live = std::sync::Arc::clone(&running);
+    let response_seen = std::sync::Arc::clone(&replied);
+    let proxy = Proxy {
+        running,
+        thread: Some(std::thread::spawn(move || {
+            let mut packet = [0; 65536];
+            while live.load(std::sync::atomic::Ordering::Acquire) {
+                match socket.recv_from(&mut packet) {
+                    Ok((_, from)) if from == robot => {
+                        response_seen.store(true, std::sync::atomic::Ordering::Release)
+                    }
+                    Ok((len, _)) => {
+                        socket.send_to(&packet[..len], robot).unwrap();
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("handshake proxy failed: {error}"),
+                }
+            }
+        })),
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let stalled_peer =
+            build_endpoint(EndpointConfig::new([0x91; 32]).with_relay(RelayConfig::Disabled))
+                .await
+                .unwrap();
+        let peer = stalled_peer.clone();
+        let stalled = tokio::spawn(async move {
+            dial(
+                &peer,
+                EndpointAddr::new(id).with_ip_addr(proxy_address),
+                alpn::OPS,
+            )
+            .await
+        });
+        tokio::time::timeout(LIMIT, async {
+            while !replied.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let desk = build_endpoint(EndpointConfig::new(DESK_SEED).with_relay(RelayConfig::Disabled))
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            let connection = dial(&desk, EndpointAddr::new(id).with_ip_addr(robot), alpn::OPS)
+                .await
+                .unwrap();
+            let (mut send, mut recv) = open_frame_stream(&connection).await.unwrap();
+            let ack = ops_exchange(
+                &mut send,
+                &mut recv,
+                br#"{"min_version":1,"max_version":1}"#,
+            )
+            .await;
+            assert_eq!(ack["type"], "ack");
+            let engaged = ops_exchange(
+                &mut send,
+                &mut recv,
+                br#"{"id":0,"verb":"engage-estop","args":{}}"#,
+            )
+            .await;
+            (engaged, connection, send, recv)
+        })
+        .await;
+        assert!(
+            !stalled.is_finished(),
+            "first peer is still waiting for TLS"
+        );
+        stalled.abort();
+        let _ = stalled.await;
+        stalled_peer.close().await;
+        let (engaged, connection, _send, _recv) =
+            delivered.expect("a pending TLS peer cannot delay e-stop delivery beyond two seconds");
+        assert_eq!(engaged["status"], "ok", "{engaged}");
+        assert_eq!(engaged["result"]["engaged"], true);
+        connection.close(0u32.into(), b"done");
+        desk.close().await;
+    });
+    drop(proxy);
+    drop(producer);
+    daemon.stop();
+}
