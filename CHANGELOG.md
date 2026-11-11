@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
+
 ### Fixed
 
 - A machine serving authenticated remote topics can also consume topics through

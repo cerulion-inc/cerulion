@@ -230,3 +230,13 @@ pairing on the LAN.
   access back.
 - [`docs/networking.md`](networking.md): the LAN plane, discovery and what a run
   exposes by default.
+
+## Graph ingress queue policy
+
+A graph producer declares its reliable queue policy with its served topic
+metadata. Wire forwarding sizes that queue to `send_queue`, or the actual tap
+depth when omitted. At capacity it refuses the new frame, retains queued
+frames in order, and exposes `wan_refused` separately from `wan_dropped`.
+A source without policy metadata is unverified for graph ingress.
+Best-effort datagram graph ingress is refused on this wire path.
+Changing a retained topic's queue policy requires restarting `cerulion-netd`.

@@ -1,7 +1,6 @@
 # cerulion_core - agent notes
 
-Core runtime: wire format, codegen, iceoryx2 transport, scheduler/level executor, graph
-runtime, gateway plane; 260+ test binaries with per-binary serial rules.
+Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rules.
 
 ## Invariants
 
@@ -32,9 +31,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
-- Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
-  graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
-  a string literal (a removed dash lowers the file's ledger line).
+- Shipped surface: in-code graphs are tests only; no tracker ids or typographic
+  dashes. Never bulk-rewrite strings; removing a dash lowers its ledger line.
 
 ## Testing
 
@@ -58,3 +56,5 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
+- Declared ingress precreates a SingleWriter service at full consumer capacity;
+  ordinary producerless absolute sources remain External.

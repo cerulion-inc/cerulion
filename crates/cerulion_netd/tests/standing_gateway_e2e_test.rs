@@ -357,6 +357,7 @@ const WIDGET_TEXT: &str = "int32 count\nfloat64 v\n";
 
 fn widget_serving(topic: &str) -> SchemaServing {
     SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
             schema_name: WIDGET_Q.to_string(),
@@ -566,6 +567,7 @@ fn a_rebooted_gateway_retains_every_previously_registered_serving() {
             ingress: vec![],
         };
         let gizmo_serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![TopicSchema {
                 topic: gizmo_topic.clone(),
                 schema_name: GIZMO_Q.to_string(),
@@ -670,6 +672,7 @@ fn a_partial_boot_does_not_strand_the_query_surface_on_dropped_maps() {
             ingress: vec![],
         };
         let post_serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![TopicSchema {
                 topic: post_topic.clone(),
                 schema_name: POST_Q.to_string(),

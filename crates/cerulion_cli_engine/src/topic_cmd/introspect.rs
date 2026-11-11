@@ -2071,6 +2071,7 @@ mod tests {
 
     fn entry(topic: &str, name: Option<&str>, hash: Option<u64>) -> cerulion_core::CatalogEntry {
         cerulion_core::CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: hash,
             schema_name: name.map(str::to_string),

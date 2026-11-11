@@ -3834,6 +3834,11 @@ A machine serving paired remote topics can also read paired robots through
 its existing device endpoint. Outbound topic mirrors use the pull protocol;
 releasing a mirror preserves the machine's incoming remote service.
 
+Graph producers expose their reliable wire queue policy in served metadata.
+A full reliable queue refuses the new frame and reports `wan_refused`; it
+preserves queued frames in order. Missing policy remains unverified for graph
+ingress, and unsupported best-effort wire ingress is refused.
+
 For `cerulion connect` / `pair` / `login` and the WAN plane. See
 `docs/remote_plane.md`.
 

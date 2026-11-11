@@ -35,6 +35,7 @@ async fn serve_connection(
                 entries: topics
                     .iter()
                     .map(|topic| CatalogEntry {
+                        egress_qos: None,
                         topic: topic.clone(),
                         schema_hash: Some(ORACLE_SCHEMA_HASH),
                         schema_name: None,

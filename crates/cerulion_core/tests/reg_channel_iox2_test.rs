@@ -2072,6 +2072,7 @@ fn a_restarted_gateway_serves_its_schemas_through_the_latched_surface() {
     )
     .expect("init gateway manager");
     let serving = |topic: &str, schema: &str, hash: u64| SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
             schema_name: schema.to_string(),

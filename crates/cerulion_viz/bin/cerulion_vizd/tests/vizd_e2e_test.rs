@@ -3532,6 +3532,7 @@ fn a_remote_topic_re_attaches_right_after_detach_on_both_surfaces_e2e() {
     // A BUILT-IN type, so the catalog resolve needs no fetch — this test is about
     // attach ROUTING, not schema acquisition (which has its own e2e).
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
             schema_name: "geometry_msgs/Vector3".to_string(),
@@ -3795,6 +3796,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
     assert_ne!(widget_hash, 0, "the custom type has a real wire hash");
 
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![
             TopicSchema {
                 topic: widget_topic.to_string(),
@@ -4037,6 +4039,7 @@ fn schema_less_resolve_is_served_by_netd_not_vizds_own_network() {
         deps: vec![],
     };
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![
             TopicSchema {
                 topic: widget_topic.to_string(),
@@ -5090,6 +5093,7 @@ fn oracle_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> cerulion_cor
         entries: entries
             .iter()
             .map(|(topic, schema_name)| CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(7),
                 schema_name: schema_name.map(str::to_string),
@@ -8661,6 +8665,7 @@ fn big_catalog(robot: &str, n: usize) -> cerulion_core::CatalogReply {
         robot: robot.to_string(),
         entries: (0..n)
             .map(|i| CatalogEntry {
+                egress_qos: None,
                 topic: format!(
                     "/discover/big/topic/{i:06}/padding/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb"
                 ),
@@ -12270,6 +12275,7 @@ fn liveness_catalog(
         entries: entries
             .iter()
             .map(|(topic, liveness)| CatalogEntry {
+                egress_qos: None,
                 topic: (*topic).to_string(),
                 schema_hash: Some(7),
                 schema_name: Some("geometry_msgs/Vector3".to_string()),

@@ -608,7 +608,7 @@ The configuration keys are:
 | `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `egress` | Optional array of canonical topics: the only topics the gateway sends to a LAN peer under `"lan_access": "open"`. `[]` sends none. Without the key, an `open` gateway sends every topic. Each topic must be a graph output or a publish topic. A non-canonical, duplicate or unknown topic, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` nothing is sent either way. See [Choose which topics leave the device](#choose-which-topics-leave-the-device). |
-| `ingress` | Optional array of canonical topics a LAN peer may publish into under `"lan_access": "open"`. Defaults to `[]`. Each topic must be read by a graph input and must be neither a graph output nor a publish topic; each frame must carry the schema hash of the inputs that read it. A non-canonical, duplicate or unread topic, a topic with another writer, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` no frame gets in. See [Let a LAN peer publish into the graph](#let-a-lan-peer-publish-into-the-graph). |
+| `ingress` | Optional array of canonical topics a LAN peer may publish into under `"lan_access": "open"`. Defaults to `[]`. Each topic must be read by a graph input and must be neither a graph output nor a publish topic; each frame must carry the schema hash of the inputs that read it. A non-canonical, duplicate or unread topic, a topic with another writer, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"`, or without listen or connect, a nonempty ingress list fails the start with error code 3. See [Let a LAN peer publish into the graph](#let-a-lan-peer-publish-into-the-graph). |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon, and neither do `connect` locators. Defaults to `true`. Android passes multicast to the app only while it holds a `WifiManager.MulticastLock`, which needs the `android.permission.CHANGE_WIFI_MULTICAST_STATE` permission; see [Discovery and access](#discovery-and-access). |
 | `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 | `remote` | Optional object `{ "enabled", "relay", "state_dir" }` that hosts the paired remote plane. `enabled` is required. `relay` is `"public"` (the default, for development only), `"disabled"`, or an array of relay URLs. `state_dir` defaults to `"remote"` and is a relative path inside the app files directory, without `.` or `..`. A missing `enabled`, an unknown key, another `relay` value, an empty relay list or a `state_dir` outside the files directory is rejected with error code 3. See [Host the paired remote plane](#host-the-paired-remote-plane). |
@@ -875,11 +875,10 @@ nor a publish topic, because a topic has one writer. A start that breaks one of
 these rules fails with error code 3, or with error code 5 for a schema no input
 declares or the inputs do not agree on, and the error names the topic.
 
-Under `"paired"` the gateway opens no ingress: it subscribes to no `ingress`
-topic on the LAN and demands none, so it refuses every frame a LAN peer
-publishes, and the start logs a warning. A start with `ingress` and an empty
-`listen` and `connect` builds no gateway, so the list has no effect and the
-start logs a warning too.
+A nonempty `ingress` list under `"paired"`, or with empty `listen` and
+`connect`, fails the start with error code 3. This embedded host supports the
+explicit open LAN compatibility path shown above; authenticated graph
+producer discovery is unavailable in the embedded host.
 
 Ingress has no sender identity. Under `open`, any host that reaches the
 gateway can publish into every `ingress` topic, and the app cannot tell one

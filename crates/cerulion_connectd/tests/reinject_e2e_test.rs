@@ -1195,6 +1195,7 @@ fn single_topic_catalog(robot: &str, topic: &str) -> CatalogReply {
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(ORACLE_SCHEMA_HASH),
             schema_name: None,

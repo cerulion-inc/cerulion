@@ -554,6 +554,7 @@ fn serve_role() {
         ingress: vec![],
     };
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.clone(),
             schema_name: "geometry_msgs/Vector3".to_string(),

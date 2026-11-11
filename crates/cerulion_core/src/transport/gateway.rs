@@ -327,6 +327,10 @@ pub struct SchemaServing {
     /// only the current run's topics plus any registered later.
     #[serde(default)]
     pub served_topics: Vec<String>,
+    /// Resolved producer policies for authenticated graph ingress. Missing
+    /// entries are unverified; they do not imply a reliable wire queue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_qos: Vec<super::carrier::EgressQos>,
 }
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
@@ -640,6 +644,15 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
+        for policy in &other.egress_qos {
+            if !self
+                .egress_qos
+                .iter()
+                .any(|have| have.topic == policy.topic)
+            {
+                self.egress_qos.push(policy.clone());
+            }
+        }
         // A non-empty `served_topics` is EXPLICIT: folding another serving's
         // explicit list into an accumulator that only had implicit
         // (topic_schemas-derived) topics would silently drop the
@@ -3001,6 +3014,7 @@ mod schema_serving_handles_tests {
             deps: vec![],
         };
         let serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![
                 TopicSchema {
                     topic: "chatter".to_string(),

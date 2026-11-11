@@ -850,6 +850,7 @@ mod tests {
             entries: entries
                 .into_iter()
                 .map(|(t, h)| CatalogEntry {
+                    egress_qos: None,
                     topic: t.to_string(),
                     schema_hash: h,
                     schema_name: None,

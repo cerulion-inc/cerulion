@@ -1440,6 +1440,7 @@ mod tests {
                 version: 1,
                 robot: "ubuntu".to_string(),
                 entries: vec![CatalogEntry {
+                    egress_qos: None,
                     topic: "/tf".to_string(),
                     schema_hash: Some(7),
                     schema_name: Some("tf2_msgs/TFMessage".to_string()),
@@ -1536,6 +1537,7 @@ mod tests {
             rate_estimate: None,
         };
         let entry = |topic: &str, liveness: Option<TopicLiveness>| CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(7),
             schema_name: Some("sensor_msgs/PointCloud2".to_string()),

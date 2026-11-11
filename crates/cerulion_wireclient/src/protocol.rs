@@ -137,6 +137,9 @@ pub struct StatusReply {
 /// test fails if the robot's shape drifts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicStatus {
+    /// New frames refused while the producer's reliable queue was full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_refused: Option<u64>,
     /// The canonical absolute topic name.
     pub topic: String,
     /// Frames written to QUIC by the robot.

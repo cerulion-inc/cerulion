@@ -8012,6 +8012,7 @@ mod tests {
         let found = cerulion_core::transport::cerulion_q::build_catalog_reply(
             "producer",
             [cerulion_core::transport::cerulion_q::CatalogEntry {
+                egress_qos: None,
                 topic: "/camera".to_string(),
                 schema_hash: None,
                 schema_name: Some("camera_msgs/Frame".to_string()),

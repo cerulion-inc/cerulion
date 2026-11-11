@@ -10489,6 +10489,7 @@ mod tests {
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(7),
                 schema_name: schema_name.map(str::to_string),
@@ -10537,6 +10538,7 @@ mod tests {
             entries: entries
                 .iter()
                 .map(|(topic, schema_name)| CatalogEntry {
+                    egress_qos: None,
                     topic: topic.to_string(),
                     schema_hash: Some(7),
                     schema_name: schema_name.map(str::to_string),
@@ -10647,6 +10649,7 @@ mod tests {
             robot: "go2".to_string(),
             entries: vec![
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/utlidar/cloud".to_string(),
                     schema_hash: Some(1),
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -10655,6 +10658,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/uslam/cloud_map".to_string(),
                     schema_hash: None,
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -10663,6 +10667,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/legacy".to_string(),
                     schema_hash: None,
                     schema_name: None,
@@ -10714,6 +10719,7 @@ mod tests {
         use cerulion_core::{CatalogProvenance, LivenessState, TopicLiveness, TopicRateEstimate};
         use std::collections::BTreeSet;
         let entry = |topic: &str, liveness: Option<TopicLiveness>| CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(1),
             schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -11866,6 +11872,7 @@ mod tests {
             version: 1,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(1),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -12059,6 +12066,7 @@ mod tests {
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(1),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -14519,6 +14527,7 @@ mod monitor_snapshot_tests {
             entries: entries
                 .iter()
                 .map(|(topic, liveness)| CatalogEntry {
+                    egress_qos: None,
                     topic: (*topic).to_string(),
                     schema_hash: None,
                     schema_name: None,

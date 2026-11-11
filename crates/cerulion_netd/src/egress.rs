@@ -628,6 +628,24 @@ impl GatewayEgressPlane {
                 .accumulated_serving
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // A live remote tap can retain the earlier queue policy. Refuse a
+            // conflicting replacement until the shared daemon is restarted.
+            for (index, policy) in serving.egress_qos.iter().enumerate() {
+                if serving.egress_qos[..index]
+                    .iter()
+                    .chain(acc.egress_qos.iter())
+                    .any(|have| have.topic == policy.topic && have != policy)
+                {
+                    return Err(EgressError::Gateway {
+                        source: Box::new(TransportError::InvalidTransportConfig {
+                            reason: format!(
+                                "topic '{}' has a different retained wire queue policy; restart cerulion-netd before changing it",
+                                policy.topic
+                            ),
+                        }),
+                    });
+                }
+            }
             acc.merge_from(serving);
             acc.clone()
         };
@@ -1008,6 +1026,7 @@ mod tests {
     #[test]
     fn hash_for_topic_resolves_from_serving_else_zero() {
         let serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![TopicSchema {
                 topic: "/robot/odom".to_string(),
                 schema_name: "nav_msgs/Odometry".to_string(),
