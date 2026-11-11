@@ -2174,7 +2174,10 @@ fn catalog_serve_decision(
     }
     note_lan_authorized(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE);
     let mut reply = build_catalog_reply_from_bridge(bridge_mgr, catalog, robot);
-    if let Some(manager) = catalog.producer_probe.as_ref().and_then(Weak::upgrade) {
+    if let Some(probe) = &catalog.producer_probe {
+        let Some(manager) = probe.upgrade() else {
+            return cerulion_q::CatalogReply::refused(robot, "producer policy is unavailable");
+        };
         reply
             .entries
             .retain(|entry| manager.remote_topic_allowed(&entry.topic).unwrap_or(false));
@@ -2241,6 +2244,18 @@ fn schema_serve_decision(
     {
         log_lan_refusal(authorizer, "schema GET", requested, &reason);
         return cerulion_q::SchemaReply::refused(robot, requested, reason);
+    }
+    if catalog.is_some_and(|catalog| {
+        catalog
+            .producer_probe
+            .as_ref()
+            .is_some_and(|probe| probe.upgrade().is_none())
+    }) {
+        return cerulion_q::SchemaReply::refused(
+            robot,
+            requested,
+            "producer policy is unavailable",
+        );
     }
     note_lan_authorized(authorizer, "schema GET", requested);
     // Held for the WHOLE decision: `replace` swaps `docs` under this lock,
@@ -3424,7 +3439,7 @@ pub struct IngressInjector {
     /// held only by an injector from
     /// [`TransportManager::create_ingress_injector_with`].
     data_service: Option<super::DataServiceFactory>,
-    // Dropped LAST: remote identity must outlive the injection publisher.
+    // Identity and remote admission both outlive the injection publisher.
     _origin: Option<super::mirror_origin::MirrorOrigin>,
     remote_lease: Option<super::egress_scope::RemoteTopicLease>,
 }
