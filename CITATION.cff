@@ -2,12 +2,10 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: Cerulion
 abstract: >-
-  Cerulion gives AI agents a harness to control real robots. This repository
-  holds the open-source runtime: a zero-copy robot runtime that records runs to
-  MCAP and re-runs supported native recordings against new code, rmw_cerulion
-  for ROS 2 (validated on Jazzy), and cerulion-rcpd, an MCP server through
-  which an agent calls only the tools the robot's operator declares
-  (not in the 1.0.0 release).
+  Cerulion is the operating system for physical AI. This repository holds the
+  open-source runtime: a zero-copy robot runtime that records runs to MCAP and
+  re-runs supported native recordings against new code, and rmw_cerulion for
+  ROS 2 (validated on Jazzy).
 # Founders as personal authors (citation credit), then the entity;
 # further individual contributors are credited in docs/legal/AUTHORS.
 authors:
