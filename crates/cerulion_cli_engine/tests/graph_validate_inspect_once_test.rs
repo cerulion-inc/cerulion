@@ -2,8 +2,8 @@
 //! `cerulion graph validate` reads each node library ONCE.
 //!
 //! Checks read a library through the caller's inspector: the per-node read
-//! the input backpressure and process groups checks and the network ingress
-//! gate share, and the params check (per type). A library's
+//! the input backpressure check and the network ingress gate share, and the
+//! params check (per type). A library's
 //! static initialization and teardown run on every in-process read, so a
 //! second read is a second run of them. This drives the real validate entry
 //! point over a two-node graph of one type with an ingress block and counts
