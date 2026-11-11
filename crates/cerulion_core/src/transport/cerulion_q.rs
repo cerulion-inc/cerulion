@@ -1843,9 +1843,10 @@ pub fn gather_runs_outcome<'a>(replies: impl IntoIterator<Item = &'a [u8]>) -> R
 /// payload or to the column order.
 pub const FIRES_WIRE_VERSION: u32 = 1;
 
-/// The most rows one [`FiresReply`] carries. A desk that receives a full page
-/// asks again with the reply's `next` to read on. A lost sequence takes no
-/// row, so a shorter page reached the newest fire the run had recorded.
+/// The most rows one [`FiresReply`] carries. A full page may have more
+/// waiting, so a desk that receives one asks again with the reply's `next`.
+/// That ask can come back empty. A lost sequence takes no row, so a shorter
+/// page reached the newest fire the run had recorded.
 pub const MAX_FIRES_PER_REPLY: usize = FIRE_SERVE_MAX;
 
 /// The most `in_tick` entries a served reply names: one per node, and a node

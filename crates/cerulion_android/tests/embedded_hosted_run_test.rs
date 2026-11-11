@@ -595,13 +595,21 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     let stats = fire_stats(&runtime).expect("a hosted run reports its tap");
     assert!(stats.armed, "{stats:?}");
     assert!(stats.recorded >= next, "{stats:?}");
-    while fire_stats(&runtime).is_some_and(|stats| stats.armed) {
+    //    The run stays hosted while the lease runs out, so the tap must
+    //    still report. A missing tap is a failure, not a disarm.
+    loop {
+        let stats = fire_stats(&runtime).expect("the hosted run lost its tap during the lease");
+        if !stats.armed {
+            break;
+        }
         assert!(
             asked.elapsed() < Duration::from_secs(15),
             "the tap stayed armed long after the lease"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    let after = fire_stats(&runtime).expect("the hosted run still reports its tap");
+    assert!(!after.armed, "{after:?}");
     assert!(
         asked.elapsed() >= Duration::from_secs(4),
         "the tap disarmed {:?} after the last GET, before its 5 s lease",
