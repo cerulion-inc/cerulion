@@ -405,10 +405,6 @@ impl std::ops::Deref for ScopedSubscriber {
 fn ensure_topic_available(
     topic: &str,
     schemas_dir: Option<&std::path::Path>,
-    // The caller's cancellation flag, so the first-contact wait below stays
-    // interruptible. `topic echo`/`topic hz` own one (their SIGINT handler clears it,
-    // and installing that handler is what removes the default terminate disposition);
-    // `topic info` installs none and passes `None`.
     running: Option<&std::sync::atomic::AtomicBool>,
     scope: TopicScope,
 ) -> CliResult<(
@@ -416,10 +412,29 @@ fn ensure_topic_available(
     ScopedSubscriber,
     TopicSource,
 )> {
+    ensure_topic_available_with_selection(topic, schemas_dir, running, scope, None)
+}
+
+fn ensure_topic_available_with_selection(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    // The caller's cancellation flag, so the first-contact wait below stays
+    // interruptible. `topic echo`/`topic hz` own one (their SIGINT handler clears it,
+    // and installing that handler is what removes the default terminate disposition);
+    // `topic info` installs none and passes `None`.
+    running: Option<&std::sync::atomic::AtomicBool>,
+    scope: TopicScope,
+    robot: Option<&str>,
+) -> CliResult<(
+    Arc<cerulion_core::TransportManager>,
+    ScopedSubscriber,
+    TopicSource,
+)> {
     // The observer's transport is now strictly LOCAL-ONLY — the ONE
     // per-computer network session lives in `cerulion-netd`, not in this process.
-    // A genuine LOCAL topic (a local graph produces it) is read directly with zero
-    // network cost; a REMOTE topic — or a netd MIRROR another consumer is already
+    // A genuine LOCAL topic (a local graph produces it) is read from local SHM;
+    // automatic scope also checks remote catalogs for ambiguous names.
+    // A REMOTE topic, or a netd MIRROR another consumer is already
     // streaming — is DEMANDED from netd, which re-injects the shared frame into the
     // desk's SHM ONCE where this observer reads it via a normal subscriber (the
     // rule: one data source = one topic, obtained over the network once).
@@ -440,6 +455,98 @@ fn ensure_topic_available(
     // kill-switch message below.
     let mirror_robot = gather_mirror_provenance().get(topic).cloned();
     let mut marked_mirror = transport.is_network_mirror(topic)?;
+    #[cfg(unix)]
+    let remote_directory = if !killed {
+        Some(crate::account_robot_access::automatic::discover()?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let mut selected_remote = None;
+    #[cfg(unix)]
+    if let Some(directory) = &remote_directory {
+        for diagnostic in &directory.diagnostics {
+            tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
+        }
+        let selected_robot = robot
+            .map(|selector| directory.select(selector))
+            .transpose()?
+            .flatten();
+        if let Some(selected) = selected_robot {
+            if selected.catalog.is_none() {
+                let state = match &selected.presence {
+                    cerulion_netd::account_access::RobotPresence::NotReached { reason } => {
+                        format!("is offline (not reached: {})", sanitize_display(reason))
+                    }
+                    cerulion_netd::account_access::RobotPresence::Unknown { reason } => {
+                        format!("has unknown reachability ({})", sanitize_display(reason))
+                    }
+                    cerulion_netd::account_access::RobotPresence::Online => {
+                        "is online but its topics are unavailable".into()
+                    }
+                };
+                return Err(CliError::Validation(format!(
+                    "robot '{}' {state}",
+                    sanitize_display(&selected.name)
+                )));
+            }
+            if let Some(error) = selected
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.error.as_ref())
+            {
+                return Err(CliError::Validation(format!(
+                    "robot '{}' topics are unavailable: {}",
+                    sanitize_display(&selected.name),
+                    sanitize_display(error)
+                )));
+            }
+        }
+        let catalogs: Vec<_> = directory
+            .robots
+            .iter()
+            .filter_map(|robot| robot.catalog.clone())
+            .collect();
+        let selector = selected_robot.map(|robot| robot.route.as_str()).or(robot);
+        let selection = crate::account_robot_access::automatic::topic_candidates(
+            topic,
+            listed_local && mirror_robot.is_none() && !marked_mirror && selected_robot.is_none(),
+            &catalogs,
+            selector,
+        )?;
+        selected_remote = selection;
+    }
+    if killed && robot.is_some() {
+        return Err(CliError::Validation(
+            "--robot remote reads are disabled by --local or the network kill switch".into(),
+        ));
+    }
+    #[cfg(unix)]
+    if let Some(route) = &selected_remote {
+        if let Some(directory) = &remote_directory {
+            if let Err(error) = directory.sync_selected_epoch(route) {
+                tracing::warn!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+            }
+        }
+        let catalog = remote_directory
+            .as_ref()
+            .and_then(|directory| directory.robots.iter().find(|robot| robot.route == *route))
+            .and_then(|robot| robot.catalog.as_ref())
+            .ok_or_else(|| CliError::Validation("selected robot catalog is unavailable".into()))?;
+        let target = automatic_ingress_target(topic, route, schemas_dir, catalog)?;
+        let (subscriber, guard) = demand_observer_from_netd(&transport, topic, &target)?;
+        return Ok((
+            transport,
+            ScopedSubscriber {
+                subscriber,
+                _guard: ObservationGuard::RemoteDemand { _demand: guard },
+            },
+            TopicSource::Remote {
+                robot: target.robot,
+                walker: target.walker,
+            },
+        ));
+    }
     if matches!(
         classify_observed_topic(listed_local, mirror_robot.is_some() || marked_mirror),
         ObserveVia::LocalDirect
@@ -539,7 +646,30 @@ fn ensure_topic_available(
         // Every non-Found outcome routes through ONE place — see
         // `unresolved_remote_error`, which is where the three different failures are
         // kept different.
-        other => return Err(unresolved_remote_error(topic, other)),
+        other => {
+            let error = unresolved_remote_error(topic, other);
+            #[cfg(unix)]
+            if let Some(directory) = &remote_directory {
+                let offline: Vec<_> = directory
+                    .robots
+                    .iter()
+                    .filter(|robot| {
+                        matches!(
+                            robot.presence,
+                            cerulion_netd::account_access::RobotPresence::NotReached { .. }
+                        )
+                    })
+                    .map(|robot| sanitize_display(&robot.name))
+                    .collect();
+                if !offline.is_empty() {
+                    return Err(CliError::Validation(format!(
+                        "{error}; offline account or paired robots: {}",
+                        offline.join(", ")
+                    )));
+                }
+            }
+            return Err(error);
+        }
     };
 
     // Demand the shared mirror from netd (spawning the one-per-computer daemon
@@ -560,6 +690,68 @@ fn ensure_topic_available(
             walker: target.walker,
         },
     ))
+}
+
+#[cfg(unix)]
+fn automatic_ingress_target(
+    topic: &str,
+    robot: &str,
+    schemas_dir: Option<&std::path::Path>,
+    catalog: &cerulion_core::CatalogReply,
+) -> CliResult<RemoteIngressTarget> {
+    let mut client = cerulion_netd::NetdClient::connect_or_spawn()
+        .map_err(|error| CliError::Validation(error.to_string()))?;
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.topic == topic)
+        .ok_or_else(|| {
+            CliError::Validation(format!(
+                "robot '{}' no longer catalogs '{}'",
+                sanitize_display(robot),
+                sanitize_display(topic)
+            ))
+        })?;
+    let qualified = entry
+        .schema_name
+        .as_ref()
+        .ok_or_else(|| CliError::Validation("remote topic catalog has no schema name".into()))?
+        .clone();
+    let local = local_walker_from_workspace(schemas_dir);
+    let walker = if local
+        .schema_hash_for(&qualified)
+        .is_some_and(|hash| entry.schema_hash.is_none_or(|expected| expected == hash))
+    {
+        local
+    } else {
+        let replies = client
+            .query_schema(Some(robot), &qualified)
+            .map_err(|error| CliError::Validation(error.to_string()))?;
+        let reply = replies
+            .iter()
+            .find(|reply| !reply.docs.is_empty())
+            .ok_or_else(|| {
+                CliError::Validation("remote robot did not serve its topic schema".into())
+            })?;
+        seed_framewalker(&reply.docs)
+    };
+    let schema_hash = walker.schema_hash_for(&qualified).ok_or_else(|| {
+        CliError::Validation("remote schema closure could not be resolved".into())
+    })?;
+    if entry
+        .schema_hash
+        .is_some_and(|expected| expected != schema_hash)
+    {
+        return Err(CliError::Validation(
+            "remote topic schema differs from the decoder layout".into(),
+        ));
+    }
+    Ok(RemoteIngressTarget {
+        robot: robot.into(),
+        schema_name: qualified,
+        schema_hash,
+        walker,
+    })
 }
 
 /// How a requested `topic` should be OBSERVED given whether it is
@@ -641,6 +833,22 @@ fn demand_remote_from_netd(
     Ok((subscriber, DemandGuard { client }))
 }
 
+/// Authenticated account/pair observation uses a private source channel.
+#[cfg(unix)]
+fn demand_observer_from_netd(
+    transport: &Arc<cerulion_core::TransportManager>,
+    topic: &str,
+    target: &RemoteIngressTarget,
+) -> CliResult<(cerulion_core::CerulionSubscriber, DemandGuard)> {
+    let mut client = cerulion_netd::NetdClient::connect_or_spawn()
+        .map_err(|e| CliError::Validation(e.to_string()))?;
+    let reply = client
+        .observe(&target.robot, topic, target.schema_hash)
+        .map_err(|e| CliError::Validation(e.to_string()))?;
+    let subscriber = open_mirror_after_demand(transport, &reply.local_topic)?;
+    Ok((subscriber, DemandGuard { client }))
+}
+
 /// Non-Unix stub: the netd demand plane is a UDS daemon, unavailable
 /// off Unix. A remote observation there is a loud error, never silent.
 #[cfg(not(unix))]
@@ -711,6 +919,15 @@ fn open_mirror_after_demand(
 /// Oracle-tested.
 fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
     match resolve {
+        RemoteResolve::Ambiguous { candidates } => CliError::AmbiguousTopic(format!(
+            "topic '{}' is ambiguous: {}; select one with --robot NAME",
+            sanitize_display(topic),
+            candidates
+                .into_iter()
+                .map(|name| sanitize_display(&name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         RemoteResolve::Found(_) => CliError::Validation(format!(
             "internal error: topic '{topic}' resolved successfully but was routed to the \
              unresolved-remote error path — this is a Cerulion bug, please report it"
@@ -1410,6 +1627,51 @@ pub type CatalogGather =
 /// gather, for the typed `topic list -t` and `topic find`. Its replies are
 /// empty when no robot answered its catalog GET.
 pub fn query_remote_topics_and_catalogs(
+    opts: &RemoteTopicsOptions,
+    scan: bool,
+) -> CliResult<(RemoteDiscovery, CatalogGather)> {
+    #[cfg(unix)]
+    let directory = if opts.scouting {
+        crate::account_robot_access::automatic::discover()?
+    } else {
+        Default::default()
+    };
+    let mut result = query_lan_topics_and_catalogs(opts, scan);
+    #[cfg(unix)]
+    {
+        for diagnostic in &directory.diagnostics {
+            tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
+        }
+        if !directory.robots.is_empty() {
+            if let Err(error) = &result {
+                tracing::warn!(error = %error, "LAN discovery unavailable while remote catalogs remain readable");
+            }
+            if result.is_err() {
+                result = Ok((RemoteDiscovery::empty(), CatalogGather::default()));
+            }
+            let (disc, catalogs) = result
+                .as_mut()
+                .expect("successful LAN result or explicit empty fallback");
+            for robot in directory.robots {
+                if let Some(catalog) = robot.catalog {
+                    for entry in &catalog.entries {
+                        disc.topics.push(entry.topic.clone());
+                        disc.announce_entries
+                            .push((robot.route.clone(), Some(entry.topic.clone())));
+                    }
+                    catalogs.replies.push(catalog);
+                } else {
+                    disc.announce_entries.push((robot.route, None));
+                }
+            }
+            disc.topics.sort();
+            disc.topics.dedup();
+        }
+    }
+    result
+}
+
+pub(crate) fn query_lan_topics_and_catalogs(
     opts: &RemoteTopicsOptions,
     scan: bool,
 ) -> CliResult<(RemoteDiscovery, CatalogGather)> {
@@ -2369,7 +2631,8 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         // This is the LOCAL-topic unknown-frame fallback: there is no absence claim to
         // make (the caller just degrades to hex), so the cold-start arm collapses
         // with the others into "no remote walker".
-        SchemaResolve::NoProducer
+        SchemaResolve::Ambiguous { .. }
+        | SchemaResolve::NoProducer
         | SchemaResolve::DiscoveryNotConverged
         // A cancelled resolve degrades to hex exactly like the others —
         // this seam renders no claim, so it has nothing to say about the wait.
@@ -2402,6 +2665,8 @@ pub struct RemoteIngressTarget {
 /// different, actionable failure (name the robot + the cause) — collapsing both
 /// to `None` produced the misleading "not found on any discovered robot".
 pub enum RemoteResolve {
+    /// Multiple robots catalog the topic; an exact selector is required.
+    Ambiguous { candidates: Vec<String> },
     /// A robot catalogs the topic AND serves a resolvable schema — ready to
     /// ingress.
     Found(RemoteIngressTarget),
@@ -2494,6 +2759,7 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
 ) -> RemoteResolve {
     match resolve_remote_topic_schema_with_opts(topic, connect, listen, scouting, schemas_dir, wait)
     {
+        SchemaResolve::Ambiguous { candidates } => RemoteResolve::Ambiguous { candidates },
         SchemaResolve::NoProducer => RemoteResolve::NoProducer,
         // Carried through DISTINCT — collapsing it into `NoProducer` here
         // would re-create the exact false-absence claim this issue removed.
@@ -2540,6 +2806,9 @@ pub fn resolve_remote_ingress_target_with_opts_and_wait(
 /// discovered robot's CATALOG, fetch that type's `.msg`/YAML closure, and seed a
 /// [`FrameWalker`](cerulion_core::codegen::FrameWalker).
 enum SchemaResolve {
+    Ambiguous {
+        candidates: Vec<String>,
+    },
     /// A robot catalogs the topic + served a non-empty schema closure.
     Found {
         robot: String,
@@ -2561,7 +2830,10 @@ enum SchemaResolve {
     /// [`RemoteResolve::Cancelled`].
     Cancelled,
     /// A robot catalogs the topic but did not serve its schema.
-    SchemaUnavailable { robot: String, cause: String },
+    SchemaUnavailable {
+        robot: String,
+        cause: String,
+    },
     /// A robot refused its catalog, so its topics were not searched. The
     /// authorizer's own reason travels with it so the refusal text can say
     /// WHY instead of prescribing the wrong remedy.
@@ -2573,6 +2845,9 @@ enum SchemaResolve {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CatalogTarget {
+    Ambiguous {
+        candidates: Vec<String>,
+    },
     Found {
         robot: String,
         qualified: String,
@@ -2585,6 +2860,18 @@ enum CatalogTarget {
 }
 
 fn catalog_target(catalogs: &[cerulion_core::CatalogReply], topic: &str) -> CatalogTarget {
+    let candidates: std::collections::BTreeSet<_> = catalogs
+        .iter()
+        .filter(|catalog| {
+            catalog.error.is_none() && catalog.entries.iter().any(|entry| entry.topic == topic)
+        })
+        .map(|catalog| catalog.robot.clone())
+        .collect();
+    if candidates.len() > 1 {
+        return CatalogTarget::Ambiguous {
+            candidates: candidates.into_iter().collect(),
+        };
+    }
     if let Some((robot, qualified)) = catalogs.iter().find_map(|catalog| {
         catalog.entries.iter().find_map(|entry| {
             if entry.topic == topic {
@@ -2720,6 +3007,9 @@ fn netd_resolve_topic_schema(
     warn_on_catalog_refusals(&catalogs);
     // Find the catalog entry for THIS topic that carries a qualified schema name.
     let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Ambiguous { candidates } => {
+            return Some(SchemaResolve::Ambiguous { candidates })
+        }
         CatalogTarget::Found { robot, qualified } => (robot, qualified),
         CatalogTarget::Refused { robot, reason } => {
             return Some(SchemaResolve::CatalogRefused { robot, reason });
@@ -2968,6 +3258,10 @@ fn resolve_remote_topic_schema_with_opts(
     let read_nothing_conclusive = gathered.replies.is_empty() || !gathered.is_complete();
     let catalogs = gathered.replies;
     let (robot, qualified) = match catalog_target(&catalogs, topic) {
+        CatalogTarget::Ambiguous { candidates } => {
+            mgr.close();
+            return SchemaResolve::Ambiguous { candidates };
+        }
         CatalogTarget::Found { robot, qualified } => (robot, qualified),
         CatalogTarget::Refused { robot, reason } => {
             mgr.close();
@@ -3240,7 +3534,7 @@ pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
 /// All externally-sourced strings (robot names, locators) are passed through
 /// [`sanitize_display`] first — a hostile LAN peer cannot inject terminal
 /// escapes into this output. Provenance/rung tags are internal (safe) and raw.
-fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> String {
+pub(crate) fn render_robots_section(robots: &[RobotRow], peers: &[DiscoveredPeer]) -> String {
     let candidates: Vec<&DiscoveredPeer> = peers
         .iter()
         .filter(|p| p.rung != DiscoveryRung::Mdns)
@@ -3378,8 +3672,8 @@ fn push_column(out: &mut String, column: Option<String>) {
 /// and the escape that fits the evidence:
 ///
 /// - `reachable == false` (no locator given, no robot row, no mDNS answer):
-///   the `--connect tcp/<host>:7683` hint, for a robot scouting cannot reach
-///   (7683 is the well-known permissive-gateway port).
+///   the sign-in or pairing hint, because account and paired robots are
+///   reached automatically through the authenticated remote plane.
 /// - `reachable == true` (a given locator, a discovered robot, or an mDNS
 ///   browse answer): a peer IS reachable and simply advertised no topic within
 ///   the window (a busy peer, or no networked publisher alive yet; a
@@ -3397,8 +3691,8 @@ fn render_remote_none_discovered(reachable: bool) -> String {
         )
     } else {
         format!(
-            "remote: none discovered in {window_ms} ms (a robot off the LAN needs \
-             --connect tcp/<host>:7683)\n"
+            "remote: none discovered in {window_ms} ms (sign in or pair a robot; \
+             account and paired robots are reached automatically)\n"
         )
     }
 }
@@ -3507,6 +3801,9 @@ fn push_remote_rows_with_mirrors(
     for (topic, robot) in rows {
         out.push_str(&sanitize_display(topic));
         push_column(out, column(topic));
+        if topic.starts_with("/__cerulion/observers/") {
+            out.push_str("  [internal]");
+        }
         if let Some(robot) = robot {
             out.push_str("  ● streaming  ");
             out.push_str(&sanitize_display(robot));
@@ -4099,6 +4396,32 @@ pub fn topic_echo_with_scope(
     truncate_length: usize,
     scope: TopicScope,
 ) -> CliResult<()> {
+    topic_echo_with_selection(
+        topic,
+        schemas_dir,
+        running,
+        writer,
+        truncate_length,
+        scope,
+        None,
+    )
+}
+
+/// Observe a topic on an exact robot or resolve its unique source automatically.
+#[allow(clippy::print_stderr)] // Observer diagnostics must survive tracing filters.
+pub fn topic_echo_with_selection(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    // Max array ELEMENTS to print per array before closing it with a
+    // `!truncated <n>` element (the `--truncate-length` flag; the CLI passes
+    // [`DEFAULT_ECHO_TRUNCATE_LENGTH`] when the flag is omitted). Bounds every
+    // array: byte, numeric, string and message arrays alike.
+    truncate_length: usize,
+    scope: TopicScope,
+    robot: Option<&str>,
+) -> CliResult<()> {
     // The observer transport is LOCAL-ONLY — a genuine local topic
     // reads directly; a REMOTE topic (or a netd mirror) is demanded from the shared
     // cerulion-netd daemon, which re-injects the frames into local SHM where the
@@ -4114,12 +4437,17 @@ pub fn topic_echo_with_scope(
     // disposition, so without it the wait is uninterruptible. And an interrupted
     // resolve exits QUIETLY (exit 0, the repo's clean-cancel precedent) rather than
     // rendering a verdict about a topic we stopped looking for.
-    let (_transport, subscriber, source) =
-        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
-            Ok(v) => v,
-            Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
-            Err(e) => return Err(e),
-        };
+    let (_transport, subscriber, source) = match ensure_topic_available_with_selection(
+        topic,
+        schemas_dir,
+        Some(running.as_ref()),
+        scope,
+        robot,
+    ) {
+        Ok(v) => v,
+        Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
+        Err(e) => return Err(e),
+    };
 
     // Build a LOCAL walker from the desk's built-in types +
     // (when present) the workspace `.msg` store + `schemas/*.yaml`, so a frame
@@ -4359,6 +4687,19 @@ pub fn topic_hz_with_scope(
     writer: &mut dyn Write,
     scope: TopicScope,
 ) -> CliResult<()> {
+    topic_hz_with_selection(topic, schemas_dir, running, writer, scope, None)
+}
+
+/// Observe a topic on an exact robot or resolve its unique source automatically.
+#[allow(clippy::print_stderr)] // Observer diagnostics must survive tracing filters.
+pub fn topic_hz_with_selection(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    scope: TopicScope,
+    robot: Option<&str>,
+) -> CliResult<()> {
     // Remote-aware — a topic absent locally is DEMANDED from the shared
     // cerulion-netd daemon (netd owns the mirror). The seeded walker in `source` is
     // unused here — `hz` only times arrivals — but the silence report reads its ORIGIN so a
@@ -4369,12 +4710,17 @@ pub fn topic_hz_with_scope(
     // stale-mirror re-open trap).
     // See `topic_echo` — the wait must be interruptible here too, and an
     // interrupted resolve exits quietly rather than rendering a verdict.
-    let (_transport, subscriber, source) =
-        match ensure_topic_available(topic, schemas_dir, Some(running.as_ref()), scope) {
-            Ok(v) => v,
-            Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
-            Err(e) => return Err(e),
-        };
+    let (_transport, subscriber, source) = match ensure_topic_available_with_selection(
+        topic,
+        schemas_dir,
+        Some(running.as_ref()),
+        scope,
+        robot,
+    ) {
+        Ok(v) => v,
+        Err(_) if interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let source_desc = observer_source_description(&source);
 
     let mut timestamps: Vec<u64> = vec![];
@@ -4540,6 +4886,16 @@ pub fn topic_info_with_scope(
     schemas_dir: Option<&std::path::Path>,
     scope: TopicScope,
 ) -> CliResult<String> {
+    topic_info_with_selection(topic, schemas_dir, scope, None)
+}
+
+/// Observe a topic on an exact robot or resolve its unique source automatically.
+pub fn topic_info_with_selection(
+    topic: &str,
+    schemas_dir: Option<&std::path::Path>,
+    scope: TopicScope,
+    robot: Option<&str>,
+) -> CliResult<String> {
     // Remote-aware — a topic absent locally is DEMANDED from the shared
     // cerulion-netd daemon (netd owns the mirror), so `info` can report a live remote
     // topic AND name its type (item 2) via the walker seeded during the resolve.
@@ -4549,7 +4905,8 @@ pub fn topic_info_with_scope(
     // `_transport` is the LOCAL read transport, retained until after that drop.
     // `topic info` installs no signal handler, so it still dies on the
     // default SIGINT disposition and has no flag to thread.
-    let (_transport, subscriber, source) = ensure_topic_available(topic, schemas_dir, None, scope)?;
+    let (_transport, subscriber, source) =
+        ensure_topic_available_with_selection(topic, schemas_dir, None, scope, robot)?;
 
     let local_walker = local_walker_from_workspace(schemas_dir);
 
@@ -4985,11 +5342,11 @@ mod tests {
         // satisfied by prose. The ALLOW marker scan further down
         // deliberately uses RAW lines — the marker IS a comment by construction.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo_with_scope(").to_string();
-        let hz = fn_body(&src, "pub fn topic_hz_with_scope(").to_string();
-        let info = fn_body(&src, "pub fn topic_info_with_scope(").to_string();
-        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo_with_scope(");
-        let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz_with_scope(");
+        let echo = fn_body(&src, "pub fn topic_echo_with_selection(").to_string();
+        let hz = fn_body(&src, "pub fn topic_hz_with_selection(").to_string();
+        let info = fn_body(&src, "pub fn topic_info_with_selection(").to_string();
+        let raw_echo = fn_body(TOPIC_CMD_SRC, "pub fn topic_echo_with_selection(");
+        let raw_hz = fn_body(TOPIC_CMD_SRC, "pub fn topic_hz_with_selection(");
 
         // Extractor sanity: real, non-trivial bodies (a broken extractor
         // returning "{}" must not vacuously pass the negative assertions).
@@ -5167,8 +5524,8 @@ mod tests {
         // justifying the marker, so a raw-source walk could satisfy the
         // anti-vacuity assert from prose alone.
         let src = code_only(TOPIC_CMD_SRC);
-        let echo = fn_body(&src, "pub fn topic_echo_with_scope(").to_string();
-        let hz = fn_body(&src, "pub fn topic_hz_with_scope(").to_string();
+        let echo = fn_body(&src, "pub fn topic_echo_with_selection(").to_string();
+        let hz = fn_body(&src, "pub fn topic_hz_with_selection(").to_string();
 
         for (name, body) in [("topic_echo", echo), ("topic_hz", hz)] {
             // Anti-vacuity: the floor exists at all.
@@ -6147,8 +6504,8 @@ mod tests {
         );
         // …but the hint is the UNREACHABLE arm: the --connect escape survives.
         assert!(
-            out.contains("--connect tcp/<host>:7683"),
-            "a mere cache candidate must not suppress the --connect escape; got: {out}"
+            out.contains("sign in or pair a robot"),
+            "unverified candidates retain the automatic account/pairing hint; got: {out}"
         );
         // The whole shape, exactly: the candidates line, a blank line, then
         // the one unreachable line (a candidates-only ROBOTS section is
@@ -6212,8 +6569,8 @@ mod tests {
     /// `--connect` escape for a robot scouting cannot reach. Hand oracle.
     fn unreachable_none_line() -> String {
         format!(
-            "remote: none discovered in {} ms (a robot off the LAN needs \
-             --connect tcp/<host>:7683)\n",
+            "remote: none discovered in {} ms (sign in or pair a robot; \
+             account and paired robots are reached automatically)\n",
             REMOTE_QUERY_GATHER_WINDOW.as_millis()
         )
     }
@@ -6264,8 +6621,8 @@ mod tests {
         );
         let window = format!("{} ms", REMOTE_QUERY_GATHER_WINDOW.as_millis());
         assert!(
-            out.contains(&window) && out.contains("--connect tcp/<host>:7683"),
-            "endpoint-less empty arm must name the bounded window + the --connect escape; \
+            out.contains(&window) && out.contains("sign in or pair a robot"),
+            "endpoint-less empty arm names the bounded window and automatic pairing; \
              got: {out}"
         );
         assert!(

@@ -3,6 +3,8 @@
 One gateway per computer, one zenoh session, refcounted UDS NDJSON topic demands.
 lib + bin: injected in-process daemon tests prove wiring, not live delivery.
 
+- Protocol 10 adds paired directory discovery and isolated observer demands. Wire/2 names remain canonical; `/__cerulion/observers/` mirrors are source-qualified, refcounted and released on the last observer. Graph ingress stays canonical.
+
 ## Invariants
 - LAN defaults to Paired everywhere; explicit Open warns. Delivery fixtures select Open.
 - Gateway/probe/taps obey SHM producer scope even on open LAN: local-only and outputs omitted from declared egress stay private; taps retain leases.
@@ -54,6 +56,8 @@ lib + bin: injected in-process daemon tests prove wiring, not live delivery.
 - `cargo test -p cerulion_netd` is parallel-safe; keep `--no-default-features` green.
   Oracles are COUNTS, never wall clocks.
 - `wan_plane_iroh_test owner_pair::controller` wants `-- --test-threads=1`.
+- `wan_plane_iroh_test automatic_cli` needs `cargo build -p cerulion_cli` first;
+  run its real CLI/SHM delivery check with `-- --test-threads=1`.
 - `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
   it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
 

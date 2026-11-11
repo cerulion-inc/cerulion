@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Local-only graph and node runs exclude their topics, schemas and run metadata from every remote serving plane, including an already running open gateway. An enabled `network:` block's egress list is enforced for that producing run by other daemons too.
 - Network-enabled runs start the authenticated remote server on their first egress registration without requiring `CERULION_NETD_LISTEN`. Query-only desks and local-only runs start no server; the last serving registration's release or disconnect reaps it after active work, owed e-stop delivery and its latch clear. Saved robot pairings and expired saved logins preserve offline serving. Owned remote servers receive SIGTERM and a bounded graceful cleanup window before forced reap.
+- Topic discovery lists account-owned and explicitly paired robots anywhere, with direct or relayed reachability and visible offline status. Topic reads and remote visualization demand authenticated wire/2 streams automatically, keep identical local and remote names separate, and release streams when their observers exit. `topic echo`, `hz`, and `info` accept `--robot NAME` and refuse ambiguous names with exit 2.
 
 ## [2.0.0] - 2026-11-11
 

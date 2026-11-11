@@ -448,6 +448,9 @@ fn an_isolated_transient_resolve_is_not_converged_never_a_false_absence() {
     // isolated, so nothing can answer.
     let resolved = resolve_remote_ingress_target_with_opts("/nobody", &[], &[], false, None);
     match resolved {
+        RemoteResolve::Ambiguous { candidates } => {
+            panic!("isolated session has no candidates: {candidates:?}")
+        }
         RemoteResolve::DiscoveryNotConverged => {}
         RemoteResolve::NoProducer => panic!(
             "an isolated resolve read NO robot's catalog — reporting NoProducer makes the CLI \
@@ -2029,6 +2032,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             resolve_remote_ingress_target_with_opts(custom_topic, &connect, &[], false, None);
         if matches!(known, RemoteResolve::Found(_)) {
             let custom_label = match &custom {
+                RemoteResolve::Ambiguous { .. } => "Ambiguous",
                 RemoteResolve::Found(_) => "Found",
                 RemoteResolve::NoProducer => "NoProducer",
                 // Unreachable on THIS path (an explicit `--connect` locator
