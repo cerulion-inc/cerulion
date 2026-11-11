@@ -486,7 +486,7 @@ async fn unpaired_peers_filling_the_shared_slots_cannot_take_the_paired_reserve(
         // it would be retried or admitted, so this refusal proves the desk got
         // in while the 24 shared slots were full.
         refused_by_direct(robot_udp, &mut direct[17]).await;
-        // The stranger's relay URL bucket is still full.
+        // Unpaired relay arrivals are still refused at the shared cap.
         refused_by_relay(&mut stranger, robot_id, &mut relayed[8]).await;
     })
     .await;

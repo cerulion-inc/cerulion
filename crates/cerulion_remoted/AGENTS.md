@@ -22,8 +22,8 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   key and refuses any other value; a cloud account needs the roots-verified chain
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
-  concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
-  TLS: 32 (last 8 for paired relay keys); retry 16; 4/IP or paired key; 8/unpaired URL.
+  concurrently so no session starves it (`estop_starvation_test.rs`).
+  TLS: docs/remote_plane.md; paired keys Retry first.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - `cerulion_pairing`'s canonical signing bytes are pinned by INDEPENDENT
@@ -46,13 +46,13 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
   CAP_OBSERVE after async provider work (`local_schema_provider_test`).
 
-## Testing
-- Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
-  limit a parallel run hits iceoryx service/port errors.
-- The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
+## Tests
+- `wire_plane_test` uses `-- --test-threads=1`: parallel tests at the macOS
+  256-file soft limit hit iceoryx service/port errors.
+- Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct
+  `TransportManager::get_or_init()` callers are `#[serial]`;
   e2e: loopback iroh and relays only, bounded awaits.
-- remoted and link cold-compile iroh. remoted, connectd, wireclient, link and
-  accountd are OUT of `default-members`: build with `-p`.
+- remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
 Deep reference: docs/internals/remote-access.md, before touching the verb table,
 trust persistence, the wire plane, pairing formats or epoch delivery.

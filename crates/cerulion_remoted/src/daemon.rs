@@ -52,9 +52,11 @@ const MAX_HELLO_LEN: usize = 4096;
 ///
 /// At most 32 TLS handshakes are pending, and arrivals other than paired relay
 /// keys fill at most 24 of them. Unvalidated addresses are retried from half
-/// capacity; validated IPs and paired relay keys hold at most four slots each,
-/// unpaired relay arrivals share eight per URL and custom transports share four.
-/// Established connections have their own protocol deadlines.
+/// capacity. A paired relay key answers one Retry, which travels over the relay
+/// to the key's holder, before it takes a slot. Validated IPs and paired relay
+/// keys hold at most four slots each, unpaired relay arrivals share eight per
+/// URL and custom transports share four. Established connections have their own
+/// protocol deadlines.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Bound unauthenticated work without serializing one peer ahead of safety ops.
@@ -94,7 +96,14 @@ impl Cap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
     Admit,
+    /// Address validation under pressure: an unvalidated arrival once half the
+    /// slots are pending, below the unpaired share.
     Retry,
+    /// An unvalidated arrival under a paired relay key. iroh reads that key from
+    /// the source address, which an IP datagram can forge, so the arrival takes
+    /// no slot until it returns the Retry token. The Retry goes out over the
+    /// relay, so only the key's holder receives it.
+    KeyRetry,
     Refuse(Cap),
 }
 
@@ -104,9 +113,9 @@ const _: () = assert!(
     MAX_PENDING_HANDSHAKES / 2 < UNPAIRED_PENDING && UNPAIRED_PENDING < MAX_PENDING_HANDSHAKES
 );
 
-/// The global cap, the unpaired share (paired relay keys exempt), address
-/// Retry, then the per-IP cap. `ip_pending` is the count of the arrival's
-/// validated IP, zero for every other source.
+/// The global cap, the paired key Retry, the unpaired share (paired relay keys
+/// exempt), address Retry, then the per-IP cap. `ip_pending` is the count of
+/// the arrival's validated IP, zero for every other source.
 fn handshake_admission(
     pending: usize,
     ip_pending: usize,
@@ -115,6 +124,8 @@ fn handshake_admission(
 ) -> Admission {
     if pending >= MAX_PENDING_HANDSHAKES {
         Admission::Refuse(Cap::Global)
+    } else if paired && !validated {
+        Admission::KeyRetry
     } else if !paired && pending >= UNPAIRED_PENDING {
         Admission::Refuse(Cap::UnpairedShare)
     } else if !validated && pending >= MAX_PENDING_HANDSHAKES / 2 {
@@ -203,8 +214,9 @@ fn source_admission(
     }
 }
 
-/// Whether an admission at `pending` closes the global, unpaired-share and
-/// address-retry regimes: only below half capacity.
+/// Whether an admission or completion at `pending` closes the global,
+/// unpaired-share, address-retry and handshake-failure regimes: only below half
+/// capacity.
 fn shared_regimes_close(pending: usize) -> bool {
     pending < MAX_PENDING_HANDSHAKES / 2
 }
@@ -713,8 +725,12 @@ pub async fn serve_planes(
                 };
                 match accepted {
                     Ok(a) => {
-                        if let Some(suppressed) = handshake_failures.on_success() {
-                            tracing::info!(suppressed, "remote TLS handshake completion recovered");
+                        // Below half capacity only, so completions interleaved
+                        // with a flood of failures cannot re-arm its loud line.
+                        if shared_regimes_close(handshakes.len()) {
+                            if let Some(suppressed) = handshake_failures.on_success() {
+                                tracing::info!(suppressed, "remote TLS handshake completion recovered");
+                            }
                         }
                         let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
                             match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
@@ -776,7 +792,8 @@ pub async fn serve_planes(
                 });
                 let pending_from_source = pending_from(&sources, source.as_ref());
                 use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-                match source_admission(handshakes.len(), pending_from_source, validated, source.as_ref()) {
+                let admission = source_admission(handshakes.len(), pending_from_source, validated, source.as_ref());
+                match admission {
                     Admission::Refuse(cap) => {
                         match handshake_admission_failures.refused(cap) {
                             RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(pending = handshakes.len(), cap = cap.as_str(), total_failures = handshake_admission_failures.total(cap), "remote handshake refused at its admission cap"),
@@ -785,10 +802,14 @@ pub async fn serve_planes(
                         incoming.refuse();
                         continue;
                     }
-                    Admission::Retry => {
-                        match handshake_retry_failures.on_failure() {
-                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::debug!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
-                            RegimeDecision::Suppressed { .. } => tracing::trace!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
+                    Admission::Retry | Admission::KeyRetry => {
+                        // A paired key's Retry is its normal path, not pressure,
+                        // so only address retry feeds the retry latch.
+                        if admission == Admission::Retry {
+                            match handshake_retry_failures.on_failure() {
+                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::debug!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
+                                RegimeDecision::Suppressed { .. } => tracing::trace!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
+                            }
                         }
                         match incoming.retry() {
                             Ok(()) => {
@@ -1219,11 +1240,13 @@ mod tests {
             (32, 0, true, false, Admission::Refuse(Cap::Global)),
             (33, 0, true, false, Admission::Refuse(Cap::Global)),
             (32, 4, true, false, Admission::Refuse(Cap::Global)),
-            (0, 0, false, true, Admission::Admit),
-            (15, 0, false, true, Admission::Admit),
-            (16, 0, false, true, Admission::Retry),
-            (24, 0, false, true, Admission::Retry),
-            (31, 0, false, true, Admission::Retry),
+            (0, 0, false, true, Admission::KeyRetry),
+            (15, 0, false, true, Admission::KeyRetry),
+            (16, 0, false, true, Admission::KeyRetry),
+            (24, 0, false, true, Admission::KeyRetry),
+            (31, 0, false, true, Admission::KeyRetry),
+            (0, 0, true, true, Admission::Admit),
+            (15, 0, true, true, Admission::Admit),
             (23, 0, true, true, Admission::Admit),
             (24, 0, true, true, Admission::Admit),
             (31, 0, true, true, Admission::Admit),
@@ -1325,7 +1348,7 @@ mod tests {
             source_admission(
                 8,
                 pending_from(&sources, Some(&paired)),
-                false,
+                true,
                 Some(&paired)
             ),
             Admission::Admit
@@ -1359,24 +1382,30 @@ mod tests {
             source_admission(31, 4, true, Some(&paired)),
             Admission::Refuse(Cap::PairedRelay)
         );
-        for (source, count, expected) in [
-            (&unpaired, 7, Admission::Admit),
-            (&unpaired, 8, Admission::Refuse(Cap::UnpairedRelay)),
-            (&unpaired, 9, Admission::Refuse(Cap::UnpairedRelay)),
-            (&paired, 0, Admission::Admit),
-            (&paired, 3, Admission::Admit),
-            (&paired, 4, Admission::Refuse(Cap::PairedRelay)),
-            (&paired, 5, Admission::Refuse(Cap::PairedRelay)),
+        for (source, count, validated, expected) in [
+            (&unpaired, 7, false, Admission::Admit),
+            (&unpaired, 8, false, Admission::Refuse(Cap::UnpairedRelay)),
+            (&unpaired, 9, false, Admission::Refuse(Cap::UnpairedRelay)),
+            (&paired, 0, true, Admission::Admit),
+            (&paired, 3, true, Admission::Admit),
+            (&paired, 4, true, Admission::Refuse(Cap::PairedRelay)),
+            (&paired, 5, true, Admission::Refuse(Cap::PairedRelay)),
+            (&paired, 0, false, Admission::KeyRetry),
+            (&paired, 4, false, Admission::KeyRetry),
         ] {
-            assert_eq!(source_admission(8, count, false, Some(source)), expected);
+            assert_eq!(
+                source_admission(8, count, validated, Some(source)),
+                expected,
+                "{source:?} at {count}, validated {validated}"
+            );
         }
         assert_eq!(
             source_admission(16, 0, false, Some(&paired)),
-            Admission::Retry
+            Admission::KeyRetry
         );
         assert_eq!(
             source_admission(16, 4, false, Some(&paired)),
-            Admission::Retry
+            Admission::KeyRetry
         );
         assert_eq!(
             source_admission(32, 4, true, Some(&paired)),
@@ -1389,6 +1418,48 @@ mod tests {
         assert_eq!(
             source_admission(32, 0, true, Some(&paired)),
             Admission::Refuse(Cap::Global)
+        );
+    }
+
+    /// An IP datagram whose source is a relay-mapped address reads as an
+    /// unvalidated relay arrival under the key that address maps to. However many such
+    /// arrivals come, at any pending count and any bucket count, none takes a
+    /// slot: each gets a Retry that only the key's holder receives.
+    #[test]
+    fn a_forged_relay_source_never_takes_a_paired_key_slot() {
+        let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let forged = IncomingAddr::Relay {
+            url: "https://relay.example.invalid".parse().unwrap(),
+            endpoint_id: key,
+        };
+        let source = handshake_source(forged, false, |id| *id == key).unwrap();
+        assert_eq!(source, SourceKey::PairedRelay(key));
+        for pending in 0..=33 {
+            for from_source in 0..=5 {
+                let expected = if pending >= 32 {
+                    Admission::Refuse(Cap::Global)
+                } else {
+                    Admission::KeyRetry
+                };
+                assert_eq!(
+                    source_admission(pending, from_source, false, Some(&source)),
+                    expected,
+                    "pending {pending}, from source {from_source}"
+                );
+            }
+        }
+        // The same key, validated by the returned token, takes its bucket.
+        assert_eq!(
+            source_admission(0, 0, true, Some(&source)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(0, 3, true, Some(&source)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(0, 4, true, Some(&source)),
+            Admission::Refuse(Cap::PairedRelay)
         );
     }
 
