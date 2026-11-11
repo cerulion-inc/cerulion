@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Checked, cached calls to the host's immutable C table.
 
-use std::mem::{align_of, offset_of};
 use std::sync::{Arc, Mutex};
 
+use super::deferred::{Deferred, Terminal};
 use crate::error::{NodeErrorKind, TransportError, TransportResult};
 use crate::message::ShmMessage;
 use crate::node_abi::*;
@@ -13,6 +13,7 @@ struct ClientInner {
     api: HostApiV1,
     context: ContextHandle,
     failure: Mutex<Option<TransportError>>,
+    deferred: Mutex<Deferred>,
 }
 
 /// Node-owned cache of checked C function pointers and a host-minted handle.
@@ -57,62 +58,21 @@ impl HostClient {
         context: ContextHandle,
         required: u64,
     ) -> Result<Self, Status> {
-        if api.is_null()
-            || !api.addr().is_multiple_of(align_of::<HostApiV1>())
-            || context.value == 0
-        {
+        if context.value == 0 {
             return Err(super::status(status_code::INVALID_ARGUMENT));
         }
-        // SAFETY (U05): the caller guarantees a live immutable fixed header;
-        // non-null/alignment are checked before reading it. No full table yet.
-        let header = unsafe { api.cast::<TableHeaderV1>().read() };
-        validate_header::<HostApiV1>(&header)
+        // SAFETY (U05): caller retains the immutable host allocation and code;
+        // the frozen interface validates alignment, complete header identity
+        // and all 28 callback representations before returning a typed table.
+        let api = unsafe { read_host_api(api) }
             .map_err(|_| super::status(status_code::INVALID_ARGUMENT))?;
-        // Read required function addresses as integers BEFORE forming a typed
-        // HostApi value: a null Rust function pointer is an invalid value.
-        let offsets = [
-            offset_of!(HostApiV1, bind_port),
-            offset_of!(HostApiV1, loan_output),
-            offset_of!(HostApiV1, finish_output),
-            offset_of!(HostApiV1, submit_spill),
-            offset_of!(HostApiV1, discard_output),
-            offset_of!(HostApiV1, receive_input),
-            offset_of!(HostApiV1, release_input),
-            offset_of!(HostApiV1, input_head),
-            offset_of!(HostApiV1, set_snapshot_inputs),
-            offset_of!(HostApiV1, snapshot_inputs),
-            offset_of!(HostApiV1, pump_history),
-            offset_of!(HostApiV1, clock),
-            offset_of!(HostApiV1, request_shutdown),
-            offset_of!(HostApiV1, environment),
-            offset_of!(HostApiV1, poll_event),
-            offset_of!(HostApiV1, publisher_counters),
-            offset_of!(HostApiV1, copy_error),
-            offset_of!(HostApiV1, diagnostic),
-            offset_of!(HostApiV1, accumulate_count),
-            offset_of!(HostApiV1, accumulate_frame),
-            offset_of!(HostApiV1, mark_served),
-            offset_of!(HostApiV1, capture_accumulate),
-            offset_of!(HostApiV1, query_extension),
-            offset_of!(HostApiV1, restore_accumulate),
-        ];
-        for offset in offsets {
-            // SAFETY (U05): complete byte size/identity were checked; fn fields
-            // have pointer-sized initialized representations on this target.
-            let address = unsafe { api.cast::<u8>().add(offset).cast::<usize>().read() };
-            if address == 0 {
-                return Err(super::status(status_code::INVALID_ARGUMENT));
-            }
-        }
-        // SAFETY (U05): complete shape and every fn representation checked;
-        // host backing remains immutable. Copy only the C records/callbacks.
-        let api = unsafe { api.read() };
         negotiate(required, api.capabilities)
             .map_err(|_| super::status(status_code::UNSUPPORTED))?;
         Ok(Self(Arc::new(ClientInner {
             api,
             context,
             failure: Mutex::new(None),
+            deferred: Mutex::new(Deferred::default()),
         })))
     }
 
@@ -143,10 +103,7 @@ impl HostClient {
                 kind,
                 reason,
             },
-            None => TransportError::NodeError {
-                node_id: "host".into(),
-                reason,
-            },
+            None => TransportError::HostServiceFailed { reason },
         }
     }
 
@@ -168,6 +125,10 @@ impl HostClient {
         );
         if !matches!(status.code, status_code::OK | status_code::BUFFER_TOO_SMALL) {
             return None;
+        }
+        if status.code == status_code::OK && required == 0 {
+            // A complete empty copy has already consumed its token.
+            return Some(String::new());
         }
         let len = usize::try_from(required)
             .ok()
@@ -203,7 +164,8 @@ impl HostClient {
             .and_then(|mut failure| failure.take())
     }
 
-    pub(super) fn has_failure(&self) -> bool {
+    /// Whether a prior host service failed during the current node call.
+    pub fn has_failure(&self) -> bool {
         self.0
             .failure
             .lock()
@@ -228,7 +190,14 @@ impl HostClient {
         &self,
         port: PortHandle,
     ) -> TransportResult<WriteSlotV1> {
-        let request = Self::request::<T>();
+        self.loan_frame(port, Self::request::<T>())
+    }
+
+    pub(super) fn loan_frame(
+        &self,
+        port: PortHandle,
+        request: LoanRequestV1,
+    ) -> TransportResult<WriteSlotV1> {
         let mut slot = WriteSlotV1 {
             data: std::ptr::null_mut(),
             lease: LeaseHandle::default(),
@@ -259,16 +228,68 @@ impl HostClient {
     }
 
     pub(super) fn finish_output(&self, lease: LeaseHandle, size: u32) {
-        let status = host_call!(self, finish_output, lease, size);
-        if let Err(error) = self.check(status) {
+        self.terminal(Terminal::Finish(lease, size));
+    }
+    pub(super) fn discard_output(&self, lease: LeaseHandle, reason: u32) {
+        self.terminal(Terminal::Discard(lease, reason));
+    }
+    fn invoke_terminal(&self, operation: Terminal) -> Status {
+        match operation {
+            Terminal::Finish(lease, size) => host_call!(self, finish_output, lease, size),
+            Terminal::Discard(lease, reason) => host_call!(self, discard_output, lease, reason),
+            Terminal::Release(lease) => host_call!(self, release_input, lease),
+        }
+    }
+    fn terminal(&self, operation: Terminal) {
+        let status = self.invoke_terminal(operation);
+        if status.code == status_code::INVALID_STATE {
+            // Admission has no lease effect. Keep one bounded scalar operation
+            // until this node next enters an admitted host invocation.
+            let result = self
+                .0
+                .deferred
+                .lock()
+                .map_err(|_| super::argument_error("deferred release gate is poisoned"))
+                .and_then(|mut pending| pending.push(operation));
+            if let Err(error) = result {
+                self.record_failure(error);
+            }
+        } else if let Err(error) = self.check(status) {
             self.record_failure(error);
         }
     }
-
-    pub(super) fn discard_output(&self, lease: LeaseHandle, reason: u32) {
-        let status = host_call!(self, discard_output, lease, reason);
-        if let Err(error) = self.check(status) {
-            self.record_failure(error);
+    pub(super) fn extend_deferred_budget(&self, additional: usize) -> TransportResult<()> {
+        self.0
+            .deferred
+            .lock()
+            .map_err(|_| super::argument_error("deferred release gate is poisoned"))?
+            .extend_capacity(additional)
+    }
+    /// Count locally deferred releases independently of diagnostics.
+    pub fn deferred_release_count(&self) -> usize {
+        self.0.deferred.lock().map_or(0, |pending| pending.len())
+    }
+    /// Retry out-of-admission releases before user code in an admitted call.
+    /// Every admitted terminal result retires its queue entry exactly once.
+    pub fn flush_deferred(&self) -> TransportResult<()> {
+        loop {
+            let mut pending = self
+                .0
+                .deferred
+                .lock()
+                .map_err(|_| super::argument_error("deferred release gate is poisoned"))?;
+            let Some(operation) = pending.front() else {
+                return Ok(());
+            };
+            // Host terminal services cannot re-enter node code. Keep the row
+            // reserved during the synchronous call so a concurrent finalizer
+            // cannot occupy it before an admission refusal is returned.
+            let status = self.invoke_terminal(operation);
+            if status.code != status_code::INVALID_STATE {
+                pending.pop();
+            }
+            drop(pending);
+            self.check(status)?;
         }
     }
 
@@ -283,6 +304,51 @@ impl HostClient {
         };
         let status = host_call!(self, submit_spill, lease, bytes_span(payload), size);
         if let Err(error) = self.check(status) {
+            self.record_failure(error);
+        }
+    }
+
+    pub(super) fn create_raw(
+        &self,
+        request: RawPublisherRequestV1,
+    ) -> TransportResult<PortBindingV1> {
+        let mut binding = PortBindingV1 {
+            port: PortHandle::default(),
+            topic: bytes_span(&[]),
+            configured_capacity: 0,
+            read_mode: 0,
+        };
+        self.check(host_call!(
+            self,
+            create_raw_publisher,
+            request,
+            &mut binding
+        ))?;
+        if binding.port.value == 0 {
+            return Err(super::argument_error(
+                "host raw publisher handle is invalid",
+            ));
+        }
+        Ok(binding)
+    }
+    pub(super) fn finish_raw(&self, lease: LeaseHandle, size: u32) -> TransportResult<usize> {
+        let mut recipients = 0;
+        self.check(host_call!(
+            self,
+            finish_raw_output,
+            lease,
+            size,
+            &mut recipients
+        ))?;
+        usize::try_from(recipients)
+            .map_err(|_| super::argument_error("raw recipient count exceeds usize"))
+    }
+    pub(super) fn register_raw(&self, port: PortHandle) -> TransportResult<()> {
+        // Explicitly fallible: network registration failure must leave local ingress usable.
+        self.check(host_call!(self, register_raw_egress, port))
+    }
+    pub(super) fn destroy_raw(&self, port: PortHandle) {
+        if let Err(error) = self.check(host_call!(self, destroy_raw_publisher, port)) {
             self.record_failure(error);
         }
     }
@@ -324,10 +390,7 @@ impl HostClient {
     }
 
     pub(super) fn release_read(&self, lease: LeaseHandle) {
-        let status = host_call!(self, release_input, lease);
-        if let Err(error) = self.check(status) {
-            self.record_failure(error);
-        }
+        self.terminal(Terminal::Release(lease));
     }
 
     fn clock(&self, source: u32) -> Option<u64> {
@@ -445,8 +508,10 @@ impl HostClient {
             return Ok(None);
         }
         self.check(status)?;
-        if event.port != port || event.kind != kind {
-            return Err(super::argument_error("host event port or kind is invalid"));
+        if event.port != port || event.kind != kind || event.reserved != 0 {
+            return Err(super::argument_error(
+                "host event port, kind or reserved field is invalid",
+            ));
         }
         Ok(Some(event))
     }

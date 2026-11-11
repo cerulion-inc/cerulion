@@ -15,10 +15,10 @@
 //! releases it.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use backend::{Context as NodeContext, Loan as RawShmLoan, Publishers};
 use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
 use cerulion_core::dynamic::{FrameEncoder, SchemaSet};
-use cerulion_core::graph::node::{AnyPublisher, NodeContext};
-use cerulion_core::transport::publisher::RawShmLoan;
+use cerulion_core::graph::node::NodeContext as NativeContext;
 use cerulion_core::transport::subscriber::RawInputView;
 use cerulion_core::wire::WireHeader;
 use cerulion_core::{SyncHeadOp, SyncOpAnswer};
@@ -41,6 +41,8 @@ use std::sync::{Once, OnceLock};
 pub use cerulion_core;
 
 pub mod abi;
+mod backend;
+pub mod stable;
 
 fn builtin_schemas() -> Vec<MessageSchema> {
     native_ros2_messages::BUILTIN_MSGS
@@ -154,6 +156,7 @@ impl HostCtx {
 enum FrameBacking {
     Sample(RawInputView<'static>),
     Copied(Rc<[u8]>),
+    Plugin(cerulion_core::graph::node_plugin_abi::RawFrameRead),
 }
 
 #[pyclass(unsendable)]
@@ -169,6 +172,7 @@ impl HostFrame {
         match &self.backing {
             FrameBacking::Sample(view) => view,
             FrameBacking::Copied(bytes) => bytes,
+            FrameBacking::Plugin(frame) => frame.bytes(),
         }
     }
 }
@@ -337,7 +341,7 @@ impl HostLoan {
 /// built-in message plus the workspace's) per tick would put thousands of
 /// allocations on the loan path.
 struct HostTickShared {
-    publishers: Cell<*mut indexmap::IndexMap<String, AnyPublisher>>,
+    publishers: Cell<*mut ()>,
     outputs: Rc<HashMap<String, LoanMeta>>,
     schemas: Rc<SchemaSet>,
     active: Cell<bool>,
@@ -347,6 +351,16 @@ struct HostTickShared {
 #[pyclass(unsendable)]
 struct HostTick {
     state: Rc<HostTickShared>,
+}
+
+// Invalidate a retained Python tick handle even if Rust unwinds before normal
+// cleanup; its pointer must never outlive the local publisher borrow.
+struct TickAccessGuard(Rc<HostTickShared>);
+impl Drop for TickAccessGuard {
+    fn drop(&mut self) {
+        self.0.active.set(false);
+        self.0.publishers.set(std::ptr::null_mut());
+    }
 }
 
 #[pymethods]
@@ -367,10 +381,7 @@ impl HostTick {
         // SAFETY: The active flag and null check above are set before the
         // Host releases its mutable publisher borrow. The unsendable pyclass
         // prevents concurrent Python access while this pointer is used.
-        let publishers = unsafe { &mut *publishers_ptr };
-        let publisher = publishers
-            .get_mut(name)
-            .ok_or_else(|| PyValueError::new_err(format!("unknown output '{name}'")))?;
+        let publishers = unsafe { &mut *publishers_ptr.cast::<Publishers<'_>>() };
         let layout = state.schemas.layout(&meta.schema_name).ok_or_else(|| {
             PyValueError::new_err(format!("schema {:?} is not available", meta.schema_name))
         })?;
@@ -386,19 +397,11 @@ impl HostTick {
                 )));
             }
         }
-        let loan = match publisher {
-            AnyPublisher::Ipc(publisher) => publisher
-                .loan_raw_uninit(total)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        };
-        let mut loan = loan;
-        for byte in loan.bytes_uninit_mut() {
-            byte.write(0);
-        }
-        let mut loan = unsafe {
-            // SAFETY: every byte of the exact-size raw loan was initialized.
-            loan.assume_init()
-        };
+        let request =
+            stable::loan_request(layout, meta.schema_hash).map_err(PyValueError::new_err)?;
+        let mut loan = publishers
+            .loan(name, total, request)
+            .map_err(PyRuntimeError::new_err)?;
         let entries = {
             let bytes = loan.bytes_mut();
             encoder
@@ -963,11 +966,29 @@ impl Host {
     /// cdylib) is alive in the process; node-directory activation uses the
     /// process-wide Python registry.
     pub fn init(
+        ctx: Box<NativeContext>,
+        module_name: &str,
+        sys_path: &[&str],
+        info: &[u8],
+        first_instance: bool,
+    ) -> Result<Self, String> {
+        Self::init_backend(
+            Box::new(NodeContext::Native(ctx)),
+            module_name,
+            sys_path,
+            info,
+            first_instance,
+            None,
+        )
+    }
+
+    fn init_backend(
         mut ctx: Box<NodeContext>,
         module_name: &str,
         sys_path: &[&str],
         info: &[u8],
         first_instance: bool,
+        params: Option<&[u8]>,
     ) -> Result<Self, String> {
         initialize_python()?;
         Python::attach(|py| -> Result<Self, String> {
@@ -1027,7 +1048,16 @@ impl Host {
                 .call1((
                     classes[0].1.clone(),
                     host_ctx,
-                    py.None(),
+                    match params {
+                        Some(bytes) if !bytes.is_empty() => {
+                            let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+                            py.import("json")
+                                .and_then(|m| m.call_method1("loads", (text,)))
+                                .map_err(python_error)?
+                                .unbind()
+                        }
+                        _ => py.None(),
+                    },
                     workspace.to_string_lossy().into_owned(),
                     sys_path.first().copied(),
                 ))
@@ -1116,48 +1146,22 @@ impl Host {
     /// copy, and the touched-output list crosses back as Python values.
     pub fn tick(&mut self) -> Result<(), String> {
         let clock = self.ctx.clock().clone();
-        let (publishers, subscribers) = self.ctx.split_publishers_subscribers_mut();
-        let publishers_ptr = publishers as *mut _;
+        let (mut publishers, mut subscribers) = self.ctx.split();
+        let publishers_ptr = (&mut publishers as *mut Publishers<'_>).cast::<()>();
         Python::attach(|py| {
             let frames = &mut self.frame_scratch;
             frames.clear();
             let result = (|| -> Result<(), String> {
                 for name in &self.input_names {
-                    let view = match (
-                        subscribers.get_mut(name.as_str()),
-                        self.input_hashes.get(name),
-                    ) {
-                        (Some(subscriber), Some(&schema_hash)) => subscriber
-                            .view_raw_expecting(schema_hash)
-                            .map_err(|error| error.to_string())?,
-                        _ => None,
+                    let backing = match self.input_hashes.get(name) {
+                        Some(&hash) => subscribers.read(name, hash, &mut self.held_copies)?,
+                        None => None,
                     };
-                    let Some(view) = view else {
+                    let Some(backing) = backing else {
                         frames.push(None);
                         continue;
                     };
-                    // The header the frame checks parsed rides the view; the
-                    // schema hash is read from it, not parsed a second time.
-                    let schema_hash = view.schema_hash();
-                    let backing = match view.into_owned() {
-                        Ok(view) => FrameBacking::Sample(view),
-                        Err(held) => {
-                            let cached = self
-                                .held_copies
-                                .get(name)
-                                .filter(|copy| copy.as_ref() == &held[..]);
-                            let copy = match cached {
-                                Some(copy) => Rc::clone(copy),
-                                None => {
-                                    // hot-path-alloc-ok: one copy per distinct held frame.
-                                    let copy: Rc<[u8]> = Rc::from(&held[..]);
-                                    self.held_copies.insert(name.clone(), Rc::clone(&copy));
-                                    copy
-                                }
-                            };
-                            FrameBacking::Copied(copy)
-                        }
-                    };
+                    let schema_hash = self.input_hashes[name];
                     // hot-path-alloc-ok: the frame Python reads is a CPython
                     // object, one per input frame per tick; it wraps the SHM
                     // sample (or the one held copy above) and copies no bytes.
@@ -1182,6 +1186,7 @@ impl Host {
                     active: Cell::new(true),
                     loans: RefCell::new(Vec::new()),
                 });
+                let _access = TickAccessGuard(Rc::clone(&state));
                 let tick = Py::new(
                     py,
                     HostTick {
@@ -1215,6 +1220,10 @@ impl Host {
                 state.active.set(false);
                 state.publishers.set(std::ptr::null_mut());
                 let (touched, tick_error) = match call_result {
+                    Ok(touched) if publishers.pending_failure() => (
+                        touched,
+                        Some("host service failed during Python tick".into()),
+                    ),
                     Ok(touched) => (touched, None),
                     Err(error) => {
                         let mut message = error;
@@ -1300,7 +1309,7 @@ impl Host {
                         if !self.outputs.contains_key(name.as_str()) {
                             return Err(format!("unknown output '{name}'"));
                         }
-                        if publishers.get(name.as_str()).is_none() {
+                        if !publishers.contains(name.as_str()) {
                             return Err(format!("unknown output publisher '{name}'"));
                         }
                     }
@@ -1326,46 +1335,37 @@ impl Host {
                             .outputs
                             .get(&name)
                             .ok_or_else(|| format!("unknown output '{name}'"))?;
-                        // SAFETY: the split context borrow keeps the publishers map
-                        // alive for the duration of this tick.
-                        let publisher = publishers
-                            .get_mut(&name)
-                            .ok_or_else(|| format!("unknown output publisher '{name}'"))?;
-                        // A restored replay seeds the publisher; the first frame
-                        // continues the recorded stream's numbering, as a Rust node's does.
-                        let initial = match publisher {
-                            AnyPublisher::Ipc(publisher) => publisher.initial_sequence(),
+                        let host_stamps = raw_loan.host_stamps();
+                        let sequence = if host_stamps {
+                            None
+                        } else {
+                            let initial = publishers.initial_sequence(&name);
+                            if !self.next_sequences.contains_key(name.as_str()) {
+                                // hot-path-alloc-ok: each native output keys its sequence only on its first publish.
+                                self.next_sequences.insert(name.clone(), initial);
+                            }
+                            Some(self.next_sequences.get_mut(name.as_str()).ok_or_else(|| {
+                                format!("output '{name}' has no sequence counter")
+                            })?)
                         };
-                        if !self.next_sequences.contains_key(name.as_str()) {
-                            // hot-path-alloc-ok: an output's first publish keys its
-                            // sequence counter; every later tick finds the entry.
-                            self.next_sequences.insert(name.clone(), initial);
-                        }
-                        let sequence = self
-                            .next_sequences
-                            .get_mut(name.as_str())
-                            .ok_or_else(|| format!("output '{name}' has no sequence counter"))?;
                         let bytes = raw_loan.bytes_mut();
                         let mut header = WireHeader::read_from_buf(bytes).ok_or_else(|| {
                             format!("output loan '{name}' has an invalid wire header")
                         })?;
                         header.schema_hash = meta.schema_hash;
-                        header.sequence = *sequence;
-                        header.timestamp_ns = clock.now_ns();
+                        if let Some(sequence) = sequence.as_deref() {
+                            header.sequence = *sequence;
+                            header.timestamp_ns = clock.now_ns();
+                        }
                         header.write_to_buf(bytes);
-                        match publisher {
-                            AnyPublisher::Ipc(publisher) => {
-                                publisher
-                                    .send_raw_loan(raw_loan)
-                                    .map_err(|error| error.to_string())?;
+                        let before = committed;
+                        let result = publishers.commit(&name, raw_loan, &mut committed);
+                        if committed > before {
+                            if let Some(sequence) = sequence {
                                 *sequence = sequence.wrapping_add(1);
-                                committed += 1;
-                                publisher.check_subscriber_events();
-                                publisher
-                                    .notify_sent_sample()
-                                    .map_err(|error| error.to_string())?;
                             }
                         }
+                        result?;
                         Ok(())
                     })();
                     if let Err(error) = result {
@@ -1408,6 +1408,7 @@ impl Host {
 #[macro_export]
 macro_rules! export_node {
     (module: $module:literal, sys_path: [$($path:expr),* $(,)?], info: $info:ident) => {
+        $crate::export_stable_node! { module: $module, sys_path: [$($path),*], info: $info }
         static NODES: ::std::sync::Mutex<
             ::std::option::Option<::std::collections::HashMap<u64, $crate::Host>>,
         > = ::std::sync::Mutex::new(::std::option::Option::None);
@@ -1633,6 +1634,35 @@ mod tests {
             module: "abi_value_test",
             sys_path: [],
             info: INFO
+        }
+
+        #[test]
+        fn retained_tick_access_is_invalidated_on_drop_and_unwind() {
+            use std::cell::{Cell, RefCell};
+            use std::collections::HashMap;
+            use std::rc::Rc;
+            for unwind in [false, true] {
+                let state = Rc::new(crate::HostTickShared {
+                    publishers: Cell::new(std::ptr::dangling_mut::<()>()),
+                    outputs: Rc::new(HashMap::new()),
+                    schemas: Rc::new(
+                        cerulion_core::dynamic::SchemaSet::from_schemas(Vec::new())
+                            .unwrap()
+                            .0,
+                    ),
+                    active: Cell::new(true),
+                    loans: RefCell::new(Vec::new()),
+                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _guard = crate::TickAccessGuard(Rc::clone(&state));
+                    if unwind {
+                        panic!("tick access oracle");
+                    }
+                }));
+                assert_eq!(result.is_err(), unwind);
+                assert!(!state.active.get());
+                assert!(state.publishers.get().is_null());
+            }
         }
 
         #[test]

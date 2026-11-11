@@ -324,3 +324,13 @@ Further siblings (`macro_lifecycle_test`, `macro_shim_methods_test`,
 the `cdylib_*` policy/QoS/event files) each state their serial requirement and fixture
 prereqs in their file header; run serial binaries individually with
 `-- --test-threads=1`, never the whole workspace at once.
+
+The embedded Python `export_node!` uses the same stable export adapter with
+node-local Python context and buffer owners. The native and stable backends
+share input validation, touched-output preflight and tick failure cleanup.
+Stable frame reads pin host leases, and writable buffer exports retain their
+loan until released; dynamic variable frames use the explicit adaptive spill
+callback. The host supplies sequence and clock stamps. Python metadata requires
+process retention because CPython caches node-local pyclass code and retained
+memoryviews may still hold leases after a failed tick. Python nodes advertise
+no state or external-source capability and restart from init.

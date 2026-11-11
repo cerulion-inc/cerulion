@@ -38,7 +38,9 @@ impl Drop for WriteLease<'_> {
             self.active = false;
             self.client.discard_output(
                 self.slot.lease,
-                if std::thread::panicking() {
+                if self.discard_reason == discard_reason::SPILL_RELEASE {
+                    discard_reason::SPILL_RELEASE
+                } else if std::thread::panicking() {
                     discard_reason::TICK_PANICKED
                 } else {
                     self.discard_reason
@@ -130,6 +132,17 @@ impl<'loan, T: ShmMessage + 'loan> OutputProxy<'loan, T> {
         self.armed = true;
     }
 
+    // hot-path-alloc-ok-fn: only a failed nested flush formats its cold diagnostic detail.
+    fn record_nested_failure(&self, error: &TransportError) {
+        let detail =
+            format!("OutputProxy: staged nested-field flush failed; skipping publish\n{error}");
+        // This record-only detail is staged by the host; NESTED_FAILED consumes
+        // it and emits one native latch decision with the original error field.
+        self.lease
+            .client
+            .diagnostic(self.lease.publisher.handle, 1, detail.as_bytes());
+    }
+
     fn finalize(&mut self) {
         let Some(mut writer) = self.writer.take() else {
             return;
@@ -138,8 +151,9 @@ impl<'loan, T: ShmMessage + 'loan> OutputProxy<'loan, T> {
             drop(writer);
             return;
         }
-        if T::flush_staged_nested(&mut writer).is_err() {
+        if let Err(error) = T::flush_staged_nested(&mut writer) {
             self.lease.discard_reason = discard_reason::NESTED_FAILED;
+            self.record_nested_failure(&error);
             drop(writer);
             return;
         }
@@ -175,10 +189,10 @@ impl<'loan, T: ShmMessage + 'loan> OutputProxy<'loan, T> {
             // Explicit copied exception: the host synchronously copies the
             // node-owned spill and preserves the original loan timestamp. The
             // original slot stays leased until the local writer has dropped.
+            self.lease.discard_reason = discard_reason::SPILL_RELEASE;
             self.lease
                 .client
                 .submit_spill(self.lease.slot.lease, payload);
-            self.lease.discard_reason = discard_reason::SPILL_RELEASE;
             drop(writer);
         } else {
             if total > self.lease.slot.capacity {
@@ -211,7 +225,8 @@ impl<T: ShmMessage> Drop for OutputProxy<'_, T> {
     fn drop(&mut self) {
         // Drop cannot unwind across the boundary or cause a second panic while
         // a user tick is unwinding. The lease's own drop still returns its slot.
-        if catch_unwind(AssertUnwindSafe(|| self.finalize())).is_err() {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.finalize())) {
+            super::contain_panic_payload(payload);
             if self.lease.discard_reason != discard_reason::SPILL_RELEASE {
                 self.lease.discard_reason = discard_reason::TICK_PANICKED;
             }

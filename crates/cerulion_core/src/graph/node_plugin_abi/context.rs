@@ -77,6 +77,14 @@ impl NodeContext {
     /// Bind declaration-order ports before calling the user's init.
     // hot-path-alloc-ok-fn: create copies names/configuration into node-owned maps once.
     pub fn new(client: HostClient, info: &NodeInfo) -> TransportResult<Self> {
+        let budget = info
+            .input_names()
+            .len()
+            .checked_add(info.output_names().len())
+            .and_then(|ports| ports.checked_mul(4))
+            .and_then(|budget| budget.checked_add(1))
+            .ok_or_else(|| super::argument_error("deferred lease budget overflows"))?;
+        client.extend_deferred_budget(budget)?;
         let mut publishers = IndexMap::new();
         let mut subscribers = IndexMap::new();
         for (index, name) in info.input_names().iter().enumerate() {
@@ -162,6 +170,14 @@ impl NodeContext {
     pub fn subscriber_names(&self) -> impl Iterator<Item = &str> {
         self.subscribers.keys().map(String::as_str)
     }
+    /// Access host-owned raw-ingress publishers without a native transport owner.
+    pub fn raw_ingress(&self) -> TransportResult<super::RawIngress> {
+        Ok(super::RawIngress::plugin(
+            HostClient::share(&self.client),
+            Arc::clone(&self.clock),
+        ))
+    }
+
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
     }

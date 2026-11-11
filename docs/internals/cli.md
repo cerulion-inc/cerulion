@@ -1142,9 +1142,10 @@ it with a no-replace hard link. Failed writes leave no partial final manifest;
 concurrent choices win. Clean up the staging file and propagate filesystem errors,
 including filesystems without hard-link support; never fall back to overwriting.
 
-`node build` probes PATH `rustc` only for an advisory warning. Cargo owns compiler
-selection, including environment and project configuration overrides. The built
-cdylib must match the host's full compiler fingerprint, checked at load before init.
+`node build` uses Cargo compiler selection through toolchain files and compiler
+overrides. Cargo enforces the workspace MSRV. Native loading checks the frozen
+boundary major, complete layout identity and capabilities; compiler provenance
+is diagnostic metadata and never a load refusal.
 
 ### Bundled starters
 

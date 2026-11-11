@@ -36,14 +36,19 @@ text, a complete copy consumes it, short buffers retain it, a stale token return
 INVALID_HANDLE and zero means none. Error-kind tags are frozen in the ABI crate;
 unknown received kinds become untyped failures.
 
-Every terminal output or input operation except INVALID_HANDLE consumes its
-lease exactly once. A complete-frame size outside [prefix_size, capacity] is
+Every admitted finish_output, discard_output or release_input result except
+INVALID_HANDLE consumes its lease exactly once. INVALID_STATE admission refusal
+has no lease effect: another tick may still borrow that frame. submit_spill never
+consumes and separately records attempted versus submitted state. After any
+submission, finish_output and every discard reason except SPILL_RELEASE refuse
+while retaining the original mapping. Malformed spill, SPILL_RELEASE without an
+attempt and destroy backstop reclamation each count INVARIANT exactly once. A complete-frame size outside [prefix_size, capacity] is
 consumed as a counted INVARIANT and returns INVALID_ARGUMENT. A non-OK create
 frees partial node state and leaves no instance; the host never destroys it.
 Successful create is paired with exactly one destroy even if shutdown fails.
 
 The host serializes NodeApi, StateApi and ExternalApi entries for each instance.
-Raw create/loan/finish/discard/egress calls may run on any helper thread,
+Raw create/loan/finish/discard/egress and injected-clock calls may run on any helper thread,
 concurrently with ticks and different publishers; short per-publisher locks do
 not take the tick lock or return BUSY for contention. Raw helper leases never
 block begin_fire. Ordinary port, state and sync calls require an admitted node
