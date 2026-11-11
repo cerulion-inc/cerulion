@@ -9,7 +9,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   a fused chain may serve a frame it just committed, in-process.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
+- Native plugins use the checked stable node table. Refuse a different boundary major or incompatible complete layout; compiler provenance does not decide compatibility.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
 - Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
@@ -64,3 +64,17 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
+
+## Host node ABI services
+
+- `graph/node_host_abi.rs` owns native contexts, ports and sample leases. The loader
+  must call `begin_fire()` once per invocation and return all helper/accessor
+  borrows before `remove_context`. Never hand a Rust owner to a node callback.
+- `transport/plugin_lease.rs` is a fixed arena; no callback may grow it. Preserve
+  adaptive spill and retain the original mapping through writer destruction.
+- Run `cargo test -p cerulion_core --test node_host_abi_test -- --test-threads=1`
+  alone under the shared build lock. It has real native delivery, bounded-buffer
+  refusal and thread-local allocation controls; no cdylib build prerequisite.
+- Host unit filters: `transport::plugin_lease::tests` and
+  `graph::node_host_abi::tests`. Shared raw accumulator hooks must reuse the
+  existing typed gather/drop/event/state path, with no parallel policy.

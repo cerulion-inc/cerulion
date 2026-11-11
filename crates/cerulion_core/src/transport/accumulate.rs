@@ -350,7 +350,37 @@ impl<'a> Frames<'a> {
 /// the same frame checks a typed read applies. Monomorphised per input at
 /// registration so the type-erased collect still refuses what a typed read
 /// would.
-type FrameCheck = fn(&str, &[u8]) -> TransportResult<()>;
+#[derive(Debug, Clone, Copy)]
+enum FrameCheck {
+    Typed(fn(&str, &[u8]) -> TransportResult<()>),
+    Raw(super::plugin_lease::PluginWireLayout),
+}
+
+impl FrameCheck {
+    fn check(&self, topic: &str, raw: &[u8]) -> TransportResult<()> {
+        match self {
+            Self::Typed(check) => check(topic, raw),
+            Self::Raw(layout) => {
+                let (header, _) = super::input_view::validate_wire_frame_raw(
+                    topic,
+                    raw,
+                    Some(layout.schema_hash),
+                )?;
+                if !layout.accepts(raw, header.total_size)
+                    || raw.as_ptr().align_offset(layout.alignment as usize) != 0
+                {
+                    // hot-path-alloc-ok: malformed-frame refusal only, never accepted delivery
+                    return Err(TransportError::Deserialization {
+                        topic: topic.to_string(),
+                        reason: "accumulate frame does not match its plugin schema layout"
+                            .to_string(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
 
 fn check_frame<T: ShmMessage>(topic: &str, raw: &[u8]) -> TransportResult<()> {
     validate_wire_frame::<T>(topic, raw).map(|_| ())
@@ -414,6 +444,35 @@ impl AccumulatorSet {
         name: &str,
         cap: usize,
     ) -> TransportResult<()> {
+        self.register_checked(ctx, name, cap, FrameCheck::Typed(check_frame::<T>))
+    }
+
+    /// Host-only registration from a checked plugin schema descriptor.
+    /// Reuses native collect, ordering, drop/event accounting and state bytes.
+    #[doc(hidden)]
+    pub fn register_raw(
+        &mut self,
+        ctx: &mut NodeContext,
+        name: &str,
+        cap: usize,
+        layout: super::plugin_lease::PluginWireLayout,
+    ) -> TransportResult<()> {
+        if layout.prefix_len().is_none() {
+            // hot-path-alloc-ok: invalid descriptor is refused during graph construction
+            return Err(TransportError::InvalidTransportConfig {
+                reason: "accumulate plugin layout is invalid".to_string(),
+            });
+        }
+        self.register_checked(ctx, name, cap, FrameCheck::Raw(layout))
+    }
+
+    fn register_checked(
+        &mut self,
+        ctx: &mut NodeContext,
+        name: &str,
+        cap: usize,
+        check: FrameCheck,
+    ) -> TransportResult<()> {
         if self.inputs.iter().any(|a| &*a.name == name) {
             return Err(TransportError::InvalidTransportConfig {
                 reason: format!("accumulate input '{name}' is registered twice"),
@@ -431,7 +490,7 @@ impl AccumulatorSet {
             name: Arc::from(name), // hot-path-alloc-ok: registration, once per input at node init
             topic,
             buffer,
-            check: check_frame::<T>,
+            check,
             overflow: FailureRegimeLatch::new(),
             owed_event: None,
             faults: FailureRegimeLatch::new(),
@@ -443,6 +502,29 @@ impl AccumulatorSet {
     /// Is `name` an accumulate input?
     pub fn contains(&self, name: &str) -> bool {
         self.inputs.iter().any(|a| &*a.name == name)
+    }
+
+    /// Borrow host-owned ordered frames without changing queue admission.
+    #[doc(hidden)]
+    pub fn frames_raw(&self, name: &str) -> Option<Frames<'_>> {
+        self.inputs
+            .iter()
+            .find(|acc| &*acc.name == name)
+            .map(|acc| acc.buffer.frames())
+    }
+
+    /// This fire's losses and lifetime losses, using the native counters.
+    #[doc(hidden)]
+    pub fn dropped_raw(&self, name: &str) -> Option<(u64, u64)> {
+        self.inputs
+            .iter()
+            .find(|acc| &*acc.name == name)
+            .map(|acc| {
+                (
+                    acc.buffer.dropped_for_this_fire(),
+                    acc.buffer.dropped_total(),
+                )
+            })
     }
 
     /// The step-boundary freeze for one node: every accumulate input in
@@ -498,24 +580,75 @@ impl AccumulatorSet {
         }
         out.write(&len_u32(self.inputs.len())?.to_le_bytes())?;
         for acc in &self.inputs {
-            out.write(&len_u32(acc.name.len())?.to_le_bytes())?;
-            out.write(acc.name.as_bytes())?;
-            let buffer = &acc.buffer;
-            out.write(&buffer.dropped_total.to_le_bytes())?;
-            let (pending_drops, pending) = if buffer.served {
-                (0u64, &buffer.slots[..0])
-            } else {
-                (buffer.dropped_since_serve, &buffer.slots[..buffer.held])
-            };
-            out.write(&pending_drops.to_le_bytes())?;
-            out.write(&len_u32(pending.len())?.to_le_bytes())?;
-            for slot in pending {
-                let bytes = slot.bytes();
-                out.write(&len_u32(bytes.len())?.to_le_bytes())?;
-                out.write(bytes)?;
-            }
+            acc.capture(out)?;
         }
         Ok(())
+    }
+
+    /// Capture exactly one native input record, without the set-count prefix.
+    /// A node adapter writes that count once before its declaration-order walk.
+    #[doc(hidden)]
+    pub fn capture_raw_port(&self, name: &str, out: &mut dyn StateSink) -> Result<(), StateError> {
+        self.inputs
+            .iter()
+            .find(|acc| &*acc.name == name)
+            // hot-path-alloc-ok: invalid capture binding only, never a configured input
+            .ok_or_else(|| StateError::AccumulateRestore {
+                input: name.to_string(),
+                reason: "unknown accumulate input".to_string(),
+            })?
+            .capture(out)
+    }
+
+    /// Validate a complete canonical plugin-input record before applying the
+    /// native restore. A refusal leaves frames and drop counters untouched.
+    #[doc(hidden)]
+    // hot-path-alloc-ok-fn: restore is a cold lifecycle operation; only refusals allocate
+    pub fn restore_raw_port(&mut self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
+        let acc = self
+            .inputs
+            .iter_mut()
+            .find(|acc| &*acc.name == name)
+            .ok_or_else(|| StateError::AccumulateRestore {
+                input: name.to_string(),
+                reason: "unknown accumulate input".to_string(),
+            })?;
+        let refuse = |reason: &str| StateError::AccumulateRestore {
+            input: name.to_string(),
+            reason: reason.to_string(),
+        };
+        let FrameCheck::Raw(layout) = acc.check else {
+            return Err(refuse("input is not registered for plugin state"));
+        };
+        let mut src = StateCursor::new(bytes);
+        let name_len = src.read_payload_len()?;
+        if src.take(name_len)? != name.as_bytes() {
+            return Err(refuse("recorded input name differs"));
+        }
+        let total = read_u64(&mut src)?;
+        let pending = read_u64(&mut src)?;
+        if pending > total {
+            return Err(refuse("pending drops exceed lifetime drops"));
+        }
+        let frames = src.read_element_count()?;
+        if frames > acc.buffer.cap() {
+            return Err(refuse("recorded frames exceed the input cap"));
+        }
+        for _ in 0..frames {
+            let len = src.read_payload_len()?;
+            let frame = src.take(len)?;
+            let size =
+                u32::try_from(len).map_err(|_| refuse("recorded frame exceeds the wire size"))?;
+            if !layout.accepts(frame, size)
+                || WireHeader::read_from_buf(frame).is_none_or(|header| header.total_size != size)
+            {
+                return Err(refuse("recorded frame does not match the input schema"));
+            }
+        }
+        src.finish()?;
+        let mut src = StateCursor::new(bytes);
+        acc.restore(&mut src)?;
+        src.finish()
     }
 
     /// Apply what [`Self::capture`] wrote to a node whose accumulate inputs
@@ -594,6 +727,25 @@ fn read_u64(src: &mut StateCursor<'_>) -> Result<u64, StateError> {
 }
 
 impl Accumulator {
+    fn capture(&self, out: &mut dyn StateSink) -> Result<(), StateError> {
+        out.write(&len_u32(self.name.len())?.to_le_bytes())?;
+        out.write(self.name.as_bytes())?;
+        let buffer = &self.buffer;
+        out.write(&buffer.dropped_total.to_le_bytes())?;
+        let (pending_drops, pending) = if buffer.served {
+            (0u64, &buffer.slots[..0])
+        } else {
+            (buffer.dropped_since_serve, &buffer.slots[..buffer.held])
+        };
+        out.write(&pending_drops.to_le_bytes())?;
+        out.write(&len_u32(pending.len())?.to_le_bytes())?;
+        for slot in pending {
+            let bytes = slot.bytes();
+            out.write(&len_u32(bytes.len())?.to_le_bytes())?;
+            out.write(bytes)?;
+        }
+        Ok(())
+    }
     // hot-path-alloc-ok-fn: a state restore runs once, before the first step;
     // it allocates only to name a refusal and for a slot's first frame
     fn restore(&mut self, src: &mut StateCursor<'_>) -> Result<(), StateError> {
@@ -635,7 +787,10 @@ impl Accumulator {
             // carry no alignment, the slot is 8-byte aligned as a read is.
             buffer
                 .insert(&self.topic, frame)
-                .and_then(|_| (self.check)(&self.topic, buffer.slots[buffer.held - 1].bytes()))
+                .and_then(|_| {
+                    self.check
+                        .check(&self.topic, buffer.slots[buffer.held - 1].bytes())
+                })
                 .map_err(|e| refuse(&self.name, format!("a held frame is refused: {e}")))?;
         }
         buffer.finish_collect();
@@ -696,7 +851,8 @@ impl Accumulator {
                     // too: a collect whose readable frames are all refused
                     // still reports when its evictions happened.
                     newest_ts = newest_ts.max(view.header().timestamp_ns);
-                    (self.check)(&self.topic, &view)
+                    self.check
+                        .check(&self.topic, &view)
                         .and_then(|()| self.buffer.insert(&self.topic, &view))
                         .map(|_| ())
                 }
@@ -1134,7 +1290,10 @@ mod tests {
         })
     }
 
-    fn set_of(inputs: &[(&str, usize)], check: FrameCheck) -> AccumulatorSet {
+    fn set_of(
+        inputs: &[(&str, usize)],
+        check: fn(&str, &[u8]) -> TransportResult<()>,
+    ) -> AccumulatorSet {
         AccumulatorSet {
             inputs: inputs
                 .iter()
@@ -1142,7 +1301,7 @@ mod tests {
                     name: Arc::from(*name),
                     topic: format!("/{name}"),
                     buffer: AccumulateBuffer::new(*cap).unwrap(),
-                    check,
+                    check: FrameCheck::Typed(check),
                     overflow: FailureRegimeLatch::new(),
                     owed_event: None,
                     faults: FailureRegimeLatch::new(),

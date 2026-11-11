@@ -1597,6 +1597,120 @@ impl CerulionPublisher {
         ))
     }
 
+    /// Host-private native loan for a checked plugin descriptor.
+    ///
+    /// Keeps the adaptive capacity and initializes only the wire prefix, as
+    /// `loan_proxy` does. The native owner stays in the host lease arena.
+    #[doc(hidden)]
+    pub(crate) fn loan_plugin_frame(
+        &mut self,
+        layout: super::plugin_lease::PluginWireLayout,
+    ) -> TransportResult<RawShmLoan> {
+        let prefix = layout
+            .prefix_len()
+            .ok_or_else(|| TransportError::InvalidTransportConfig {
+                reason: "plugin wire prefix or alignment is invalid".to_string(),
+            })?;
+        if prefix > self.max_slice_len.get() {
+            return Err(TransportError::BufferTooSmall {
+                topic: self.topic.to_string(),
+                needed: prefix as usize,
+                available: self.max_slice_len.get() as usize,
+            });
+        }
+        self.check_subscriber_events();
+        if self.fault_inject_loan_fail_next {
+            self.fault_inject_loan_fail_next = false;
+            self.bump_discard_signal();
+            return Err(TransportError::LoanCapacity {
+                topic: self.topic.to_string(),
+            });
+        }
+        let capacity = if layout.variable_fields == 0 {
+            prefix
+        } else {
+            self.adaptive_loan_size(prefix)
+        };
+        let mut loan = self
+            .loan_raw_uninit(capacity as usize)
+            .inspect_err(|_| self.bump_discard_signal())?;
+        let mut header_bytes = [0; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: capacity,
+            offset_table_offset: WireHeader::SIZE as u32 + layout.fixed_size,
+            offset_table_count: layout.variable_fields,
+            sequence: self.sequence(),
+            timestamp_ns: self.clock.now_ns(),
+            step_tag: crate::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut header_bytes);
+        let bytes = loan.bytes_uninit_mut();
+        for byte in &mut bytes[..prefix as usize] {
+            byte.write(0);
+        }
+        for (dst, src) in bytes.iter_mut().zip(header_bytes) {
+            dst.write(src);
+        }
+        // SAFETY: this is the same native mapping and prefix initialization
+        // as loan_proxy. Every mapping byte has an OS-defined value; only the
+        // initialized prefix is interpreted before the trusted plugin writes
+        // its payload. Host finish validates offset ranges and total_size and
+        // never sends an incomplete/abandoned loan. No lifetime is extended.
+        Ok(unsafe { loan.assume_init_shm_defined() })
+    }
+
+    /// Commit an already validated plugin loan through native accounting.
+    /// Header timestamp is the loan stamp; sequence is consumed here only.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_frame(
+        &mut self,
+        mut loan: RawShmLoan,
+        mut header: WireHeader,
+        total_size: u32,
+    ) -> TransportResult<()> {
+        header.total_size = total_size;
+        header.sequence = self.commit_sequence();
+        header.write_to_buf(loan.bytes_mut());
+        if let Err(error) = self.send_raw_loan(loan) {
+            self.record_send_fail_drop();
+            return Err(error);
+        }
+        self.record_payload_size(total_size);
+        self.complete_plugin_output();
+        if let Err(error) = self.notify_sent_sample() {
+            tracing::trace!(topic = %self.topic, error = %error, "plugin output notification failed after delivery");
+        }
+        Ok(())
+    }
+
+    /// Commit the explicitly advertised adaptive-spill exception.
+    /// Payload remains node-owned for this synchronous copy into a new loan.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_spill(
+        &mut self,
+        mut header: WireHeader,
+        payload: &[u8],
+    ) -> TransportResult<()> {
+        header.total_size = (WireHeader::SIZE + payload.len()) as u32;
+        header.sequence = self.commit_sequence();
+        let mut bytes = [0; WireHeader::SIZE];
+        header.write_to_buf(&mut bytes);
+        if let Err(error) = self.send_overflow_frame(&bytes, payload) {
+            self.record_payload_size(header.total_size);
+            self.record_dropped_overflow_frame();
+            return Err(error);
+        }
+        self.complete_plugin_output();
+        Ok(())
+    }
+
+    fn complete_plugin_output(&mut self) {
+        if let Some(suppressed) = self.record_output_complete() {
+            tracing::info!(topic = %self.topic, suppressed_count = suppressed, "plugin output recovered after incomplete frames");
+        }
+    }
+
     /// Best-effort `SentSample` notification — exposed for `OutputProxy::Drop`,
     /// the service layer, and raw-ingress `publish_raw`: the doorbell ring, then
     /// the listener notify. The rmw bridge's publish paths call the two halves

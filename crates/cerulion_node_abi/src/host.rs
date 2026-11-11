@@ -59,7 +59,8 @@ pub struct HostApiV1 {
         unsafe extern "C" fn(ContextHandle, PortHandle, *mut PublisherCountersV1) -> Status,
     /// Copy diagnostic for token; short-buffer refusal does not consume it.
     pub copy_error: unsafe extern "C" fn(ContextHandle, u64, MutableBytes, *mut u64) -> Status,
-    /// Report a structured node-side diagnostic; host suppresses repeated regimes.
+    /// Report a structured node-side diagnostic at diagnostic_level. Zero port
+    /// selects a distinct node-wide latch; named ports retain their own regimes.
     pub diagnostic: unsafe extern "C" fn(ContextHandle, PortHandle, u32, Bytes) -> Status,
     /// Hand pending batch to this fire once, returning both drop observations.
     /// Repeated calls during the fire return the same frozen batch; subsequent
@@ -83,4 +84,20 @@ pub struct HostApiV1 {
     /// Restore exactly one matching per-port record; reject trailing bytes, wrong
     /// name/schema/capacity/counters before mutation. Caller retains byte storage.
     pub restore_accumulate: unsafe extern "C" fn(ContextHandle, PortHandle, Bytes) -> Status,
+    /// Cold create of a bounded host-owned raw-ingress publisher. All topic
+    /// bytes are borrowed only for this call; returned topic borrows immutable
+    /// context-lifetime storage. Exhausted publisher budget returns BUSY.
+    pub create_raw_publisher:
+        unsafe extern "C" fn(ContextHandle, RawPublisherRequestV1, *mut PortBindingV1) -> Status,
+    /// Consume a raw write lease once, including on failure. Preserve the complete
+    /// caller-supplied header, schema and initialized length; never stamp another
+    /// sequence/time. Return actual recipients; every error arm writes zero.
+    pub finish_raw_output:
+        unsafe extern "C" fn(ContextHandle, LeaseHandle, u32, *mut u64) -> Status,
+    /// Announce the bound topic/schema for dynamic egress through the existing
+    /// local control channel. A refusal leaves local ingress usable.
+    pub register_raw_egress: unsafe extern "C" fn(ContextHandle, PortHandle) -> Status,
+    /// Cold destroy; outstanding leases return BUSY. Handles are invalidated
+    /// without reuse; context teardown drops any remaining native raw ports.
+    pub destroy_raw_publisher: unsafe extern "C" fn(ContextHandle, PortHandle) -> Status,
 }

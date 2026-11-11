@@ -13,6 +13,10 @@ include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 [lints]
 workspace = true
 
+[features]
+loader = ["dep:libloading", "stabby/libloading"]
+
 [dependencies]
+libloading = { version = "=0.8.9", optional = true }
 stabby = { version = "=72.1.16", default-features = false, features = ["std"] }
 thiserror = "2"

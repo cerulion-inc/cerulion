@@ -6,15 +6,21 @@
 
 mod checker;
 mod host;
+#[cfg(feature = "loader")]
+mod loader;
 mod node;
 mod types;
+mod validation;
 
 pub use checker::*;
 pub use host::*;
+#[cfg(feature = "loader")]
+pub use loader::*;
 pub use node::*;
 /// The maintained layout checker, available through the runtime re-export.
 pub use stabby;
 pub use types::*;
+pub use validation::*;
 
 /// Boundary major supported by these permanently frozen records.
 pub const BOUNDARY_MAJOR: u32 = 1;

@@ -30,6 +30,9 @@ pub mod drain_latch;
 pub mod executor;
 pub mod launch_args;
 pub mod node;
+mod node_dylib_abi;
+#[doc(hidden)]
+pub mod node_host_abi;
 #[doc(hidden)]
 pub mod node_plugin_abi;
 pub mod param_resume;
