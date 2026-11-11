@@ -40,8 +40,9 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - Same-user outbound reuses endpoint/runtime/node; refuse key/namespace mismatch before dialing, retire only outbound sessions.
 
 ## Testing
-- Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
-  limit a parallel run hits iceoryx service/port errors.
+- Run `wire_plane_test` and `rcp_forward_e2e_test` with `-- --test-threads=1`: under
+  the macOS 256-file soft limit a parallel run hits open-file and iceoryx
+  service/port errors.
 - The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
   e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
 - remoted/link cold-compile iroh. remoted/connectd/wireclient/link/accountd are OUT of default-members: build with `-p`.

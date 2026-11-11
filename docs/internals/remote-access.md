@@ -1046,8 +1046,9 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
 
 ## 11. Test map
 
-Every crate in this family is PARALLEL-safe, with no test requiring serial
-execution and none ignored by default: per-test SHM roots
+Every crate in this family is PARALLEL-safe in CI, with none ignored by
+default (on a macOS desk at the 256-file soft limit, run `wire_plane_test` and
+`rcp_forward_e2e_test` with `-- --test-threads=1`): per-test SHM roots
 (`TransportManager::init_for_test`), per-test sockets/tempdirs, loopback-only
 iroh (relay disabled + direct dial, every await bounded). Nothing dials a relay,
 a real robot, or multicast. Every crate here is named in a CI test step on BOTH
@@ -1099,7 +1100,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,
-`cerud`, `cerulion_ops_proto`, `cerulion_accountd`, `cerulion-wire`; no `--test-threads=1` anywhere in
+`cerud`, `cerulion_ops_proto`, `cerulion_accountd`, `cerulion-wire`; no `--test-threads=1` in CI for
 this family. `cerulion_link` / `cerulion_remoted` cold-compile the ~390-crate
 iroh tree: long first builds are normal. The netd WAN plane tests ride
 `cargo test -p cerulion_netd` (`wan` is default-on; keep

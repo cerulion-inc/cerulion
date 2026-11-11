@@ -4193,11 +4193,18 @@ jobs:
   # and its hosted plane test starts the process runtime, so its step uses one
   # thread. For the other packages that is a READ of the tests rather than an
   # assumption. `cerulion_remoted` is the only one of them that builds real
-  # iceoryx2 transports at all. One of its files, `tests/act_verbs_test.rs`,
-  # calls `TransportManager::get_or_init()`, the process-global manager on the
-  # default namespace; every test in it carries `#[serial]`, which takes one
-  # lock shared by the whole test binary, so no two of them run at once. Its
-  # other transport files mint ISOLATED per-test SHM roots via
+  # iceoryx2 transports at all. Its ops verbs reach
+  # `TransportManager::get_or_init()`, the process-global manager on the
+  # default namespace: the act verbs such as `topic-publish` take their remote
+  # lease there and `engage-estop` asks the flashback recorder through it, so
+  # every test that calls those verbs reaches that manager. Two files also
+  # call it directly. In `tests/act_verbs_test.rs` every test
+  # carries `#[serial]`, which takes one lock shared by the whole test binary,
+  # so no two of them run at once. In `tests/rcp_forward_e2e_test.rs` one test
+  # runs in a child process that excludes topics and announces runs on the
+  # default namespace, under topic names and run ids that carry the child's
+  # pid; no test there asserts a process-wide counter. Every other transport
+  # these files build is an ISOLATED per-test SHM root via
   # `TransportManager::init_for_test` (their own headers say "parallel-safe
   # without `#[serial]`"), which is the same property that lets the
   # `cerulion_connectd` step above run parallel.
