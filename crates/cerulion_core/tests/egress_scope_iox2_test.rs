@@ -116,6 +116,28 @@ fn malformed_names_refuse_without_creating_data_services() {
 }
 
 #[test]
+fn declared_run_ingress_cannot_inject_into_an_existing_local_only_run() {
+    let config = cerulion_core::testing::iceoryx_test_config();
+    let local =
+        TransportManager::init_for_test(TransportConfig::default(), config.clone()).unwrap();
+    let gateway = TransportManager::init_for_test(
+        TransportConfig {
+            network: Some(cerulion_core::NetworkConfig::default()),
+            ..Default::default()
+        },
+        config,
+    )
+    .unwrap();
+    let _scope = local.exclude_remote_topic("/private_input").unwrap();
+    let before = gateway.remote_access_refusals();
+    assert!(gateway
+        .register_run_ingress_topic("/private_input", 1, MaxSliceLen::const_new(128))
+        .is_err());
+    assert_eq!(gateway.remote_access_refusals() - before, 1);
+    assert!(gateway.list_topics().unwrap().is_empty());
+}
+
+#[test]
 fn exhausted_remote_lease_slots_fail_closed_and_release_on_drop() {
     let (producer, remote) = managers();
     let leases: Vec<_> = (0..64)
@@ -170,6 +192,9 @@ fn service_family_exclusion_refuses_requests_and_all_per_client_replies() {
     ] {
         assert!(remote.acquire_remote_topic_lease(&topic).is_err());
         assert!(!remote.remote_topic_allowed(&topic).unwrap());
+        let canonical = format!("/{topic}");
+        assert!(remote.acquire_remote_topic_lease(&canonical).is_err());
+        assert!(!remote.remote_topic_allowed(&canonical).unwrap());
     }
     assert!(producer.list_topics().unwrap().is_empty());
 }
@@ -177,12 +202,16 @@ fn service_family_exclusion_refuses_requests_and_all_per_client_replies() {
 #[test]
 fn opaque_child_scope_is_deterministic_and_the_environment_kill_switch_wins() {
     use cerulion_core::transport::egress_scope::RunTopicScope;
-    let json = r#"{"mode":"declared","topics":["/public"]}"#;
+    let json = r#"{"mode":"declared","topics":["/public"],"ingress":["/input"]}"#;
     for _ in 0..2 {
         let scope = RunTopicScope::from_values(None, Some(json)).unwrap();
         assert!(!scope.excludes("/public"));
         assert!(scope.excludes("/private"));
-        for network in ["off", "typo"] {
+        assert!(scope.excludes("/input"));
+        assert!(!scope.excludes_input("/input"));
+        assert!(!scope.excludes_input("/public"));
+        assert!(scope.excludes_input("/private"));
+        for network in ["off", " off ", "typo"] {
             assert!(RunTopicScope::from_values(Some(network), Some(json))
                 .unwrap()
                 .excludes("/public"));

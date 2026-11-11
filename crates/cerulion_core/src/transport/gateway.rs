@@ -1006,6 +1006,10 @@ impl GatewayRuntime {
             });
         }
 
+        manager
+            .network()
+            .expect("gateway network checked above")
+            .set_run_scope(Arc::downgrade(&manager));
         // 1. Install the egress posture FIRST (before the watch can flip a flag).
         match &plan.egress_policy {
             GatewayEgressPolicy::AllowAll => manager.bridge_manager().set_egress_allow_all()?,
@@ -1241,10 +1245,6 @@ impl GatewayRuntime {
         let schema_source_for_seam = schema_source.clone();
         #[cfg(any(test, feature = "test-helpers"))]
         let run_source_for_seam = run_source.clone();
-        manager
-            .network()
-            .expect("gateway network checked above")
-            .set_run_scope(Arc::downgrade(&manager));
         let permissive = matches!(plan.egress_policy, GatewayEgressPolicy::AllowAll);
         if !egress_flags.is_empty() || permissive {
             let network = manager.network().expect("network present (checked above)");

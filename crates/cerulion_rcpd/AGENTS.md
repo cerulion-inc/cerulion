@@ -5,9 +5,7 @@ HTTP) serving `robot://graph`, `robot://state/{name}` and the manifest's tools.
 User reference: docs/rcp.md.
 
 ## Invariants
-
 - Remote graph and state resources, tool journals and external eye requests respect native producer egress scope. Journal admission survives caller cancellation through the pending answer; emergency-stop operations remain available independently.
-
 - Deny by default: the callable tools are the manifest's `tools`, `estop`, and
   `estop_clear` under `limits.estop_clear: agent`. Any other name is receipted
   `denied` and never reaches the graph. Built-in names cannot be declared.

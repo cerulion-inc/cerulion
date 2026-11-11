@@ -414,14 +414,18 @@ fn a_ros_topic_is_the_cerulion_canonical_name_and_a_native_subscriber_reads_it()
                     "--test-threads=1",
                 ])
                 .env("CERULION_SCOPE_CHILD", profile)
+                .env("CERULION_SCOPE_SUFFIX", std::process::id().to_string())
                 .env_remove("CERULION_NETWORK")
-                .env_remove(cerulion_core::transport::egress_scope::RUN_SCOPE_ENV);
+                .env_remove("CERULION_RUN_TOPIC_SCOPE");
             if profile == "off" {
                 command.env("CERULION_NETWORK", "off");
             } else {
                 command.env(
                     cerulion_core::transport::egress_scope::RUN_SCOPE_ENV,
-                    r#"{"mode":"declared","topics":[]}"#,
+                    format!(
+                        r#"{{"mode":"declared","topics":[],"ingress":["/rmw_cn/chatter/{}"]}}"#,
+                        std::process::id()
+                    ),
                 );
             }
             let output = command.output().unwrap();
@@ -433,7 +437,14 @@ fn a_ros_topic_is_the_cerulion_canonical_name_and_a_native_subscriber_reads_it()
         }
     }
     unsafe {
-        let suffix = unique_suffix();
+        let suffix = if scoped_child {
+            std::env::var("CERULION_SCOPE_SUFFIX")
+                .unwrap()
+                .parse()
+                .unwrap()
+        } else {
+            unique_suffix()
+        };
         let type_name = format!("Pt{suffix}");
         let ts = point_ts(&type_name);
         let (node, _opts) = setup_node(&format!("cn_node_{suffix}"));

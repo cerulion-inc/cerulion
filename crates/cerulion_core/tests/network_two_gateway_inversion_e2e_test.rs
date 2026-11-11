@@ -175,7 +175,11 @@ fn setup_scoped_rig(tag: &str, egress: GatewayEgressPolicy, excluded: bool) -> R
         .expect("init G_prod");
         let plan = GatewayPlan {
             egress_policy: egress.clone(),
-            announce: vec![topic.clone()],
+            announce: if excluded {
+                vec![]
+            } else {
+                vec![topic.clone()]
+            },
             ingress: vec![],
         };
         match GatewayRuntime::new(g, plan) {

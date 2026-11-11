@@ -4461,6 +4461,11 @@ fn serving_gateway_names_runtime_route_via_hash_and_serves_schema() {
         "the schema-serving surface never served the custom type post-construction"
     );
     // A cached custom doc must follow its current producer's scope.
+    gateway
+        .manager()
+        .network()
+        .unwrap()
+        .withdraw_announcements_except(&[]);
     let _scope = p
         .exclude_remote_topic(&runtime_topic)
         .expect("exclude source");
@@ -6944,4 +6949,24 @@ fn permissive_probe_refuses_a_local_only_topic_before_a_data_tap_opens() {
         .unwrap()
         .announced_topics()
         .contains(&topic));
+}
+
+#[test]
+fn announced_names_hold_scope_until_withdrawn_and_private_names_cannot_announce() {
+    let topic = format!("/scope/announce/{}", unique_id());
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (producer, _clock, gateway, _pubs) = make_producer_and_gateway("scope_ann", plan, &[]);
+    let network = gateway.manager().network().unwrap();
+    network.set_lan_access(cerulion_core::LanAccess::Open);
+    gateway.manager().announce_egress_topic(&topic).unwrap();
+    assert!(network.is_announced(&topic));
+    assert!(producer.exclude_remote_topic(&topic).is_err());
+    assert_eq!(network.withdraw_announcements_except(&[]), 1);
+    let _scope = producer.exclude_remote_topic(&topic).unwrap();
+    assert!(gateway.manager().announce_egress_topic(&topic).is_err());
+    assert!(!network.is_announced(&topic));
 }

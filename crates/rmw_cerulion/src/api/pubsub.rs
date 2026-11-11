@@ -2569,7 +2569,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
         } else if can_loan_take {
             topic_config.create_borrow_floor = Some(RMW_TAKE_LOAN_BORROW_BUDGET);
         }
-        if let Err(error) = rt.claim_topic_scope(&topic) {
+        if let Err(error) = rt.claim_input_scope(&topic) {
             tracing::error!(topic = %topic, error = %error, "subscription scope admission failed");
             return std::ptr::null_mut();
         }

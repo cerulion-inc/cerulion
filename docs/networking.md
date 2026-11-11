@@ -28,7 +28,7 @@ default + gateway, the discovery ladder, and pairing.
   (gossip stays on); `CERULION_MULTICAST_SCOUTING=on` turns it back on. One
   loud breadcrumb prints at start:
 
-  > ``network egress OPEN: CERULION_LAN_ACCESS=open permits unpaired LAN peers to read this run's egress topics. Restrict topics with a `network:` egress list, or run `--local` for local-only.``
+  > ``LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.``
 
 - **The `network:` block TIGHTENS.** With an explicit enabled block the
   gateway runs STRICT: it announces + egresses exactly the declared `egress`
@@ -53,12 +53,14 @@ default + gateway, the discovery ladder, and pairing.
   are unavailable off-machine, including through an already running open gateway,
   remote server or topic mirror. Local observers and recording still work.
   Opaque `ros2:` graph children inherit the same run scope, including topics
-  discovered only when the child creates an endpoint. A separately launched
+  discovered only when the child creates an endpoint. Config-mapped raw DDS
+  outputs obey the run's local-only scope and declared egress too. A separately launched
   third-party DDS participant has its own transport settings.
-- **Producer policy survives a topic restart.** A remote data tap or mirror holds
-  admission until it releases its data port. If an earlier remote demand still
-  holds a topic when a local-only producer starts, startup refuses that topic
-  and asks you to close the demand. It cannot attach to that remote tap's service.
+- **Producer policy survives a topic restart.** Remote taps, mirrors and open-LAN
+  announcement names hold admission until withdrawn. If earlier remote serving
+  still holds a topic when a local-only producer starts, startup refuses that
+  topic. Close the demand and withdraw its announcement, or restart the serving
+  daemon before starting the local-only run.
 - **Networked multi-process is FIRST-CLASS.** An enabled block is accepted on a
   multi-process run exactly as on a monolith. The supervisor spawns ONE
   gateway beside the workers; each worker stays network-free.
