@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot demand topics or publish into graph ingress through the zenoh plane.
   Paired desks use the authenticated remote plane. Explicit
   `CERULION_LAN_ACCESS=open` remains available for development and warns at startup.
+- Networking guides and the Go2 graph pair describe automatic account and saved
+  pairing discovery, authenticated declared imports, shared serving and consuming,
+  and explicit open-LAN compatibility without requiring addresses for paired access.
 
 ## [2.0.0] - 2026-11-11
 
