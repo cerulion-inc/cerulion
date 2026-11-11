@@ -120,7 +120,7 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 
 /// The iceoryx2 node-name PREFIX every resim runs under
 /// (`{REPLAY_NODE_NAME_PREFIX}{identity}`, minted at
-/// [`TransportManager::init`] below).
+/// `init_resim_transport` below).
 ///
 /// A named constant rather than an inline literal because
 /// [`crate::replay_cmd`] has to SUBTRACT it: iceoryx2 caps a node name at
@@ -129,6 +129,375 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 /// twice would put a refused run one rename away (and, before
 /// `TransportManager::init`'s conversion became fallible, a PANIC one rename away).
 pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
+
+/// The fixed head of every resim's PRIVATE iceoryx2 prefix
+/// (`{RESIM_NAMESPACE_MARKER}{pid:08x}_`, see [`resim_namespace_prefix`]).
+///
+/// A resim publishes the frames it re-executes and the recorded external
+/// inputs it re-injects under the recording's own topic names, and its
+/// transport runs under this prefix. iceoryx2 names every node, service and
+/// shared-memory segment `{prefix}{name}` and opens only files carrying its own
+/// prefix, so a process on the shared namespace (iceoryx2's default `iox2_`,
+/// the one `graph run`, `cerulion-netd`, `bagd` and `topic echo` use) cannot
+/// open a service a resim creates, and a resim cannot open theirs.
+///
+/// It diverges from `iox2_` at its first character and from the multi-process
+/// planning namespace's `cer_p_` at its fifth, so iceoryx2's string-prefix
+/// listing of one namespace never reaches another's files.
+pub const RESIM_NAMESPACE_MARKER: &str = "cer_resim_";
+
+/// The private iceoryx2 prefix of the resim running as process `pid`.
+///
+/// The pid is rendered as exactly eight lowercase hex digits (every `u32`
+/// fits), so every resim prefix has the same length and none is a strict
+/// prefix of another: iceoryx2 lists a namespace's nodes by string-prefix
+/// match, and prefixes of different lengths would let one resim's listing reach
+/// another's node files. Two resims running at once have different pids, so
+/// each runs on its own namespace.
+///
+/// Nothing the run records or reports carries this prefix: it names files, and
+/// a topic's iceoryx2 service identity is derived from the topic alone.
+#[must_use]
+pub fn resim_namespace_prefix(pid: u32) -> String {
+    format!("{RESIM_NAMESPACE_MARKER}{pid:08x}_")
+}
+
+/// The pid whose private resim namespace a node-monitor file belongs to.
+///
+/// `Some(pid)` for `{RESIM_NAMESPACE_MARKER}{pid:08x}_{node id}{monitor_suffix}`,
+/// the shape iceoryx2 gives a node's monitor file in a namespace minted by
+/// [`resim_namespace_prefix`]; `None` for any other name, including the
+/// monitor's `_context` and `_owner_lock` companions and every other
+/// namespace's files.
+fn resim_namespace_owner(file_name: &str, monitor_suffix: &str) -> Option<u32> {
+    if monitor_suffix.is_empty() || !file_name.ends_with(monitor_suffix) {
+        return None;
+    }
+    let rest = file_name.strip_prefix(RESIM_NAMESPACE_MARKER)?;
+    let hex = rest.get(..8)?;
+    if !rest.get(8..)?.starts_with('_')
+        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// The iceoryx2 config of the resim running as `pid`: `base` with the private
+/// [`resim_namespace_prefix`]. A resim passes the host's RESOLVED config
+/// (`Config::global_config()`), so an operator's iceoryx2 config file, its root
+/// path included, applies exactly as it does to a live run.
+fn resim_ix_config(
+    base: &iceoryx2::config::Config,
+    pid: u32,
+) -> Result<iceoryx2::config::Config, ReplayError> {
+    use iceoryx2::prelude::{FileName, SemanticString};
+    let prefix = resim_namespace_prefix(pid);
+    let file_name = FileName::new(prefix.as_bytes()).map_err(|e| ReplayError::Internal {
+        reason: format!(
+            "cannot build the resim's private iceoryx2 prefix '{prefix}': iceoryx2 rejects it \
+             ({e:?})"
+        ),
+    })?;
+    let mut ix_config = base.clone();
+    ix_config.global.prefix = file_name;
+    Ok(ix_config)
+}
+
+/// Start the process transport of a resim on the resim's private namespace.
+///
+/// The cross-process transport is built with [`resim_ix_config`] for this
+/// process, after [`sweep_dead_resim_namespaces`] has reclaimed what earlier
+/// resims left. It is the process singleton (one iceoryx2 node per process), so
+/// every later [`TransportManager::get`] in the run lands on the same private
+/// namespace. The singleton keeps the config of its FIRST initialization, so
+/// the namespace is checked after the call: a transport some earlier code
+/// started on another namespace refuses the run (exit 5) instead of
+/// re-executing onto it.
+///
+/// The `local-transport` build's transport is in-process only, so nothing
+/// outside the process can attach to it and it keeps the plain initializer.
+fn init_resim_transport(
+    config: cerulion_core::TransportConfig,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    match cerulion_core::transport::TRANSPORT_KIND {
+        cerulion_core::transport::TransportKind::InProcess => {
+            TransportManager::init(config).map_err(replay_transport_init_error)
+        }
+        cerulion_core::transport::TransportKind::CrossProcess => {
+            let base = iceoryx2::config::Config::global_config();
+            let swept = sweep_dead_resim_namespaces(
+                base,
+                cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET,
+            );
+            if swept.namespaces > 0 {
+                tracing::debug!(
+                    namespaces = swept.namespaces,
+                    unswept = swept.unswept,
+                    cleanups = swept.cleaned.cleanups,
+                    total_failures = swept.cleaned.failed_cleanups,
+                    deferred = swept.cleaned.deferred,
+                    "replay: swept the private namespaces earlier resims left"
+                );
+            }
+            let pid = std::process::id();
+            let ix_config = resim_ix_config(base, pid)?;
+            let transport = TransportManager::init_with_config(config, ix_config)
+                .map_err(replay_transport_init_error)?;
+            let expected = resim_namespace_prefix(pid);
+            let running = transport.iox_config().global.prefix.to_string();
+            if running != expected {
+                return Err(ReplayError::Internal {
+                    reason: format!(
+                        "the replay transport was already running on the iceoryx2 namespace \
+                         '{running}' instead of the resim's private '{expected}'; refusing to \
+                         re-execute onto a namespace other processes attach to"
+                    ),
+                });
+            }
+            Ok(transport)
+        }
+    }
+}
+
+/// What one [`sweep_dead_resim_namespaces`] found and did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResimNamespaceSweep {
+    /// Resim namespaces with at least one node-monitor file.
+    namespaces: usize,
+    /// Of those, the ones the budget left unswept.
+    unswept: usize,
+    /// The dead-node sweep's counts, summed over the swept namespaces.
+    cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
+}
+
+/// Reclaim what dead resims left in their private namespaces under `base`'s
+/// root, within `budget`.
+///
+/// The process transport lives as long as the process, so a finished resim's
+/// iceoryx2 node is never dropped, and a killed one also leaves every service
+/// it held. The shared-namespace sweeps (`graph run`'s, `cerulion clean`)
+/// list only that namespace's files, so each resim sweeps the resim
+/// namespaces too:
+/// every pid with a resim node-monitor file in `base`'s node directory, in
+/// ascending order, gets the dead-node sweep on its namespace. That sweep
+/// removes only nodes whose process is gone, so a resim still running is left
+/// alone. The budget covers all of them together; a namespace past it waits
+/// for the next resim. Advisory: nothing here fails the resim.
+fn sweep_dead_resim_namespaces(
+    base: &iceoryx2::config::Config,
+    budget: Duration,
+) -> ResimNamespaceSweep {
+    let node_dir = PathBuf::from(String::from(&base.global.node_dir()));
+    let monitor_suffix = base.global.node.monitor_suffix.to_string();
+    let Ok(entries) = std::fs::read_dir(&node_dir) else {
+        return ResimNamespaceSweep::default();
+    };
+    // Sorted and de-duplicated: a namespace holds one monitor file per node.
+    let owners: BTreeSet<u32> = entries
+        .flatten()
+        .filter_map(|entry| resim_namespace_owner(entry.file_name().to_str()?, &monitor_suffix))
+        .collect();
+    let mut sweep = ResimNamespaceSweep {
+        namespaces: owners.len(),
+        ..ResimNamespaceSweep::default()
+    };
+    // Startup hygiene only: the elapsed time bounds how long the sweep may
+    // delay the resim and never reaches anything the run executes or reports.
+    let started = std::time::Instant::now();
+    for pid in owners {
+        let remaining = budget.saturating_sub(started.elapsed());
+        let ix_config = match resim_ix_config(base, pid) {
+            Ok(ix_config) if !remaining.is_zero() => ix_config,
+            _ => {
+                sweep.unswept += 1;
+                continue;
+            }
+        };
+        let swept = cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(
+            &ix_config, remaining,
+        );
+        sweep.cleaned.cleanups += swept.cleanups;
+        sweep.cleaned.failed_cleanups += swept.failed_cleanups;
+        sweep.cleaned.deferred += swept.deferred;
+    }
+    sweep
+}
+
+#[cfg(test)]
+mod resim_namespace_tests {
+    use super::{
+        resim_ix_config, resim_namespace_owner, resim_namespace_prefix,
+        sweep_dead_resim_namespaces, ResimNamespaceSweep, RESIM_NAMESPACE_MARKER,
+    };
+    use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
+    use iceoryx2::node::{Node, NodeBuilder, NodeState};
+    use iceoryx2::prelude::CallbackProgression;
+    use iceoryx2::service::ipc_threadsafe::Service;
+    use std::time::Duration;
+
+    /// iceoryx2's default node-monitor suffix, as a hand-written literal.
+    const MONITOR: &str = ".node_monitor";
+
+    /// Hand oracles: the marker, the pid in exactly eight lowercase hex
+    /// digits, then `_`, at both ends of the `u32` range and at Linux's
+    /// largest `pid_max`.
+    #[test]
+    fn the_private_prefix_is_the_marker_then_the_pid_in_eight_hex_digits() {
+        assert_eq!(resim_namespace_prefix(0), "cer_resim_00000000_");
+        assert_eq!(resim_namespace_prefix(0x1234), "cer_resim_00001234_");
+        assert_eq!(resim_namespace_prefix(4_194_304), "cer_resim_00400000_");
+        assert_eq!(resim_namespace_prefix(u32::MAX), "cer_resim_ffffffff_");
+    }
+
+    /// No resim prefix string-prefixes another resim's, the default
+    /// namespace's, the planning namespace's or iceoryx2's test namespaces',
+    /// in either direction: the property that keeps one namespace's node
+    /// listing out of another's files.
+    #[test]
+    fn no_resim_prefix_lists_another_namespace() {
+        let pids = [
+            0u32,
+            1,
+            0x10,
+            0x123,
+            0x1234,
+            0x00ab_cdef,
+            0x0fff_ffff,
+            u32::MAX,
+        ];
+        let resim: Vec<String> = pids
+            .iter()
+            .map(|&pid| resim_namespace_prefix(pid))
+            .collect();
+        for a in &resim {
+            assert_eq!(a.len(), RESIM_NAMESPACE_MARKER.len() + 9, "{a}");
+            for b in &resim {
+                if a != b {
+                    assert!(!b.starts_with(a.as_str()), "{a} lists {b}'s files");
+                }
+            }
+            for other in ["iox2_", "cer_p_0123456789abcdef", "test_prefix_"] {
+                assert!(
+                    !other.starts_with(a.as_str()) && !a.starts_with(other),
+                    "{a} and {other} overlap"
+                );
+            }
+        }
+    }
+
+    /// iceoryx2 accepts every prefix, and the config keeps the base's root.
+    #[test]
+    fn the_private_config_is_the_base_with_the_private_prefix() {
+        let base = iceoryx2::config::Config::global_config();
+        for pid in [0, 0x1234, u32::MAX] {
+            let ix_config = resim_ix_config(base, pid).expect("a prefix iceoryx2 accepts");
+            assert_eq!(
+                ix_config.global.prefix.to_string(),
+                resim_namespace_prefix(pid)
+            );
+            assert_eq!(
+                String::from(ix_config.global.root_path()),
+                String::from(base.global.root_path())
+            );
+        }
+    }
+
+    /// A resim's monitor file names its pid; every other name, the monitor's
+    /// companions and other namespaces' files included, names none.
+    #[test]
+    fn only_a_resim_monitor_file_names_an_owner() {
+        assert_eq!(
+            resim_namespace_owner("cer_resim_0000abcd_1234567890.node_monitor", MONITOR),
+            Some(0xabcd)
+        );
+        assert_eq!(
+            resim_namespace_owner("cer_resim_ffffffff_1.node_monitor", MONITOR),
+            Some(u32::MAX)
+        );
+        for name in [
+            "cer_resim_0000abcd_1234567890.node_monitor_context",
+            "cer_resim_0000abcd_1234567890.node_monitor_owner_lock",
+            // Upper case: the prefix renders lower case only.
+            "cer_resim_0000ABCD_1234567890.node_monitor",
+            // Seven digits, then the separator.
+            "cer_resim_000abcd_1234567890.node_monitor",
+            // No separator after the eight digits.
+            "cer_resim_0000abcd1234567890.node_monitor",
+            // A sign `u32::from_str_radix` would accept.
+            "cer_resim_+000abcd_1.node_monitor",
+            "iox2_1234567890.node_monitor",
+            "cer_p_0123456789abcdef1234567890.node_monitor",
+            "1234567890",
+            "cer_resim_",
+        ] {
+            assert_eq!(resim_namespace_owner(name, MONITOR), None, "{name}");
+        }
+        assert_eq!(
+            resim_namespace_owner("cer_resim_0000abcd_1.node_monitor", ""),
+            None,
+            "an empty suffix matches nothing"
+        );
+    }
+
+    /// The owner parse inverts the prefix for every pid shape.
+    #[test]
+    fn a_monitor_file_names_the_pid_its_prefix_was_minted_from() {
+        for pid in [0, 1, 0x1234, 0x00ab_cdef, u32::MAX] {
+            let name = format!("{}98765{MONITOR}", resim_namespace_prefix(pid));
+            assert_eq!(resim_namespace_owner(&name, MONITOR), Some(pid), "{name}");
+        }
+    }
+
+    /// The sweep over a REAL node on a resim namespace in an isolated root:
+    /// it finds the namespace, a zero budget sweeps nothing, a live node is
+    /// never reaped, and a node dropped gracefully leaves nothing to find.
+    #[test]
+    fn the_sweep_finds_a_resim_namespace_and_never_reaps_a_live_node() {
+        let root = cerulion_core::testing::IsolatedRoot::mint("rsweep");
+        let base = root.config();
+        let ix_config = resim_ix_config(&base, std::process::id()).expect("the private config");
+        let node = NodeBuilder::new()
+            .config(&ix_config)
+            .create::<Service>()
+            .expect("a live node on the resim namespace");
+
+        assert_eq!(
+            sweep_dead_resim_namespaces(&base, Duration::ZERO),
+            ResimNamespaceSweep {
+                namespaces: 1,
+                unswept: 1,
+                cleaned: BoundedCleanup::default(),
+            },
+            "a zero budget finds the namespace and sweeps nothing"
+        );
+        assert_eq!(
+            sweep_dead_resim_namespaces(&base, Duration::from_secs(10)),
+            ResimNamespaceSweep {
+                namespaces: 1,
+                unswept: 0,
+                cleaned: BoundedCleanup::default(),
+            },
+            "a live node is not dead, so nothing is removed"
+        );
+        let mut alive = 0usize;
+        Node::<Service>::list(&ix_config, |state| {
+            if matches!(state, NodeState::Alive(_)) {
+                alive += 1;
+            }
+            CallbackProgression::Continue
+        })
+        .expect("list the resim namespace");
+        assert_eq!(alive, 1, "the swept node is still alive");
+
+        drop(node);
+        assert_eq!(
+            sweep_dead_resim_namespaces(&base, Duration::from_secs(10)),
+            ResimNamespaceSweep::default(),
+            "a gracefully dropped node leaves no monitor file"
+        );
+    }
+}
 
 /// Burst-aware provisioning: headroom added on top of the recording's
 /// measured max intra-step burst when raising a topic's service ceiling —
@@ -7959,7 +8328,7 @@ struct ReplayContext {
     resume: Option<ResumePlan>,
 }
 
-/// Classify a `TransportManager::init` failure on the resim path.
+/// Classify a failure to start the resim's transport ([`init_resim_transport`]).
 ///
 /// One failure class here is NOT a harness bug: an
 /// [`UnrepresentableNodeName`](cerulion_core::TransportError::UnrepresentableNodeName)
@@ -8023,7 +8392,10 @@ fn build_replay_context(
             // sibling Cerulion processes are untouched.
             let _ = crate::ipc_cleanup::cleanup_dead_iceoryx2_nodes();
             let clock = Arc::new(VirtualClock::new());
-            let transport = TransportManager::init(cerulion_core::TransportConfig {
+            // On the resim's PRIVATE namespace (`init_resim_transport`), so no
+            // live graph, recorder or network daemon on this host receives
+            // the frames it re-executes or the recorded inputs it re-injects.
+            let transport = init_resim_transport(cerulion_core::TransportConfig {
                 node_name: format!("{REPLAY_NODE_NAME_PREFIX}{}", config.identity()),
                 clock: clock.clone(),
                 subscriber_buffer_size: REPLAY_SUBSCRIBER_BUFFER,
@@ -8034,8 +8406,7 @@ fn build_replay_context(
                 // deliberately NOT a warn, since this arm is hit by design
                 // on every replay of a networked graph).
                 network: None,
-            })
-            .map_err(replay_transport_init_error)?;
+            })?;
             if let Some(plan) = resume.as_ref() {
                 if !plan.seeds.is_empty() {
                     transport.set_replay_sequence_seeds(plan.seeds.clone());

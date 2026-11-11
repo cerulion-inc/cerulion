@@ -364,7 +364,8 @@ given for another ask text as `not_recorded`, and `--resim all --verify`
 reports a changed ask as a divergence on the ask topic. A running daemon's
 eye reads the same topics, and tells a played recording by where its frames
 come from: `bag play` publishes from the transport node `cerulion_bag_play`
-and `bag play --resim` from `cerulion_replay_` and the recording's identity.
+and `bag play --resim` from `cerulion_replay_` and the recording's identity,
+on a private shared-memory namespace the daemon never sees.
 An ask from either gets no request, no answer and no receipt, with Jev on
 or off, and a wrist frame from either is never held, whatever their wire
 timestamps say, so an unpaced resim whose replay clock passes the host's

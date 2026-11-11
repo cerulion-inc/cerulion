@@ -150,7 +150,9 @@ resolves to exactly one of these, in evaluation order:
 not a deployment, so it stays LOCAL-ONLY by design (its transport is built
 `network: None`; it never resolves a network). Re-execution
 (`cerulion bag play <bag> --resim all`) is likewise network-inert by
-construction (the bag is the input, and a replay must match the live run).
+construction (the bag is the input, and a replay must match the live run):
+it runs on a private shared-memory namespace, so a `cerulion-netd` on the
+same machine never sees its frames.
 
 ## Local inspection and compatibility
 

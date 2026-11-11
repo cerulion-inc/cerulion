@@ -587,13 +587,14 @@ fn illegal_flag_combinations_are_refused_by_name_and_never_as_a_violation() {
 // cdylib through `DylibNodeEntry` over an isolated per-test transport, then the
 // REAL `cerulion bag play <bag> --resim all --verify` binary is spawned with
 // cwd = the workspace root:
-// its engine resolves the same cdylib as the candidate and replays on the
-// GLOBAL transport namespace.
+// its engine resolves the same cdylib as the candidate and replays on a
+// private iceoryx2 namespace of its own.
 //
 // `#[serial]`: the parent's reference runs load a cdylib (the process-global
-// NODES registry) and the subprocesses use the GLOBAL iceoryx2 namespace —
-// unique per-run topic prefixes make collisions structurally unlikely, but the
-// serialization keeps the two subprocess transports from ever overlapping.
+// NODES registry), and the `graph run --record` subprocess and the arms that
+// open the topic from the parent use the GLOBAL iceoryx2 namespace. Unique
+// per-run topic prefixes make collisions structurally unlikely; the
+// serialization keeps those transports from ever overlapping.
 // ===========================================================================
 
 use std::io::Read as _;
@@ -657,8 +658,9 @@ fn nondet_fixture_cdylib() -> PathBuf {
 /// graphs/demo.yaml (one `ticker` period node producing `/{prefix}/ticker/cmd`),
 /// nodes/ticker/src/lib.rs (fixture source copy, for the metadata walkers), and
 /// target/debug/libticker.* (the PREBUILT fixture cdylib under the node-type
-/// name the resolver looks for). `prefix` must be unique per reference run —
-/// the subprocess replays on the global iceoryx2 namespace.
+/// name the resolver looks for). `prefix` must be unique per reference run:
+/// the arms that open the topic on the global iceoryx2 namespace share it with
+/// every other process on the host.
 fn build_replay_workspace(root: &Path, prefix: &str) -> String {
     build_replay_workspace_from(
         root,
@@ -1405,9 +1407,10 @@ fn subprocess_replay_of_thinned_trace_bag_exits_6_with_trace_divergence() {
 /// --workspace`) — the helpers PANIC with the exact build instruction if any
 /// artifact is missing.
 ///
-/// Runs the record + all three replays on the GLOBAL iceoryx2 namespace (the
-/// production `graph run` path has no isolation seam — that IS the point of a
-/// closed-loop e2e); `#[serial]` + a unique per-run prefix keep it safe.
+/// Runs the record on the GLOBAL iceoryx2 namespace (the production
+/// `graph run` path has no isolation seam, which IS the point of a closed-loop
+/// e2e) and each replay on its own private one; `#[serial]` and a unique
+/// per-run prefix keep it safe.
 #[test]
 #[serial]
 fn real_recorded_bag_replays_end_to_end() {
@@ -2247,4 +2250,269 @@ fn record_out_failures_are_loud_and_leave_no_file() {
         "stderr: {stderr}"
     );
     assert!(!out.exists(), "a refused invocation writes nothing");
+}
+
+// ===========================================================================
+// A resim runs on a PRIVATE shared-memory namespace: nothing attached to the
+// shared one receives what it publishes.
+//
+// The byte-for-byte match with the recording is
+// `subprocess_replay_of_matching_workspace_exits_0_with_pass`; two resims
+// producing the same frames is `record_out_writes_the_re_executed_frames_in_both_modes`
+// (each run's output bag equals one hand oracle).
+// ===========================================================================
+
+/// A transport on the SHARED iceoryx2 namespace: the host's resolved global
+/// config, the one a live `graph run`, `cerulion topic echo`, `bagd` and
+/// `cerulion-netd` build theirs on, not a per-test root.
+fn shared_namespace_transport(tag: &str) -> Arc<cerulion_core::TransportManager> {
+    cerulion_core::TransportManager::init_for_test(
+        cerulion_core::TransportConfig {
+            node_name: format!("{tag}_{}", std::process::id()),
+            ..Default::default()
+        },
+        iceoryx2::config::Config::global_config().clone(),
+    )
+    .expect("a transport on the shared namespace")
+}
+
+/// Every frame a data-only tap holds, oldest first (the drain loop
+/// `reference_run_cdylib` runs).
+fn drain_tap(tap: &mut cerulion_core::transport::subscriber::DataOnlySubscriber) -> Vec<Vec<u8>> {
+    let budget = tap.max_borrowed_samples().max(1);
+    let mut frames = Vec::new();
+    let mut scratch = Vec::new();
+    loop {
+        scratch.clear();
+        let n = tap
+            .drain_owned(budget, &mut scratch)
+            .expect("drain the tap");
+        frames.extend(scratch.drain(..).map(|s| s.payload().to_vec()));
+        if n < budget {
+            return frames;
+        }
+    }
+}
+
+/// Publish `frame` on `topic` from the shared namespace, the way any producer
+/// attached there does.
+fn publish_on_shared_namespace(
+    shared: &cerulion_core::TransportManager,
+    topic: &str,
+    frame: &[u8],
+) -> cerulion_core::transport::publisher::CerulionPublisher {
+    let slot = cerulion_core::wire::MaxSliceLen::try_new(frame.len() as u32)
+        .expect("a recorded frame holds its wire header");
+    let mut publisher = shared
+        .create_publisher_simple(topic, slot)
+        .expect("a producer on the shared namespace");
+    publisher
+        .publish_raw(frame)
+        .expect("publish one recorded frame on the shared namespace");
+    publisher
+}
+
+/// A consumer on the SHARED namespace, attached before the resim starts,
+/// receives nothing from it: neither a live graph's input subscriber on the
+/// topic nor the data-only tap `bagd` and `cerulion-netd`'s egress read with.
+///
+/// Anti-tautology: after the resim, one recorded frame published on the shared
+/// namespace reaches both, so they were attached and readable all along.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn a_resim_delivers_nothing_to_a_consumer_on_the_shared_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}iso", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let topic = format!("/{prefix}/ticker/cmd");
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    assert_eq!(frames.len(), 3, "one frame per step");
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let shared = shared_namespace_transport("rp_shared_consumer");
+    // A live input creates the topic's service when it comes up before its
+    // producer; the tap only ever opens an existing one.
+    let input = shared
+        .create_subscriber(&topic)
+        .expect("a live input on the shared namespace");
+    let mut tap = shared
+        .create_data_only_subscriber(&topic)
+        .expect("a tap on the shared namespace");
+
+    let out = run_replay_bin_in_workspace(root, &bag);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the resim still matches the recording byte for byte; stderr: {stderr}"
+    );
+    assert!(stderr.contains("replay PASS"), "stderr: {stderr}");
+
+    let mut delivered = 0usize;
+    while input.try_receive_one(|_| {}).expect("read the live input") {
+        delivered += 1;
+    }
+    assert_eq!(
+        delivered, 0,
+        "a resim's frames reached a live input on the shared namespace"
+    );
+    assert_eq!(
+        drain_tap(&mut tap),
+        Vec::<Vec<u8>>::new(),
+        "a resim's frames reached a tap on the shared namespace"
+    );
+
+    let _producer = publish_on_shared_namespace(&shared, &topic, &frames[0]);
+    let recorded = WireHeader::read_from_buf(&frames[0]).expect("frame header");
+    let mut received = Vec::new();
+    while input
+        .try_receive_one(|m| received.push((m.header().sequence, m.header().timestamp_ns)))
+        .expect("read the live input")
+    {}
+    assert_eq!(
+        received,
+        vec![(recorded.sequence, recorded.timestamp_ns)],
+        "the live input receives what a producer on its namespace publishes"
+    );
+    assert_eq!(
+        drain_tap(&mut tap),
+        vec![frames[0].clone()],
+        "the tap receives what a producer on its namespace publishes"
+    );
+}
+
+/// What `cerulion-netd`'s egress does with a topic it was asked to forward,
+/// polled through the resim's whole life: open the producer's service on the
+/// shared namespace (open-only, never creating it) and drain it. The resim
+/// never gives it a service to open, while it runs or after it exits.
+///
+/// Anti-tautology: once a producer does exist on the shared namespace, the
+/// same open succeeds and the tap receives its frame.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn a_resim_creates_no_service_an_egress_tap_on_the_shared_namespace_can_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}egr", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let topic = format!("/{prefix}/ticker/cmd");
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    assert_eq!(frames.len(), 3, "one frame per step");
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let shared = shared_namespace_transport("rp_shared_egress");
+    assert!(
+        shared.create_data_only_subscriber(&topic).is_err(),
+        "no producer of the topic exists on the shared namespace before the resim"
+    );
+
+    let err_path = root.join("resim.stderr");
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_cerulion"))
+            .args(RESIM_VERIFY_ARGV)
+            .arg(&bag)
+            .current_dir(root)
+            .env_remove("CARGO_TARGET_DIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+            .spawn()
+            .expect("spawn the resim"),
+    );
+    let started = Instant::now();
+    let mut polls = 0usize;
+    let mut opened = 0usize;
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let status = loop {
+        // Polled BEFORE the exit check, so the resim's whole life is covered.
+        if let Ok(mut tap) = shared.create_data_only_subscriber(&topic) {
+            opened += 1;
+            received.extend(drain_tap(&mut tap));
+        }
+        polls += 1;
+        if let Some(status) = child.0.try_wait().expect("poll the resim") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the resim did not finish within 120 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let stderr = read_file(&err_path);
+    assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("replay PASS"), "stderr: {stderr}");
+    assert!(polls > 0, "the tap was polled while the resim ran");
+    assert_eq!(
+        (opened, received.len()),
+        (0, 0),
+        "an egress tap on the shared namespace opened a service the resim created"
+    );
+    assert!(
+        shared.create_data_only_subscriber(&topic).is_err(),
+        "the resim left a service of the topic on the shared namespace"
+    );
+
+    let slot = cerulion_core::wire::MaxSliceLen::try_new(frames[0].len() as u32)
+        .expect("a recorded frame holds its wire header");
+    let mut producer = shared
+        .create_publisher_simple(&topic, slot)
+        .expect("a producer on the shared namespace");
+    let mut tap = shared
+        .create_data_only_subscriber(&topic)
+        .expect("with a producer on the shared namespace, the egress tap opens its service");
+    producer
+        .publish_raw(&frames[0])
+        .expect("publish one recorded frame on the shared namespace");
+    assert_eq!(
+        drain_tap(&mut tap),
+        vec![frames[0].clone()],
+        "the tap receives what a producer on its namespace publishes"
+    );
+}
+
+/// Two resims of one bag, two processes on two private namespaces, write
+/// byte-identical reports: nothing a resim reports depends on its namespace
+/// or its process id. The report itself is a PASS that byte-compared the one
+/// produced topic.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn two_resims_of_one_bag_write_byte_identical_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}two", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let report = |name: &str| -> Vec<u8> {
+        let path = root.join(name);
+        let out = run_replay_bin_in_workspace_with_report(root, &bag, &path);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+        std::fs::read(&path).expect("the report is written")
+    };
+    let first = report("first.json");
+    let second = report("second.json");
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        String::from_utf8_lossy(&second),
+        "two resims of one bag must report byte for byte alike"
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&first).expect("the report is JSON");
+    assert_eq!(parsed["passed"], true, "{parsed}");
+    assert_eq!(parsed["topics_checked"], 1, "{parsed}");
+    assert_eq!(parsed["topics_passed"], 1, "{parsed}");
+    assert!(
+        !String::from_utf8_lossy(&first).contains("cer_resim_"),
+        "the report names no private namespace: {parsed}"
+    );
 }

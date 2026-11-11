@@ -34,6 +34,7 @@ unrecognized subcommand.
 | Speed | Wall-paced from the bag's timeline | As fast as possible, no pacing knob |
 | Purpose | DRIVE consumers with realistic data | RE-RUN your current code against real inputs |
 | Needs the workspace? | No | Yes: it loads the cdylibs |
+| Who sees its frames | Anything attached to local shared memory | Nothing outside the resim: it runs on a private shared-memory namespace |
 
 Re-simulation re-injects only external-source topics and recomputes everything
 else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
