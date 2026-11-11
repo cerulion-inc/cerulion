@@ -1,14 +1,12 @@
 # cerulion_core - agent notes
 
-Core runtime: wire format, codegen, iceoryx2 transport, scheduler/level executor, graph
-runtime, gateway plane; 260+ test binaries with per-binary serial rules.
+Wire, codegen, iceoryx2, scheduler/graph and gateway; per-binary serial test rules.
 
 ## Invariants
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
-- LAN access defaults to Paired on every platform. Open LAN transport fixtures
-  select Open explicitly; a locator or sign-in never opens the paired gate.
+- LAN defaults to Paired; fixtures select Open. Locators/login never open it.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
 - The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.

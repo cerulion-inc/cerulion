@@ -31565,6 +31565,9 @@ process_groups:
             Ok(true)
         }
         fn release_egress(&self, _id: cerulion_netd::egress::EgressId) {}
+        fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+            Some(cerulion_core::LanAccess::Paired)
+        }
     }
 
     /// An unused mirror plane — the daemon requires one, but this egress-only test
