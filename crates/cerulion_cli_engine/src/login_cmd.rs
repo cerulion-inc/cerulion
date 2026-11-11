@@ -1854,7 +1854,7 @@ mod tests {
             .expect("the held refresh lock must cause the refusal")
             .parse()
             .unwrap();
-        assert!(reported_ms <= budget.as_millis(), "{error}");
+        assert!((1..=budget.as_millis()).contains(&reported_ms), "{error}");
         assert!(elapsed >= budget, "the lock wait ended early: {elapsed:?}");
         assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
         assert_eq!(auth::load_from(&path).state().unwrap(), &state);
