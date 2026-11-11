@@ -147,8 +147,10 @@ the same entry instead of running the daemon.
   thread queues behind a full queue is dropped like any other. A writer
   thread that cannot start, or a runtime that cannot be built, exits the
   binary 1 after one error line. In a build with the test seam only,
-  `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a smaller line bound
-  (`test_queue_lines`: a positive whole number, at most `QUEUE_LINES`), as
+  `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a line bound of at most
+  `QUEUE_LINES` (`test_queue_lines`: a positive whole number that fits a
+  `usize`, whitespace around it trimmed, a larger one than `QUEUE_LINES`
+  setting `QUEUE_LINES`; any other value, zero among them, sets none), as
   the crate's other `_FOR_TEST` variables set their seams; it takes effect
   once the daemon has logged that it listens (`shrink_queue_for_test`,
   called right after that line), so the lines before it are queued under the
@@ -661,13 +663,14 @@ a device key sends nothing and logs that at warn. `RcpdEstop` shares an
 `Owing` with its delivery: a `period` mutex over the period's first engager
 and the last delivery id, an `engages` count and the `running` delivery
 id (0 for none). Under `period`, `send` names the first engager of the
-period, adds one to `engages`, and, when `running` is 0, sets it to a new id
-and builds the delivery; it then releases `period`, spawns `Delivery::run`
-on the runtime handle `serve_core` captured, in the engage's span, and
-keeps the handle of the delivery with the larger id. Otherwise it releases
-`period` and logs at info that the running delivery covers the engage.
-`period` is held only for those steps, never across an `.await`, and
-no log line is written under it. Each attempt reads `engages` as it
+period, adds one to `engages`, and, when `running` is 0, sets it to a new id;
+it then releases `period`, builds the delivery, its `Running` guard first,
+spawns `Delivery::run` on the runtime handle `serve_core` captured, in the
+engage's span, and keeps the handle of the delivery with the larger id.
+Otherwise it releases `period` and logs at info that the running delivery
+covers the engage. `period` is held only for those steps, never across an
+`.await`; no log line is written under it, and no `Running` guard is dropped
+under it, since the guard's drop takes it. Each attempt reads `engages` as it
 begins, reads the token through `load_token`, then sends `initialize`,
 `notifications/initialized` and `tools/call` `estop` with `reason`
 `rcp::OPS_ESTOP_REASON` (`estop_session`), each POST on a fresh loopback
@@ -678,9 +681,10 @@ engager), its response head within `estop_policy::estop_head_bound` of
 answer within `OPS_ESTOP_ANSWER` (10 s) after it, then a `DELETE` of the
 session rcpd issued it, within `OPS_ESTOP_DELETE` (2 s), also after a
 stop by Ctrl-C or SIGTERM. It succeeds only when the call's result says
-`"estopped": true` (`estop_outcome`); the delivery records the answer on
-its `Running` guard as soon as the call returns, before the `DELETE`, logs
-it at warn with `failed_attempts` after the `DELETE`, then calls
+`"estopped": true` (`estop_outcome`); the delivery records on its `Running`
+guard, as soon as the call returns and before the `DELETE`, the `engages`
+count that attempt began with (`answered_at_start`), logs the answer at warn
+with `failed_attempts` after the `DELETE`, then calls
 `Owing::finish` on its own task. `finish`, under `period`, writes no log line and asks
 `estop_policy::after_answer` of the count at the attempt's start and
 now: `Done` ends the period and clears `running` while it still holds
@@ -695,20 +699,31 @@ Both the attempt and the sleep race the stop flag, a `watch` that
 `RcpdEstop::shut_down` sets once `serve_planes` returns; `shut_down` then
 waits for the task within `CONNECT_TIMEOUT`; a delivery whose `send` has
 not yet stored its handle is not awaited, and it reads the stop and ends
-as on any stop. A `Running` guard in the delivery clears `running` on
-any other end, by compare-and-swap of its own id, and logs at error unless
-rcpd had answered the attempt in flight: a stop by Ctrl-C or SIGTERM
-(`serve_core`'s teardown calls `RcpdEstop::shut_down`), a panic, or a runtime
-dropped with the task. A delivery ended during the `DELETE` of an attempt rcpd
-answered logs nothing; one that reaches `finish`'s `Done` has its mark cleared
-there, so its guard reads no flag. An error answer leaves `answered` unset.
-A `cerulion-remoted` that is killed (SIGKILL), crashes, or ends at the
-hard-exit deadline or a second stop signal (`_exit(4)`) runs no destructor,
-so it may end with no line and no `DELETE`. A `send` that reads `running`
-just before an ending delivery's guard clears it logs the engage as covered
-and starts nothing; unless rcpd had answered the attempt in flight, the guard logs
-its error line as well. A delivery that ends before `finish` answers
-`Done`, answered or not, leaves its period open, so the next delivery still names the period's first engager
+as on any stop. A `Running` guard in the delivery clears `running` on any
+other end (a stop by Ctrl-C or SIGTERM, which `serve_core`'s teardown sends
+through `RcpdEstop::shut_down`; a panic; a runtime dropped with the task; or a
+`spawn` on a runtime that has shut down, which drops the delivery on `send`'s
+thread) through `Owing::clear_mark`, which under `period` swaps the guard's id
+for 0 and, when it held it, reads `engages`; the guard writes any line after
+`period` is released. With `answered_at_start` unset, it logs at error that
+rcpd had not answered. With it set (an end during the `DELETE` of the attempt
+rcpd answered, on a panic or a dropped runtime), it asks `after_answer` of it
+and the count it read: `Done` logs nothing, and `Again` logs at error that the
+`estop` owed to a later engage was not sent and that the next engage sends it.
+On `finish`'s `Again` the delivery resets `answered_at_start` before its next
+attempt, and an error answer leaves it unset. One that reaches `finish`'s
+`Done` has its mark cleared there, so its guard logs nothing. A
+`cerulion-remoted` that is killed (SIGKILL), crashes, or ends at the hard-exit
+deadline or a second stop signal (`_exit(4)`) runs no destructor, so it may
+end with no line and no `DELETE`. A `send` and an ending guard serialize on
+`period`: an engage counted before the guard's swap finds `running` set, is
+logged as covered and is in the count the guard reads, so the guard logs its
+early-end line when rcpd had not answered, its owed line when the answered
+attempt began before that engage, and nothing when that attempt began after
+every engage counted; one counted after the swap reads `running` as 0 and
+starts a delivery. A delivery that ends before `finish` answers `Done`,
+answered or not, leaves its period open, so the next delivery still names the
+period's first engager
 and rcpd's journal can name an earlier device for a later engage. Every
 delivery line names the engager as `by` (the device key, hex); the warn
 failure lines and the closed-latch line also carry rcpd's caller identity as
