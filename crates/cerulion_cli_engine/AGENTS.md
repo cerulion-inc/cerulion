@@ -15,6 +15,7 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
+- Graph/node runs claim excluded-topic SHM leases before service creation or worker spawn, including recording. Off/inert excludes all run topics; strict excludes produced topics outside declared egress. Retain guards until every run data port and worker is gone.
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
   share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
