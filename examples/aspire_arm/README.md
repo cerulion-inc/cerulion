@@ -1,5 +1,7 @@
 # aspire_arm
 
+Experimental: not in any release; build from source.
+
 A simulated arm that a coding agent drives through the Robot Context Protocol,
 and a recording of what the agent did that replays byte for byte with no agent
 and no model.

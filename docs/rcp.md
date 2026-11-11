@@ -1,5 +1,7 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
+Experimental: not in any release; build from source.
+
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
 itself as `cerulion-rcp`. Every tool call is written to a hash-chained receipt
