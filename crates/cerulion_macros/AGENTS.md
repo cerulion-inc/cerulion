@@ -27,6 +27,12 @@ codegen/rewriter change runs `cargo test -p cerulion_core` AND `cargo test -p ce
   from one parsed list, so the in-process and cdylib paths cannot disagree (internals doc).
 - Keep internal modules `mod`, never `pub mod` - a `proc-macro = true` crate may export
   only its macros; `pub mod` is a hard compile error.
+- Stable exports derive plugin init/tick/helpers from the common rewritten impl
+  (`plugin_impl.rs`), never a second body rewriter. `plugin_codegen.rs` owns the
+  optional checked bootstrap and node-local lifecycle/state/external tables.
+  Keep native context layouts unchanged; only integer handles and checked leased
+  bytes cross the stable boundary. Spill submission borrows its payload, and the
+  original lease is discarded with SPILL_RELEASE only after the writer drops.
 - Macro error paths re-emit the original struct alongside the `compile_error!` - keep
   that, or one real diagnostic cascades into pages of "cannot find type" noise.
 

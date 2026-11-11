@@ -443,7 +443,7 @@ mod tests {
         );
         let mut shape = 0;
         let mut inline = 0;
-        let mut source = ExternalSourceV1::default();
+        let mut source = ExternalSourceV1 { fd: -1, kind: 0, flags: 0 };
         // SAFETY: aligned caller-owned scalar outputs remain live.
         unsafe {
             assert_eq!(exports.shape(&mut shape).code, status_code::OK);
@@ -505,7 +505,7 @@ mod tests {
         };
         assert_eq!(retry.code, status_code::BUFFER_TOO_SMALL);
         assert_eq!(short, [0xa5; 3]);
-        let mut text = [0u8; 42];
+        let mut text = [0u8; 43];
         assert_eq!(text.len(), oracle.len());
         // SAFETY: complete live caller-owned destination.
         assert_eq!(
