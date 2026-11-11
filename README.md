@@ -280,7 +280,7 @@ This workload comparison uses a nominal 100 Hz offered load. The stock ROS 2 lan
 
 ### Free run and lockstep
 
-A multi-process graph free-runs by default: each process steps on its own clock and none waits on a barrier. `CERULION_EXECUTION_MODE=lockstep` opts out into barrier lockstep. Measured on one build and one Linux x86_64 machine, two processes, fixed 100 Hz, six interleaved reps per mode, recording enabled:
+A multi-process graph free-runs by default: each process steps on its own clock and none waits on a barrier. `CERULION_EXECUTION_MODE=lockstep` opts out into barrier lockstep; that opt-out is deprecated and outside Semantic Versioning, so a minor release may change or remove it. Measured on one build and one Linux x86_64 machine, two processes, fixed 100 Hz, six interleaved reps per mode, recording enabled:
 
 | Payload | Free run (default), p50 / p99 in µs | Lockstep, p50 / p99 in µs |
 |---|---:|---:|

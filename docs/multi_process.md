@@ -19,6 +19,13 @@ Multi-process buys you **fault isolation** (a crashed group takes down only
 its own nodes) and OS-level resource separation, not latency: intra-process
 fusion remains the fastest path.
 
+> **Deprecated:** the `CERULION_EXECUTION_MODE=lockstep` opt-out, and the
+> `CERULION_BARRIER_SPIN_US` and `CERULION_BARRIER_OS_SYNC` variables that tune
+> its barrier, are outside Semantic Versioning and may change or be removed in a
+> 2.x minor release. A multi-process run already free-runs by default. Replaying
+> a bag stamped `coordination: lockstep` is not deprecated. See
+> [Multi-process execution](user-api.md#multi-process-execution).
+
 Related: `docs/multi_publisher_topics.md` (single-writer topics across
 groups), the cross-process barrier + deterministic-live clock,
 recording/replay,
@@ -38,8 +45,8 @@ recording's per-edge read log offline).
   is re-executed rank by rank; what a free-run run does NOT give you is the
   cross-rank equality the barrier buys, so the merged cross-process trace is
   not the monolith's.
-- **Under the `CERULION_EXECUTION_MODE=lockstep` opt-out** workers run in
-  lockstep: a shared-memory barrier gates every DAG-level
+- **Under the deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out**
+  workers run in lockstep: a shared-memory barrier gates every DAG-level
   boundary, and every worker advances the same deterministic-live logical
   clock quantum, so the merged cross-process fire TRACE is
   replay-deterministic, and so is the DATA on every edge the DAG orders. The
@@ -467,8 +474,10 @@ Two consequences to know:
 
 ### Barrier boundary spin (default-on)
 
-(A property of the `lockstep` opt-out, the mode that has a barrier to wait on;
-a free-run worker never reaches this wait.)
+(A property of the deprecated `lockstep` opt-out, the mode that has a barrier
+to wait on; a free-run worker never reaches this wait. The two variables
+below, `CERULION_BARRIER_SPIN_US` and `CERULION_BARRIER_OS_SYNC`, are
+deprecated with it.)
 
 At every level boundary each worker waits on the shared barrier. The
 blocking tier is a process-shared futex on Linux and, on macOS 14.4 and

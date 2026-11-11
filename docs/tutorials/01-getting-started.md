@@ -948,10 +948,10 @@ wire header:
   jitter (100.027 ms then 100.009 ms in the capture above) instead of landing on
   exact multiples. What makes the Step 7 replay exact is not a tidy clock but
   the recorded posture: every step boundary is written into the bag and replayed
-  from there. `CERULION_EXECUTION_MODE=lockstep` opts into the other shape,
-  where every rank advances the same 100 ms quantum behind a shared barrier, so
-  its stamps are logical quantum values counted from zero instead of readings
-  that carry the run's jitter.
+  from there. The deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out gives
+  the other shape, where every rank advances the same 100 ms quantum behind a
+  shared barrier, so its stamps are logical quantum values counted from zero
+  instead of readings that carry the run's jitter.
 - `schema`: the layout-sensitive schema hash (see the wire-format footnote below)
 - `size`: total wire size (header + payload)
 
