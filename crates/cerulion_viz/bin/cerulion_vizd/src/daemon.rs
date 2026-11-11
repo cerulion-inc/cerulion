@@ -5796,6 +5796,42 @@ impl NetdDemandPlane {
             }
         }
     }
+
+    /// Drop the kept client if netd closed its end, so the next call reconnects.
+    /// A call that sends nothing would not notice the close on its own.
+    fn drop_client_if_hung_up(&self) {
+        let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|client| peer_hung_up(client.control_fd()))
+        {
+            *guard = None;
+        }
+    }
+}
+
+/// Whether the idle control connection on `fd` can no longer carry a request:
+/// the peer closed it, it failed, or it holds bytes no request asked for.
+fn peer_hung_up(fd: std::os::unix::io::RawFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: `fd` is the open socket of a live client (borrowed, never closed
+    // here), and the buffer is one valid byte. MSG_PEEK leaves the stream as it
+    // was; MSG_DONTWAIT never blocks.
+    let read = unsafe {
+        libc::recv(
+            fd,
+            std::ptr::addr_of_mut!(byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if read >= 0 {
+        return true;
+    }
+    !matches!(
+        io::Error::last_os_error().kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
 }
 
 impl Default for NetdDemandPlane {
@@ -5868,6 +5904,9 @@ impl DemandPlane for NetdDemandPlane {
         // Checked here because the client reports its own version refusal as a
         // protocol error, which drops the connection: a follower would then open
         // a new one on every poll, to a daemon that stays this old while it runs.
+        // The refusal sends nothing, so the kept connection is checked first: once
+        // the old daemon has exited, this poll reconnects to the one now running.
+        self.drop_client_if_hung_up();
         self.with_client(|c| {
             let daemon = c.daemon_protocol();
             if daemon < FIRES_MIN_DAEMON_VERSION {
@@ -5925,7 +5964,9 @@ fn activity_target_error(robot: &str, run_id: &str) -> Option<String> {
 const ACTIVITY_WINDOW: Duration = Duration::from_secs(5);
 
 /// The most runs followed at once. A fifth waits (answered `degraded`) until
-/// one of them goes a lease without an ask, then takes its place.
+/// one of them goes a lease without an ask, then takes its place once that
+/// follower's thread has ended. So at most this many polls and netd
+/// connections are open.
 const MAX_FIRE_FOLLOWERS: usize = 4;
 
 /// The `reason` of the `degraded` answer a plane with no follower plane gets.
@@ -6076,6 +6117,20 @@ impl FireFollowers {
             };
             followers.remove(&lapsed);
         }
+        // A follower left the map only stops at its next check, which can wait
+        // on a stalled netd poll. Its thread and connection count until it ends.
+        let running = {
+            let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            threads.retain(|thread| !thread.is_finished());
+            threads.len()
+        };
+        if running >= MAX_FIRE_FOLLOWERS {
+            return degraded(format!(
+                "cerulion-vizd follows at most {MAX_FIRE_FOLLOWERS} runs at once, and a run no \
+                 longer asked about is still ending its last poll: this run is followed once \
+                 it has"
+            ));
+        }
         let Some(plane) = planes.follower_plane() else {
             return degraded(NO_FOLLOWER_PLANE.to_string());
         };
@@ -6151,16 +6206,24 @@ impl FireFollowers {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .fold(polled, fetched_at);
-            self.pause_until(next_poll);
+            self.pause_until(next_poll, &key, &follower);
         }
     }
 
-    /// Sleep until `until`, one interval at a time so that `close` never waits
-    /// out a whole retry.
-    fn pause_until(&self, until: Instant) {
+    /// Sleep until `until`, one interval at a time so that neither `close` nor
+    /// a follower's replacement waits out a whole retry.
+    fn pause_until(&self, until: Instant, key: &FollowKey, follower: &Arc<Mutex<FireFollower>>) {
         loop {
             let now = Instant::now();
-            if now >= until || self.closed.load(Ordering::SeqCst) {
+            let replaced = || {
+                !self
+                    .followers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(key)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, follower))
+            };
+            if now >= until || self.closed.load(Ordering::SeqCst) || replaced() {
                 return;
             }
             std::thread::sleep((until - now).min(self.timing.interval));
@@ -6577,7 +6640,17 @@ mod fire_follower_tests {
         let r0_last_asked = at(10 + 7 * 50);
         let r0_lapsed = r0_last_asked + FollowTiming::PRODUCTION.lease + Duration::from_millis(1);
         let answer = followers.ask(key("r4"), None, r0_lapsed, &fake);
-        assert_eq!(answer.state, ActivityState::Starting);
+        assert!(
+            matches!(answer.state, ActivityState::Degraded { .. }),
+            "r4 waits for r0's thread to end: {:?}",
+            answer.state
+        );
+        assert_eq!(
+            followers.followed(),
+            vec![key("r1"), key("r2"), key("r3")],
+            "r0 was retired"
+        );
+        ask_until_started(&followers, key("r4"), r0_lapsed, &fake);
         assert_eq!(
             followers.followed(),
             vec![key("r1"), key("r2"), key("r3"), key("r4")],
@@ -6606,9 +6679,9 @@ mod fire_follower_tests {
             );
         }
         let lapsed = t0 + Duration::from_secs(4);
-        followers.ask(key("e"), None, lapsed, &fake);
+        ask_until_started(&followers, key("e"), lapsed, &fake);
         assert!(!followers.followed().contains(&key("a")), "a was replaced");
-        followers.ask(key("a"), None, lapsed, &fake);
+        ask_until_started(&followers, key("a"), lapsed, &fake);
         assert_eq!(
             followers.followed(),
             vec![key("a"), key("c"), key("d"), key("e")]
@@ -6621,6 +6694,89 @@ mod fire_follower_tests {
             "the first follower of a stopped; the second one still follows"
         );
         assert_eq!(fake.opened(), 6);
+        followers.close();
+    }
+
+    /// Ask about `key` at `now` until its follower starts.
+    fn ask_until_started(
+        followers: &Arc<FireFollowers>,
+        key: FollowKey,
+        now: Instant,
+        planes: &dyn DemandPlane,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let answer = followers.ask(key.clone(), None, now, planes);
+            if answer.state == ActivityState::Starting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{key:?} never started: {:?}",
+                answer.state
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_replacement_waits_for_the_retired_followers_poll_to_end() {
+        let fake = FiresFake::slow(Robot::Silent, Duration::from_millis(800));
+        let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
+        let t0 = Instant::now();
+        for robot in ["a", "b", "c", "d"] {
+            followers.ask(key(robot), None, t0, &fake);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.in_flight() < 4 {
+            assert!(Instant::now() < deadline, "the four followers never polled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lapsed = t0 + FollowTiming::PRODUCTION.lease + Duration::from_millis(1);
+        let first = followers.ask(key("e"), None, lapsed, &fake);
+        let ActivityState::Degraded { reason } = first.state else {
+            panic!("e started while a's poll was in flight: {:?}", first.state)
+        };
+        assert!(reason.contains("still ending its last poll"), "{reason}");
+        assert_eq!(fake.opened(), 4, "no fifth connection while a's poll runs");
+
+        let mut most_in_flight = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while followers.ask(key("e"), None, lapsed, &fake).state != ActivityState::Starting {
+            most_in_flight = most_in_flight.max(fake.in_flight());
+            assert!(Instant::now() < deadline, "e never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(most_in_flight <= 4, "{most_in_flight} polls in flight");
+        assert_eq!(fake.opened(), 5);
+        assert_eq!(
+            followers.followed(),
+            vec![key("b"), key("c"), key("d"), key("e")]
+        );
+        followers.close();
+    }
+
+    #[test]
+    fn a_retired_follower_ends_without_waiting_out_its_retry() {
+        let fake = FiresFake::new(Robot::Failing);
+        let followers = Arc::new(FireFollowers::new(FollowTiming::PRODUCTION));
+        let t0 = Instant::now();
+        for robot in ["a", "b", "c", "d"] {
+            followers.ask(key(robot), None, t0, &fake);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.polls().len() < 4 {
+            assert!(Instant::now() < deadline, "the four followers never polled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lapsed = t0 + FollowTiming::PRODUCTION.lease + Duration::from_millis(1);
+        let retired = Instant::now();
+        ask_until_started(&followers, key("e"), lapsed, &fake);
+        assert!(
+            retired.elapsed() < FollowTiming::PRODUCTION.retry,
+            "e waited {:?}, the whole retry of the follower it replaced",
+            retired.elapsed()
+        );
         followers.close();
     }
 
@@ -6701,6 +6857,7 @@ mod fire_follower_tests {
         socket: PathBuf,
         accepted: Arc<AtomicU64>,
         lines: Arc<AtomicU64>,
+        streams: Arc<Mutex<Vec<UnixStream>>>,
     }
     impl OldNetd {
         fn start() -> Self {
@@ -6716,10 +6873,15 @@ mod fire_follower_tests {
             let listener = UnixListener::bind(&socket).unwrap();
             let accepted = Arc::new(AtomicU64::new(0));
             let lines = Arc::new(AtomicU64::new(0));
+            let streams = Arc::new(Mutex::new(Vec::new()));
             let (counted, read) = (Arc::clone(&accepted), Arc::clone(&lines));
+            let kept = Arc::clone(&streams);
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
+                    if let Ok(clone) = stream.try_clone() {
+                        kept.lock().unwrap().push(clone);
+                    }
                     counted.fetch_add(1, Ordering::SeqCst);
                     let banner = format!(
                         r#"{{"hello":"cerulion-netd","protocol":9,"wire_header":{}}}"#,
@@ -6744,6 +6906,14 @@ mod fire_follower_tests {
                 socket,
                 accepted,
                 lines,
+                streams,
+            }
+        }
+
+        /// Close every accepted connection, as an exiting daemon does.
+        fn hang_up(&self) {
+            for stream in self.streams.lock().unwrap().drain(..) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
     }
@@ -6772,6 +6942,30 @@ mod fire_follower_tests {
             netd.accepted.load(Ordering::SeqCst),
             1,
             "the refusal is the daemon's version, so the connection is kept"
+        );
+        assert_eq!(netd.lines.load(Ordering::SeqCst), 0, "nothing was sent");
+    }
+
+    #[test]
+    fn a_refused_follower_reconnects_once_the_old_netd_hangs_up() {
+        let netd = OldNetd::start();
+        let plane = NetdDemandPlane::with_socket(netd.socket.clone())
+            .follower_plane()
+            .expect("a netd plane opens follower planes");
+        plane
+            .query_fires("temi", RUN_TEXT, None)
+            .expect_err("a v9 netd cannot serve fires");
+        assert_eq!(netd.accepted.load(Ordering::SeqCst), 1);
+
+        netd.hang_up();
+        let error = plane
+            .query_fires("temi", RUN_TEXT, None)
+            .expect_err("this netd is still v9");
+        assert!(error.contains("v9"), "{error}");
+        assert_eq!(
+            netd.accepted.load(Ordering::SeqCst),
+            2,
+            "the poll after the old daemon closed its end connects again"
         );
         assert_eq!(netd.lines.load(Ordering::SeqCst), 0, "nothing was sent");
     }
