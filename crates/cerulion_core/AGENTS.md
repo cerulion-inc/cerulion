@@ -9,7 +9,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   a fused chain may serve a frame it just committed, in-process.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
+- Native plugins use the checked stable node table. Refuse a different boundary major or incompatible complete layout; compiler provenance does not decide compatibility.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
 - Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);

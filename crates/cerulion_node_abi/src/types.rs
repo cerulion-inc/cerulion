@@ -308,6 +308,20 @@ pub struct ClockValueV1 {
     pub reserved: u32,
 }
 
+/// Structured diagnostic levels; zero PortHandle selects the node-wide latch.
+pub mod diagnostic_level {
+    /// Unrecoverable failure.
+    pub const ERROR: u32 = 1;
+    /// Recoverable failure.
+    pub const WARN: u32 = 2;
+    /// Lifecycle observation.
+    pub const INFO: u32 = 3;
+    /// Operational observation.
+    pub const DEBUG: u32 = 4;
+    /// Hot-path observation.
+    pub const TRACE: u32 = 5;
+}
+
 /// Existing author event kinds, polled only for the specified port.
 pub mod event_kind {
     /// Backpressure regime observation.

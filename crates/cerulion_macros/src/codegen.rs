@@ -1517,6 +1517,13 @@ fn gen_cdylib(
         .map(|i| json_escape(&i.field_name.to_string()))
         .collect();
     let input_field_types: Vec<&syn::Type> = inputs.iter().map(|i| &i.field_type).collect();
+    let input_accumulate_caps: Vec<String> = inputs
+        .iter()
+        .map(|i| {
+            i.accumulate
+                .map_or_else(|| "null".to_owned(), |cap| cap.to_string())
+        })
+        .collect();
     let input_key_suffixes: Vec<String> = inputs
         .iter()
         .map(|i| {
@@ -1854,12 +1861,13 @@ fn gen_cdylib(
                     first_input = false;
                     let _: () = <#input_field_types as #__cer_root::message::ShmMessage>::_SHM_INVARIANTS;
                     inputs.push_str(&::std::format!(
-                        r#"{{"name":"{}","schema_hash":{},"wire_fixed_size":{},"variable_count":{},"alignment":{}{}}}"#,
+                        r#"{{"name":"{}","schema_hash":{},"wire_fixed_size":{},"variable_count":{},"alignment":{},"accumulate_cap":{}{}}}"#,
                         #input_field_names,
                         <#input_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
                         <#input_field_types as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
                         <#input_field_types as #__cer_root::message::ShmMessage>::VARIABLE_FIELD_COUNT,
                         #__cer_root::shm_runtime::FRAME_ALIGN,
+                        #input_accumulate_caps,
                         #input_key_suffixes,
                     ));
                 )*

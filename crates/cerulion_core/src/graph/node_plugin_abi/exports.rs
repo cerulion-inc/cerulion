@@ -443,7 +443,11 @@ mod tests {
         );
         let mut shape = 0;
         let mut inline = 0;
-        let mut source = ExternalSourceV1 { fd: -1, kind: 0, flags: 0 };
+        let mut source = ExternalSourceV1 {
+            fd: -1,
+            kind: 0,
+            flags: 0,
+        };
         // SAFETY: aligned caller-owned scalar outputs remain live.
         unsafe {
             assert_eq!(exports.shape(&mut shape).code, status_code::OK);

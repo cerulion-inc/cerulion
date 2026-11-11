@@ -33,6 +33,35 @@ pub enum AbiError {
     /// Capability bits and extension presence disagree.
     #[error("node capability bits disagree with its extension tables")]
     Extensions,
+    /// Opening a native library failed before discovery.
+    #[error("node library could not be opened: {reason}")]
+    Library {
+        /// Native loader diagnostic.
+        reason: String,
+    },
+    /// Stable bootstrap discovery failed; legacy exports cannot be executed.
+    #[error("node stable interface could not be discovered; rebuild the node: {reason}")]
+    Bootstrap {
+        /// Checked discovery diagnostic.
+        reason: String,
+    },
+    /// A descriptor violates a frozen pointer/length contract.
+    #[error("node interface descriptor is invalid: {reason}")]
+    Descriptor {
+        /// Bounded validation diagnostic.
+        reason: &'static str,
+    },
+    /// A required C callback is null.
+    #[error("node interface {table} is missing required callback {callback}")]
+    Callback {
+        /// Complete table type.
+        table: &'static str,
+        /// Required callback field.
+        callback: &'static str,
+    },
+    /// Native plugins are supported only on the existing POSIX targets.
+    #[error("native node plugins are unsupported on this platform")]
+    Platform,
 }
 
 /// Validate the complete immutable table, never a prefix or only field offsets.

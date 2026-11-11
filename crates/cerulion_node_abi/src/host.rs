@@ -59,7 +59,8 @@ pub struct HostApiV1 {
         unsafe extern "C" fn(ContextHandle, PortHandle, *mut PublisherCountersV1) -> Status,
     /// Copy diagnostic for token; short-buffer refusal does not consume it.
     pub copy_error: unsafe extern "C" fn(ContextHandle, u64, MutableBytes, *mut u64) -> Status,
-    /// Report a structured node-side diagnostic; host suppresses repeated regimes.
+    /// Report a structured node-side diagnostic at diagnostic_level. Zero port
+    /// selects a distinct node-wide latch; named ports retain their own regimes.
     pub diagnostic: unsafe extern "C" fn(ContextHandle, PortHandle, u32, Bytes) -> Status,
     /// Hand pending batch to this fire once, returning both drop observations.
     /// Repeated calls during the fire return the same frozen batch; subsequent

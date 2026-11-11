@@ -204,6 +204,20 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// Host runtime maintenance may inspect its own native ports without crossing C.
+    pub(crate) fn native_for_runtime(&self) -> &NodeContext {
+        &self.native
+    }
+
+    /// Exclusive host maintenance runs only after every accessor lease returned.
+    pub(crate) fn native_mut_for_runtime(&mut self) -> Result<&mut NodeContext, HostServiceError> {
+        self.admit()?;
+        if self.leases.active() != 0 {
+            return Err(HostServiceError::Busy);
+        }
+        Ok(&mut self.native)
+    }
+
     /// Resolve names once and provision all lease rows before node creation.
     /// The environment is the same immutable snapshot used to build `native`.
     // hot-path-alloc-ok-fn: binding and fixed lease allocation occur at graph build
@@ -665,8 +679,16 @@ impl HostContext {
         }
         *spill_attempted = true;
         let header = *header;
-        let next_count = self.counters.committed.checked_add(1).ok_or(LeaseError::GenerationExhausted)?;
-        let next_spills = self.counters.spills.checked_add(1).ok_or(LeaseError::GenerationExhausted)?;
+        let next_count = self
+            .counters
+            .committed
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
+        let next_spills = self
+            .counters
+            .spills
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
         let layout = self.ports[index].spec.layout;
         let max_capacity = self.output_publisher(index)?.max_slice_len().get();
         if payload.len().checked_add(WireHeader::SIZE) != Some(size as usize)
@@ -1033,8 +1055,12 @@ impl HostContext {
     /// independently of whether the tracing subscriber records a log line.
     pub fn diagnostic_failures(&self, context: u64, port: u64) -> Result<u64, HostServiceError> {
         self.admit()?;
-        if port == 0 { return Ok(self.diagnostics.total_failures()); }
-        let index = (port as u32).checked_sub(1).ok_or(LeaseError::InvalidHandle)? as usize;
+        if port == 0 {
+            return Ok(self.diagnostics.total_failures());
+        }
+        let index = (port as u32)
+            .checked_sub(1)
+            .ok_or(LeaseError::InvalidHandle)? as usize;
         let bound = self.ports.get(index).ok_or(LeaseError::InvalidHandle)?;
         self.port_index(context, port, bound.spec.direction)?;
         Ok(bound.diagnostics.total_failures())
