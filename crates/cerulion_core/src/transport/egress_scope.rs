@@ -101,14 +101,49 @@ pub fn marker_service_name(topic: &str) -> String {
 
 // hot-path-alloc-ok-fn: cold admission only, never frame delivery.
 fn verifier(topic: &str) -> TransportResult<AttributeVerifier> {
-    super::validate_topic_name(topic).map_err(|e| error(topic, e))?;
-    let key = "topic"
+    // Registration and announcement names can exceed native data-port names.
+    // Verify their complete identity without putting it in one bounded attribute.
+    if topic.is_empty() || topic.len() > super::reg_channel::MAX_REG_TOPIC_LEN {
+        return Err(error(
+            topic,
+            "topic is empty or exceeds the registration name limit",
+        ));
+    }
+    let length_key = "topic_len"
         .try_into()
         .map_err(|e| error(topic, format!("{e}")))?;
-    let value = topic.try_into().map_err(|e| error(topic, format!("{e}")))?;
-    AttributeVerifier::new()
-        .require(&key, &value)
-        .map_err(|e| error(topic, e))
+    let length = topic
+        .len()
+        .to_string()
+        .as_str()
+        .try_into()
+        .map_err(|e| error(topic, e))?;
+    let mut verifier = AttributeVerifier::new()
+        .require(&length_key, &length)
+        .map_err(|e| error(topic, e))?;
+    let mut remaining = topic;
+    let mut index = 0;
+    while !remaining.is_empty() {
+        let mut end = remaining
+            .len()
+            .min(iceoryx2::constants::MAX_ATTRIBUTE_VALUE_LENGTH);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        let key = if index == 0 {
+            "topic".to_string()
+        } else {
+            format!("topic_{index}")
+        };
+        let key = key.as_str().try_into().map_err(|e| error(topic, e))?;
+        let value = remaining[..end].try_into().map_err(|e| error(topic, e))?;
+        verifier = verifier
+            .require(&key, &value)
+            .map_err(|e| error(topic, e))?;
+        remaining = &remaining[end..];
+        index += 1;
+    }
+    Ok(verifier)
 }
 
 // hot-path-alloc-ok-fn: cold admission only, never frame delivery.

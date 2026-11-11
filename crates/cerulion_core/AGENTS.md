@@ -1,6 +1,6 @@
 # cerulion_core - agent notes
 
-Wire/codegen, iceoryx2, scheduler/graph and gateway runtime; 260+ binaries have per-binary serial rules.
+Wire/codegen, iceoryx2, scheduler/graph and gateways; test isolation varies by binary.
 
 ## Invariants
 - Excluded producers hold guards before data ports; remote taps, mirrors and announces retain opposite leases until withdrawal. Remote metadata uses `collect_remote_run_entries`: v2 private/v1 public, local accepts both; hide private ids and counts. No frame-path checks.
@@ -36,7 +36,7 @@ Wire/codegen, iceoryx2, scheduler/graph and gateway runtime; 260+ binaries have 
 ## Testing
 
 - Binaries taking the global TransportManager singleton run ALONE (`-- --test-threads=1`
-  locally, a nextest fence in CI); per-test-SHM-root ones are parallel-safe.
+  locally, a nextest fence in CI); per-test SHM roots isolate data, but process-global counters serialize.
 - CI shards 4 ways: `./tools/scripts/ci_test_shard.sh cerulion_core <n> 4` runs one leg
   (`cargo nextest run`, NOT `--test-threads=1`); fence `.config/nextest.toml`, `serial_discipline_test`.
 - cdylib tests dlopen prebuilt fixtures (`cargo build -p test_node_*` first); after ANY core
