@@ -4550,6 +4550,34 @@ fn excluded_run_topics(
     Ok(excluded)
 }
 
+fn producer_scope_for_run(
+    run_network: &RunNetwork,
+    config: &GraphConfig,
+) -> cerulion_core::transport::egress_scope::RunTopicScope {
+    match run_network {
+        RunNetwork::Off | RunNetwork::Inert => {
+            cerulion_core::transport::egress_scope::RunTopicScope::LocalOnly
+        }
+        RunNetwork::Permissive(_) => {
+            cerulion_core::transport::egress_scope::RunTopicScope::Unrestricted
+        }
+        RunNetwork::Strict(_) => cerulion_core::transport::egress_scope::RunTopicScope::Declared {
+            topics: config
+                .network
+                .as_ref()
+                .into_iter()
+                .flat_map(|network| network.egress_topics())
+                .map(str::to_string)
+                .collect(),
+            ingress: config
+                .network
+                .as_ref()
+                .map(|network| network.ingress.clone())
+                .unwrap_or_default(),
+        },
+    }
+}
+
 fn exclude_run_topics(
     transport: &cerulion_core::TransportManager,
     topics: &[String],
@@ -6274,28 +6302,7 @@ pub fn graph_run(
     // nodes by name. `finish` folds their teardown (SIGINT, bounded grace,
     // SIGKILL backstop) and a `--peer-loss fail` death into each exit below;
     // `Drop` is the never-orphan floor for the `?` paths in between.
-    let ros2_scope = match &run_network {
-        RunNetwork::Off | RunNetwork::Inert => {
-            cerulion_core::transport::egress_scope::RunTopicScope::LocalOnly
-        }
-        RunNetwork::Permissive(_) => {
-            cerulion_core::transport::egress_scope::RunTopicScope::Unrestricted
-        }
-        RunNetwork::Strict(_) => cerulion_core::transport::egress_scope::RunTopicScope::Declared {
-            topics: config
-                .network
-                .as_ref()
-                .into_iter()
-                .flat_map(|network| network.egress_topics())
-                .map(str::to_string)
-                .collect(),
-            ingress: config
-                .network
-                .as_ref()
-                .map(|network| network.ingress.clone())
-                .unwrap_or_default(),
-        },
-    };
+    let ros2_scope = producer_scope_for_run(&run_network, &config);
     let ros2_children = crate::ros2_graph::Ros2Children::spawn_with_scope(
         &ros2_entries,
         workspace_root,
@@ -6751,6 +6758,7 @@ pub fn graph_run(
             factories,
             schema_hashes: &schema_hashes,
             excluded_topics: &excluded_topics,
+            producer_scope: ros2_scope.clone(),
             record_dir: Path::new(&record_dir),
             record_env,
             record_cpu,
@@ -12502,6 +12510,8 @@ fn graph_run_supervisor(
     if let (Some(record_dir), Some(recorded)) = (record, recorded_topics.as_deref()) {
         if running.load(Ordering::Relaxed) {
             recording = start_supervisor_recording(SupervisorRecordingStart {
+                transport: &data_plane_transport,
+                producer_scope: &producer_scope_for_run(&run_network, &config),
                 embed_config,
                 record_dir: Path::new(record_dir),
                 workspace_root,
@@ -17878,6 +17888,7 @@ fn report_record_schema_coverage(
 /// Bundled inputs for [`spawn_bagd_recorder`] (>7 independent args).
 #[cfg(unix)]
 struct BagdSpawnSpec<'a> {
+    status_off: bool,
     graph_name: &'a str,
     out_path: &'a Path,
     topics_json_path: &'a Path,
@@ -18030,7 +18041,34 @@ fn bagd_argv(spec: &BagdSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
         argv.push("--schema-catalog".into());
         argv.push(catalog_path.into());
     }
+    if spec.status_off {
+        argv.push("--status-period-ms".into());
+        argv.push("0".into());
+    }
     argv
+}
+
+/// Exclude recorder metadata before startup, or disable it when the shared topic is leased.
+#[cfg(unix)]
+fn prepare_bagd_status(
+    transport: &cerulion_core::TransportManager,
+    scope: &cerulion_core::transport::egress_scope::RunTopicScope,
+    graph_name: &str,
+) -> (
+    Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
+    bool,
+) {
+    if !scope.excludes(cerulion_bagd::STATUS_TOPIC) {
+        return (None, false);
+    }
+    match transport.exclude_remote_topic(cerulion_bagd::STATUS_TOPIC) {
+        Ok(guard) => (Some(guard), false),
+        Err(error) => {
+            tracing::warn!(graph = %graph_name, topic = cerulion_bagd::STATUS_TOPIC, error = %error,
+                "recorder status disabled: the shared status topic cannot be excluded from remote access");
+            (None, true)
+        }
+    }
 }
 
 /// Extracted for reuse: spawn
@@ -19375,6 +19413,7 @@ struct RecordingRun<'a> {
     factories: indexmap::IndexMap<String, Box<dyn cerulion_core::NodeEntry>>,
     schema_hashes: &'a std::collections::HashMap<String, u64>,
     excluded_topics: &'a [String],
+    producer_scope: cerulion_core::transport::egress_scope::RunTopicScope,
     record_dir: &'a Path,
     record_env: RecordEnvMode,
     record_cpu: RecordCpu,
@@ -19428,6 +19467,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         factories: _factories,
         schema_hashes: _schema_hashes,
         excluded_topics: _excluded_topics,
+        producer_scope: _producer_scope,
         record_dir: _record_dir,
         record_env: _record_env,
         record_cpu: _record_cpu,
@@ -21502,6 +21542,7 @@ struct SupervisorRecording {
     /// never reached — a pre-JOIN supervisor error abandons the bag
     /// un-finalized, the same class as the single-process pre-run error paths.
     bagd: ChildGuard,
+    _status_scope: Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
     /// The bag path (the deliverable — reported by `finalize`).
     out_path: std::path::PathBuf,
     /// RAII over the scratch files (ready/topics/env + bagd's iox2-config).
@@ -21528,6 +21569,8 @@ impl SupervisorRecording {
 /// Bundled inputs for [`start_supervisor_recording`] (>7 independent args).
 #[cfg(unix)]
 struct SupervisorRecordingStart<'a> {
+    transport: &'a cerulion_core::TransportManager,
+    producer_scope: &'a cerulion_core::transport::egress_scope::RunTopicScope,
     record_dir: &'a Path,
     /// Resolves the `schemas/` corpus whose custom-type text becomes
     /// the bag's schema provenance — the SAME input the single-process path
@@ -21599,6 +21642,8 @@ fn start_supervisor_recording(
     start: SupervisorRecordingStart<'_>,
 ) -> CliResult<Option<SupervisorRecording>> {
     let SupervisorRecordingStart {
+        transport,
+        producer_scope,
         embed_config,
         record_dir,
         workspace_root,
@@ -21695,8 +21740,10 @@ fn start_supervisor_recording(
     // two are one string.
     let flashback_uniform_dir = (!flashback_switched_off())
         .then(|| begin_flashback_plane(workspace_root, graph_name, effective_config));
+    let (status_scope, status_off) = prepare_bagd_status(transport, producer_scope, graph_name);
     let mut bagd = spawn_bagd_recorder(BagdSpawnSpec {
         graph_name,
+        status_off,
         out_path: &paths.out,
         topics_json_path: &paths.topics_json,
         ready_path: &paths.ready,
@@ -21749,6 +21796,7 @@ fn start_supervisor_recording(
 
     Ok(Some(SupervisorRecording {
         bagd,
+        _status_scope: status_scope,
         out_path: paths.out.clone(),
         _scratch: scratch,
     }))
@@ -21764,6 +21812,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         factories,
         schema_hashes,
         excluded_topics,
+        producer_scope,
         record_dir,
         record_env,
         record_cpu,
@@ -22014,8 +22063,11 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // snapshot's key.
     let flashback_uniform_dir = (!flashback_switched_off())
         .then(|| begin_flashback_plane(workspace_root, graph_name, &effective_config));
+    let (_bagd_status_scope, status_off) =
+        prepare_bagd_status(&transport, &producer_scope, graph_name);
     let mut guard = spawn_bagd_recorder(BagdSpawnSpec {
         graph_name,
+        status_off,
         out_path: &out_path,
         topics_json_path: &topics_json_path,
         ready_path: &ready_path,
@@ -24787,6 +24839,145 @@ process_groups:
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_with_disabled_status_passes_the_existing_zero_period_flag() {
+        let mut spec = BagdSpawnSpec {
+            graph_name: "scope",
+            status_off: false,
+            out_path: Path::new("recordings/scope.mcap"),
+            topics_json_path: Path::new("topics.json"),
+            ready_path: Path::new("ready"),
+            env_json_path: Path::new("env.json"),
+            recorder_json_path: Path::new("recorder.json"),
+            graph_yaml_path: Path::new("graph.yaml"),
+            ring_names: &[],
+            record_cpu: RecordCpu::None,
+            iox2_config_path: None,
+            schema_catalog_path: None,
+            state_tag: None,
+            flashback_dir: None,
+        };
+        let normal = bagd_argv(&spec);
+        assert!(!normal.iter().any(|arg| arg == "--status-period-ms"));
+        spec.status_off = true;
+        let private = bagd_argv(&spec);
+        let mut expected = normal;
+        expected.extend([std::ffi::OsString::from("--status-period-ms"), "0".into()]);
+        assert_eq!(private, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn recorder_status_scope_refuses_remote_metadata_and_keeps_local_delivery() {
+        use cerulion_core::transport::egress_scope::RunTopicScope;
+        use cerulion_core::{
+            GatewayEgressPolicy, GatewayPlan, GatewayRuntime, NetworkConfig, TransportConfig,
+            TransportManager,
+        };
+        const BODY: &[u8] = br#"{"state":"recording","bag_path":"recordings/scope.mcap","messages":1,"bytes":8,"chunks":1,"per_topic":{"/scope/private":1}}"#;
+        let mut header = cerulion_core::wire::WireHeader::new(0xBA6D_5747_5541_5553, 0, 0);
+        header.total_size = (cerulion_core::wire::WireHeader::SIZE + BODY.len()) as u32;
+        let mut frame = vec![0; cerulion_core::wire::WireHeader::SIZE];
+        header.write_to_buf(&mut frame);
+        frame.extend_from_slice(BODY);
+        for scope in [
+            RunTopicScope::LocalOnly,
+            RunTopicScope::Declared {
+                topics: vec![],
+                ingress: vec![],
+            },
+            RunTopicScope::Unrestricted,
+            RunTopicScope::Declared {
+                topics: vec![cerulion_bagd::STATUS_TOPIC.into()],
+                ingress: vec![],
+            },
+        ] {
+            for _ in 0..2 {
+                let manager = TransportManager::init_for_test(
+                    TransportConfig {
+                        network: Some(NetworkConfig::default()),
+                        ..Default::default()
+                    },
+                    cerulion_core::testing::iceoryx_test_config(),
+                )
+                .unwrap();
+                let (guard, status_off) = prepare_bagd_status(&manager, &scope, "scope");
+                assert!(!status_off);
+                let private = scope.excludes(cerulion_bagd::STATUS_TOPIC);
+                assert_eq!(guard.is_some(), private);
+                let mut publisher = manager
+                    .create_publisher(
+                        cerulion_bagd::STATUS_TOPIC,
+                        cerulion_core::wire::MaxSliceLen::const_new(4096),
+                        0,
+                    )
+                    .unwrap();
+                let mut local = manager
+                    .create_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+                    .unwrap();
+                let gateway = GatewayRuntime::new(
+                    manager.clone(),
+                    GatewayPlan {
+                        egress_policy: GatewayEgressPolicy::AllowAll,
+                        announce: vec![],
+                        ingress: vec![],
+                    },
+                )
+                .unwrap();
+                manager
+                    .network()
+                    .unwrap()
+                    .set_lan_access(cerulion_core::LanAccess::Open);
+                if private {
+                    assert!(gateway.catalog_serve_for_test("scope").entries.is_empty());
+                    let refusals = gateway.demand_refusal_count();
+                    assert!(!gateway.demand_query_grants_for_test(cerulion_bagd::STATUS_TOPIC));
+                    assert_eq!(gateway.demand_refusal_count(), refusals + 1);
+                    assert!(matches!(
+                        manager.acquire_remote_topic_lease(cerulion_bagd::STATUS_TOPIC),
+                        Err(cerulion_core::TransportError::EgressScope { .. })
+                    ));
+                } else {
+                    assert!(gateway.demand_query_grants_for_test(cerulion_bagd::STATUS_TOPIC));
+                }
+                let mut remote = (!private).then(|| {
+                    manager
+                        .create_remote_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+                        .unwrap()
+                });
+                publisher.publish_raw(&frame).unwrap();
+                let mut local_frames = Vec::new();
+                local.drain_owned(1, &mut local_frames).unwrap();
+                assert_eq!(local_frames.len(), 1);
+                assert_eq!(local_frames[0].payload(), frame.as_slice());
+                if let Some(remote) = &mut remote {
+                    let mut frames = Vec::new();
+                    remote.drain_owned(1, &mut frames).unwrap();
+                    assert_eq!(frames.len(), 1);
+                    assert_eq!(frames[0].payload(), frame.as_slice());
+                }
+                drop(publisher);
+                drop(local);
+                drop(remote);
+                drop(gateway);
+                drop(guard);
+            }
+        }
+        let manager = TransportManager::init_for_test(
+            TransportConfig::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let _remote = manager
+            .acquire_remote_topic_lease(cerulion_bagd::STATUS_TOPIC)
+            .unwrap();
+        let (guard, status_off) = prepare_bagd_status(&manager, &RunTopicScope::LocalOnly, "scope");
+        assert!(guard.is_none());
+        assert!(status_off);
+    }
+
     /// What `graph run --record` hands the recorder is what
     /// arms live-topic discovery, and nothing pinned it.
     ///
@@ -24820,6 +25011,7 @@ process_groups:
         let rings = vec!["cer_rec_0".to_string()];
         let argv = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
             ready_path: Path::new("/rec/.demo.ready"),
@@ -24916,6 +25108,7 @@ process_groups:
         // single-process shape.
         let lean = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
             ready_path: Path::new("/rec/.demo.ready"),
@@ -24986,6 +25179,7 @@ process_groups:
         let rings = vec!["cer_rec_0".to_string()];
         let argv = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            status_off: false,
             out_path: &out,
             topics_json_path: &topics_json,
             ready_path: &ready,
@@ -25275,6 +25469,7 @@ process_groups:
         let rings = vec!["cer_rec_0".to_string()];
         let record = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
             ready_path: Path::new("/rec/.demo.ready"),
@@ -31701,7 +31896,7 @@ process_groups:
     #[test]
     fn run_topic_exclusions_follow_network_scope_and_declared_egress_only() {
         use cerulion_core::{ClosureNodeEntry, NodeEntry, NodeInfo};
-        let config: GraphConfig = serde_yaml::from_str("name: scope\nprefix: scope\nnodes:\n  - id: source\n    type: source\n    outputs:\n      - name: public\n        schema: u8\n      - name: private\n        schema: u8\nnetwork:\n  enabled: true\n  egress: [/scope/source/public]\n").unwrap();
+        let config: GraphConfig = serde_yaml::from_str("name: scope\nprefix: scope\nnodes:\n  - id: source\n    type: source\n    outputs:\n      - name: public\n        schema: u8\n      - name: private\n        schema: u8\nnetwork:\n  mode: peer\n  egress: [/scope/source/public]\n").unwrap();
         let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> =
             indexmap::IndexMap::new();
         factories.insert(

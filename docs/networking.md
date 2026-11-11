@@ -52,6 +52,8 @@ default + gateway, the discovery ladder, and pairing.
   no gateway, no session, loud notice. Its topics, schemas and run metadata
   are unavailable off-machine, including through an already running open gateway,
   remote server or topic mirror. Local observers and recording still work.
+  Recorder status follows the same scope. If another run already exports the
+  shared status topic, this recording disables its status publication.
   Opaque `ros2:` graph children inherit the same run scope, including topics
   discovered only when the child creates an endpoint. Config-mapped raw DDS
   outputs obey the run's local-only scope and declared egress too. A separately launched
