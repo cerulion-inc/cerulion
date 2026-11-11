@@ -9,7 +9,7 @@ TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
-- Bounded account/pair catalogs; selectors resolve collisions; caches fence identity. Paired skips implicit LAN; Open/locators/scan retain it; broken pairings report diagnostics.
+- Bounded account/pair catalogs; selectors resolve collisions; caches fence identity. Paired skips implicit LAN; Open/locators/scan retain it; broken pairings report diagnostics. Stale sessions refresh on caller within 2 s; cached reads log at debug.
 - Graph/node scope precedes services/workers, also recording: off/inert excludes all topics, strict non-egress outputs. Drop guards after ports/workers.
 - Paired graphs gate producers with serving_authority; resolve canonical ingress before GO, retain pinned demands, refuse schema/QoS/writer mismatches.
 - Engine enforces invariants; CLI aids users.

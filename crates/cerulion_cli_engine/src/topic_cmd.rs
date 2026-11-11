@@ -467,9 +467,7 @@ fn ensure_topic_available_with_selection(
     let mut source_catalogs = Vec::new();
     #[cfg(unix)]
     if let Some(directory) = &remote_directory {
-        for diagnostic in &directory.diagnostics {
-            tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
-        }
+        directory.log_diagnostics();
         let selected_robot = robot
             .map(|selector| directory.select(selector))
             .transpose()?
@@ -538,7 +536,11 @@ fn ensure_topic_available_with_selection(
     if let Some(route) = &selected_remote {
         if let Some(directory) = &remote_directory {
             if let Err(error) = directory.sync_selected_epoch(route) {
-                tracing::warn!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+                if directory.serves_cached_directory() {
+                    tracing::debug!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+                } else {
+                    tracing::warn!(robot = %route, error = %error, "selected robot revocations could not be refreshed");
+                }
             }
         }
         let catalog = source_catalogs
@@ -1654,9 +1656,7 @@ pub fn query_remote_topics_and_catalogs(
     let mut result = query_lan_topics_and_catalogs(opts, scan);
     #[cfg(unix)]
     {
-        for diagnostic in &directory.diagnostics {
-            tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
-        }
+        directory.log_diagnostics();
         if !directory.robots.is_empty() {
             if let Err(error) = &result {
                 tracing::warn!(error = %error, "LAN discovery unavailable while remote catalogs remain readable");

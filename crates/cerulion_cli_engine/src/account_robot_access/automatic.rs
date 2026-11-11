@@ -72,6 +72,24 @@ impl RemoteCatalogs {
             .map(|_| ())
     }
 
+    /// Whether account metadata came from the saved directory after a service failure.
+    pub fn serves_cached_directory(&self) -> bool {
+        self._account
+            .as_ref()
+            .is_some_and(|directory| directory.is_cached())
+    }
+
+    /// Keep cache-backed failures available to listings without warning on each read.
+    pub fn log_diagnostics(&self) {
+        for diagnostic in &self.diagnostics {
+            if self.serves_cached_directory() {
+                tracing::debug!(error = %diagnostic, "remote robot directory could not be fully checked");
+            } else {
+                tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
+            }
+        }
+    }
+
     pub(super) fn take_hold(&mut self) -> Option<NetdClient> {
         self._hold.take()
     }
@@ -101,7 +119,12 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
         return Ok(result);
     }
     let directory = if signed_in {
-        match account_robots::fetch_within(account_robots::LISTING_FETCH_BUDGET) {
+        // Finish single-use token rotation on this thread before the read-only
+        // directory worker starts. A failed refresh falls back to the saved directory.
+        let fetched =
+            crate::login_cmd::refresh_session_if_stale_within(account_robots::LISTING_FETCH_BUDGET)
+                .and_then(|_| account_robots::fetch_within(account_robots::LISTING_FETCH_BUDGET));
+        match fetched {
             Ok(directory) => {
                 if let Err(error) = directory.cache_for_offline() {
                     result

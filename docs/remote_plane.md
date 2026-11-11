@@ -86,6 +86,11 @@ with the same canonical name; wire/2 still names the original topic. Observers o
 one source share a demand, and the last observer releases the channel. Graph
 ingress keeps canonical names and the single-writer contract.
 
+An expired session is refreshed and saved before account discovery, with a 2 s
+budget. If the service is unavailable, the saved account directory remains
+usable. Topic reads keep cache diagnostics at debug; `topic list` reports them
+on one stderr line, and an explicit `--robot` reports unavailable robot topics.
+
 A desk cannot write a topic on the robot or send it teleop commands over
 `cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
 never reads a data stream from the desk. The `teleop` and `deploy` verbs

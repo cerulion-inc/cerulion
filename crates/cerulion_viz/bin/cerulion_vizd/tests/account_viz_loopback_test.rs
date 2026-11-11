@@ -171,15 +171,17 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
     );
     assert_eq!(attached["entity"], "world/account_loopback/telemetry");
     assert_eq!(netd.active_demand_count(), 1);
-    assert_eq!(desk.topic_publisher_count_checked(TOPIC), Some(1));
+    let observed = cerulion_netd::TopicKey::observed(&route, TOPIC).local_topic();
+    assert_eq!(desk.topic_publisher_count_checked(&observed), Some(1));
+    assert_eq!(desk.topic_publisher_count_checked(TOPIC), Some(0));
     let provenance = desk.gather_mirror_provenance_checked(BOUND).unwrap();
     assert!(provenance.completeness.is_settled());
     assert_eq!(provenance.records.len(), 1);
-    assert_eq!(provenance.records[0].topic, TOPIC);
+    assert_eq!(provenance.records[0].topic, observed);
     assert_eq!(provenance.records[0].origin_robot, route);
     robot.assert_one_owner_pair(&account);
 
-    let mut probe = desk.create_data_only_subscriber(TOPIC).unwrap();
+    let mut probe = desk.create_data_only_subscriber(&observed).unwrap();
     let mut scratch = Vec::new();
     let mut values = BTreeMap::new();
     for i in 0..PAYLOADS.len() {
@@ -247,6 +249,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
             .unwrap();
         if netd.mirror_count() == 0
             && netd.lingering_count() == 0
+            && desk.topic_publisher_count_checked(&observed) == Some(0)
             && desk.topic_publisher_count_checked(TOPIC) == Some(0)
             && provenance.completeness.is_settled()
             && provenance.records.is_empty()

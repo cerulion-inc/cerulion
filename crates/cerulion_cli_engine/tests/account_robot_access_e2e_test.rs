@@ -439,9 +439,10 @@ fn a_blackholed_account_service_bounds_the_listing_and_names_the_gap() {
 
 #[test]
 #[serial]
-fn a_listing_with_a_stale_session_refreshes_nothing_and_says_so() {
+fn read_only_directory_listing_does_not_spend_a_refresh_token() {
     use std::time::{Duration, Instant};
-    // Counts every connection; a refresh or a catalog request would arrive here.
+    // The read-only worker cannot rotate tokens. Automatic discovery refreshes
+    // separately on its calling thread before using this listing helper.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let held = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -895,4 +896,250 @@ fn paired_posture_lists_and_reads_owned_topics_without_a_lan_catalog_request() {
     drop(stop);
     producer.join().unwrap();
     daemon.shutdown();
+}
+
+fn expire_session(fixture: &Fixture) -> auth::AuthState {
+    let path = fixture.home.path().join("auth.json");
+    let mut state = auth::load_from(&path).state().unwrap().clone();
+    state.expires_at_ns = 1;
+    auth::write_to(&path, &state).unwrap();
+    state
+}
+
+#[test]
+#[serial]
+fn automatic_discovery_rotates_an_expired_session_before_listing_robots() {
+    let fixture = Fixture::new();
+    let stale = expire_session(&fixture);
+    let mut daemon = cerulion_netd::start(
+        fixture.socket(),
+        Arc::new(AccessSpy::default()),
+        cerulion_netd::NetdConfig::default(),
+    )
+    .unwrap();
+    let listing = account_robot_access::automatic::discover().unwrap();
+    assert!(listing.diagnostics.is_empty(), "{:?}", listing.diagnostics);
+    assert!(!listing.serves_cached_directory());
+    assert_eq!(listing.robots.len(), 1);
+    assert_eq!(listing.robots[0].name, "owned-robot");
+    assert_eq!(
+        listing.robots[0].route,
+        cerulion_netd::account_access::robot_route(&fixture.robot_id)
+    );
+    let loaded = auth::load_from(&fixture.home.path().join("auth.json"));
+    let rotated = loaded.state().unwrap();
+    assert_ne!(rotated.session_token, stale.session_token);
+    assert_ne!(rotated.refresh_token, stale.refresh_token);
+    assert!(rotated.session_is_valid(auth::now_unix_ns()));
+    assert_eq!(rotated.account_id, stale.account_id);
+    drop(listing);
+    daemon.shutdown();
+}
+
+#[test]
+#[serial]
+fn automatic_discovery_bounds_a_blackholed_refresh_and_serves_the_cache() {
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::new();
+    cerulion_cli_engine::account_robots::fetch()
+        .unwrap()
+        .cache_for_offline()
+        .unwrap();
+    let stale = expire_session(&fixture);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let (stop, stopped) = mpsc::channel();
+    let (connected, received) = mpsc::channel();
+    let blackhole = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        connected.send(()).unwrap();
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(stream);
+    });
+    let mut daemon = cerulion_netd::start(
+        fixture.socket(),
+        Arc::new(AccessSpy::default()),
+        cerulion_netd::NetdConfig::default(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let listing = account_robot_access::automatic::discover().unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    received.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(listing.serves_cached_directory());
+    assert_eq!(listing.robots.len(), 1);
+    assert_eq!(listing.robots[0].name, "owned-robot");
+    assert!(listing
+        .diagnostics
+        .iter()
+        .any(|row| row.contains("unreachable")));
+    assert!(listing
+        .diagnostics
+        .iter()
+        .any(|row| row.contains("revocation")));
+    let loaded = auth::load_from(&fixture.home.path().join("auth.json"));
+    assert_eq!(
+        loaded.state().unwrap(),
+        &stale,
+        "no token rotation was abandoned"
+    );
+    drop(listing);
+    stop.send(()).unwrap();
+    blackhole.join().unwrap();
+    daemon.shutdown();
+}
+
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn local_topic_echo_on_an_expired_session_desk_delivers_without_warns() {
+    use cerulion_cli_engine::topic_cmd::{self, TopicScope};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let fixture = Fixture::new();
+    cerulion_cli_engine::account_robots::fetch()
+        .unwrap()
+        .cache_for_offline()
+        .unwrap();
+    let stale = expire_session(&fixture);
+    let _service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:9");
+    let mut daemon = cerulion_netd::start(
+        fixture.socket(),
+        Arc::new(AccessSpy::default()),
+        cerulion_netd::NetdConfig::default(),
+    )
+    .unwrap();
+    let topic = format!("/expired_session_echo_{}", std::process::id());
+    let walker = vector3_walker();
+    let hash = walker.schema_hash_for("geometry_msgs/Vector3").unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    struct StopAfterDelivery {
+        bytes: Vec<u8>,
+        running: Arc<AtomicBool>,
+    }
+    impl std::io::Write for StopAfterDelivery {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            if self.bytes.windows(4).any(|window| window == b"3.25") {
+                self.running.store(false, Ordering::SeqCst);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let writer_running = running.clone();
+    let (ready, begun) = mpsc::channel();
+    let producing = running.clone();
+    let producer_topic = topic.clone();
+    let producer = std::thread::spawn(move || {
+        let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+        let mut publisher = manager
+            .create_publisher_simple(
+                &producer_topic,
+                cerulion_core::wire::MaxSliceLen::const_new(256),
+            )
+            .unwrap();
+        let header = cerulion_core::WireHeader {
+            schema_hash: hash,
+            total_size: 64,
+            offset_table_offset: 64,
+            offset_table_count: 0,
+            sequence: 19,
+            timestamp_ns: 123_456_789,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        };
+        let mut frame = [0; 64];
+        header.write_to_buf(&mut frame);
+        for (index, value) in [1.5_f64, -2.5, 3.25].into_iter().enumerate() {
+            let offset = 40 + index * 8;
+            frame[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        ready.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while producing.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            publisher.publish_raw(&frame).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        producing.store(false, Ordering::SeqCst);
+    });
+    begun.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut writer = StopAfterDelivery {
+        bytes: Vec::new(),
+        running: writer_running,
+    };
+    let echoed = topic_cmd::topic_echo_with_selection(
+        &topic,
+        None,
+        running,
+        &mut writer,
+        16,
+        TopicScope::Automatic,
+        None,
+    );
+    producer.join().unwrap();
+    echoed.unwrap();
+    let output = String::from_utf8(writer.bytes).unwrap();
+    assert!(output.contains("x: 1.5"), "{output}");
+    assert!(output.contains("y: -2.5"), "{output}");
+    assert!(output.contains("z: 3.25"), "{output}");
+    logs_assert(|lines| {
+        let warnings: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains(" WARN "))
+            .collect();
+        if warnings.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("unexpected warnings: {warnings:?}"))
+        }
+    });
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    topic_cmd::introspect::print_topic_list(
+        false,
+        topic_cmd::introspect::TypeColumn::Hidden,
+        topic_cmd::remote_discovery_options(false, vec![], vec![]),
+        false,
+        None,
+        &mut out,
+        &mut err,
+    )
+    .unwrap();
+    let diagnostic = String::from_utf8(err).unwrap();
+    assert_eq!(diagnostic.lines().count(), 1, "{diagnostic}");
+    assert!(diagnostic.contains("unreachable"), "{diagnostic}");
+    assert!(String::from_utf8(out).unwrap().contains("owned-robot"));
+    let loaded = auth::load_from(&fixture.home.path().join("auth.json"));
+    assert_eq!(loaded.state().unwrap(), &stale);
+    let explicit = topic_cmd::topic_info_with_selection(
+        &topic,
+        None,
+        TopicScope::Automatic,
+        Some("owned-robot"),
+    )
+    .unwrap_err();
+    assert!(
+        explicit.to_string().contains("unknown reachability"),
+        "{explicit}"
+    );
+    daemon.shutdown();
+}
+
+fn vector3_walker() -> cerulion_core::codegen::FrameWalker {
+    let schema = cerulion_core::codegen::parse_rosmsg(
+        "float64 x\nfloat64 y\nfloat64 z\n",
+        "Vector3",
+        Some("geometry_msgs"),
+    )
+    .unwrap();
+    let (walker, warnings) = cerulion_core::codegen::FrameWalker::new(vec![schema]);
+    assert!(warnings.is_empty());
+    walker
 }
