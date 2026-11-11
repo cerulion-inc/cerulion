@@ -37,7 +37,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
 - Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
-- Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Metadata per-call; refusals keep readers and idle fence. Retire only outbound.
+- Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Validation refusals retain readers; failed cleanup fences. Retire only outbound.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft

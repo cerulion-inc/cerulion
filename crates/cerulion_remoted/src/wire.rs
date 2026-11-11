@@ -46,27 +46,63 @@ use serde::{Deserialize, Serialize};
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
 use crate::tap::{peek_schema_hash, TapManager};
 
-/// Only a local source may be exported under this robot's authorization.
-pub(crate) fn wire_servable(manager: &TransportManager, topic: &str) -> Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SourceRefusal {
+    Mirror,
+    Reserved,
+    MarkerUnavailable(String),
+    Excluded(String),
+}
+
+impl SourceRefusal {
+    pub(crate) fn message(&self, topic: &str) -> String {
+        match self {
+            Self::Mirror => format!(
+                "'{topic}' is a network mirror of another robot; read it on its source robot"
+            ),
+            Self::Reserved => {
+                format!("'{topic}' is in Cerulion's reserved control-plane namespace")
+            }
+            Self::MarkerUnavailable(reason) => format!(
+                "could not verify the network mirror marker for '{topic}'; remote access is refused: {reason}"
+            ),
+            Self::Excluded(message) => message.clone(),
+        }
+    }
+}
+
+fn local_source(topic: &str, marker: Result<bool, String>) -> Result<(), SourceRefusal> {
+    if matches!(marker, Ok(true)) {
+        return Err(SourceRefusal::Mirror);
+    }
     let prefix = cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX;
     if topic == prefix
         || topic
             .strip_prefix(prefix)
             .is_some_and(|suffix| suffix.starts_with('/'))
-        || !matches!(manager.is_network_mirror(topic), Ok(false))
     {
-        return Err(format!(
-            "'{topic}' is a network mirror of another robot; read it on its source robot"
-        ));
+        return Err(SourceRefusal::Reserved);
     }
+    marker.map_err(SourceRefusal::MarkerUnavailable)?;
+    Ok(())
+}
+
+/// Only a local source may be exported under this robot's authorization.
+pub(crate) fn wire_servable(manager: &TransportManager, topic: &str) -> Result<(), SourceRefusal> {
+    local_source(
+        topic,
+        manager
+            .is_network_mirror(topic)
+            .map_err(|error| error.to_string()),
+    )?;
     if !manager
         .remote_topic_allowed(topic)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| SourceRefusal::Excluded(error.to_string()))?
     {
-        return Err(
-            "the producing run excludes this topic from network egress; remote access is refused"
-                .into(),
-        );
+        return Err(SourceRefusal::Excluded(cerulion_core::TransportError::EgressScope {
+            topic: topic.to_owned(),
+            reason: "the producing run excludes this topic from network egress; remote access is refused".into(),
+        }.to_string()));
     }
     Ok(())
 }
@@ -852,7 +888,8 @@ async fn handle_request(
                     }
                 }
             };
-            if let Err(message) = wire_servable(&manager, &topic) {
+            if let Err(refusal) = wire_servable(&manager, &topic) {
+                let message = refusal.message(&topic);
                 return WireResponse::Error {
                     topic: Some(topic),
                     message,
@@ -901,7 +938,9 @@ async fn handle_request(
             let source = plane
                 .manager()
                 .map_err(|error| error.to_string())
-                .and_then(|manager| wire_servable(&manager, &topic));
+                .and_then(|manager| {
+                    wire_servable(&manager, &topic).map_err(|refusal| refusal.message(&topic))
+                });
             if let Err(message) = source {
                 return WireResponse::Error {
                     topic: Some(topic),
@@ -1114,14 +1153,30 @@ mod tests {
         )
         .unwrap();
         for topic in ["/__cerulion", "/__cerulion/observers/x/y"] {
+            assert_eq!(wire_servable(&manager, topic), Err(SourceRefusal::Reserved));
             assert_eq!(
-                wire_servable(&manager, topic),
-                Err(format!(
-                    "'{topic}' is a network mirror of another robot; read it on its source robot"
-                ))
+                SourceRefusal::Reserved.message(topic),
+                format!("'{topic}' is in Cerulion's reserved control-plane namespace")
             );
         }
         assert_eq!(wire_servable(&manager, "/__cerulionx"), Ok(()));
+    }
+
+    #[test]
+    fn source_refusals_distinguish_live_mirrors_reserved_names_and_marker_errors() {
+        let topic = "/__cerulion/observers/x/y";
+        assert_eq!(local_source(topic, Ok(true)), Err(SourceRefusal::Mirror));
+        assert_eq!(local_source(topic, Ok(false)), Err(SourceRefusal::Reserved));
+        assert_eq!(
+            local_source(topic, Err("marker unreadable".into())),
+            Err(SourceRefusal::Reserved)
+        );
+        let refusal = local_source("/local", Err("marker unreadable".into())).unwrap_err();
+        assert_eq!(
+            refusal,
+            SourceRefusal::MarkerUnavailable("marker unreadable".into())
+        );
+        assert_eq!(refusal.message("/local"), "could not verify the network mirror marker for '/local'; remote access is refused: marker unreadable");
     }
 
     /// The control protocol round-trips through JSON with the documented `verb` /

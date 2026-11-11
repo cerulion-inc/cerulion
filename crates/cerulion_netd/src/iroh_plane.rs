@@ -294,6 +294,17 @@ pub struct IrohMirrorPlane {
 }
 
 impl IrohMirrorPlane {
+    #[cfg(test)]
+    pub(crate) fn poison_membership_cleanup_for_test(&self) {
+        let diagnostics = self.missing_cache_noted.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = diagnostics.lock().unwrap();
+            panic!("poison the retired-membership diagnostics lock");
+        })
+        .join()
+        .is_err());
+    }
+
     /// Build the iroh WAN plane over the desk's `manager` (its SHM mirror target) and
     /// `registry` (the WAN dial params). Builds the dedicated tokio runtime; binds NO
     /// iroh endpoint yet (the endpoint is lazy — bound on the first ensure).

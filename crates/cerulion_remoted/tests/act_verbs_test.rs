@@ -66,7 +66,12 @@ fn act_reads_refuse_mirrors_and_reserved_channels() {
         .unwrap();
     let publish = TopicPublishVerb::new(lease());
     let call = ServiceCallVerb::new(lease());
-    for topic in [topic, "/__cerulion", "/__cerulion/observers/x/y"] {
+    for topic in [
+        topic,
+        "/__cerulion",
+        "/__cerulion/observers/x/y",
+        "__cerulion/x",
+    ] {
         for handler in [
             &TopicSnapshotVerb as &dyn VerbHandler,
             &TopicEchoOnceVerb,
@@ -76,14 +81,44 @@ fn act_reads_refuse_mirrors_and_reserved_channels() {
             let error = handler
                 .execute(&json!({"topic": topic, "service": topic, "timeout_s": 0}))
                 .unwrap_err();
+            let expected = if topic == "/act_verbs_test/mirror" {
+                format!("unavailable: '{topic}' is a network mirror of another robot; read it on its source robot")
+            } else {
+                format!("usage: '{topic}' is in Cerulion's reserved control-plane namespace")
+            };
             assert!(
-                matches!(error, CerudError::Verb(ref message) if message == &format!(
-                    "unavailable: '{topic}' is a network mirror of another robot; read it on its source robot"
-                )),
+                matches!(error, CerudError::Verb(ref message) if message == &expected),
                 "{}: {error}",
                 handler.name()
             );
         }
+    }
+}
+
+#[test]
+#[serial]
+fn act_refusals_preserve_the_excluded_topic_context() {
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let topic = "/act_verbs_test/excluded";
+    let _exclusion = manager.exclude_remote_topic(topic).unwrap();
+    let publish = TopicPublishVerb::new(lease());
+    let call = ServiceCallVerb::new(lease());
+    for handler in [
+        &TopicSnapshotVerb as &dyn VerbHandler,
+        &TopicEchoOnceVerb,
+        &publish,
+        &call,
+    ] {
+        let error = handler
+            .execute(&json!({"topic":topic,"service":topic,"timeout_s":0}))
+            .unwrap_err();
+        assert!(
+            matches!(error, CerudError::Verb(ref message) if message == &format!(
+                "unavailable: Remote access policy for topic '{topic}' refused: the producing run excludes this topic from network egress; remote access is refused"
+            )),
+            "{}: {error}",
+            handler.name()
+        );
     }
 }
 

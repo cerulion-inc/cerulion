@@ -69,7 +69,7 @@ fn shared_endpoint_operation_errors_preserve_canonical_and_observer_delivery() {
             2 => assert!(plane
                 .query_schema("producer", "/__cerulion", Duration::from_millis(500))
                 .unwrap_err()
-                .contains("is a network mirror of another robot; read it on its source robot")),
+                .contains("is in Cerulion's reserved control-plane namespace")),
             _ => unreachable!(),
         }
         assert!(
