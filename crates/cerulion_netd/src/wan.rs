@@ -410,7 +410,7 @@ impl WanRegistry {
     /// through the SHARED [`cerulion_wireclient::epoch::resolve_epoch_dir`]
     /// rule — the same rule, the same inputs, the same one-per-process breadcrumb as
     /// a boot-time resolution; only the TIMING differs.
-    fn epoch_dir(&self) -> Option<&Path> {
+    pub(crate) fn epoch_dir(&self) -> Option<&Path> {
         self.epoch_dir
             .get_or_init(|| {
                 let dir = self.desk_paths.as_ref().and_then(|inputs| {

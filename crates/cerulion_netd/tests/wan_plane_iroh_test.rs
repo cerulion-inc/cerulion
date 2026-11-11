@@ -161,6 +161,90 @@ fn claimed_unpaired() -> PairingAuthorizer {
     PairingAuthorizer::new(claimed_store(), DeviceAccountIndex::new())
 }
 
+fn expired_grant_authorizer(device: [u8; 32]) -> PairingAuthorizer {
+    use cerulion_pairing::format::*;
+    use cerulion_remoted::pairing_verbs::OwnerGrantWire;
+    use cerulion_remoted::{KeyAccess, RemotedClock};
+    let intermediate = live_inter_sk();
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[30; 32]);
+    let subject = AccountId([0x5c; 32]);
+    let validity = Validity {
+        not_before_ns: 0,
+        not_after_ns: T_NOW * 10,
+    };
+    let scope = Scope {
+        role: Role::OPERATOR,
+        caps: Scope::CAP_OBSERVE,
+    };
+    let grant = OwnerGrantWire {
+        intermediate: IntermediateCert {
+            version: FORMAT_VERSION,
+            intermediate_key: live_pk(&intermediate),
+            validity,
+            issued_at_ns: 1,
+            max_scope: Scope::OWNER_FULL,
+        }
+        .sign_by_roots(&[&live_root_sk()]),
+        owner_cert: DeviceCert {
+            version: FORMAT_VERSION,
+            device_key: live_pk(&owner),
+            account: OWNER,
+            principal_kind: PrincipalKind::Human,
+            scope: Scope::OWNER_FULL,
+            validity,
+            issued_at_ns: 1,
+            issuer_key: live_pk(&intermediate),
+        }
+        .sign(&intermediate),
+        subject_cert: DeviceCert {
+            version: FORMAT_VERSION,
+            device_key: PublicKey(device),
+            account: subject,
+            principal_kind: PrincipalKind::Human,
+            scope,
+            validity,
+            issued_at_ns: 1,
+            issuer_key: live_pk(&intermediate),
+        }
+        .sign(&intermediate),
+        access_grant: AccessGrant {
+            version: FORMAT_VERSION,
+            subject,
+            robot: RobotId([5; 32]),
+            scope,
+            principal_kind: PrincipalKind::Human,
+            validity: Validity {
+                not_before_ns: 0,
+                not_after_ns: T_NOW + 1,
+            },
+            issued_at_ns: 1,
+            owner: OWNER,
+            owner_device_key: live_pk(&owner),
+        }
+        .sign(&owner),
+    };
+    let clock = RemotedClock::fixed(T_NOW);
+    let trust = SharedTrust::new_with_clock(
+        claimed_store_for_live_epochs(),
+        DeviceAccountIndex::new(),
+        Vec::new(),
+        clock.clone(),
+    );
+    trust
+        .establish_owner_grant(&grant.into_presentation(), &device, None, T_NOW)
+        .unwrap();
+    assert!(matches!(
+        trust.snapshot_for_key(&device).1,
+        KeyAccess::Allowed(_)
+    ));
+    clock.set(T_NOW + 1);
+    assert!(matches!(
+        trust.snapshot_for_key(&device).1,
+        KeyAccess::NotAllowed
+    ));
+    PairingAuthorizer::from_shared(trust)
+}
+
 /// Serve wire connections in a LOOP until aborted — so a demand→release (which drops
 /// the connection) can be followed by a re-demand (a fresh dial the loop accepts).
 async fn robot_serve_loop(daemon: Endpoint, authz: Arc<PairingAuthorizer>, plane: Arc<WirePlane>) {
@@ -472,6 +556,185 @@ fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
 fn iroh_wan_plane_reinjects_byte_identical_frames() {
     let collected = run_headline("hdl", 6);
     assert_oracle_and_gap_free(&collected);
+}
+
+#[test]
+fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
+    let seed = unique_secret();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let endpoint = rt.block_on(disabled_endpoint(seed));
+    let id = endpoint.id();
+    let sockets = endpoint.bound_sockets();
+    let remote = RobotFixture::start("shared", Arc::new(claimed_paired(public_of(&seed))));
+    let manager = test_manager("shared_host");
+    let observer_seed = unique_secret();
+    let serve = rt.spawn(robot_serve_loop(
+        endpoint.clone(),
+        Arc::new(claimed_paired(public_of(&observer_seed))),
+        Arc::new(WirePlane::with_manager("shared-host", manager.clone())),
+    ));
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("outbound.sock");
+    let service = cerulion_netd::shared_endpoint::OutboundServer::start(
+        socket.clone(),
+        endpoint.clone(),
+        rt.handle().clone(),
+        seed,
+        manager.clone(),
+    )
+    .unwrap();
+    let wrong_identity = IrohMirrorPlane::new_shared(
+        manager.clone(),
+        Arc::new(one_robot_registry("producer", &remote, unique_secret())),
+        socket.clone(),
+    )
+    .unwrap();
+    let refusal = wrong_identity
+        .ensure_mirror(&TopicKey::new("producer", "/refused"), ORACLE_SCHEMA_HASH)
+        .unwrap_err();
+    assert!(refusal
+        .to_string()
+        .contains("does not match the current device key"));
+    let mismatched_namespace = IrohMirrorPlane::new_shared(
+        test_manager("shared_other_namespace"),
+        Arc::new(one_robot_registry("producer", &remote, seed)),
+        socket.clone(),
+    )
+    .unwrap();
+    assert!(mismatched_namespace
+        .ensure_mirror(&TopicKey::new("producer", "/refused"), ORACLE_SCHEMA_HASH,)
+        .unwrap_err()
+        .to_string()
+        .contains("namespace does not match"));
+    let registry = Arc::new(one_robot_registry("producer", &remote, seed));
+    let plane = IrohMirrorPlane::new_shared(manager.clone(), registry, socket.clone()).unwrap();
+    let topic = format!("/wan/shared/{}", unique_id());
+    let stop = Arc::new(AtomicBool::new(false));
+    let producer = spawn_producer(remote.manager.clone(), topic.clone(), stop.clone());
+    let key = TopicKey::new("producer", &topic);
+    let foreign = RobotFixture::start("shared_foreign", Arc::new(claimed_unpaired()));
+    let foreign_plane = IrohMirrorPlane::new_shared(
+        manager.clone(),
+        Arc::new(one_robot_registry("foreign", &foreign, seed)),
+        socket,
+    )
+    .unwrap();
+    let foreign_refusal = foreign_plane
+        .ensure_mirror(&TopicKey::new("foreign", &topic), ORACLE_SCHEMA_HASH)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        foreign_refusal.contains("refused") || foreign_refusal.contains("unpaired"),
+        "{foreign_refusal}"
+    );
+    let expired = RobotFixture::start(
+        "shared_expired",
+        Arc::new(expired_grant_authorizer(public_of(&seed))),
+    );
+    let expired_plane = IrohMirrorPlane::new_shared(
+        manager.clone(),
+        Arc::new(one_robot_registry("expired", &expired, seed)),
+        directory.path().join("outbound.sock"),
+    )
+    .unwrap();
+    let expired_refusal = expired_plane
+        .ensure_mirror(&TopicKey::new("expired", &topic), ORACLE_SCHEMA_HASH)
+        .unwrap_err()
+        .to_string();
+    assert!(expired_refusal.contains("refused"), "{expired_refusal}");
+    let served_topic = format!("/wan/served/{}", unique_id());
+    let served_producer = spawn_producer(manager.clone(), served_topic.clone(), stop.clone());
+    let observer_manager = test_manager("shared_observer");
+    let mut peers = HashMap::new();
+    peers.insert(
+        "serving-consumer".into(),
+        WanRobot {
+            eid: endpoint.id(),
+            direct_addrs: loopback_sockets(&endpoint.bound_sockets()),
+        },
+    );
+    let observer = IrohMirrorPlane::new(
+        observer_manager.clone(),
+        Arc::new(WanRegistry::new(
+            peers,
+            observer_seed,
+            RelayConfig::Disabled,
+        )),
+    )
+    .unwrap();
+    let served_key = TopicKey::new("serving-consumer", &served_topic);
+    observer
+        .ensure_mirror(&served_key, ORACLE_SCHEMA_HASH)
+        .unwrap();
+    for _ in 0..2 {
+        plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
+        assert_oracle_and_gap_free(&collect_frames(&manager, &topic, 3));
+        assert_eq!(plane.release_mirror(&key), MirrorRelease::Retired);
+        assert_oracle_and_gap_free(&collect_frames(&observer_manager, &served_topic, 3));
+    }
+    drop(service);
+    let service = cerulion_netd::shared_endpoint::OutboundServer::start(
+        directory.path().join("outbound.sock"),
+        endpoint.clone(),
+        rt.handle().clone(),
+        seed,
+        manager.clone(),
+    )
+    .unwrap();
+    assert!(
+        plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).is_err(),
+        "the lost control connection must be fenced"
+    );
+    plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
+    assert_oracle_and_gap_free(&collect_frames(&manager, &topic, 3));
+    assert_eq!(plane.release_mirror(&key), MirrorRelease::Retired);
+    assert_eq!(endpoint.id(), id);
+    assert_eq!(endpoint.bound_sockets(), sockets);
+    plane.invalidate_account().unwrap();
+    assert!(
+        !endpoint.is_closed(),
+        "outbound account fencing preserves serving"
+    );
+    assert!(plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).is_err());
+    assert_oracle_and_gap_free(&collect_frames(&observer_manager, &served_topic, 3));
+    let dropped = IrohMirrorPlane::new_shared(
+        manager.clone(),
+        Arc::new(one_robot_registry("producer", &remote, seed)),
+        directory.path().join("outbound.sock"),
+    )
+    .unwrap();
+    dropped.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
+    assert_oracle_and_gap_free(&collect_frames(&manager, &topic, 2));
+    drop(dropped);
+    let freed = manager
+        .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
+        .expect("dropping a shared mirror synchronously frees its writer slot");
+    drop(freed);
+    stop.store(true, Ordering::Relaxed);
+    producer.join().unwrap();
+    served_producer.join().unwrap();
+    assert_eq!(observer.release_mirror(&served_key), MirrorRelease::Retired);
+    drop(service);
+    serve.abort();
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), endpoint.close()).await })
+        .expect("shared endpoint shutdown must settle on its owning runtime");
+}
+
+#[test]
+fn shared_endpoint_refuses_a_different_device_key_before_dialing() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let endpoint = rt.block_on(disabled_endpoint(unique_secret()));
+    let registry = Arc::new(WanRegistry::new(
+        HashMap::new(),
+        unique_secret(),
+        RelayConfig::Disabled,
+    ));
+    let plane = IrohMirrorPlane::new(test_manager("shared_mismatch"), registry).unwrap();
+    assert!(plane
+        .with_endpoint(endpoint.clone(), rt.handle().clone())
+        .is_err());
+    assert!(!endpoint.is_closed());
+    rt.block_on(endpoint.close());
 }
 
 /// Determinism (Principle #7): two full runs each match the hand oracle (each frame

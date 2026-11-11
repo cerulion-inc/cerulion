@@ -3865,6 +3865,10 @@ its own one-shot process.)
 
 ### Remote access and accounts
 
+A machine serving paired remote topics can also read paired robots through
+its existing device endpoint. Outbound topic mirrors use the pull protocol;
+releasing a mirror preserves the machine's incoming remote service.
+
 For `cerulion connect` / `pair` / `login` and the WAN plane. See
 `docs/remote_plane.md`.
 

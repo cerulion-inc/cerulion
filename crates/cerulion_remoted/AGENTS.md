@@ -42,6 +42,8 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
 - Metadata reads the EXISTING netd snapshot (namespace checked; never starts netd)
   or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
   CAP_OBSERVE after async provider work (`local_schema_provider_test`).
+- Same-user outbound control reuses the endpoint, runtime and transport node.
+  Refuse key/namespace mismatch before dialing; retire outbound sessions only.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft

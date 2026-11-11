@@ -805,6 +805,16 @@ everything else to zenoh (`wan.rs` unit test
 
 ## 8b. The account-first path: register at first serve, reach by account
 
+Serving machines consume other robots through the same endpoint owned by
+`cerulion-remoted`. The private `remoted/outbound.sock` control service uses
+kernel peer credentials and bounded framed requests. It validates the live
+device key and shared-memory namespace before dialing, then runs the existing
+wire demand and validated reinjection path. No wire publish verb is involved.
+Release retires the reader before acknowledgement; closing local control
+retires every mirror on that connection. Account fencing retires outbound
+sessions without closing the serving endpoint. The delivery and refusal pins
+are in `crates/cerulion_netd/tests/wan_plane_iroh_test.rs`.
+
 The ceremony above (a chassis secret, a pairing code, an operator typing at the
 robot) is the path for a machine nobody has an account for. A machine that IS
 logged in needs none of it, because `cerulion login` already proved which

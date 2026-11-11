@@ -144,12 +144,9 @@ fn install_and_unknown_presence_never_construct_a_wan_plane() {
 }
 
 #[test]
-fn resolved_network_and_serving_postures_refuse_before_plane_or_hold() {
+fn resolved_network_off_refuses_before_plane_or_hold() {
     let login = Login::new();
-    for (network, serving, refusal) in [
-        (false, false, NETWORK_OFF),
-        (true, true, crate::wan::SERVING_MACHINE_WAN_REFUSAL),
-    ] {
+    for (network, serving, refusal) in [(false, false, NETWORK_OFF), (false, true, NETWORK_OFF)] {
         let controller = login.controller(network, serving);
         let mut registry = DemandRegistry::new(Instant::now());
         controller

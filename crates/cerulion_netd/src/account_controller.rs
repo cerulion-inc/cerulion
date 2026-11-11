@@ -108,7 +108,7 @@ impl AccountWanController {
         }) {
             return Err("manual WAN robot names cannot use the reserved account: prefix".into());
         }
-        let serving = config.serving_gateway;
+        let serving_gateway = config.serving_gateway;
         Ok(Self {
             lan: GatewayMirrorPlane::new(Arc::clone(&manager)),
             manager,
@@ -118,7 +118,7 @@ impl AccountWanController {
             paired: Mutex::new(HashMap::new()),
             pins: Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
-                serving_gateway: serving,
+                serving_gateway,
                 registry: Arc::new(manual),
                 plane: None,
                 account_mode: false,
@@ -172,9 +172,6 @@ impl AccountWanController {
         if !self.config.network_enabled {
             return Err(NETWORK_OFF.into());
         }
-        if self.config.serving_gateway {
-            return Err(crate::wan::SERVING_MACHINE_WAN_REFUSAL.into());
-        }
         Ok(())
     }
 
@@ -189,9 +186,6 @@ impl AccountWanController {
 
     fn ensure_plane<'a>(&self, state: &'a mut State) -> Result<&'a IrohMirrorPlane, String> {
         self.network_allowed()?;
-        if state.serving_gateway {
-            return Err(crate::wan::SERVING_MACHINE_WAN_REFUSAL.into());
-        }
         if state.pending_all || !state.pending_robots.is_empty() {
             return Err("previous WAN mirrors are awaiting registry retirement".into());
         }
@@ -199,10 +193,18 @@ impl AccountWanController {
             return Err(NEED_INSTALL.into());
         }
         if state.plane.is_none() {
-            state.plane = Some(
+            let plane = if state.serving_gateway {
+                let root = cerulion_discovery::robot_state::resolve()
+                    .ok_or("owned remote endpoint state root is unavailable")?;
+                IrohMirrorPlane::new_shared(
+                    Arc::clone(&self.manager),
+                    Arc::clone(&state.registry),
+                    crate::shared_endpoint::socket_path(&root),
+                )?
+            } else {
                 IrohMirrorPlane::new(Arc::clone(&self.manager), Arc::clone(&state.registry))?
-                    .with_authorizer(Arc::clone(&self.authorizer)),
-            );
+            };
+            state.plane = Some(plane.with_authorizer(Arc::clone(&self.authorizer)));
         }
         state
             .plane

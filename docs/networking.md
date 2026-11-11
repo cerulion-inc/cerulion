@@ -236,6 +236,10 @@ A **desk**, a machine that both produces topics and consumes remote ones
 otherwise multiply fastest. Graphs and remote consumers on one machine share
 that one daemon and one zenoh session, whatever the machine is.
 
+When that machine also serves the authenticated remote plane, outbound paired
+reads share the endpoint owned by `cerulion-remoted`. Releasing an outbound
+mirror leaves incoming remote access running.
+
 - **How.** A producing graph pushes its egress plan into `cerulion-netd` over
   the `register_egress` UDS verb (spawning netd detached + refcounting exactly
   like the ingress consumers do); netd boots ONE shared embedded gateway on the

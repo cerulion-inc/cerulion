@@ -40,10 +40,12 @@ lib + bin: injected in-process daemon tests prove wiring, not live delivery.
   facts use `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
-  bookkeeping so LAN never waits on WAN metadata, and pins survive tearing. EVERY
-  demand calls `prepare_demand`, even an already-mirrored topic: a stale identity
-  or dead reader must not acknowledge a phantom mirror. Validate the reserved
-  `account:` route before `TopicKey` trims ordinary names.
+  bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY
+  demand calls `prepare_demand`: stale identity or dead reader cannot acknowledge
+  a phantom mirror. Validate `account:` before `TopicKey` trims ordinary names.
+- Serving controllers use remoted's bounded same-user `outbound.sock`, endpoint
+  and runtime. Key and SHM namespace must match before dialing. Close retires
+  mirrors; account fencing preserves the owned endpoint. Never bind its key twice.
 - Identity snapshots carry public bytes only, hold the auth-store lock across every
   read, and refuse rather than wait on a busy writer. Expiry gates new enrollment,
   never durable bindings; an account or key change fences the controller.

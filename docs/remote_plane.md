@@ -8,6 +8,10 @@ iroh endpoint per robot, dial-by-key, the `cerulion/ops/1` and
 `cerulion/wire/2` protocols, designed to be reachable from boot, gated by the
 offline pairing access list.
 
+A serving machine can also read paired robots through that same device
+endpoint. Outbound topic mirrors use the existing pull protocol; releasing a
+mirror preserves the machine's incoming remote service.
+
 It is separate from [`docs/networking.md`](networking.md), which covers the LAN
 zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
