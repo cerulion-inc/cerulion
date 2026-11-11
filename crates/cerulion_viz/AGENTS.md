@@ -1,25 +1,22 @@
 # cerulion_viz - agent notes
 
-Crates: `lib/cerulion_viz` (rerun render/sink lib), `lib/go2_tf` (pure TFMessage codec, no transport or
-rerun), `bin/cerulion_vizd` (desk viz daemon). NOT default-members: a plain `cargo build` stays rerun-free
-(pinned by `default_member_build_is_rerun_free`); use `-p <crate>`.
+Crates: lib/cerulion_viz (rerun render/sink), lib/go2_tf (pure TFMessage codec, no transport/rerun), bin/cerulion_vizd (desk daemon). Outside default-members; plain builds stay rerun-free (`default_member_build_is_rerun_free`); use `-p`.
 
-- Remote attach taps the local channel returned by netd observer demand while retaining canonical topic/schema/robot identity in viewer state. A source change requires detach.
+- Remote attach taps netd observer local_channel; viewer keeps canonical topic/schema/robot. Source changes require detach.
 
 ## Invariants
 
 - Live viz is INSTANT-ONLY: reconnects get statics + blueprint, never replay (`re_grpc_server` fork in
   `[patch.crates-io]`); bump rerun via fork merge only.
 - Never re-log statics on a cadence: `log_static` is display-idempotent but storage-APPEND; re-log on byte change.
-- No vizd control handler waits or polls: ONE round trip (`convergence_adoption_test`).
+- Vizd control never waits/polls: one round trip (`convergence_adoption_test`).
 - Taps and netd demands are daemon-global: they survive control-connection close and die only on
   detach, compose rollback or shutdown; close releases ONLY the event subscription.
 - Every attach seam (remote/local/compose) opens a wake listener (`WakeMode::Listener`); drain
   before waiting - a wake is a signal, not a count.
 - `account:<robot-id>` routes keep netd's refusals and never fall back to LAN; validate before
   pinned-schema fast paths (`account_route_test`).
-- The four topic surfaces (discover/list/status/attach) read ONE attribution map
-  (`Ctx::attribution_snapshot`); post-attach attribution is cached - poll, never read once.
+- Discover/list/status/attach share `Ctx::attribution_snapshot`; poll cached post-attach attribution, never read once.
 - Dump-companion panes are gated on `RenderProof` (per input, sticky); a new layout-affecting
   signal joins the drain-loop comparison or it never reflows.
 - MarkerArray is a stateful mutation stream: never auto-clear absent markers, never coalesce

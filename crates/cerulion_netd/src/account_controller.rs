@@ -73,7 +73,6 @@ struct State {
     pending_all: bool,
     pending_robots: BTreeSet<String>,
     busy_since: Option<Instant>,
-    serving_gateway: bool,
 }
 
 /// Owns at most one outgoing endpoint. This type never exposes its device seed.
@@ -187,9 +186,6 @@ impl AccountWanController {
 
     fn ensure_plane<'a>(&self, state: &'a mut State) -> Result<&'a IrohMirrorPlane, String> {
         self.network_allowed()?;
-        if state.serving_gateway {
-            return Err(crate::wan::SERVING_MACHINE_WAN_REFUSAL.into());
-        }
         if state.pending_all || !state.pending_robots.is_empty() {
             return Err("previous WAN mirrors are awaiting registry retirement".into());
         }

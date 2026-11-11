@@ -1,44 +1,34 @@
-# cerulion_netd - agent notes
+# cerulion_netd
 
-One-per-machine gateway: one zenoh session, refcounted UDS NDJSON demands.
-Injected spy tests prove daemon wiring; real network tests prove delivery.
+One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies prove wiring, not delivery.
 
-- Protocol 10 adds paired directory discovery and isolated observer demands. Wire/2 names remain canonical; `/__cerulion/observers/` mirrors are source-qualified, refcounted and released on the last observer. Graph ingress stays canonical.
+- Protocol10: paired catalogs and isolated `/__cerulion/observers/` mirrors; canonical wire/2 and graph ingress. Last observer releases its source-qualified mirror.
 
-## Invariants
-- A remote demand cannot widen producer policy: the embedded gateway and permissive probe consult mandatory SHM egress scope, and taps retain remote leases. Local-only topics and produced topics omitted by an enabled egress block remain unavailable even under open LAN access.
-- One daemon per machine: an `flock`-held pidfile (`cerulion_hygiene::NETD`); the
-  kernel drops the lock on death. Never add a second lock scheme. Android: abstract
-  socket, same-UID peers only.
+## Rules
+- LAN defaults to Paired everywhere; explicit Open warns. Delivery fixtures select Open.
+- Gateway/probe/taps obey SHM producer scope even on open LAN: local-only and outputs omitted from declared egress stay private; taps retain leases.
+- Singleton is kernel flock on `cerulion_hygiene::NETD` pidfile, released on death; no second scheme. Android uses an abstract same-UID socket.
 - Connection close IS the release (crash-safe refcounts). The LAST release retires
   the mirror and frees the single-writer SHM slot; a re-demand recreates it.
-- ONE mirror per canonical topic across both planes, so frames cross once however
-  many consumers demand. Which plane served it is `MirrorPlane::serving_plane`,
-  on each `status` row from the route PINNED at ensure; absent is unknown, not LAN.
-- `wan` is DEFAULT-ON and netd is OUT of `default-members` - a plain `cargo build`
-  stays iroh-free, lean consumers set `default-features = false`. Either side
-  changes the whole workspace build.
+- ONE mirror per canonical stream across planes. Status uses `MirrorPlane::serving_plane`, pinned at ensure; absent is unknown, not LAN.
+- WAN default-on; netd outside default-members keeps plain builds iroh-free. Lean consumers use default-features=false; either changes workspace builds.
 - Never answer a cold start with a confident empty: `DiscoveryState::NotConverged`
   until discovery settles (`query::classify_gather`). An additive field whose serde
   default is a POSITIVE claim needs a `PROTOCOL_VERSION` bump plus a client floor,
   `<=`-asserted, never an equality pin.
-- Convergence waits call the non-reconnecting `_once` verbs (a reconnect re-runs
-  spawn-wait and falsifies the wall). A cancelled wait is never an absence claim.
-- The control loop waits on socket-readable OR push-slot-filled; socket-only stalls
-  catalog pushes on an idle client.
+- Convergence uses non-reconnecting `_once` (reconnect restarts spawn-wait); cancellation never proves absence.
+- Control waits on readable socket OR filled push slot; socket-only stalls idle-client catalogs.
 - A nonzero non-loopback TCP `CERULION_NETD_LISTEN` port is the ONLY gate for the mDNS
   beacon and standing mode (gateway boots at start, idle self-exit off). None means a
   reported refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
-- Serving accepts a saved login or authenticated durable local robot pairing via
-  `serving_login::require_serving_authority`; expiry preserves offline serving.
-  LISTEN startup retains prior-login policy; off/injected daemons are exempt.
-- First nonempty egress registration starts ONE remoted child, no LISTEN needed.
-  Consumer-only desks stay outbound. Last release waits for active/owed work,
-  fences new admission with `serving_hold` and reaps via SIGTERM plus bounded grace.
-- `begin_serving` retires the outgoing endpoint before spawning remoted;
-  `end_serving` runs after reap. Both mark assignments pending under controller
-  state lock. Serving mirrors reuse outbound.sock; never bind the key twice.
-  Watchdogs budget child grace plus epoch-worker cleanup before ownership returns.
+- Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
+  LISTEN needs login; off/injected exempt. First nonempty WAN egress starts one
+  remoted without LISTEN; query/off starts none; standing persists until shutdown.
+- Idle reap waits for work/latch/owed delivery, retains singleton and exclusive
+  `serving.hold`; guards/sources share it, never unlink. Own process group, direct
+  TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
+- Controller lock fences outgoing at `begin_serving`; `end_serving` follows reap;
+  facts use `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY
@@ -47,13 +37,8 @@ Injected spy tests prove daemon wiring; real network tests prove delivery.
 - Serving controllers use remoted's bounded same-user `outbound.sock`, endpoint
   and runtime. Key and SHM namespace must match before dialing. Close retires
   mirrors; account fencing preserves the owned endpoint. Never bind its key twice.
-- Identity snapshots carry public bytes only, hold the auth-store lock across every
-  read, and refuse rather than wait on a busy writer. Expiry gates new enrollment,
-  never durable bindings; an account or key change fences the controller.
-- `release_max_level_info`: `debug!` is absent from a release build, so operator
-  outcomes log at `info!` or louder. Sibling lookup goes through
-  `resolve_netd_bin_from` (macOS `current_exe()` is not canonicalized), and netd
-  links READER-only `cerulion_discovery`: no peers.json write path here.
+- Identity snapshots are public bytes, auth-store locked across reads; busy writers refuse. Expiry gates enrollment, never durable bindings; account/key change fences the controller.
+- Release removes debug; operator outcomes use info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is reader-only: no peers.json writes.
 
 ## Testing
 - `cargo test -p cerulion_netd` is parallel-safe; keep `--no-default-features` green.

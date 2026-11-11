@@ -139,6 +139,7 @@ fn wire_response_parity() {
     });
     cross::<_, robot::WireResponse>(&desk::WireResponse::Status(desk::StatusReply {
         topics: vec![desk::TopicStatus {
+            wan_refused: Some(2),
             topic: "/imu".to_string(),
             wan_forwarded: 100,
             wan_dropped: 3,

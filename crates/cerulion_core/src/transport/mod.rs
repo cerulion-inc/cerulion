@@ -4140,6 +4140,19 @@ impl TransportManager {
         egress_scope::LocalOnlyTopic::acquire(&self.node, topic)
     }
 
+    /// Retain an existing producer exclusion for a dynamically created local port.
+    /// Hold it after that port drops, including a detached producer's lifetime.
+    pub fn retain_local_topic_scope(
+        &self,
+        topic: &str,
+    ) -> TransportResult<Option<egress_scope::LocalOnlyTopic>> {
+        if egress_scope::allowed(&self.node, topic)? {
+            Ok(None)
+        } else {
+            self.exclude_remote_topic(topic).map(Some)
+        }
+    }
+
     /// Hold remote admission for an operation until after its data ports drop.
     pub fn acquire_remote_topic_lease(
         &self,
@@ -4297,14 +4310,13 @@ impl TransportManager {
                 ),
             });
         };
+        // Every remote input, including a declared run gateway, admits producer
+        // scope before the watch or SHM publisher can reach another local run.
+        let remote_lease = Some(self.acquire_remote_topic_lease(topic)?);
         // Step 1: latched watch start (see ordering rationale in the doc).
         self.start_network_bridge_watch()?;
         // Step 2: the identity marker (shared mirrors only), then the
         // egress-suppressed local injection publisher.
-        let remote_lease = match identity {
-            IngressIdentity::NetworkMirror => Some(self.acquire_remote_topic_lease(topic)?),
-            IngressIdentity::RunGateway => None,
-        };
         let marker = match identity {
             IngressIdentity::NetworkMirror => {
                 Some(mirror_origin::MirrorOrigin::open(&self.node, topic)?)

@@ -318,6 +318,12 @@ fn gate_with(
     interactive: bool,
     telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<Option<LoginOutcome>> {
+    // The same local authority as supervised serving and graph registration:
+    // a validated claimed robot keeps working without an auth.json or enrollment.
+    #[cfg(unix)]
+    if cerulion_netd::serving_login::require_serving_authority().is_ok() {
+        return Ok(None);
+    }
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
         LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(None),

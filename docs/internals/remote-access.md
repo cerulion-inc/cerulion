@@ -818,16 +818,17 @@ are in `crates/cerulion_netd/tests/wan_plane_iroh_test.rs`.
 The ceremony above (a chassis secret, a pairing code, an operator typing at the
 robot) is the path for a machine nobody has an account for. A machine that IS
 logged in needs none of it, because `cerulion login` already proved which
-account owns it. **This path is proven against the in-tree `cerulion_accountd`
-only; the hosted issuer is identity-only today, so nothing here works against
-it until that service issues device certificates and registers robots.**
+account owns it. The shared account HTTP client sends `cerulion-pairing-protocol: 1`, which opts
+into the hosted device-certificate and robot-registration routes. A client
+without that header receives the identity-only compatibility response. New
+clients must reuse `login_cmd::build_http_client` or send the same header.
 
 **On the robot, `cerulion login` is the only account step.** The first
-network-serving run registers the machine. The gate is the LISTEN locator
-(`CERULION_NETD_LISTEN`): it is what makes netd a standing gateway, and only a
-standing gateway starts `robot_supervisor`. netd is spawn-once, so the variable
-must be in netd's OWN environment before the first command that spawns it; a
-netd already running without it must be stopped. A failed registration, or a
+live egress registration registers the machine and starts `robot_supervisor`.
+An explicit LISTEN configuration also retains its standing-server behavior,
+but no LISTEN setting is required for authenticated serving. A query-only desk
+does not start the supervisor merely because it discovers robots. Established
+pairing state can serve without introducing a new login or enrollment step. A failed registration, or a
 `cerulion-remoted` that exits, is retried with a backoff that doubles from 5 s
 to a 300 s cap, at most 30 consecutive attempts; a sequence that stayed up for
 10 minutes starts the count again. Each failure is a warning naming the reason
@@ -842,14 +843,16 @@ registration code without a `netd -> cli_engine` package edge; no operator ever
 runs either by hand. All three binaries must therefore sit in one directory.
 The release archives after v1.0.0, the installer and the Debian package place
 `cerulion`, `cerulion-netd` and `cerulion-remoted` side by side, so a released
-install with `CERULION_NETD_LISTEN` set runs this supervisor path.
+install can start this supervisor path on its first live export, without a
+listen setting.
 
 The robot's identity is the login device key, so the endpoint id a desk dials is
 the key registration proved possession of. Roots come from the issuer's
 well-known endpoint. Registration is idempotent: an already-registered machine
 does nothing. If the account service is unreachable at first serve the WAN plane
-refuses loudly with the reason, the LAN plane keeps serving, and the supervisor
-retries on the backoff above.
+cannot register new account ownership and retries on the backoff above. Existing
+validated registration and pairing state can continue offline. The paired LAN
+gate remains closed; an unavailable issuer never enables unauthenticated access.
 
 **On the desk, there is no pairing step.** `topic list` and `viz --robot` read
 the account's robots from the issuer's owner-only list endpoint and mark each

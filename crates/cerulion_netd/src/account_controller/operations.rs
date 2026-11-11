@@ -199,9 +199,18 @@ impl MirrorPlane for AccountWanController {
     }
 
     fn end_serving(&self) {
-        // Only called after the server has been reaped. Retained pins are
-        // retired by the existing identity watch / prepare_demand path.
+        // Reap ends the owned endpoint; fence all shared readers before another
+        // outgoing endpoint can be constructed. Pins retire on the demand path.
         if let Ok(mut state) = self.state.lock() {
+            let proof = state.registry.owner_certificate();
+            state.pending_all = true;
+            state.pending_robots.clear();
+            if let Some(plane) = state.plane.take() {
+                let _retired = plane.invalidate_account();
+            }
+            if let Ok(proof) = proof {
+                let _restored = state.registry.replace_owner_certificate(proof);
+            }
             state.serving_gateway = self.config.serving_gateway;
         }
     }

@@ -25,16 +25,21 @@ pub const RUN_SCOPE_ENV: &str = "CERULION_RUN_TOPIC_SCOPE";
 
 /// Producing process policy, resolved before any data endpoint opens.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "mode", content = "topics", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub enum RunTopicScope {
     Unrestricted,
     LocalOnly,
-    Declared(Vec<String>),
+    Declared {
+        topics: Vec<String>,
+        #[serde(default)]
+        ingress: Vec<String>,
+    },
 }
 
 impl RunTopicScope {
     // hot-path-alloc-ok-fn: cold process configuration, never frame delivery.
     pub fn from_values(network: Option<&str>, scope: Option<&str>) -> TransportResult<Self> {
+        let network = network.map(str::trim);
         if network.is_some_and(|value| !value.trim().is_empty()) {
             if network != Some("off") {
                 tracing::warn!("unrecognized network switch: treating this process as local-only");
@@ -51,8 +56,14 @@ impl RunTopicScope {
         match self {
             Self::Unrestricted => false,
             Self::LocalOnly => true,
-            Self::Declared(allowed) => !allowed.iter().any(|allowed| allowed == topic),
+            Self::Declared { topics, .. } => !topics.iter().any(|allowed| allowed == topic),
         }
+    }
+
+    /// Declared ingress admits consumers without permitting those consumers to publish.
+    pub fn excludes_input(&self, topic: &str) -> bool {
+        self.excludes(topic)
+            && !matches!(self, Self::Declared { ingress, .. } if ingress.iter().any(|allowed| allowed == topic))
     }
 }
 
@@ -64,7 +75,7 @@ pub fn service_scope_topic(service: &str) -> String {
 
 // hot-path-alloc-ok-fn: cold endpoint admission, never frame delivery.
 fn service_parent_scope(topic: &str) -> Option<String> {
-    let service = topic.strip_prefix("svc/")?;
+    let service = topic.trim_start_matches('/').strip_prefix("svc/")?;
     let name = service
         .strip_suffix("/request")
         .or_else(|| service.rsplit_once("/reply/").map(|(name, _)| name))?;
@@ -136,7 +147,7 @@ impl LocalOnlyTopic {
             .map_err(|e| error(topic, e))?;
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         if service.dynamic_config().number_of_listeners() > 0 {
-            return Err(error(topic, "a remote reader or writer still holds this topic; close its demand before starting a local-only producer"));
+            return Err(error(topic, "remote serving still holds this topic; close its demand and withdraw its announcement or restart the serving daemon before starting a local-only producer"));
         }
         Ok(Self {
             _notifier: notifier,

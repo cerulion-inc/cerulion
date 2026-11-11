@@ -1,7 +1,6 @@
 # cerulion_cli - agent notes
 
-Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic lives in
-`cerulion_cli_engine` - read that crate's AGENTS.md first; behavior changes go there.
+Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.md`; behavior lives there.
 
 ## Invariants
 - `clap_complete::CompleteEnv::with_factory(families::cli_command).complete()` is the FIRST
@@ -25,7 +24,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 - Create verbs (`node|graph|schema create`) complete nothing.
 
 ## Testing
-- `network_gateway_e2e_test` proves run-level local switches and egress exclusion against an independent open gateway and a real TCP peer, with local-delivery and declared-egress controls.
+- `network_gateway_e2e_test`: local switches/egress exclusion, independent open TCP peer, local and allowed delivery.
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
   They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field (Rust
   drops fields in declaration order).
@@ -53,7 +52,6 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
   subtree (workers, gateway, ros2 entry), else `single_process`; reap/poll via its METHODS
   (`wait_bounded`, `try_wait_noting`) so it notes live workers first, and it never caches an
   EMPTY note, so a poll at t=0 cannot freeze the verdict. `Drop` only REPORTS a leak; arms
-  that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
-  and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
+  that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk checks constructors and bare reaps; await GO (`deployment live`) before a kill, else ABORT path.
 
 Reference: docs/internals/cli.md (contracts, completion, verb families, test maps).

@@ -86,7 +86,7 @@ impl GraphFeed {
             .gather_live_runs(RUN_GATHER_WINDOW)
             .map_err(|error| error.to_string())?;
         let visible: Vec<_> =
-            cerulion_core::transport::run_artifacts::collect_run_entries(&gather.records)
+            cerulion_core::transport::run_artifacts::collect_remote_run_entries(&gather.records)
                 .entries
                 .into_iter()
                 .filter(cerulion_core::transport::run_artifacts::remote_visible)
@@ -95,6 +95,14 @@ impl GraphFeed {
             .runs
             .records
             .retain(|run| visible.iter().any(|entry| entry.run_id == run.run_id));
+        if let crate::graph::RunsCompleteness::Incomplete {
+            live_writers,
+            writers_heard,
+        } = &mut graph.runs.completeness
+        {
+            *live_writers = 0;
+            *writers_heard = 0;
+        }
         let mut nodes = std::collections::BTreeSet::new();
         for entry in visible {
             if let Ok(config) =

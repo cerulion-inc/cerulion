@@ -7,20 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
-- A machine serving authenticated remote topics can also consume topics through the same device endpoint. Outbound mirror release preserves incoming serving.
-- Network-enabled runs start the authenticated remote server on their first egress registration without requiring `CERULION_NETD_LISTEN`. Query-only desks and local-only runs start no server; the last serving registration's release or disconnect reaps it after active work, owed e-stop delivery and its latch clear. Saved robot pairings and expired saved logins preserve offline serving. Owned remote servers receive SIGTERM and a bounded graceful cleanup window before forced reap.
-- Topic discovery lists account-owned and explicitly paired robots anywhere, with direct or relayed reachability and visible offline status. Topic reads and remote visualization demand authenticated wire/2 streams automatically, keep identical local and remote names separate, and release streams when their observers exit. `topic echo`, `hz`, and `info` accept `--robot NAME` and refuse ambiguous names with exit 2.
-
-- Local-only graph and node runs exclude their topics, schemas and run metadata from every remote serving plane, including an already running open gateway. An enabled `network:` block's egress list is enforced for that producing run by other daemons too.
 ### Changed
+- Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
 
 - LAN topic access defaults to paired on every platform. Unpaired LAN peers
   cannot demand topics or publish into graph ingress through the zenoh plane.
   Paired desks use the authenticated remote plane. Explicit
   `CERULION_LAN_ACCESS=open` remains available for development and warns at startup.
+- Networking guides and the Go2 graph pair describe automatic account and saved
+  pairing discovery, authenticated declared imports, shared serving and consuming,
+  and explicit open-LAN compatibility without requiring addresses for paired access.
+
+### Fixed
+- Local-only graph and node runs exclude their topics, schemas and run metadata from every remote serving plane, including an already running open gateway. An enabled `network:` block's egress list is enforced for that producing run by other daemons too.
+- Network-enabled runs start the authenticated remote server on their first egress registration without requiring `CERULION_NETD_LISTEN`. Query-only desks and local-only runs start no server; the last serving registration's release or disconnect reaps it after active work, owed e-stop delivery and its latch clear. Saved robot pairings and expired saved logins preserve offline serving. Owned remote servers receive SIGTERM and a bounded graceful cleanup window before forced reap.
+- Topic discovery lists account-owned and explicitly paired robots anywhere, with direct or relayed reachability and visible offline status. Topic reads and remote visualization demand authenticated wire/2 streams automatically, keep identical local and remote names separate, and release streams when their observers exit. `topic echo`, `hz`, and `info` accept `--robot NAME` and refuse ambiguous names with exit 2.
+- A machine serving authenticated remote topics can also consume topics through
+  the same device endpoint. Outbound mirror release preserves incoming serving.
 
 ## [2.0.0] - 2026-11-11
 

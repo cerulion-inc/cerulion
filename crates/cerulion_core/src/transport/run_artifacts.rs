@@ -541,6 +541,17 @@ pub fn collect_run_entries(records: &[RunRecord]) -> RunFold {
     fold
 }
 
+/// Filter durable registry policy before opening artifacts or naming read failures.
+// hot-path-alloc-ok-fn: cold remote metadata request, never frame delivery.
+pub fn collect_remote_run_entries(records: &[RunRecord]) -> RunFold {
+    let visible: Vec<_> = records
+        .iter()
+        .filter(|record| record.remote_visible)
+        .cloned()
+        .collect();
+    collect_run_entries(&visible)
+}
+
 /// Read one run's directory and mint its served entry, or report WHY not.
 ///
 /// Artifact errors, containment refusals and [`RunEntry::new`]'s own refusals
@@ -623,6 +634,7 @@ mod tests {
     /// the exact value it expects back.
     fn record_at(run_id: u128, dir: &Path) -> RunRecord {
         RunRecord {
+            remote_visible: true,
             run_id,
             supervisor_pid: 4242,
             run_started_at_ns: 1_700_000_000_000_000_000,
@@ -636,6 +648,23 @@ mod tests {
     fn write_run_dir(dir: &Path, graph_yaml: &str, run_json: &str) {
         std::fs::write(dir.join(GRAPH_YAML_FILE), graph_yaml).expect("write graph.yaml");
         std::fs::write(dir.join(RUN_JSON_FILE), run_json).expect("write run.json");
+    }
+
+    #[test]
+    fn private_registry_policy_hides_even_missing_artifacts_without_naming_the_run() {
+        let public_dir = run_dir_in_root("visible_metadata");
+        write_run_dir(&public_dir, "name: public\n", "{\"network\":\"strict\"}");
+        let public = record_at(1, &public_dir);
+        let mut private = record_at(2, &absent_dir_in_root("private_metadata"));
+        private.remote_visible = false;
+        for _ in 0..2 {
+            let records = [public.clone(), private.clone()];
+            assert_eq!(collect_run_entries(&records).skipped.len(), 1);
+            let remote = collect_remote_run_entries(&records);
+            assert!(remote.skipped.is_empty());
+            assert_eq!(remote.entries.len(), 1);
+            assert_eq!(remote.entries[0].run_id, format_run_id(1));
+        }
     }
 
     #[test]

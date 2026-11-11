@@ -2245,18 +2245,19 @@ fn schema_serve_decision(
         log_lan_refusal(authorizer, "schema GET", requested, &reason);
         return cerulion_q::SchemaReply::refused(robot, requested, reason);
     }
-    if catalog.is_some_and(|catalog| {
-        catalog
-            .producer_probe
-            .as_ref()
-            .is_some_and(|probe| probe.upgrade().is_none())
-    }) {
-        return cerulion_q::SchemaReply::refused(
-            robot,
-            requested,
-            "producer policy is unavailable",
-        );
-    }
+    let producer_scope = match catalog.and_then(|catalog| catalog.producer_probe.as_ref()) {
+        Some(probe) => match probe.upgrade() {
+            Some(manager) => Some(manager),
+            None => {
+                return cerulion_q::SchemaReply::refused(
+                    robot,
+                    requested,
+                    "producer policy is unavailable",
+                );
+            }
+        },
+        None => None,
+    };
     note_lan_authorized(authorizer, "schema GET", requested);
     // Held for the WHOLE decision: `replace` swaps `docs` under this lock,
     // so a schema GET never mixes the old and new maps mid-closure.
@@ -2270,13 +2271,7 @@ fn schema_serve_decision(
         .docs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((catalog, manager)) = catalog.and_then(|catalog| {
-        catalog
-            .producer_probe
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .map(|manager| (catalog, manager))
-    }) {
+    if let Some((catalog, manager)) = catalog.zip(producer_scope.as_ref()) {
         let mut bindings: Vec<_> = catalog
             .topic_schemas
             .lock()
@@ -2297,6 +2292,8 @@ fn schema_serve_decision(
                 names.get(hash).map(|root| (topic.clone(), root.clone()))
             }),
         );
+        bindings.sort();
+        bindings.dedup();
         let visible = bindings.iter().any(|(topic, root)| {
             manager.remote_topic_allowed(topic).unwrap_or(false)
                 && (root == requested
@@ -2377,13 +2374,10 @@ fn handle_runs_verb(
 ///    hosted runs are still served: they come from this process's memory, not
 ///    from the registry that failed.
 /// 3. **Gathered** - whatever the registry established plus the hosted runs,
-///    with the gather's OWN completeness verdict carried through unchanged. That
-///    passthrough is the whole reason [`cerulion_q::RunsCompleteness`] exists: a
+///    with a settled verdict or a non-claim without machine-wide writer counts. A
 ///    windowed LISTEN that expired with live writers unheard produces the SAME
 ///    empty list a genuinely idle machine produces, and only the verdict tells
-///    them apart (the same lesson the discovery marker and the checked mirror
-///    gather taught). A served hosted run does not change the verdict: the host
-///    knows it exactly.
+///    them apart. Unknown writers may be private, so their counts stay local.
 ///
 /// Runs whose directory could not be read are SKIPPED with a named reason (see
 /// [`run_artifacts::collect_run_entries`]) rather than served as entries carrying
@@ -2406,7 +2400,7 @@ fn runs_serve_decision(
     note_lan_authorized(authorizer, "runs GET", RUNS_QUERY_RESOURCE);
     let gathered = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
         Ok(gather) => {
-            let fold = run_artifacts::collect_run_entries(&gather.records);
+            let fold = run_artifacts::collect_remote_run_entries(&gather.records);
             for skip in &fold.skipped {
                 tracing::warn!(
                     robot = %robot,
@@ -2418,7 +2412,15 @@ fn runs_serve_decision(
                      with no nodes"
                 );
             }
-            Some((fold, gather.completeness.into()))
+            // Unknown writers may be private. Preserve the non-claim without
+            // disclosing machine-wide writer counts to the remote reader.
+            let completeness: cerulion_q::RunsCompleteness = gather.completeness.into();
+            let completeness = if completeness.is_settled() {
+                completeness
+            } else {
+                cerulion_q::RunsCompleteness::not_established()
+            };
+            Some((fold, completeness))
         }
         Err(e) => {
             tracing::warn!(
@@ -3701,6 +3703,13 @@ struct DemandAuthorization {
     scope: Option<Weak<TransportManager>>,
 }
 
+// Announced names are remote metadata too. Withdraw the token before releasing
+// producer admission, so a private successor cannot inherit a stale announce.
+struct ScopedTopicAnnouncement {
+    _token: TopicToken,
+    _scope: Option<super::egress_scope::RemoteTopicLease>,
+}
+
 /// Manages the zenoh session and background network task lifecycle.
 ///
 /// The session is lazily created on first call to [`session()`](Self::session).
@@ -3748,7 +3757,7 @@ pub struct NetworkManager {
     /// (idempotent - a re-announce is a no-op, never a duplicate token);
     /// observable via [`Self::announced_topics`]. Dropping a token undeclares
     /// it (the topic goes off the network listing).
-    announced: Mutex<HashMap<String, TopicToken>>,
+    announced: Mutex<HashMap<String, ScopedTopicAnnouncement>>,
     /// The retained BARE identity announce token
     /// (`cerulion_ann/{robot}` - robot presence with no topic suffix). At most
     /// ONE per gateway process; declared via [`Self::announce_gateway_identity`]
@@ -5074,8 +5083,26 @@ impl NetworkManager {
             }
         }
 
+        let producer_scope = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scope
+            .clone();
+        let scope = producer_scope
+            .map(|weak| {
+                weak.upgrade()
+                    .ok_or_else(|| TransportError::Internal {
+                        reason: "producer policy is unavailable".into(),
+                    })?
+                    .acquire_remote_topic_lease(&canonical)
+            })
+            .transpose()?;
         let session = self.session()?;
-        let token = TopicToken::announce(session, &robot, &canonical)?;
+        let token = ScopedTopicAnnouncement {
+            _token: TopicToken::announce(session, &robot, &canonical)?,
+            _scope: scope,
+        };
 
         let mut announced = self
             .announced
@@ -5213,7 +5240,7 @@ impl NetworkManager {
             .iter()
             .map(|topic| canonical_topic(topic).into_owned())
             .collect();
-        let withdrawn: Vec<TopicToken> = {
+        let withdrawn: Vec<ScopedTopicAnnouncement> = {
             let mut announced = self
                 .announced
                 .lock()
@@ -8482,6 +8509,7 @@ mod hosted_runs_serve_tests {
         let _writer = RunHandle::publish_on_config(
             &namespace,
             RunRecord {
+                remote_visible: true,
                 run_id: 0x77,
                 supervisor_pid: std::process::id(),
                 run_started_at_ns: 1,
@@ -8683,6 +8711,7 @@ mod hosted_runs_serve_tests {
         let _writer = RunHandle::publish_on_config(
             &namespace,
             RunRecord {
+                remote_visible: true,
                 run_id: RUN,
                 supervisor_pid: std::process::id(),
                 run_started_at_ns: 1,
@@ -8812,6 +8841,7 @@ mod hosted_runs_serve_tests {
         let _writer = RunHandle::publish_on_config(
             &namespace,
             RunRecord {
+                remote_visible: true,
                 run_id: RUN,
                 supervisor_pid: std::process::id(),
                 run_started_at_ns: 20,

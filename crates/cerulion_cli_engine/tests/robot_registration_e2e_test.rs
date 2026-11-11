@@ -703,6 +703,57 @@ fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_off
     server.0.kill().unwrap();
     server.0.wait().unwrap();
 
+    // The command-wide gate accepts the same durable robot authority as netd.
+    // No account file or reachable issuer is needed, and the read writes no trust.
+    let saved_auth = std::fs::read(home.join("auth.json")).unwrap();
+    std::fs::remove_file(home.join("auth.json")).unwrap();
+    let saved_key = std::fs::read(remoted.join("device_key")).unwrap();
+    let saved_trust = std::fs::read(remoted.join("trust_store")).unwrap();
+    let saved_index = std::fs::read(remoted.join("device_index.json")).unwrap();
+    for _ in 0..2 {
+        let output = bounded_output(
+            Command::new(built_binary("cerulion"))
+                .args(["topic", "list", "--local"])
+                .env("CERULION_STATE_ROOT", &root)
+                .env("CERULION_LOGIN_GATE", "1")
+                .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(
+            std::fs::read(remoted.join("trust_store")).unwrap(),
+            saved_trust
+        );
+        assert_eq!(
+            std::fs::read(remoted.join("device_index.json")).unwrap(),
+            saved_index
+        );
+    }
+    for name in ["device_key", "device_index.json"] {
+        let path = remoted.join(name);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"corrupt").unwrap();
+        let output = bounded_output(
+            Command::new(built_binary("cerulion"))
+                .args(["topic", "list", "--local"])
+                .env("CERULION_STATE_ROOT", &root)
+                .env("CERULION_LOGIN_GATE", "1")
+                .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
+        );
+        assert_eq!(output.status.code(), Some(7));
+        assert!(!home.join("auth.json").exists());
+        std::fs::write(path, original).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(remoted.join("device_key")).unwrap(),
+        saved_key
+    );
+    std::fs::write(home.join("auth.json"), saved_auth).unwrap();
+
     // With the issuer unreachable and the login token expired, both actual
     // workers still accept the already committed same-account ownership.
     let before = std::fs::read(remoted.join("trust_store")).unwrap();

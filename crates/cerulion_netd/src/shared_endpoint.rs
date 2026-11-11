@@ -72,14 +72,17 @@ enum Operation {
         robot: String,
         topic: String,
         schema_hash: u64,
+        observer: bool,
     },
     Release {
         robot: String,
         topic: String,
+        observer: bool,
     },
     HasReader {
         robot: String,
         topic: String,
+        observer: bool,
     },
     Retire {
         robot: String,
@@ -100,10 +103,22 @@ enum Answer {
     Done,
     Present(bool),
     Probe(Option<String>),
-    Catalog(CatalogReply),
+    Catalog(
+        CatalogReply,
+        crate::account_access::RobotPath,
+        Option<SocketAddr>,
+    ),
     Schema(SchemaReply),
     Released(bool),
-    Retired(Vec<(String, String)>),
+    Retired(Vec<(String, String, bool)>),
+}
+
+fn topic_key(robot: String, topic: String, observer: bool) -> TopicKey {
+    if observer {
+        TopicKey::observed(robot, topic)
+    } else {
+        TopicKey::new(robot, topic)
+    }
 }
 
 fn write_message(stream: &mut UnixStream, value: &impl Serialize) -> Result<(), String> {
@@ -357,7 +372,7 @@ impl SharedMirrorPlane {
         match self.call(Operation::Sync)? {
             Answer::Retired(keys) => Ok(keys
                 .into_iter()
-                .map(|(robot, topic)| TopicKey::new(&robot, &topic))
+                .map(|(robot, topic, observer)| topic_key(robot, topic, observer))
                 .collect()),
             _ => Err("outbound membership reply is invalid".into()),
         }
@@ -372,6 +387,7 @@ impl SharedMirrorPlane {
         match self.call(Operation::HasReader {
             robot: key.robot.clone(),
             topic: key.topic.clone(),
+            observer: key.observer,
         })? {
             Answer::Present(present) => Ok(present),
             _ => Err("outbound reader reply is invalid".into()),
@@ -381,6 +397,7 @@ impl SharedMirrorPlane {
         self.call(Operation::Ensure {
             robot: key.robot.clone(),
             topic: key.topic.clone(),
+            observer: key.observer,
             schema_hash,
         })
         .map(|_| ())
@@ -389,6 +406,7 @@ impl SharedMirrorPlane {
         match self.call(Operation::Release {
             robot: key.robot.clone(),
             topic: key.topic.clone(),
+            observer: key.observer,
         }) {
             Ok(Answer::Released(true)) => MirrorRelease::Retired,
             _ => MirrorRelease::Lingering,
@@ -408,12 +426,23 @@ impl SharedMirrorPlane {
             _ => Err("outbound probe reply is invalid".into()),
         }
     }
-    pub(crate) fn catalog(&self, robot: &str, timeout: Duration) -> Result<CatalogReply, String> {
+    pub(crate) fn catalog(
+        &self,
+        robot: &str,
+        timeout: Duration,
+    ) -> Result<
+        (
+            CatalogReply,
+            crate::account_access::RobotPath,
+            Option<SocketAddr>,
+        ),
+        String,
+    > {
         match self.call(Operation::Catalog {
             robot: robot.into(),
             budget_ms: timeout.as_millis().min(15_000) as u64,
         })? {
-            Answer::Catalog(catalog) => Ok(catalog),
+            Answer::Catalog(catalog, path, direct) => Ok((catalog, path, direct)),
             _ => Err("outbound catalog reply is invalid".into()),
         }
     }
@@ -609,15 +638,25 @@ fn serve_connection(
                     robot,
                     topic,
                     schema_hash,
+                    observer,
                 } => mirror
-                    .ensure_mirror(&TopicKey::new(&robot, &topic), schema_hash)
+                    .ensure_mirror(&topic_key(robot, topic, observer), schema_hash)
                     .map(|()| Answer::Done)
                     .map_err(|error| error.to_string()),
-                Operation::Release { robot, topic } => Ok(Answer::Released(
-                    mirror.release_mirror(&TopicKey::new(&robot, &topic)) == MirrorRelease::Retired,
+                Operation::Release {
+                    robot,
+                    topic,
+                    observer,
+                } => Ok(Answer::Released(
+                    mirror.release_mirror(&topic_key(robot, topic, observer))
+                        == MirrorRelease::Retired,
                 )),
-                Operation::HasReader { robot, topic } => mirror
-                    .has_reader(&TopicKey::new(&robot, &topic))
+                Operation::HasReader {
+                    robot,
+                    topic,
+                    observer,
+                } => mirror
+                    .has_reader(&topic_key(robot, topic, observer))
                     .map(Answer::Present),
                 Operation::Retire { robot } => mirror.retire_robot(&robot).map(|()| Answer::Done),
                 Operation::Probe { robot, budget_ms } => mirror
@@ -629,8 +668,8 @@ fn serve_connection(
                         })
                     }),
                 Operation::Catalog { robot, budget_ms } => mirror
-                    .query_catalog(&robot, Duration::from_millis(budget_ms.min(15_000)))
-                    .map(Answer::Catalog),
+                    .query_catalog_with_path(&robot, Duration::from_millis(budget_ms.min(15_000)))
+                    .map(|(catalog, path, direct)| Answer::Catalog(catalog, path, direct)),
                 Operation::Schema {
                     robot,
                     topic,
@@ -641,7 +680,7 @@ fn serve_connection(
                 Operation::Sync => Ok(Answer::Retired(
                     retired
                         .into_iter()
-                        .map(|key| (key.robot, key.topic))
+                        .map(|key| (key.robot, key.topic, key.observer))
                         .collect(),
                 )),
                 Operation::Invalidate => mirror.invalidate_account().map(|()| Answer::Done),

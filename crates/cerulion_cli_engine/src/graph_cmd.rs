@@ -4510,13 +4510,14 @@ fn excluded_run_topics(
     network: &RunNetwork,
     config: &GraphConfig,
     factories: &indexmap::IndexMap<String, Box<dyn cerulion_core::NodeEntry>>,
+    bridge_config: Option<&Path>,
 ) -> CliResult<Vec<String>> {
     let mut infos = indexmap::IndexMap::new();
     for (id, entry) in factories {
         infos.insert(id.clone(), entry.info()?);
     }
     let topology = cerulion_core::graph::GraphTopology::build(config, &infos)?;
-    Ok(topology
+    let mut excluded: Vec<_> = topology
         .topics()
         .filter(|flow| match network {
             RunNetwork::Off | RunNetwork::Inert => true,
@@ -4530,7 +4531,22 @@ fn excluded_run_topics(
             RunNetwork::Permissive(_) => false,
         })
         .map(|flow| flow.topic.clone())
-        .collect())
+        .collect();
+    if !matches!(network, RunNetwork::Permissive(_)) {
+        if let Some(path) = bridge_config {
+            for topic in crate::schema_serve::bridge_scope_topics(path)? {
+                let private = matches!(network, RunNetwork::Off | RunNetwork::Inert)
+                    || !config
+                        .network
+                        .as_ref()
+                        .is_some_and(|net| net.egress_topics().any(|egress| egress == topic));
+                if private && !excluded.contains(&topic) {
+                    excluded.push(topic);
+                }
+            }
+        }
+    }
+    Ok(excluded)
 }
 
 fn exclude_run_topics(
@@ -4584,23 +4600,6 @@ fn resolve_gateway_launch(
         &workspace_root.join("schemas"),
         bridge_config_path.as_deref(),
     );
-    // Carry an explicit policy for every announced topic, including default
-    // reliable topics. An omitted policy is unknown to an authenticated consumer.
-    schema_serving.egress_qos = plan
-        .announce
-        .iter()
-        .map(|topic| {
-            net.egress_qos
-                .iter()
-                .find(|policy| policy.topic == *topic)
-                .cloned()
-                .unwrap_or_else(|| cerulion_core::EgressQos {
-                    topic: topic.clone(),
-                    reliability: cerulion_core::EgressReliability::Reliable,
-                    send_queue: None,
-                })
-        })
-        .collect();
     if matches!(run_network, RunNetwork::Strict(_)) {
         schema_serving
             .topic_schemas
@@ -4628,6 +4627,23 @@ fn resolve_gateway_launch(
             .schema_hashes
             .retain(|binding| allowed.contains(&binding.qualified));
     }
+    // Carry an explicit policy for every announced topic, including default
+    // reliable topics. An omitted policy is unknown to an authenticated consumer.
+    schema_serving.egress_qos = plan
+        .announce
+        .iter()
+        .map(|topic| {
+            net.egress_qos
+                .iter()
+                .find(|policy| policy.topic == *topic)
+                .cloned()
+                .unwrap_or_else(|| cerulion_core::EgressQos {
+                    topic: topic.clone(),
+                    reliability: cerulion_core::EgressReliability::Reliable,
+                    send_queue: None,
+                })
+        })
+        .collect();
     // Mint the robot identity for
     // the discovery surface (the mDNS beacon + the announce keys' robot chunk +
     // the `cerulion_q/{robot}/**` query surface — ALL from this ONE value, so
@@ -6276,19 +6292,20 @@ pub fn graph_run(
         RunNetwork::Permissive(_) => {
             cerulion_core::transport::egress_scope::RunTopicScope::Unrestricted
         }
-        RunNetwork::Strict(_) => cerulion_core::transport::egress_scope::RunTopicScope::Declared(
-            config
+        RunNetwork::Strict(_) => cerulion_core::transport::egress_scope::RunTopicScope::Declared {
+            topics: config
                 .network
                 .as_ref()
                 .into_iter()
-                .flat_map(|network| {
-                    network
-                        .egress_topics()
-                        .chain(network.ingress.iter().map(String::as_str))
-                })
+                .flat_map(|network| network.egress_topics())
                 .map(str::to_string)
                 .collect(),
-        ),
+            ingress: config
+                .network
+                .as_ref()
+                .map(|network| network.ingress.clone())
+                .unwrap_or_default(),
+        },
     };
     let ros2_children = crate::ros2_graph::Ros2Children::spawn_with_scope(
         &ros2_entries,
@@ -6688,7 +6705,9 @@ pub fn graph_run(
         graph_name,
     )?;
 
-    let excluded_topics = excluded_run_topics(&run_network, &config, &factories)?;
+    let bridge_config = crate::schema_serve::resolve_bridge_config_path(graphs_dir, graph_name);
+    let excluded_topics =
+        excluded_run_topics(&run_network, &config, &factories, bridge_config.as_deref())?;
 
     // Wedge alarm: EVERY path below this point is a monolith (the supervisor arm
     // returned above), and a monolith has no supervisor — so the per-node
@@ -11172,7 +11191,14 @@ fn graph_run_supervisor(
         graphs_dir,
         config.identity(),
     )?;
-    let excluded_topics = excluded_run_topics(&run_network, &config, &planning_factories)?;
+    let bridge_config =
+        crate::schema_serve::resolve_bridge_config_path(graphs_dir, config.identity());
+    let excluded_topics = excluded_run_topics(
+        &run_network,
+        &config,
+        &planning_factories,
+        bridge_config.as_deref(),
+    )?;
     // The AUTHORITATIVE per-node metadata: each planning factory's OWN
     // `NodeEntry::info()` — i.e. what the BUILT cdylib declares, which is
     // exactly what `GraphRuntime::build_*` below levelizes with. Harvested here
@@ -31731,23 +31757,51 @@ process_groups:
         );
         let strict = RunNetwork::Strict(cerulion_core::NetworkConfig::default());
         let open = RunNetwork::Permissive(cerulion_core::NetworkConfig::default());
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = dir.path().join("bridge.yaml");
+        std::fs::write(
+            &bridge,
+            "mappings:\n  - cerulion_topic: /raw/private\n    ros_type: geometry_msgs/Vector3\n",
+        )
+        .unwrap();
         for _ in 0..2 {
             assert_eq!(
-                excluded_run_topics(&strict, &config, &factories).unwrap(),
+                excluded_run_topics(&strict, &config, &factories, None).unwrap(),
                 vec!["/scope/source/private"]
             );
             assert_eq!(
-                excluded_run_topics(&RunNetwork::Off, &config, &factories).unwrap(),
+                excluded_run_topics(&RunNetwork::Off, &config, &factories, None).unwrap(),
                 vec!["/scope/source/public", "/scope/source/private"]
             );
             assert_eq!(
-                excluded_run_topics(&RunNetwork::Inert, &config, &factories).unwrap(),
+                excluded_run_topics(&RunNetwork::Inert, &config, &factories, None).unwrap(),
                 vec!["/scope/source/public", "/scope/source/private"]
             );
-            assert!(excluded_run_topics(&open, &config, &factories)
+            assert!(excluded_run_topics(&open, &config, &factories, None)
                 .unwrap()
                 .is_empty());
+            assert_eq!(
+                excluded_run_topics(&strict, &config, &factories, Some(&bridge)).unwrap(),
+                vec!["/scope/source/private", "/raw/private"]
+            );
+            assert_eq!(
+                excluded_run_topics(&RunNetwork::Off, &config, &factories, Some(&bridge)).unwrap(),
+                vec![
+                    "/scope/source/public",
+                    "/scope/source/private",
+                    "/raw/private"
+                ]
+            );
         }
+        std::fs::write(&bridge, "[").unwrap();
+        assert!(excluded_run_topics(&RunNetwork::Off, &config, &factories, Some(&bridge)).is_err());
+        std::fs::remove_file(&bridge).unwrap();
+        assert!(excluded_run_topics(&strict, &config, &factories, Some(&bridge)).is_err());
+        assert!(
+            excluded_run_topics(&open, &config, &factories, Some(&bridge))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A one-topic AllowAll `GatewayLaunch` (the desk egress overlay input) at the

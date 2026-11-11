@@ -395,7 +395,16 @@ impl Runtime {
     /// A process retains exclusions until its additive endpoint registrations end.
     // hot-path-alloc-ok-fn: cold endpoint creation, never publish or take.
     pub fn claim_topic_scope(&self, topic: &str) -> cerulion_core::TransportResult<()> {
-        if !self.topic_scope.excludes(topic) {
+        self.claim_scope(topic, self.topic_scope.excludes(topic))
+    }
+
+    pub fn claim_input_scope(&self, topic: &str) -> cerulion_core::TransportResult<()> {
+        self.claim_scope(topic, self.topic_scope.excludes_input(topic))
+    }
+
+    // hot-path-alloc-ok-fn: cold endpoint creation, never publish or take.
+    fn claim_scope(&self, topic: &str, excluded: bool) -> cerulion_core::TransportResult<()> {
+        if !excluded {
             return Ok(());
         }
         let mut scopes = lock_unpoisoned(&self.local_exclusions).ok_or_else(|| {

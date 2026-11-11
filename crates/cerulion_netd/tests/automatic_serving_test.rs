@@ -301,6 +301,12 @@ fn no_listen_serves_persisted_pairing_and_expired_login_and_reaps_on_last_releas
         until(|| !children(daemon.child.id()).is_empty());
         let server_pid = children(daemon.child.id());
         assert_eq!(server_pid.len(), 1);
+        let pid = rustix::process::Pid::from_raw(i32::try_from(server_pid[0]).unwrap()).unwrap();
+        assert_eq!(
+            rustix::process::getpgid(Some(pid)).unwrap(),
+            pid,
+            "owned remoted is isolated from netd's terminal process group"
+        );
         assert!(matches!(
             request(&mut b, register(1, TOPIC)),
             Response::Egress(_)

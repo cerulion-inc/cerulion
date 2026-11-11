@@ -1,20 +1,18 @@
-# cerulion_core - agent notes
+# cerulion_core
 
-Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rules.
+Core: wire/codegen/iceoryx2/scheduler/graph/gateway; serial rules per binary.
 
 ## Invariants
-- Local-only producer exclusions precede data services; every remote tap or mirror holds an opposite egress-scope lease until its data port drops. Never use a local capture tap for remote serving. Admission and refusal counts are cold-path work; no per-frame checks.
+- Producers exclude before ports; remote taps/mirrors/announces hold opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame-path checks.
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
 - LAN defaults to Paired; fixtures select Open. Locators/login never open it.
-- Any change to a generated-cdylib FFI signature or error-code meaning bumps
-  `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
+- FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs;
+  the loader also refuses a differing `RUSTC_FINGERPRINT`.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
-- Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
-  strings and bytes ride variable fields via the offset table, the slot is the backing.
+- Raw SHM has no pointers (String/Vec/HashMap); strings/bytes use slot-backed offsets.
 - Wire `sequence` is consumed at COMMIT (`OutputProxy::Drop`), never at loan: a discarded
   loan burns no sequence, so streams stay gap-free.
 - A publisher drains its OWN event listener on every notifying path (iceoryx2 delivers
@@ -23,8 +21,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rule
   totals log as `total_failures=`, site keys as `topic=`/`service=`.
 - Sync fires ONCE PER COMPLETE ALIGNED SET, each trigger consumed by at most one set; verdicts
   from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
-- Graph YAML denies unknown fields - a typo'd key is a loud parse error, never a silent
-  default; a new field needs round-trip + rejection oracle arms.
+- Graph YAML denies unknown fields; new fields need round-trip/rejection oracles.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
@@ -49,7 +46,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rule
   parallel-safe, no fence. Re-bless trybuild (`TRYBUILD=overwrite`, `macro_compile_fail_test`)
   on drift, from CI's output.
 
-## Gotchas
+## Traps
 
 - `#[traced_test]` needs tracing-test's `no-env-filter` feature (on the dev-dep) or
   production events silently vanish. `GraphRuntime` is `!Debug` - use `match`.
