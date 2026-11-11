@@ -70,3 +70,49 @@ fn contain_panic_payload(payload: Box<dyn std::any::Any + Send>) {
         std::mem::forget(nested);
     }
 }
+
+/// Borrow the original node reason or a transport operation's display text.
+/// Owner/phase labels are supplied by the receiving runtime, exactly once.
+// hot-path-alloc-ok-fn: only failed operations format non-node diagnostics.
+pub fn diagnostic_reason(error: &TransportError) -> std::borrow::Cow<'_, str> {
+    match error {
+        TransportError::NodeError { reason, .. }
+        | TransportError::NodeFailed { reason, .. }
+        | TransportError::NodeTickPanicked { reason, .. }
+        | TransportError::HostServiceFailed { reason } => std::borrow::Cow::Borrowed(reason),
+        error => std::borrow::Cow::Owned(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn raw_host_error_text_keeps_native_display_and_user_transport_wrapping_exact() {
+        let error = TransportError::HostServiceFailed {
+            reason: "publish probe failed".into(),
+        };
+        assert_eq!(error.to_string(), "publish probe failed");
+        assert_eq!(diagnostic_reason(&error), "publish probe failed");
+        let node = crate::error::NodeError::Transport(error).into_transport("zero_copy_tick");
+        assert_eq!(
+            diagnostic_reason(&node),
+            "Transport error: publish probe failed"
+        );
+    }
+    #[test]
+    fn untyped_python_reason_and_panic_reason_are_not_wrapped_or_rewritten() {
+        for error in [
+            TransportError::NodeError {
+                node_id: "Python node".into(),
+                reason: "RuntimeError: probe\n".into(),
+            },
+            TransportError::NodeTickPanicked {
+                node_id: "host".into(),
+                reason: "RuntimeError: probe\n".into(),
+            },
+        ] {
+            assert_eq!(diagnostic_reason(&error), "RuntimeError: probe\n");
+        }
+    }
+}

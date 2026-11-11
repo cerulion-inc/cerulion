@@ -236,7 +236,7 @@ fn preserve_error(
     client: &plugin::HostClient,
     error: cerulion_core::error::TransportError,
 ) -> String {
-    let message = error.to_string();
+    let message = plugin::diagnostic_reason(&error).into_owned();
     client.record_failure(error);
     message
 }

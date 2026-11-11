@@ -75,3 +75,7 @@ their U06/U12 lifetime and descriptor validation live in the shared export adapt
 The escaped-buffer fixture runs in a fresh process: an exported memoryview
 survives node destruction, its lease is refused for reuse, and the old bytes
 remain readable after the extra library owner is dropped.
+
+Python node diagnostic copies preserve the original traceback or preflight
+reason exactly. The backend retains host error classification separately from
+the Python exception string.

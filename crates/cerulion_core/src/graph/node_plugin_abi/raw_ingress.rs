@@ -5,6 +5,7 @@ use crate::error::TransportResult;
 use crate::node_abi::{
     discard_reason, full_queue, LoanRequestV1, PortHandle, RawPublisherRequestV1, WriteSlotV1,
 };
+use crate::transport::plugin_lease::PluginWireLayout;
 use crate::transport::publisher::CerulionPublisher;
 use crate::transport::{FullQueueSend, TransportManager};
 use crate::wire::{MaxSliceLen, WireHeader};
@@ -160,19 +161,11 @@ impl RawPublisher {
                 schema_hash,
                 ..
             } => {
-                crate::transport::input_view::validate_wire_frame_raw(
-                    topic,
-                    frame,
-                    Some(*schema_hash),
-                )?;
+                validate_raw_frame(topic, frame, *schema_hash)?;
                 publisher.publish_raw(frame)
             }
             PublisherBackend::Plugin(publisher) => {
-                crate::transport::input_view::validate_wire_frame_raw(
-                    &publisher.topic,
-                    frame,
-                    Some(publisher.hash),
-                )?;
+                validate_raw_frame(&publisher.topic, frame, publisher.hash)?;
                 let size = u32::try_from(frame.len())
                     .map_err(|_| super::argument_error("raw frame exceeds u32"))?;
                 if size > publisher.maximum.get() {
@@ -233,4 +226,30 @@ impl RawPublisher {
             PublisherBackend::Plugin(publisher) => publisher.client.register_raw(publisher.handle),
         }
     }
+}
+
+// hot-path-alloc-ok-fn: malformed raw frames allocate only their refusal diagnostic.
+fn validate_raw_frame(topic: &str, frame: &[u8], hash: u64) -> TransportResult<()> {
+    let (header, _) =
+        crate::transport::input_view::validate_wire_frame_raw(topic, frame, Some(hash))?;
+    let Some(fixed_size) = header
+        .offset_table_offset
+        .checked_sub(WireHeader::SIZE as u32)
+    else {
+        return Err(super::argument_error(
+            "raw frame has an invalid offset table",
+        ));
+    };
+    let layout = PluginWireLayout {
+        schema_hash: hash,
+        fixed_size,
+        variable_fields: header.offset_table_count,
+        alignment: crate::shm_runtime::FRAME_ALIGN as u32,
+    };
+    if header.total_size as usize != frame.len() || !layout.accepts(frame, header.total_size) {
+        return Err(super::argument_error(
+            "raw frame has an invalid offset table",
+        ));
+    }
+    Ok(())
 }

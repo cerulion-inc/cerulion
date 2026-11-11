@@ -121,7 +121,7 @@ impl<T: PluginNode> NodeExports<T> {
                     status_code::FAILED
                 },
                 error.node_error_kind().map_or(0, |kind| kind.code()),
-                error.to_string(),
+                super::diagnostic_reason(&error).into_owned(),
             ),
             _ => unreachable!("scalar refusal returned before diagnostic formatting"),
         };
@@ -195,9 +195,8 @@ impl<T: PluginNode> NodeExports<T> {
         }
         // SAFETY (U12): caller's aligned writable output is live for this call;
         // initialize the invalid sentinel before any node/transport side effect.
-        unsafe {
-            output.write(NodeHandle::default());
-        }
+        let output = unsafe { &mut *output };
+        *output = NodeHandle::default();
         self.guarded(|| {
             // SAFETY (U05): caller's immutable table/context lifetime is the
             // documented create contract; connect validates full shape first.
@@ -223,11 +222,8 @@ impl<T: PluginNode> NodeExports<T> {
                 let _ = self.registry.destroy(handle);
                 return Err(error);
             }
-            // SAFETY (U12): valid_output checked aligned non-null storage;
-            // caller retains it until return, and the handle is not an address.
-            unsafe {
-                output.write(NodeHandle { value: handle });
-            }
+            // The caller-owned output borrow stays exclusive through create.
+            *output = NodeHandle { value: handle };
             Ok(())
         })
     }
@@ -465,10 +461,18 @@ mod tests {
     }
 
     impl PluginNode for CounterNode {
-        fn create(_: HostClient, _: &[u8]) -> TransportResult<Self> {
+        fn create(_: HostClient, params: &[u8]) -> TransportResult<Self> {
+            if params == b"fail" {
+                return Err(crate::error::NodeError::Logic("create probe".into())
+                    .into_transport("user_init"));
+            }
             Ok(Self { value: 7 })
         }
         fn tick(&mut self) -> TransportResult<()> {
+            if self.value == 998 {
+                return Err(crate::error::NodeError::Logic("tick probe".into())
+                    .into_transport("zero_copy_tick"));
+            }
             if self.value == 999 {
                 return Err(super::super::argument_error("counter refuses 999"));
             }
@@ -705,6 +709,108 @@ mod tests {
             .is_none());
         assert_eq!(exports.destroy(handle).code, status_code::OK);
         assert!(exports.errors.lock().unwrap().instances.is_empty());
+    }
+
+    fn copied_reason(exports: &NodeExports<CounterNode>, token: u64) -> String {
+        let mut bytes = [0u8; 128];
+        let mut required = 0;
+        // SAFETY: exclusive initialized bytes and aligned required scalar
+        // remain live through the checked synchronous diagnostic copy.
+        let status = unsafe {
+            exports.copy_error(
+                token,
+                super::super::client::mutable_bytes(&mut bytes),
+                &mut required,
+            )
+        };
+        assert_eq!(status.code, status_code::OK);
+        String::from_utf8(bytes[..required as usize].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn complete_empty_reason_copy_consumes_once_without_rewriting_text() {
+        let (exports, handle) = installed();
+        let status = exports.error_for(
+            handle.value,
+            CallError::Node(TransportError::NodeError {
+                node_id: "empty reason".into(),
+                reason: String::new(),
+            }),
+        );
+        assert_eq!(copied_reason(&exports, status.error), "");
+        let mut required = 1;
+        // SAFETY: empty null span is never dereferenced; required is aligned local storage.
+        let stale = unsafe {
+            exports.copy_error(
+                status.error,
+                MutableBytes {
+                    ptr: std::ptr::null_mut(),
+                    len: 0,
+                },
+                &mut required,
+            )
+        };
+        assert_eq!(stale.code, status_code::INVALID_HANDLE);
+    }
+
+    #[test]
+    fn typed_rust_tick_error_copy_preserves_the_original_reason_exactly() {
+        let (exports, handle) = installed();
+        exports
+            .registry
+            .call(handle.value, |node| {
+                node.value = 998;
+                Ok(())
+            })
+            .unwrap();
+        let status = exports.tick(handle);
+        assert_eq!((status.code, status.kind), (status_code::FAILED, 1));
+        assert_eq!(
+            copied_reason(&exports, status.error),
+            "Logic error: tick probe"
+        );
+    }
+
+    #[test]
+    fn typed_rust_create_error_copy_preserves_the_original_reason_exactly() {
+        use crate::graph::node::{NodeContext, ShutdownSignal};
+        use crate::graph::node_host_abi::{
+            register_context, remove_context, HostContext, HOST_API,
+        };
+        let environment = std::sync::Arc::new(std::collections::HashMap::new());
+        let context = NodeContext::with_runtime_env(
+            Default::default(),
+            Default::default(),
+            std::sync::Arc::new(crate::clock::VirtualClock::new()),
+            ShutdownSignal::new(),
+            environment.clone(),
+        );
+        let context = ContextHandle {
+            value: register_context(HostContext::new(context, Vec::new(), environment, 1).unwrap())
+                .unwrap(),
+        };
+        let exports = NodeExports::<CounterNode>::default();
+        let mut output = NodeHandle { value: 99 };
+        // SAFETY: actual immutable process table and registered host context
+        // remain live; params/output are initialized caller-owned allocations.
+        let status = unsafe {
+            exports.create(
+                &HOST_API,
+                context,
+                super::super::client::bytes_span(b"fail"),
+                &mut output,
+                0,
+            )
+        };
+        assert_eq!(
+            (status.code, status.kind, output.value),
+            (status_code::FAILED, 1, 0)
+        );
+        assert_eq!(
+            copied_reason(&exports, status.error),
+            "Logic error: create probe"
+        );
+        remove_context(context.value).unwrap();
     }
 
     #[test]

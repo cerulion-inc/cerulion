@@ -59,3 +59,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
+
+Stable node diagnostic copies retain the original reason text. Host callback
+errors use an identity display locally so raw helpers and user transport-error
+wrapping keep the original message. Caller/phase labels are added by the loader.

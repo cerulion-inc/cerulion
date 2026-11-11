@@ -75,6 +75,7 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
         let mut frame = [0u8; 64];
         let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 41, 123);
         header.total_size = 64;
+        header.offset_table_offset = 64;
         header.write_to_buf(&mut frame);
         let payload = [7.0f64, -2.25, 0.5];
         for (index, value) in payload.iter().enumerate() {
@@ -85,6 +86,18 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
             .view_raw_expecting(Vector3::SCHEMA_HASH)
             .unwrap()
             .is_none());
+        header.offset_table_offset = 0;
+        header.write_to_buf(&mut frame);
+        let malformed = publisher.publish_raw(&frame).unwrap_err();
+        assert_eq!(
+            cerulion_core::graph::node_plugin_abi::diagnostic_reason(&malformed),
+            "raw frame has an invalid offset table"
+        );
+        assert!(receiver
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .is_none());
+        header.offset_table_offset = 64;
         let scripted = factory.clock_arc();
         for timestamp in [123_u64, 456] {
             clock.set(timestamp);
@@ -205,6 +218,7 @@ fn helper_clock_and_raw_publish_deliver_while_node_tick_gate_is_held() {
             let mut frame = [0u8; 64];
             let mut header = WireHeader::new(Vector3::SCHEMA_HASH, sequence, timestamp);
             header.total_size = 64;
+            header.offset_table_offset = 64;
             header.write_to_buf(&mut frame);
             frame[40..48].copy_from_slice(&7.0f64.to_le_bytes());
             frame[48..56].copy_from_slice(&(-2.25f64).to_le_bytes());
@@ -232,6 +246,7 @@ fn helper_clock_and_raw_publish_deliver_while_node_tick_gate_is_held() {
                     .unwrap();
                 let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
                 header.total_size = 64;
+                header.offset_table_offset = 64;
                 header.write_to_buf(loan.bytes_mut());
                 loan.bytes_mut()[40..64].copy_from_slice(&[
                     0, 0, 0, 0, 0, 0, 28, 64, 0, 0, 0, 0, 0, 0, 2, 192, 0, 0, 0, 0, 0, 0, 224, 63,
