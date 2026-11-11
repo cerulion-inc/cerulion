@@ -196,7 +196,10 @@ pub fn prepare(state_root: &Path) -> CliResult<BootstrapPrepared> {
     create_state_root(state_root)?;
     let metadata = fs::symlink_metadata(state_root)?;
     if metadata.uid() != cerulion_hygiene::euid() || metadata.mode() & 0o077 != 0 {
-        return Err(refused("the robot state directory must be owner-only"));
+        let directory = state_root.to_string_lossy().replace('\'', "'\\''");
+        return Err(refused(&format!(
+            "the robot state directory must be owner-only; run `chmod 700 '{directory}'`"
+        )));
     }
     let bundle_path = state_root.join(BUNDLE_FILE);
     auth::with_store_lock(&bundle_path, || Ok(prepare_locked(&bundle_path, initial)))?

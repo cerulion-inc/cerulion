@@ -4,38 +4,39 @@ CLI logic; `cerulion_cli` parses args.
 Writers (`node create/delete/modify/stage`, graph create/partition/run
 partition persistence, ros2 attach/migrate --write, schema create/delete) hold
 `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` across writes:
-UNIX flock shared with wsd, thread reentrant, others wait with one warn;
+UNIX flock: shared with wsd, thread reentrant, waiters warn once;
 elsewhere a no-op. Reads use `acquire_read`: create nothing, refuse re-entry.
 Reject symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits existing
 tracked `.gitignore` when creating `.cerulion/`. Migration uses polling
 `acquire_interruptibly(root, interrupted)` -> `AcquireError` (no From).
-Locks are per root; --workspace is the COLCON root. Stage declared ports via
+Locks are per root; --workspace is COLCON root. Stage declared ports via
 `graph_cmd::stage_declared_node`. Paired skips implicit LAN catalogs; Open,
-locators and scan retain them. Broken pairings are diagnostics. Observer channels
+locators and scan retain them. Bad pairings are diagnostics. Observer channels
 are private per source; ambiguity needs selectors; caches bind account/key.
-Refresh stale sessions on caller within 2 s; cache logs debug. Unread catalogs prove no absence.
+Caller refresh: 2 s; cache logs debug; unread catalogs cannot prove absence.
+Refused identity: re-login, never offline; run watches warn on registration failures.
 
 ## Invariants
-- Enforce invariants at the engine boundary; CLI checks are UX.
-- `account_robot_access`: only netd opens WAN. Probes share 4 s, 500 ms per robot,
+- Engine enforces invariants; CLI checks are UX.
+- `account_robot_access`: netd alone opens WAN. Probes: 4 s total, 500 ms per robot,
   never pair/demand. Automatic catalogs share another 4 s; owned/paired coalesce by
   endpoint key. LAN/account merge requires robot ID AND key. Auth keeps
   `/v1/me.account_id`; pairing maps via `account_identity::pairing_account_id`.
-  Login validates mapping/challenge/registration/leaf/key before writes;
+  Login checks mapping/challenge/registration/leaf/key before writes;
   `device-chain.json` commits LAST.
 - `node build`'s rustc probe is advisory; the cdylib fingerprint, checked at load, counts.
 - Android: cdylibs prefer `<target>/<triple>/<profile>`, then `<target>/<profile>`;
   `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
 - `node_metadata::parse_node_metadata` is the port/trigger authority; `INFO_END`
   before `INFO_START` is fatal.
-- Never hand-compute pinned schema hashes: run `pinned_hashes`, copy into `topic_cmd.rs`.
+- Pinned schema hashes: never hand-compute; run `pinned_hashes`, copy to `topic_cmd.rs`.
 - Completions never hang, spawn, or open the network (`run_bounded`, `completions_test`).
 - Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
-  never warn-and-accept. A duplicated identity refuses iff ANY bearer is un-carryable.
+  never accept with a warn. Duplicate identities refuse iff ANY bearer is un-carryable.
 - Rewrite `node modify` sources with `syn` spans, never `str::replace`.
 - iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
-- Blocking waits check `running` after interrupted ERRORS and retry only within
+- Waits check `running` after interrupted ERRORS; retry only within
   `MAX_CONSECUTIVE_WAIT_ERRORS`; never sleep-retry an ERROR. FOREIGN children Cerulion SIGINTs go via `child_signals`
   (SIG_IGN/blocks survive exec); self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
@@ -52,8 +53,8 @@ pins. See `docs/internals/cli.md` §11 for contract and compiler checks.
   the `pairing_*_parity_test` JSON oracles stay byte-identical to the app's. Build
   `test_node_macro_{period,data_trigger}_cdylib` first.
 ## Gotchas
-- `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use
+- `proc_macro2::Literal::to_string()` keeps `100_000`, `100u64`, `0xff`; use
   `parse_int_literal` or `syn::LitInt::base10_parse`.
-- Numeric false-pass classes (NaN folds, >2^53 widening, length fields).
-Read `docs/internals/cli.md` before topics/local scope, starters,
+- Guard NaN folds, >2^53 widening and length fields.
+`docs/internals/cli.md`: read before topics/local scope, starters,
 replay, completions, Python (§13), or graph run/profile/partition.

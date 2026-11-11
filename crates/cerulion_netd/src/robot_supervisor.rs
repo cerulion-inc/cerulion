@@ -88,15 +88,18 @@ impl RobotSupervisor {
                     attempt += 1;
                     let started = Instant::now();
                     let result = run(&worker_running, stop_grace, |eid| {
-                        gateway
+                        let refreshed = gateway
                             .refresh_robot_beacon(eid)
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| error.to_string())?;
+                        gateway.set_robot_startup_error(None);
+                        Ok(refreshed)
                     });
                     let Err(error) = result else { return };
                     attempt = counted_attempt(attempt, started.elapsed());
                     if !worker_running.load(Ordering::SeqCst) {
                         return;
                     }
+                    gateway.set_robot_startup_error(Some(error.clone()));
                     match retry_delay(attempt) {
                         Some(delay) => {
                             tracing::warn!(
@@ -577,7 +580,7 @@ fn run_json<T: serde::de::DeserializeOwned>(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     let mut child = OwnedChild(
         command
             .spawn()
@@ -588,6 +591,23 @@ fn run_json<T: serde::de::DeserializeOwned>(
         .stdout
         .take()
         .ok_or_else(|| format!("{stage}: no result pipe"))?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{stage}: no error pipe"))?;
+    let (error_sender, error_receiver) = mpsc::sync_channel(1);
+    let error_reader = std::thread::Builder::new()
+        .name("robot-bootstrap-error".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stderr
+                .take(MAX_RESULT_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = error_sender.send(result);
+        })
+        .map_err(|error| format!("{stage} error reader: {error}"))?;
     let (sender, receiver) = mpsc::sync_channel(1);
     // Both child entry points are leaf workers. A concurrent bounded reader
     // prevents pipe backpressure; dropping/killing the owned child closes its EOF.
@@ -613,14 +633,33 @@ fn run_json<T: serde::de::DeserializeOwned>(
             .join()
             .map_err(|_| format!("{stage} result reader panicked"))?;
     }
+    let errors =
+        error_receiver.recv_timeout(pipe_deadline.saturating_duration_since(Instant::now()));
+    if errors.is_ok() {
+        error_reader
+            .join()
+            .map_err(|_| format!("{stage} error reader panicked"))?;
+    }
     let status = status?;
     let bytes = output
         .map_err(|_| format!("{stage} result did not close before the bootstrap deadline"))?
         .map_err(|error| format!("{stage} result: {error}"))?;
     if !status.success() {
-        return Err(format!(
-            "{stage} exited ({status}); see the child error above"
-        ));
+        let errors = errors
+            .map_err(|_| format!("{stage} error pipe did not close before the bootstrap deadline"))?
+            .map_err(|error| format!("{stage} error pipe: {error}"))?;
+        let reason: String = String::from_utf8_lossy(&errors)
+            .chars()
+            .take(4096)
+            .map(|character| {
+                if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        return Err(format!("{stage} exited ({status}): {}", reason.trim()));
     }
     if bytes.len() as u64 > MAX_RESULT_BYTES {
         return Err(format!("{stage} result exceeded the size limit"));

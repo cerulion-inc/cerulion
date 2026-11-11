@@ -853,6 +853,7 @@ impl Ctx {
             })
             .collect();
         Response::Status(StatusResponse {
+            robot_startup_error: self.egress_plane.robot_startup_error(),
             id,
             demands,
             active_connections: reg.active_connections(),

@@ -37,6 +37,38 @@ fn client_and_peer() -> (NetdClient, UnixStream) {
     (client, peer)
 }
 
+#[test]
+fn bounded_status_carries_failures_and_refuses_uncorrelated_replies() {
+    for reply in [
+        "{\"method\":\"status\",\"id\":1,\"demands\":[],\"active_connections\":1,\"idle\":false,\"robot_startup_error\":\"state directory is not owner-only\"}\n",
+        "{\"method\":\"status\",\"id\":2,\"demands\":[],\"active_connections\":1,\"idle\":false}\n",
+        "{\"method\":\"error\",\"id\":1,\"error\":\"status refused\"}\n",
+    ] {
+        let (mut client, mut peer) = client_and_peer();
+        peer.write_all(reply.as_bytes()).unwrap();
+        let result = client.status_until(deadline());
+        if reply.contains("owner-only") {
+            assert_eq!(result.unwrap().robot_startup_error.as_deref(), Some("state directory is not owner-only"));
+        } else if reply.contains("status refused") {
+            assert!(result.unwrap_err().to_string().contains("status refused"));
+        } else {
+            assert!(result.unwrap_err().to_string().contains("correlated daemon status"));
+            assert_poisoned(&mut client);
+        }
+    }
+}
+
+#[test]
+fn bounded_status_retires_a_connection_when_its_reply_never_arrives() {
+    let (mut client, _peer) = client_and_peer();
+    let started = Instant::now();
+    assert!(client
+        .status_until(started + Duration::from_millis(50))
+        .is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_poisoned(&mut client);
+}
+
 fn receive_install(peer: &UnixStream) -> String {
     let mut line = String::new();
     BufReader::new(peer).read_line(&mut line).unwrap();

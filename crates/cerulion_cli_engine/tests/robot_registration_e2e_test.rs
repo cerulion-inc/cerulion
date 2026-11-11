@@ -215,6 +215,42 @@ fn register_robot_binds_the_logged_in_account_and_returns_an_owner_grant() {
         .is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+#[serial]
+fn real_registration_worker_names_the_permission_fix_for_a_0755_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.to_str().unwrap());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    login(port, &email);
+    let root = home.join("robot's state");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .args(["bootstrap-robot", "--state-root"])
+            .arg(&root)
+            .env("CERULION_LOGIN_GATE", "1"),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains(&format!(
+        "automatic robot registration: the robot state directory must be owner-only; run `chmod 700 '{}/robot'\\''s state'`", home.display())));
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!root.join("robot-registration.json").exists());
+}
+
 #[test]
 #[serial]
 fn re_registering_the_same_machine_is_idempotent() {

@@ -254,7 +254,84 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
         .robots
         .sort_by(|a, b| (&a.name, &a.route).cmp(&(&b.name, &b.route)));
     result._account = directory;
+    let complete_certificate = auth::device_cert_path().is_some_and(|path| path.is_file())
+        && auth::auth_json_path()
+            .map(|path| crate::owner_certificate::cache_path(&path))
+            .is_some_and(|path| path.is_file());
+    for robot in &mut result.robots {
+        explain_device_enrollment(signed_in, complete_certificate, robot);
+    }
     Ok(result)
+}
+
+const MISSING_DEVICE_CERTIFICATE: &str = "this machine's sign-in has no device certificate, so the robot cannot verify it; run `cerulion login` again to enroll this machine";
+const UNPAIRED_DEVICE_KEY: &str = "the robot refused this machine's device key as unpaired for its account; run `cerulion login` again to enroll this machine";
+
+/// A refused identity is not evidence that a robot is offline. Durable guest
+/// pairings and successfully answered catalogs do not require an owner login.
+fn explain_device_enrollment(
+    signed_in: bool,
+    complete_certificate: bool,
+    robot: &mut RobotCatalog,
+) {
+    if !signed_in || robot.trust != RobotTrustSource::Account {
+        return;
+    }
+    if robot
+        .catalog
+        .as_ref()
+        .is_some_and(|catalog| catalog.error.is_none())
+    {
+        return;
+    }
+    let reason = robot
+        .catalog
+        .as_ref()
+        .and_then(|catalog| catalog.error.as_deref())
+        .or(match &robot.presence {
+            RobotPresence::NotReached { reason } | RobotPresence::Unknown { reason } => {
+                Some(reason.as_str())
+            }
+            RobotPresence::Online => None,
+        });
+    let message = if !complete_certificate {
+        MISSING_DEVICE_CERTIFICATE
+    } else if reason.is_some_and(|reason| reason.contains("unpaired device key")) {
+        UNPAIRED_DEVICE_KEY
+    } else {
+        return;
+    };
+    if let Some(catalog) = &mut robot.catalog {
+        catalog.error = Some(message.into());
+    }
+    if !matches!(robot.presence, RobotPresence::Online) {
+        robot.presence = RobotPresence::Unknown {
+            reason: message.into(),
+        };
+    }
+    tracing::debug!(robot = %robot.name, error = message, "robot access requires device enrollment");
+}
+
+/// Explain why an explicitly selected robot cannot serve a topic yet.
+pub(crate) fn unavailable_robot_message(robot: &RobotCatalog) -> Option<String> {
+    let state = if let Some(catalog) = &robot.catalog {
+        let error = catalog.error.as_ref()?;
+        format!("topics are unavailable: {}", super::display_text(error))
+    } else {
+        match &robot.presence {
+            RobotPresence::NotReached { reason } => {
+                format!("is offline (not reached: {})", super::display_text(reason))
+            }
+            RobotPresence::Unknown { reason } => {
+                format!("has unknown reachability ({})", super::display_text(reason))
+            }
+            RobotPresence::Online => "is online but its topics are unavailable".into(),
+        }
+    };
+    Some(format!(
+        "robot '{}' {state}",
+        super::display_text(&robot.name)
+    ))
 }
 
 /// Validate durable pairing pins and the existing machine key without login,
@@ -706,5 +783,59 @@ mod tests {
         assert_eq!(listing.matches("REMOTE TOPICS").count(), 1);
         assert!(listing.contains("/state  [std_msgs/String]  robot=paired\n"));
         assert!(!listing.contains("--connect"));
+    }
+
+    #[test]
+    fn legacy_login_and_unpaired_key_refusals_name_enrollment_in_list_and_echo() {
+        for (complete, expected) in [
+            (false, "this machine's sign-in has no device certificate, so the robot cannot verify it; run `cerulion login` again to enroll this machine"),
+            (true, "the robot refused this machine's device key as unpaired for its account; run `cerulion login` again to enroll this machine"),
+        ] {
+            let mut robot = RobotCatalog {
+                route: "owned".into(), name: "arm1".into(), endpoint_key: Some([7; 32]),
+                trust: RobotTrustSource::Account,
+                presence: RobotPresence::NotReached { reason: "wire plane refused: unpaired device key".into() },
+                path: RobotPath::Unknown, catalog: None,
+            };
+            explain_device_enrollment(true, complete, &mut robot);
+            assert_eq!(unavailable_robot_message(&robot).unwrap(), format!("robot 'arm1' has unknown reachability ({expected})"));
+            assert_eq!(render_robots(&[robot.clone()], false), format!("  arm1  unknown ({expected})  owned\n"));
+            assert!(!render_robots(&[robot.clone()], false).contains("offline"));
+            robot.presence = RobotPresence::Online;
+            let mut reply = catalog("owned", "/state");
+            reply.error = Some("wire plane refused: unpaired device key".into());
+            robot.catalog = Some(reply);
+            explain_device_enrollment(true, complete, &mut robot);
+            assert_eq!(unavailable_robot_message(&robot).unwrap(), format!("robot 'arm1' topics are unavailable: {expected}"));
+            assert_eq!(render_robots(&[robot], false), format!("  arm1  online, path unknown  owned  topics unavailable: {expected}\n"));
+        }
+    }
+
+    #[test]
+    fn missing_owner_certificate_does_not_break_guest_pairings_or_answered_catalogs() {
+        let original = RobotCatalog {
+            route: "paired".into(),
+            name: "paired".into(),
+            endpoint_key: Some([7; 32]),
+            trust: RobotTrustSource::Paired,
+            presence: RobotPresence::NotReached {
+                reason: "dial timed out".into(),
+            },
+            path: RobotPath::Unknown,
+            catalog: None,
+        };
+        let mut robot = original.clone();
+        explain_device_enrollment(true, false, &mut robot);
+        assert_eq!(robot, original);
+        robot.trust = RobotTrustSource::Account;
+        let original = robot.clone();
+        explain_device_enrollment(false, false, &mut robot);
+        assert_eq!(robot, original);
+        explain_device_enrollment(true, true, &mut robot);
+        assert_eq!(robot, original);
+        robot.catalog = Some(catalog("paired", "/state"));
+        let original = robot.clone();
+        explain_device_enrollment(true, false, &mut robot);
+        assert_eq!(robot, original);
     }
 }

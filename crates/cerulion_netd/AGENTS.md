@@ -1,12 +1,13 @@
 # cerulion_netd - agent notes
 
-One machine gateway owns ONE zenoh session, serving refcounted topic demands
+Machine gateway owns ONE zenoh session, serving refcounted demands
 through UDS NDJSON. Library/bin split: injected-plane tests prove control wiring,
 not live transport.
 
 - Protocol 10 adds paired catalogs and observer demands. Wire/2 and graph ingress
   stay canonical; WAN observers use private /__cerulion/observers/ channels, shared
   per source and released at last observer. LAN observers share canonical demands.
+  Run watches report status startup failures through the shared latch.
 
 ## Invariants
 - One daemon per machine: an `flock`-held pidfile (`cerulion_hygiene::NETD`); the
@@ -56,5 +57,4 @@ not live transport.
   SHM namespace and owner controller: run `-- --test-threads=1` (CI does too).
 - `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
   it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
-
-Deep reference: docs/internals/network-daemons.md, docs/internals/remote-access.md.
+Read: docs/internals/network-daemons.md, docs/internals/remote-access.md.
