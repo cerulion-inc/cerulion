@@ -1218,6 +1218,9 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     #tick_within_with_call
                     #throttle_with_call
                     .with_params(vec![#(#param_spec_exprs),*])
+                    // The tick preamble refuses an output with no publisher,
+                    // so the graph build must refuse an unlisted output.
+                    .with_publisher_for_every_output()
                 )
             }
 
@@ -1879,8 +1882,11 @@ fn gen_cdylib(
                 // node-level `tick_within_ms` / `throttle_ms` (each a
                 // leading-comma fragment, present only when declared)
                 // after `outputs` and before `policy`.
+                // `publisher_for_every_output`: the tick preamble refuses an
+                // output with no publisher, so the host graph build refuses
+                // an output this node declares and its graph does not list.
                 let json = ::std::format!(
-                    r#"{{"inputs":{},"outputs":{}{}{}{}}}"#,
+                    r#"{{"inputs":{},"outputs":{}{}{}{},"publisher_for_every_output":true}}"#,
                     inputs,
                     outputs,
                     #qos_json,

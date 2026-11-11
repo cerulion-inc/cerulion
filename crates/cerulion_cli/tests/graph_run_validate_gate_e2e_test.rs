@@ -962,9 +962,14 @@ fn an_unwired_trigger_input_is_refused_without_promising_a_false_escape() {
         root.join("target/debug").join(dylib_file("relay")),
     )
     .expect("copy fixture cdylib");
+    // The graph lists the node's declared output `cmd`, so the unwired
+    // trigger is the only fault in it.
     std::fs::write(
         root.join("graphs/demo.yaml"),
-        "prefix: trig\nnodes:\n  - id: relay\n    type: relay\n",
+        format!(
+            "prefix: trig\nnodes:\n  - id: relay\n    type: relay\n    outputs:\n      \
+             - name: cmd\n        schema: {TRUE_SCHEMA}\n"
+        ),
     )
     .unwrap();
 

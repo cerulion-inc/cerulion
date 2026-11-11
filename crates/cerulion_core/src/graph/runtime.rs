@@ -40,7 +40,7 @@ use crate::scheduler::{
 use crate::transport::{PublisherProvisioning, TopicServiceConfig, TransportManager};
 use crate::wire::MaxSliceLen;
 
-use super::config::{GraphConfig, DEFAULT_MAX_SLICE_LEN};
+use super::config::{GraphConfig, NodeDef, DEFAULT_MAX_SLICE_LEN};
 use super::node::{
     flood_log_action, AnyPublisher, AnySubscriber, BackpressurePolicy, ExternalSource,
     FloodLogAction, InputConsume, InputMeta, MacroPolicy, NodeContext, NodeEntry, NodeInfo,
@@ -617,6 +617,41 @@ fn build_output_meta_lookup(metas: &[OutputMeta]) -> HashMap<String, &OutputMeta
 // hot-path-alloc-ok-fn: cold: graph BUILD — runs once per process, before the first step
 fn build_input_meta_lookup(metas: &[InputMeta]) -> HashMap<String, &InputMeta> {
     metas.iter().map(|m| (m.name.clone(), m)).collect()
+}
+
+/// Refuse a node that declares an output its graph entry does not list.
+///
+/// The graph creates a publisher only for each output the YAML lists, so a
+/// node has none for an output it declares and the YAML leaves out. A
+/// `#[cerulion_node]` node would then fail every tick before its body runs,
+/// and the graph would report running while it does nothing. An output the
+/// YAML lists and the node does not declare is accepted: it only creates a
+/// publisher the node never writes.
+///
+/// This function checks the node it gets, of any kind. The graph build calls
+/// it only for a node whose [`NodeInfo::publisher_for_every_output`] is
+/// `true` (a `#[cerulion_node]` node): a Python node, a raw FFI node and a
+/// hand-written entry take a publisher only for an output they write, so
+/// their graphs still start. The embedded Android runtime calls it for every
+/// node.
+///
+/// `Err` holds the message, which names the first unlisted output in the
+/// node's declaration order.
+// hot-path-alloc-ok-fn: cold: graph BUILD, runs once per node before the first step
+pub fn check_declared_outputs_listed(node: &NodeDef, info: &NodeInfo) -> Result<(), String> {
+    let unlisted = info
+        .output_names()
+        .iter()
+        .find(|declared| !node.outputs.iter().any(|listed| listed.name == **declared));
+    match unlisted {
+        None => Ok(()),
+        Some(output) => Err(format!(
+            "node '{}' output '{output}': the node declares this output and the graph does \
+             not list it, so the node has no publisher for it; add `- name: {output}` with \
+             its `schema:` under the node's `outputs:`",
+            node.id
+        )),
+    }
 }
 
 /// Resolve the EXPECTED schema hash for a declared network
@@ -5570,6 +5605,19 @@ impl GraphRuntime {
             supports_sync_head_ops.insert(id.clone(), entry.supports_sync_head_ops());
             supports_sync_capture_stamps.insert(id.clone(), entry.supports_sync_capture_stamps());
             probes_trigger_input.insert(id.clone(), entry.probes_trigger_input());
+        }
+        // A `#[cerulion_node]` node needs a publisher for every output it
+        // declares, and the graph creates one only for each output its YAML
+        // lists: refuse an unlisted output now, before any transport resource
+        // exists. Other nodes take a publisher only for an output they write,
+        // so they are not checked.
+        for node_def in &config.nodes {
+            if let Some(info) = entry_infos.get(&node_def.id) {
+                if info.publisher_for_every_output() {
+                    check_declared_outputs_listed(node_def, info)
+                        .map_err(|reason| TransportError::GraphError { reason })?;
+                }
+            }
         }
         // Per capture-time Sync node: its stamp locations and window, filled by
         // the per-node validation below and consumed where the sync ops are
