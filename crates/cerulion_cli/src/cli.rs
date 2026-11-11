@@ -147,7 +147,7 @@ impl From<PeerLoss> for EnginePeerLossPolicy {
 // families. A plain comment, not a doc comment, so `cerulion --help` keeps the
 // text it has: clap's derive copies a doc comment into the root's help.
 #[derive(Parser)]
-#[command(name = "cerulion", about = "Cerulion robotics middleware CLI", version)]
+#[command(name = "cerulion", about = "Cerulion robot runtime CLI", version)]
 pub struct Cli {
     /// Enable verbose (debug-level) logging (`-v` or `--verbose`)
     //

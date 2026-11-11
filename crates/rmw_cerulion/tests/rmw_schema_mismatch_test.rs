@@ -511,8 +511,7 @@ fn field_value_before(line: &str, key: &str, next_key: &str) -> Option<String> {
 /// `subscription` must be a live subscription created by this implementation.
 unsafe fn hash_mismatch_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
-    cerulion_core::transport::failure_regime_latch::lock_regime_latch(&data.hash_mismatches)
-        .total_failures()
+    data.hash_mismatches.read().total_failures()
 }
 
 /// The shadow pool's own counters: shadows BUILT and shadows sitting FREE.
@@ -537,10 +536,7 @@ unsafe fn shadows_built_and_free(subscription: *const ffi::rmw_subscription_t) -
 /// `subscription` must be a live subscription created by this implementation.
 unsafe fn decode_failure_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
-    data.decode_failures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .total_failures()
+    data.decode_failures.read().total_failures()
 }
 
 /// The wire `schema_hash` this subscription's bridge expects.
@@ -1336,10 +1332,7 @@ const LOAN_REFUSED: &str = "loaned take refused";
 /// `service` must be a live service created by this implementation.
 unsafe fn service_decode_failure_count(service: *const ffi::rmw_service_t) -> u64 {
     let data = &*((*service).data as *const rmw_cerulion::runtime::ServiceData);
-    data.decode_failures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .total_failures()
+    data.decode_failures.read().total_failures()
 }
 
 /// The one loud refusal line, with its `reason=` value checked against the

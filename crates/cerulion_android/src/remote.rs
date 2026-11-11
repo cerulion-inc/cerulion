@@ -18,12 +18,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cerulion_core::{SchemaServing, TransportManager};
 
 use crate::config::RemoteRelay;
 use crate::error::EmbedError;
+use crate::runtime::RemoteStatus;
 
 /// What a start hands the host to bind its plane.
 pub struct RemoteStart {
@@ -121,32 +122,64 @@ const PLANE_UNSTOPPED: u8 = 2;
 /// Whether a runtime in this process hosts a remote plane.
 static REMOTE_HOSTED: AtomicU8 = AtomicU8::new(PLANE_FREE);
 
+/// The plane that did not stop, with its stop error: the record every later
+/// start and status read in this process name it from.
+static UNSTOPPED: Mutex<Option<RemoteStatus>> = Mutex::new(None);
+
+/// The plane in this process that did not stop, if one did not.
+pub(crate) fn unstopped_plane() -> Option<RemoteStatus> {
+    UNSTOPPED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// The one remote plane a process hosts. Every runtime reads the same device
 /// key, so two planes would answer under one endpoint id for two different
 /// runs; a second runtime with the plane enabled is refused while one holds
-/// this lease, and every one is refused after a plane failed to stop.
+/// this lease, and none binds after a plane failed to stop.
 struct RemoteLease(());
 
+/// What [`RemoteLease::acquire`] finds.
+enum Acquired {
+    Lease(RemoteLease),
+    /// A plane in this process did not stop: the process record names it.
+    Stuck(RemoteStatus),
+}
+
 impl RemoteLease {
-    fn acquire() -> Result<Self, EmbedError> {
+    fn acquire() -> Result<Acquired, EmbedError> {
         match REMOTE_HOSTED.compare_exchange(
             PLANE_FREE,
             PLANE_HELD,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(Self(())),
-            Err(PLANE_UNSTOPPED) => Err(EmbedError::Remote(
-                "a remote plane in this process did not stop cleanly and may still answer under \
-                 this device key; restart the app process before starting a runtime with \
-                 remote.enabled"
-                    .to_string(),
-            )),
-            Err(_) => Err(EmbedError::Remote(
-                "another embedded runtime in this process hosts the remote plane; stop it \
-                 before starting a runtime with remote.enabled"
-                    .to_string(),
-            )),
+            Ok(_) => Ok(Acquired::Lease(Self(()))),
+            // The failed stop writes the record before it sets
+            // PLANE_UNSTOPPED, so the lease and the record give one answer
+            // in this one step.
+            Err(PLANE_UNSTOPPED) => unstopped_plane().map(Acquired::Stuck).ok_or_else(|| {
+                EmbedError::Remote(
+                    "a remote plane in this process did not stop cleanly and may still answer \
+                     under this device key; restart the app process before starting a runtime \
+                     with remote.enabled"
+                        .to_string(),
+                )
+            }),
+            // A stop that failed writes the record under its mutex before
+            // its Release store of PLANE_UNSTOPPED, so between the two the
+            // lease still reads held. The record is never cleared, so a
+            // record here means that plane did not stop. A stop that still
+            // runs has no record: its plane is still up, and the start can
+            // retry.
+            Err(_) => unstopped_plane().map(Acquired::Stuck).ok_or_else(|| {
+                EmbedError::Remote(
+                    "another embedded runtime in this process hosts the remote plane; stop it \
+                     before starting a runtime with remote.enabled"
+                        .to_string(),
+                )
+            }),
         }
     }
 
@@ -177,14 +210,27 @@ impl HostedPlane {
     }
 
     /// Stop the plane, then free the lease. A plane that does not stop
-    /// cleanly keeps the process from binding another one.
+    /// cleanly keeps the process from binding another one, and
+    /// [`unstopped_plane`] names it.
     pub(crate) fn stop(self) -> Result<(), String> {
         let HostedPlane {
             plane,
             _lease: lease,
         } = self;
+        let endpoint_id = plane.endpoint_id();
+        let bound_sockets = plane
+            .bound_sockets()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let result = plane.stop();
-        if result.is_err() {
+        if let Err(error) = &result {
+            *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = Some(RemoteStatus {
+                endpoint_id,
+                bound_sockets,
+                stop_error: Some(error.clone()),
+                off_reason: None,
+            });
             lease.keep_unstopped();
         }
         result
@@ -195,16 +241,48 @@ impl HostedPlane {
 /// no host involved.
 #[cfg(test)]
 pub(crate) fn hosted_for_test(plane: Box<dyn BoundRemote>) -> Result<HostedPlane, EmbedError> {
-    Ok(HostedPlane {
-        plane,
-        _lease: RemoteLease::acquire()?,
-    })
+    match RemoteLease::acquire()? {
+        Acquired::Lease(lease) => Ok(HostedPlane {
+            plane,
+            _lease: lease,
+        }),
+        Acquired::Stuck(_) => Err(EmbedError::Remote("a plane did not stop".to_string())),
+    }
+}
+
+/// TEST SEAM: free the process's remote plane lease and forget a plane
+/// that failed to stop.
+#[cfg(test)]
+pub(crate) fn free_lease_for_test() {
+    *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    REMOTE_HOSTED.store(PLANE_FREE, Ordering::Release);
+}
+
+/// TEST SEAM: write the process record of a plane that did not stop, and
+/// leave the lease as it is.
+#[cfg(test)]
+pub(crate) fn record_unstopped_for_test(stuck: RemoteStatus) {
+    *UNSTOPPED.lock().unwrap_or_else(PoisonError::into_inner) = Some(stuck);
+}
+
+/// What [`bind`] gives a start.
+pub(crate) enum Bound {
+    /// The plane bound under the process's lease.
+    Hosted(HostedPlane),
+    /// A plane in this process did not stop, so none binds: the start goes
+    /// on with remote off.
+    Stuck(RemoteStatus),
 }
 
 /// Take the process's remote plane lease and bind the plane through the
-/// registered host.
-pub(crate) fn bind(start: RemoteStart) -> Result<HostedPlane, EmbedError> {
-    let lease = RemoteLease::acquire()?;
+/// registered host. After a plane in this process did not stop, no plane
+/// binds and the host is not asked: [`Bound::Stuck`] names the stuck plane.
+/// Every other failure is an error with its code.
+pub(crate) fn bind(start: RemoteStart) -> Result<Bound, EmbedError> {
+    let lease = match RemoteLease::acquire()? {
+        Acquired::Lease(lease) => lease,
+        Acquired::Stuck(stuck) => return Ok(Bound::Stuck(stuck)),
+    };
     let slot = host();
     let Some(host_impl) = slot.as_ref() else {
         return Err(EmbedError::Remote(
@@ -215,8 +293,8 @@ pub(crate) fn bind(start: RemoteStart) -> Result<HostedPlane, EmbedError> {
         ));
     };
     let plane = host_impl.bind(start).map_err(EmbedError::from)?;
-    Ok(HostedPlane {
+    Ok(Bound::Hosted(HostedPlane {
         plane,
         _lease: lease,
-    })
+    }))
 }

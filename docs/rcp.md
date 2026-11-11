@@ -177,7 +177,14 @@ its `intent`, deletes the
 file and opens the latch inside the same lock. The receipt log therefore
 orders engages and clears as they took effect. An `estop` that lands while
 a clear holds that lock closes the latch at once and publishes its frame
-after the clear's receipt write.
+after the clear's receipt write. When `estop` cannot write the latch file or
+its `intent` receipt, it logs the error after its frame is queued and the
+lock is released, so writing that error line does not hold the frame. A
+receipt `estop_clear` cannot write is logged after it releases the lock,
+so that line does not hold an `estop` waiting for the lock. The error line
+for a receipt that could not be written, from any tool call or eye answer,
+is also written after the receipt log's lock is released; an `estop` takes
+that lock before it queues its frame.
 
 A latch-gated call (a motion call or `estop_clear`) whose MCP request was
 already cancelled when the journal takes it from its queue is dropped, not
@@ -421,43 +428,64 @@ and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).
 ### One e-stop for the ops and rcp planes
 
 The ops e-stop that `cerulion-remoted` holds is one latch for the ops act
-verbs and the rcp plane. An `estop` call from a desk engages it before the
+verbs, the ops verb `restart` and the rcp plane. An `estop` call from a desk engages it before the
 call reaches rcpd, then rcpd engages its own latch as for any `estop`. The
 ops plane's `engage-estop` engages the same latch, then sends an `estop` to
 rcpd until rcpd answers, so rcpd engages its own latch too. While the ops latch is engaged:
 
-- every other tool call from a desk is refused before it reaches rcpd, with
-  error `-32001` and the message `refused: the robot's e-stop is engaged`;
+- every other tool call from a desk except `estop_clear` is refused before it
+  reaches rcpd, with error `-32001` and the message `refused: the robot's
+  e-stop is engaged`;
 - `estop_clear` is refused too, with `refused: the robot's ops e-stop is
   engaged; it clears when cerulion-remoted restarts`;
 - the ops act verbs `topic-publish` and `service-call` are refused;
-- `estop`, `tools/list`, the resources and the session messages still work;
-- `restart` does not read the latch: a desk with the operator role can
-  restart a graph while it is engaged, and LAN ingress does not read it
-  either.
+- the ops verb `restart` is refused (`unavailable: the robot's e-stop is
+  engaged, so restart is refused`) before it stops anything. It reads the
+  latch again after its stop command and before its start command, and an
+  engage in between means the start command does not run (`unavailable:
+  the robot's e-stop was engaged during the restart, so the graph was not
+  started again after its stop`). An engage after that second read does
+  not stop the graph the start command starts;
+- `estop`, `tools/list`, the resources and the session messages still work.
+
+LAN ingress does not read the latch.
 
 The ops latch is read when a desk's message arrives and again on the open
 connection to rcpd just before the plane sends it. A tool call already sent
 to rcpd is stopped by rcpd's own latch, which closes on an `estop` (see
-[E-stop](#e-stop)): rcpd refuses each mutating call it holds that it has not
-yet published, and the call it is running has already reached the graph, which
-receives the e-stop frame next.
+[E-stop](#e-stop)): rcpd refuses each mutating call it holds when the `estop`
+reaches it and has not yet published, and the call it is running has already
+reached the graph, which receives the e-stop frame next.
 
 The `estop` that an ops `engage-estop` sends goes over the same loopback link
 and token file, on an MCP session of its own, with the `reason` `the robot's
 ops e-stop was engaged (engage-estop)`; rcpd receipts and journals it under
-the engager's identity, `iroh:<device key hex>/account:<account hex>`.
-`engage-estop` answers without waiting for it, and the ops latch stays
-engaged whatever happens to it. It reaches rcpd once rcpd answers that its
+the engager's identity, `iroh:<device key hex>/account:<account hex>`, or
+`iroh:<device key hex>` for a device bound to no account. `engage-estop`
+answers without waiting for it, and the ops latch stays engaged whatever
+happens to it. Each attempt waits for each response head for
+`--rcp-head-timeout-ms` or 1 s, whichever is longer, and for each answer for
+10 s after its head. The `estop` reaches rcpd once rcpd answers that its
 latch closed: while rcpd is not reachable, the token file fails its check, or
 rcpd answers with an error, `cerulion-remoted` sends it again, waiting 100 ms
 after the first failure, twice as long after each further one and at most
-2 s, on a new MCP session each time. It logs the first failure at error with
-its reason, then at most one line every 30 s with the attempt count, and logs
-at warn once rcpd's latch closes. One such delivery is in flight at a time:
-an `engage-estop` while one is in flight starts none, since the one in flight
-keeps sending, and a delivery still in flight when `cerulion-remoted` stops
-ends with a warning.
+2 s, on a new MCP session each time. It logs the first failure at warn with
+its reason, and the 10th, 100th, 1000th failure and so on at warn with the
+count, the others at debug, which a release build compiles out, and logs at
+warn once rcpd's latch closes. One such delivery runs at a time, under the
+identity of the first engager since rcpd last answered one: an `engage-estop`
+while one runs starts none, since the one running keeps sending, and when that
+`engage-estop` came after the attempt rcpd answers began, the delivery sends
+the `estop` once more. A delivery that ends before rcpd answers logs at error;
+one that ends after rcpd answered that its latch closed, while it deletes
+its MCP session, logs nothing. These lines go through the daemon's log queue,
+so a stderr that takes no more lines delays no attempt (see
+[`docs/remote_plane.md`](remote_plane.md#e-stop-does-not-wait-behind-another-session)).
+When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
+the middle of an attempt first deletes the MCP session rcpd issued it, within
+2 s, inside the 5 s the stop waits for the delivery's task. A stop the
+hard-exit deadline or a second signal ends, a SIGKILL (as a `cerulion-netd`
+stop sends) or a crash may end it with no line and no `DELETE`.
 
 The latch clears only when `cerulion-remoted` restarts. To recover, restart
 `cerulion-remoted`, then clear rcpd's own latch: `estop_clear` under
