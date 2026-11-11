@@ -1105,12 +1105,16 @@ fed:
   any bag a batch deeper than its read stage's window
   (`read_identity_batch_unattributed`): the read names only its newest frame.
 - A bag that starts mid-run (a `bag record --run` attach, a lapped ring, a
-  Flashback window): a free-run replay refuses a mid-run bag before any feed is
-  planned.
+  Flashback window): on a free-run bag with one worker rank, a read that
+  continues a writer run begun before the bag's first step names no writer
+  (`read_identity_absent`). A free-run bag with several worker ranks is refused
+  by every replay, `--resim all` included, since per-rank resume anchors are
+  not supported.
 
  Replay such a bag with `--resim all` and no
 `--verify`, which re-creates each consumer's queue and labels its reads best
-effort.
+effort. A free-run bag that starts mid-run replays this way only when it holds
+one worker rank.
 
 The verdict's second line says how reads were fed: `reads: fed by recorded
 identity (R reads, F frames, ...)`, or `reads: best effort, no read identity

@@ -51,14 +51,17 @@ EOF
 cat > "$tools/curl" <<'EOF'
 #!/bin/sh
 set -eu
-if [ "$#" != 7 ] || [ "$1" != --proto ] || [ "$2" != '=https' ] ||
+if [ "$#" != 15 ] || [ "$1" != --proto ] || [ "$2" != '=https' ] ||
     [ "$3" != --tlsv1.2 ] || [ "$4" != -fsSL ] ||
-    [ "$5" != https://sh.rustup.rs ] || [ "$6" != -o ]; then
+    [ "$5" != --retry ] || [ "$6" != 5 ] || [ "$7" != --retry-delay ] || [ "$8" != 5 ] ||
+    [ "$9" != --connect-timeout ] || [ "${10}" != 30 ] ||
+    [ "${11}" != --max-time ] || [ "${12}" != 120 ] ||
+    [ "${13}" != https://sh.rustup.rs ] || [ "${14}" != -o ]; then
     printf '%s\n' 'unexpected curl arguments' >&2
     exit 1
 fi
 [ "${FIXTURE_FAIL_DOWNLOAD:-0}" = 0 ] || exit 1
-cat > "$7" <<'INIT'
+cat > "${15}" <<'INIT'
 #!/bin/sh
 set -eu
 [ "$*" = '-y --profile minimal --default-toolchain 1.93.0 --no-modify-path' ]
@@ -79,16 +82,21 @@ mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
 
 # Every individual argument is part of the oracle, including clauses that a
 # short-circuit list under set -e would otherwise silently ignore.
-for wrong_argument in 1 2 3 4 5 6; do
-    set -- --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$work/bad-init"
-    case "$wrong_argument" in
-        1) set -- wrong "$2" "$3" "$4" "$5" "$6" "$7" ;;
-        2) set -- "$1" wrong "$3" "$4" "$5" "$6" "$7" ;;
-        3) set -- "$1" "$2" wrong "$4" "$5" "$6" "$7" ;;
-        4) set -- "$1" "$2" "$3" wrong "$5" "$6" "$7" ;;
-        5) set -- "$1" "$2" "$3" "$4" wrong "$6" "$7" ;;
-        6) set -- "$1" "$2" "$3" "$4" "$5" wrong "$7" ;;
-    esac
+for wrong_argument in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+    set -- --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 \
+        --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o "$work/bad-init"
+    # Rebuild the list with argument number $wrong_argument replaced: each pass
+    # appends one argument and shifts the original off the front.
+    position=0
+    for argument do
+        position=$((position + 1))
+        if [ "$position" = "$wrong_argument" ]; then
+            set -- "$@" wrong
+        else
+            set -- "$@" "$argument"
+        fi
+        shift
+    done
     if "$tools/curl" "$@" > "$work/wrong-curl.log" 2>&1; then
         printf 'error: curl oracle accepted incorrect argument %s\n' "$wrong_argument" >&2
         exit 1

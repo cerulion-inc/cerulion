@@ -96,7 +96,38 @@ trap 'rm -rf "$tmp"' EXIT
 tarball="actionlint_${ACTIONLINT_VERSION}_${platform}.tar.gz"
 url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
 
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$url" -o "$tmp/$tarball" \
+# `--retry 5 --retry-delay 5` retries curl's transient class (a timeout, and
+# HTTP 408, 429, 500, 502, 503 and 504) five times at least five seconds
+# apart. `--retry-all-errors` widens that to every failure, a connection reset
+# included, and exists from curl 7.71.0; an older curl rejects the option and
+# the transfer never starts. So it is passed only when `curl --version` reports
+# 7.71 or newer, and a version that does not parse counts as older.
+# `--connect-timeout` and `--max-time` bound one attempt, which turns a stalled
+# connection into a timeout and so into a retry; `--retry-max-time` starts no
+# new attempt after 120 s.
+curl_version="$(curl --version 2>/dev/null | awk 'NR == 1 {print $2}')" || curl_version=""
+
+curl_retries_all_errors() {
+  local major minor
+  major="${1%%.*}"
+  minor="${1#*.}"
+  minor="${minor%%.*}"
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$major" -gt 7 ] || { [ "$major" -eq 7 ] && [ "$minor" -ge 71 ]; }
+}
+
+retry_all_errors=()
+if curl_retries_all_errors "$curl_version"; then
+  retry_all_errors=(--retry-all-errors)
+else
+  printf 'install_actionlint: curl %s does not report 7.71 or newer, so only its transient errors are retried\n' \
+    "${curl_version:-(version unknown)}" >&2
+fi
+
+curl -fsSL --retry 5 --retry-delay 5 ${retry_all_errors[@]+"${retry_all_errors[@]}"} \
+  --retry-max-time 120 --connect-timeout 30 --max-time 180 \
+  "$url" -o "$tmp/$tarball" \
   || die "download failed: $url"
 
 # Verify BEFORE unpacking: an unverified archive is not extracted at all.

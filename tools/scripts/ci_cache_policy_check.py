@@ -607,7 +607,8 @@ CACHE_HIT_PREFIX_RE = re.compile(r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.cache-hit 
 STEP_OUTPUT_GUARD_RE = re.compile(
     r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+ == '[A-Za-z0-9_.\-]+'$"
 )
-TOOL_CACHE_PATH_RE = re.compile(r"^~/\.cargo/bin/[A-Za-z0-9_.\-]+$")
+TOOL_CACHE_PATH_RE = re.compile(r"^(?:~/\.cargo/bin/[A-Za-z0-9_.\-]+|"
+                                r"~/\.cache/cerulion-tool-tarballs)$")
 EVENT_NE_PULL_REQUEST = "github.event_name != 'pull_request'"
 EVENT_EQ_RE = re.compile(r"^github\.event_name == '([A-Za-z0-9_]+)'$")
 SCOPE_SUFFIX = "-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}"
@@ -1071,9 +1072,11 @@ def _check_tool_cache(add, steps, index, step, key):
     A key with no `hashFiles(...)` has no lockfile generation, so
     `ci_cache_prune.sh` refuses it and there is nothing for the namespace policy
     to name -- gating it into a namespace the default never lists means the tool
-    is never cached and gets reinstalled on every run. Exactly one shape is
-    allowed to be keyed that way: a TOOL binary under `~/.cargo/bin/`, a few MB,
-    whose key names the pinned version. It keeps the cache-hit test (do not
+    is never cached and gets reinstalled on every run. Two shapes are allowed to
+    be keyed that way: a TOOL binary under `~/.cargo/bin/`, a few MB, whose key
+    names the pinned version; and `~/.cache/cerulion-tool-tarballs`, the pinned
+    release tarballs `tools/scripts/tool_tarball_cache.sh` fills, whose key that
+    script derives from the pins. Each keeps the cache-hit test (do not
     re-upload what was restored) and the merge-queue test (nothing could restore
     it), and carries no namespace gate and no prune step. Any other
     lockhash-free key is a violation: a per-commit key inside a namespace the
@@ -1086,8 +1089,9 @@ def _check_tool_cache(add, steps, index, step, key):
             step.line,
             "TOOL_CACHE",
             "save step %r has a key with no hashFiles(...) lockfile hash (%r), so no prune can "
-            "reclaim its generations; only a tool binary cache (one `with.path` under "
-            "`~/.cargo/bin/`) may be keyed that way, and this one caches %r"
+            "reclaim its generations; only a tool cache (one `with.path` under "
+            "`~/.cargo/bin/`, or `~/.cache/cerulion-tool-tarballs`) may be keyed that way, "
+            "and this one caches %r"
             % (label, key, step.path),
         )
         return
@@ -1624,6 +1628,30 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-machete
           key: cargo-machete-bin-${{ runner.os }}-v0.9.2
+
+  tool-tarballs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tool tarball cache key
+        id: tool-tarballs-key
+        run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
+      - name: Cache the pinned tool tarballs (restore)
+        id: cache-restore-tool-tarballs
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
+      - name: Fetch and verify the pinned tool tarballs
+        if: steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'
+        run: ./tools/scripts/tool_tarball_cache.sh fill
+      - name: Cache the pinned tool tarballs (save)
+        if: >-
+          steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'
+          && github.event_name != 'merge_group'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/cerulion-tool-tarballs
+          key: ${{ steps.tool-tarballs-key.outputs.key }}
 """.replace("<MAIN>", MAIN_ONLY_CLAUSE)
 
 # A workflow that restores and never saves costs the store nothing, so it
@@ -2055,6 +2083,26 @@ def _mutants():
              "          key: cargo-machete-bin-${{ runner.os }}-v0.9.2\n"),
         {"TOOL_CACHE"},
     ))
+    # TOOL_CACHE: the tarball cache's key over another directory under ~/.cache,
+    # which nothing prunes either.
+    out.append((
+        "TOOL_CACHE a lockhash-free key over another ~/.cache directory",
+        _mut(clean,
+             "        uses: actions/cache/save@v4\n        with:\n"
+             "          path: ~/.cache/cerulion-tool-tarballs\n",
+             "        uses: actions/cache/save@v4\n        with:\n"
+             "          path: ~/.cache\n"),
+        {"TOOL_CACHE"},
+    ))
+    # TOOL_CACHE: the tarball cache's save without its merge-queue test.
+    out.append((
+        "TOOL_CACHE the tarball cache saved from the merge queue",
+        _mut(clean,
+             "          steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'\n"
+             "          && github.event_name != 'merge_group'\n",
+             "          steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'\n"),
+        {"TOOL_CACHE"},
+    ))
     # R3: the save no longer asks whether the prune actually pruned. A run
     # behind the default-branch tip then skips the prune and uploads anyway.
     out.append((
@@ -2111,7 +2159,7 @@ def _mutants():
     out.append((
         "parse error: a YAML anchor",
         _mut(clean, "    runs-on: ubuntu-latest\n", "    runs-on: &ru ubuntu-latest\n",
-             total=7, occurrence=1),
+             total=8, occurrence=1),
         None,
     ))
     # The restore-only workflow and its two structural failures.
@@ -2136,8 +2184,8 @@ def self_test():
         fails.append("clean workflow reported %d violation(s): %s" % (len(problems), problems))
     # Guard against a fixture or reader that silently stopped seeing the steps:
     # every rule below would pass vacuously on an empty step list.
-    if stats != {"saves": 7, "prunes": 6, "policy": 1}:
-        fails.append("clean workflow parsed to %r, expected 7 saves and 6 prunes" % (stats,))
+    if stats != {"saves": 8, "prunes": 6, "policy": 1}:
+        fails.append("clean workflow parsed to %r, expected 8 saves and 6 prunes" % (stats,))
 
     cases += 1
     problems, stats = check_text("mem.yml", RESTORE_ONLY_WORKFLOW)

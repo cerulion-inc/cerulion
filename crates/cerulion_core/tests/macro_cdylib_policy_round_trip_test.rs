@@ -229,3 +229,19 @@ fn cdylib_input_meta_carries_schema_hash_matching_in_process_twin() {
          SCHEMA_HASH const (macro-emission ↔ FFI ↔ host-parse parity)"
     );
 }
+
+/// A `#[cerulion_node]` cdylib's info JSON carries
+/// `"publisher_for_every_output":true`, and the host parse keeps it. Without
+/// the key the host reads `false`, so the graph build does not refuse an
+/// output the node declares and its graph does not list, and the node then
+/// fails every tick. This test fails if `gen_cdylib` drops the key.
+#[test]
+fn cdylib_info_marks_a_macro_node_as_needing_a_publisher_for_every_output() {
+    let path = find_cdylib("test_node_macro_cdylib");
+    let node = DylibNodeEntry::load(&path).expect("load macro cdylib");
+    let info = node.info().expect("info should parse");
+    assert!(
+        info.publisher_for_every_output(),
+        "the macro cdylib info JSON must carry \"publisher_for_every_output\":true"
+    );
+}

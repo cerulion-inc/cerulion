@@ -159,8 +159,13 @@ jobs:
           expected=d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab
           # Both fetches write to a file: curl discards a partial file before a
           # retry, which it cannot do for output sent into a pipe.
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/gradle-8.9-bin.zip "$url"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/gradle-8.9-bin.zip.sha256 "$url.sha256"
+          # --connect-timeout and --max-time bound one attempt, so a stalled
+          # connection times out and is retried; --retry-max-time starts no new
+          # attempt after 120 s.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 30 --max-time 300 -o /tmp/gradle-8.9-bin.zip "$url"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 30 --max-time 60 -o /tmp/gradle-8.9-bin.zip.sha256 "$url.sha256"
           published="$(awk '{print $1}' /tmp/gradle-8.9-bin.zip.sha256)"
           test "$published" = "$expected"
           echo "$expected  /tmp/gradle-8.9-bin.zip" | sha256sum -c -
