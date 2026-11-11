@@ -1747,7 +1747,7 @@ fn run(cli: Cli) -> CliResult<()> {
                             local || network.is_some(),
                             graph_cmd::PRODUCTION_TRACE_LIMIT,
                             None, // `node run` does not support recording (use `graph run --record`)
-                            graph_cmd::RecordEnvMode::default(), // unused (record is None)
+                            graph_cmd::RecordEnvMode::default(), // renders the run's env.json
                             graph_cmd::RecordCpu::default(), // unused (record is None)
                             // `node run`'s temp single-node graph must
                             // never auto-partition: no consent seam.

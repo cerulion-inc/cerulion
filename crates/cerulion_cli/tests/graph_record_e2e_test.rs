@@ -181,6 +181,19 @@ const PROBE_SECRET_VALUE: &str = "cer-record-probe-secret-value";
 /// FNV-1a 64 test vectors.
 const PROBE_SECRET_FNV64: &str = "f63ebe3c0e65672d";
 
+/// The secret-NAME probe: an ALLOWLISTED name (`CERULION_*`) whose `TOKEN`
+/// segment marks it as a secret, so the default `--record-env allowlist` must
+/// hash its value even though the name is on the allowlist.
+const PROBE_TOKEN_NAME: &str = "CERULION_E2E_PROBE_TOKEN";
+
+/// The secret-name probe's value: long and distinctive, like
+/// [`PROBE_SECRET_VALUE`], so its absence from the bytes is not a coincidence.
+const PROBE_TOKEN_VALUE: &str = "cer-record-probe-token-value";
+
+/// FNV-1a 64 of [`PROBE_TOKEN_VALUE`], computed outside the tree with the
+/// same parameters as [`PROBE_SECRET_FNV64`].
+const PROBE_TOKEN_FNV64: &str = "5c2b3670b7a85a12";
+
 /// FNV-1a 64 over `bytes`, written out here rather than imported: the production
 /// renderer hashes with `cerulion_core::wire::fnv1a_hash`, and calling that same
 /// function to check its own output would assert nothing. Anchored on the
@@ -236,6 +249,9 @@ fn spawn_graph_record(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, Path
         // `PROBE_SECRET_FNV64` there. Set in the harness (not one arm) so every
         // recording in this file is made in the presence of a secret.
         .env(PROBE_SECRET_NAME, PROBE_SECRET_VALUE)
+        // The secret-NAME probe: allowlisted by prefix, hashed by its `TOKEN`
+        // segment (`PROBE_TOKEN_FNV64` in the happy-path arm).
+        .env(PROBE_TOKEN_NAME, PROBE_TOKEN_VALUE)
         // Keep the captured log PLAIN. `cerulion_core::init_logging` builds a
         // `fmt::layer()` with tracing-subscriber's `ansi` feature on, which
         // italicises field NAMES and dims the `=`, so a field arrives as
@@ -398,6 +414,11 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
         PROBE_SECRET_FNV64,
         "the recorded constant must be the hash of the probe value it names"
     );
+    assert_eq!(
+        format!("{:016x}", fnv1a_64(PROBE_TOKEN_VALUE.as_bytes())),
+        PROBE_TOKEN_FNV64,
+        "the recorded constant must be the hash of the token probe value it names"
+    );
 
     let env_json: serde_json::Value =
         serde_json::from_slice(&env_att.data).expect("env.json parses as JSON");
@@ -424,12 +445,32 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
         "an ALLOWLISTED name (CERULION_*) keeps its value verbatim — this is the half that fails \
          if the default is mapped to `none` or if everything is redacted"
     );
-    // The secret itself never reaches the artifact. Checked over the RAW bytes,
-    // not the parsed value, so a second copy anywhere in the attachment (a
-    // duplicated key, a nested render) is caught too.
+    // An ALLOWLISTED name with a secret marker segment is hashed like a
+    // non-allowlisted one, while `CERULION_NETWORK` above stays verbatim.
+    let token = &env_json[PROBE_TOKEN_NAME];
+    assert_eq!(
+        token["redacted"],
+        serde_json::Value::Bool(true),
+        "a CERULION_* name with a TOKEN segment must be recorded as \
+         {{\"redacted\":true,\"fnv64\":...}} under the DEFAULT --record-env allowlist; got {token}"
+    );
+    assert_eq!(
+        token["fnv64"].as_str(),
+        Some(PROBE_TOKEN_FNV64),
+        "the secret-named value must carry its FNV-1a 64 so replay can DETECT divergence; got \
+         {token}"
+    );
+    // The secrets themselves never reach the artifact. Checked over the RAW
+    // bytes, not the parsed value, so a second copy anywhere in the attachment
+    // (a duplicated key, a nested render) is caught too.
+    let env_text = String::from_utf8_lossy(&env_att.data);
     assert!(
-        !String::from_utf8_lossy(&env_att.data).contains(PROBE_SECRET_VALUE),
+        !env_text.contains(PROBE_SECRET_VALUE),
         "the env.json attachment must not contain the secret literal"
+    );
+    assert!(
+        !env_text.contains(PROBE_TOKEN_VALUE),
+        "the env.json attachment must not contain the secret-named token literal"
     );
     // A REAL `--record` bag carries the recorder-host
     // identity attachment, stamped with THIS host's arch/os (replay warns on
