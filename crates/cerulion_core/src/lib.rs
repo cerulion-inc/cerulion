@@ -716,8 +716,9 @@ pub mod wire;
 ///   `ReplayReadViolation` and its kind) is reached through a crate-owned
 ///   `Arc` from that field, so those rows enter the `abi_layout` table at this
 ///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
-///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
-///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///   `(u64, Option<u64>)` to `RefillOutcome`, which was host-side only at v26:
+///   the legacy refill export remained unchanged. Stable node libraries now
+///   use the host head operations.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///

@@ -1054,6 +1054,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn android_init_refusal_preserves_the_composed_native_error() {
+        let error = classify(
+            Phase::Init,
+            abi::Status {
+                code: abi::status_code::FAILED,
+                kind: 0,
+                error: 0,
+            },
+            "the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)".to_owned(),
+            "<library path>",
+        );
+        assert_eq!(error.to_string(), "Node '<library path>' error: init failed: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)");
+    }
+
+    #[test]
     fn state_failure_codes_preserve_the_native_export_contract() {
         for (code, native) in [
             (abi::status_code::BUFFER_TOO_SMALL, -6),

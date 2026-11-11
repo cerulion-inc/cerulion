@@ -981,13 +981,13 @@ wake on it, so the set is served at the next boundary rather than waiting for a
 new arrival.
 
 **Not every Sync node gets this.** Per-set delivery needs the node's trigger
-reads to go through the frozen-slot path, so it is what `#[cerulion_node]`
-nodes get, in-process and cdylib alike. A node that cannot provide it keeps
+reads to go through the frozen-slot path. Stable node libraries use the host
+head operations. A hand-written entry that cannot provide them keeps
 the **legacy latest-per-set** semantic (it still fires once per
 complete alignment, but its tick reads the FRESHEST frame on each trigger
 rather than the members the alignment chose, and both skip counters stay 0
 forever, so the depth-tuning advice above does not apply to it). Two ways in:
-a legacy `--raw-ffi` node, or running with
+a hand-written `NodeEntry` without host head operations, or running with
 `CERULION_DRAIN_DISCIPLINE=separate`. It is never silent: the graph build
 emits one `warn!` naming the node, the reason and the fix.
 

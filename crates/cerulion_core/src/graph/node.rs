@@ -2930,28 +2930,20 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
     }
 }
 
-/// STOPGAP: install a cdylib-local stderr `fmt` tracing subscriber so
-/// node-side `tracing` events become host-visible.
+/// Install a cdylib-local stderr `fmt` tracing subscriber for node events.
 ///
 /// A cdylib statically links its OWN copy of `cerulion_core` + `tracing`, so its
 /// `tracing` global dispatcher is a distinct static from the host binary's. The
 /// host initializing its subscriber does nothing for the cdylib's static, so
-/// without this every `tracing::error!`/`warn!`/`info!` emitted by node-side code
-/// (including `cerulion_core`'s loud-by-design
-/// [`OutputProxy`]
-/// discard error) dispatches to a no-op — production dylib graphs run silently
-/// broken. This installs an `fmt` subscriber writing to `stderr` on the CALLING
-/// linked copy's `tracing` static, making those events land on the process's
-/// stderr. (The post-launch (a) design bridges node-side events into the host's
-/// own subscriber for unified filtering/formatting; this is the interim fix.)
+/// without this the node's own `tracing` events have no subscriber. This
+/// installs a `fmt` subscriber writing to stderr on the calling linked copy.
+/// The host emits stable-node [`OutputProxy`] discard and recovery diagnostics
+/// through its own subscriber.
 ///
 /// Contract:
-/// - Called from CDYLIB-side code only. A `#[cerulion_node]` node never calls
-///   it: the macro-generated `cerulion_node_init` does, before any node code
-///   runs. A hand-written raw-FFI node library gets the subscriber only if
-///   its own init calls this function; the `cerulion node create --raw-ffi`
-///   template does not, so such a node's `tracing` output stays silent until
-///   it does. See "Node (cdylib) logs" in `docs/user-api.md`. Because the symbol
+/// - Called from cdylib-side code. The generated stable create and the
+///   `cerulion node create --raw-ffi` template install it for the node's own
+///   events before constructing the node or calling its init. Because the symbol
 ///   resolves to the cdylib's statically-linked `cerulion_core`, it operates on
 ///   that linked copy's `tracing` static. HOST processes never call it.
 /// - Guarded by a function-local [`Once`](std::sync::Once). That static is
@@ -4760,15 +4752,15 @@ fn cstr_to_lossy_string(c_str: &CStr) -> String {
 
 /// Truncate `s` to at most
 /// `max_bytes` bytes, walking down to the nearest UTF-8 char boundary so
-/// the returned slice is always valid `&str`. Used by `info()` to
-/// log a JSON prefix without panicking on multi-byte char cutoffs.
+/// the returned slice is always valid `&str`. Used by `fuzz_parse_info_json`
+/// to report a JSON prefix without panicking on multi-byte char cutoffs.
 ///
 /// Properties:
 /// - For `s.len() <= max_bytes`: returns the whole string (no-op loop).
 /// - For `max_bytes == 0`: returns `""`.
 /// - For all other cases: result length is `<= max_bytes` and the
 ///   slice is a valid prefix at a char boundary.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-helpers"))]
 fn safe_utf8_prefix(s: &str, max_bytes: usize) -> &str {
     let mut end = max_bytes.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {

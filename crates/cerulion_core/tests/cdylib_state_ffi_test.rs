@@ -1890,7 +1890,11 @@ fn held_accumulate_restore_refusals_preserve_full_native_reasons_and_state() {
     ] {
         let error = entry.restore_state(&one_held_vector_record(hash, size, len)).unwrap_err();
         let TransportError::GraphError { reason } = error else { panic!("restore must keep native state error class") };
-        assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: accumulate input `tf` cannot be restored: a held frame is refused: {detail}. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+        let expected = format!(
+            "node '{}' state restore failed (code -5): cerulion_node_restore_state: accumulate input `tf` cannot be restored: a held frame is refused: {detail}. The node may be PARTIALLY restored — the run must fail rather than continue (§2.8)", // dash-ok: native state error text kept byte-identical.
+            path.display()
+        );
+        assert_eq!(reason, expected);
         let mut captured = VecSink::new();
         entry.capture_state(&mut captured).unwrap();
         assert_eq!(captured.into_inner(), [1, 0, 0, 0, 2, 0, 0, 0, b't', b'f', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -1917,7 +1921,11 @@ fn truncated_accumulate_drop_counters_keep_native_eight_byte_reads() {
         let TransportError::GraphError { reason } = error else {
             panic!("restore must keep native state error class")
         };
-        assert_eq!(reason, format!("node '{}' state restore failed (code -5): cerulion_node_restore_state: state blob truncated: needed 8 more byte(s), 7 remain. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)", path.display()));
+        let expected = format!(
+            "node '{}' state restore failed (code -5): cerulion_node_restore_state: state blob truncated: needed 8 more byte(s), 7 remain. The node may be PARTIALLY restored — the run must fail rather than continue (§2.8)", // dash-ok: native state error text kept byte-identical.
+            path.display()
+        );
+        assert_eq!(reason, expected);
     }
     entry.shutdown().unwrap();
 }
