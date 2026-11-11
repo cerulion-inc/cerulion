@@ -144,6 +144,7 @@ fn register_egress(
         ingress: vec![],
     };
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: canonical.clone(),
             schema_name: schema_name.to_string(),

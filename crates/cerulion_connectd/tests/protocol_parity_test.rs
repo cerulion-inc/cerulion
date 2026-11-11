@@ -49,6 +49,7 @@ fn a_catalog() -> CatalogReply {
         robot: "go2".to_string(),
         entries: vec![
             CatalogEntry {
+                egress_qos: None,
                 topic: "/imu".to_string(),
                 schema_hash: Some(0xDEAD_BEEF_CAFE_F00D),
                 schema_name: Some("sensor_msgs/Imu".to_string()),
@@ -57,6 +58,7 @@ fn a_catalog() -> CatalogReply {
                 liveness: None,
             },
             CatalogEntry {
+                egress_qos: None,
                 topic: "/silent".to_string(),
                 schema_hash: None,
                 schema_name: None,

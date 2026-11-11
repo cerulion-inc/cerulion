@@ -95,6 +95,7 @@ fn the_document_carries_runs_nodes_and_a_sorted_catalog() {
         g.catalog.entries,
         vec![
             CatalogEntry {
+                egress_qos: None,
                 topic: "/a".into(),
                 schema_hash: None,
                 schema_name: None,
@@ -103,6 +104,7 @@ fn the_document_carries_runs_nodes_and_a_sorted_catalog() {
                 liveness: None,
             },
             CatalogEntry {
+                egress_qos: None,
                 topic: "/b".into(),
                 schema_hash: None,
                 schema_name: None,

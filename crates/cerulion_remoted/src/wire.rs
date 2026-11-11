@@ -208,6 +208,9 @@ pub struct StatusReply {
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicStatus {
+    /// Frames refused by a declared reliable queue; absent on a legacy source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_refused: Option<u64>,
     /// The canonical absolute topic name.
     pub topic: String,
     /// Frames written to QUIC.
@@ -810,7 +813,28 @@ async fn handle_request(
                     }
                 }
             };
-            match taps.demand(&manager, connection, &topic).await {
+            let schemas = match &plane.local_schemas {
+                Some(source) => match source.load(manager.iox_shm_identity()).await {
+                    Ok(schemas) => Some(schemas),
+                    Err(error) => {
+                        return WireResponse::Error {
+                            topic: Some(topic),
+                            message: error.to_string(),
+                        }
+                    }
+                },
+                None => None,
+            };
+            if let Some(refusal) = metadata_refusal(authorizer, connection, Some(&topic)) {
+                return refusal;
+            }
+            let qos = schemas
+                .as_ref()
+                .and_then(|schemas| schemas.egress_qos(&topic));
+            match taps
+                .demand_with_qos(&manager, connection, &topic, qos)
+                .await
+            {
                 Ok(()) => WireResponse::DemandAccepted { topic },
                 Err(e) => WireResponse::Error {
                     topic: Some(topic),
@@ -930,12 +954,12 @@ async fn build_catalog(
     // Enumerate topics + peek the unknown ones off the async runtime, under a
     // whole-catalog time cap. `peeked` returns the freshly-observed hashes so we
     // can fold them into the per-connection cache below.
-    let peeked: Vec<(String, Option<u64>)> = tokio::task::spawn_blocking(move || {
+    let peeked: Vec<(String, Option<u64>, Option<u32>)> = tokio::task::spawn_blocking(move || {
         let topics = manager.list_topics().map_err(|e| e.to_string())?;
         // Hard stop for the SUM of this catalog's peeks (the DoS bound).
         let catalog_deadline = Instant::now() + CATALOG_TOTAL_PEEK_BUDGET;
         let per_topic = crate::tap::catalog_peek_budget();
-        let rows: Vec<(String, Option<u64>)> = topics
+        let rows: Vec<(String, Option<u64>, Option<u32>)> = topics
             .into_iter()
             .filter(|topic| manager.remote_topic_allowed(topic).unwrap_or(false))
             .map(|topic| {
@@ -956,10 +980,11 @@ async fn build_catalog(
                         }
                     }
                 };
-                (topic, hash)
+                let producers = manager.topic_publisher_count_checked(&topic);
+                (topic, hash, producers)
             })
             .collect();
-        Ok::<Vec<(String, Option<u64>)>, String>(rows)
+        Ok::<Vec<(String, Option<u64>, Option<u32>)>, String>(rows)
     })
     .await
     .map_err(|e| WireError::Transport(format!("catalog assembly task join failed: {e}")))?
@@ -977,7 +1002,7 @@ async fn build_catalog(
     // the closest 2-variant fit.
     let entries: Vec<CatalogEntry> = peeked
         .into_iter()
-        .map(|(topic, hash)| {
+        .map(|(topic, hash, producer_count)| {
             if let Some(h) = hash {
                 taps.record_schema_hash(&topic, h);
             }
@@ -986,17 +1011,15 @@ async fn build_catalog(
                 None => None,
             };
             CatalogEntry {
+                egress_qos: schemas
+                    .as_ref()
+                    .and_then(|schemas| schemas.egress_qos(&topic))
+                    .cloned(),
                 topic,
                 schema_hash: hash,
                 schema_name,
                 provenance: CatalogProvenance::Runtime,
-                // The WAN/iroh remoted plane does not stamp the live
-                // producer count (the LAN gateway's `build_catalog_reply_from_bridge`
-                // probes it via `topic_publisher_count`). `None` degrades the desk to
-                // a rendering with no liveness affordance for a WAN-served
-                // catalog, exactly like an older robot. (The same probe could run
-                // here off the `taps` SHM handle.)
-                producer_count: None,
+                producer_count,
                 // Likewise, the WAN/iroh remoted plane runs no
                 // `TopicLivenessObserver` (that lives in the LAN gateway's drive
                 // loop). `None` is the UNKNOWN verdict — the desk renders a

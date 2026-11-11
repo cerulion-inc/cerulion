@@ -2723,6 +2723,7 @@ fn build_catalog_reply_from_bridge(
             _ => None,
         };
         CatalogEntry {
+            egress_qos: None,
             topic,
             schema_hash,
             schema_name,

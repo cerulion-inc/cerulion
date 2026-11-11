@@ -4419,6 +4419,7 @@ fn serving_gateway_names_runtime_route_via_hash_and_serves_schema() {
     // The serving: the custom Widget doc + the hash→name reverse binding, with NO
     // explicit topic→name binding (so the catalog MUST use the hash reverse map).
     let serving = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![],
         schema_docs: vec![cerulion_core::SchemaDoc {
             qualified: widget_q.to_string(),
@@ -4924,6 +4925,7 @@ fn c5c_demand_authorizer_refuses_catalog_and_schema_enumeration() {
     // A gateway that SERVES a schema doc (so the AllowAll schema path returns a real
     // `found` closure, and the deny path visibly withholds it).
     let serving = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![],
         schema_docs: vec![cerulion_core::SchemaDoc {
             qualified: served_q.to_string(),
@@ -6726,6 +6728,7 @@ fn a_runtime_topic_of_a_builtin_type_is_catalog_named_through_the_corpus_binding
         "the control hash must be absent from the corpus map"
     );
     let serving = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![], // NO topic→name binding: the catalog MUST use the hash map
         schema_docs: vec![],   // built-ins are never served — the desk has them
         schema_hashes: bindings,
@@ -6835,6 +6838,7 @@ fn a_merged_serving_reaches_the_live_catalog_and_schema_serve_first_wins() {
 
     let boot_doc_text = "int32 alpha\n";
     let boot_serving = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![],
         schema_docs: vec![cerulion_core::SchemaDoc {
             qualified: "boot_msgs/Alpha".to_string(),
@@ -6894,6 +6898,7 @@ fn a_merged_serving_reaches_the_live_catalog_and_schema_serve_first_wins() {
     // doc AND a conflicting rebind of the BOOT hash (which must not take).
     let later_doc_text = "float64 v\nint32 n\n";
     let later_serving = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![],
         schema_docs: vec![cerulion_core::SchemaDoc {
             qualified: "later_msgs/Widget".to_string(),
@@ -6962,6 +6967,7 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
         schema_name: q.to_string(),
     };
     let mut acc = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![topic("/a", "pkg/A")],
         schema_docs: vec![doc("pkg/A", "int32 a\n")],
         schema_hashes: vec![binding(1, "pkg/A")],
@@ -6971,6 +6977,7 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
     // rebind of /a (canonicalized: the bare "a" spelling must still collide), a
     // rebind of hash 1, and a different doc under pkg/A. First-wins keeps A's.
     let later = cerulion_core::SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![topic("a", "pkg/WrongA"), topic("/b", "pkg/B")],
         schema_docs: vec![doc("pkg/A", "int64 wrong\n"), doc("pkg/B", "int32 b\n")],
         schema_hashes: vec![binding(1, "pkg/WrongA"), binding(2, "pkg/B")],

@@ -4627,6 +4627,23 @@ fn resolve_gateway_launch(
             .schema_hashes
             .retain(|binding| allowed.contains(&binding.qualified));
     }
+    // Carry an explicit policy for every announced topic, including default
+    // reliable topics. An omitted policy is unknown to an authenticated consumer.
+    schema_serving.egress_qos = plan
+        .announce
+        .iter()
+        .map(|topic| {
+            net.egress_qos
+                .iter()
+                .find(|policy| policy.topic == *topic)
+                .cloned()
+                .unwrap_or_else(|| cerulion_core::EgressQos {
+                    topic: topic.clone(),
+                    reliability: cerulion_core::EgressReliability::Reliable,
+                    send_queue: None,
+                })
+        })
+        .collect();
     // Mint the robot identity for
     // the discovery surface (the mDNS beacon + the announce keys' robot chunk +
     // the `cerulion_q/{robot}/**` query surface — ALL from this ONE value, so
@@ -25563,6 +25580,7 @@ process_groups:
     #[test]
     fn gateway_handoff_round_trips_schema_serving_and_tolerates_absent_field() {
         let serving = cerulion_core::SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![cerulion_core::TopicSchema {
                 topic: "/t".to_string(),
                 schema_name: "pkg/Type".to_string(),

@@ -33,6 +33,7 @@ const BUILTIN_HASH: u64 = 0x1112_1314_1516_1718;
 
 fn serving() -> SchemaServing {
     SchemaServing {
+        egress_qos: Vec::new(),
         served_topics: vec![TOPIC.into(), RAW_TOPIC.into()],
         topic_schemas: vec![TopicSchema {
             topic: TOPIC.into(),

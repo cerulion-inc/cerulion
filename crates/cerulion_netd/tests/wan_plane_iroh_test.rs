@@ -1314,6 +1314,7 @@ async fn recording_robot_recording_epochs(
                 entries: catalog_topics
                     .iter()
                     .map(|(t, h)| CatalogEntry {
+                        egress_qos: None,
                         topic: t.clone(),
                         schema_hash: Some(*h),
                         schema_name: None,

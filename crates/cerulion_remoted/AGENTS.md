@@ -39,9 +39,10 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
-- Metadata reads the EXISTING netd snapshot (namespace checked; never starts netd)
-  or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
-  CAP_OBSERVE after async provider work (`local_schema_provider_test`).
+- Metadata reads namespace-checked netd snapshots (no startup) or in-process
+  `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
+- Wire graph demands honor declared Reliable/send_queue; unknown policy stays
+  unknown, best-effort refuses. Count refusals separately; checked producer counts.
 - Same-user outbound control reuses the endpoint, runtime and transport node.
   Refuse key/namespace mismatch before dialing; retire outbound sessions only.
 

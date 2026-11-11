@@ -382,3 +382,118 @@ fn external_topic_with_attached_publisher_never_warns() {
         }
     });
 }
+
+#[test]
+fn declared_ingress_precreates_full_consumer_capacity_and_delivers_oracle_bytes() {
+    use cerulion_core::graph::config::{NetworkBlock, NetworkMode};
+    use cerulion_core::graph::node::{
+        BackpressurePolicy, ClosureNodeEntry, InputConsume, InputMeta, MacroPolicy, NodeInfo,
+    };
+    use cerulion_core::transport::network::ReinjectOutcome;
+    use cerulion_core::transport::PublisherProvisioning;
+    use cerulion_core::wire::{StepTag, WireHeader};
+    use std::sync::Mutex;
+
+    for _ in 0..2 {
+        let (mut config, mut factories) = ext_graph(Arc::new(AtomicU64::new(0)));
+        config.network = Some(NetworkBlock {
+            mode: NetworkMode::Peer,
+            ingress: vec!["/ext/cam".into()],
+            ..Default::default()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let output = seen.clone();
+        let entry = ClosureNodeEntry::new(
+            NodeInfo::with_meta(
+                vec![InputMeta {
+                    name: "inp".into(),
+                    schema_hash: Vector3::SCHEMA_HASH,
+                    trigger: true,
+                    depth: 48,
+                    backpressure: BackpressurePolicy::DropOldest,
+                    expect_within_ms: None,
+                    consume: InputConsume::Fifo,
+                }],
+                vec![],
+            )
+            .with_policy(MacroPolicy::DataTrigger {
+                input_name: "inp".into(),
+            }),
+            move |ctx| {
+                if let Some(input) = ctx.subscriber_mut("inp") {
+                    if let Ok(Some(value)) = input.try_view::<Vector3, _>(|v| v.x.to_bits()) {
+                        output.lock().unwrap().push(value);
+                    }
+                }
+                Ok(())
+            },
+        );
+        factories.insert("consumer".into(), Box::new(entry));
+        let mut runtime =
+            GraphRuntime::build_for_test(config, factories, Arc::new(VirtualClock::new()), 8)
+                .unwrap();
+        let cfg = &runtime.owned_topic_configs()["/ext/cam"];
+        assert_eq!(
+            cfg.publisher_provisioning,
+            PublisherProvisioning::SingleWriter
+        );
+        assert!(cfg.subscriber_max_buffer_size >= 48);
+        let manager = runtime.test_transport().unwrap().clone();
+        let injector = manager
+            .create_remote_ingress_injector(
+                "/ext/cam",
+                Vector3::SCHEMA_HASH,
+                MaxSliceLen::const_new(256),
+            )
+            .unwrap();
+        assert!(manager
+            .create_publisher("/ext/cam", MaxSliceLen::const_new(256), 0)
+            .is_err());
+        let mut tap = manager.create_data_only_subscriber("/ext/cam").unwrap();
+        let mut oracle = Vec::new();
+        for (sequence, x) in [1.25f64, 2.5, 5.0].into_iter().enumerate() {
+            let mut frame = vec![0; WireHeader::SIZE + 24];
+            WireHeader {
+                schema_hash: Vector3::SCHEMA_HASH,
+                total_size: 64,
+                offset_table_offset: 64,
+                offset_table_count: 0,
+                sequence: sequence as u32,
+                timestamp_ns: 100 + sequence as u64,
+                step_tag: StepTag::UNTAGGED,
+            }
+            .write_to_buf(&mut frame[..WireHeader::SIZE]);
+            frame[40..48].copy_from_slice(&x.to_le_bytes());
+            frame[48..56].copy_from_slice(&(-2.0f64).to_le_bytes());
+            frame[56..64].copy_from_slice(&(3.0f64).to_le_bytes());
+            assert!(
+                matches!(injector.reinject_raw(&frame), ReinjectOutcome::Injected { recipients } if recipients >= 2)
+            );
+            oracle.push(frame);
+        }
+        let mut delivered = Vec::new();
+        let mut batch = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(tap.drain_owned(1, &mut batch).unwrap(), 1);
+            delivered.push(batch[0].payload().to_vec());
+            batch.clear();
+        }
+        assert_eq!(delivered, oracle);
+        for _ in 0..3 {
+            runtime.step(Duration::from_millis(1));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1.25f64.to_bits(), 2.5f64.to_bits(), 5.0f64.to_bits()]
+        );
+        drop(delivered);
+        drop(injector);
+        manager
+            .create_remote_ingress_injector(
+                "/ext/cam",
+                Vector3::SCHEMA_HASH,
+                MaxSliceLen::const_new(256),
+            )
+            .expect("release makes the canonical writer slot reusable");
+    }
+}

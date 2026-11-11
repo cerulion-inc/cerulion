@@ -781,6 +781,13 @@ network:
 
 ### The egress/ingress model
 
+Declared graph ingress reserves one canonical local writer at the complete
+consumer capacity before an injector opens. Authenticated wire producers
+carry explicit Reliable/send_queue metadata: congestion refuses new frames
+and preserves queued frames, with `wan_refused` distinct from `wan_dropped`.
+A missing policy is unverified; best-effort datagram graph ingress is refused
+on the authenticated wire path.
+
 The graph file stays the single source of truth: under a
 Strict block, which topics cross the machine boundary is declared in YAML.
 

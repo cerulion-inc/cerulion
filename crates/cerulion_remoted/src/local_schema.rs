@@ -43,6 +43,7 @@ impl LocalSchemaSource {
 }
 
 pub(crate) struct LocalSchemas {
+    egress_qos: BTreeMap<String, cerulion_core::EgressQos>,
     topic_types: BTreeMap<String, String>,
     hash_types: BTreeMap<u64, String>,
     docs: BTreeMap<String, SchemaDoc>,
@@ -51,10 +52,17 @@ pub(crate) struct LocalSchemas {
 impl LocalSchemas {
     fn from_serving(serving: SchemaServing) -> Self {
         let mut result = Self {
+            egress_qos: BTreeMap::new(),
             topic_types: BTreeMap::new(),
             hash_types: BTreeMap::new(),
             docs: BTreeMap::new(),
         };
+        for policy in serving.egress_qos {
+            result
+                .egress_qos
+                .entry(policy.topic.clone())
+                .or_insert(policy);
+        }
         // The egress source merges first-wins; retain that rule when indexing.
         for binding in serving.topic_schemas {
             result
@@ -79,6 +87,10 @@ impl LocalSchemas {
             .get(topic)
             .or_else(|| hash.and_then(|hash| self.hash_types.get(&hash)))
             .map(String::as_str)
+    }
+
+    pub(crate) fn egress_qos(&self, topic: &str) -> Option<&cerulion_core::EgressQos> {
+        self.egress_qos.get(topic)
     }
 
     pub(crate) fn reply(&self, robot: &str, topic: &str, hash: Option<u64>) -> SchemaReply {
@@ -165,6 +177,7 @@ mod tests {
     #[test]
     fn indexing_preserves_first_wins_and_topic_binding_precedes_hash_binding() {
         let schemas = LocalSchemas::from_serving(SchemaServing {
+            egress_qos: Vec::new(),
             served_topics: vec!["/reading".into()],
             topic_schemas: vec![
                 TopicSchema {

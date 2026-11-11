@@ -1,6 +1,6 @@
 # cerulion_core - agent notes
 
-Wire, codegen, iceoryx2, scheduler/graph and gateway; per-binary serial test rules.
+Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rules.
 
 ## Invariants
 - Excluded producers hold guards before data ports; remote taps, mirrors and announces retain opposite leases until withdrawal. Remote metadata uses `collect_remote_run_entries`: v2 private/v1 public, local accepts both; hide private ids and counts. No frame-path checks.
@@ -31,8 +31,8 @@ Wire, codegen, iceoryx2, scheduler/graph and gateway; per-binary serial test rul
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
-- `check_public_surface.sh`: in-code graphs belong in tests, including this crate's examples;
-  no shipped tracker ids/typographic dashes. Never bulk-edit strings; removed dashes lower ledgers.
+- Shipped surface: in-code graphs are tests only; no tracker ids or typographic
+  dashes. Never bulk-rewrite strings; removing a dash lowers its ledger line.
 
 ## Testing
 
@@ -56,3 +56,5 @@ Wire, codegen, iceoryx2, scheduler/graph and gateway; per-binary serial test rul
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
+- Declared ingress precreates a SingleWriter service at full consumer capacity;
+  ordinary producerless absolute sources remain External.

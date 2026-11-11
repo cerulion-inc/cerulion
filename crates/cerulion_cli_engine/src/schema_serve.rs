@@ -531,6 +531,7 @@ fn build_schema_serving_inner(
     }
 
     SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas,
         schema_docs,
         schema_hashes,
