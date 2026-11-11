@@ -180,4 +180,26 @@ mod tests {
         assert!(registry.rows.lock().unwrap().is_empty());
         assert_eq!(*registry.next.lock().unwrap(), u64::MAX);
     }
+
+    #[test]
+    fn destructor_panic_invalidates_the_handle_and_preserves_other_instances() {
+        struct Drops {
+            panic: bool,
+        }
+        impl Drop for Drops {
+            fn drop(&mut self) {
+                assert!(!self.panic, "destructor oracle");
+            }
+        }
+        let registry = NodeRegistry::default();
+        let first = registry.insert(Drops { panic: true }).unwrap();
+        let second = registry.insert(Drops { panic: false }).unwrap();
+        assert!(matches!(registry.destroy(first), Err(CallError::Panic)));
+        assert!(matches!(
+            registry.call(first, |_| Ok(())),
+            Err(CallError::InvalidHandle)
+        ));
+        registry.call(second, |_| Ok(())).unwrap();
+        registry.destroy(second).unwrap();
+    }
 }

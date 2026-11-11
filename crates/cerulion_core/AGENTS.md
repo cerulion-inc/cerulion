@@ -33,8 +33,11 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
 - `graph/node_plugin_abi/` owns local adapters for the checked C tables. Host
-  samples remain behind integer leases; local readers/writers drop before release.
+  samples remain behind integer leases. Ordinary receive owners outlive the entire
+  callback, including an early view drop; local writers drop before release.
   Adapter oracle tests: `cargo test -p cerulion_core --lib graph::node_plugin_abi`.
+  Bootstrap/metadata/refusal fixture: `node_plugin_exports_test` (build
+  `test_node_macro_cdylib` first; no transport is created).
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
   graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
   a string literal (a removed dash lowers the file's ledger line).

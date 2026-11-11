@@ -1819,8 +1819,13 @@ fn gen_cdylib(
         TokenStream::new()
     };
 
-    let stable =
-        crate::plugin_codegen::generate(entry_name, node_name, inputs, node_level.external);
+    let stable = crate::plugin_codegen::generate(
+        entry_name,
+        node_name,
+        inputs,
+        outputs,
+        node_level.external,
+    );
     quote! {
         #[allow(unexpected_cfgs)]
         #[cfg(feature = "cdylib")]
@@ -1852,14 +1857,10 @@ fn gen_cdylib(
                 #(
                     if !first_input { inputs.push(','); }
                     first_input = false;
-                    let _: () = <#input_field_types as #__cer_root::message::ShmMessage>::_SHM_INVARIANTS;
                     inputs.push_str(&::std::format!(
-                        r#"{{"name":"{}","schema_hash":{},"wire_fixed_size":{},"variable_count":{},"alignment":{}{}}}"#,
+                        r#"{{"name":"{}","schema_hash":{}{}}}"#,
                         #input_field_names,
                         <#input_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
-                        <#input_field_types as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
-                        <#input_field_types as #__cer_root::message::ShmMessage>::VARIABLE_FIELD_COUNT,
-                        #__cer_root::shm_runtime::FRAME_ALIGN,
                         #input_key_suffixes,
                     ));
                 )*
@@ -1870,7 +1871,6 @@ fn gen_cdylib(
                 #(
                     if !first { outputs.push(','); }
                     first = false;
-                    let _: () = <#output_field_types as #__cer_root::message::ShmMessage>::_SHM_INVARIANTS;
                     let max_slice_len_default =
                         match <#output_field_types as #__cer_root::message::ShmMessage>::MAX_SLICE_LEN {
                             ::std::option::Option::Some(n) =>
@@ -1891,14 +1891,12 @@ fn gen_cdylib(
                     // that has not learned it defaults the field to "no
                     // claim" and sizes from the file exactly as before.
                     outputs.push_str(&::std::format!(
-                        r#"{{"name":"{}","schema_hash":{},"max_slice_len_default":{},"promise_within_ms":{},"wire_fixed_size":{},"variable_count":{},"alignment":{}}}"#,
+                        r#"{{"name":"{}","schema_hash":{},"max_slice_len_default":{},"promise_within_ms":{},"wire_fixed_size":{}}}"#,
                         #output_field_names,
                         <#output_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
                         max_slice_len_default,
                         #output_promise_within,
                         <#output_field_types as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
-                        <#output_field_types as #__cer_root::message::ShmMessage>::VARIABLE_FIELD_COUNT,
-                        #__cer_root::shm_runtime::FRAME_ALIGN,
                     ));
                 )*
                 outputs.push(']');
