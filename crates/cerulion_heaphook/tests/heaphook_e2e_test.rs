@@ -40,6 +40,18 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 /// keeps `read_to_string` from ever seeing EOF.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const DONE_MARKER: &str = "PROBE_DONE";
+const LOSS_DIAGNOSTIC: &str =
+    "cerulion heap hook: another allocator won malloc; zero-copy disabled\n";
+const CANONICAL_WON_FACTS: &str = concat!(
+    "canonical_plt=1\npresent=1\nstatus_won=1\nallocation_nonnull=1\n",
+    "at_slot_base=1\nslot_written=1\nslot_untouched=0\nrange_test=1\n",
+    "disarm_rc=0\nretire_rc=0\nPROBE_DONE\n"
+);
+const CANONICAL_LOST_FACTS: &str = concat!(
+    "canonical_plt=1\npresent=1\nstatus_won=0\nallocation_nonnull=1\n",
+    "at_slot_base=0\nslot_written=0\nslot_untouched=1\nrange_test=0\n",
+    "disarm_rc=0\nretire_rc=0\nPROBE_DONE\n"
+);
 
 /// The running test binary's profile directory (`<target>[/<triple>]/<profile>`).
 fn profile_dir() -> PathBuf {
@@ -210,31 +222,67 @@ fn shim_so() -> PathBuf {
 /// itself before reporting the handshake and an actual in-slot allocation.
 fn canonical_probe_bin() -> &'static Path {
     static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BIN.get_or_init(|| {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/canonical_plt.c");
-        let bin = profile_dir().join(format!("heaphook_canonical_plt_{}", std::process::id()));
-        let output = Command::new("cc")
-            .args(["-O0", "-fno-pie", "-no-pie", "-Wall", "-Wextra", "-Werror"])
-            .arg(source)
-            .args(["-o"])
-            .arg(&bin)
-            .arg("-ldl")
-            .output()
-            .expect("compile canonical PLT fixture with cc");
-        assert!(
-            output.status.success(),
-            "canonical PLT fixture did not compile:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        bin
-    })
+    BIN.get_or_init(|| compile_canonical_probe("preload", &[]))
+        .as_path()
+}
+
+#[derive(Clone, Copy)]
+enum AllocatorOrder {
+    ForeignFirst,
+    HookFirst,
+}
+
+/// Link both interposers as DT_NEEDED entries, in the chosen order. Neither
+/// linked test uses LD_PRELOAD: a linked allocator must obey the same gate.
+fn linked_canonical_probe_bin(order: AllocatorOrder) -> &'static Path {
+    static FOREIGN_FIRST: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static HOOK_FIRST: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    match order {
+        AllocatorOrder::ForeignFirst => FOREIGN_FIRST
+            .get_or_init(|| compile_canonical_probe("foreign_first", &[shim_so(), hook_so()])),
+        AllocatorOrder::HookFirst => HOOK_FIRST
+            .get_or_init(|| compile_canonical_probe("hook_first", &[hook_so(), shim_so()])),
+    }
     .as_path()
+}
+
+fn compile_canonical_probe(label: &str, libraries: &[PathBuf]) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/canonical_plt.c");
+    let bin = profile_dir().join(format!(
+        "heaphook_canonical_plt_{label}_{}",
+        std::process::id()
+    ));
+    let mut cmd = Command::new("cc");
+    cmd.args(["-O0", "-fno-pie", "-no-pie", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .arg("-o")
+        .arg(&bin);
+    if !libraries.is_empty() {
+        cmd.arg("-Wl,--no-as-needed")
+            .args(libraries)
+            .args(["-Xlinker", "-rpath", "-Xlinker"])
+            .arg(profile_dir());
+    }
+    let output = cmd
+        .arg("-ldl")
+        .output()
+        .expect("compile canonical PLT fixture with cc");
+    assert!(
+        output.status.success(),
+        "canonical PLT fixture did not compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bin
 }
 
 /// The C fixture never forks and emits only a bounded set of fact lines, so
 /// drain after exit and, on timeout, signal only the child we started.
 fn run_canonical_probe(ld_preload: Option<String>, debug: bool) -> Run {
-    let mut cmd = Command::new(canonical_probe_bin());
+    run_canonical_bin(canonical_probe_bin(), ld_preload, debug)
+}
+
+fn run_canonical_bin(bin: &Path, ld_preload: Option<String>, debug: bool) -> Run {
+    let mut cmd = Command::new(bin);
     cmd.env_remove("LD_PRELOAD")
         .env_remove("CERULION_HEAPHOOK_DEBUG")
         .stdout(Stdio::piped())
@@ -427,6 +475,35 @@ fn assert_completed(run: &Run, probe: &str) {
     );
 }
 
+/// Literal fact vectors pin status, non-null allocation, slot address and
+/// bytes independently; repeated runs must reproduce these exact bytes.
+fn assert_canonical_outcome(run: &Run, won: bool, debug: bool) {
+    assert_completed(run, "canonical_plt");
+    assert_eq!(
+        run.stdout,
+        if won {
+            CANONICAL_WON_FACTS
+        } else {
+            CANONICAL_LOST_FACTS
+        }
+    );
+    let mut expected_stderr = if won {
+        String::new()
+    } else {
+        LOSS_DIAGNOSTIC.to_string()
+    };
+    if debug {
+        expected_stderr.push_str(&format!(
+            "cerulion heap hook loaded: abi v{HEAPHOOK_ABI_VERSION} won_malloc={}\n",
+            u8::from(won)
+        ));
+    }
+    assert_eq!(
+        run.stderr, expected_stderr,
+        "the loss is always loud and a win never warns"
+    );
+}
+
 // ── the arms ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -440,27 +517,56 @@ fn handshake_present_reports_version_and_won_malloc() {
 
 #[test]
 fn a_canonical_malloc_plt_import_keeps_the_hook_active_and_allocates_in_slot() {
-    let expected_stdout = concat!(
-        "canonical_plt=1\npresent=1\nstatus_won=1\nat_slot_base=1\n",
-        "range_test=1\ndisarm_rc=0\nretire_rc=0\nPROBE_DONE\n"
-    );
     for _ in 0..2 {
         let run = run_canonical_probe(Some(hook_so().display().to_string()), true);
-        assert_completed(&run, "canonical_plt");
-        run.assert_fact("canonical_plt", "1");
-        run.assert_fact("present", "1");
-        run.assert_fact("status_won", "1");
-        run.assert_fact("at_slot_base", "1");
-        run.assert_fact("range_test", "1");
-        run.assert_fact("disarm_rc", "0");
-        run.assert_fact("retire_rc", "0");
-        assert_eq!(run.stdout, expected_stdout, "deterministic fact bytes");
-        assert!(
-            !run.stderr.contains("another allocator won malloc"),
-            "{}",
-            run.stderr
-        );
-        assert!(run.stderr.contains("won_malloc=1"), "{}", run.stderr);
+        assert_canonical_outcome(&run, true, true);
+    }
+}
+
+#[test]
+fn a_canonical_plt_fixture_without_the_hook_has_no_handshake() {
+    let run = run_canonical_probe(None, false);
+    assert_completed(&run, "canonical_plt");
+    assert_eq!(run.stdout, "canonical_plt=1\npresent=0\nPROBE_DONE\n");
+    assert!(run.stderr.is_empty());
+}
+
+#[test]
+fn a_foreign_allocator_ahead_of_a_canonical_plt_hook_is_always_reported() {
+    let preload = format!("{}:{}", shim_so().display(), hook_so().display());
+    for debug in [false, true] {
+        for _ in 0..2 {
+            let run = run_canonical_probe(Some(preload.clone()), debug);
+            assert_canonical_outcome(&run, false, debug);
+        }
+    }
+}
+
+#[test]
+fn a_canonical_plt_hook_ahead_of_a_foreign_allocator_still_wins() {
+    let preload = format!("{}:{}", hook_so().display(), shim_so().display());
+    let run = run_canonical_probe(Some(preload), true);
+    assert_canonical_outcome(&run, true, true);
+}
+
+#[test]
+fn a_preloaded_non_allocator_dependency_does_not_hide_the_malloc_definition() {
+    let preload = format!("libdl.so.2:{}", hook_so().display());
+    let run = run_canonical_probe(Some(preload), false);
+    assert_canonical_outcome(&run, true, false);
+}
+
+#[test]
+fn linked_allocators_obey_definition_order_for_a_canonical_plt_import() {
+    for (order, won) in [
+        (AllocatorOrder::ForeignFirst, false),
+        (AllocatorOrder::HookFirst, true),
+    ] {
+        let bin = linked_canonical_probe_bin(order);
+        for _ in 0..2 {
+            let run = run_canonical_bin(bin, None, true);
+            assert_canonical_outcome(&run, won, true);
+        }
     }
 }
 
@@ -481,10 +587,14 @@ fn handshake_absent_without_preload() {
 #[test]
 fn handshake_foreign_allocator_reports_not_won() {
     let ld = format!("{}:{}", shim_so().display(), hook_so().display());
-    let run = run_probe_ld("handshake", Some(ld), &[]);
+    let run = run_probe_ld("handshake", Some(ld), &[("CERULION_HEAPHOOK_DEBUG", "0")]);
     assert_completed(&run, "handshake");
     run.assert_fact("present", "1"); // the hook's symbol is still there
     run.assert_fact("status_won", "0"); // but it did NOT win malloc
+    assert_eq!(
+        run.stderr, LOSS_DIAGNOSTIC,
+        "a real loss is loud without debug enabled"
+    );
 }
 
 #[test]

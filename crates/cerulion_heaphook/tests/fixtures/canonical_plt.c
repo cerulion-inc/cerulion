@@ -43,9 +43,22 @@ int main(void) {
         return 4;
     }
     // No printing or bookkeeping in the armed region: this call goes through
-    // the executable's canonical PLT and must return the slot's first byte.
+    // the executable's canonical PLT. A hook win must return the slot's first
+    // byte; a foreign allocator must leave the slot untouched.
     void *allocation = allocate(64);
+    int nonnull = allocation != NULL;
     int at_base = allocation == slot;
+    if (nonnull) {
+        for (size_t i = 0; i < 64; ++i) {
+            ((unsigned char *)allocation)[i] = 0x5a;
+        }
+    }
+    int slot_written = 1;
+    int slot_untouched = 1;
+    for (size_t i = 0; i < 64; ++i) {
+        slot_written &= slot[i] == 0x5a;
+        slot_untouched &= slot[i] == 0;
+    }
     int adopted = range_test(allocation, 64);
     int disarm_rc = disarm();
     free(allocation);
@@ -53,7 +66,10 @@ int main(void) {
     // Keep the mapping alive until exit, matching the quarantine's lifetime.
     puts("present=1");
     printf("status_won=%u\n", won);
+    printf("allocation_nonnull=%d\n", nonnull);
     printf("at_slot_base=%d\n", at_base);
+    printf("slot_written=%d\n", slot_written);
+    printf("slot_untouched=%d\n", slot_untouched);
     printf("range_test=%d\n", adopted);
     printf("disarm_rc=%d\n", disarm_rc);
     printf("retire_rc=%d\n", retire_rc);
