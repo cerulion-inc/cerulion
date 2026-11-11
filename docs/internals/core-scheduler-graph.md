@@ -477,6 +477,25 @@ this section is the opt-out's machinery.)
   uses `VirtualClock`. `RealClock::virt_ns()` / `ext_ns()` return `None` with a one-time
   warn.
 
+## Node host service table
+
+`graph/node_host_abi.rs` owns native contexts behind generation-checked handles
+and independent context execution gates. The frozen `HOST_API` contains C
+function pointers and primitive records; context maps, environment snapshots,
+ports, clocks, event queues and diagnostic owners remain host-local. All callbacks
+contain unwinds before returning across C. The loader calls `begin_fire()` once
+before each invocation, waits for node helpers before teardown, then revokes all
+leases before removing the context.
+
+Input head tags preserve every native Sync operation and its explicit boundary
+or refill site. Trigger drains report withheld admission and failed heads
+separately; neither is inferred from an empty queue. Clock calls preserve source
+presence, and environment reads use the immutable graph snapshot. Complete
+diagnostic copies use caller storage with size-query/retry semantics. Diagnostic
+levels are error=1, warn=2, info=3, debug=4, trace=5; zero and other values are
+refused. Port zero selects a separate node-wide failure latch. Per-port and
+node-wide latch counters remain observable without a tracing subscriber.
+
 ## cdylib runtime contracts (host side)
 
 - `CERULION_ABI_VERSION` (`src/lib.rs`): the loader hard-rejects a cdylib whose
