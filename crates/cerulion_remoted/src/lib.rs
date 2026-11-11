@@ -73,8 +73,14 @@
 //! - [`flashback`]: publishes a capture request when the ops-plane e-stop is engaged.
 //! - [`rcp`]: the `cerulion/rcp/1` plane, an MCP proxy from a paired desk to the
 //!   robot's local `cerulion-rcpd`, checking every message per MCP method.
+//! - [`shutdown`]: the [`ShutdownStage`](shutdown::ShutdownStage) the serving
+//!   loop runs before the daemon tears down, and the binary's hard-exit
+//!   deadline.
 //! - [`clock`]: the robot's TRUSTED clock for pairing verification (never a
 //!   client-supplied time).
+//! - [`log_writer`]: the binary's log writer, a bounded queue in front of
+//!   stderr written by a thread of its own; it drops and counts a line it
+//!   cannot queue.
 //!
 //! Linking `cerulion_core` (for the SHM tap, the wire format and the `cerulion_q`
 //! vocabulary) makes `remoted` AGPL; it is robot-side, so that is correct. Design
@@ -98,16 +104,19 @@ pub mod device_index;
 pub mod epoch_pull;
 pub mod error;
 pub mod estop_lease;
+mod estop_policy;
 pub mod flashback;
 pub mod forward;
 pub mod host;
 mod local_schema;
+pub mod log_writer;
 pub mod ops;
 pub mod pairing_verbs;
 mod private_file;
 pub mod provision;
 pub mod rcp;
 pub mod robot_settings;
+pub mod shutdown;
 pub mod tap;
 pub mod trust;
 pub mod verbs;

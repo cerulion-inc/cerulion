@@ -11,7 +11,7 @@ readme = "README.md"
 # A binary crate has no API docs for docs.rs to render; the user guide is the
 # documentation a `cargo install` user wants.
 documentation = "https://docs.cerulion.com"
-keywords = ["robotics", "cli", "zero-copy", "middleware", "cerulion"]
+keywords = ["robotics", "cli", "zero-copy", "ros2", "cerulion"]
 categories = ["science::robotics", "command-line-utilities"]
 # A crates.io download carries this crate's own sources, its README, the
 # text of the license it is published under and this manifest. Whatever else

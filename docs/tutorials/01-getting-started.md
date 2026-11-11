@@ -55,7 +55,7 @@ Three nodes forming a reactive pipeline:
   Build the nodes below with the same compiler that built the `cerulion` binary you
   installed above: a node cdylib built by a different rustc release is refused at
   load, loudly. A downloaded release binary is pinned to the exact rustc that built
-  it, named in the archive's `rustc-version.txt` (Rust 1.93.0 for the 1.0.0
+  it, named in the archive's `rustc-version.txt` (Rust 1.95.0 for the 2.0.0
   binaries), and the README's [Install](../../README.md#install) section gives the
   `RUSTUP_TOOLCHAIN=` step for that case. On Homebrew and apt, run
   `cerulion-install-rust` once to install that compiler, then put
@@ -77,7 +77,8 @@ only place wiring lives.
 ## Complete starter source
 
 To read and run complete scanner and controller implementations before writing
-new node types, choose the route for your installed CLI.
+new node types, choose the route for your installed CLI. The 2.0.0 CLI includes
+`--starter`, so it takes the second route; the first is for a 1.0.0 install.
 
 ### Released CLI 1.0.0
 
@@ -851,9 +852,13 @@ one group contained to its own process.
 >   `source:`. Nothing is misspelled: in a multi-process run each worker sees only
 >   its own part of the graph, so its upstream looks external to it.
 > - `WARN network egress OPEN BY DEFAULT`: with no `network:` block, the topics
->   are visible to other Cerulion machines on your LAN. `--network off` keeps a
->   run local-only. The first networked run also starts the shared `cerulion-netd`
->   daemon and says so; it exits by itself when idle.
+>   are open to every machine on your LAN, with no peer authentication.
+>   `--network off` turns off only this run's own gateway; while `cerulion-netd`
+>   serves the LAN it still sends a live local topic to a LAN peer that names it.
+>   To refuse every LAN peer, set `CERULION_LAN_ACCESS=paired` for every Cerulion
+>   command and daemon and restart a running `cerulion-netd`. The first networked
+>   run also starts the shared `cerulion-netd` daemon and says so; it exits by
+>   itself when idle.
 
 Leave it running and open a second terminal.
 
@@ -1227,11 +1232,19 @@ contributes name-only, and a layout change inside such a target is not caught.
   from Step 3a). If two instances need different policies, make them two
   node types. Stage the second instance with its own id:
   `cerulion node stage lidar_sensor -g obstacle_avoidance -i rear_sensor`.
+  The command writes the entry with its outputs. Each instance lists the
+  `scan` output that `lidar_sensor` declares:
   ```yaml
   - id: front_sensor
     type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
   - id: rear_sensor
     type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
   ```
 
 - **QoS deadlines:** Independent of trigger policy, every port + the node
@@ -1268,9 +1281,9 @@ contributes name-only, and a layout change inside such a target is not caught.
   recording and playback in full.
 
 - **Visualize it:** `cerulion viz` attaches the live topics to the viz daemon and
-  [Cerulion Studio](../../README.md#studio-for-your-computer) connects to that
-  same daemon and renders them. Nothing is added to the graph for either. Name
-  the topics you want, or pass none to attach every decodable local topic:
+  Cerulion Studio connects to that same daemon and renders them. Nothing is
+  added to the graph for either. Name the topics you want, or pass none to
+  attach every decodable local topic:
 
   ```bash
   cerulion viz /demo/lidar_sensor/scan /demo/safety_controller/cmd_vel

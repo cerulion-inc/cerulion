@@ -138,7 +138,11 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl jq
           install -m 0755 -d /usr/share/keyrings
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          # Plain --retry: the focal images' curl 7.68 predates
+          # --retry-all-errors. --connect-timeout and --max-time bound one
+          # attempt, so a stalled connection times out and is retried.
+          curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 30 --max-time 60 \
+            https://cli.github.com/packages/githubcli-archive-keyring.gpg \
             -o /usr/share/keyrings/githubcli-archive-keyring.gpg
           chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
           arch=$(dpkg --print-architecture)
@@ -285,8 +289,15 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential curl ca-certificates git clang libclang-dev pkg-config procps
-          curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt
+          # To a file, not a pipe: curl discards a partial file before a retry,
+          # which it cannot do for output already sent into `sh`. Plain --retry,
+          # because focal's curl 7.68 predates --retry-all-errors.
+          # --connect-timeout and --max-time bound one attempt, so a stalled
+          # connection times out and is retried. The installer reads /dev/null:
+          # this script itself arrives on bash's stdin.
+          curl --proto "=https" --tlsv1.2 -sSf --retry 5 --retry-delay 5 \
+            --connect-timeout 30 --max-time 120 -o /tmp/rustup-init.sh https://sh.rustup.rs
+          sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal --component rustfmt </dev/null
           . "$HOME/.cargo/env"
           rustc -vV; cargo -vV
 

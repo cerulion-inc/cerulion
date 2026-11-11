@@ -591,7 +591,14 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                 // The discard marker is deliberately scoped to "committed 0
                 // outputs (no seq burned)"; the post-commit send-failure class is
                 // NOT handled here.
-                if let Err(e) = sample_mut.send() {
+                //
+                // `block`: `send_counted` counts the frame on every registered
+                // consumer's word BEFORE the push makes it visible, so a
+                // consumer in another process that pops and records it while
+                // this drop is still running finds the count already there.
+                // On `Err` it has taken the count back (no-op unless this
+                // topic is wired all-`block`).
+                if let Err(e) = pubr.send_counted(sample_mut) {
                     // The sequence was consumed at commit but the frame
                     // never reached any subscriber queue. Bump the send-fail
                     // counter (a bare `error!` + `return` would be the one counter-less
@@ -621,11 +628,6 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                          regime (further discards on this port will log loudly again)"
                     );
                 }
-                // `block`: the frame is now in every subscriber's
-                // queue — bump each registered consumer's outstanding
-                // counter (no-op unless this topic is wired all-`block`).
-                // Mirrors the queue depth the producer's pre-fire reads.
-                pubr.record_block_published();
                 // The frame went out — reset this output's
                 // `promise_within_ms` watchdog window (no-op unless wired).
                 pubr.record_promise_within_published();

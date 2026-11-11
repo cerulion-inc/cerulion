@@ -285,6 +285,16 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   recovery never buys a still-broken peer a fresh quota.
 - A diagnostic latch never wedges the path it observes and never silently resets its
   regime on a poisoned mutex (`lock_regime_latch` arm).
+- `transport/drain_clip_latch.rs` (`DrainClipLatch`) builds on `FailureRegimeLatch` for a
+  `block` input's drains that remove more frames than its credit word counts. An outside
+  writer's clipped drains interleave with the counted producer's clean ones, so a regime
+  closes after a run of consecutive clean drains: 1 for the input's first regime, so its
+  first clean drain closes it, and every close doubles the run the next regime needs, up to
+  `CLOSE_AFTER_MAX` (65_536). An interleaved writer whose frames are `G < 65_536` clean
+  drains apart opens at most `floor(log2(G)) + 2` regimes, and the first clip after 65_536
+  clean drains in a row is loud again however many regimes closed before. Pinned by its unit
+  vectors, a seeded fault for the cap under `oracle-mutants`, and
+  `credit_block_iox2_test::an_interleaved_outside_writer_does_not_repeat_the_loud_line_per_frame`.
 - The two demand wire header latch tables (`KeyedLatches` in `transport/network.rs`) are
   bounded in key COUNT (`KEYED_LATCHES_CAP`, 256) and key part LENGTH
   (`LATCH_KEY_PART_MAX_LEN`, 256 bytes, the ack peer set's limit). A key the table will not
