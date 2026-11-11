@@ -32,6 +32,8 @@ pub mod launch_args;
 pub mod node;
 #[doc(hidden)]
 pub mod node_host_abi;
+#[doc(hidden)]
+pub mod node_plugin_abi;
 pub mod param_resume;
 pub mod params;
 pub mod partition;
