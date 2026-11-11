@@ -11,6 +11,7 @@ mod client;
 mod context;
 mod exports;
 mod input;
+mod metadata;
 mod output;
 mod registry;
 mod state;
@@ -20,6 +21,7 @@ pub use client::HostClient;
 pub use context::{AnyPublisher, AnySubscriber, NodeContext};
 pub use exports::{NodeExports, PluginNode};
 pub use input::{Accumulated, InputView};
+pub use metadata::{metadata, raw_metadata};
 pub use output::{LazyOutput, OutputProxy};
 pub use registry::NodeRegistry;
 

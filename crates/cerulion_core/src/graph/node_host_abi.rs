@@ -1687,6 +1687,7 @@ fn event_record(port: abi::PortHandle, event: HostEvent) -> abi::EventV1 {
         elapsed_ms: 0,
         policy_value: 0,
         cause: 0,
+        reserved: 0,
     };
     match event {
         HostEvent::Backpressure(event) => {

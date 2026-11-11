@@ -396,7 +396,7 @@ mod tests {
             true
         }
         fn probe(&self) -> bool {
-            true
+            self.value != 0
         }
         fn external_source(&mut self) -> TransportResult<ExternalSourceV1> {
             Ok(ExternalSourceV1 {
@@ -463,6 +463,7 @@ mod tests {
         );
         assert_eq!(exports.probe(handle).code, status_code::OK);
         assert_eq!(exports.shutdown(handle).code, status_code::OK);
+        assert_eq!(exports.probe(handle).code, status_code::BUSY);
         assert_eq!(
             exports
                 .registry
@@ -742,5 +743,26 @@ mod tests {
             );
             assert_eq!(sink.written(), &[9, 0, 0, 0, 0, 0, 0, 0]);
         }
+    }
+
+    #[test]
+    fn sink_panic_is_caught_and_next_capture_remains_callable() {
+        struct PanicSink;
+        impl StateSink for PanicSink {
+            fn write(&mut self, _: &[u8]) -> Result<(), crate::state::SinkFull> {
+                panic!("sink panic oracle")
+            }
+        }
+        let (exports, handle) = installed();
+        let mut sink = PanicSink;
+        let mut bridge = super::super::state::SinkBridge::new(&mut sink);
+        let descriptor = bridge.descriptor();
+        // SAFETY: node-owned synchronous bridge remains live; it catches the
+        // panicking Rust sink before returning through its extern C callback.
+        assert_eq!(
+            unsafe { exports.capture(handle, &descriptor, 8) }.code,
+            status_code::PANICKED
+        );
+        assert_eq!(exports.tick(handle).code, status_code::OK);
     }
 }

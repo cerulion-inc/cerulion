@@ -228,15 +228,7 @@ impl HostClient {
         &self,
         port: PortHandle,
     ) -> TransportResult<WriteSlotV1> {
-        let _: () = T::_SHM_INVARIANTS;
-        let request = LoanRequestV1 {
-            schema_hash: T::SCHEMA_HASH,
-            minimum_capacity: (WireHeader::SIZE + T::WIRE_FIXED_SIZE + 8 * T::VARIABLE_FIELD_COUNT)
-                as u32,
-            wire_fixed_size: T::WIRE_FIXED_SIZE as u32,
-            variable_count: T::VARIABLE_FIELD_COUNT as u32,
-            alignment: crate::shm_runtime::FRAME_ALIGN as u32,
-        };
+        let request = Self::request::<T>();
         let mut slot = WriteSlotV1 {
             data: std::ptr::null_mut(),
             lease: LeaseHandle::default(),
@@ -251,6 +243,19 @@ impl HostClient {
             return Err(super::argument_error("host loan returned an invalid lease"));
         }
         Ok(slot)
+    }
+
+    /// Shared compile-checked wire facts for cold metadata and adaptive loans.
+    pub fn request<T: ShmMessage>() -> LoanRequestV1 {
+        let _: () = T::_SHM_INVARIANTS;
+        LoanRequestV1 {
+            schema_hash: T::SCHEMA_HASH,
+            minimum_capacity: (WireHeader::SIZE + T::WIRE_FIXED_SIZE + 8 * T::VARIABLE_FIELD_COUNT)
+                as u32,
+            wire_fixed_size: T::WIRE_FIXED_SIZE as u32,
+            variable_count: T::VARIABLE_FIELD_COUNT as u32,
+            alignment: crate::shm_runtime::FRAME_ALIGN as u32,
+        }
     }
 
     pub(super) fn finish_output(&self, lease: LeaseHandle, size: u32) {

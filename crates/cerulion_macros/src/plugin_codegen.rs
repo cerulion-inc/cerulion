@@ -5,15 +5,22 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::crate_root;
-use crate::parse::FieldInputAttr;
+use crate::parse::{FieldInputAttr, FieldOutputAttr};
 
 pub(crate) fn generate(
     entry: &syn::Ident,
     node: &syn::Ident,
     inputs: &[FieldInputAttr],
+    outputs: &[FieldOutputAttr],
     external: bool,
 ) -> TokenStream {
     let root = crate_root::root();
+    let input_types = inputs.iter().map(|input| &input.field_type);
+    let output_types = outputs.iter().map(|output| &output.field_type);
+    let accumulate_caps = inputs.iter().map(|input| match input.accumulate {
+        Some(cap) => quote!(Some(#cap)),
+        None => quote!(None),
+    });
     let register = crate::input_accumulate::register_calls_for(inputs, &quote! { instance });
     let required = if inputs.iter().any(|input| input.accumulate.is_some()) {
         quote!(#root::node_abi::capability::ACCUMULATE)
@@ -200,9 +207,17 @@ pub(crate) fn generate(
             header: #root::node_abi::TableHeaderV1::for_type::<#root::node_abi::ExternalApiV1>(), describe: __cer_stable_external,
         };
         static __CER_STABLE_API: ::std::sync::OnceLock<&'static #root::node_abi::NodeApiV1> = ::std::sync::OnceLock::new();
+        static __CER_STABLE_METADATA: ::std::sync::OnceLock<::std::ffi::CString> = ::std::sync::OnceLock::new();
         fn __cer_stable_api() -> *const #root::node_abi::NodeApiV1 {
             *__CER_STABLE_API.get_or_init(|| {
-                let metadata = INFO_JSON.get_or_init(__cer_build_info_json).as_bytes();
+                let metadata = __CER_STABLE_METADATA.get_or_init(|| {
+                    #root::graph::node_plugin_abi::metadata(
+                        INFO_JSON.get_or_init(__cer_build_info_json).as_c_str(),
+                        &[#(#root::graph::node_plugin_abi::HostClient::request::<#input_types>()),*],
+                        &[#(#root::graph::node_plugin_abi::HostClient::request::<#output_types>()),*],
+                        &[#(#accumulate_caps),*],
+                    ).expect("generated wire facts match the common metadata")
+                }).as_bytes();
                 // hot-path-alloc-ok: bootstrap owns one immutable table for the library lifetime.
                 ::std::boxed::Box::leak(::std::boxed::Box::new(#root::node_abi::NodeApiV1 {
                     header: #root::node_abi::TableHeaderV1::for_type::<#root::node_abi::NodeApiV1>(),
