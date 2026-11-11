@@ -2193,17 +2193,22 @@ fn run(cli: Cli) -> CliResult<()> {
                     &mut std::io::stderr(),
                 )
             }
-            TopicAction::Info { topic, local } => {
+            TopicAction::Info {
+                topic,
+                local,
+                robot,
+            } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info_with_scope(
+                let info = topic_cmd::topic_info_with_selection(
                     &topic,
                     schemas_dir,
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )?;
                 println!("{}", info);
                 Ok(())
@@ -2212,6 +2217,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 topic,
                 truncate_length,
                 local,
+                robot,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -2224,16 +2230,21 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo_with_scope(
+                topic_cmd::topic_echo_with_selection(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )
             }
-            TopicAction::Hz { topic, local } => {
+            TopicAction::Hz {
+                topic,
+                local,
+                robot,
+            } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -2242,12 +2253,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz_with_scope(
+                topic_cmd::topic_hz_with_selection(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )
             }
         },

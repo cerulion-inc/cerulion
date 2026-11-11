@@ -14,10 +14,14 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 `acquire_interruptibly(root, interrupted)`, which polls and returns
 `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
+- Account/pair topic discovery uses bounded netd catalogs. Remote observers use source-qualified internal channels; duplicate topic sources require an explicit selector. Offline caches are fenced to the current account/device identity.
+
 ## Invariants
 - Enforce invariants at the engine boundary; CLI checks are UX.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
-  share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
+  share 4 s, 500 ms per robot, never pair or demand. Automatic catalogs share a
+  separate 4 s total deadline and coalesce owned/paired routes by endpoint key.
+  LAN and account rows merge only on
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.

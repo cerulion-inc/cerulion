@@ -4097,10 +4097,17 @@ impl Ctx {
                 );
             }
         };
+        let source_channel = match self.demand_plane.local_channel(&robot, &topic) {
+            Ok(channel) => channel,
+            Err(error) => {
+                let _ = perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic);
+                return Response::error(Some(id), error, Some(topic));
+            }
+        };
         // On a FRESH demand, wait for netd's just-created mirror service to become
         // cross-process-visible before tapping it (netd is a separate process).
         if newly_demanded {
-            wait_for_mirror_service(&self.manager, &topic);
+            wait_for_mirror_service(&self.manager, &source_channel);
         }
 
         // 3. Tap the now-local mirror by the IDENTICAL local tap path, and report
@@ -4137,9 +4144,10 @@ impl Ctx {
                 })
                 .and_then(|()| {
                     st.taps
-                        .attach(
+                        .attach_source(
                             &self.manager,
                             &topic,
+                            &source_channel,
                             entity_override.as_deref(),
                             // Desk-side mirror publishers provide wake notifications.
                             WakeMode::Listener,
@@ -5555,6 +5563,10 @@ pub trait DemandPlane: Send + Sync {
     /// against `schema_hash`. Called ONCE per topic (the reserve-then-commit
     /// guarantees it). A `String` error is surfaced to the controller verbatim.
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String>;
+    /// Local channel provided by the observer demand. Legacy test planes remain canonical.
+    fn local_channel(&self, _robot: &str, topic: &str) -> Result<String, String> {
+        Ok(topic.into())
+    }
     /// Release a previously-demanded `(robot, topic)` (the `detach` early release).
     fn release(&self, robot: &str, topic: &str) -> Result<(), String>;
     /// Query `robot`'s topic CATALOG over netd's shared session (the
@@ -5666,6 +5678,7 @@ pub trait DemandPlane: Send + Sync {
 /// self`, and controller threads share it) and opened LAZILY on the first demand, so
 /// a viz daemon that only ever serves LOCAL attaches never connects to netd.
 pub struct NetdDemandPlane {
+    channels: Mutex<BTreeMap<(String, String), String>>,
     client: Mutex<Option<NetdClient>>,
     /// `Some(socket)` targets a SPECIFIC control socket (the e2e's in-process netd);
     /// `None` uses the well-known default path (production, first-consumer-spawns).
@@ -5678,6 +5691,7 @@ impl NetdDemandPlane {
     pub fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            channels: Mutex::new(BTreeMap::new()),
             socket: None,
         }
     }
@@ -5687,6 +5701,7 @@ impl NetdDemandPlane {
     pub fn with_socket(socket: PathBuf) -> Self {
         Self {
             client: Mutex::new(None),
+            channels: Mutex::new(BTreeMap::new()),
             socket: Some(socket),
         }
     }
@@ -5734,10 +5749,28 @@ impl Default for NetdDemandPlane {
 
 impl DemandPlane for NetdDemandPlane {
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
-        self.with_client(|c| c.demand(robot, topic, schema_hash).map(|_| ()))
+        let reply = self.with_client(|c| c.observe(robot, topic, schema_hash))?;
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((robot.into(), topic.into()), reply.local_topic);
+        Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
-        self.with_client(|c| c.release(robot, topic).map(|_| ()))
+        self.with_client(|c| c.unobserve(robot, topic).map(|_| ()))?;
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(robot.into(), topic.into()));
+        Ok(())
+    }
+    fn local_channel(&self, robot: &str, topic: &str) -> Result<String, String> {
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(robot.into(), topic.into()))
+            .cloned()
+            .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
         // Route the catalog GET through the ONE persistent netd connection (netd runs

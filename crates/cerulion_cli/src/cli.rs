@@ -1933,11 +1933,14 @@ pub enum TopicAction {
     },
     /// Show info about a topic (schema name + last sequence/timestamp)
     ///
-    /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
-    /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Pass `--local`
+    /// Reads a local topic or an account/paired robot's topic anywhere.
+    /// Remote topics are demanded automatically and released on exit.
+    /// Ambiguous topic names require --robot NAME. Pass `--local`
     /// to read genuine local producers without remote discovery or demand.
     Info {
+        /// Select a robot by its exact name or account route.
+        #[arg(long, value_name = "NAME", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
         /// is refused even when its bytes already exist locally.
@@ -1949,11 +1952,14 @@ pub enum TopicAction {
     },
     /// Echo messages from a topic as YAML
     ///
-    /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
-    /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Pass `--local`
+    /// Reads a local topic or an account/paired robot's topic anywhere.
+    /// Remote topics are demanded automatically and released on exit.
+    /// Ambiguous topic names require --robot NAME. Pass `--local`
     /// to read genuine local producers without remote discovery or demand.
     Echo {
+        /// Select a robot by its exact name or account route.
+        #[arg(long, value_name = "NAME", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
         /// is refused even when its bytes already exist locally.
@@ -1976,11 +1982,14 @@ pub enum TopicAction {
     },
     /// Measure publish rate on a topic
     ///
-    /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
-    /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Pass `--local`
+    /// Reads a local topic or an account/paired robot's topic anywhere.
+    /// Remote topics are demanded automatically and released on exit.
+    /// Ambiguous topic names require --robot NAME. Pass `--local`
     /// to read genuine local producers without remote discovery or demand.
     Hz {
+        /// Select a robot by its exact name or account route.
+        #[arg(long, value_name = "NAME", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
         /// is refused even when its bytes already exist locally.

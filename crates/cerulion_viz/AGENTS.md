@@ -4,6 +4,8 @@ Crates: `lib/cerulion_viz` (rerun render/sink lib), `lib/go2_tf` (pure TFMessage
 rerun), `bin/cerulion_vizd` (desk viz daemon). NOT default-members: a plain `cargo build` stays rerun-free
 (pinned by `default_member_build_is_rerun_free`); use `-p <crate>`.
 
+- Remote attach taps the local channel returned by netd observer demand while retaining canonical topic/schema/robot identity in viewer state. A source change requires detach.
+
 ## Invariants
 
 - Live viz is INSTANT-ONLY: reconnects get statics + blueprint, never replay (`re_grpc_server` fork in
