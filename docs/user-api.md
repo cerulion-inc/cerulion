@@ -2298,9 +2298,9 @@ network:
   to a router without routing traffic. `disabled` (also what an omitted `mode:`
   means) makes the BLOCK inert, which is NOT the same as turning the network
   off: a run treats a disabled block exactly like no block at all, so under the
-  real clock it gets the permissive default above (gateway process, mDNS
-  discovery, produced topics eligible for announcement when LAN access is
-  open). The local-only switch is
+  real clock every produced topic is eligible for paired export through the
+  shared daemon. Explicit open LAN access retains mDNS and announcement
+  compatibility. The local-only switch is
   `--network off` / `CERULION_NETWORK=off`, nothing in this block. `router` is
   deliberately NOT exposed. An unknown mode string is rejected at parse
   listing the valid values.
@@ -2387,9 +2387,9 @@ rejection names the offending topic or setting and the fix:
 
 Empty `egress`/`ingress` under `peer`/`client` is valid (an
 export-restricted robot). Inspect what remote machines are advertising with
-`cerulion topic list` (remote discovery is automagic over mDNS by
-default; add `--connect tcp/<host>:7683`, the well-known permissive-gateway
-port, for a peer mDNS can't find).
+`cerulion topic list`: same-account robots and saved pairings are discovered
+without locators. The legacy zenoh discovery and `--connect` options apply to
+explicit open LAN deployments.
 
 Runtime controls (`cerulion graph run`, `node run`):
 
@@ -3373,9 +3373,10 @@ does not issue them. Against such a service:
   pipe, a socket, a device node) is refused by kind, naming what is there, rather than
   opened: reading one can block forever, and a command that hangs silently is worse than
   one that says what is wrong.
-- `cerulion account devices list` / `revoke` fail with a message naming this variable
-  rather than a bare 404. Point it at a service that registers devices (a local
-  `cerulion-accountd`) to use them. `revoke` distinguishes the two 404 readings by asking
+- `cerulion account devices list` / `revoke` use the hosted device routes through
+  the shared client's pairing-protocol header. A custom issuer without device
+  registration fails with a message naming this variable instead of a bare 404.
+  `revoke` distinguishes the two 404 readings by asking
   `GET /v1/devices` whether the service registers devices at all; only a 404 (no surface)
   and a success (a surface this id is not on) are answers; a probe that fails, at the
   transport or with a status of its own (401, 5xx), makes the error say the outcome is
@@ -3844,9 +3845,9 @@ For `cerulion connect` / `pair` / `login` and the WAN plane. See
 | `CERULION_EPOCH_DIR` | Where the desk's revocation-epoch cache lives. Deliberately not `CERULION_NETD_*`-prefixed: it is a desk-wide artifact location honored by `cerulion connect`, `cerulion-netd` and the account-page cache writer alike. Default: an `epochs/` directory next to the desk key file. |
 | `CERULION_CONNECTD_BIN` | Path to the `cerulion-connectd` sibling binary that `cerulion connect` spawns, for when it does not sit beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it. |
 | `CERULION_ACCOUNT_SERVICE` | Base URL of the account service `cerulion login` talks to. For pointing a desk at a self-hosted or development issuer. |
-| `CERULION_NETD_DESK_KEY` | ABSOLUTE path to the desk's device key file: the desk's identity and the key a robot access-lists. Unset means an EPHEMERAL key, which an un-paired robot refuses, so a real WAN deployment points this at `~/.cerulion/desk.key` (the same key `cerulion pair` creates). WAN builds only. |
+| `CERULION_NETD_DESK_KEY` | ABSOLUTE path to the desk's device key file: the desk's identity and the key a robot access-lists. Automatic account and saved pairing routes use the persisted machine identity without this setting. The manual WAN route uses an ephemeral key when this is unset, which a robot without that key in its access list refuses. WAN builds only. |
 | `CERULION_NETD_DEVICE_CERT` | Explicit ABSOLUTE path to the cached device cert `cerulion login` writes. Unset takes the sibling `device.cert` next to the desk key. A relative value in either variable makes `cerulion login` refuse rather than write a file `cerulion-netd`, which resolves it against its own working directory, may not read. WAN builds only. |
-| `CERULION_NETD_WAN_ROBOTS` | `;`-separated `name=eid[@ip:port,...]` entries naming the robots reachable over the iroh WAN plane. Unset means every demand routes to the zenoh LAN plane. WAN builds only. |
+| `CERULION_NETD_WAN_ROBOTS` | `;`-separated `name=eid[@ip:port,...]` entries naming the robots reachable over the iroh WAN plane. Optional manual routes; automatic account and saved pairing discovery does not require this setting. Unmatched legacy demands use the zenoh LAN compatibility path. WAN builds only. |
 | `CERULION_NETD_RELAY_DISABLED` | Any non-empty value disables all iroh relays (LAN direct-dial only), for a locked-down or air-gapped desk. WAN builds only. |
 | `CERULION_STATE_ROOT` | The on-robot state root for `cerulion-remoted` (default `/var/lib/cerulion`). Also its `--state-root` flag. |
 | `CERULION_REMOTED_HARD_EXIT_MS` | How long `cerulion-remoted` may take to stop after Ctrl-C or SIGTERM, or after its accept loop stops on its own, in ms (default **30000**), before it exits with status **4**. A set, non-blank value that is not a positive whole number is logged at start and the default is used. A second Ctrl-C or SIGTERM during the stop also exits with status 4, after at most the 100 ms it waits for its queued log lines, as the deadline does, and every other exit waits as long at most; after the accept loop stopped on its own, the first one already counts as that second one. The deadline ends the process, a full stderr included; it does not wait for the daemon's own work, but a thread blocked in an uninterruptible kernel wait, such as an fsync on a stalled disk, still holds the exit until that wait returns. No log line of the daemon's logger holds a graceful stop: a line that does not fit in its log queue, or whose write fails, is dropped and counted (`log_lines_dropped` in the `cerulion/wire/2` `status` reply). A graceful stop, also one that starts because the accept loop stopped on its own, exits 0, or 3 when a shutdown participant registered on its ops plane failed, panicked or was cancelled (`cerulion-remoted` registers none of its own); the rcpd e-stop delivery, the epoch poller and the endpoint close do not change the status, and a graceful stop that ends an ops e-stop rcpd had not answered logs that at error, and an attempt rcpd had issued an MCP session first sends rcpd that session's `DELETE`; a stop the deadline or a second signal ends may exit without that line and without the `DELETE`. systemd shows 3 and 4 under their LSB names (NOTIMPLEMENTED, NOPERMISSION); keep the deadline below the service manager's stop timeout. |
