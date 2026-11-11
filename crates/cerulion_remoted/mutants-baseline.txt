@@ -1,9 +1,11 @@
-# Mutation baseline for cerulion_remoted: the pure decisions of the e-stop policy and of the stop.
+# Mutation baseline for cerulion_remoted: the pure decisions of the e-stop policy, of the stop and of the log writer.
 #
-# Scope: two pure scopes, the e-stop policy file below and the stop's
-# exit-status and deadline decisions in the second section. The rest of the
-# crate holds the lease, transport and file paths that the mutation rule does
-# not cover.
+# Scope: three pure scopes, the e-stop policy file below, the stop's
+# exit-status and deadline decisions in the second section, and the log
+# writer's queue bound, drop report and test-seam queue override in the
+# third. The rest of the crate
+# holds the lease, transport and file paths that the mutation rule does not
+# cover.
 #
 # Run:     cargo mutants -p cerulion_remoted \
 #            -f crates/cerulion_remoted/src/estop_policy.rs -- --lib
@@ -56,5 +58,44 @@
 #
 # Every mutant of this scope that survives the test suite is listed below with
 # the reason it is not killed, as for the scope above.
+
+(none)
+
+# Third scope: the pure decision functions of the log writer.
+#
+# Scope: `admits` (src/log_writer.rs), whether the log queue takes one more
+# line; `drop_report`, what one batch of dropped lines reports through the
+# regime latch; and `test_queue_lines`, the line bound the test seam's queue
+# override sets (compiled only with the `test-seam` feature, which the lib
+# tests enable). The queue, the writer thread and the drain are live paths the
+# mutation rule does not cover; the lib tests of src/log_writer.rs and the
+# real-binary tests in tests/estop_full_stderr_test.rs and
+# tests/daemon_stop_signal_test.rs gate them.
+#
+# Run:     cargo mutants -p cerulion_remoted \
+#            -f crates/cerulion_remoted/src/log_writer.rs \
+#            --re 'admits|drop_report|test_queue_lines' --timeout 180 -- --lib
+# Result:  14 mutants: 8 caught, 6 unviable (do not compile), 0 missed.
+#
+# admits: all five operator variants are caught: `&&` replaced with `||`,
+# `<` replaced with `==`, with `>` and with `<=`, and `<=` replaced with `>`,
+# each by `log_writer::tests::a_line_fits_while_both_bounds_hold_and_is_refused_past_either`.
+# Its body replaced with `true` or `false` does not compile: its arguments are
+# then unused under the crate's deny lints. Without `--timeout 180`, the tests
+# that wait at a shut sink run into the 20 s default timeout under three of
+# the variants, which the test above fails at once.
+#
+# drop_report has no viable mutant: its body replaced with
+# `Default::default()` does not compile, because `Report` has no default, and
+# its match has no `_ =>` arm, so no arm is deleted. Each arm's result is
+# asserted by `log_writer::tests::each_batch_of_drops_reports_what_the_regime_latch_decides`.
+#
+# test_queue_lines: `>` replaced with `==`, `<` and `>=` are caught by
+# `log_writer::tests::the_test_seam_only_shrinks_the_queue_and_keeps_room_for_a_line`.
+# Its body replaced with `None`, `Some(0)` or `Some(1)` does not compile: its
+# argument is then unused.
+#
+# Every mutant of this scope that survives the test suite is listed below with
+# the reason it is not killed, as for the scopes above.
 
 (none)
