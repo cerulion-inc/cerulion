@@ -306,7 +306,6 @@ fn deferred_releases_free_retained_rows_once_and_match_native_delivery() {
             .create_publisher("abi/deferred/input", maximum, 1)
             .unwrap();
         let mut native_receiver = manager.create_subscriber("abi/deferred/native").unwrap();
-        let mut receiver = manager.create_subscriber("abi/deferred/plugin").unwrap();
         let mut publishers = IndexMap::new();
         publishers.insert(
             "out".into(),
@@ -316,6 +315,7 @@ fn deferred_releases_free_retained_rows_once_and_match_native_delivery() {
                     .unwrap(),
             ),
         );
+        let mut receiver = manager.create_subscriber("abi/deferred/plugin").unwrap();
         let mut subscribers = IndexMap::new();
         subscribers.insert(
             "input".into(),
@@ -467,4 +467,179 @@ fn deferred_releases_free_retained_rows_once_and_match_native_delivery() {
         with_context(context.value, |host| host.end_node_call()).unwrap();
         remove_context(context.value).unwrap();
     }
+}
+
+#[test]
+fn native_and_stable_output_discard_logs_match_exactly_and_recover_after_delivery() {
+    use cerulion_core::graph::node::AnyPublisher;
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::graph::node_plugin_abi::LazyOutput;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+    use native_ros2_messages::std_msgs::String as RosString;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(777);
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "node_plugin_discard_log_parity".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        iceoryx_test_config(),
+    )
+    .unwrap();
+    // Both phases use the same actual publisher, topic and native latch.
+    let mut publisher = manager
+        .create_publisher("abi/discard/parity", MaxSliceLen::try_new(128).unwrap(), 1)
+        .unwrap();
+    let mut receiver = manager.create_subscriber("abi/discard/parity").unwrap();
+    let native_log = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogWriter(native_log.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for complete in [false, false, true] {
+            let mut output = publisher.loan_proxy::<RosString>().unwrap();
+            if complete {
+                output.set_data("ok").unwrap();
+            }
+            drop(output);
+            if !complete {
+                assert!(receiver
+                    .view_raw_expecting(RosString::SCHEMA_HASH)
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    });
+    let view = receiver
+        .view_raw_expecting(RosString::SCHEMA_HASH)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.header().sequence, 0);
+    assert_eq!(view.header().timestamp_ns, 777);
+    assert_eq!(&view[48..50], b"ok");
+    drop(view);
+    let mut publishers = IndexMap::new();
+    publishers.insert("out".into(), AnyPublisher::Ipc(publisher));
+    let env = Arc::new(HashMap::new());
+    let native = NodeContext::with_runtime_env(
+        publishers,
+        IndexMap::new(),
+        clock,
+        ShutdownSignal::new(),
+        env.clone(),
+    );
+    let request = HostClient::request::<RosString>();
+    let specs = vec![HostPortSpec {
+        name: "out".into(),
+        direction: LeaseDirection::Write,
+        layout: PluginWireLayout {
+            schema_hash: RosString::SCHEMA_HASH,
+            fixed_size: request.wire_fixed_size,
+            variable_fields: request.variable_count,
+            alignment: request.alignment,
+        },
+        read_mode: 0,
+        accumulate_cap: None,
+    }];
+    let context = ContextHandle {
+        value: register_context(HostContext::new(native, specs, env, 5).unwrap()).unwrap(),
+    };
+    // SAFETY (U05): immutable HOST_API and real context retain their native
+    // publisher and every lease until this local adapter and client are dropped.
+    let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+    let info = DylibNodeEntry::parse_info_json_labeled(&format!(
+        r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":{},"max_slice_len_default":128}}],"policy":{{"period_ms":1}}}}"#,
+        RosString::SCHEMA_HASH), "discard parity").unwrap();
+    with_context(context.value, |host| host.begin_node_call()).unwrap();
+    let mut plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+    let stable_log = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogWriter(stable_log.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for complete in [false, false, true] {
+            with_context(context.value, |host| host.begin_fire()).unwrap();
+            let mut output = LazyOutput::<RosString>::new(plugin.publisher_mut("out").unwrap());
+            let proxy = output.__cer_loan().unwrap();
+            if complete {
+                proxy.set_data("ok").unwrap();
+            }
+            output.__cer_arm_if_loaned();
+            drop(output);
+            if !complete {
+                assert!(receiver
+                    .view_raw_expecting(RosString::SCHEMA_HASH)
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    });
+    let view = receiver
+        .view_raw_expecting(RosString::SCHEMA_HASH)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.header().sequence, 1);
+    assert_eq!(view.header().timestamp_ns, 777);
+    assert_eq!(&view[48..50], b"ok");
+    drop(view);
+    let native_text = std::string::String::from_utf8(native_log.lock().unwrap().clone()).unwrap();
+    let stable_text = std::string::String::from_utf8(stable_log.lock().unwrap().clone()).unwrap();
+    for text in [&native_text, &stable_text] {
+        assert_eq!(text.matches("OutputProxy dropped without writing all declared variable fields; skipping publish").count(), 1);
+        assert_eq!(
+            text.matches("OutputProxy discard suppressed: incomplete output")
+                .count(),
+            1
+        );
+        assert_eq!(text.matches("OutputProxy: output recovered").count(), 1);
+        assert!(text.contains("suppressed_count=1"));
+    }
+    let native_lines: Vec<_> = native_text
+        .lines()
+        .filter(|line| line.contains("OutputProxy"))
+        .collect();
+    let stable_lines: Vec<_> = stable_text
+        .lines()
+        .filter(|line| line.contains("OutputProxy"))
+        .collect();
+    assert_eq!(native_lines, stable_lines);
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.counters().discarded)).unwrap(),
+        2
+    );
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.counters().committed)).unwrap(),
+        1
+    );
+    assert!(!client.has_failure());
+    drop(plugin);
+    drop(client);
+    with_context(context.value, |host| host.end_node_call()).unwrap();
+    remove_context(context.value).unwrap();
 }

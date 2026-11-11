@@ -132,6 +132,17 @@ impl<'loan, T: ShmMessage + 'loan> OutputProxy<'loan, T> {
         self.armed = true;
     }
 
+    // hot-path-alloc-ok-fn: only a failed nested flush formats its cold diagnostic detail.
+    fn record_nested_failure(&self, error: &TransportError) {
+        let detail =
+            format!("OutputProxy: staged nested-field flush failed; skipping publish\n{error}");
+        // This record-only detail is staged by the host; NESTED_FAILED consumes
+        // it and emits one native latch decision with the original error field.
+        self.lease
+            .client
+            .diagnostic(self.lease.publisher.handle, 1, detail.as_bytes());
+    }
+
     fn finalize(&mut self) {
         let Some(mut writer) = self.writer.take() else {
             return;
@@ -140,8 +151,9 @@ impl<'loan, T: ShmMessage + 'loan> OutputProxy<'loan, T> {
             drop(writer);
             return;
         }
-        if T::flush_staged_nested(&mut writer).is_err() {
+        if let Err(error) = T::flush_staged_nested(&mut writer) {
             self.lease.discard_reason = discard_reason::NESTED_FAILED;
+            self.record_nested_failure(&error);
             drop(writer);
             return;
         }
