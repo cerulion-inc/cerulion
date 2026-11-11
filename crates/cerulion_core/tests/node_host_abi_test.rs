@@ -108,6 +108,14 @@ struct Harness {
 }
 impl Harness {
     fn new(layout: PluginWireLayout, cap: Option<usize>, budget: usize) -> Self {
+        Self::construct(layout, cap, budget, false)
+    }
+    fn construct(
+        layout: PluginWireLayout,
+        cap: Option<usize>,
+        budget: usize,
+        carry_transport: bool,
+    ) -> Self {
         let clock = Arc::new(VirtualClock::new());
         clock.set(777);
         let manager = TransportManager::init_for_test(
@@ -128,13 +136,16 @@ impl Harness {
             "ABI_ORACLE".to_string(),
             "frozen".to_string(),
         )]));
-        let native = NodeContext::with_runtime_env(
+        let mut native = NodeContext::with_runtime_env(
             IndexMap::from([("out".to_string(), AnyPublisher::Ipc(publisher))]),
             IndexMap::from([("in".to_string(), AnySubscriber::Ipc(subscriber))]),
             clock.clone(),
             ShutdownSignal::new(),
             env.clone(),
         );
+        if carry_transport {
+            native.set_transport(manager.clone());
+        }
         // Outputs precede inputs here: binding ordinals are direction-scoped.
         let host = HostContext::new(
             native,
@@ -161,6 +172,7 @@ impl Harness {
         let context = abi::ContextHandle {
             value: register_context(host).unwrap(),
         };
+        with_context(context.value, |host| host.begin_node_call()).unwrap();
         let mut binding = MaybeUninit::<abi::PortBindingV1>::uninit();
         assert_eq!(
             abi_call!((HOST_API.bind_port)(context, 0, 1, binding.as_mut_ptr())).code,
@@ -366,7 +378,7 @@ fn budget_and_foreign_handles_leave_pending_delivery_intact() {
             out.as_mut_ptr()
         ))
         .code,
-        6
+        9
     );
     assert_eq!(
         abi_call!((HOST_API.finish_output)(h.context, loan.lease, 64)).code,
@@ -381,7 +393,7 @@ fn budget_and_foreign_handles_leave_pending_delivery_intact() {
             out.as_mut_ptr()
         ))
         .code,
-        6
+        2
     );
     assert_eq!(
         abi_call!((HOST_API.release_input)(foreign.context, read.lease)).code,
@@ -459,7 +471,7 @@ fn read_mode_and_borrow_exclusion_preserve_the_native_frame() {
             out.as_mut_ptr()
         ))
         .code,
-        6
+        9
     );
     let mut head = MaybeUninit::<abi::HeadOutcomeV1>::uninit();
     assert_eq!(
@@ -470,7 +482,7 @@ fn read_mode_and_borrow_exclusion_preserve_the_native_frame() {
             head.as_mut_ptr()
         ))
         .code,
-        6
+        9
     );
     inspect(&read, |frame| {
         assert_eq!(frame, oracle_frame(0, 777, [15.0, 16.0, 17.0]))
@@ -573,7 +585,7 @@ fn spill_retains_original_mapping_on_success_and_refusal_until_release() {
             3040
         ))
         .code,
-        5
+        4
     );
     h.discard(loan, abi::discard_reason::SPILL_RELEASE);
     let read = h.receive();
@@ -612,7 +624,7 @@ fn spill_retains_original_mapping_on_success_and_refusal_until_release() {
     let counters = with_context(h.context.value, |host| Ok(host.counters())).unwrap();
     assert_eq!(
         (counters.committed, counters.spills, counters.discarded),
-        (u64::from(warmup) + 1, 1, 0)
+        (u64::from(warmup) + 1, 1, 1)
     );
 }
 
@@ -1423,7 +1435,7 @@ fn raw_ingress_preserves_original_wire_bytes_and_recipient_count_in_two_runs() {
 fn raw_creation_refuses_reserved_tags_and_budget_reuse_before_native_creation() {
     let h = RawHarness::new(1);
     let mut out = MaybeUninit::uninit();
-    for tag in [abi::full_queue::BLOCK, 3, u32::MAX] {
+    for tag in [abi::full_queue::RESERVED_BLOCK, 3, u32::MAX] {
         let mut request = raw_request("abi/raw/refusal");
         request.full_queue = tag;
         assert_eq!(
@@ -1481,7 +1493,7 @@ fn raw_creation_refuses_reserved_tags_and_budget_reuse_before_native_creation() 
             out.as_mut_ptr()
         ))
         .code,
-        abi::status_code::BUSY
+        abi::status_code::FAILED
     );
     assert_eq!(
         abi_call!((HOST_API.register_raw_egress)(h.context, binding.port)).code,
@@ -1603,18 +1615,22 @@ fn raw_loan_and_foreign_completion_refusals_preserve_the_owner_and_delivery() {
             out.as_mut_ptr()
         ))
         .code,
-        abi::status_code::BUSY
+        abi::status_code::FAILED
     );
+    let other_slot = h.loan(other.port, 64);
+    fill_raw(&other_slot, &oracle_frame(12, 300, [1.0, 2.0, 3.0]));
+    let mut other_recipients = 999;
     assert_eq!(
-        abi_call!((HOST_API.loan_output)(
+        abi_call!((HOST_API.finish_raw_output)(
             h.context,
-            other.port,
-            raw_loan_request(64),
-            out.as_mut_ptr()
+            other_slot.lease,
+            64,
+            &mut other_recipients
         ))
         .code,
-        abi::status_code::BUSY
+        0
     );
+    assert_eq!(other_recipients, 0);
     let mut recipients = 999;
     assert_eq!(
         abi_call!((HOST_API.finish_raw_output)(
@@ -1733,7 +1749,7 @@ fn raw_creation_never_falls_back_to_another_context_transport() {
             out.as_mut_ptr()
         ))
         .code,
-        abi::status_code::BUSY
+        abi::status_code::FAILED
     );
     let mut recipients = 999;
     assert_eq!(
@@ -1798,4 +1814,452 @@ fn raw_host_publish_and_receive_add_no_heap_allocation_after_warmup() {
     // Subtract exactly the pinned upstream 2035 allocation per native loan.
     let upstream = upstream_2035_publish_allocs(8);
     assert_eq!(count.finish() - upstream, 0);
+}
+
+#[test]
+fn helper_raw_delivery_continues_during_ticks_and_while_the_context_gate_is_held() {
+    for _ in 0..2 {
+        let h = Harness::construct(vector_layout(), None, 4, true);
+        let mut binding = MaybeUninit::uninit();
+        assert_eq!(
+            abi_call!((HOST_API.create_raw_publisher)(
+                h.context,
+                raw_request("abi/raw/helper"),
+                binding.as_mut_ptr()
+            ))
+            .code,
+            0
+        );
+        // SAFETY: successful raw creation initialized the complete binding.
+        let binding = unsafe { binding.assume_init() };
+        let mut raw_subscriber = h._manager.create_subscriber("abi/raw/helper").unwrap();
+        let context = h.context;
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (delivered_tx, delivered_rx) = std::sync::mpsc::channel();
+
+            let helper = scope.spawn(move || {
+                for sequence in 0..200 {
+                    let mut slot = MaybeUninit::uninit();
+                    assert_eq!(
+                        abi_call!((HOST_API.loan_output)(
+                            context,
+                            binding.port,
+                            raw_loan_request(64),
+                            slot.as_mut_ptr()
+                        ))
+                        .code,
+                        0
+                    );
+                    // SAFETY: successful raw loan initialized the complete slot.
+                    let slot = unsafe { slot.assume_init() };
+                    if sequence == 0 {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    let mut time = MaybeUninit::uninit();
+                    assert_eq!(
+                        abi_call!((HOST_API.clock)(
+                            context,
+                            abi::clock_source::ACTIVE,
+                            time.as_mut_ptr()
+                        ))
+                        .code,
+                        0
+                    );
+                    // SAFETY: successful helper clock read initialized the complete record.
+                    let time = unsafe { time.assume_init() };
+                    assert_eq!((time.timestamp_ns, time.present), (777, 1));
+                    let expected = oracle_frame(sequence, time.timestamp_ns, [11.0, 12.0, 13.0]);
+                    fill_raw(&slot, &expected);
+                    let mut recipients = 999;
+                    assert_eq!(
+                        abi_call!((HOST_API.finish_raw_output)(
+                            context,
+                            slot.lease,
+                            64,
+                            &mut recipients
+                        ))
+                        .code,
+                        0
+                    );
+                    assert_eq!(recipients, 1);
+                    let delivered = raw_subscriber
+                        .view_raw_expecting(Vector3::SCHEMA_HASH)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&delivered[..], &expected);
+                    drop(delivered);
+                    if sequence == 0 {
+                        delivered_tx.send(()).unwrap();
+                    }
+                }
+            });
+            held_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            with_context(h.context.value, |host| {
+                assert_eq!(host.outstanding_leases(), 1);
+                host.begin_fire()?;
+                release_tx.send(()).unwrap();
+                // Liveness oracle: raw finish must deliver without this tick gate.
+                delivered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+            for sequence in 0..200 {
+                with_context(h.context.value, |host| {
+                    host.end_node_call()?;
+                    host.begin_node_call()?;
+                    host.begin_fire()
+                })
+                .unwrap();
+                h.publish([1.0, 2.0, 3.0]);
+                let frame = h.receive();
+                inspect(&frame, |bytes| {
+                    assert_eq!(bytes, oracle_frame(sequence, 777, [1.0, 2.0, 3.0]))
+                });
+                h.release(frame);
+            }
+            helper.join().unwrap();
+        });
+        assert_eq!(
+            abi_call!((HOST_API.destroy_raw_publisher)(h.context, binding.port)).code,
+            0
+        );
+    }
+}
+
+#[test]
+fn ordinary_callbacks_refuse_wrong_thread_and_closed_scope_without_lease_effects() {
+    let h = Harness::new(vector_layout(), None, 2);
+    let slot = h.loan();
+    write_values(&slot, [11.0, 12.0, 13.0]);
+    let context = h.context;
+    let lease = slot.lease;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                assert_eq!(
+                    abi_call!((HOST_API.finish_output)(context, lease, 64)).code,
+                    abi::status_code::INVALID_STATE
+                )
+            })
+            .join()
+            .unwrap();
+    });
+    assert_eq!(
+        with_context(context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.admission_violations()
+        ))),
+        Ok((1, 1))
+    );
+    with_context(context.value, |host| host.end_node_call()).unwrap();
+    assert_eq!(
+        abi_call!((HOST_API.finish_output)(context, lease, 64)).code,
+        abi::status_code::INVALID_STATE
+    );
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.outstanding_leases())),
+        Ok(1)
+    );
+    with_context(context.value, |host| host.begin_node_call()).unwrap();
+    assert_eq!(
+        abi_call!((HOST_API.finish_output)(h.context, slot.lease, 64)).code,
+        0
+    );
+    let frame = h.receive();
+    inspect(&frame, |bytes| {
+        assert_eq!(bytes, oracle_frame(0, 777, [11.0, 12.0, 13.0]))
+    });
+    h.release(frame);
+}
+
+#[test]
+fn submitted_spills_allow_only_release_and_malformed_submission_counts_once() {
+    use native_ros2_messages::std_msgs::String as Text;
+    let layout = PluginWireLayout {
+        schema_hash: Text::SCHEMA_HASH,
+        fixed_size: Text::WIRE_FIXED_SIZE as u32,
+        variable_fields: Text::VARIABLE_FIELD_COUNT as u32,
+        alignment: cerulion_core::shm_runtime::FRAME_ALIGN as u32,
+    };
+    let h = Harness::new(layout, None, 2);
+    let slot = h.loan();
+    // The initialized empty payload is valid, but is not larger than this slot.
+    let payload = [0; 8];
+    assert_eq!(
+        abi_call!((HOST_API.submit_spill)(
+            h.context,
+            slot.lease,
+            bytes(&payload),
+            48
+        ))
+        .code,
+        abi::status_code::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.invariant_failures()
+        ))),
+        Ok((1, 1))
+    );
+    assert_eq!(
+        abi_call!((HOST_API.finish_output)(h.context, slot.lease, 48)).code,
+        abi::status_code::INVALID_HANDLE
+    );
+    assert_eq!(
+        abi_call!((HOST_API.discard_output)(
+            h.context,
+            slot.lease,
+            abi::discard_reason::TICK_FAILED
+        ))
+        .code,
+        abi::status_code::INVALID_HANDLE
+    );
+    assert_eq!(
+        abi_call!((HOST_API.submit_spill)(
+            h.context,
+            slot.lease,
+            bytes(&payload),
+            48
+        ))
+        .code,
+        abi::status_code::INVALID_HANDLE
+    );
+    h.discard(slot, abi::discard_reason::SPILL_RELEASE);
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.invariant_failures(),
+            host.counters().discarded
+        ))),
+        Ok((0, 1, 1))
+    );
+    let open = h.loan();
+    assert_eq!(
+        abi_call!((HOST_API.discard_output)(
+            h.context,
+            open.lease,
+            abi::discard_reason::SPILL_RELEASE
+        ))
+        .code,
+        abi::status_code::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.invariant_failures()
+        ))),
+        Ok((0, 2))
+    );
+    h.empty();
+}
+
+#[test]
+fn destroy_backstop_counts_each_leaked_owner_once_and_never_publishes_it() {
+    let h = Harness::new(vector_layout(), None, 3);
+    h.publish([1.0, 2.0, 3.0]);
+    let read = h.receive();
+    let write = h.loan();
+    write_values(&write, [4.0, 5.0, 6.0]);
+    // The foreign writers/readers have ceased accessing these slots, but omitted release.
+    with_context(h.context.value, |host| {
+        host.revoke();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.invariant_failures(),
+            host.counters().discarded
+        ))),
+        Ok((0, 2, 1))
+    );
+    assert_eq!(
+        abi_call!((HOST_API.release_input)(h.context, read.lease)).code,
+        abi::status_code::INVALID_HANDLE
+    );
+    assert_eq!(
+        abi_call!((HOST_API.finish_output)(h.context, write.lease, 64)).code,
+        abi::status_code::INVALID_HANDLE
+    );
+    with_context(h.context.value, |host| {
+        host.revoke();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        with_context(h.context.value, |host| Ok(host.invariant_failures())),
+        Ok(2)
+    );
+}
+
+#[test]
+fn raw_bad_terminal_arguments_and_destroy_backstop_retire_once_without_delivery() {
+    let h = RawHarness::new(1);
+    let binding = h.create("abi/raw/terminal");
+    let mut subscriber = h.manager.create_subscriber("abi/raw/terminal").unwrap();
+    for reason in [
+        None,
+        Some(abi::discard_reason::SPILL_RELEASE),
+        Some(u32::MAX),
+    ] {
+        let slot = h.loan(binding.port, 64);
+        fill_raw(&slot, &oracle_frame(55, 777, [1.0, 2.0, 3.0]));
+        let result = match reason {
+            None => abi_call!((HOST_API.finish_raw_output)(
+                h.context,
+                slot.lease,
+                64,
+                std::ptr::null_mut()
+            )),
+            Some(reason) => abi_call!((HOST_API.discard_output)(h.context, slot.lease, reason)),
+        };
+        assert_eq!(result.code, abi::status_code::INVALID_ARGUMENT);
+        assert_eq!(
+            with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+            Ok(0)
+        );
+        assert_eq!(
+            abi_call!((HOST_API.discard_output)(
+                h.context,
+                slot.lease,
+                abi::discard_reason::INVARIANT
+            ))
+            .code,
+            abi::status_code::INVALID_HANDLE
+        );
+        assert!(subscriber.view_raw().unwrap().is_none());
+    }
+    assert_eq!(
+        with_context(h.context.value, |host| Ok(host.invariant_failures())),
+        Ok(3)
+    );
+    let leaked = h.loan(binding.port, 64);
+    fill_raw(&leaked, &oracle_frame(56, 777, [4.0, 5.0, 6.0]));
+    assert_eq!(
+        abi_call!((HOST_API.destroy_raw_publisher)(h.context, binding.port)).code,
+        abi::status_code::BUSY
+    );
+    // The caller has stopped accessing the mapping before forced context teardown.
+    with_context(h.context.value, |host| {
+        host.revoke();
+        host.revoke();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.invariant_failures(),
+            host.counters().discarded
+        ))),
+        Ok((0, 4, 4))
+    );
+    let mut recipients = 999;
+    assert_eq!(
+        abi_call!((HOST_API.finish_raw_output)(
+            h.context,
+            leaked.lease,
+            64,
+            &mut recipients
+        ))
+        .code,
+        abi::status_code::INVALID_HANDLE
+    );
+    assert_eq!(recipients, 0);
+    assert!(subscriber.view_raw().unwrap().is_none());
+}
+
+#[test]
+fn malformed_spill_spans_sizes_and_offsets_retain_the_mapping_and_count_once() {
+    type Text = native_ros2_messages::std_msgs::String;
+    let layout = PluginWireLayout {
+        schema_hash: Text::SCHEMA_HASH,
+        fixed_size: 0,
+        variable_fields: 1,
+        alignment: 8,
+    };
+    let h = Harness::new(layout, None, 2);
+    for _ in 0..cerulion_core::transport::adaptive_sizer::WINDOW_SIZE {
+        let slot = h.loan();
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(h.context, slot.lease, 48)).code,
+            0
+        );
+        h.release(h.receive());
+    }
+    for variant in 0..5 {
+        let slot = h.loan();
+        let mut payload = vec![0; 3000];
+        payload[..4].copy_from_slice(&8u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&2992u32.to_le_bytes());
+        let (span, total) = match variant {
+            0 => (
+                abi::Bytes {
+                    ptr: std::ptr::null(),
+                    len: 3000,
+                },
+                3040,
+            ),
+            1 => (bytes(&payload), 3039),
+            2 => {
+                payload.resize(4064, 0);
+                (bytes(&payload), 4104)
+            }
+            3 => {
+                payload[..4].copy_from_slice(&4u32.to_le_bytes());
+                (bytes(&payload), 3040)
+            }
+            _ => {
+                payload[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                (bytes(&payload), 3040)
+            }
+        };
+        assert_eq!(
+            abi_call!((HOST_API.submit_spill)(h.context, slot.lease, span, total)).code,
+            abi::status_code::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            with_context(h.context.value, |host| Ok((
+                host.outstanding_leases(),
+                host.invariant_failures()
+            ))),
+            Ok((1, variant + 1))
+        );
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(h.context, slot.lease, 48)).code,
+            abi::status_code::INVALID_HANDLE
+        );
+        h.discard(slot, abi::discard_reason::SPILL_RELEASE);
+        assert_eq!(
+            with_context(h.context.value, |host| Ok((
+                host.outstanding_leases(),
+                host.invariant_failures()
+            ))),
+            Ok((0, variant + 1))
+        );
+        h.empty();
+    }
+    let recovered = h.loan();
+    assert_eq!(
+        abi_call!((HOST_API.finish_output)(h.context, recovered.lease, 48)).code,
+        0
+    );
+    let delivered = h.receive();
+    inspect(&delivered, |frame| {
+        assert_eq!(&frame[40..], &[0; 8]);
+        assert_eq!(
+            WireHeader::read_from_buf(frame).unwrap().sequence,
+            cerulion_core::transport::adaptive_sizer::WINDOW_SIZE as u32
+        );
+    });
+    h.release(delivered);
 }

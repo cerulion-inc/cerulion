@@ -130,6 +130,7 @@ struct Row<T> {
 /// A fixed-capacity arena. Native owners are dropped only by host code.
 pub struct LeaseArena<T> {
     rows: Box<[Row<T>]>,
+    index_base: u32,
     first_free: Option<usize>,
     active: usize,
 }
@@ -138,7 +139,16 @@ impl<T> LeaseArena<T> {
     /// Provision all rows at context construction, before any node fires.
     // hot-path-alloc-ok-fn: fixed lease storage allocated at graph build only
     pub fn new(capacity: usize) -> Result<Self, LeaseError> {
+        Self::with_index_base(capacity, 0)
+    }
+
+    /// Provision a disjoint token-index range for independently locked ports.
+    // hot-path-alloc-ok-fn: bounded rows are allocated before any sample operation
+    pub fn with_index_base(capacity: usize, index_base: u32) -> Result<Self, LeaseError> {
         if capacity > u32::MAX as usize
+            || capacity
+                .checked_add(index_base as usize)
+                .is_none_or(|end| end > u32::MAX as usize)
             || capacity > (isize::MAX as usize) / std::mem::size_of::<Row<T>>()
         {
             return Err(LeaseError::InvalidBudget);
@@ -156,6 +166,7 @@ impl<T> LeaseArena<T> {
             .into_boxed_slice();
         Ok(Self {
             rows,
+            index_base,
             first_free: (capacity > 0).then_some(0),
             active: 0,
         })
@@ -186,7 +197,7 @@ impl<T> LeaseArena<T> {
         row.direction = direction;
         row.reserved = true;
         self.active += 1;
-        Ok((u64::from(generation) << 32) | (index as u64 + 1))
+        Ok((u64::from(generation) << 32) | (u64::from(self.index_base) + index as u64 + 1))
     }
 
     /// Attach a native owner to a reservation without allocating.
@@ -243,13 +254,20 @@ impl<T> LeaseArena<T> {
 
     /// Return all owners during teardown, while their ports still exist.
     pub fn revoke_all(&mut self) {
+        self.revoke_with(|_, _, owner| drop(owner));
+    }
+
+    /// Retire each live owner once, exposing its native accounting identity.
+    pub fn revoke_with(&mut self, mut observe: impl FnMut(u64, LeaseDirection, T)) {
         let capacity = self.rows.len();
         for (index, row) in self.rows.iter_mut().enumerate() {
             // Clear before drop, including a destructor that unwinds. The
             // boundary execution gate catches while retaining the context lock.
             row.reserved = false;
             row.generation = 0;
-            drop(row.value.take());
+            if let Some(owner) = row.value.take() {
+                observe(row.port, row.direction, owner);
+            }
             row.next_free = (index + 1 < capacity).then_some(index + 1);
         }
         self.first_free = (!self.rows.is_empty()).then_some(0);
@@ -257,14 +275,18 @@ impl<T> LeaseArena<T> {
     }
 
     fn row(&self, token: u64) -> Result<&Row<T>, LeaseError> {
-        let index = token_index(token)?;
+        let index = token_index(token)?
+            .checked_sub(self.index_base as usize)
+            .ok_or(LeaseError::InvalidHandle)?;
         let row = self.rows.get(index).ok_or(LeaseError::InvalidHandle)?;
         validate_token(row, token)?;
         Ok(row)
     }
 
     fn row_mut(&mut self, token: u64) -> Result<&mut Row<T>, LeaseError> {
-        let index = token_index(token)?;
+        let index = token_index(token)?
+            .checked_sub(self.index_base as usize)
+            .ok_or(LeaseError::InvalidHandle)?;
         let row = self.rows.get_mut(index).ok_or(LeaseError::InvalidHandle)?;
         validate_token(row, token)?;
         Ok(row)
@@ -272,7 +294,7 @@ impl<T> LeaseArena<T> {
 
     fn recycle(&mut self, token: u64) {
         // Called only after row()/row_mut() validated the index and token.
-        let index = (token as u32 - 1) as usize;
+        let index = (token as u32 - 1 - self.index_base) as usize;
         let row = &mut self.rows[index];
         row.reserved = false;
         row.generation = 0;
@@ -404,6 +426,43 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
         assert!(matches!(
             LeaseArena::<u8>::new(usize::MAX),
+            Err(LeaseError::InvalidBudget)
+        ));
+    }
+
+    #[test]
+    fn disjoint_index_ranges_reject_each_others_tokens_and_revoke_once() {
+        for _ in 0..2 {
+            let mut ordinary = LeaseArena::with_index_base(2, 0).unwrap();
+            let mut raw = LeaseArena::with_index_base(2, 2).unwrap();
+            let a = ordinary.claim(7, LeaseDirection::Write).unwrap();
+            let b = raw.claim(8, LeaseDirection::Read).unwrap();
+            assert_eq!(a as u32, 1);
+            assert_eq!(b as u32, 3);
+            ordinary.insert(a, 11).unwrap();
+            raw.insert(b, 22).unwrap();
+            assert_eq!(
+                raw.take(a, 7, LeaseDirection::Write),
+                Err(LeaseError::InvalidHandle)
+            );
+            assert_eq!(
+                ordinary.take(b, 8, LeaseDirection::Read),
+                Err(LeaseError::InvalidHandle)
+            );
+            let mut observed = Vec::new();
+            raw.revoke_with(|port, direction, owner| observed.push((port, direction, owner)));
+            raw.revoke_with(|_, _, _| panic!("owner reclaimed twice"));
+            assert_eq!(observed, [(8, LeaseDirection::Read, 22)]);
+            assert_eq!(raw.active(), 0);
+            assert_eq!(raw.owner(b), Err(LeaseError::InvalidHandle));
+            assert_eq!(ordinary.take(a, 7, LeaseDirection::Write), Ok(11));
+            let next = raw.claim(8, LeaseDirection::Read).unwrap();
+            assert_eq!(next as u32, 3);
+            assert_ne!(next, b);
+            raw.cancel(next).unwrap();
+        }
+        assert!(matches!(
+            LeaseArena::<u8>::with_index_base(2, u32::MAX - 1),
             Err(LeaseError::InvalidBudget)
         ));
     }

@@ -4,6 +4,10 @@
 //! A plugin gets integer handles and borrowed wire bytes. This module retains
 //! the context, transport owners, frozen input heads and diagnostic state.
 //! It creates no transport session and never transfers a Rust owner to a node.
+//! Raw publisher and clock services run on any thread, independently of ticks.
+//! Ordinary callbacks require the admitted node-call thread; concurrency refuses
+//! INVALID_STATE without changing leases. BUSY only denotes destroy with leases.
+//! The loader serializes NodeApi, StateApi and ExternalApi entries on each handle.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -31,7 +35,9 @@ pub enum HostServiceError {
     /// Native transport failure, distinct from an empty receive.
     Transport(TransportError),
     /// A port has an outstanding read or write accessor.
-    Busy,
+    InvalidState,
+    /// Destruction must wait for caller-held native leases.
+    DestroyBusy,
     /// Teardown or a fatal failure has stopped new admissions.
     Terminal,
     /// Caller buffer is short; no diagnostic/event has been consumed.
@@ -86,13 +92,12 @@ struct BoundPort {
 }
 
 enum NativeLease {
-    RawWrite {
-        loan: RawShmLoan,
-    },
     Write {
         loan: RawShmLoan,
         header: WireHeader,
         spill_attempted: bool,
+        spill_submitted: bool,
+        invariant_counted: bool,
     },
     Read {
         _owner: Option<RawInputView<'static>>,
@@ -193,10 +198,10 @@ pub struct HostContext {
     // Drop leases before ports: their native refcounts must return while the
     // publisher/subscriber owners still exist, even during initialization failure.
     leases: LeaseArena<NativeLease>,
-    raw_ports: Box<[Option<raw::RawPort>]>,
+    raw: Arc<raw::RawServices>,
     native: NodeContext,
     ports: Box<[BoundPort]>,
-    raw_created: usize,
+    call_thread: Option<std::thread::ThreadId>,
     environment: Arc<HashMap<String, String>>,
     counters: HostLeaseCounters,
     terminal: bool,
@@ -209,6 +214,54 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// Admit one native node/state/external entry on the current thread.
+    /// The loader retains its separate NodeHandle gate and releases this context
+    /// mutex before invoking foreign code. Helpers use only raw services.
+    pub fn begin_node_call(&mut self) -> Result<(), HostServiceError> {
+        if self.call_thread.is_some() {
+            return Err(HostServiceError::InvalidState);
+        }
+        self.call_thread = Some(std::thread::current().id());
+        Ok(())
+    }
+    /// End admission after the foreign entry and its local accessor drops return.
+    pub fn end_node_call(&mut self) -> Result<(), HostServiceError> {
+        if self.call_thread != Some(std::thread::current().id()) {
+            return Err(HostServiceError::InvalidState);
+        }
+        self.call_thread = None;
+        Ok(())
+    }
+    fn require_node_call(&self) -> Result<(), HostServiceError> {
+        self.admit()?;
+        if self.call_thread == Some(std::thread::current().id()) {
+            Ok(())
+        } else {
+            Err(HostServiceError::InvalidState)
+        }
+    }
+    /// Observable count of rejected ordinary callback admissions.
+    pub fn admission_violations(&self) -> u64 {
+        self.raw
+            .violations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Provision the raw publisher count before registration; lease rows per raw
+    /// publisher equal this context's already configured ordinary lease budget.
+    // hot-path-alloc-ok-fn: owned context builder before registration only
+    pub fn with_raw_publisher_budget(mut self, budget: usize) -> Result<Self, HostServiceError> {
+        if Arc::strong_count(&self.raw) != 1 {
+            return Err(HostServiceError::InvalidState);
+        }
+        self.raw = Arc::new(raw::RawServices::new(
+            self.native.transport().cloned(),
+            Arc::clone(self.native.clock()),
+            self.ports.len(),
+            self.raw.lease_budget(),
+            budget,
+        )?);
+        Ok(self)
+    }
     /// Host runtime maintenance may inspect its own native ports without crossing C.
     pub(crate) fn native_for_runtime(&self) -> &NodeContext {
         &self.native
@@ -218,7 +271,7 @@ impl HostContext {
     pub(crate) fn native_mut_for_runtime(&mut self) -> Result<&mut NodeContext, HostServiceError> {
         self.admit()?;
         if self.leases.active() != 0 {
-            return Err(HostServiceError::Busy);
+            return Err(HostServiceError::InvalidState);
         }
         Ok(&mut self.native)
     }
@@ -275,6 +328,13 @@ impl HostContext {
                 accumulators.register_raw(&mut native, &spec.name, cap, spec.layout)?;
             }
         }
+        let raw = Arc::new(raw::RawServices::new(
+            native.transport().cloned(),
+            Arc::clone(native.clock()),
+            specs.len(),
+            lease_budget,
+            128,
+        )?);
         Ok(Self {
             leases: LeaseArena::new(lease_budget)?,
             native,
@@ -295,11 +355,8 @@ impl HostContext {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            raw_ports: (0..128)
-                .map(|_| None)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            raw_created: 0,
+            raw,
+            call_thread: None,
             environment,
             counters: HostLeaseCounters::default(),
             terminal: false,
@@ -347,7 +404,7 @@ impl HostContext {
     ) -> Result<R, HostServiceError> {
         self.admit()?;
         if self.leases.active() != 0 {
-            return Err(HostServiceError::Busy);
+            return Err(HostServiceError::InvalidState);
         }
         Ok(operation(&mut self.native))
     }
@@ -405,7 +462,7 @@ impl HostContext {
     pub fn begin_fire(&mut self) -> Result<(), HostServiceError> {
         self.admit()?;
         if self.leases.active() != 0 {
-            return Err(HostServiceError::Busy);
+            return Err(HostServiceError::InvalidState);
         }
         for bound in &mut self.ports {
             bound.offered_this_fire = false;
@@ -459,7 +516,7 @@ impl HostContext {
     ) -> Result<abi::AccumulateInfoV1, HostServiceError> {
         let index = self.accumulator_index(context, port)?;
         if self.ports[index].busy {
-            return Err(HostServiceError::Busy);
+            return Err(HostServiceError::InvalidState);
         }
         let bound = &mut self.ports[index];
         if !bound.offered_this_fire {
@@ -493,7 +550,7 @@ impl HostContext {
         let index = self.accumulator_index(context, port)?;
         let bound = &self.ports[index];
         if bound.busy || !bound.offered_this_fire {
-            return Err(HostServiceError::Busy);
+            return Err(HostServiceError::InvalidState);
         }
         let next_borrows = bound
             .accumulated_borrows
@@ -630,6 +687,8 @@ impl HostContext {
                 loan,
                 header,
                 spill_attempted: false,
+                spill_submitted: false,
+                invariant_counted: false,
             },
         )?;
         self.ports[index].busy = true;
@@ -652,11 +711,11 @@ impl HostContext {
         let suppressed = self.output_publisher(index)?.replay_suppress_active();
         let NativeLease::Write {
             loan,
-            spill_attempted: false,
+            spill_submitted: false,
             ..
         } = self.leases.get_mut(token, port, LeaseDirection::Write)?
         else {
-            return Err(HostServiceError::InvalidDescriptor);
+            return Err(LeaseError::InvalidHandle.into());
         };
         if !suppressed && !layout.accepts(loan.bytes_mut(), total_size) {
             self.discard_output(context, port, token, HostDiscardReason::Invariant)?;
@@ -696,22 +755,42 @@ impl HostContext {
         size: u32,
     ) -> Result<(), HostServiceError> {
         let index = self.port_index(context, port, LeaseDirection::Write)?;
+        let suppressed = self.output_publisher(index)?.replay_suppress_active();
         let NativeLease::Write {
             header,
-            spill_attempted,
+            loan,
+            spill_submitted,
             ..
         } = self.leases.get_mut(token, port, LeaseDirection::Write)?
         else {
-            return Err(HostServiceError::InvalidDescriptor);
+            return Err(LeaseError::InvalidHandle.into());
         };
-        if *spill_attempted {
-            return Err(LeaseError::InvalidTransition.into());
+        if *spill_submitted {
+            return Err(LeaseError::InvalidHandle.into());
         }
-        *spill_attempted = true;
+        *spill_submitted = true;
         let header = *header;
-        if self.output_publisher(index)?.replay_suppress_active() {
+        let capacity = loan.bytes_mut().len();
+        if suppressed {
             return Ok(());
         }
+        let layout = self.ports[index].spec.layout;
+        let max_capacity = self.output_publisher(index)?.max_slice_len().get();
+        if payload.len().checked_add(WireHeader::SIZE) != Some(size as usize)
+            || size as usize <= capacity
+            || size > max_capacity
+            || !layout.accepts_payload(payload, size)
+        {
+            self.count_spill_invariant(index, port, token)?;
+            return Err(HostServiceError::InvalidDescriptor);
+        }
+        let NativeLease::Write {
+            spill_attempted, ..
+        } = self.leases.get_mut(token, port, LeaseDirection::Write)?
+        else {
+            return Err(LeaseError::InvalidHandle.into());
+        };
+        *spill_attempted = true;
         let next_count = self
             .counters
             .committed
@@ -722,19 +801,56 @@ impl HostContext {
             .spills
             .checked_add(1)
             .ok_or(LeaseError::GenerationExhausted)?;
-        let layout = self.ports[index].spec.layout;
-        let max_capacity = self.output_publisher(index)?.max_slice_len().get();
-        if payload.len().checked_add(WireHeader::SIZE) != Some(size as usize)
-            || size > max_capacity
-            || !layout.accepts_payload(payload, size)
-        {
-            return Err(HostServiceError::InvalidDescriptor);
-        }
-        // Retain the old mapping while the node's writer still borrows it.
-        let publisher = self.output_publisher(index)?;
-        publisher.commit_plugin_spill(header, payload)?;
+        self.output_publisher(index)?
+            .commit_plugin_spill(header, payload)?;
         self.counters.committed = next_count;
         self.counters.spills = next_spills;
+        Ok(())
+    }
+
+    fn count_spill_invariant(
+        &mut self,
+        index: usize,
+        port: u64,
+        token: u64,
+    ) -> Result<(), HostServiceError> {
+        let NativeLease::Write {
+            invariant_counted, ..
+        } = self.leases.get_mut(token, port, LeaseDirection::Write)?
+        else {
+            return Err(LeaseError::InvalidHandle.into());
+        };
+        if !*invariant_counted {
+            *invariant_counted = true;
+            self.output_publisher(index)?
+                .record_invariant_violation_drop();
+            self.raw
+                .invariants
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters.discarded = self.counters.discarded.saturating_add(1);
+        }
+        Ok(())
+    }
+    fn reject_spill_span(
+        &mut self,
+        context: u64,
+        port: u64,
+        token: u64,
+    ) -> Result<(), HostServiceError> {
+        let index = self.port_index(context, port, LeaseDirection::Write)?;
+        let NativeLease::Write {
+            spill_submitted, ..
+        } = self.leases.get_mut(token, port, LeaseDirection::Write)?
+        else {
+            return Err(LeaseError::InvalidHandle.into());
+        };
+        if *spill_submitted {
+            return Err(LeaseError::InvalidHandle.into());
+        }
+        *spill_submitted = true;
+        if !self.output_publisher(index)?.replay_suppress_active() {
+            self.count_spill_invariant(index, port, token)?;
+        }
         Ok(())
     }
 
@@ -747,34 +863,29 @@ impl HostContext {
         reason: HostDiscardReason,
     ) -> Result<(), HostServiceError> {
         let index = self.port_index(context, port, LeaseDirection::Write)?;
-        let storage_only = matches!(
-            reason,
-            HostDiscardReason::SpillRelease | HostDiscardReason::ReplaySuppressed
-        ) || self.output_publisher(index)?.replay_suppress_active();
-        let next_count = if storage_only {
-            self.counters.discarded
-        } else {
-            self.counters
-                .discarded
-                .checked_add(1)
-                .ok_or(LeaseError::GenerationExhausted)?
+        let NativeLease::Write {
+            spill_submitted,
+            spill_attempted,
+            invariant_counted,
+            ..
+        } = self.leases.get(token, port, LeaseDirection::Write)?
+        else {
+            return Err(LeaseError::InvalidHandle.into());
         };
-        let owner = self.leases.get(token, port, LeaseDirection::Write)?;
-        if reason == HostDiscardReason::SpillRelease
-            && !matches!(
-                owner,
-                NativeLease::Write {
-                    spill_attempted: true,
-                    ..
-                }
-            )
-        {
-            return Err(LeaseError::InvalidTransition.into());
+        if *spill_submitted && reason != HostDiscardReason::SpillRelease {
+            return Err(LeaseError::InvalidHandle.into());
         }
+        let missing_attempt = reason == HostDiscardReason::SpillRelease && !*spill_attempted;
+        let submitted = *spill_submitted;
+        let counted = *invariant_counted;
+        let suppressed = self.output_publisher(index)?.replay_suppress_active();
         let owner = self.leases.take(token, port, LeaseDirection::Write)?;
         self.ports[index].busy = false;
         drop(owner);
-        if storage_only {
+        if suppressed || reason == HostDiscardReason::ReplaySuppressed {
+            return Ok(());
+        }
+        if reason == HostDiscardReason::SpillRelease && (!missing_attempt || counted) {
             return Ok(());
         }
         let publisher = self.output_publisher(index)?;
@@ -795,10 +906,20 @@ impl HostContext {
                 ),
             }
         }
-        if reason == HostDiscardReason::Invariant {
+        if reason == HostDiscardReason::Invariant || missing_attempt {
             publisher.record_invariant_violation_drop();
+            self.raw
+                .invariants
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.counters.discarded = next_count;
+        self.counters.discarded = self
+            .counters
+            .discarded
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
+        if missing_attempt && !submitted {
+            return Err(HostServiceError::InvalidDescriptor);
+        }
         Ok(())
     }
 
@@ -867,11 +988,6 @@ impl HostContext {
         token: u64,
     ) -> Result<(), HostServiceError> {
         let index = self.port_index(context, port, LeaseDirection::Read)?;
-        let next_count = self
-            .counters
-            .released
-            .checked_add(1)
-            .ok_or(LeaseError::GenerationExhausted)?;
         let owner = self.leases.take(token, port, LeaseDirection::Read)?;
         if matches!(
             owner,
@@ -885,6 +1001,11 @@ impl HostContext {
             self.ports[index].busy = false;
         }
         drop(owner);
+        let next_count = self
+            .counters
+            .released
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
         self.counters.released = next_count;
         Ok(())
     }
@@ -932,7 +1053,7 @@ impl HostContext {
             .iter()
             .any(|port| port.spec.direction == LeaseDirection::Write && port.busy)
         {
-            return Err(HostServiceError::Busy);
+            return Err(HostServiceError::InvalidState);
         }
         self.native.pump_history();
         Ok(())
@@ -1075,7 +1196,26 @@ impl HostContext {
 
     /// Current terminal observations, independent of logs.
     pub fn counters(&self) -> HostLeaseCounters {
-        self.counters
+        HostLeaseCounters {
+            committed: self.counters.committed.saturating_add(
+                self.raw
+                    .committed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            discarded: self.counters.discarded.saturating_add(
+                self.raw
+                    .discarded
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            ..self.counters
+        }
+    }
+
+    /// Invariant failures, including leaked input and output leases reclaimed at destroy.
+    pub fn invariant_failures(&self) -> u64 {
+        self.raw
+            .invariants
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Node-wide (zero port) or per-port diagnostic failures, observable
@@ -1095,7 +1235,7 @@ impl HostContext {
 
     /// Number of active/reserved native owners.
     pub fn outstanding_leases(&self) -> usize {
-        self.leases.active()
+        self.leases.active() + self.raw.active.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Copy the complete owner-local diagnostic into caller storage.
@@ -1109,30 +1249,43 @@ impl HostContext {
             return Err(LeaseError::InvalidHandle.into());
         }
         let error = self.diagnostic.as_ref().ok_or(LeaseError::InvalidHandle)?;
-        let mut measure = DiagnosticWriter {
-            target: None,
-            written: 0,
-        };
-        write_diagnostic(&mut measure, error).map_err(|_| HostServiceError::InvalidDescriptor)?;
-        if target.len() < measure.written {
-            return Err(HostServiceError::BufferTooSmall(measure.written));
-        }
-        let mut writer = DiagnosticWriter {
-            target: Some(target),
-            written: 0,
-        };
-        write_diagnostic(&mut writer, error).map_err(|_| HostServiceError::InvalidDescriptor)?;
-        Ok(writer.written)
+        copy_diagnostic_bytes(error, target)
     }
 
     /// Stop admissions and retire all owners while native ports remain live.
     pub fn revoke(&mut self) {
         self.terminal = true;
-        self.leases.revoke_all();
-        for row in self.raw_ports.iter_mut().flatten() {
-            row.busy = false;
-            row.publisher.take();
-        }
+        self.call_thread = None;
+        let native = &mut self.native;
+        let ports = &self.ports;
+        let counters = &mut self.counters;
+        let raw = &self.raw;
+        self.leases.revoke_with(|port, direction, owner| {
+            let already_counted = matches!(
+                &owner,
+                NativeLease::Write {
+                    invariant_counted: true,
+                    ..
+                }
+            );
+            if !already_counted {
+                raw.invariants
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if direction == LeaseDirection::Write {
+                    let index = (port as u32 - 1) as usize;
+                    if let Some(bound) = ports.get(index) {
+                        if let Some(AnyPublisher::Ipc(publisher)) =
+                            native.publisher_mut(&bound.spec.name)
+                        {
+                            publisher.record_invariant_violation_drop();
+                        }
+                    }
+                    counters.discarded = counters.discarded.saturating_add(1);
+                }
+            }
+            drop(owner);
+        });
+        self.raw.revoke();
         for port in &mut self.ports {
             port.busy = false;
             port.accumulated_borrows = 0;
@@ -1149,7 +1302,7 @@ impl HostContext {
 
     fn unborrowed(&self, index: usize) -> Result<(), HostServiceError> {
         if self.ports[index].busy || self.ports[index].accumulated_borrows != 0 {
-            Err(HostServiceError::Busy)
+            Err(HostServiceError::InvalidState)
         } else {
             Ok(())
         }
@@ -1221,9 +1374,30 @@ fn write_diagnostic(
     }
 }
 
+fn copy_diagnostic_bytes(
+    error: &HostServiceError,
+    target: &mut [u8],
+) -> Result<usize, HostServiceError> {
+    let mut measure = DiagnosticWriter {
+        target: None,
+        written: 0,
+    };
+    write_diagnostic(&mut measure, error).map_err(|_| HostServiceError::InvalidDescriptor)?;
+    if target.len() < measure.written {
+        return Err(HostServiceError::BufferTooSmall(measure.written));
+    }
+    let mut writer = DiagnosticWriter {
+        target: Some(target),
+        written: 0,
+    };
+    write_diagnostic(&mut writer, error).map_err(|_| HostServiceError::InvalidDescriptor)?;
+    Ok(writer.written)
+}
+
 struct ContextRow {
     generation: u32,
     owner: Option<Arc<Mutex<HostContext>>>,
+    raw: Option<Arc<raw::RawServices>>,
 }
 
 static CONTEXTS: OnceLock<RwLock<Vec<ContextRow>>> = OnceLock::new();
@@ -1248,16 +1422,25 @@ pub fn register_context(context: HostContext) -> Result<u64, HostServiceError> {
         .get_or_init(|| RwLock::new(Vec::new()))
         .write()
         .map_err(|_| HostServiceError::Panicked)?;
+    let raw = Some(Arc::clone(&context.raw));
     let owner = Some(Arc::new(Mutex::new(context)));
     let index = if let Some(index) = rows.iter().position(|row| row.owner.is_none()) {
-        rows[index] = ContextRow { generation, owner };
+        rows[index] = ContextRow {
+            generation,
+            owner,
+            raw,
+        };
         index
     } else {
         if rows.len() >= u32::MAX as usize {
             return Err(LeaseError::InvalidBudget.into());
         }
         let index = rows.len();
-        rows.push(ContextRow { generation, owner });
+        rows.push(ContextRow {
+            generation,
+            owner,
+            raw,
+        });
         index
     };
     Ok((u64::from(generation) << 32) | (index as u64 + 1))
@@ -1282,8 +1465,27 @@ fn context_owner(handle: u64) -> Result<Arc<Mutex<HostContext>>, HostServiceErro
         .ok_or_else(|| LeaseError::InvalidHandle.into())
 }
 
+fn raw_owner(handle: u64) -> Result<Arc<raw::RawServices>, HostServiceError> {
+    let index = (handle as u32)
+        .checked_sub(1)
+        .ok_or(LeaseError::InvalidHandle)? as usize;
+    let rows = CONTEXTS
+        .get()
+        .ok_or(LeaseError::InvalidHandle)?
+        .read()
+        .map_err(|_| HostServiceError::Panicked)?;
+    let row = rows.get(index).ok_or(LeaseError::InvalidHandle)?;
+    if row.generation == 0 || row.generation != (handle >> 32) as u32 {
+        return Err(LeaseError::InvalidHandle.into());
+    }
+    row.raw
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| LeaseError::InvalidHandle.into())
+}
+
 /// Execute a host operation inside its context gate; independent contexts
-/// run concurrently. Concurrent/reentrant calls refuse BUSY without waiting.
+/// run concurrently. Concurrent/reentrant calls refuse INVALID_STATE without waiting.
 /// Unwinds are caught before the mutex guard can poison. Never hold this gate
 /// across NodeApi execution, which synchronously calls back into HOST_API.
 pub fn with_context<R>(
@@ -1291,9 +1493,15 @@ pub fn with_context<R>(
     operation: impl FnOnce(&mut HostContext) -> Result<R, HostServiceError>,
 ) -> Result<R, HostCallFailure> {
     let owner = context_owner(handle).map_err(|error| classify_failure(&error, 0))?;
+    let services = raw_owner(handle).map_err(|error| classify_failure(&error, 0))?;
     let mut context = owner.try_lock().map_err(|error| HostCallFailure {
         status: match error {
-            std::sync::TryLockError::WouldBlock => abi::status_code::BUSY,
+            std::sync::TryLockError::WouldBlock => {
+                services
+                    .violations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                abi::status_code::INVALID_STATE
+            }
             std::sync::TryLockError::Poisoned(_) => abi::status_code::PANICKED,
         },
         kind: 0,
@@ -1313,7 +1521,16 @@ pub fn with_context<R>(
             HostServiceError::Panicked
         }
     };
-    let token = match context.diagnostic_token.checked_add(1) {
+    if matches!(error, HostServiceError::InvalidState) {
+        services
+            .violations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let token = match context
+        .diagnostic_token
+        .checked_add(1)
+        .filter(|token| *token < (1 << 63))
+    {
         Some(token) => {
             context.diagnostic_token = token;
             token
@@ -1350,9 +1567,10 @@ fn classify_failure(error: &HostServiceError, error_token: u64) -> HostCallFailu
         | HostServiceError::Terminal => 4,
         HostServiceError::InvalidDescriptor
         | HostServiceError::Lease(LeaseError::InvalidBudget | LeaseError::InvalidTransition) => 5,
-        HostServiceError::Busy
-        | HostServiceError::Lease(LeaseError::BudgetExhausted | LeaseError::GenerationExhausted) => {
-            6
+        HostServiceError::InvalidState => abi::status_code::INVALID_STATE,
+        HostServiceError::DestroyBusy => abi::status_code::BUSY,
+        HostServiceError::Lease(LeaseError::BudgetExhausted | LeaseError::GenerationExhausted) => {
+            abi::status_code::FAILED
         }
     };
     let kind = match error {
@@ -1373,9 +1591,12 @@ pub fn copy_context_diagnostic(
     token: u64,
     target: &mut [u8],
 ) -> Result<usize, HostServiceError> {
+    if token & (1 << 63) != 0 {
+        return raw_owner(handle)?.copy_error(token, target);
+    }
     let owner = context_owner(handle)?;
     let context = owner.try_lock().map_err(|error| match error {
-        std::sync::TryLockError::WouldBlock => HostServiceError::Busy,
+        std::sync::TryLockError::WouldBlock => HostServiceError::InvalidState,
         std::sync::TryLockError::Poisoned(_) => HostServiceError::Panicked,
     })?;
     catch_unwind(AssertUnwindSafe(|| context.copy_diagnostic(token, target))).map_err(
@@ -1403,6 +1624,7 @@ pub fn remove_context(handle: u64) -> Result<(), HostServiceError> {
         return Err(LeaseError::InvalidHandle.into());
     }
     row.owner = None;
+    row.raw = None;
     row.generation = 0;
     Ok(())
 }
@@ -1487,7 +1709,7 @@ macro_rules! host_callback {
             match catch_unwind(AssertUnwindSafe(|| {
                 #[allow(unused_mut)]
                 let mut $memory = CallerMemory;
-                call_status(with_context($context.value, |$host| $body))
+                call_status(with_context($context.value, |$host| { $host.require_node_call()?; $body }))
             })) {
                 Ok(result) => result,
                 Err(payload) => { contain_panic_payload(payload); status(abi::status_code::PANICKED) }
@@ -1521,12 +1743,8 @@ host_callback!(callback_bind(context, ordinal: u32, direction: u32, out: *mut ab
     out.write(host.binding(context.value, ordinal, direction)?);
     Ok(status(abi::status_code::OK))
 });
-host_callback!(callback_loan(context, port: abi::PortHandle, request: abi::LoanRequestV1, out: *mut abi::WriteSlotV1) |host, memory| {
+host_callback!(callback_typed_loan(context, port: abi::PortHandle, request: abi::LoanRequestV1, out: *mut abi::WriteSlotV1) |host, memory| {
     let out = memory.output(out)?;
-    if host.raw_candidate(context.value, port.value) {
-        out.write(host.loan_raw(context.value, port.value, request)?);
-        return Ok(status(abi::status_code::OK));
-    }
     let index = host.port_index(context.value, port.value, LeaseDirection::Write)?;
     let layout = host.ports[index].spec.layout;
     let prefix = layout.prefix_len().ok_or(HostServiceError::InvalidDescriptor)?;
@@ -1547,15 +1765,13 @@ host_callback!(callback_spill(context, lease: abi::LeaseHandle, payload: abi::By
     match memory.bytes(payload) {
         Ok(payload) => host.submit_spill(context.value, port, lease.value, payload, total)?,
         Err(error) => {
-            let NativeLease::Write { spill_attempted, .. } = host.leases.get_mut(lease.value, port, LeaseDirection::Write)? else { return Err(HostServiceError::InvalidDescriptor); };
-            if *spill_attempted { return Err(LeaseError::InvalidTransition.into()); }
-            *spill_attempted = true;
+            host.reject_spill_span(context.value, port, lease.value)?;
             return Err(error);
         }
     }
     Ok(status(abi::status_code::OK))
 });
-host_callback!(callback_discard(context, lease: abi::LeaseHandle, reason: u32) |host, _memory| {
+host_callback!(callback_typed_discard(context, lease: abi::LeaseHandle, reason: u32) |host, _memory| {
     let port = lease_port(host, lease, LeaseDirection::Write)?;
     let reason = match reason {
         abi::discard_reason::TICK_FAILED | abi::discard_reason::TICK_PANICKED => HostDiscardReason::TickFailed,
@@ -1563,12 +1779,45 @@ host_callback!(callback_discard(context, lease: abi::LeaseHandle, reason: u32) |
         abi::discard_reason::REPLAY_SUPPRESSED => HostDiscardReason::ReplaySuppressed,
         abi::discard_reason::SPILL_RELEASE => HostDiscardReason::SpillRelease,
         abi::discard_reason::INVARIANT => HostDiscardReason::Invariant,
-        _ => return Err(HostServiceError::InvalidDescriptor),
+        _ => { host.discard_output(context.value, port, lease.value, HostDiscardReason::Invariant)?; return Err(HostServiceError::InvalidDescriptor); },
     };
-    if host.raw_candidate(context.value, port) { host.discard_raw(context.value, port, lease.value, reason)?; }
-    else { host.discard_output(context.value, port, lease.value, reason)?; }
+    host.discard_output(context.value, port, lease.value, reason)?;
     Ok(status(abi::status_code::OK))
 });
+unsafe extern "C" fn callback_loan(
+    context: abi::ContextHandle,
+    port: abi::PortHandle,
+    request: abi::LoanRequestV1,
+    out: *mut abi::WriteSlotV1,
+) -> abi::Status {
+    match raw_owner(context.value) {
+        Ok(raw) if raw.port_candidate(port.value) => {
+            // SAFETY: forwarding the unchanged live caller arguments preserves the C entry contract.
+            unsafe { raw::callback_loan_raw(context, port, request, out) }
+        }
+        _ => {
+            // SAFETY: forwarding the unchanged live caller arguments preserves the C entry contract.
+            unsafe { callback_typed_loan(context, port, request, out) }
+        }
+    }
+}
+unsafe extern "C" fn callback_discard(
+    context: abi::ContextHandle,
+    lease: abi::LeaseHandle,
+    reason: u32,
+) -> abi::Status {
+    match raw_owner(context.value) {
+        Ok(raw) if raw.lease_candidate(lease.value) => {
+            // SAFETY: forwarding the unchanged caller handles preserves the C entry contract.
+            unsafe { raw::callback_discard_raw(context, lease, reason) }
+        }
+        _ => {
+            // SAFETY: forwarding the unchanged caller handles preserves the C entry contract.
+            unsafe { callback_typed_discard(context, lease, reason) }
+        }
+    }
+}
+
 host_callback!(callback_receive(context, port: abi::PortHandle, mode: u32, out: *mut abi::ReadSlotV1) |host, memory| {
     let out = memory.output(out)?;
     let index = host.port_index(context.value, port.value, LeaseDirection::Read)?;
@@ -1640,18 +1889,6 @@ host_callback!(
         Ok(status(abi::status_code::OK))
     }
 );
-host_callback!(callback_clock(context, source: u32, out: *mut abi::ClockValueV1) |host, memory| {
-    let out = memory.output(out)?;
-    let time = match source {
-        abi::clock_source::ACTIVE => Some(host.clock_now()?),
-        abi::clock_source::VIRTUAL => host.clock_virtual()?,
-        abi::clock_source::EXTERNAL => host.clock_external()?,
-        abi::clock_source::REAL => Some(host.clock_real()?),
-        _ => return Err(HostServiceError::InvalidDescriptor),
-    };
-    out.write(abi::ClockValueV1 { timestamp_ns: time.unwrap_or(0), present: u32::from(time.is_some()), reserved: 0 });
-    Ok(status(abi::status_code::OK))
-});
 host_callback!(
     callback_shutdown(context) | host,
     _memory | {
@@ -1892,7 +2129,7 @@ pub static HOST_API: abi::HostApiV1 = abi::HostApiV1 {
     set_snapshot_inputs: callback_snapshots_configure,
     snapshot_inputs: callback_snapshots,
     pump_history: callback_pump,
-    clock: callback_clock,
+    clock: raw::callback_clock,
     request_shutdown: callback_shutdown,
     environment: callback_environment,
     poll_event: callback_event,
@@ -2214,20 +2451,14 @@ mod tests {
     }
 
     #[test]
-    fn reentrant_callback_refuses_busy_without_waiting_on_its_own_gate() {
+    fn reentrant_callback_refuses_invalid_state_without_waiting_on_its_own_gate() {
         let handle = register_context(clock_context(321)).unwrap();
         with_context(handle, |context| {
-            let mut out = std::mem::MaybeUninit::<abi::ClockValueV1>::uninit();
-            // SAFETY: the output record is live and exclusive. Reentrancy is
-            // deliberately exercised and must refuse before accessing state.
-            let result = unsafe {
-                (HOST_API.clock)(
-                    abi::ContextHandle { value: handle },
-                    abi::clock_source::ACTIVE,
-                    out.as_mut_ptr(),
-                )
-            };
-            assert_eq!(result.code, abi::status_code::BUSY);
+            // SAFETY: the context is live; reentrant ordinary admission must
+            // refuse before accessing state or requesting shutdown.
+            let result =
+                unsafe { (HOST_API.request_shutdown)(abi::ContextHandle { value: handle }) };
+            assert_eq!(result.code, abi::status_code::INVALID_STATE);
             assert_eq!(context.clock_now().unwrap(), 321);
             Ok(())
         })
@@ -2243,9 +2474,10 @@ mod tests {
             (HostServiceError::Lease(LeaseError::WrongOwner), 4),
             (HostServiceError::Lease(LeaseError::InvalidTransition), 5),
             (HostServiceError::Lease(LeaseError::InvalidBudget), 5),
-            (HostServiceError::Lease(LeaseError::BudgetExhausted), 6),
-            (HostServiceError::Lease(LeaseError::GenerationExhausted), 6),
-            (HostServiceError::Busy, 6),
+            (HostServiceError::Lease(LeaseError::BudgetExhausted), 2),
+            (HostServiceError::Lease(LeaseError::GenerationExhausted), 2),
+            (HostServiceError::InvalidState, 9),
+            (HostServiceError::DestroyBusy, 6),
             (HostServiceError::InvalidDescriptor, 5),
             (HostServiceError::BufferTooSmall(17), 8),
             (
