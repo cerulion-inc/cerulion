@@ -4460,20 +4460,23 @@ nodes:
                 lease: Duration::from_secs(5),
             });
             let topology = runtime.run_topology();
-            let run_json = String::from_utf8(render_hosted_run_manifest(&HostedRunSpec {
-                run_id: RUN_ID,
-                graph_name: "wire",
-                run_started_at_ns: 0,
-                pid: std::process::id(),
-                lan_access: "open",
-                endpoints: &[],
-                topology: &topology,
-                fires: Some(FireTelemetryDecl {
-                    version: 1,
-                    capacity: 4096,
-                    lease_ms: 5000,
-                }),
-            }))
+            let run_json = String::from_utf8(
+                render_hosted_run_manifest(&HostedRunSpec {
+                    run_id: RUN_ID,
+                    graph_name: "wire",
+                    run_started_at_ns: 0,
+                    pid: std::process::id(),
+                    lan_access: "open",
+                    endpoints: &[],
+                    topology: &topology,
+                    fires: Some(FireTelemetryDecl {
+                        version: 1,
+                        capacity: 4096,
+                        lease_ms: 5000,
+                    }),
+                })
+                .expect("the hosted run.json fits the served cap"),
+            )
             .unwrap();
             let entry = RunEntry::new(RUN_ID, "wire", 0, RunState::Live, GRAPH, run_json)
                 .expect("a well-formed entry");
