@@ -56,4 +56,5 @@ Codegen/rewriter changes run core and cerulion tests with root serial discipline
   preserves `100_000`/`0xff`/type suffixes, which `str::parse::<u64>()` rejects, and a
   swallowed parse error silently drops the user's policy.
 
+Stable maintenance only; link cdylibs before pushing.
 Deep reference: docs/internals/macros.md (grammar, rewriter, root, FFI, trybuild).
