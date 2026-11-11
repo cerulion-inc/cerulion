@@ -3572,6 +3572,12 @@ mod tests {
         NotJson,
         /// Answer the `estop` call with a result that does not say `estopped`.
         NoEstopped,
+        /// Answer the `estop` call with a body shaped as rcpd writes it, with
+        /// a stand-in `call_id`, when the graph did not acknowledge its e-stop
+        /// frame on the default results topic within rcpd's 2 s e-stop
+        /// timeout and its intent receipt was not written; the delivery reads
+        /// only `estopped` and `graph_acknowledged`.
+        Unacknowledged,
         /// Answer as rcpd does.
         Answer,
     }
@@ -3688,6 +3694,9 @@ mod tests {
                         )),
                         Turn::NotJson => Some(raw("200 OK", "", "not json")),
                         Turn::NoEstopped => Some(estop_answer(r#"{"graph_acknowledged":true}"#)),
+                        Turn::Unacknowledged => Some(estop_answer(
+                            r#"{"call_id":1,"estopped":true,"graph_acknowledged":false,"graph_error":"no answer on /rcp/results within 2000 ms","receipt":null,"result":null}"#,
+                        )),
                         _ if kind == "DELETE" => Some(empty("200 OK")),
                         _ if id.is_null() => Some(empty("202 Accepted")),
                         _ if kind == "initialize" => Some(json(
@@ -4088,6 +4097,55 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn an_estop_rcpd_answered_without_the_graphs_acknowledgement_ends_the_delivery_and_logs_so(
+    ) {
+        use Turn::{Answer, Unacknowledged};
+        let dir = tempfile::tempdir().unwrap();
+        let mut stand_in = ScriptedRcpd::start(vec![Answer, Answer, Unacknowledged]).await;
+        let rcpd = sender_to(dir.path(), stand_in.addr);
+        // rcpd answers the first delivery's estop with its latch closed and
+        // the graph's acknowledgement missing, and the second's in full.
+        for (key, acknowledged) in [
+            ([1u8; 32], "graph_acknowledged=false"),
+            ([2u8; 32], "graph_acknowledged=true"),
+        ] {
+            assert!(rcpd.send(&key), "the engage started no delivery");
+            until_delivered(&rcpd).await;
+            assert_eq!(stand_in.kinds_so_far(), attempt());
+            assert_eq!(
+                rcpd.owing.period.lock().unwrap().engager,
+                None,
+                "the answered delivery left its period open"
+            );
+            let by = format!("by={}", hex::encode(key));
+            logs_assert(
+                |logs| match lines_with(logs, &[LATCH_CLOSED, &by]).as_slice() {
+                    [line]
+                        if ["WARN", acknowledged, "attempts=1", "failed_attempts=0"]
+                            .iter()
+                            .all(|part| has(line, part)) =>
+                    {
+                        Ok(())
+                    }
+                    lines => Err(format!("closed-latch lines: {lines:#?}")),
+                },
+            );
+        }
+        logs_assert(|logs| {
+            let failed = lines_with(logs, &[ATTEMPT_FAILED]);
+            let early = lines_with(logs, &[ENDED_EARLY]);
+            if failed.is_empty() && early.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failure lines: {failed:#?}, early-end lines: {early:#?}"
+                ))
+            }
+        });
     }
 
     #[tokio::test(flavor = "multi_thread")]
