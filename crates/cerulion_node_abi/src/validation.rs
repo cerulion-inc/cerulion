@@ -133,7 +133,11 @@ pub unsafe fn read_host_api(ptr: *const HostApiV1) -> Result<HostApiV1, AbiError
         mark_served,
         capture_accumulate,
         query_extension,
-        restore_accumulate
+        restore_accumulate,
+        create_raw_publisher,
+        finish_raw_output,
+        register_raw_egress,
+        destroy_raw_publisher
     );
     // SAFETY: all callbacks are non-null, complete table storage is initialized
     // and live, and every other host-table field is an unrestricted integer.
@@ -321,24 +325,81 @@ mod tests {
     }
 
     #[test]
-    fn missing_host_callback_refuses_before_any_rust_function_value_exists() {
-        let mut raw = vec![0usize; size_of::<HostApiV1>().div_ceil(size_of::<usize>())];
-        // SAFETY: initialized aligned scalar storage covers the host table. Only
-        // a valid scalar header is written; its first null callback must refuse
-        // before a Rust HostApi value can be formed from the malformed bytes.
-        let result = unsafe {
-            let ptr = raw.as_mut_ptr().cast::<HostApiV1>();
-            ptr.cast::<TableHeaderV1>()
-                .write(TableHeaderV1::for_type::<HostApiV1>());
-            read_host_api(ptr)
-        };
-        assert!(matches!(
-            result,
-            Err(AbiError::Callback {
-                table: "HostApiV1",
-                callback: "bind_port"
-            })
-        ));
+    fn every_missing_host_callback_refuses_before_any_rust_function_value_exists() {
+        let fields = [
+            (offset_of!(HostApiV1, bind_port), "bind_port"),
+            (offset_of!(HostApiV1, loan_output), "loan_output"),
+            (offset_of!(HostApiV1, finish_output), "finish_output"),
+            (offset_of!(HostApiV1, submit_spill), "submit_spill"),
+            (offset_of!(HostApiV1, discard_output), "discard_output"),
+            (offset_of!(HostApiV1, receive_input), "receive_input"),
+            (offset_of!(HostApiV1, release_input), "release_input"),
+            (offset_of!(HostApiV1, input_head), "input_head"),
+            (
+                offset_of!(HostApiV1, set_snapshot_inputs),
+                "set_snapshot_inputs",
+            ),
+            (offset_of!(HostApiV1, snapshot_inputs), "snapshot_inputs"),
+            (offset_of!(HostApiV1, pump_history), "pump_history"),
+            (offset_of!(HostApiV1, clock), "clock"),
+            (offset_of!(HostApiV1, request_shutdown), "request_shutdown"),
+            (offset_of!(HostApiV1, environment), "environment"),
+            (offset_of!(HostApiV1, poll_event), "poll_event"),
+            (
+                offset_of!(HostApiV1, publisher_counters),
+                "publisher_counters",
+            ),
+            (offset_of!(HostApiV1, copy_error), "copy_error"),
+            (offset_of!(HostApiV1, diagnostic), "diagnostic"),
+            (offset_of!(HostApiV1, accumulate_count), "accumulate_count"),
+            (offset_of!(HostApiV1, accumulate_frame), "accumulate_frame"),
+            (offset_of!(HostApiV1, mark_served), "mark_served"),
+            (
+                offset_of!(HostApiV1, capture_accumulate),
+                "capture_accumulate",
+            ),
+            (offset_of!(HostApiV1, query_extension), "query_extension"),
+            (
+                offset_of!(HostApiV1, restore_accumulate),
+                "restore_accumulate",
+            ),
+            (
+                offset_of!(HostApiV1, create_raw_publisher),
+                "create_raw_publisher",
+            ),
+            (
+                offset_of!(HostApiV1, finish_raw_output),
+                "finish_raw_output",
+            ),
+            (
+                offset_of!(HostApiV1, register_raw_egress),
+                "register_raw_egress",
+            ),
+            (
+                offset_of!(HostApiV1, destroy_raw_publisher),
+                "destroy_raw_publisher",
+            ),
+        ];
+        for (missing, name) in fields {
+            let mut raw = vec![0usize; size_of::<HostApiV1>().div_ceil(size_of::<usize>())];
+            // SAFETY: aligned initialized scalar storage covers the whole host
+            // table. We construct malformed callback bytes, never a typed table:
+            // every case contains one null callback and MUST refuse before any
+            // Rust function pointer value or reference is formed or invoked.
+            let result = unsafe {
+                let ptr = raw.as_mut_ptr().cast::<HostApiV1>();
+                ptr.cast::<TableHeaderV1>()
+                    .write(TableHeaderV1::for_type::<HostApiV1>());
+                for (offset, _) in fields {
+                    ptr.cast::<u8>().add(offset).cast::<usize>().write(1);
+                }
+                ptr.cast::<u8>().add(missing).cast::<usize>().write(0);
+                read_host_api(ptr)
+            };
+            assert!(
+                matches!(result, Err(AbiError::Callback { table: "HostApiV1", callback }) if callback == name)
+            );
+        }
     }
 
     #[test]

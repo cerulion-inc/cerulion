@@ -190,6 +190,15 @@ mod tests {
     #[test]
     fn frozen_port_event_accumulator_and_sync_tags_match_wire_oracles() {
         assert_eq!(core::mem::size_of::<PortBindingV1>(), 32);
+        assert_eq!(core::mem::size_of::<RawPublisherRequestV1>(), 32);
+        assert_eq!(
+            [
+                full_queue::CONFIG_DEFAULT,
+                full_queue::DISCARD,
+                full_queue::BLOCK
+            ],
+            [0, 1, 2]
+        );
         assert_eq!(core::mem::size_of::<AccumulateInfoV1>(), 24);
         assert_eq!(core::mem::size_of::<EventV1>(), 88);
         assert_eq!(

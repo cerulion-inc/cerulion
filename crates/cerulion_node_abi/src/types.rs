@@ -440,3 +440,29 @@ pub struct ExtensionDescriptorV1 {
     /// Exact immutable extension version.
     pub version: u32,
 }
+
+/// Cold raw-ingress publisher request. Topic bytes are borrowed only for create;
+/// host copies their UTF-8 storage and retains the native publisher and QoS.
+#[stabby::stabby]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RawPublisherRequestV1 {
+    /// Caller-owned UTF-8 topic, never retained as a pointer by the host.
+    pub topic: Bytes,
+    /// Canonical schema hash validated against every submitted raw frame.
+    pub schema_hash: u64,
+    /// Configured complete-frame ceiling, including the wire header.
+    pub configured_capacity: u32,
+    /// full_queue tag; all unknown values are refused before creation.
+    pub full_queue: u32,
+}
+
+/// Frozen native raw-ingress full-queue send overrides.
+pub mod full_queue {
+    /// Preserve the native publisher's existing config-selected strategy.
+    pub const CONFIG_DEFAULT: u32 = 0;
+    /// Non-waiting send skips full subscriber queues.
+    pub const DISCARD: u32 = 1;
+    /// Explicit retry-until-delivered strategy.
+    pub const BLOCK: u32 = 2;
+}
