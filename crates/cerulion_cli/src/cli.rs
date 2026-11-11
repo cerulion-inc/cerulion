@@ -59,7 +59,8 @@ impl From<TimeSource> for EngineTimeSource {
 pub enum RecordEnv {
     /// Record every variable NAME, and VALUES only for CERULION_*, RUST_LOG
     /// and IOX2_* names with no TOKEN, KEY, SECRET, PASSWORD or CREDENTIAL
-    /// part (plurals included). Every other value is stored as a hash, so a
+    /// part, in any case, plural or with trailing digits (CERULION_KEY2 is
+    /// hashed). Every other value is stored as a hash, so a
     /// re-execution can detect that it changed without the bag carrying your
     /// secrets. The default.
     Allowlist,

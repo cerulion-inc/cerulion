@@ -26361,7 +26361,7 @@ process_groups:
     }
 
     /// The secret-name rule over hand-written names: a marker counts only as
-    /// its own segment (split at every non-alphanumeric ASCII character),
+    /// its own segment (split at every character that is not an ASCII letter or digit),
     /// case-insensitively, with trailing digits removed, singular or plural.
     #[cfg(unix)]
     #[test]
