@@ -41,10 +41,10 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring, n
 - Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is read-only: no peers.json writes.
 
 ## Tests
-- Run `-- --test-threads=1` (CLI shares SHM); `--no-default-features` stays green. Count oracles, not clocks.
+- `-- --test-threads=1` (CLI shares SHM); `--no-default-features` green. Count oracles, not clocks.
 - Build `cerulion_cli`/`cerulion_remoted` first; WAN fixtures use the real CLI/default
   SHM namespace and owner controller; CI runs serial.
-- `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
-  it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
+- `#[traced_test]` capture is thread-local: plane tokio workers are invisible.
+  Test-only beacon suppression stays out of `src/**` (walk enforced).
 
 See: docs/internals/network-daemons.md, docs/internals/remote-access.md.

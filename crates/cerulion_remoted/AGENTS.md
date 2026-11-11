@@ -1,6 +1,6 @@
 # cerulion_remoted
 
-One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
+One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
 - Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
@@ -38,7 +38,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
 - Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
-- Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Validation refusals retain readers; failed cleanup fences. Retire only outbound.
+- Same-user outbound shares endpoint/runtime/node; pre-dial key/namespace gate. Metadata per-call; validation refusals keep readers/idle fence; cleanup errors fence control. Retire only outbound.
 
 ## Tests
 - Run `wire_plane_test` with `-- --test-threads=1`: at the macOS 256-file soft
@@ -48,5 +48,4 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   e2e: loopback iroh only, relay off, direct dial, bounded awaits.
 - remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
-Read docs/internals/remote-access.md before verb table, trust persistence, wire,
-pairing formats or epoch changes.
+Read docs/internals/remote-access.md before verb, trust, wire, pairing or epoch changes.
