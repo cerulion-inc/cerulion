@@ -8,8 +8,11 @@ use crate::*;
 /// Raw publisher create/loan/finish/discard/egress may run on any helper thread
 /// concurrently with tick, synchronized per raw publisher without the tick lock.
 /// They never return BUSY for thread contention; helper leases do not block fires.
+/// Clock access also runs on any thread, outside admission, without BUSY or
+/// INVALID_STATE, preserving the injected graph clock for helper publication.
 /// Ordinary ports, sync and state are admitted node-call services; out-of-call or
-/// concurrent use returns counted INVALID_STATE. BUSY means destroy must wait for
+/// concurrent use returns counted INVALID_STATE without changing any lease.
+/// BUSY means destroy must wait for
 /// outstanding leases: release them and retry. No NodeApi/StateApi/ExternalApi
 /// entries run concurrently for one NodeHandle. Every call-scoped ordinary lease
 /// ends before return; after destroy the host reclaims leaks as INVARIANT, without
@@ -28,17 +31,18 @@ pub struct HostApiV1 {
     /// Loan adaptive capacity, initialize prefix, retain native loan on host.
     pub loan_output:
         unsafe extern "C" fn(ContextHandle, PortHandle, LoanRequestV1, *mut WriteSlotV1) -> Status,
-    /// Commit initialized frame bytes. Every result except INVALID_HANDLE consumes
-    /// the lease once. Size outside `prefix_size..=capacity` counts INVARIANT and
+    /// Commit initialized frame bytes. An admitted terminal result other than
+    /// INVALID_HANDLE consumes once; INVALID_STATE admission refusal has no effect. Size outside `prefix_size..=capacity` counts INVARIANT and
     /// returns INVALID_ARGUMENT. After submit_spill, return INVALID_HANDLE.
     pub finish_output: unsafe extern "C" fn(ContextHandle, LeaseHandle, u32) -> Status,
     /// Copy a node-owned initialized overflow PAYLOAD into a fresh host loan.
     /// Header/timestamp come from old lease; size includes header. The caller
     /// retains spill allocation until return. Original loan stays live on EVERY
     /// result until discard_output(SPILL_RELEASE) after writer destruction.
-    /// Records one attempt per lease; repeated submission cannot publish twice.
+    /// Tracks separate attempted/submitted states; repeated submission cannot publish twice.
     /// Require size == header_len + payload.len and capacity < size <= configured
     /// capacity. First submission fully accounts commit/send failure/INVARIANT.
+    /// Malformed spill is counted once; submission never consumes any lease.
     /// Original storage remains live until writer Drop and SPILL_RELEASE.
     pub submit_spill: unsafe extern "C" fn(ContextHandle, LeaseHandle, Bytes, u32) -> Status,
     /// Consume original loan without consuming wire sequence. SPILL_RELEASE only
@@ -46,13 +50,15 @@ pub struct HostApiV1 {
     /// drive existing counters/latches. Never call while its writer is live.
     /// After submission only SPILL_RELEASE is accepted; other reasons refuse.
     /// SPILL_RELEASE without an attempt consumes as counted INVARIANT.
-    /// Every result except INVALID_HANDLE consumes an ordinary lease once.
+    /// An admitted result except INVALID_HANDLE consumes once; INVALID_STATE
+    /// admission refusal preserves the lease. No-attempt release counts once.
     pub discard_output: unsafe extern "C" fn(ContextHandle, LeaseHandle, u32) -> Status,
     /// Receive through the existing queue/frozen read path and retain frame.
     /// Requested read_mode must match the cold binding classification.
     pub receive_input:
         unsafe extern "C" fn(ContextHandle, PortHandle, u32, *mut ReadSlotV1) -> Status,
-    /// End immutable input borrow. Every result except INVALID_HANDLE consumes once.
+    /// End immutable input borrow. An admitted result except INVALID_HANDLE consumes
+    /// once; INVALID_STATE admission refusal leaves the owner and mapping intact.
     pub release_input: unsafe extern "C" fn(ContextHandle, LeaseHandle) -> Status,
     /// Apply head_op with explicit boundary/refill site through existing decisions.
     pub input_head:

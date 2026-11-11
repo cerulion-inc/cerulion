@@ -23,7 +23,7 @@ pub use client::HostClient;
 pub use context::{AnyPublisher, AnySubscriber, NodeContext};
 pub use exports::{NodeExports, PluginNode};
 pub use input::{Accumulated, InputView};
-pub use metadata::{metadata, metadata_with_accumulation, raw_metadata};
+pub use metadata::{metadata, raw_metadata};
 pub use output::{LazyOutput, OutputProxy};
 pub use raw_frame::{RawFrameLoan, RawFrameRead};
 pub use raw_ingress::{RawIngress, RawPublisher};

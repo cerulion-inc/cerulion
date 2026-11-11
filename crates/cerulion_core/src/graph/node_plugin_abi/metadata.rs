@@ -12,23 +12,8 @@ pub fn metadata(
     base: &CStr,
     inputs: &[LoanRequestV1],
     outputs: &[LoanRequestV1],
+    accumulate_caps: &[Option<usize>],
 ) -> TransportResult<CString> {
-    metadata_with_accumulation(base, inputs, outputs, &[])
-}
-
-/// Add explicit accumulation limits without changing common legacy metadata.
-// hot-path-alloc-ok-fn: checked cold bootstrap metadata, once per library.
-pub fn metadata_with_accumulation(
-    base: &CStr,
-    inputs: &[LoanRequestV1],
-    outputs: &[LoanRequestV1],
-    caps: &[Option<u32>],
-) -> TransportResult<CString> {
-    if !caps.is_empty() && caps.len() != inputs.len() {
-        return Err(super::argument_error(
-            "accumulation limits differ from input count",
-        ));
-    }
     let mut value: serde_json::Value = serde_json::from_slice(base.to_bytes())
         .map_err(|error| super::argument_error(&error.to_string()))?;
     for (direction, facts) in [("inputs", inputs), ("outputs", outputs)] {
@@ -41,7 +26,7 @@ pub fn metadata_with_accumulation(
                 "wire facts differ from the common port count",
             ));
         }
-        for (index, (port, facts)) in ports.iter_mut().zip(facts).enumerate() {
+        for (port, facts) in ports.iter_mut().zip(facts) {
             let port = port
                 .as_object_mut()
                 .ok_or_else(|| super::argument_error("common port metadata is not an object"))?;
@@ -55,15 +40,20 @@ pub fn metadata_with_accumulation(
             port.insert("wire_fixed_size".into(), facts.wire_fixed_size.into());
             port.insert("variable_count".into(), facts.variable_count.into());
             port.insert("alignment".into(), facts.alignment.into());
-            if direction == "inputs" {
-                if let Some(Some(cap)) = caps.get(index) {
-                    if *cap == 0 {
-                        return Err(super::argument_error("accumulation limit is zero"));
-                    }
-                    port.insert("accumulate_cap".into(), (*cap).into());
-                }
-            }
         }
+    }
+    let input_ports = value["inputs"]
+        .as_array_mut()
+        .ok_or_else(|| super::argument_error("input metadata array is missing"))?;
+    if input_ports.len() != accumulate_caps.len() {
+        return Err(super::argument_error(
+            "accumulate capacities differ from input count",
+        ));
+    }
+    for (port, capacity) in input_ports.iter_mut().zip(accumulate_caps) {
+        port.as_object_mut()
+            .ok_or_else(|| super::argument_error("input metadata is not an object"))?
+            .insert("accumulate_cap".into(), (*capacity).into());
     }
     let bytes =
         serde_json::to_vec(&value).map_err(|error| super::argument_error(&error.to_string()))?;
@@ -103,7 +93,7 @@ pub fn raw_metadata(
         serde_json::to_vec(&value).map_err(|error| super::argument_error(&error.to_string()))?;
     let normalized =
         CString::new(bytes).map_err(|error| super::argument_error(&error.to_string()))?;
-    metadata(&normalized, inputs, outputs)
+    metadata(&normalized, inputs, outputs, &vec![None; inputs.len()])
 }
 
 #[cfg(test)]
@@ -124,7 +114,7 @@ mod tests {
     fn stable_facts_preserve_common_metadata_and_leave_the_legacy_bytes_untouched() {
         let base = c"{\"inputs\":[{\"name\":\"input\",\"schema_hash\":7,\"trigger\":true}],\"outputs\":[{\"name\":\"output\",\"schema_hash\":9}],\"params\":[{\"name\":\"scale\",\"default\":2}],\"policy\":{\"kind\":\"data_trigger\",\"input\":\"input\"}}";
         for _ in 0..2 {
-            let enriched = metadata(base, &[facts(7)], &[facts(9)]).unwrap();
+            let enriched = metadata(base, &[facts(7)], &[facts(9)], &[None]).unwrap();
             let value: serde_json::Value = serde_json::from_slice(enriched.to_bytes()).unwrap();
             assert_eq!(value["inputs"][0]["trigger"], true);
             assert_eq!(value["inputs"][0]["wire_fixed_size"], 24);
@@ -148,7 +138,7 @@ mod tests {
             c"{\"inputs\":[3],\"outputs\":[]}",
             c"{\"inputs\":[{\"schema_hash\":8}],\"outputs\":[]}",
         ] {
-            assert!(metadata(base, &[facts(7)], &[]).is_err());
+            assert!(metadata(base, &[facts(7)], &[], &[None]).is_err());
         }
     }
 }

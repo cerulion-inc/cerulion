@@ -82,7 +82,13 @@ impl DylibNodeEntry {
             .map_err(|e| error(format!("node metadata is not UTF-8: {e}")))?
             .to_owned();
         let mut author_metadata: serde_json::Value = serde_json::from_str(&metadata)
-            .map_err(|e| error(format!("node metadata is invalid: {e}")))?;
+            .map_err(|parse| {
+                tracing::error!(node_id = %label, error = %parse, "node info returned unparseable JSON");
+                TransportError::NodeInfoParse {
+                    diag_label: label.clone(), json_len: metadata.len(),
+                    prefix: metadata.chars().take(80).collect(), reason: parse.to_string(),
+                }
+            })?;
         let retain_process = match author_metadata.get("retain_process") {
             None => false,
             Some(value) => value
@@ -164,7 +170,7 @@ impl DylibNodeEntry {
             instance: None,
             context: None,
             info,
-            metadata,
+            metadata: author_metadata,
             ports: Some(ports),
             params: "{}".to_owned(),
             label,
@@ -206,7 +212,7 @@ impl DylibNodeEntry {
             let mut required = 0u64;
             // SAFETY: library retains callback, caller owns output scalar. Null
             // zero-length buffer is the frozen non-consuming size query.
-            let queried = unsafe {
+            let queried = self.invoke(|| unsafe {
                 (self.api().copy_error)(
                     status.error,
                     abi::MutableBytes {
@@ -215,7 +221,7 @@ impl DylibNodeEntry {
                     },
                     &mut required,
                 )
-            };
+            })?;
             if matches!(
                 queried.code,
                 abi::status_code::OK | abi::status_code::BUFFER_TOO_SMALL
@@ -225,7 +231,7 @@ impl DylibNodeEntry {
                 let mut bytes = vec![0u8; required as usize];
                 // SAFETY: exclusive host buffer is initialized and remains live
                 // through synchronous copy; node never retains or frees it.
-                let copied = unsafe {
+                let copied = self.invoke(|| unsafe {
                     (self.api().copy_error)(
                         status.error,
                         abi::MutableBytes {
@@ -234,7 +240,7 @@ impl DylibNodeEntry {
                         },
                         &mut required,
                     )
-                };
+                })?;
                 if copied.code == abi::status_code::OK && required as usize <= bytes.len() {
                     reason = String::from_utf8_lossy(&bytes[..required as usize]).into_owned();
                 }
@@ -257,6 +263,22 @@ impl DylibNodeEntry {
         }
         Err(self.error(reason))
     }
+    // hot-path-alloc-ok-fn: admission diagnostics allocate only on contract refusal.
+    fn invoke<R>(&self, call: impl FnOnce() -> R) -> TransportResult<R> {
+        let Some(context) = self.context else {
+            // Library-only shape discovery before create has no host context.
+            return Ok(call());
+        };
+        host::with_context(context, HostContext::begin_node_call)
+            .map_err(|error| self.error(format!("node call admission failed: {error:?}")))?;
+        // The context admission gate is released before foreign execution;
+        // synchronous HostApi callbacks may re-enter it on this thread.
+        let result = call();
+        host::with_context(context, HostContext::end_node_call)
+            .map_err(|error| self.error(format!("node call completion failed: {error:?}")))?;
+        Ok(result)
+    }
+
     fn native<R>(
         &self,
         op: impl FnOnce(&mut NodeContext) -> R,
@@ -329,6 +351,16 @@ impl NodeEntry for DylibNodeEntry {
     }
     // hot-path-alloc-ok-fn: parameter serialization occurs only before initialization
     fn set_params(&mut self, params: &ParamValues) -> TransportResult<()> {
+        if self.info.params().is_empty() && !params.is_empty() {
+            return Err(self.error(format!(
+                "node declares no params; supplied {}",
+                params
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         self.params = crate::graph::params::params_to_json(params)
             .map_err(|e| self.error(format!("params could not be encoded: {e}")))?;
         Ok(())
@@ -366,7 +398,7 @@ impl NodeEntry for DylibNodeEntry {
         // SAFETY: checked code/table retained, process-lifetime HOST_API; host
         // context remains registered. Params and exclusive output last this call.
         // No host context lock is held while plugin callbacks re-enter services.
-        let status = unsafe {
+        let status = self.invoke(|| unsafe {
             (self.api().create)(
                 &HOST_API,
                 abi::ContextHandle { value: handle },
@@ -376,6 +408,16 @@ impl NodeEntry for DylibNodeEntry {
                 },
                 &mut instance,
             )
+        });
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                // A refused completion may follow successful create. Retain code
+                // and host mappings until safe teardown can settle that instance.
+                self.retain_process = true;
+                self.instance = (instance.value != 0).then_some(instance);
+                return Err(error);
+            }
         };
         if let Err(error) = self.result(status, "init") {
             if !self.retain_process {
@@ -401,7 +443,7 @@ impl NodeEntry for DylibNodeEntry {
             .map_err(|e| self.error(format!("node fire admission failed: {e:?}")))?;
         // SAFETY: graph holds exclusive NodeEntry access; node instance and host
         // context are live, all previous loans returned, checked library retained.
-        let result = unsafe { (self.api().tick)(instance) };
+        let result = self.invoke(|| unsafe { (self.api().tick)(instance) })?;
         self.result(result, "tick")
     }
     // hot-path-alloc-ok-fn: node teardown diagnostics are outside publish and receive
@@ -411,11 +453,18 @@ impl NodeEntry for DylibNodeEntry {
         };
         // SAFETY: exclusive lifecycle call while context/services/code remain
         // live; shutdown runs before node allocator destroys its own state.
-        let status = unsafe { (self.api().shutdown)(instance) };
-        let result = self.result(status, "shutdown");
+        let result = self
+            .invoke(|| unsafe { (self.api().shutdown)(instance) })
+            .and_then(|status| self.result(status, "shutdown"));
         // SAFETY: all synchronous node calls have returned; node frees only its
         // own instance allocation, never the host context or sample owners.
-        let destroyed = unsafe { (self.api().destroy)(instance) };
+        let destroyed = match self.invoke(|| unsafe { (self.api().destroy)(instance) }) {
+            Ok(status) => status,
+            Err(error) => {
+                self.retain_process = true;
+                return Err(error);
+            }
+        };
         if destroyed.code != abi::status_code::OK {
             self.retain_process = true;
             return self.result(destroyed, "destroy");
@@ -544,8 +593,14 @@ impl NodeEntry for DylibNodeEntry {
         let mut shape = 0;
         // SAFETY: SDK validated complete immutable state table retained by library;
         // exclusive stack output is live through synchronous, handle-free query.
-        let status = unsafe { ((*ptr).shape)(&mut shape) };
-        (status.code == abi::status_code::OK).then_some(shape)
+        let status = self.invoke(|| unsafe { ((*ptr).shape)(&mut shape) }).ok()?;
+        match self.result(status, "state shape") {
+            Ok(()) => Some(shape),
+            Err(error) => {
+                tracing::warn!(node_id = %self.label, error = %error, "cerulion_node_state_shape failed; node state is unavailable");
+                None
+            }
+        }
     }
     // hot-path-alloc-ok-fn: anchor restoration and its diagnostics are cold
     fn restore_state(&mut self, bytes: &[u8]) -> TransportResult<()> {
@@ -555,15 +610,16 @@ impl NodeEntry for DylibNodeEntry {
         }
         // SAFETY: checked state table/code and instance retained, exclusive entry;
         // payload is host-owned and borrowed only through this synchronous call.
-        let status = unsafe {
+        let instance = self.handle()?;
+        let status = self.invoke(|| unsafe {
             ((*ptr).restore)(
-                self.handle()?,
+                instance,
                 abi::Bytes {
                     ptr: bytes.as_ptr(),
                     len: bytes.len() as u64,
                 },
             )
-        };
+        })?;
         self.result(status, "restore state")
     }
     // hot-path-alloc-ok-fn: state capture diagnostics allocate only on refusal
@@ -584,7 +640,8 @@ impl NodeEntry for DylibNodeEntry {
         };
         // SAFETY: checked callback/instance remain live; bridge and record are
         // exclusive borrowed stack objects, never retained past synchronous call.
-        let status = unsafe { ((*ptr).capture)(self.handle()?, &output, capacity) };
+        let instance = self.handle()?;
+        let status = self.invoke(|| unsafe { ((*ptr).capture)(instance, &output, capacity) })?;
         if bridge.panicked {
             return Err(self.error("host state sink panicked".to_owned()));
         }
@@ -605,7 +662,10 @@ impl NodeEntry for DylibNodeEntry {
         let mut safe = 0;
         // SAFETY: checked library/state/instance live; stack scalar exclusively
         // borrowed for synchronous query, graph serializes instance calls.
-        let status = unsafe { ((*ptr).inline_safe)(instance, &mut safe) };
+        let Ok(status) = self.invoke(|| unsafe { ((*ptr).inline_safe)(instance, &mut safe) })
+        else {
+            return false;
+        };
         status.code == abi::status_code::OK && safe == 1
     }
     fn cer_probe(&self) -> bool {
@@ -618,8 +678,10 @@ impl NodeEntry for DylibNodeEntry {
         }
         // SAFETY: checked state table and instance live; graph serializes the
         // synchronous probe with all other calls and retains library until return.
-        unsafe { ((*ptr).probe)(instance).code == abi::status_code::OK }
+        self.invoke(|| unsafe { ((*ptr).probe)(instance) })
+            .is_ok_and(|status| status.code == abi::status_code::OK)
     }
+    // hot-path-alloc-ok-fn: live source discovery runs once before polling; only a refused descriptor allocates text.
     fn external_source(&mut self) -> Option<ExternalSource> {
         let ptr = self.api().external;
         let instance = self.instance?;
@@ -633,7 +695,9 @@ impl NodeEntry for DylibNodeEntry {
         };
         // SAFETY: validated external table/code and instance live; exclusive stack
         // output lasts query. Graph asks once at live entry, never replay stepping.
-        let status = unsafe { ((*ptr).describe)(instance, &mut source) };
+        let status = self
+            .invoke(|| unsafe { ((*ptr).describe)(instance, &mut source) })
+            .ok()?;
         if source.flags & abi::external::RETAIN_PROCESS != 0 {
             self.retain_process = true;
         }
@@ -648,12 +712,22 @@ impl NodeEntry for DylibNodeEntry {
                 abi::external::HOST_DRIVEN => source.flags == 0,
                 _ => false,
             };
-        observe(
-            &self.label,
-            "external source",
-            &mut self.external_errors,
-            !valid,
-        );
+        if !valid {
+            let error = self
+                .result(status, "external source")
+                .err()
+                .unwrap_or_else(|| self.error("external source descriptor is invalid".to_owned()));
+            match self.external_errors.on_failure() {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                    tracing::error!(node_id = %self.label, error = %error,
+                    total_failures = self.external_errors.total_failures(), "node has no external source")
+                }
+                RegimeDecision::Suppressed { .. } => tracing::debug!(node_id = %self.label,
+                    total_failures = self.external_errors.total_failures(), "external source failure continues"),
+            }
+        } else if let Some(suppressed) = self.external_errors.on_success() {
+            tracing::info!(node_id = %self.label, suppressed, "external source recovered");
+        }
         if !valid {
             return None;
         }
@@ -677,6 +751,7 @@ impl Drop for DylibNodeEntry {
         }
         if self.retain_process {
             if let Some(library) = self.library.take() {
+                tracing::debug!(node_id = %self.label, "leaking cdylib library handle for process-lifetime helpers");
                 library.retain_for_process();
             }
         }

@@ -18,7 +18,7 @@ pub(crate) fn generate(
     let input_types = inputs.iter().map(|input| &input.field_type);
     let input_caps = inputs.iter().map(|input| match input.accumulate {
         Some(cap) => {
-            quote!(Some(u32::try_from(#cap).expect("accumulation limit fits the host bound")))
+            quote!(Some(#cap))
         }
         None => quote!(None),
     });
@@ -213,7 +213,7 @@ pub(crate) fn generate(
         fn __cer_stable_api() -> *const #root::node_abi::NodeApiV1 {
             *__CER_STABLE_API.get_or_init(|| {
                 let metadata = __CER_STABLE_METADATA.get_or_init(|| {
-                    #root::graph::node_plugin_abi::metadata_with_accumulation(
+                    #root::graph::node_plugin_abi::metadata(
                         INFO_JSON.get_or_init(__cer_build_info_json).as_c_str(),
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#input_types>()),*],
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#output_types>()),*],
