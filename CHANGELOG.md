@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - An ops `engage-estop` delivery in `cerulion-remoted` can end, on a panic or a dropped runtime, while it deletes the MCP session of an attempt rcpd answered that its latch closed. When an `engage-estop` came after that attempt began, the delivery now logs at error that the `estop` it still owed that `engage-estop` was not sent; the next `engage-estop` sends it. Before, it logged nothing.
+- After a `detach`, `cerulion-vizd`'s `attach`, `list`, `status` and `discover` replies no longer name the retired mirror's robot for a topic a desk producer took over. A mirror-provenance read that started before a `detach` or a remote `attach` and finished after it was stored over the newer state; it is now refused.
 
 ## [2.0.0] - 2026-11-11
 

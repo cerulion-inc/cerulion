@@ -1697,12 +1697,13 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
     // `attach_local`'s documented one.
     //
     // The enumeration is taken from the registry's whole read surface rather than
-    // guessed. In vizd's `src/` a provenance FETCH is reachable by exactly two
-    // names: `Ctx::gather_mirror_provenance` (which wraps
-    // `TransportManager::gather_mirror_provenance{,_checked}` — the `_checked` twin
-    // carries the bare name as a prefix, so one needle covers both), and
-    // `Ctx::attribution_snapshot`, which calls it and then merges the authoritative
-    // held half. Everything else in that API is pure (`merge_attribution`), a WRITE
+    // guessed. In vizd's `src/` a provenance FETCH is reachable by exactly three
+    // names, covered by two needles: `Ctx::gather_mirror_provenance` and the
+    // uncached registry read under it, `Ctx::gather_mirror_provenance_uncached`
+    // (which wraps `TransportManager::gather_mirror_provenance{,_checked}`; the
+    // bare name is a prefix of every one of these, so one needle covers them all),
+    // and `Ctx::attribution_snapshot`, which calls the first and then merges the
+    // authoritative held half. Everything else in that API is pure (`merge_attribution`), a WRITE
     // (`{,un}register_mirror_provenance`, called nowhere in vizd) or a cache read
     // (the `mirror_provenance` FIELD, which is what the refresher above uses).
     //
