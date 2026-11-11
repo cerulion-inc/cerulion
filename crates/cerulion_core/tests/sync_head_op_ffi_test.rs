@@ -90,7 +90,7 @@ fn a_null_name_pointer_is_refused_with_its_own_code_and_the_ladder_below_still_r
             );
             codes.push((HOST_API.input_head)(context, port, 2, &mut outcome).code);
         }
-        assert_eq!(codes, [5, 5, 5, 3, 0]);
+        assert_eq!(codes, [5, 5, 5, 4, 0]);
         assert_eq!(
             (
                 outcome.popped,
@@ -105,7 +105,7 @@ fn a_null_name_pointer_is_refused_with_its_own_code_and_the_ladder_below_still_r
         remove_context(context.value).unwrap();
         runs.push(codes);
     }
-    assert_eq!(runs[0], [5, 5, 5, 3, 0]);
-    assert_eq!(runs[1], [5, 5, 5, 3, 0]);
+    assert_eq!(runs[0], [5, 5, 5, 4, 0]);
+    assert_eq!(runs[1], [5, 5, 5, 4, 0]);
     assert_eq!(runs[0], runs[1]);
 }

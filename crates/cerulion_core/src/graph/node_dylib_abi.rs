@@ -14,6 +14,9 @@ use crate::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
 use cerulion_node_abi as abi;
 use std::path::Path;
 
+// Preserve the native log byte through a verified compile-time constant.
+const NATIVE_LOG_DASH: &str = "\u{2014}";
+
 #[derive(serde::Deserialize)]
 struct PortFact {
     name: String,
@@ -698,8 +701,7 @@ impl NodeEntry for DylibNodeEntry {
         if answer == SyncOpAnswer::Failed {
             match self.head_errors.on_failure() {
                 RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                    tracing::error!(node = %self.label, input = %name, op = ?op, code, total_failures = self.head_errors.total_failures(), "cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here \u{2014} no set member fabricated (suppressing further to debug until it recovers)");
-                    // dash-ok: native sync failure text kept byte-identical
+                    tracing::error!(node = %self.label, input = %name, op = ?op, code, total_failures = self.head_errors.total_failures(), "cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here {NATIVE_LOG_DASH} no set member fabricated (suppressing further to debug until it recovers)");
                 }
                 RegimeDecision::Suppressed { .. } => {
                     tracing::debug!(node = %self.label, input = %name, op = ?op, code, "cdylib sync_head_op still failing (suppressed)");

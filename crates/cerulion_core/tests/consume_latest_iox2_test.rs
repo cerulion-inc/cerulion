@@ -1374,6 +1374,12 @@ fn a_failed_cdylib_body_probe_says_so_on_its_own_latch() {
                 probe_heads[0]
             ));
         }
+        if !probe_heads[0].contains("cdylib consume = latest body probe got no answer (op code 0 of cerulion_node_sync_head_op failed or answered a kind this host does not know); this input fires on every arrival its trigger subscriber counts, including a frame an earlier read already took, until the probe answers (suppressing further to debug until it recovers)") {
+            return Err("the probe must preserve the complete native message bytes".into());
+        }
+        if !lines.iter().any(|line| line.contains("cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here \u{2014} no set member fabricated (suppressing further to debug until it recovers)")) {
+            return Err("the Sync failure must preserve the complete native message bytes".into());
+        }
         let sync_heads = lines
             .iter()
             .filter(|l| l.contains("ERROR") && l.contains("per-set Sync alignment pass ends here"))
