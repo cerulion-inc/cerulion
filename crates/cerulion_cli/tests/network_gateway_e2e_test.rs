@@ -749,8 +749,8 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
                     .is_ok_and(|value| {
                         value["bag_path"]
                             .as_str()
-                            .filter(|path| Path::new(path).is_absolute())
-                            .and_then(|path| Path::new(path).canonicalize().ok())
+                            .filter(|path| Path::new(path).parent() == Some(relative_recordings))
+                            .and_then(|path| tmp.path().join(path).canonicalize().ok())
                             .as_ref()
                             == Some(&expected_status_path)
                     })
@@ -797,6 +797,15 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
         wait_until_dead(gw_pid, Duration::from_secs(15)),
         "the gateway child must be reaped after the record run exits"
     );
+    let displayed_bag = relative_recordings.join(bag.file_name().unwrap());
+    assert!(read_file(&stdout_path)
+        .lines()
+        .any(|line| { line == format!("recording written to {}", displayed_bag.display()) }));
+    let recorder_log = read_file(&stderr_path);
+    assert!(recorder_log.lines().any(|line| {
+        line.contains("spawned bagd recorder")
+            && line.contains(&format!("bag={}", displayed_bag.display()))
+    }));
 
     let reader = cerulion_bag::BagReader::open(&bag).expect("open bag");
     let (_msgs, completeness) = reader.recover_messages().expect("recover");

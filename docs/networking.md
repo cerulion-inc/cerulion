@@ -52,7 +52,9 @@ default + gateway, the discovery ladder, and pairing.
   no gateway, no session, loud notice. Its topics, schemas and run metadata
   are unavailable off-machine, including through an already running open gateway,
   remote server or topic mirror. Local observers and recording still work.
-  Published graph recorder status names the full path of its MCAP file.
+  Published graph recorder status preserves the recording directory's spelling:
+  the default reports `recordings/<graph>_<timestamp>.mcap` relative to the run's
+  working directory; an absolute recording directory stays absolute.
   Recorder status follows the same scope. If another run already exports the
   shared status topic, this recording disables its status publication.
   Opaque `ros2:` graph children inherit the same run scope, including topics
