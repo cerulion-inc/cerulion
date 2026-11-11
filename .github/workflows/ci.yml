@@ -4803,6 +4803,36 @@ jobs:
             crates/cerulion_py/target
           key: cargo-py-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}
 
+  rmw-latency-comparison:
+    name: RMW latency comparison (Linux)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Check RMW report parser oracles
+        run: python3 tools/scripts/test_compare_rmw_latency.py
+      - name: Compare real RMW release percentiles
+        run: |
+          git fetch origin main
+          baseline_ref=$(git merge-base HEAD origin/main)
+          python3 tools/scripts/compare_rmw_latency.py --baseline "$baseline_ref" --output rmw-latency
+      - name: Preserve RMW measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rmw-latency-comparison
+          path: rmw-latency
+          if-no-files-found: error
+
   test-latency:
     name: Latency Threshold (Linux)
     runs-on: ubuntu-latest
