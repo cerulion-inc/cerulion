@@ -1102,9 +1102,9 @@ and `rcp_forward_e2e_test`, mark every test `#[serial]`. Tests in other files
 that drive `topic-publish` or `engage-estop` on a daemon host (`loopback_test`,
 `ops_loopback_test`, `estop_starvation_test`) reach that manager through the
 verbs without `#[serial]`. Isolation otherwise comes from per-test SHM roots
-(`TransportManager::init_for_test`), per-test sockets/tempdirs and loopback-only
-iroh (relay disabled + direct dial, every await bounded). Nothing dials a relay,
-a real robot, or multicast. Every crate here is named in a CI test step on BOTH
+(`TransportManager::init_for_test`), per-test sockets/tempdirs and loopback iroh,
+direct or through an in-process loopback relay, every await bounded. Nothing
+dials an external relay, a real robot, or multicast. Every crate here is named in a CI test step on BOTH
 platforms: most in the crate-tests job; `cerulion_connectd` and
 `cerulion_wireclient` in the main test jobs.
 
