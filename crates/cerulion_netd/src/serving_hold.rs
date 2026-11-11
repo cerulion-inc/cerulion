@@ -3,10 +3,15 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+
+/// The owned server's stable fence, outside its provisioned robot-state directory.
+pub fn fence_path(state_root: &Path) -> PathBuf {
+    state_root.join("serving/serving.hold")
+}
 
 /// Work which must remain reachable until it settles.
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +124,17 @@ fn lock_error(error: TryLockError) -> io::Error {
 }
 
 fn open_fence(path: &Path) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("remote serving fence has no parent directory"))?;
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(parent)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
