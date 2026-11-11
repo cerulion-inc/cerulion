@@ -88,8 +88,7 @@ impl PluginWireLayout {
     }
 }
 
-// Shared across contexts: a lease from another context cannot accidentally
-// match the first generation of the same row in this arena.
+// Shared across contexts instead of restarting each row at generation one.
 static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
 
 /// A refusal before changing a lease row or touching its native resource.
@@ -101,7 +100,7 @@ pub enum LeaseError {
     WrongOwner,
     /// Every provisioned row is reserved or holds a live sample.
     BudgetExhausted,
-    /// No unique generation remains; tokens must never wrap and alias.
+    /// A non-wrapping context identity or lifetime counter is exhausted.
     GenerationExhausted,
     /// The requested allocation cannot be represented on this target.
     InvalidBudget,
@@ -188,8 +187,17 @@ impl<T> LeaseArena<T> {
 
     /// Reserve before a loan/receive so budget rejection has no queue effects.
     pub fn claim(&mut self, port: u64, direction: LeaseDirection) -> Result<u64, LeaseError> {
+        self.claim_with_counter(port, direction, &NEXT_GENERATION)
+    }
+
+    fn claim_with_counter(
+        &mut self,
+        port: u64,
+        direction: LeaseDirection,
+        counter: &AtomicU32,
+    ) -> Result<u64, LeaseError> {
         let index = self.first_free.ok_or(LeaseError::BudgetExhausted)?;
-        let generation = mint_generation(&NEXT_GENERATION)?;
+        let generation = mint_lease_generation(counter);
         let row = &mut self.rows[index];
         self.first_free = row.next_free.take();
         row.generation = generation;
@@ -325,6 +333,20 @@ fn check_owner<T>(row: &Row<T>, port: u64, direction: LeaseDirection) -> Result<
     Ok(())
 }
 
+// Lease generations cycle globally, preserving the gen<<32 token layout and
+// skipping zero. Context identities keep the separate non-wrapping mint below.
+fn mint_lease_generation(counter: &AtomicU32) -> u32 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let value = current.max(1);
+        let next = value.wrapping_add(1).max(1);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return value,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub(crate) fn mint_generation(counter: &AtomicU32) -> Result<u32, LeaseError> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
@@ -416,7 +438,35 @@ mod tests {
     }
 
     #[test]
-    fn generation_exhaustion_never_wraps_and_invalid_budget_never_allocates() {
+    fn lease_generation_wraps_skips_zero_and_refuses_stale_rows() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+        let mut arena = LeaseArena::<[u8; 4]>::new(1).unwrap();
+        let mut stale = 0;
+        for generation in [u32::MAX - 1, u32::MAX, 1] {
+            let token = arena
+                .claim_with_counter(7, LeaseDirection::Write, &counter)
+                .unwrap();
+            assert_eq!(token, (u64::from(generation) << 32) | 1);
+            arena.insert(token, [1, 0, 0, 0]).unwrap();
+            assert_eq!(
+                arena.take(stale, 7, LeaseDirection::Write),
+                Err(LeaseError::InvalidHandle)
+            );
+            assert_eq!(
+                arena.take(token, 7, LeaseDirection::Write),
+                Ok([1, 0, 0, 0])
+            );
+            assert_eq!(arena.active(), 0);
+            stale = token;
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert!(arena.claim(7, LeaseDirection::Write).is_ok());
+        let zero = AtomicU32::new(0);
+        assert_eq!(mint_lease_generation(&zero), 1);
+    }
+
+    #[test]
+    fn context_generation_exhaustion_never_wraps_and_invalid_budget_never_allocates() {
         let counter = AtomicU32::new(u32::MAX - 1);
         assert_eq!(mint_generation(&counter), Ok(u32::MAX - 1));
         assert_eq!(

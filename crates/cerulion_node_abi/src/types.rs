@@ -476,7 +476,8 @@ pub struct RawPublisherRequestV1 {
     pub schema_hash: u64,
     /// Configured complete-frame ceiling, including the wire header.
     pub configured_capacity: u32,
-    /// full_queue tag; all unknown values are refused before creation.
+    /// full_queue tag: RESERVED_BLOCK returns UNSUPPORTED (7), unknown tags
+    /// return INVALID_ARGUMENT (5); both refuse before native creation.
     pub full_queue: u32,
 }
 
@@ -486,6 +487,6 @@ pub mod full_queue {
     pub const CONFIG_DEFAULT: u32 = 0;
     /// Non-waiting send skips full subscriber queues.
     pub const DISCARD: u32 = 1;
-    /// Reserved explicit blocking strategy; refused by raw-ingress creation.
+    /// Reserved explicit blocking strategy; creation returns UNSUPPORTED (7).
     pub const RESERVED_BLOCK: u32 = 2;
 }
