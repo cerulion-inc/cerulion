@@ -717,6 +717,7 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
     });
 
     // A normal recording still emits the recorder's own status, including its bag path.
+    let expected_status_path = bag.canonicalize().unwrap();
     let status_manager = cerulion_core::TransportManager::init_for_test(
         cerulion_core::TransportConfig::default(),
         Default::default(),
@@ -738,7 +739,11 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
                         &sample.payload()[cerulion_core::wire::WireHeader::SIZE..],
                     )
                     .is_ok_and(|value| {
-                        value["bag_path"].as_str() == Some(bag.to_string_lossy().as_ref())
+                        value["bag_path"]
+                            .as_str()
+                            .and_then(|path| Path::new(path).canonicalize().ok())
+                            .as_ref()
+                            == Some(&expected_status_path)
                     })
                 });
                 status_frames.clear();
