@@ -2394,7 +2394,7 @@ Runtime controls (`cerulion graph run`, `node run`):
   `schema info`) is the kill-switch: run LOCAL-ONLY (no gateway, no zenoh
   session; a loud notice). Its topics, schemas and run metadata are unavailable
   to other machines through every Cerulion daemon, including one already serving
-  another run with open LAN access. Local observers and recording still work.
+  another run with open LAN access. Local observers and recording still work. Opaque `ros2:` graph children inherit the run scope, including topics and service replies created dynamically.
   A remote demand retained from an earlier producer must close before this run
   can claim the same topic as local-only; otherwise startup refuses it.
   The YAML stays untouched. `off` is the only accepted

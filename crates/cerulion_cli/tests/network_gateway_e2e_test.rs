@@ -1057,8 +1057,8 @@ fn cli_producer_scope_arm(tag: &str, env_off: bool, flags: &[&str], strict: bool
     };
     use native_ros2_messages::geometry_msgs::Vector3;
     let tmp = tempfile::tempdir().unwrap();
-    let prefix = format!("/egress_scope_{tag}_{}", std::process::id());
-    let topic = format!("{prefix}/ticker/cmd");
+    let prefix = format!("egress_scope_{tag}_{}", std::process::id());
+    let topic = format!("/{prefix}/ticker/cmd");
     let block = if strict {
         format!(
             "network:\n  enabled: true\n  egress: [{}]\n",

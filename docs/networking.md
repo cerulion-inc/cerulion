@@ -52,6 +52,9 @@ default + gateway, the discovery ladder, and pairing.
   no gateway, no session, loud notice. Its topics, schemas and run metadata
   are unavailable off-machine, including through an already running open gateway,
   remote server or topic mirror. Local observers and recording still work.
+  Opaque `ros2:` graph children inherit the same run scope, including topics
+  discovered only when the child creates an endpoint. A separately launched
+  third-party DDS participant has its own transport settings.
 - **Producer policy survives a topic restart.** A remote data tap or mirror holds
   admission until it releases its data port. If an earlier remote demand still
   holds a topic when a local-only producer starts, startup refuses that topic

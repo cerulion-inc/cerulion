@@ -19,6 +19,58 @@ use crate::error::{TransportError, TransportResult};
 pub(crate) static REMOTE_ACCESS_REFUSALS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Internal scope passed by the CLI to opaque ROS children before startup.
+#[doc(hidden)]
+pub const RUN_SCOPE_ENV: &str = "CERULION_RUN_TOPIC_SCOPE";
+
+/// Producing process policy, resolved before any data endpoint opens.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", content = "topics", rename_all = "snake_case")]
+pub enum RunTopicScope {
+    Unrestricted,
+    LocalOnly,
+    Declared(Vec<String>),
+}
+
+impl RunTopicScope {
+    // hot-path-alloc-ok-fn: cold process configuration, never frame delivery.
+    pub fn from_values(network: Option<&str>, scope: Option<&str>) -> TransportResult<Self> {
+        if network.is_some_and(|value| !value.trim().is_empty()) {
+            if network != Some("off") {
+                tracing::warn!("unrecognized network switch: treating this process as local-only");
+            }
+            return Ok(Self::LocalOnly);
+        }
+        match scope {
+            None => Ok(Self::Unrestricted),
+            Some(json) => serde_json::from_str(json).map_err(|e| error(RUN_SCOPE_ENV, e)),
+        }
+    }
+
+    pub fn excludes(&self, topic: &str) -> bool {
+        match self {
+            Self::Unrestricted => false,
+            Self::LocalOnly => true,
+            Self::Declared(allowed) => !allowed.iter().any(|allowed| allowed == topic),
+        }
+    }
+}
+
+/// One service family scope protects its request and every per-client reply.
+// hot-path-alloc-ok-fn: cold endpoint admission, never frame delivery.
+pub fn service_scope_topic(service: &str) -> String {
+    format!("__cerulion_service_scope/{}", service.trim_matches('/'))
+}
+
+// hot-path-alloc-ok-fn: cold endpoint admission, never frame delivery.
+fn service_parent_scope(topic: &str) -> Option<String> {
+    let service = topic.strip_prefix("svc/")?;
+    let name = service
+        .strip_suffix("/request")
+        .or_else(|| service.rsplit_once("/reply/").map(|(name, _)| name))?;
+    Some(service_scope_topic(name))
+}
+
 const PREFIX: &str = "/__cerulion/egress_scope/";
 type Marker = iceoryx2::service::port_factory::event::PortFactory<CerService>;
 
@@ -96,6 +148,7 @@ impl LocalOnlyTopic {
 /// Remote admission lease. Its data port must drop before this lease.
 #[must_use = "hold the remote lease until its data port drops"]
 pub struct RemoteTopicLease {
+    _service_scope: Option<Box<RemoteTopicLease>>,
     _listener: Listener<CerService>,
     _service: Marker,
 }
@@ -103,6 +156,9 @@ pub struct RemoteTopicLease {
 impl RemoteTopicLease {
     // hot-path-alloc-ok-fn: cold admission only, never frame delivery.
     pub(crate) fn acquire(node: &Node<CerService>, topic: &str) -> TransportResult<Self> {
+        let service_scope = service_parent_scope(topic)
+            .map(|parent| Self::acquire(node, &parent).map(Box::new))
+            .transpose()?;
         let service = open(node, topic)?;
         let listener = service
             .listener_builder()
@@ -113,6 +169,7 @@ impl RemoteTopicLease {
             return Err(error(topic, "the producing run excludes this topic from network egress; remote access is refused"));
         }
         Ok(Self {
+            _service_scope: service_scope,
             _listener: listener,
             _service: service,
         })
@@ -123,6 +180,11 @@ impl RemoteTopicLease {
 // hot-path-alloc-ok-fn: cold control-plane check only, never frame delivery.
 pub(crate) fn allowed(node: &Node<CerService>, topic: &str) -> TransportResult<bool> {
     use iceoryx2::service::builder::event::EventOpenError;
+    if let Some(parent) = service_parent_scope(topic) {
+        if !allowed(node, &parent)? {
+            return Ok(false);
+        }
+    }
     match node
         .service_builder(&name(topic)?)
         .event()

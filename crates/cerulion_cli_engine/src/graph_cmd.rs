@@ -6259,12 +6259,34 @@ pub fn graph_run(
     // nodes by name. `finish` folds their teardown (SIGINT, bounded grace,
     // SIGKILL backstop) and a `--peer-loss fail` death into each exit below;
     // `Drop` is the never-orphan floor for the `?` paths in between.
-    let ros2_children = crate::ros2_graph::Ros2Children::spawn(
+    let ros2_scope = match &run_network {
+        RunNetwork::Off | RunNetwork::Inert => {
+            cerulion_core::transport::egress_scope::RunTopicScope::LocalOnly
+        }
+        RunNetwork::Permissive(_) => {
+            cerulion_core::transport::egress_scope::RunTopicScope::Unrestricted
+        }
+        RunNetwork::Strict(_) => cerulion_core::transport::egress_scope::RunTopicScope::Declared(
+            config
+                .network
+                .as_ref()
+                .into_iter()
+                .flat_map(|network| {
+                    network
+                        .egress_topics()
+                        .chain(network.ingress.iter().map(String::as_str))
+                })
+                .map(str::to_string)
+                .collect(),
+        ),
+    };
+    let ros2_children = crate::ros2_graph::Ros2Children::spawn_with_scope(
         &ros2_entries,
         workspace_root,
         config.identity(),
         running.clone(),
         resolve_peer_loss(peer_loss),
+        &ros2_scope,
     )?;
 
     // Write THIS RUN's directory and announce it on
@@ -26558,7 +26580,7 @@ process_groups:
             "the refusal must read the native graph, after the `ros2:` split"
         );
         for later in [
-            "Ros2Children::spawn(",
+            "Ros2Children::spawn_with_scope(",
             "begin_run_descriptor(",
             "load_node_factories_from_cache(",
             "run_graph_recording(RecordingRun",
@@ -31654,7 +31676,7 @@ process_groups:
     #[test]
     fn run_topic_exclusions_follow_network_scope_and_declared_egress_only() {
         use cerulion_core::{ClosureNodeEntry, NodeEntry, NodeInfo};
-        let config: GraphConfig = serde_yaml::from_str("name: scope\nprefix: /scope\nnodes:\n  - id: source\n    type: source\nnetwork:\n  enabled: true\n  egress: [/scope/source/public]\n").unwrap();
+        let config: GraphConfig = serde_yaml::from_str("name: scope\nprefix: scope\nnodes:\n  - id: source\n    type: source\n    outputs:\n      - name: public\n        schema: u8\n      - name: private\n        schema: u8\nnetwork:\n  enabled: true\n  egress: [/scope/source/public]\n").unwrap();
         let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> =
             indexmap::IndexMap::new();
         factories.insert(

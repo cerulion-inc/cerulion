@@ -156,3 +156,47 @@ fn a_wrong_topic_attribute_cannot_authorize_remote_access() {
         .is_err());
     assert!(remote.list_topics().unwrap().is_empty());
 }
+
+#[test]
+fn service_family_exclusion_refuses_requests_and_all_per_client_replies() {
+    use cerulion_core::transport::{egress_scope, service};
+    let (producer, remote) = managers();
+    let parent = egress_scope::service_scope_topic("/private_service");
+    let _scope = producer.exclude_remote_topic(&parent).unwrap();
+    for topic in [
+        service::request_topic("/private_service"),
+        service::reply_topic("/private_service", &[0x41; 16]),
+        service::reply_topic("/private_service", &[0x42; 16]),
+    ] {
+        assert!(remote.acquire_remote_topic_lease(&topic).is_err());
+        assert!(!remote.remote_topic_allowed(&topic).unwrap());
+    }
+    assert!(producer.list_topics().unwrap().is_empty());
+}
+
+#[test]
+fn opaque_child_scope_is_deterministic_and_the_environment_kill_switch_wins() {
+    use cerulion_core::transport::egress_scope::RunTopicScope;
+    let json = r#"{"mode":"declared","topics":["/public"]}"#;
+    for _ in 0..2 {
+        let scope = RunTopicScope::from_values(None, Some(json)).unwrap();
+        assert!(!scope.excludes("/public"));
+        assert!(scope.excludes("/private"));
+        for network in ["off", "typo"] {
+            assert!(RunTopicScope::from_values(Some(network), Some(json))
+                .unwrap()
+                .excludes("/public"));
+        }
+        assert!(!RunTopicScope::from_values(None, None)
+            .unwrap()
+            .excludes("/public"));
+        for malformed in [
+            "",
+            "null",
+            r#"{"mode":"unknown"}"#,
+            r#"{"mode":"declared","topics":"/public"}"#,
+        ] {
+            assert!(RunTopicScope::from_values(None, Some(malformed)).is_err());
+        }
+    }
+}

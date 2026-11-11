@@ -403,6 +403,35 @@ fn settle_until(
 #[traced_test]
 #[serial]
 fn a_ros_topic_is_the_cerulion_canonical_name_and_a_native_subscriber_reads_it() {
+    let scoped_child = std::env::var_os("CERULION_SCOPE_CHILD").is_some();
+    if !scoped_child {
+        for profile in ["off", "declared"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "a_ros_topic_is_the_cerulion_canonical_name_and_a_native_subscriber_reads_it",
+                    "--test-threads=1",
+                ])
+                .env("CERULION_SCOPE_CHILD", profile)
+                .env_remove("CERULION_NETWORK")
+                .env_remove(cerulion_core::transport::egress_scope::RUN_SCOPE_ENV);
+            if profile == "off" {
+                command.env("CERULION_NETWORK", "off");
+            } else {
+                command.env(
+                    cerulion_core::transport::egress_scope::RUN_SCOPE_ENV,
+                    r#"{"mode":"declared","topics":[]}"#,
+                );
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     unsafe {
         let suffix = unique_suffix();
         let type_name = format!("Pt{suffix}");
@@ -427,6 +456,25 @@ fn a_ros_topic_is_the_cerulion_canonical_name_and_a_native_subscriber_reads_it()
         // The native side: a plain cerulion_core subscriber opens the SAME
         // iceoryx2 service (`<topic>/data`) by the canonical name ...
         let transport = TransportManager::get().expect("the rmw runtime's transport");
+        if scoped_child {
+            let remote =
+                TransportManager::init_for_test(TransportConfig::default(), transport.iox_config())
+                    .unwrap();
+            assert!(remote
+                .create_remote_data_only_subscriber(&ros_topic)
+                .is_err());
+            assert!(remote
+                .create_remote_ingress_injector(
+                    &ros_topic,
+                    expected_hash,
+                    MaxSliceLen::const_new(256)
+                )
+                .is_err());
+            assert_eq!(
+                transport.dynamic_egress_record_hash_for_test(&ros_topic),
+                None
+            );
+        }
         let native = transport
             .create_subscriber_open_only(&ros_topic)
             .expect("the canonical name opens the rmw publisher's data service");
