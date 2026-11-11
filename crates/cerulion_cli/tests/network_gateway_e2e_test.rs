@@ -346,6 +346,7 @@ fn spawn_graph_run(
         .args(extra)
         .current_dir(root)
         .env("CERULION_HOME", &login_home)
+        .env("CERULION_LAN_ACCESS", "open")
         .env_remove("CERULION_LOGIN_GATE")
         .env_remove("CERULION_NETWORK")
         .env_remove("CARGO_TARGET_DIR")

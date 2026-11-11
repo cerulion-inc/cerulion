@@ -7,6 +7,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rule
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
+- LAN defaults to Paired; fixtures select Open. Locators/login never open it.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
 - The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.

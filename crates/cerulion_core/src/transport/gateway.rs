@@ -3201,6 +3201,7 @@ mod hosted_runs_tests {
                 crate::testing::iceoryx_test_config(),
             )
             .expect("init gateway manager");
+            manager.network().unwrap().set_lan_access(LanAccess::Open);
             match GatewayRuntime::new(Arc::clone(&manager), allow_all_plan()) {
                 Ok(gateway) => return (manager, gateway, port),
                 Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
@@ -3237,6 +3238,7 @@ mod hosted_runs_tests {
             crate::testing::iceoryx_test_config(),
         )
         .expect("init gateway manager");
+        manager.network().unwrap().set_lan_access(LanAccess::Open);
         let hosted = manager
             .network()
             .expect("a configured network")

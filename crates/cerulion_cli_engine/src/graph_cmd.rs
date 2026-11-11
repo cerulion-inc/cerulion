@@ -3841,17 +3841,16 @@ const GATEWAY_PORT_ENV: &str = "CERULION_GATEWAY_PORT";
 /// its base before giving up (the AddrInUse ladder in `graph_run_gateway`).
 pub const GATEWAY_BIND_RETRIES: u16 = 8;
 
-/// Permissive-egress breadcrumb — fired EXACTLY ONCE at the CLI/supervisor gateway
-/// spawn site (never per worker): permissive-default egress is open. `pub`
-/// so tests pin the exact text.
-pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN: CERULION_LAN_ACCESS=open permits unpaired LAN peers to read this run's egress topics. Restrict topics with a `network:` egress list, or run `--local` for local-only.";
+/// Open-LAN breadcrumb, fired once at the CLI/supervisor gateway spawn site,
+/// never per worker. Public so tests pin the operator-facing text.
+pub const PERMISSIVE_EGRESS_NOTICE: &str = "LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.";
 
-fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
+fn lan_access_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
     match access {
         Some(cerulion_core::LanAccess::Open) => {
             tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
         }
-        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
+        Some(cerulion_core::LanAccess::Paired) => tracing::debug!(
             graph = %graph_name,
             lan_access = "paired",
             "LAN access is paired-only: the gateway refuses every LAN peer"
@@ -3921,8 +3920,7 @@ impl RunNetwork {
         }
     }
 
-    /// True for the permissive default arm — drives the one-shot
-    /// [`PERMISSIVE_EGRESS_NOTICE`] breadcrumb at the gateway spawn site.
+    /// True when every produced topic is eligible for export.
     pub fn is_permissive(&self) -> bool {
         matches!(self, RunNetwork::Permissive(_))
     }
@@ -4649,8 +4647,8 @@ fn resolve_gateway_launch(
 /// Spawn ONE gateway child (`cerulion graph run-gateway --handoff
 /// <file>`) for `launch`. Writes the serde handoff to a unique temp file
 /// (removed on the returned guard's `Drop`), execs the current binary with
-/// cwd = the workspace root, and for a permissive run reports the LAN posture
-/// through [`permissive_egress_breadcrumb`]. `ix_config_json` is `None` for the
+/// cwd = the workspace root, and reports the LAN posture through
+/// [`lan_access_breadcrumb`]. `ix_config_json` is `None` for the
 /// monolith (default namespace) or the supervisor's minted deployment Config
 /// JSON.
 fn spawn_gateway(
@@ -4724,12 +4722,9 @@ fn spawn_gateway(
         permissive = launch.permissive,
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
-    // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker. A paired LAN access posture (the gateway child
-    // inherits this env) refuses every LAN peer, so the egress is not open.
-    if launch.permissive {
-        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
-    }
+    // Report explicit open access for both strict and permissive plans. The
+    // gateway child inherits this environment; a paired start is quiet.
+    lan_access_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
         reaped: Arc::new(AtomicBool::new(false)),
@@ -5015,11 +5010,9 @@ fn register_egress_with_netd(
         announce = launch.plan.announce.len(),
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
-    // The ONE permissive breadcrumb per run, using the posture reported by netd.
+    // The LAN breadcrumb uses the posture reported by netd.
     // Missing posture is UNKNOWN (an older daemon) - never assume open.
-    if launch.permissive {
-        permissive_egress_breadcrumb(graph_name, resp.lan_access);
-    }
+    lan_access_breadcrumb(graph_name, resp.lan_access);
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child
     // death-watch. The watch borrows the client's control fd; the guard's field order
@@ -5050,7 +5043,7 @@ fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_
 /// reports no posture (an older daemon) may. An open run accepts any netd,
 /// because a paired netd is only stricter.
 #[cfg(unix)]
-fn netd_posture_acceptable(
+pub(crate) fn netd_posture_acceptable(
     reported: Option<cerulion_core::LanAccess>,
     requested: cerulion_core::LanAccess,
 ) -> bool {
@@ -23125,6 +23118,35 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 mod tests {
     use super::*;
 
+    #[test]
+    #[tracing_test::traced_test]
+    fn paired_lan_start_has_no_open_access_warning() {
+        lan_access_breadcrumb("paired_graph", Some(cerulion_core::LanAccess::Paired));
+        assert!(!logs_contain("WARN"));
+        assert!(!logs_contain(PERMISSIVE_EGRESS_NOTICE));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn explicit_open_lan_start_names_unpaired_access_and_the_default_remedy() {
+        lan_access_breadcrumb("open_graph", Some(cerulion_core::LanAccess::Open));
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain(PERMISSIVE_EGRESS_NOTICE));
+        assert!(logs_contain("unpaired peers"));
+        assert!(logs_contain(
+            "Unset CERULION_LAN_ACCESS to restore paired access"
+        ));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn unknown_lan_posture_warns_without_claiming_open_access() {
+        lan_access_breadcrumb("unknown_graph", None);
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("did not report a LAN-access posture"));
+        assert!(!logs_contain(PERMISSIVE_EGRESS_NOTICE));
+    }
+
     /// A paired run rides only a netd that reports paired: an open or an
     /// unknown posture is refused. An open run accepts every netd. Hand
     /// oracle over all six (reported, requested) pairs.
@@ -31663,6 +31685,9 @@ process_groups:
             Ok(true)
         }
         fn release_egress(&self, _id: cerulion_netd::egress::EgressId) {}
+        fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+            Some(cerulion_core::LanAccess::Paired)
+        }
     }
 
     /// An unused mirror plane — the daemon requires one, but this egress-only test

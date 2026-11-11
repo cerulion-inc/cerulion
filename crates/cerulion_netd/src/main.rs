@@ -301,7 +301,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // authorizer via `build_mirror_plane` below.
     let demand_authorizer = build_demand_authorizer();
     if let Some(net) = manager.network() {
-        tracing::info!(lan_access = net.lan_access().as_str(), "LAN access posture");
+        report_lan_access(net.lan_access());
         net.set_demand_authorizer(Arc::clone(&demand_authorizer));
     }
     // The mirror plane (ingress), the egress plane, AND the query
@@ -467,6 +467,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Report an explicitly open posture without warning on a paired default.
+fn report_lan_access(access: cerulion_core::LanAccess) {
+    match access {
+        cerulion_core::LanAccess::Open => tracing::warn!(
+            lan_access = "open",
+            "LAN access is explicitly open: unpaired peers may read exported topics and publish \
+             into declared ingress topics; unset CERULION_LAN_ACCESS to restore paired access"
+        ),
+        cerulion_core::LanAccess::Paired => {
+            tracing::debug!(lan_access = "paired", "LAN access posture");
+        }
+    }
 }
 
 /// The lifecycle wording of a STANDING daemon (listen-configured, the gateway
@@ -750,6 +764,25 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn paired_startup_does_not_warn_about_open_access() {
+        report_lan_access(cerulion_core::LanAccess::Paired);
+        assert!(!logs_contain("WARN"));
+        assert!(!logs_contain("unpaired peers"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn explicit_open_startup_warns_about_unpaired_access() {
+        report_lan_access(cerulion_core::LanAccess::Open);
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("unpaired peers may read exported topics"));
+        assert!(logs_contain(
+            "unset CERULION_LAN_ACCESS to restore paired access"
+        ));
+    }
 
     fn parse(args: &[&str]) -> ArgAction {
         parse_args(args.iter().map(|s| s.to_string()))

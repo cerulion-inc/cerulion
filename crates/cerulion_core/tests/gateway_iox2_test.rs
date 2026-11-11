@@ -266,6 +266,9 @@ fn make_producer_and_gateway(
         root,
     )
     .expect("init gateway G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let gateway = GatewayRuntime::new(g, plan).expect("gateway boot");
     (p, clock, gateway, publishers)
 }
@@ -608,6 +611,9 @@ fn run_gateway_egress_e2e(tag: &str) -> Vec<Received> {
             root_a.clone(),
         )
         .expect("init G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
             announce: vec![topic.clone()],
@@ -646,6 +652,10 @@ fn run_gateway_egress_e2e(tag: &str) -> Vec<Received> {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b_transport
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let b_sub = b_transport.create_subscriber(&topic).expect("B subscriber");
     b_transport
         .register_ingress_topic(&topic, Vector3::SCHEMA_HASH, MaxSliceLen::const_new(256))
@@ -779,6 +789,9 @@ fn gateway_forwards_the_gap_frame_byte_identical() {
             root_a.clone(),
         )
         .expect("init G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
             announce: vec![topic.clone()],
@@ -812,6 +825,10 @@ fn gateway_forwards_the_gap_frame_byte_identical() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b_transport
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let b_sub = b_transport.create_subscriber(&topic).expect("B subscriber");
     b_transport
         .register_ingress_topic(&topic, Image::SCHEMA_HASH, msl)
@@ -915,6 +932,9 @@ fn gateway_ingress_reinjects_into_local_shm() {
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init A");
+        mgr.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         match mgr.start_network_bridge_watch() {
             Ok(()) => {
                 a = Some((mgr, port));
@@ -943,6 +963,10 @@ fn gateway_ingress_reinjects_into_local_shm() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b_mgr
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     // B's local subscriber first (before the gateway's ingress re-injects).
     let b_sub = b_mgr.create_subscriber(&topic).expect("B subscriber");
     let plan = GatewayPlan {
@@ -1019,6 +1043,9 @@ fn a_later_gateway_on_one_manager_demands_its_own_ingress_topics() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager");
+    mgr.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = |topic: &str| GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowList(vec![]),
         announce: vec![],
@@ -1126,6 +1153,9 @@ fn reconciler_flips_flag_from_live_demand_while_subscriber_suppressed() {
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         // Suppress the subscriber flag-flip BEFORE the watch starts.
         g.network()
             .expect("G network")
@@ -1160,6 +1190,9 @@ fn reconciler_flips_flag_from_live_demand_while_subscriber_suppressed() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     b.register_ingress_topic(&topic, Vector3::SCHEMA_HASH, MaxSliceLen::const_new(256))
         .expect("B register_ingress_topic (declares the demand token)");
 
@@ -1412,6 +1445,9 @@ fn ingress_only_gateway_starts_no_reconciler() {
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init G (ingress-only)");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowList(vec![]), // deny-all = ingress-only
             announce: vec![],
@@ -1480,6 +1516,9 @@ fn reconciler_background_thread_advances_and_joins_promptly() {
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init G (background)");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
             announce: vec![topic.clone()],
@@ -2418,6 +2457,9 @@ fn a_paired_switch_waits_out_an_in_flight_announce() {
             root.clone(),
         )
         .expect("init gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let manager = Arc::clone(&g);
         match GatewayRuntime::new(g, plan.clone()) {
             Ok(gateway) => {
@@ -2605,6 +2647,9 @@ fn a_paired_switch_waits_out_an_in_flight_demand_query() {
             root.clone(),
         )
         .expect("init gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let manager = Arc::clone(&g);
         match GatewayRuntime::new(g, plan.clone()) {
             Ok(gateway) => {
@@ -3630,6 +3675,9 @@ fn empty_allow_all_gateway_starts_reconciler_for_get_expiry() {
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init G (empty AllowAll)");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         // EMPTY announce + AllowAll = the generic `ros2 attach` shape.
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
@@ -3960,6 +4008,9 @@ fn make_listening_producer_and_gateway(
             root.clone(),
         )
         .expect("init gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         match GatewayRuntime::new(g, plan.clone()) {
             Ok(gateway) => return (p, clock, gateway, port),
             Err(e) => {
@@ -4008,6 +4059,9 @@ fn belt_reaffirms_a_runtime_registered_topic_via_live_reconcile_seam() {
         )
         .expect("init G");
         g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
+        g.network()
             .expect("G network")
             .set_suppress_live_demand_for_test(true);
         match GatewayRuntime::new(g, plan.clone()) {
@@ -4044,6 +4098,9 @@ fn belt_reaffirms_a_runtime_registered_topic_via_live_reconcile_seam() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     b.register_ingress_topic(
         &runtime_topic,
         Vector3::SCHEMA_HASH,
@@ -4183,6 +4240,9 @@ fn discovery_truth_channel_registered_topic_is_announce_visible_pre_demand() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let b_session = b
         .network()
         .expect("B network")
@@ -4264,6 +4324,9 @@ fn discovery_truth_probe_served_topic_becomes_announce_visible() {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init B");
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let b_session = b
         .network()
         .expect("B network")
@@ -4315,6 +4378,9 @@ fn make_serving_producer_and_gateway(
             root.clone(),
         )
         .expect("init gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         match GatewayRuntime::new_with_schema_serving(g, plan.clone(), serving.clone()) {
             Ok(gateway) => return (p, clock, gateway, port),
             Err(e) => {
@@ -4408,6 +4474,7 @@ fn serving_gateway_names_runtime_route_via_hash_and_serves_schema() {
         connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // The catalog NAMES the runtime raw route via the hash reverse map.
@@ -4515,6 +4582,9 @@ fn new_embedded_boots_empty_permissive_and_accepts_a_runtime_egress_registration
         root.clone(),
     )
     .expect("init embedded gateway G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
 
     // The additive constructor: empty announce, permissive posture.
     let mut gateway = GatewayRuntime::new_embedded(g, cerulion_core::SchemaServing::default())
@@ -5050,6 +5120,9 @@ fn make_clocked_producer_and_gateway(
         root,
     )
     .expect("init gateway G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let gateway = GatewayRuntime::new(g, plan).expect("gateway boot");
     (p, clock, gateway, publishers)
 }
@@ -5226,6 +5299,10 @@ fn a_restarted_gateway_reports_its_liveness_through_the_latched_catalog() {
         root,
     )
     .expect("init gateway manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     const MS: u64 = 1_000_000;
     let frames = |at: u64| {
         manager
@@ -6264,6 +6341,9 @@ fn a_lull_free_restart_resets_the_epoch_on_the_demand_plane() {
         root.clone(),
     )
     .expect("init gateway G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![topic.clone()],

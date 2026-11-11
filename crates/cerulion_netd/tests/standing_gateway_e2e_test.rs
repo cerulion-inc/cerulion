@@ -132,6 +132,9 @@ fn robot_shaped_plane(tag: &str, id: &str, attempt: usize) -> (Arc<GatewayEgress
         root,
     )
     .expect("init shared gateway G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     (
         Arc::new(GatewayEgressPlane::new_without_mdns_for_test(g)),
         port,
@@ -398,6 +401,7 @@ fn assert_type_resolves_remotely(
         connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
     let mut last_name: Option<String> = None;
     for _ in 0..40 {
