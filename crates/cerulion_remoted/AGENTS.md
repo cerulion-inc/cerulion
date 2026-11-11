@@ -5,6 +5,12 @@ for pairing; multiplexes wire/2 and ops/1. This guide also covers pairing, link,
 wireclient, connectd, cerud, accountd and cerulion-wire.
 
 ## Invariants
+- Owned-server idle admission uses `serving_hold::ServingHolds`, installed on
+  daemon `OpsServing`. Acquire a work guard before shell/exec admission and retain
+  it through child drain and final witness; missing daemon manager is an error.
+  Ops/RCP admissions, the e-stop latch and owed delivery retain the native shared
+  fence. Netd's exclusive fence prevents new work racing idle stop; never unlink
+  the file. Shutdown participants still run on explicit SIGTERM while holds exist.
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
   to capability table in `authorizer.rs` is the sacred security surface. An
   unclassified verb is DENIED (`authorizer_matrix_test.rs` pins every cell).

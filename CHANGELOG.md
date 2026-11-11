@@ -7,12 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
-
 ### Fixed
 
-- A machine serving authenticated remote topics can also consume topics through
-  the same device endpoint. Outbound mirror release preserves incoming serving.
+- Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
+- A machine serving authenticated remote topics can also consume topics through the same device endpoint. Outbound mirror release preserves incoming serving.
+- Network-enabled runs start the authenticated remote server on their first egress registration without requiring `CERULION_NETD_LISTEN`. Query-only desks and local-only runs start no server; the last serving registration's release or disconnect reaps it after active work, owed e-stop delivery and its latch clear. Saved robot pairings and expired saved logins preserve offline serving. Owned remote servers receive SIGTERM and a bounded graceful cleanup window before forced reap.
 
 ## [2.0.0] - 2026-11-11
 
