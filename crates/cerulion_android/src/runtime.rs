@@ -29,7 +29,7 @@ use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
     TopicSchema,
 };
-use cerulion_core::transport::hosted_runs::{HostedRun, HostedRunGuard};
+use cerulion_core::transport::hosted_runs::{HostedRun, HostedRunGuard, HostedRuns};
 use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
 use cerulion_core::transport::run_registry::{mint_run_id, RunState};
 use cerulion_core::transport::{
@@ -2180,11 +2180,7 @@ fn commit(
         if remote.is_some() {
             status.remote = remote;
         }
-        status.fire_telemetry = run
-            .hosted
-            .as_ref()
-            .and_then(|hosted| hosted.fires.clone())
-            .map_or_else(FireTelemetry::default, FireTelemetry::live);
+        status.fire_telemetry = served_fire_telemetry(run.hosted.as_ref());
     }
     // Another publisher in the process may send such a topic, so it is
     // allowed; a misspelled topic would otherwise poll EMPTY with no sign.
@@ -2262,41 +2258,48 @@ fn host_run(
             return None;
         }
     };
-    let hosted_runs = network.hosted_runs();
-    match entry {
-        Ok(entry) => {
-            let fires = Some(Arc::clone(&hosted.fire_tap));
-            let guard = hosted_runs.host(
-                hosted.run_id,
-                HostedRun {
-                    entry,
-                    live: Arc::clone(&hosted.live),
-                    fires: fires.clone(),
-                },
-            );
-            Some(HostedRunHold {
-                _guard: guard,
+    Some(host_on(&network.hosted_runs(), hosted.run_id, entry))
+}
+
+/// Host `run` on `hosted_runs` under `run_id`. An `Err` is hosted as
+/// undescribable with that reason (`host_undescribable` logs it): a desk
+/// reads fires by the topology in the run's `run.json`, so that run serves
+/// none.
+fn host_on(
+    hosted_runs: &HostedRuns,
+    run_id: u128,
+    run: Result<HostedRun, RunEntryError>,
+) -> HostedRunHold {
+    match run {
+        Ok(run) => {
+            let fires = run.fires.clone();
+            HostedRunHold {
+                _guard: hosted_runs.host(run_id, run),
                 fires,
-            })
+            }
         }
-        // A desk reads fires by the topology in the run's `run.json`, so a
-        // run the `runs` verb names undescribable serves none.
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "the runs verb names the run undescribable: it serves no fires"
-            );
-            Some(HostedRunHold {
-                _guard: hosted_runs.host_undescribable(hosted.run_id, error),
-                fires: None,
-            })
-        }
+        Err(error) => HostedRunHold {
+            _guard: hosted_runs.host_undescribable(run_id, error),
+            fires: None,
+        },
     }
 }
 
-/// The entry the `runs` verb serves for `hosted`: the graph's name and its
+/// The fire telemetry `status` reports for the run `hosted` holds: live only
+/// while the run serves fires.
+fn served_fire_telemetry(hosted: Option<&HostedRunHold>) -> FireTelemetry {
+    hosted
+        .and_then(|hosted| hosted.fires.clone())
+        .map_or_else(FireTelemetry::default, FireTelemetry::live)
+}
+
+/// The run the `runs` verb serves for `hosted`: the graph's name and its
 /// effective `graph.yaml`, and a `run.json` with the app's endpoint, the
 /// built topology and the fire telemetry the run serves.
+///
+/// The run serves the fire tap only when its `run.json` kept `topology` and
+/// `telemetry`: a `run.json` above the served cap drops both, and a fire
+/// record without the topology names no node.
 ///
 /// The inner `Err` is a run that fails the served-entry checks, for example a
 /// `run.json` above the served cap with only its base keys. The host still
@@ -2309,7 +2312,7 @@ fn hosted_run_entry(
     gateway: &GatewayStartPlan,
     hosted: &HostedRunPlan,
     started_at_ns: u64,
-) -> Result<Result<RunEntry, RunEntryError>, EmbedError> {
+) -> Result<Result<HostedRun, RunEntryError>, EmbedError> {
     let graph_yaml = effective_graph_yaml(graph)?;
     let endpoints = [RunEndpoint {
         id: APP_ENDPOINT.to_string(),
@@ -2330,7 +2333,7 @@ fn hosted_run_entry(
             })
             .collect(),
     }];
-    let run_json = match render_hosted_run_manifest(&HostedRunSpec {
+    let manifest = match render_hosted_run_manifest(&HostedRunSpec {
         run_id: hosted.run_id,
         graph_name: graph.identity(),
         run_started_at_ns: started_at_ns,
@@ -2344,8 +2347,17 @@ fn hosted_run_entry(
             lease_ms: u64::try_from(FIRE_TAP_CONFIG.lease.as_millis()).unwrap_or(u64::MAX),
         }),
     }) {
-        Ok(run_json) => run_json,
+        Ok(manifest) => manifest,
         Err(too_large) => return Ok(Err(too_large.into())),
+    };
+    let fires = if manifest.declares_fires {
+        Some(Arc::clone(&hosted.fire_tap))
+    } else {
+        tracing::warn!(
+            "the run.json is above the served cap with its topology, so it omits the topology \
+             and the fire telemetry: the run serves no fires"
+        );
+        None
     };
     Ok(RunEntry::new(
         hosted.run_id,
@@ -2353,8 +2365,13 @@ fn hosted_run_entry(
         started_at_ns,
         RunState::Live,
         graph_yaml,
-        String::from_utf8_lossy(&run_json).into_owned(),
-    ))
+        String::from_utf8_lossy(&manifest.bytes).into_owned(),
+    )
+    .map(|entry| HostedRun {
+        entry,
+        live: Arc::clone(&hosted.live),
+        fires,
+    }))
 }
 
 /// The graph config the runtime built from, as the `graph.yaml` a hosted
@@ -3047,6 +3064,11 @@ mod tests {
     /// A gateway plan with nothing to announce: the build takes the
     /// ownership (step 1) and the test fails a later step.
     fn recorder_only_gateway_plan(recorder: RecorderPlan) -> StartPlan {
+        gateway_plan(Some(recorder))
+    }
+
+    /// A gateway plan with nothing to announce, and `recorder`.
+    fn gateway_plan(recorder: Option<RecorderPlan>) -> StartPlan {
         let (schemas, _) = SchemaSet::from_schemas(Vec::new()).expect("empty schema set");
         StartPlan {
             graph: None,
@@ -3073,7 +3095,7 @@ mod tests {
                 mdns: false,
             }),
             remote: None,
-            recorder: Some(recorder),
+            recorder,
             graph_exit: None,
         }
     }
@@ -3507,6 +3529,86 @@ nodes:
         );
         assert_ne!(before.fire_telemetry, status.fire_telemetry);
         assert_eq!(read.fire_telemetry, status.fire_telemetry);
+    }
+
+    /// The hosted run of the panic graph, with `topology` in place of the
+    /// built one.
+    fn hosted_panic_run(topology: Option<RunTopology>) -> (GraphRuntime, HostedRunPlan) {
+        let mut graph = panic_fixture_graph();
+        let fire_tap = graph.install_fire_tap(FIRE_TAP_CONFIG);
+        let hosted = HostedRunPlan {
+            run_id: 0x718,
+            topology: topology.unwrap_or_else(|| graph.run_topology()),
+            fire_tap,
+            live: Arc::new(AtomicBool::new(true)),
+        };
+        (graph, hosted)
+    }
+
+    /// A topology whose `run.json` is above the served cap.
+    fn oversized_topology() -> RunTopology {
+        let node = |i: usize| cerulion_core::graph::TopologyNode {
+            id: format!("node_{i}"),
+            node_type: "wide".into(),
+            trigger: cerulion_core::graph::TopologyTrigger::Period {
+                interval_ns: 1_000_000,
+            },
+            inputs: vec![],
+            outputs: vec![cerulion_core::graph::TopologyPort {
+                name: "out".into(),
+                topic: format!("/wide/node_{i}/out"),
+            }],
+            reports_writes: true,
+        };
+        RunTopology {
+            version: 1,
+            nodes: (0..20_000).map(node).collect(),
+        }
+    }
+
+    /// A `run.json` that drops its topology to fit the served cap names no
+    /// node of a fire record, so the run is hosted without the fire tap:
+    /// `fires` is not served, `status` reports no fire telemetry and the tap
+    /// is never armed. The same graph with its own topology serves both.
+    #[test]
+    fn a_hosted_run_whose_run_json_omits_the_topology_serves_no_fires() {
+        let plan = gateway_plan(None);
+        let gateway = plan.gateway.as_ref().expect("a gateway plan");
+        let hosted_runs = HostedRuns::default();
+
+        let (mut graph, hosted) = hosted_panic_run(Some(oversized_topology()));
+        let run = hosted_run_entry(&plan, graph.config(), gateway, &hosted, 1)
+            .expect("the graph.yaml renders")
+            .expect("the slim run.json is a served entry");
+        let doc: serde_json::Value =
+            serde_json::from_str(&run.entry.run_json).expect("run.json parses");
+        assert!(doc.get("topology").is_none(), "{doc}");
+        assert!(doc.get("telemetry").is_none(), "{doc}");
+        assert!(run.fires.is_none(), "the run must not serve the fire tap");
+        let hold = host_on(&hosted_runs, hosted.run_id, Ok(run));
+        assert!(hold.fires.is_none());
+        let telemetry = served_fire_telemetry(Some(&hold));
+        assert_eq!(telemetry.stats(), None);
+        assert_eq!(telemetry, FireTelemetry::default());
+        graph.step(Duration::from_millis(50));
+        assert!(!hosted.fire_tap.stats().armed, "nothing armed the tap");
+        assert_eq!(hosted.fire_tap.stats().recorded, 0);
+
+        let (served_graph, hosted) = hosted_panic_run(None);
+        let run = hosted_run_entry(&plan, served_graph.config(), gateway, &hosted, 1)
+            .expect("the graph.yaml renders")
+            .expect("the run.json is a served entry");
+        let doc: serde_json::Value =
+            serde_json::from_str(&run.entry.run_json).expect("run.json parses");
+        assert!(doc.get("topology").is_some(), "{doc}");
+        assert!(doc.get("telemetry").is_some(), "{doc}");
+        let hold = host_on(&hosted_runs, hosted.run_id, Ok(run));
+        let fires = hold.fires.as_ref().expect("the run serves the fire tap");
+        assert!(Arc::ptr_eq(fires, &hosted.fire_tap));
+        assert_eq!(
+            served_fire_telemetry(Some(&hold)).stats(),
+            Some(hosted.fire_tap.stats())
+        );
     }
 
     /// A graph whose nodes `a` and `b` read `/app/cmd` on input `cmd` with
