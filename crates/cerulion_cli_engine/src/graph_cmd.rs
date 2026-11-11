@@ -4862,7 +4862,8 @@ fn classify_netd_peek(ret: libc::ssize_t, errno: i32) -> NetdConnLiveness {
 /// the owning [`NetdEgressGuard`] drops its client, so the watcher never touches the fd
 /// after the client closes it (and never fires a spurious crash warn for OUR OWN
 /// teardown — the `stop` flag wins that handshake, exactly like the gateway's `reaped`).
-/// Explicitly NO reconnect: recovery is not this watch's job.
+/// The held egress connection never reconnects. Status polls may open another
+/// local control connection, but never restart netd or restore an egress plan.
 #[cfg(unix)]
 struct NetdLivenessWatch {
     /// Set by `Drop` (intentional teardown) or by the watcher itself (detected death);
@@ -4898,11 +4899,32 @@ fn spawn_netd_liveness_watch(
     let stop_thread = Arc::clone(&stop);
     let spawned = std::thread::Builder::new()
         .name("cer-netd-watch".to_string())
-        .spawn(move || loop {
+        .spawn(move || {
+            let mut registration_failures = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
+            let mut status_client = None;
+            let mut next_status = std::time::Instant::now();
+            loop {
             // Teardown handshake: `Drop` flips `stop` before the client fd closes, so
             // the watcher exits without a spurious crash warn (mirrors GatewayChild).
             if stop_thread.load(Ordering::Acquire) {
                 break;
+            }
+            if std::time::Instant::now() >= next_status {
+                let deadline = std::time::Instant::now() + Duration::from_millis(300);
+                if status_client.is_none() {
+                    status_client = cerulion_netd::NetdClient::connect_existing_until(deadline).ok();
+                }
+                if let Some(client) = &mut status_client {
+                    match client.status_until(deadline) {
+                        Ok(status) => report_robot_registration_status(
+                            &graph_name,
+                            status.robot_startup_error.as_deref(),
+                            &mut registration_failures,
+                        ),
+                        Err(_) => status_client = None,
+                    }
+                }
+                next_status = std::time::Instant::now() + Duration::from_secs(1);
             }
             let mut byte = [0u8; 1];
             // SAFETY: a non-blocking, non-consuming PEEK of a single byte on the
@@ -4937,6 +4959,7 @@ fn spawn_netd_liveness_watch(
                     break;
                 }
             }
+            }
         });
     let handle = match spawned {
         Ok(h) => Some(h),
@@ -4949,6 +4972,33 @@ fn spawn_netd_liveness_watch(
         }
     };
     NetdLivenessWatch { stop, handle }
+}
+
+#[cfg(unix)]
+fn report_robot_registration_status(
+    graph_name: &str,
+    error: Option<&str>,
+    failures: &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+) {
+    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+    if let Some(error) = error {
+        match failures.on_failure() {
+            RegimeDecision::Loud => tracing::warn!(
+                graph = %graph_name, error = %error, total_failures = failures.total_failures(),
+                "automatic robot registration failed; remote access is unavailable; correct the reported cause"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                graph = %graph_name, error = %error, suppressed, total_failures = failures.total_failures(),
+                "automatic robot registration remains unavailable"
+            ),
+            RegimeDecision::StillFailing { total, suppressed } => tracing::info!(
+                graph = %graph_name, error = %error, total_failures = total, suppressed,
+                "automatic robot registration remains unavailable"
+            ),
+        }
+    } else if let Some(suppressed) = failures.on_success() {
+        tracing::info!(graph = %graph_name, suppressed, "automatic robot registration recovered");
+    }
 }
 
 /// Unix only: a held egress registration on the shared `cerulion-netd`
@@ -32232,12 +32282,17 @@ process_groups:
     #[cfg(unix)]
     #[derive(Default)]
     struct DeskSpyEgress {
+        startup_error: Mutex<Option<String>>,
         register_calls: std::sync::atomic::AtomicUsize,
         announced: Mutex<Vec<String>>,
         configs: Mutex<Vec<Option<String>>>,
     }
     #[cfg(unix)]
     impl cerulion_netd::egress::EgressPlane for DeskSpyEgress {
+        fn robot_startup_error(&self) -> Option<String> {
+            self.startup_error.lock().unwrap().clone()
+        }
+
         fn register_egress(
             &self,
             _id: cerulion_netd::egress::EgressId,
@@ -32734,6 +32789,87 @@ process_groups:
         // `local`'s fd closes, so the watcher never touches a closed/recycled fd. No hang.
         drop(watch);
         drop(local);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn owner_only_registration_failure_reaches_the_runs_stderr_once() {
+        const CHILD: &str = "CERULION_REGISTRATION_WARN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["graph_cmd::tests::owner_only_registration_failure_reaches_the_runs_stderr_once", "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr
+                    .matches("automatic robot registration failed; remote access is unavailable")
+                    .count(),
+                1,
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("the robot state directory must be owner-only; run `chmod 700 "),
+                "{stderr}"
+            );
+            assert!(stderr.contains("robot-state'`"), "{stderr}");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let _home = NamedEnvGuard::set("CERULION_HOME", home.to_str());
+        let socket = home.join("netd.sock");
+        let _socket = NamedEnvGuard::set(cerulion_netd::hygiene::SOCKET_ENV, socket.to_str());
+        let _network = NamedEnvGuard::set("CERULION_NETWORK", None);
+        let state = crate::auth::AuthState {
+            account_id: "00112233-4455-4677-8899-aabbccddeeff".into(),
+            session_token: "test-session".into(),
+            refresh_token: "test-refresh".into(),
+            expires_at_ns: u64::MAX,
+            logged_in_ever: true,
+            role: None,
+        };
+        crate::auth::write_to(&home.join("auth.json"), &state).unwrap();
+        crate::auth::atomic_write_secret(&home.join("desk.key"), &[7; 32]).unwrap();
+        let root = home.join("robot-state");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = crate::robot_bootstrap::prepare(&root)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, format!("automatic robot registration: the robot state directory must be owner-only; run `chmod 700 '{}'`", root.display()));
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let egress = Arc::new(DeskSpyEgress::default());
+        *egress.startup_error.lock().unwrap() = Some(error);
+        let mut daemon = cerulion_netd::daemon::start_with_egress(
+            socket,
+            Arc::new(DeskUnusedMirror),
+            egress,
+            cerulion_netd::daemon::NetdConfig {
+                idle_grace: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        cerulion_core::init_logging(false, true);
+        let (local, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let watch = spawn_netd_liveness_watch(local.as_raw_fd(), "arm".into());
+        // Repeated real status round trips exercise suppression on the worker
+        // thread; the subprocess captures the same stderr writer a run uses.
+        std::thread::sleep(Duration::from_millis(2400));
+        drop(watch);
+        daemon.shutdown();
     }
 
     /// The env-seam tests route through the PUBLIC

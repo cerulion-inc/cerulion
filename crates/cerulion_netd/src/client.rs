@@ -1671,25 +1671,6 @@ impl NetdClient {
         probe.status_until(deadline)
     }
 
-    /// Read status within one deadline without reconnecting or spawning.
-    pub fn status_until(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<crate::protocol::StatusResponse, ClientError> {
-        let id = self.next_request_id();
-        match self.bounded_round_trip(&Request::Status { id }, deadline)? {
-            Response::Status(response) if response.id == id => Ok(response),
-            Response::Error(error) => Err(ClientError::Netd {
-                error: error.error,
-                robot: error.robot,
-                topic: error.topic,
-            }),
-            _ => Err(ClientError::Protocol(
-                "expected a correlated status response".into(),
-            )),
-        }
-    }
-
     /// One `status` round-trip.
     fn status_once(&mut self) -> Result<crate::protocol::StatusResponse, ClientError> {
         let id = self.next_request_id();

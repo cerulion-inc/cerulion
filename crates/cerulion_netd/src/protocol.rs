@@ -691,6 +691,10 @@ pub struct ReleaseResponse {
 /// The response to [`Request::Status`] (Principle #3 observability).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// Last automatic robot startup failure. Absent on older daemons; absence
+    /// does not establish successful registration or remote reachability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robot_startup_error: Option<String>,
     /// Echoed correlation id.
     pub id: u64,
     /// Every demanded `(robot, topic)` with its refcount, sorted canonically.
@@ -1981,6 +1985,7 @@ mod tests {
         assert_eq!(v["refcount"], 0);
 
         let st = Response::Status(StatusResponse {
+            robot_startup_error: None,
             id: 3,
             demands: vec![DemandEntry {
                 robot: "ubuntu".to_string(),

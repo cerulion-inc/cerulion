@@ -96,6 +96,26 @@ fn signal_errors_stay_inside_the_stop_deadline_and_invalid_ids_never_signal_grou
 }
 
 #[test]
+fn registration_worker_stderr_is_carried_in_the_reported_failure() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf '%s\\n' 'the robot state directory must be owner-only; run `chmod 700 /state`' >&2; exit 1"]);
+    let error = run_json::<Prepared>(
+        command,
+        "account registration",
+        Instant::now() + Duration::from_secs(5),
+        &AtomicBool::new(true),
+    )
+    .err()
+    .expect("the worker must fail");
+    assert!(
+        error.ends_with(": the robot state directory must be owner-only; run `chmod 700 /state`"),
+        "{error}"
+    );
+    assert!(!error.contains("see the child error above"));
+    assert!(!error.contains('\n'));
+}
+
+#[test]
 fn sibling_resolution_uses_the_executable_then_its_symlink_target() {
     let current = Path::new("/launcher/cerulion-netd");
     let canonical = Path::new("/release/cerulion-netd");

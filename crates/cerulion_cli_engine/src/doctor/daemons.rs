@@ -355,6 +355,7 @@ mod tests {
     #[test]
     fn the_status_answer_counts_connections_other_than_the_checks_own() {
         let status = cerulion_netd::protocol::StatusResponse {
+            robot_startup_error: None,
             id: 1,
             demands: vec![cerulion_netd::protocol::DemandEntry {
                 robot: "go2".to_string(),
@@ -380,6 +381,7 @@ mod tests {
             }
         );
         let alone = cerulion_netd::protocol::StatusResponse {
+            robot_startup_error: None,
             active_connections: 0,
             demands: Vec::new(),
             ..status

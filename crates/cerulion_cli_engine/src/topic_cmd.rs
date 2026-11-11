@@ -482,35 +482,10 @@ fn ensure_topic_available_with_selection(
             .map(|selector| directory.select(selector))
             .transpose()?
             .flatten();
-        if let Some(selected) = selected_robot {
-            if selected.catalog.is_none() {
-                let state = match &selected.presence {
-                    cerulion_netd::account_access::RobotPresence::NotReached { reason } => {
-                        format!("is offline (not reached: {})", sanitize_display(reason))
-                    }
-                    cerulion_netd::account_access::RobotPresence::Unknown { reason } => {
-                        format!("has unknown reachability ({})", sanitize_display(reason))
-                    }
-                    cerulion_netd::account_access::RobotPresence::Online => {
-                        "is online but its topics are unavailable".into()
-                    }
-                };
-                return Err(CliError::Validation(format!(
-                    "robot '{}' {state}",
-                    sanitize_display(&selected.name)
-                )));
-            }
-            if let Some(error) = selected
-                .catalog
-                .as_ref()
-                .and_then(|catalog| catalog.error.as_ref())
-            {
-                return Err(CliError::Validation(format!(
-                    "robot '{}' topics are unavailable: {}",
-                    sanitize_display(&selected.name),
-                    sanitize_display(error)
-                )));
-            }
+        if let Some(message) = selected_robot
+            .and_then(crate::account_robot_access::automatic::unavailable_robot_message)
+        {
+            return Err(CliError::Validation(message));
         }
         source_catalogs = directory
             .robots
@@ -677,28 +652,16 @@ fn ensure_topic_available_with_selection(
         // `unresolved_remote_error`, where the distinct failure outcomes are
         // kept different.
         other => {
-            let error = unresolved_remote_error(topic, other);
             #[cfg(unix)]
-            if let Some(directory) = &remote_directory {
-                let offline: Vec<_> = directory
-                    .robots
-                    .iter()
-                    .filter(|robot| {
-                        matches!(
-                            robot.presence,
-                            cerulion_netd::account_access::RobotPresence::NotReached { .. }
-                        )
-                    })
-                    .map(|robot| sanitize_display(&robot.name))
-                    .collect();
-                if !offline.is_empty() {
-                    return Err(CliError::Validation(format!(
-                        "{error}; offline account or paired robots: {}",
-                        offline.join(", ")
-                    )));
-                }
-            }
-            return Err(error);
+            let unchecked = remote_directory
+                .as_ref()
+                .map(|directory| unchecked_robot_catalogs(&directory.robots))
+                .unwrap_or_default();
+            #[cfg(not(unix))]
+            let unchecked = Vec::new();
+            return Err(unresolved_remote_error_with_catalog_evidence(
+                topic, other, robot, &unchecked,
+            ));
         }
     };
 
@@ -1152,6 +1115,104 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
     }
 }
 
+/// A directory row licenses absence only when its catalog answered without error.
+#[cfg(unix)]
+fn unchecked_robot_catalogs(robots: &[cerulion_netd::account_access::RobotCatalog]) -> Vec<String> {
+    use cerulion_netd::account_access::RobotPresence;
+    robots
+        .iter()
+        .filter_map(|robot| {
+            let (state, reason) = match &robot.catalog {
+                Some(catalog) => ("catalog unavailable", catalog.error.as_deref()?),
+                None => match &robot.presence {
+                    RobotPresence::NotReached { reason } => ("offline", reason.as_str()),
+                    RobotPresence::Unknown { reason } => ("unknown", reason.as_str()),
+                    RobotPresence::Online => ("catalog unavailable", "catalog was not returned"),
+                },
+            };
+            Some(format!(
+                "{} ({state}: {})",
+                sanitize_display(&robot.name),
+                sanitize_refusal_reason(reason)
+            ))
+        })
+        .collect()
+}
+
+fn unresolved_remote_error_with_catalog_evidence(
+    topic: &str,
+    resolve: RemoteResolve,
+    selector: Option<&str>,
+    unchecked: &[String],
+) -> CliError {
+    let report_unchecked = matches!(
+        resolve,
+        RemoteResolve::LanNotQueried
+            | RemoteResolve::NoProducer
+            | RemoteResolve::DiscoveryNotConverged
+    );
+    let error = match (resolve, selector) {
+        (RemoteResolve::LanNotQueried | RemoteResolve::NoProducer, _) if !unchecked.is_empty() => {
+            CliError::Validation(checked_robot_absence_message(topic, selector))
+        }
+        (RemoteResolve::DiscoveryNotConverged, _) if !unchecked.is_empty() => {
+            CliError::Validation(format!(
+                "{}; discovery has not converged, so whether it exists on unchecked robots is UNKNOWN. {RETRY_CLAUSE}",
+                checked_robot_absence_message(topic, selector)
+            ))
+        }
+        (RemoteResolve::LanNotQueried, Some(selector)) => CliError::Validation(format!(
+            "{}. LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open.",
+            checked_robot_absence_message(topic, Some(selector))
+        )),
+        (RemoteResolve::NoProducer, Some(selector)) => {
+            CliError::Validation(checked_robot_absence_message(topic, Some(selector)))
+        }
+        (RemoteResolve::DiscoveryNotConverged, Some(selector)) => {
+            CliError::Validation(format!(
+                "topic '{}' could not be checked on robot '{}' because no matching robot catalog answered in time{}; whether it exists there is UNKNOWN. {RETRY_CLAUSE}",
+                sanitize_display(topic),
+                sanitize_display(selector),
+                canonical_slash_hint(topic, has_canonical_slash_twin(topic))
+            ))
+        }
+        (other, _) => unresolved_remote_error(topic, other),
+    };
+    if report_unchecked && !unchecked.is_empty() {
+        if let CliError::Validation(message) = error {
+            return CliError::Validation(format!(
+                "{}; not checked: {}",
+                message.trim_end_matches('.'),
+                unchecked.join(", ")
+            ));
+        }
+    }
+    error
+}
+
+fn checked_robot_absence_message(topic: &str, selector: Option<&str>) -> String {
+    checked_robot_absence_with_hint(topic, selector, has_canonical_slash_twin(topic))
+}
+
+fn checked_robot_absence_with_hint(
+    topic: &str,
+    selector: Option<&str>,
+    has_slashed_twin: bool,
+) -> String {
+    let hint = canonical_slash_hint(topic, has_slashed_twin);
+    match selector {
+        Some(selector) => format!(
+            "topic '{}' was not found on the responding robots matching --robot '{}'{hint}",
+            sanitize_display(topic),
+            sanitize_display(selector)
+        ),
+        None => format!(
+            "topic '{}' was not found on this machine or on the account or paired robots that answered{hint}",
+            sanitize_display(topic)
+        ),
+    }
+}
+
 /// The precise not-found error for a topic absent LOCALLY and on
 /// every discovered robot. Keeps the canonical-slash did-you-mean the
 /// transport-level open error cannot know (and no
@@ -1163,7 +1224,7 @@ fn topic_not_found_anywhere(topic: &str) -> CliError {
 fn lan_not_queried_message(topic: &str, has_slashed_twin: bool) -> String {
     let hint = canonical_slash_hint(topic, has_slashed_twin);
     format!(
-        "topic '{}' was not found on this machine or on any account or paired robot{hint}. \
+        "topic '{}' was not found on this machine or on the account or paired robots that answered{hint}. \
          LAN robots are queried only once this machine is paired with them, or with \
          CERULION_LAN_ACCESS=open.",
         sanitize_display(topic)
@@ -8813,18 +8874,175 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn catalog_evidence_robot(
+        name: &str,
+        id: u8,
+        presence: cerulion_netd::account_access::RobotPresence,
+        catalog: Option<cerulion_core::CatalogReply>,
+    ) -> cerulion_netd::account_access::RobotCatalog {
+        use cerulion_netd::account_access::{RobotCatalog, RobotPath, RobotTrustSource};
+        RobotCatalog {
+            route: cerulion_netd::account_access::robot_route(&[id; 32]),
+            name: name.into(),
+            endpoint_key: Some([id; 32]),
+            trust: RobotTrustSource::Account,
+            presence,
+            path: RobotPath::Unknown,
+            catalog,
+        }
+    }
+
+    fn validation_body(error: CliError) -> String {
+        let CliError::Validation(message) = error else {
+            panic!("expected a validation refusal")
+        };
+        message
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unread_robot_catalogs_cannot_license_an_absence_claim() {
+        use cerulion_netd::account_access::RobotPresence;
+        let mut refused =
+            cerulion_core::transport::cerulion_q::build_catalog_reply("denied", std::iter::empty());
+        refused.error = Some("access refused".into());
+        let robots = [
+            catalog_evidence_robot(
+                "arm1",
+                1,
+                RobotPresence::NotReached {
+                    reason: "dial timed out".into(),
+                },
+                None,
+            ),
+            catalog_evidence_robot(
+                "scout",
+                2,
+                RobotPresence::Unknown {
+                    reason: "endpoint key missing".into(),
+                },
+                None,
+            ),
+            catalog_evidence_robot("denied", 3, RobotPresence::Online, Some(refused)),
+            catalog_evidence_robot(
+                "ready",
+                4,
+                RobotPresence::Online,
+                Some(cerulion_core::transport::cerulion_q::build_catalog_reply(
+                    "ready",
+                    std::iter::empty(),
+                )),
+            ),
+        ];
+        // A successful empty catalog is evidence; the three other rows are not.
+        for _ in 0..2 {
+            let unchecked = unchecked_robot_catalogs(&robots);
+            assert_eq!(
+                unchecked,
+                [
+                    "arm1 (offline: dial timed out)",
+                    "scout (unknown: endpoint key missing)",
+                    "denied (catalog unavailable: access refused)",
+                ]
+            );
+            for outcome in [RemoteResolve::LanNotQueried, RemoteResolve::NoProducer] {
+                let message = validation_body(unresolved_remote_error_with_catalog_evidence(
+                    "/arm/x", outcome, None, &unchecked,
+                ));
+                assert_eq!(message, "topic '/arm/x' was not found on this machine or on the account or paired robots that answered; not checked: arm1 (offline: dial timed out), scout (unknown: endpoint key missing), denied (catalog unavailable: access refused)");
+                assert!(!message.contains(".;"));
+            }
+            let message = validation_body(unresolved_remote_error_with_catalog_evidence(
+                "/arm/x",
+                RemoteResolve::DiscoveryNotConverged,
+                None,
+                &unchecked,
+            ));
+            assert_eq!(message, "topic '/arm/x' was not found on this machine or on the account or paired robots that answered; discovery has not converged, so whether it exists on unchecked robots is UNKNOWN. Retry in a few seconds \u{2014} a robot that is still booting, or joining the network, can take longer to answer than this command waits; if it keeps failing, check the robot is powered on and on this network, and run `cerulion topic list` to see which robots are discoverable from here; not checked: arm1 (offline: dial timed out), scout (unknown: endpoint key missing), denied (catalog unavailable: access refused)");
+            for outcome in [RemoteResolve::LanNotQueried, RemoteResolve::NoProducer] {
+                let message = validation_body(unresolved_remote_error_with_catalog_evidence(
+                    "/arm/x",
+                    outcome,
+                    Some("arm1"),
+                    &unchecked,
+                ));
+                assert_eq!(message, "topic '/arm/x' was not found on the responding robots matching --robot 'arm1'; not checked: arm1 (offline: dial timed out), scout (unknown: endpoint key missing), denied (catalog unavailable: access refused)");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_online_catalogs_and_untrusted_reasons_remain_unchecked() {
+        use cerulion_netd::account_access::RobotPresence;
+        let robots = [
+            catalog_evidence_robot("online", 1, RobotPresence::Online, None),
+            catalog_evidence_robot(
+                "bad\nname",
+                2,
+                RobotPresence::Unknown {
+                    reason: "failed\nrequest\u{2028}forged".into(),
+                },
+                None,
+            ),
+        ];
+        assert_eq!(
+            unchecked_robot_catalogs(&robots),
+            [
+                "online (catalog unavailable: catalog was not returned)",
+                "bad\u{fffd}name (unknown: failed?request?forged)",
+            ]
+        );
+        let cancelled = validation_body(unresolved_remote_error_with_catalog_evidence(
+            "/t",
+            RemoteResolve::Cancelled,
+            None,
+            &unchecked_robot_catalogs(&robots),
+        ));
+        assert_eq!(
+            cancelled,
+            "interrupted while discovering '/t' \u{2014} nothing was concluded"
+        );
+    }
+
+    #[test]
+    fn selected_robot_misses_do_not_claim_a_local_search_without_unchecked_rows() {
+        for outcome in [
+            RemoteResolve::NoProducer,
+            RemoteResolve::LanNotQueried,
+            RemoteResolve::DiscoveryNotConverged,
+        ] {
+            let message = validation_body(unresolved_remote_error_with_catalog_evidence(
+                "/t",
+                outcome,
+                Some("selected"),
+                &[],
+            ));
+            assert!(message.contains("selected"), "{message}");
+            assert!(
+                !message.contains("on this machine") && !message.contains("not produced locally"),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            checked_robot_absence_with_hint("foo", Some("selected"), true),
+            "topic 'foo' was not found on the responding robots matching --robot 'selected' \u{2014} did you mean '/foo'? (canonical Cerulion topics start with '/')"
+        );
+    }
+
     /// A policy skip keeps its own message, local slash hint and no retry advice.
     #[test]
     fn paired_lan_skip_has_its_own_non_absence_error() {
         let resolved = remote_ingress_from_schema(SchemaResolve::LanNotQueried);
         assert!(matches!(resolved, RemoteResolve::LanNotQueried));
-        let error = unresolved_remote_error("/t", resolved);
+        let error = unresolved_remote_error_with_catalog_evidence("/t", resolved, None, &[]);
         let CliError::Validation(message) = error else {
             panic!("paired LAN skip must be a validation refusal")
         };
         assert_eq!(
             message,
-            "topic '/t' was not found on this machine or on any account or paired robot. LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open."
+            "topic '/t' was not found on this machine or on the account or paired robots that answered. LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open."
         );
         assert!(!message.contains(RETRY_CLAUSE));
         assert!(!message.contains("any discovered robot"));
@@ -8832,7 +9050,7 @@ mod tests {
         assert!(!message.contains("--connect"));
         assert_eq!(
             lan_not_queried_message("foo", true),
-            "topic 'foo' was not found on this machine or on any account or paired robot \u{2014} did you mean '/foo'? (canonical Cerulion topics start with '/'). LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open."
+            "topic 'foo' was not found on this machine or on the account or paired robots that answered \u{2014} did you mean '/foo'? (canonical Cerulion topics start with '/'). LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open."
         );
     }
 

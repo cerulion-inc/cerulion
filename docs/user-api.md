@@ -164,10 +164,24 @@ two-second budget to refresh and save its tokens. The robot metadata sweep has o
 four-second budget regardless of the number of robots. A saved directory and
 authenticated direct-address hints preserve paired access when the account service
 is unavailable. Cache-backed reads keep service diagnostics at debug; `topic list`
-reports them on one stderr line. When paired access skips implicit LAN discovery,
-topic reads name the searched local, account and paired scope. LAN robots are queried
-after pairing with them or with `CERULION_LAN_ACCESS=open`; a skipped search does not
-claim absence on the LAN. A failed discovery pass reports that it has not converged.
+reports them on one stderr line. Topic reads claim absence only on this machine and
+robots whose catalogs answered successfully. Absence messages list robots with missing
+or failed catalogs under `not checked`, with their offline, unknown or catalog-unavailable reason.
+With `--robot`, errors refer to the selected source rather than a local search.
+LAN robots are queried after pairing with them or with `CERULION_LAN_ACCESS=open`;
+a skipped search does not claim absence on the LAN. A failed discovery pass reports
+that it has not converged and names the robot catalogs that were not checked.
+
+A sign-in without a device certificate cannot authenticate this machine to an
+account robot. With a still-valid session, the CLI enrolls its existing device key
+automatically in the background, without a browser step. It waits at most two
+seconds and attempts enrollment only once per process. A successful enrollment
+prints `this machine was enrolled as a device on your account`. An expired
+session or refused enrollment names the remedy. If access is refused because this machine's key is unpaired, run
+`cerulion login` again to enroll it. An authentication refusal does not mean the
+robot is offline. A producing run reports automatic robot registration failures
+at warn on stderr, with the cause, while netd retries. A robot state directory
+must be owner-only: use `chmod 700 <dir>` to correct its permissions.
 
 `topic echo`, `hz`, `info`, `find`, `snapshot`, and `viz --robot` use the existing
 authenticated remote plane automatically for those robots. Reads demand the topic

@@ -199,7 +199,20 @@ impl cerulion_netd::MirrorPlane for AccessSpy {
                 assert!(!wire.contains("account-access-session-fixture"));
                 assert!(!wire.contains("account-access-refresh-fixture"));
                 assert!(!wire.contains("private_key") && !wire.contains("desk_seed"));
-                assert!(snapshot.owner_chain.is_none());
+                if let Some(chain) = &snapshot.owner_chain {
+                    let proof: cerulion_pairing::verify::OwnerCertificatePresentationWire =
+                        postcard::from_bytes(chain).unwrap();
+                    assert_eq!(
+                        proof.device_cert.cert.device_key.0,
+                        ed25519_dalek::SigningKey::from_bytes(&[0x73; 32])
+                            .verifying_key()
+                            .to_bytes()
+                    );
+                    assert_eq!(
+                        proof.device_cert.cert.account.0,
+                        snapshot.pairing_account_id
+                    );
+                }
                 Ok(AccountAccessReply::Installed {
                     robot_count: snapshot.robots.len(),
                 })

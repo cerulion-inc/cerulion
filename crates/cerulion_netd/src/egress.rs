@@ -217,6 +217,12 @@ pub trait EgressPlane: Send + Sync {
         None
     }
 
+    /// Last automatic robot startup failure, until another registered server starts.
+    /// None means no reported failure, not proof of remote reachability.
+    fn robot_startup_error(&self) -> Option<String> {
+        None
+    }
+
     /// Release the egress registration for `id`. The registered egress LINGERS
     /// on the shared gateway past release (the reg-channel is add-only; retraction
     /// is not implemented); any declared topic announce token also lingers. The
@@ -359,6 +365,7 @@ fn run_gateway_drive(
 /// [`GatewayMirrorPlane`](crate::mirror::GatewayMirrorPlane) from the SAME manager.
 pub struct GatewayEgressPlane {
     manager: Arc<TransportManager>,
+    robot_startup_error: Mutex<Option<String>>,
     /// The lazily-booted gateway drive thread (started on the FIRST egress plan).
     /// `None` until then — a pure-ingress desk runs no egress gateway.
     inner: Mutex<Option<RunningGateway>>,
@@ -485,6 +492,7 @@ impl GatewayEgressPlane {
     fn with_beacon(manager: Arc<TransportManager>, beacon: crate::beacon::GatewayBeacon) -> Self {
         Self {
             manager,
+            robot_startup_error: Mutex::new(None),
             inner: Mutex::new(None),
             beacon,
             idle_wait_gate: Mutex::new(None),
@@ -492,6 +500,14 @@ impl GatewayEgressPlane {
             callback_serving: Mutex::new(None),
             boot_fault_after_surface: AtomicBool::new(false),
         }
+    }
+
+    /// Publish supervisor state for the producing run's status watcher.
+    pub fn set_robot_startup_error(&self, error: Option<String>) {
+        *self
+            .robot_startup_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = error;
     }
 
     /// Test seam (`#[doc(hidden)]` — never called in production): make
@@ -871,6 +887,13 @@ impl GatewayEgressPlane {
 }
 
 impl EgressPlane for GatewayEgressPlane {
+    fn robot_startup_error(&self) -> Option<String> {
+        self.robot_startup_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
         self.manager.network().map(|network| network.lan_access())
     }

@@ -284,6 +284,29 @@ impl NetdClient {
         Self::finish_bounded_handshake(stream, path, deadline)
     }
 
+    /// Read local daemon status within a caller's deadline, without reconnecting.
+    pub fn status_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<crate::protocol::StatusResponse, ClientError> {
+        self.ensure_usable()?;
+        let id = self.next_request_id();
+        match self.bounded_round_trip(&Request::Status { id }, deadline)? {
+            Response::Status(response) if response.id == id => Ok(response),
+            Response::Error(error) if error.id == Some(id) => Err(ClientError::Netd {
+                error: error.error,
+                robot: error.robot,
+                topic: error.topic,
+            }),
+            _ => {
+                self.poison();
+                Err(ClientError::Protocol(
+                    "expected a correlated daemon status response".into(),
+                ))
+            }
+        }
+    }
+
     /// Read this daemon's local schema metadata within the caller's deadline.
     /// Never discovers peers, starts a daemon, reconnects, or makes a WAN query.
     pub fn query_serving_schema_until(

@@ -1,8 +1,8 @@
 # cerulion_netd
 
-One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring, not delivery.
+One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring only.
 
-- Protocol11: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical. MirrorLost queues all losses without replacing replies; demand-free probes treat busy as unknown.
+- Protocol11: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical. MirrorLost queues losses without replacing replies; demand-free probes treat busy as unknown. Run watches latch startup errors.
 
 ## Rules
 - LAN defaults to Paired everywhere; explicit Open warns. Delivery fixtures select Open.
@@ -20,7 +20,7 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring, n
 - Control waits on readable socket OR filled push slot; socket-only stalls idle-client catalogs.
 - A nonzero non-loopback TCP `CERULION_NETD_LISTEN` port is the ONLY gate for the mDNS
   beacon and standing mode (gateway boots at start, idle self-exit off). None means a
-  reported refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
+  refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
 - Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
   LISTEN needs login; off/injected exempt. First nonempty WAN egress starts one
   remoted without LISTEN; query/off starts none; standing persists until shutdown.
@@ -36,9 +36,9 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring, n
   a phantom mirror. Validate `account:` before `TopicKey` trims ordinary names.
 - Bounded same-user `outbound.sock` shares endpoint/runtime; key/namespace
   gate before dial. Metadata per-call; validation refusals keep reader holds; cleanup errors fence.
-  Transport loss retires keys; account fences retain postcard owner; never bind key twice.
+  Transport loss retires keys; account fences keep postcard owner; never bind key twice.
 - Public identity bytes are auth-locked across reads; busy writers refuse. Expiry gates enrollment, not durable bindings; account/key changes fence it.
-- Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is read-only: no peers.json writes.
+- Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery never writes peers.json.
 
 ## Tests
 - `-- --test-threads=1` (CLI shares SHM); `--no-default-features` green. Count oracles, not clocks.

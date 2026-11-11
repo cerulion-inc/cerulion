@@ -151,6 +151,11 @@ struct IssuedRegistration {
     device_key: [u8; 32],
 }
 
+mod enrollment;
+pub use enrollment::enroll_device_once_within;
+
+pub(crate) const DEVICE_ENROLLMENT_REQUIRED: &str = "this machine's sign-in has no device certificate, so the robot cannot verify it; run `cerulion login` again to enroll this machine";
+
 #[derive(Deserialize)]
 struct AccountProfile {
     account_id: String,
@@ -1234,6 +1239,15 @@ fn register_device(
     session_token: &str,
 ) -> CliResult<Option<IssuedRegistration>> {
     let seed = ensure_device_key_seed()?;
+    register_device_with_seed(client, base, session_token, seed)
+}
+
+fn register_device_with_seed(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    session_token: &str,
+    seed: [u8; 32],
+) -> CliResult<Option<IssuedRegistration>> {
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     let public_key = signing.verifying_key().to_bytes();
     let Some((pop_challenge, pop_account)) = fetch_pop_challenge(client, base, session_token)?
