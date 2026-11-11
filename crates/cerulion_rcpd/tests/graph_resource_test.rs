@@ -102,6 +102,57 @@ async fn read_graph(client: &RunningService<RoleClient, ()>) -> RobotGraph {
     serde_json::from_str(text).expect("robot://graph is the documented JSON")
 }
 
+#[test]
+fn cached_private_topic_diagnostics_stay_hidden_after_the_producer_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = RcpManifest::load(&fixture_manifest(dir.path())).unwrap();
+    let (mgr, _) = manager("cached_private");
+    let private_topic = format!("/{}/private", unique("cached"));
+    let public_topic = format!("/{}/public", unique("cached"));
+    let scope = mgr.exclude_remote_topic(&private_topic).unwrap();
+    let private = mgr
+        .create_publisher_simple(&private_topic, MaxSliceLen::const_new(256))
+        .unwrap();
+    let _public = mgr
+        .create_publisher_simple(&public_topic, MaxSliceLen::const_new(256))
+        .unwrap();
+    let source = GraphSource::new(Arc::clone(&mgr), identity);
+    let feed = source.feed();
+    assert!(feed
+        .current()
+        .graph
+        .catalog
+        .entries
+        .iter()
+        .any(|entry| entry.topic == private_topic));
+    drop(private);
+    drop(scope);
+    assert!(mgr.remote_topic_allowed(&private_topic).unwrap());
+    for _ in 0..2 {
+        let remote = feed.remote_snapshot().unwrap();
+        let topics: Vec<_> = remote
+            .graph
+            .catalog
+            .entries
+            .iter()
+            .map(|entry| entry.topic.as_str())
+            .collect();
+        assert_eq!(topics, vec![public_topic.as_str()]);
+        assert!(remote
+            .graph
+            .monitors
+            .iter()
+            .all(|row| row.topic != private_topic));
+    }
+    assert!(feed
+        .current()
+        .graph
+        .catalog
+        .entries
+        .iter()
+        .any(|entry| entry.topic == private_topic));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_reads_the_fixture_graphs_nodes_topics_rates_and_run() {
     let dir = tempfile::tempdir().expect("tempdir");

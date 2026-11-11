@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Native SHM admission and delivery, with a separate manager per process role.
+//! Serialize this binary's process-wide refusal-counter assertions.
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{TransportConfig, TransportManager};
 use native_ros2_messages::geometry_msgs::Vector3;
+use serial_test::serial;
 use std::sync::{Arc, Barrier};
 
 fn managers() -> (Arc<TransportManager>, Arc<TransportManager>) {
@@ -14,6 +16,7 @@ fn managers() -> (Arc<TransportManager>, Arc<TransportManager>) {
 }
 
 #[test]
+#[serial]
 fn excluded_topics_remain_local_and_remote_reads_and_mirrors_are_counted_and_refused() {
     let (producer, remote) = managers();
     let _scope = producer.exclude_remote_topic("/private").unwrap();
@@ -50,6 +53,7 @@ fn excluded_topics_remain_local_and_remote_reads_and_mirrors_are_counted_and_ref
 }
 
 #[test]
+#[serial]
 fn a_retained_remote_tap_cannot_read_a_successor_local_only_producer() {
     let (producer, remote) = managers();
     let publisher = producer
@@ -70,6 +74,7 @@ fn a_retained_remote_tap_cannot_read_a_successor_local_only_producer() {
 }
 
 #[test]
+#[serial]
 fn concurrent_opposite_admissions_never_both_succeed() {
     for _ in 0..16 {
         let (producer, remote) = managers();
@@ -92,6 +97,7 @@ fn concurrent_opposite_admissions_never_both_succeed() {
 }
 
 #[test]
+#[serial]
 fn exclusion_is_namespace_scoped_and_drop_restores_remote_admission() {
     let (producer, remote) = managers();
     let other = TransportManager::init_for_test(
@@ -108,14 +114,18 @@ fn exclusion_is_namespace_scoped_and_drop_restores_remote_admission() {
 }
 
 #[test]
+#[serial]
 fn malformed_names_refuse_without_creating_data_services() {
     let (producer, remote) = managers();
     assert!(producer.exclude_remote_topic("").is_err());
     assert!(remote.acquire_remote_topic_lease("").is_err());
+    assert!(producer.exclude_remote_topic(&"x".repeat(513)).is_err());
+    assert!(remote.acquire_remote_topic_lease(&"x".repeat(513)).is_err());
     assert!(remote.list_topics().unwrap().is_empty());
 }
 
 #[test]
+#[serial]
 fn declared_run_ingress_cannot_inject_into_an_existing_local_only_run() {
     let config = cerulion_core::testing::iceoryx_test_config();
     let local =
@@ -138,6 +148,7 @@ fn declared_run_ingress_cannot_inject_into_an_existing_local_only_run() {
 }
 
 #[test]
+#[serial]
 fn exhausted_remote_lease_slots_fail_closed_and_release_on_drop() {
     let (producer, remote) = managers();
     let leases: Vec<_> = (0..64)
@@ -151,6 +162,7 @@ fn exhausted_remote_lease_slots_fail_closed_and_release_on_drop() {
 }
 
 #[test]
+#[serial]
 fn a_wrong_topic_attribute_cannot_authorize_remote_access() {
     use iceoryx2::prelude::*;
     use iceoryx2::service::attribute::AttributeVerifier;
@@ -165,10 +177,14 @@ fn a_wrong_topic_attribute_cannot_authorize_remote_access() {
         .unwrap();
     let verifier = AttributeVerifier::new()
         .require(&"topic".try_into().unwrap(), &"/wrong".try_into().unwrap())
+        .unwrap()
+        .require(&"topic_len".try_into().unwrap(), &"8".try_into().unwrap())
         .unwrap();
     let _service = node
         .service_builder(&name)
         .event()
+        .max_notifiers(64)
+        .max_listeners(64)
         .open_or_create_with_attributes(&verifier)
         .unwrap();
     let remote = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
@@ -180,6 +196,67 @@ fn a_wrong_topic_attribute_cannot_authorize_remote_access() {
 }
 
 #[test]
+#[serial]
+fn full_registration_names_and_utf8_boundaries_preserve_scope_identity() {
+    for _ in 0..2 {
+        let (producer, remote) = managers();
+        for topic in [
+            format!("/{}", "z".repeat(511)),
+            format!("/{}", "é".repeat(128)),
+        ] {
+            drop(remote.acquire_remote_topic_lease(&topic).unwrap());
+            let scope = producer.exclude_remote_topic(&topic).unwrap();
+            assert!(remote.acquire_remote_topic_lease(&topic).is_err());
+            assert!(!remote.remote_topic_allowed(&topic).unwrap());
+            drop(scope);
+            assert!(remote.acquire_remote_topic_lease(&topic).is_ok());
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn a_matching_first_attribute_cannot_hide_a_different_topic_tail() {
+    use iceoryx2::prelude::*;
+    use iceoryx2::service::attribute::AttributeVerifier;
+    let config = cerulion_core::testing::iceoryx_test_config();
+    let node = NodeBuilder::new()
+        .config(&config)
+        .create::<iceoryx2::service::ipc_threadsafe::Service>()
+        .unwrap();
+    let topic = format!("/{}", "z".repeat(511));
+    let name: ServiceName = cerulion_core::transport::egress_scope::marker_service_name(&topic)
+        .as_str()
+        .try_into()
+        .unwrap();
+    let attributes = AttributeVerifier::new()
+        .require(&"topic_len".try_into().unwrap(), &"512".try_into().unwrap())
+        .unwrap()
+        .require(
+            &"topic".try_into().unwrap(),
+            &topic[..256].try_into().unwrap(),
+        )
+        .unwrap()
+        .require(
+            &"topic_1".try_into().unwrap(),
+            &"y".repeat(256).as_str().try_into().unwrap(),
+        )
+        .unwrap();
+    let _service = node
+        .service_builder(&name)
+        .event()
+        .max_notifiers(64)
+        .max_listeners(64)
+        .open_or_create_with_attributes(&attributes)
+        .unwrap();
+    let remote = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+    assert!(remote.remote_topic_allowed(&topic).is_err());
+    assert!(remote.acquire_remote_topic_lease(&topic).is_err());
+    assert!(remote.list_topics().unwrap().is_empty());
+}
+
+#[test]
+#[serial]
 fn service_family_exclusion_refuses_requests_and_all_per_client_replies() {
     use cerulion_core::transport::{egress_scope, service};
     let (producer, remote) = managers();
@@ -200,6 +277,7 @@ fn service_family_exclusion_refuses_requests_and_all_per_client_replies() {
 }
 
 #[test]
+#[serial]
 fn opaque_child_scope_is_deterministic_and_the_environment_kill_switch_wins() {
     use cerulion_core::transport::egress_scope::RunTopicScope;
     let json = r#"{"mode":"declared","topics":["/public"],"ingress":["/input"]}"#;
