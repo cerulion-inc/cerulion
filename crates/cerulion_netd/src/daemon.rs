@@ -1952,11 +1952,10 @@ fn handle_connection(mut stream: UnixStream, ctx: Ctx, shutdown: Arc<AtomicBool>
                 return; // consumer gone / wedged — only this connection dies.
             }
         }
-        let losses = ctx
-            .registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take_mirror_losses(conn);
+        let losses = ctx.registry.try_lock().map_or_else(
+            |_| Default::default(),
+            |mut registry| registry.take_mirror_losses(conn),
+        );
         for key in losses {
             if !write_line(
                 &mut stream,

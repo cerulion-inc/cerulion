@@ -587,6 +587,8 @@ pub struct NetdClient {
     daemon_protocol: u32,
     /// A partial or invalid bounded exchange may leave a reply in flight.
     poisoned: bool,
+    pending_losses: Vec<crate::protocol::MirrorLost>,
+    push_fragment: Vec<u8>,
 }
 
 impl NetdClient {
@@ -883,6 +885,8 @@ impl NetdClient {
             socket_path: socket,
             daemon_protocol: 0,
             poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
         };
         let line = client.read_line()?;
         client.daemon_protocol = validate_hello(&line)?;
@@ -1021,16 +1025,15 @@ impl NetdClient {
     /// and adopt its fresh stream/reader + reset `next_id`. The socket path is
     /// unchanged.
     fn reconnect(&mut self) -> Result<(), ClientError> {
-        self.ensure_usable()?;
+        // Safe retry callers discard the failed framing and its held demands.
+        // Only a complete fresh handshake restores usability; never reuse the
+        // poisoned stream or carry its poison into the new connection.
         let fresh = Self::connect_or_spawn_at(self.socket_path.clone())?;
-        self.stream = fresh.stream;
-        self.reader = fresh.reader;
-        self.next_id = fresh.next_id;
         // Adopt the fresh daemon's protocol version
         // too — a reconnect can land on a DIFFERENT daemon (a v2 daemon idle-exited
         // and a v1 daemon respawned, or vice versa), so the per-verb compat gate must
         // re-gate against whoever we are now talking to, not the pre-reconnect version.
-        self.daemon_protocol = fresh.daemon_protocol;
+        *self = fresh;
         Ok(())
     }
 
@@ -1646,7 +1649,45 @@ impl NetdClient {
     /// connection during its idle exit is reported as the error
     /// [`closed_while_exiting`] recognises.
     pub fn status(&mut self) -> Result<crate::protocol::StatusResponse, ClientError> {
-        self.status_once()
+        let response = self.status_once()?;
+        if !self.pending_losses.is_empty() {
+            return Err(ClientError::MirrorLost(self.pending_losses.remove(0)));
+        }
+        Ok(response)
+    }
+
+    /// Drain every queued mirror retirement without replacing committed replies.
+    pub fn take_mirror_losses(&mut self) -> Vec<crate::protocol::MirrorLost> {
+        std::mem::take(&mut self.pending_losses)
+    }
+
+    /// Probe status on a demand-free connection within the caller's deadline.
+    /// A timeout closes only the probe and preserves every demand held by `self`.
+    pub fn probe_status_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::protocol::StatusResponse, ClientError> {
+        let mut probe = Self::connect_existing_at_until(self.socket_path.clone(), deadline)?;
+        probe.status_until(deadline)
+    }
+
+    /// Read status within one deadline without reconnecting or spawning.
+    pub fn status_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<crate::protocol::StatusResponse, ClientError> {
+        let id = self.next_request_id();
+        match self.bounded_round_trip(&Request::Status { id }, deadline)? {
+            Response::Status(response) if response.id == id => Ok(response),
+            Response::Error(error) => Err(ClientError::Netd {
+                error: error.error,
+                robot: error.robot,
+                topic: error.topic,
+            }),
+            _ => Err(ClientError::Protocol(
+                "expected a correlated status response".into(),
+            )),
+        }
     }
 
     /// One `status` round-trip.
@@ -3049,48 +3090,85 @@ mod tests {
     fn mirror_loss_consumes_the_matching_response_and_preserves_re_demand_connection() {
         use std::os::unix::net::UnixStream;
         let (stream, mut server) = UnixStream::pair().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let server_thread = std::thread::spawn(move || {
-            let mut requests = BufReader::new(server.try_clone().unwrap());
-            let mut request = String::new();
-            requests.read_line(&mut request).unwrap();
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
-                99
-            );
-            server.write_all(b"{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}\n{\"id\":99,\"demands\":[],\"active_connections\":1,\"idle\":false}\n").unwrap();
-            request.clear();
-            requests.read_line(&mut request).unwrap();
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
-                100
-            );
-            server
-                .write_all(b"{\"id\":100,\"demands\":[],\"active_connections\":1,\"idle\":false}\n")
-                .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            for id in [1, 2, 3] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["id"], id);
+                let reply = if id == 1 {
+                    assert_eq!(request["method"], "observe");
+                    assert_eq!(request["topic"], "/extra");
+                    for topic in ["/vector", "/pose"] {
+                        writeln!(
+                            server,
+                            "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"{topic}\"}}"
+                        )
+                        .unwrap();
+                    }
+                    serde_json::json!({"id":id,"robot":"arm","topic":"/extra","refcount":1,
+                        "mirror_created":true,"local_topic":"/extra"})
+                } else {
+                    serde_json::json!({"id":id,"demands":[],"active_connections":1,"idle":false})
+                };
+                writeln!(server, "{reply}").unwrap();
+            }
         });
         let mut client = NetdClient {
             reader: BufReader::new(stream.try_clone().unwrap()),
             stream,
-            next_id: 99,
+            next_id: 1,
             socket_path: PathBuf::new(),
             daemon_protocol: PROTOCOL_VERSION,
             poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
         };
-        let error = client.status().unwrap_err();
-        assert!(
-            matches!(&error, ClientError::MirrorLost(event) if event.robot == "arm" && event.topic == "/vector")
+        assert_eq!(
+            client.observe("arm", "/extra", 7).unwrap().local_topic,
+            "/extra"
         );
-        assert!(error.to_string().contains("arm"));
-        assert!(error.to_string().contains("/vector"));
+        assert!(
+            matches!(client.status(), Err(ClientError::MirrorLost(event))
+            if event.robot == "arm" && event.topic == "/vector")
+        );
+        let remaining = client.take_mirror_losses();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].topic, "/pose");
         assert!(!client.poisoned);
-        assert_eq!(client.status().unwrap().id, 100);
-        server_thread.join().unwrap();
+        assert_eq!(client.status().unwrap().id, 3);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn pushed_loss_poll_preserves_fragments_and_an_empty_socket_is_not_poisoned() {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        let mut client = NetdClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            next_id: 1,
+            socket_path: PathBuf::new(),
+            daemon_protocol: PROTOCOL_VERSION,
+            poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
+        };
+        client.poll_pushed_losses().unwrap();
+        assert!(!client.poisoned);
+        server
+            .write_all(b"{\"event\":\"mirror_lost\",\"robot\":\"arm\",")
+            .unwrap();
+        client.poll_pushed_losses().unwrap();
+        assert!(client.take_mirror_losses().is_empty());
+        server.write_all(b"\"topic\":\"/vector\"}\n").unwrap();
+        client.poll_pushed_losses().unwrap();
+        let losses = client.take_mirror_losses();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].robot, "arm");
+        assert_eq!(losses[0].topic, "/vector");
+        assert!(!client.poisoned);
     }
 
     #[test]

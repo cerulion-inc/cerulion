@@ -104,11 +104,19 @@ fn read_line(
     deadline: Instant,
     cap: usize,
 ) -> io::Result<String> {
+    read_line_with_prefix(reader, deadline, cap, Vec::new())
+}
+
+fn read_line_with_prefix(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+    cap: usize,
+    mut bytes: Vec<u8>,
+) -> io::Result<String> {
     // On macOS, changing socket timeouts after peer close returns EINVAL even
     // when a complete reply is buffered. Nonblocking I/O can still drain it.
     reader.get_ref().set_nonblocking(true)?;
     // hot-path-alloc-ok: bounded cold control response, never a topic frame
-    let mut bytes = Vec::new();
     loop {
         remaining(deadline)?;
         let available = match reader.fill_buf() {
@@ -206,6 +214,54 @@ fn wait_for_io(stream: &UnixStream, interest: PollFlags, deadline: Instant) -> i
 }
 
 impl NetdClient {
+    /// Read currently available pushed losses without waiting or poisoning on
+    /// an empty socket. Partial records remain buffered for the next poll/exchange.
+    pub fn poll_pushed_losses(&mut self) -> Result<(), ClientError> {
+        self.ensure_usable()?;
+        self.stream.set_nonblocking(true).map_err(ClientError::Io)?;
+        let result = (|| loop {
+            let available = match self.reader.fill_buf() {
+                Ok([]) => {
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "netd holding connection closed",
+                    )))
+                }
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(ClientError::Io(error)),
+            };
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.unwrap_or(available.len());
+            if count > MAX_RESPONSE_BYTES.saturating_sub(self.push_fragment.len()) {
+                return Err(ClientError::Protocol(
+                    "netd pushed control line exceeds its byte limit".into(),
+                ));
+            }
+            self.push_fragment.extend_from_slice(&available[..count]);
+            self.reader.consume(count + usize::from(newline.is_some()));
+            if newline.is_some() {
+                let bytes = std::mem::take(&mut self.push_fragment);
+                let line = String::from_utf8(bytes).map_err(|_| {
+                    ClientError::Protocol("netd pushed control line is not UTF-8".into())
+                })?;
+                match classify_control_line(&line) {
+                    ControlLine::MirrorLost(event) => self.pending_losses.push(event),
+                    _ => {
+                        return Err(ClientError::Protocol(
+                            "unexpected idle netd control record".into(),
+                        ))
+                    }
+                }
+            }
+        })();
+        self.stream
+            .set_nonblocking(false)
+            .map_err(ClientError::Io)?;
+        result
+    }
+
     /// Connect to the existing daemon before an absolute deadline, including Hello.
     /// Never starts a daemon, retries a connect, or creates a worker thread.
     pub fn connect_existing_until(deadline: Instant) -> Result<Self, ClientError> {
@@ -268,6 +324,8 @@ impl NetdClient {
             socket_path: socket,
             daemon_protocol: 0,
             poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
         };
         let result = (|| {
             let line = read_line(&mut client.reader, deadline, MAX_HELLO_BYTES)
@@ -326,13 +384,17 @@ impl NetdClient {
         let result = (|| {
             write_line(&mut self.stream, &request.to_json_line(), deadline)
                 .map_err(ClientError::Io)?;
-            let mut lost = None;
             let response = loop {
-                let line = read_line(&mut self.reader, deadline, MAX_RESPONSE_BYTES)
-                    .map_err(ClientError::Io)?;
+                let line = read_line_with_prefix(
+                    &mut self.reader,
+                    deadline,
+                    MAX_RESPONSE_BYTES,
+                    std::mem::take(&mut self.push_fragment),
+                )
+                .map_err(ClientError::Io)?;
                 match classify_control_line(&line) {
                     ControlLine::MirrorLost(event) => {
-                        lost.get_or_insert(event);
+                        self.pending_losses.push(event);
                     }
                     ControlLine::Response(text) => {
                         break serde_json::from_str::<Response>(&text).map_err(|_| {
@@ -350,7 +412,7 @@ impl NetdClient {
             self.stream
                 .set_nonblocking(false)
                 .map_err(ClientError::Io)?;
-            lost.map_or(Ok(response), |event| Err(ClientError::MirrorLost(event)))
+            Ok(response)
         })();
         if result
             .as_ref()

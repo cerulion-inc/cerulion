@@ -1747,19 +1747,27 @@ impl IrohMirrorPlane {
     /// The async body of `release_mirror`: abort the topic's reader (releasing its SHM
     /// slot), `Undemand` it on the robot, and drop the whole connection when the robot
     /// has no more demanded topics. Best-effort C0 provenance cleanup. Returns
-    /// [`MirrorRelease::Retired`] on a genuine teardown, [`MirrorRelease::Lingering`]
-    /// only when the connection is unexpectedly missing (nothing to retire cleanly).
+    /// [`MirrorRelease::Retired`] when removed or already absent. A missing reader
+    /// owns no local mirror; a shared release still refuses uncertain cleanup.
     async fn release_async(&self, key: &TopicKey) -> MirrorRelease {
         let mut st = self.inner.lock().await;
         if !st.robots.contains_key(&(key.robot.clone(), key.observer)) {
             drop(st);
-            tracing::error!(
+            tracing::debug!(
                 robot = %key.robot,
                 topic = %key.topic,
-                "cerulion-netd: iroh release for a robot with no live WAN connection — the mirror \
-                 bridge state is inconsistent; LINGERING (reclaimed at idle self-exit)"
+                "iroh reader already retired: no live robot connection"
             );
-            return MirrorRelease::Lingering;
+            return MirrorRelease::Retired;
+        }
+
+        if !st
+            .robots
+            .get(&(key.robot.clone(), key.observer))
+            .is_some_and(|connection| connection.readers.contains_key(&key.topic))
+        {
+            tracing::debug!(robot = %key.robot, topic = %key.topic, "iroh reader already retired: topic absent on live connection");
+            return MirrorRelease::Retired;
         }
 
         // 1. Remove the reader from the map FIRST (so the reader task's death handler,
