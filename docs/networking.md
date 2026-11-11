@@ -83,6 +83,11 @@ host their authenticated remote plane through `remote`; see [Android](android.md
 Authenticated ops keep their capability and e-stop checks; a graph import pulls
 an allowed producer stream and does not grant an arbitrary remote publish verb.
 
+Held remote reads survive a serving endpoint start or stop. If a reader cannot be
+restored, netd reports the robot and topic. CLI observers stop with an error;
+graph imports revalidate the pinned producer before reconnecting, and
+visualization re-demands its pinned source and schema outside frame draining.
+
 ## The decision matrix
 
 Every real-clock live run reaching `graph run` / `node run` / `ros2 attach`

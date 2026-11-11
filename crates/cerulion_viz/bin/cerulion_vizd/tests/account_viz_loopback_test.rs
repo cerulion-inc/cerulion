@@ -158,7 +158,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
         worker,
         builtin_walker(),
         None,
-        Arc::new(NetdDemandPlane::with_socket(desk_socket)),
+        Arc::new(NetdDemandPlane::with_socket(desk_socket.clone())),
     )
     .unwrap();
     let mut client = support::Client::connect(&viz_socket);
@@ -185,6 +185,41 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
     let mut scratch = Vec::new();
     let mut values = BTreeMap::new();
     for i in 0..PAYLOADS.len() {
+        if i == 1 {
+            // The held subscriber and viz tap survive a real mirror retirement.
+            // Reinstall through account lookup, then await the cold re-demand.
+            let identity = cerulion_netd::identity_snapshot::load_at(&home).unwrap();
+            let snapshot = cerulion_netd::account_access::AccountSnapshot {
+                auth_account_id: identity.auth_account_id().into(),
+                pairing_account_id: identity.account().0,
+                device_key: identity.device_key().0,
+                owner_chain: identity.owner_chain_wire().map(Vec::from),
+                robots: vec![],
+            };
+            let mut admin =
+                cerulion_netd::NetdClient::connect_existing_at(desk_socket.clone()).unwrap();
+            admin
+                .account_access_once(
+                    cerulion_netd::account_access::AccountAccessRequest::Install {
+                        snapshot: Box::new(snapshot),
+                    },
+                )
+                .unwrap();
+            assert_eq!(netd.active_demand_count(), 0);
+            let refreshed =
+                cerulion_cli_engine::account_robot_access::prepare_viz_target(&route, &[], &[])
+                    .unwrap();
+            assert_eq!(refreshed.route, route);
+            let deadline = Instant::now() + BOUND;
+            while netd.active_demand_count() != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "visualization did not re-demand the retired source"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         let oracle = frame(robot.hash, i);
         publisher.publish_raw(&oracle).unwrap();
         let deadline = Instant::now() + BOUND;

@@ -354,58 +354,69 @@ fn watch_session(
             return;
         }
         drop(stopped);
-        let result = match session.client.status() {
-            Ok(status) if status.lan_access != Some(LanAccess::Paired) => {
-                fail(
-                    control,
-                    running,
-                    "graph network daemon no longer confirms paired access".into(),
-                );
-                return;
-            }
-            Ok(status) => {
-                if expected.iter().all(|producer| {
-                    status.demands.iter().any(|row| {
-                        row.robot == producer.route
-                            && row.topic == producer.topic
-                            && row.refcount > 0
-                            && row
-                                .local_topic
-                                .as_deref()
-                                .is_none_or(|topic| topic == producer.topic)
-                            && row.plane == Some(ServingPlane::Iroh)
-                    })
-                }) {
+        let status = session.client.status();
+        if status
+            .as_ref()
+            .is_ok_and(|status| status.lan_access != Some(LanAccess::Paired))
+        {
+            fail(
+                control,
+                running,
+                "graph network daemon no longer confirms paired access".into(),
+            );
+            return;
+        }
+        let ready = status.as_ref().is_ok_and(|status| {
+            expected.iter().all(|producer| {
+                status.demands.iter().any(|row| {
+                    row.robot == producer.route
+                        && row.topic == producer.topic
+                        && row.refcount > 0
+                        && row
+                            .local_topic
+                            .as_deref()
+                            .is_none_or(|topic| topic == producer.topic)
+                        && row.plane == Some(ServingPlane::Iroh)
+                })
+            })
+        });
+        let result = if ready {
+            Ok(())
+        } else {
+            let reason = status.err().map_or_else(
+                || {
+                    let names = expected
+                        .iter()
+                        .map(|producer| {
+                            format!("robot '{}' topic '{}'", producer.route, producer.topic)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("canonical graph reader unavailable for {names}")
+                },
+                |error| error.to_string(),
+            );
+            // Loss events and missing status rows both require re-demand. Always
+            // revalidate the exact source key, schema and policy before reconnecting.
+            match open_session(registration, Some(&expected), &|| {
+                !running.load(Ordering::Acquire)
+                    || control.stopped.lock().map_or(true, |stopped| *stopped)
+            }) {
+                Ok(reconnected) => {
+                    session = reconnected;
                     Ok(())
-                } else {
-                    Err(
-                        "canonical graph ingress is reconnecting; its remote reader is unavailable"
-                            .into(),
-                    )
                 }
-            }
-            Err(error) => {
-                // Revalidate source identity before retaining fresh canonical demands.
-                match open_session(registration, Some(&expected), &|| {
-                    !running.load(Ordering::Acquire)
-                        || control.stopped.lock().map_or(true, |stopped| *stopped)
-                }) {
-                    Ok(reconnected) => {
-                        session = reconnected;
-                        Ok(())
-                    }
-                    Err(CliError::GraphIngressSourceChanged) => {
-                        fail(
-                            control,
-                            running,
-                            CliError::GraphIngressSourceChanged.to_string(),
-                        );
-                        return;
-                    }
-                    Err(reconnect) => Err(format!(
-                        "graph network connection ended: {error}; reconnect: {reconnect}"
-                    )),
+                Err(CliError::GraphIngressSourceChanged) => {
+                    fail(
+                        control,
+                        running,
+                        CliError::GraphIngressSourceChanged.to_string(),
+                    );
+                    return;
                 }
+                Err(reconnect) => Err(format!(
+                    "graph network connection ended: {reason}; reconnect: {reconnect}"
+                )),
             }
         };
         match result {

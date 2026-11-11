@@ -2298,6 +2298,10 @@ iroh uses a direct connection when possible, including on one LAN, and a relay
 otherwise. No listen setting, IP address or `--connect` flag is required for that
 path. See [authenticated discovery](networking.md#making-a-robot-discoverable).
 
+If a held remote mirror is retired, netd names its robot and topic. CLI observers
+exit with an error. Graph imports revalidate their pinned producer before
+reconnecting; visualization re-demands its pinned source and schema.
+
 An enabled `network:` block restricts exported topics and declares imported
 topics. Under paired access each import selects a unique authenticated producer;
 schema, QoS, single-writer and recording-plus-ingress checks remain enforced.

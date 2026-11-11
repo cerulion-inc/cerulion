@@ -1,4 +1,4 @@
-# cerulion_remoted - agent notes (the remote-access family's scoped file)
+# cerulion_remoted
 
 One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 

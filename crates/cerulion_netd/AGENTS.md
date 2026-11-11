@@ -1,8 +1,8 @@
 # cerulion_netd
 
-One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies prove wiring, not delivery.
+One gateway/zenoh session per host, refcounted NDJSON demands; spies prove wiring, not delivery.
 
-- Protocol10: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical.
+- Protocol11: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical. MirrorLost names losses; re-demand or stop.
 
 ## Rules
 - LAN defaults to Paired everywhere; explicit Open warns. Delivery fixtures select Open.
@@ -47,4 +47,4 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
 - `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
   it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
 
-Deep reference: docs/internals/network-daemons.md, docs/internals/remote-access.md.
+Reference: docs/internals/network-daemons.md, docs/internals/remote-access.md.
