@@ -12,8 +12,9 @@ pub struct HostApiV1 {
     pub header: TableHeaderV1,
     /// Services available for negotiation.
     pub capabilities: u64,
-    /// Resolve declaration-order port index and verify direction at cold init.
-    pub bind_port: unsafe extern "C" fn(ContextHandle, u32, u32, *mut PortHandle) -> Status,
+    /// Resolve direction-scoped declaration-order index at cold init. Topic borrows
+    /// context-lifetime immutable storage; node copies it only during create.
+    pub bind_port: unsafe extern "C" fn(ContextHandle, u32, u32, *mut PortBindingV1) -> Status,
     /// Loan adaptive capacity, initialize prefix, retain native loan on host.
     pub loan_output:
         unsafe extern "C" fn(ContextHandle, PortHandle, LoanRequestV1, *mut WriteSlotV1) -> Status,
@@ -21,16 +22,21 @@ pub struct HostApiV1 {
     pub finish_output: unsafe extern "C" fn(ContextHandle, LeaseHandle, u32) -> Status,
     /// Copy a node-owned initialized overflow PAYLOAD into a fresh host loan.
     /// Header/timestamp come from old lease; size includes header. The caller
-    /// retains spill allocation until return. Consumes old lease on every result.
-    pub finish_spill: unsafe extern "C" fn(ContextHandle, LeaseHandle, Bytes, u32) -> Status,
-    /// Discard without consuming wire sequence; reason drives host counters.
+    /// retains spill allocation until return. Original loan stays live on EVERY
+    /// result until discard_output(SPILL_RELEASE) after writer destruction.
+    /// Records one attempt per lease; repeated submission cannot publish twice.
+    pub submit_spill: unsafe extern "C" fn(ContextHandle, LeaseHandle, Bytes, u32) -> Status,
+    /// Consume original loan without consuming wire sequence. SPILL_RELEASE only
+    /// releases an attempted spill and records no node discard; other reasons
+    /// drive existing counters/latches. Never call while its writer is live.
     pub discard_output: unsafe extern "C" fn(ContextHandle, LeaseHandle, u32) -> Status,
     /// Receive through the existing queue/frozen read path and retain frame.
+    /// Requested read_mode must match the cold binding classification.
     pub receive_input:
         unsafe extern "C" fn(ContextHandle, PortHandle, u32, *mut ReadSlotV1) -> Status,
     /// End an immutable input borrow; consumes lease once.
     pub release_input: unsafe extern "C" fn(ContextHandle, LeaseHandle) -> Status,
-    /// Drain/refill/peek/promote/skip through existing host read decisions.
+    /// Apply head_op with explicit boundary/refill site through existing decisions.
     pub input_head:
         unsafe extern "C" fn(ContextHandle, PortHandle, u32, *mut HeadOutcomeV1) -> Status,
     /// Freeze non-trigger inputs; JSON names are copied only during cold setup.
@@ -46,8 +52,8 @@ pub struct HostApiV1 {
     /// Copy frozen environment value; insufficient buffer retains the value.
     /// Empty status means absent key; required length is returned in all cases.
     pub environment: unsafe extern "C" fn(ContextHandle, Bytes, MutableBytes, *mut u64) -> Status,
-    /// Poll an existing event kind, in host declaration order.
-    pub poll_event: unsafe extern "C" fn(ContextHandle, u32, *mut EventV1) -> Status,
+    /// Poll only the named port and event_kind; empty poll consumes no other event.
+    pub poll_event: unsafe extern "C" fn(ContextHandle, PortHandle, u32, *mut EventV1) -> Status,
     /// Host-owned observable counters, with no formatted hot-path text.
     pub publisher_counters:
         unsafe extern "C" fn(ContextHandle, PortHandle, *mut PublisherCountersV1) -> Status,
@@ -55,20 +61,26 @@ pub struct HostApiV1 {
     pub copy_error: unsafe extern "C" fn(ContextHandle, u64, MutableBytes, *mut u64) -> Status,
     /// Report a structured node-side diagnostic; host suppresses repeated regimes.
     pub diagnostic: unsafe extern "C" fn(ContextHandle, PortHandle, u32, Bytes) -> Status,
-    /// Bounded accumulation count and drops; no AccumulatorSet crosses.
+    /// Hand pending batch to this fire once, returning both drop observations.
+    /// Repeated calls during the fire return the same frozen batch; subsequent
+    /// fires without new collection return zero count and per-fire drops.
     pub accumulate_count:
-        unsafe extern "C" fn(ContextHandle, PortHandle, *mut u32, *mut u64) -> Status,
-    /// Borrow an indexed accumulated frame; consumes no queue frame.
+        unsafe extern "C" fn(ContextHandle, PortHandle, *mut AccumulateInfoV1) -> Status,
+    /// Repeatedly borrow indexed frames of this fire batch; consumes no queue frame.
     pub accumulate_frame:
         unsafe extern "C" fn(ContextHandle, PortHandle, u32, *mut ReadSlotV1) -> Status,
-    /// Record that a borrowed accumulated frame was served, once per lease.
+    /// Record read outcomes once per distinct accumulated host frame per fire.
+    /// Repeated iteration leases must not duplicate sequence/trace observations.
     pub mark_served: unsafe extern "C" fn(ContextHandle, LeaseHandle) -> Status,
-    /// Capture canonical accumulator bytes into a synchronous borrowed sink.
+    /// Capture exactly one native per-port record, without the outer input count.
+    /// Encoding is specified in the node interface documentation. Sink is a
+    /// frozen concrete borrowed record, not a table; validate pointer/alignment.
     pub capture_accumulate:
         unsafe extern "C" fn(ContextHandle, PortHandle, *const StateSinkV1) -> Status,
     /// Query a separately versioned service; unknown IDs return unsupported.
     pub query_extension:
         unsafe extern "C" fn(ContextHandle, u64, u32, *mut ExtensionDescriptorV1) -> Status,
-    /// Restore canonical accumulator bytes, validated before mutation.
+    /// Restore exactly one matching per-port record; reject trailing bytes, wrong
+    /// name/schema/capacity/counters before mutation. Caller retains byte storage.
     pub restore_accumulate: unsafe extern "C" fn(ContextHandle, PortHandle, Bytes) -> Status,
 }

@@ -157,4 +157,62 @@ mod tests {
         assert_eq!(status_code::EMPTY, 1);
         assert_eq!(status_code::BUFFER_TOO_SMALL, 8);
     }
+
+    #[test]
+    fn frozen_port_event_accumulator_and_sync_tags_match_wire_oracles() {
+        assert_eq!(core::mem::size_of::<PortBindingV1>(), 32);
+        assert_eq!(core::mem::size_of::<AccumulateInfoV1>(), 24);
+        assert_eq!(core::mem::size_of::<EventV1>(), 88);
+        assert_eq!(
+            [
+                head_op::FILL_BOUNDARY,
+                head_op::FILL_REFILL,
+                head_op::PROBE_NEXT,
+                head_op::PEEK_BOUNDARY,
+                head_op::PEEK_REFILL,
+                head_op::ADVANCE_BOUNDARY,
+                head_op::ADVANCE_REFILL,
+                head_op::VOID,
+                head_op::DRAIN,
+                head_op::REFILL
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            [
+                head_kind::NOTHING,
+                head_kind::PRESENT,
+                head_kind::STAMP,
+                head_kind::HEAD,
+                head_kind::FAILED,
+                head_kind::WITHHELD
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            [
+                event_kind::BACKPRESSURE,
+                event_kind::EXPECT_WITHIN,
+                event_kind::PROMISE_WITHIN,
+                event_kind::LIVELINESS
+            ],
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            [
+                event_detail::DROP_OLDEST,
+                event_detail::BLOCK,
+                event_detail::SAMPLE,
+                event_detail::ALIVE,
+                event_detail::LOST,
+                event_detail::CONNECTED,
+                event_detail::DISCONNECTED
+            ],
+            [0, 1, 2, 1, 2, 1, 2]
+        );
+        assert_eq!(
+            [discard_reason::SPILL_RELEASE, discard_reason::INVARIANT],
+            [6, 7]
+        );
+    }
 }

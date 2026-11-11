@@ -2,6 +2,8 @@
 use crate::*;
 
 /// Synchronous state sink. Context and chunk borrows end when write returns.
+/// Frozen concrete callback record, not a table: no header negotiation. Callee
+/// validates record pointer/alignment and never retains it after capture returns.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy)]

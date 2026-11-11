@@ -38,7 +38,8 @@ pub struct LeaseHandle {
 }
 
 /// Immutable bytes borrowed for one synchronous call, or library-lifetime
-/// metadata when stored in NodeApiV1. Null is permitted only for an empty span.
+/// metadata when stored in NodeApiV1, or context-lifetime topics in PortBindingV1.
+/// Null is permitted only for an empty span.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -137,7 +138,8 @@ pub struct LoanRequestV1 {
     pub alignment: u32,
 }
 
-/// A host-owned initialized output frame, exclusively borrowed until finish.
+/// A host-owned initialized output frame, exclusively borrowed until its
+/// terminal finish/discard. Spill submission alone never ends this borrow.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -187,6 +189,10 @@ pub mod discard_reason {
     pub const NESTED_FAILED: u32 = 4;
     /// Replay suppressed this output.
     pub const REPLAY_SUPPRESSED: u32 = 5;
+    /// Release original spill loan after writer destruction, without discard accounting.
+    pub const SPILL_RELEASE: u32 = 6;
+    /// Malformed writer/slot contract; records an invariant drop.
+    pub const INVARIANT: u32 = 7;
 }
 
 /// Port direction tags.
@@ -207,18 +213,59 @@ pub mod read_mode {
     pub const HELD: u32 = 2;
 }
 
-/// Synchronization head operations.
+/// Cold binding facts; topic storage remains immutable for the context lifetime.
+#[stabby::stabby]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PortBindingV1 {
+    /// Context-scoped port identifier.
+    pub port: PortHandle,
+    /// Resolved UTF-8 topic; node copies it into node-owned storage at create.
+    pub topic: Bytes,
+    /// Complete frame ceiling for outputs, zero for inputs.
+    pub configured_capacity: u32,
+    /// Exact host input classification from read_mode; ignored for outputs.
+    pub read_mode: u32,
+}
+
+/// Synchronization operations retain the caller's boundary/refill read site.
 pub mod head_op {
-    /// Inspect without consuming.
-    pub const PEEK: u32 = 0;
-    /// Promote the staged head.
-    pub const PROMOTE: u32 = 1;
-    /// Skip the staged head.
-    pub const SKIP: u32 = 2;
-    /// Drain trigger frames using existing policy.
-    pub const DRAIN: u32 = 3;
-    /// Refill at most one head.
-    pub const REFILL: u32 = 4;
+    /// Fill or re-offer a head at the level boundary.
+    pub const FILL_BOUNDARY: u32 = 0;
+    /// Fill between fires; never re-offer an unread frozen head.
+    pub const FILL_REFILL: u32 = 1;
+    /// Non-consuming arrival probe behind the head or on a latest input.
+    pub const PROBE_NEXT: u32 = 2;
+    /// Stage the next frame at the boundary read site.
+    pub const PEEK_BOUNDARY: u32 = 3;
+    /// Stage the next frame at the between-fire read site.
+    pub const PEEK_REFILL: u32 = 4;
+    /// Discard/refill the head at the boundary read site.
+    pub const ADVANCE_BOUNDARY: u32 = 5;
+    /// Discard/refill the head at the between-fire read site.
+    pub const ADVANCE_REFILL: u32 = 6;
+    /// Serve a restored head as no live frame.
+    pub const VOID: u32 = 7;
+    /// Existing trigger drain at the level boundary.
+    pub const DRAIN: u32 = 8;
+    /// Existing trigger refill between fires.
+    pub const REFILL: u32 = 9;
+}
+
+/// Exact scalar answers to native synchronization and trigger drain operations.
+pub mod head_kind {
+    /// No head/frame exists; no timestamp.
+    pub const NOTHING: u32 = 0;
+    /// Probe found another frame; stamp unknown.
+    pub const PRESENT: u32 = 1;
+    /// Peek returned a staged frame's timestamp.
+    pub const STAMP: u32 = 2;
+    /// Fill/advance produced a head, or drain returned its latest timestamp.
+    pub const HEAD: u32 = 3;
+    /// Failed operation; never evidence enabling alignment descent.
+    pub const FAILED: u32 = 4;
+    /// Empty drain/refill deliberately withheld by the replay read plan.
+    pub const WITHHELD: u32 = 5;
 }
 
 /// Bounded read/head observations; presence is explicit, never `Option<T>`.
@@ -232,7 +279,7 @@ pub struct HeadOutcomeV1 {
     pub timestamp_ns: u64,
     /// Zero or one.
     pub has_timestamp: u32,
-    /// Owner-defined existing read/head outcome kind.
+    /// Frozen head_kind answer; timestamp presence is one only for STAMP/HEAD.
     pub kind: u32,
 }
 
@@ -261,6 +308,36 @@ pub struct ClockValueV1 {
     pub reserved: u32,
 }
 
+/// Existing author event kinds, polled only for the specified port.
+pub mod event_kind {
+    /// Backpressure regime observation.
+    pub const BACKPRESSURE: u32 = 1;
+    /// Input watchdog miss.
+    pub const EXPECT_WITHIN: u32 = 2;
+    /// Output watchdog miss.
+    pub const PROMISE_WITHIN: u32 = 3;
+    /// Publisher liveliness transition.
+    pub const LIVELINESS: u32 = 4;
+}
+
+/// Kind-scoped event policy, state and cause tags.
+pub mod event_detail {
+    /// Backpressure drops the oldest frame.
+    pub const DROP_OLDEST: u32 = 0;
+    /// Backpressure blocks.
+    pub const BLOCK: u32 = 1;
+    /// Backpressure samples at policy_value milliseconds.
+    pub const SAMPLE: u32 = 2;
+    /// Liveliness state is alive.
+    pub const ALIVE: u32 = 1;
+    /// Liveliness state is lost.
+    pub const LOST: u32 = 2;
+    /// Liveliness cause is publisher connected.
+    pub const CONNECTED: u32 = 1;
+    /// Liveliness cause is publisher disconnected.
+    pub const DISCONNECTED: u32 = 2;
+}
+
 /// Scalar QoS/backpressure observation, ordered by the host's existing stores.
 #[stabby::stabby]
 #[repr(C)]
@@ -268,20 +345,43 @@ pub struct ClockValueV1 {
 pub struct EventV1 {
     /// Port responsible for the event.
     pub port: PortHandle,
-    /// Graph-clock timestamp.
+    /// Original regime_started_at_ns, missed_at_ns or changed_at_ns.
     pub timestamp_ns: u64,
     /// Cumulative observed count.
     pub total: u64,
-    /// Regime-specific count.
+    /// Backpressure regime-specific count; zero for other kinds.
     pub in_regime: u64,
-    /// Frames dropped.
+    /// Backpressure frames dropped; zero for other kinds.
     pub dropped: u64,
-    /// Effective buffer capacity.
+    /// Backpressure buffer_capacity or liveliness publisher_count; otherwise zero.
     pub capacity: u64,
-    /// Existing event kind.
+    /// Frozen event_kind tag.
     pub kind: u32,
-    /// Existing event policy/state tag.
+    /// Kind-scoped backpressure policy or liveliness state from event_detail.
     pub detail: u32,
+    /// Configured expect/promise window in milliseconds; otherwise zero.
+    pub window_ms: u64,
+    /// Original watchdog elapsed milliseconds; otherwise zero.
+    pub elapsed_ms: u64,
+    /// Backpressure Sample(N)'s interval in milliseconds; otherwise zero.
+    pub policy_value: u64,
+    /// Liveliness cause from event_detail; otherwise zero.
+    pub cause: u32,
+}
+
+/// Frozen fire batch observations. Repeated queries in one fire return the same batch.
+#[stabby::stabby]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccumulateInfoV1 {
+    /// Frame count handed to this fire.
+    pub count: u32,
+    /// Always zero.
+    pub reserved: u32,
+    /// Frames dropped for this fire.
+    pub dropped: u64,
+    /// Lifetime dropped total.
+    pub dropped_total: u64,
 }
 
 /// Snapshot of observable publisher counters.
