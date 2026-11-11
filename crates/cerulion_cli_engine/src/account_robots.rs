@@ -69,6 +69,7 @@ pub struct AccountRobotDirectory {
     /// Owned robots, sorted by hostname then robot identifier.
     pub robots: Vec<AccountRobot>,
     login: LoginSnapshot,
+    cached: bool,
 }
 
 impl std::fmt::Debug for AccountRobotDirectory {
@@ -101,7 +102,7 @@ impl AccountRobotDirectory {
         if self.account_id != current.account || self.desk_key != current.key {
             return Err(changed_login());
         }
-        if !current.state.session_is_valid(auth::now_unix_ns()) {
+        if !self.cached && !current.state.session_is_valid(auth::now_unix_ns()) {
             return Err(invalid(
                 "the session expired after fetching the robot catalog",
             ));
@@ -146,11 +147,34 @@ impl AccountRobotDirectory {
         Ok(snapshot)
     }
 
+    /// Save public, login-bound membership for offline reconnects. No token or key is cached.
+    #[cfg(unix)]
+    pub fn cache_for_offline(&self) -> CliResult<()> {
+        let snapshot = self.daemon_snapshot()?;
+        let path = self
+            .login
+            .auth_path
+            .parent()
+            .ok_or_else(changed_login)?
+            .join("robot-directory.json");
+        let bytes = serde_json::to_vec(&snapshot)
+            .map_err(|_| invalid("robot directory could not be encoded"))?;
+        auth::with_store_lock(&self.login.auth_path, || {
+            Ok((|| -> CliResult<()> {
+                ensure_unchanged(&self.login, &snapshot_locked(&self.login.auth_path)?)?;
+                auth::atomic_write_secret(&path, &bytes)?;
+                Ok(())
+            })())
+        })
+        .map_err(|_| invalid("robot directory cache could not be written"))??;
+        Ok(())
+    }
+
     /// Refuse a stale result after logout, account/key change or session refresh.
     /// Call immediately before caching or installing this result into another service.
     pub fn validate_current_login(&self) -> CliResult<()> {
         ensure_unchanged(&self.login, &snapshot(&self.login.auth_path)?)?;
-        if !self.login.state.session_is_valid(auth::now_unix_ns()) {
+        if !self.cached && !self.login.state.session_is_valid(auth::now_unix_ns()) {
             return Err(invalid(
                 "the session expired after fetching the robot catalog",
             ));
@@ -300,6 +324,82 @@ fn fetch_with(refresh: SessionRefresh) -> CliResult<AccountRobotDirectory> {
     finish(before, &read_body(response)?)
 }
 
+/// Read saved public membership only for the same current account and device key.
+/// Expired online tokens do not erase durable robot pairings; logout and key changes refuse.
+#[cfg(unix)]
+pub fn cached_directory() -> CliResult<Option<AccountRobotDirectory>> {
+    let auth_path = auth::auth_json_path().ok_or_else(changed_login)?;
+    auth::with_store_lock(&auth_path, || {
+        Ok((|| -> CliResult<Option<AccountRobotDirectory>> {
+            let current = snapshot_locked(&auth_path)?;
+            let path = auth_path
+                .parent()
+                .ok_or_else(changed_login)?
+                .join("robot-directory.json");
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(invalid("saved robot directory could not be read")),
+            };
+            let metadata = file
+                .metadata()
+                .map_err(|_| invalid("saved robot directory metadata could not be read"))?;
+            if !metadata.is_file() || metadata.len() > MAX_BODY_BYTES as u64 {
+                return Err(invalid(
+                    "saved robot directory must be a bounded regular file",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid("saved robot directory could not be read"))?;
+            if bytes.len() > MAX_BODY_BYTES {
+                return Err(invalid("saved robot directory exceeds its size limit"));
+            }
+            let saved: cerulion_netd::account_access::AccountSnapshot =
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid("saved robot directory is malformed"))?;
+            saved
+                .validate()
+                .map_err(|_| invalid("saved robot directory is invalid"))?;
+            if saved.auth_account_id != current.state.account_id
+                || saved.pairing_account_id != current.account.0
+                || saved.device_key != current.key.0
+            {
+                return Err(changed_login());
+            }
+            let robots = saved
+                .robots
+                .into_iter()
+                .map(|robot| AccountRobot {
+                    robot_id: RobotId(robot.robot_id),
+                    hostname: robot.hostname,
+                    endpoint: robot.endpoint_key.map_or(
+                        RobotEndpoint::Unknown {
+                            reason: "saved registration has no endpoint key",
+                        },
+                        |key| RobotEndpoint::Known(PublicKey(key)),
+                    ),
+                })
+                .collect();
+            Ok(Some(AccountRobotDirectory {
+                account_id: current.account,
+                desk_key: current.key,
+                robots,
+                login: current,
+                cached: true,
+            }))
+        })())
+    })
+    .map_err(|_| invalid("saved robot directory could not be locked"))?
+}
+
 /// [`fetch`] bounded by `budget`, without refreshing the session: a stale
 /// session is an error, so the worker only reads local state and sends the
 /// catalog GET. The fetch runs on its own thread; on timeout this returns an
@@ -339,6 +439,7 @@ fn finish(before: LoginSnapshot, bytes: &[u8]) -> CliResult<AccountRobotDirector
         desk_key: before.key,
         robots,
         login: before,
+        cached: false,
     })
 }
 

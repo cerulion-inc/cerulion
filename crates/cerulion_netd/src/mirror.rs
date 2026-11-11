@@ -5,7 +5,9 @@
 //! netd's [`MirrorPlane`] does exactly two things: `ensure_mirror` (on the FIRST
 //! demand for a `(robot, topic)`) registers ONE shared desk-side ingress bridge —
 //! the mirror publisher + the zenoh demand token — so a remote robot's topic
-//! re-injects into desk SHM at its CANONICAL name, and `release_mirror` (on the
+//! re-injects into desk SHM at its canonical name for graph ingress. Authenticated
+//! observers use a private source-qualified channel returned by the daemon.
+//! `release_mirror` (on the
 //! LAST release) tears it down. The production [`GatewayMirrorPlane`] owns the
 //! machine's ONE zenoh session (Principle #8) and delegates to
 //! [`TransportManager::register_ingress_topic`] — the SAME desk-mirror primitive
@@ -208,6 +210,29 @@ pub trait MirrorPlane: Send + Sync {
         })
     }
 
+    /// Replace public explicit pairing pins while serialized with demand bookkeeping.
+    fn install_paired_robots(
+        &self,
+        _robots: &[crate::account_access::PairedRobot],
+        _registry: &mut crate::registry::DemandRegistry,
+    ) -> Result<(), String> {
+        Err("paired robot access is unavailable in this network daemon".into())
+    }
+
+    /// Metadata for a pinned paired route. `None` leaves ordinary LAN queries unchanged.
+    fn paired_catalog(&self, _robot: &str) -> Option<Result<cerulion_core::CatalogReply, String>> {
+        None
+    }
+
+    /// Named schema for a pinned paired route; a refusal never falls back to LAN.
+    fn paired_schema(
+        &self,
+        _robot: &str,
+        _requested: &str,
+    ) -> Option<Result<cerulion_core::SchemaReply, String>> {
+        None
+    }
+
     /// Check admission before every demand, including reuse of an existing mirror.
     fn prepare_demand(
         &self,
@@ -224,6 +249,11 @@ pub trait MirrorPlane: Send + Sync {
         _registry: &mut crate::registry::DemandRegistry,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Actual local channel after ensure. Legacy LAN mirrors remain canonical.
+    fn local_channel(&self, key: &TopicKey) -> String {
+        key.topic.clone()
     }
 
     /// Release a route pin only after the daemon has retired its registry entry.

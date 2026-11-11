@@ -130,7 +130,8 @@ use serde::{Deserialize, Serialize};
 /// existing socket. A local serving-schema snapshot also lets remoted use the
 /// gateway's accumulated bindings without network discovery. Older daemons must
 /// be restarted before these operations.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// `10`: bounded automatic catalogs for owned and explicitly paired robots.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 const _: () = assert!(crate::account_access::MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
 
@@ -278,6 +279,26 @@ pub enum Request {
         /// A `u64` (a schema hash can exceed 2^53) — Rust consumers round-trip it
         /// exactly through `serde_json`.
         schema_hash: u64,
+    },
+    /// Demand a source-qualified private observer channel. Wire topic remains canonical.
+    Observe {
+        /// Correlation id.
+        id: u64,
+        /// Origin robot.
+        robot: String,
+        /// Canonical wire topic.
+        topic: String,
+        /// Required wire schema hash.
+        schema_hash: u64,
+    },
+    /// Release this connection's observer demand early.
+    Unobserve {
+        /// Correlation id.
+        id: u64,
+        /// Origin robot.
+        robot: String,
+        /// Canonical wire topic.
+        topic: String,
     },
     /// Release a previously-demanded `(robot, topic)` for this connection. A no-op
     /// if the connection did not hold it. Dropping the connection releases every
@@ -427,6 +448,8 @@ impl Request {
         match self {
             Request::ServingSchemaSnapshot { id }
             | Request::AccountAccess { id, .. }
+            | Request::Observe { id, .. }
+            | Request::Unobserve { id, .. }
             | Request::Demand { id, .. }
             | Request::Release { id, .. }
             | Request::Status { id }
@@ -445,6 +468,8 @@ impl Request {
         match self {
             Request::ServingSchemaSnapshot { .. } => "serving_schema_snapshot",
             Request::AccountAccess { .. } => "account_access",
+            Request::Observe { .. } => "observe",
+            Request::Unobserve { .. } => "unobserve",
             Request::Demand { .. } => "demand",
             Request::Release { .. } => "release",
             Request::Status { .. } => "status",
@@ -495,7 +520,16 @@ impl Request {
             // its own refresh path, rather than silently waiting forever for a push
             // that can never come.
             Request::ServingSchemaSnapshot { .. } => SERVING_SCHEMA_MIN_DAEMON_VERSION,
+            Request::AccountAccess {
+                action:
+                    crate::account_access::AccountAccessRequest::Discover { .. }
+                    | crate::account_access::AccountAccessRequest::InstallPaired { .. },
+                ..
+            } => crate::account_access::REMOTE_DISCOVERY_MIN_DAEMON_VERSION,
             Request::AccountAccess { .. } => crate::account_access::MIN_DAEMON_VERSION,
+            Request::Observe { .. } | Request::Unobserve { .. } => {
+                crate::account_access::REMOTE_DISCOVERY_MIN_DAEMON_VERSION
+            }
             Request::SubscribeCatalog { .. } => 6,
             // The `runs` verb needs a v7 daemon. A v<7 daemon has no
             // `runs` handler and would answer the generic unknown-method error, which
@@ -585,6 +619,9 @@ pub struct DemandEntry {
     pub robot: String,
     /// The canonical topic.
     pub topic: String,
+    /// Actual local SHM channel, when the daemon provides source attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_topic: Option<String>,
     /// How many connections currently demand this `(robot, topic)` (the shared
     /// mirror's refcount).
     pub refcount: usize,
@@ -615,6 +652,17 @@ pub struct DemandResponse {
     /// Whether THIS demand created the shared mirror (the first demander); `false`
     /// when it joined an existing mirror.
     pub mirror_created: bool,
+}
+
+/// Observer demand with the actual desk SHM channel. Required `local_topic`
+/// discriminates this from a canonical demand response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveResponse {
+    /// Canonical demand accounting.
+    #[serde(flatten)]
+    pub demand: DemandResponse,
+    /// Desk channel to open; never changes the wire name.
+    pub local_topic: String,
 }
 
 /// The response to [`Request::Release`].
@@ -1163,6 +1211,8 @@ pub enum Response {
     ServingSchemaSnapshot(ServingSchemaSnapshotResponse),
     /// Account operation result, discriminated by its required `account_access` key.
     AccountAccess(crate::account_access::AccountAccessResponse),
+    /// Observer accepted. Must precede canonical demand in untagged decoding.
+    Observed(ObserveResponse),
     /// Demand accepted.
     Demand(DemandResponse),
     /// Release accepted.
@@ -1896,6 +1946,7 @@ mod tests {
             demands: vec![DemandEntry {
                 robot: "ubuntu".to_string(),
                 topic: "/tf".to_string(),
+                local_topic: None,
                 refcount: 2,
                 plane: Some(ServingPlane::Iroh),
             }],

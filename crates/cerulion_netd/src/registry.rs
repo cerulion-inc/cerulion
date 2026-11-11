@@ -62,6 +62,8 @@ pub struct TopicKey {
     pub robot: String,
     /// The absolute canonical topic (leading `/`).
     pub topic: String,
+    /// Observer channels are isolated from canonical graph ingress.
+    pub observer: bool,
 }
 
 impl TopicKey {
@@ -71,6 +73,28 @@ impl TopicKey {
         Self {
             robot: robot.into().trim().to_string(),
             topic: canonical_topic(topic.as_ref()),
+            observer: false,
+        }
+    }
+    /// Build a source-qualified observer key without changing the wire topic.
+    pub fn observed(robot: impl Into<String>, topic: impl AsRef<str>) -> Self {
+        Self {
+            observer: true,
+            ..Self::new(robot, topic)
+        }
+    }
+
+    /// Deterministic internal channel. A name collision cannot share an injector:
+    /// distinct registry keys must independently acquire its single writer slot.
+    pub fn local_topic(&self) -> String {
+        if self.observer {
+            format!(
+                "/__cerulion/observers/{:016x}/{:016x}",
+                cerulion_core::wire::fnv1a_hash(self.robot.as_bytes()),
+                cerulion_core::wire::fnv1a_hash(self.topic.as_bytes())
+            )
+        } else {
+            self.topic.clone()
         }
     }
 }
@@ -341,7 +365,9 @@ impl DemandRegistry {
         // topic can never be both egress-registered and demanded). No state change.
         // (Inlined direct-field access — disjoint from the `held` per_conn borrow; a
         // `&self` method call would conflict.)
-        if self.egress_topics.contains_key(&key.topic) || self.egress_announced.contains(&key.topic)
+        if !key.observer
+            && (self.egress_topics.contains_key(&key.topic)
+                || self.egress_announced.contains(&key.topic))
         {
             return DemandOutcome::EgressConflict {
                 topic: key.topic.clone(),
@@ -684,7 +710,7 @@ impl DemandRegistry {
     fn demanded_topic_robot(&self, topic: &str) -> Option<String> {
         self.topics
             .keys()
-            .find(|k| k.topic == topic)
+            .find(|k| !k.observer && k.topic == topic)
             .map(|k| k.robot.clone())
     }
 
@@ -1890,5 +1916,56 @@ mod tests {
             reg.is_busy(),
             "the egress term alone keeps netd busy (conn count aside)"
         );
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+
+    #[test]
+    fn observers_share_one_source_and_never_compete_with_canonical_egress() {
+        let now = Instant::now();
+        let mut registry = DemandRegistry::new(now);
+        let first = registry.connect(now);
+        let second = registry.connect(now);
+        registry.register_egress(first, vec!["/foo".into()]);
+        let observed = TopicKey::observed("a", "foo");
+        assert_eq!(observed.topic, "/foo");
+        assert_eq!(
+            observed.local_topic(),
+            "/__cerulion/observers/af63dc4c8601ec8c/f9be0e9c9154425e"
+        );
+        assert_eq!(observed, TopicKey::observed(" a ", "/foo"));
+        assert_ne!(observed, TopicKey::new("a", "/foo"));
+        assert_ne!(
+            observed.local_topic(),
+            TopicKey::observed("b", "/foo").local_topic()
+        );
+        assert!(matches!(
+            registry.demand(first, observed.clone(), 7, now),
+            DemandOutcome::FirstDemand { refcount: 1 }
+        ));
+        registry.mark_mirror_present(&observed);
+        assert!(matches!(
+            registry.demand(second, observed.clone(), 7, now),
+            DemandOutcome::AlreadyMirrored { refcount: 2 }
+        ));
+        assert!(matches!(
+            registry.demand(second, observed.clone(), 9, now),
+            DemandOutcome::SchemaConflict { .. }
+        ));
+        assert!(matches!(
+            registry.demand(second, TopicKey::new("a", "/foo"), 7, now),
+            DemandOutcome::EgressConflict { .. }
+        ));
+        registry.disconnect(first, now);
+        assert_eq!(registry.snapshot(), vec![(observed.clone(), 1)]);
+        assert!(matches!(
+            registry.release(second, &observed, now),
+            ReleaseOutcome::LastRelease
+        ));
+        registry.retire(&observed);
+        assert!(registry.snapshot().is_empty());
     }
 }

@@ -359,6 +359,7 @@ mod tests {
             demands: vec![cerulion_netd::protocol::DemandEntry {
                 robot: "go2".to_string(),
                 topic: "/scan".to_string(),
+                local_topic: None,
                 refcount: 1,
                 plane: None,
             }],

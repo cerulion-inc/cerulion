@@ -47,9 +47,7 @@ use cerulion_netd::{DualMirrorPlane, IrohMirrorPlane, Plane, WanRegistry, WanRob
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
-use cerulion_remoted::{
-    handle_accepted_with_wire, DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane,
-};
+use cerulion_remoted::{DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane};
 use cerulion_wireclient::protocol::{StreamPreamble, WireRequest, WireResponse};
 
 const T_NOW: u64 = 1_000_000_000_000;
@@ -248,10 +246,9 @@ fn expired_grant_authorizer(device: [u8; 32]) -> PairingAuthorizer {
 /// Serve wire connections in a LOOP until aborted — so a demand→release (which drops
 /// the connection) can be followed by a re-demand (a fresh dial the loop accepts).
 async fn robot_serve_loop(daemon: Endpoint, authz: Arc<PairingAuthorizer>, plane: Arc<WirePlane>) {
-    // A non-`Ok(Some(..))` (Err / Ok(None)) ends the loop — the desk went away.
-    while let Ok(Some(accepted)) = accept_one(&daemon).await {
-        handle_accepted_with_wire(accepted, authz.clone(), None, Some(plane.clone())).await;
-    }
+    cerulion_remoted::serve_with_wire(&daemon, authz, None, Some(plane), std::future::pending())
+        .await
+        .expect("robot wire accept loop");
 }
 
 /// A live in-process robot: its own tokio runtime + iroh endpoint + a WirePlane over
@@ -270,12 +267,30 @@ struct RobotFixture {
 
 impl RobotFixture {
     fn start(tag: &str, authz: Arc<PairingAuthorizer>) -> Self {
+        Self::start_with_schema(tag, authz, None)
+    }
+
+    fn start_with_schema(
+        tag: &str,
+        authz: Arc<PairingAuthorizer>,
+        schema: Option<(String, cerulion_core::SchemaDoc)>,
+    ) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("robot runtime");
         let manager = test_manager(&format!("robot_{tag}"));
-        let plane = Arc::new(WirePlane::with_manager(
-            format!("robot-{tag}"),
-            manager.clone(),
-        ));
+        let mut plane = WirePlane::with_manager(format!("robot-{tag}"), manager.clone());
+        if let Some((topic, doc)) = schema {
+            let serving = cerulion_core::SchemaServing {
+                topic_schemas: vec![cerulion_core::TopicSchema {
+                    topic: topic.clone(),
+                    schema_name: doc.qualified.clone(),
+                }],
+                schema_docs: vec![doc],
+                schema_hashes: Vec::new(),
+                served_topics: vec![topic],
+            };
+            plane = plane.with_in_process_schema_provider(Arc::new(move || serving.clone()));
+        }
+        let plane = Arc::new(plane);
         let daemon = rt.block_on(disabled_endpoint(unique_secret()));
         let eid = daemon.id();
         let addrs = loopback_sockets(&daemon.bound_sockets());
@@ -2311,3 +2326,6 @@ mod poison_retirement;
 
 #[path = "wan_plane_iroh_test/serving_plane.rs"]
 mod serving_plane;
+
+#[path = "wan_plane_iroh_test/automatic_cli.rs"]
+mod automatic_cli;

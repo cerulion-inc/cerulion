@@ -12,6 +12,9 @@ use cerulion_netd::NetdClient;
 
 use crate::account_robots::{self, AccountRobot, AccountRobotDirectory, RobotEndpoint};
 use crate::auth;
+
+/// Automatic catalog discovery and selection for account and paired robots.
+pub mod automatic;
 use crate::error::{CliError, CliResult};
 
 // A directory can contain thousands of robots: per-robot timeouts alone would
@@ -142,15 +145,32 @@ fn classify_install_outcome(
 /// re-validated before every attempt, so a login that changes DURING the wait
 /// aborts instead of installing a snapshot that no longer describes this machine.
 pub fn install_directory(directory: &AccountRobotDirectory) -> CliResult<NetdClient> {
-    let snapshot = directory.daemon_snapshot()?;
+    directory.validate_current_login()?;
     let mut client = NetdClient::connect_or_spawn().map_err(access_error)?;
+    install_directory_until(
+        directory,
+        &mut client,
+        Instant::now() + Duration::from_secs(5),
+    )?;
+    Ok(client)
+}
+
+fn install_directory_until(
+    directory: &AccountRobotDirectory,
+    client: &mut NetdClient,
+    deadline: Instant,
+) -> CliResult<()> {
+    let snapshot = directory.daemon_snapshot()?;
     let started = Instant::now();
     loop {
         // Connecting can wait for startup; refuse stale HTTP results before IPC.
         directory.validate_current_login()?;
-        let outcome = client.account_access_once(AccountAccessRequest::Install {
-            snapshot: Box::new(snapshot.clone()),
-        });
+        let outcome = client.account_access_until(
+            AccountAccessRequest::Install {
+                snapshot: Box::new(snapshot.clone()),
+            },
+            deadline,
+        );
         // The daemon's own message, not the client error's display text, which
         // prefixes it. Other failures carry no daemon message and settle at once.
         let daemon_message = match &outcome {
@@ -160,7 +180,7 @@ pub fn install_directory(directory: &AccountRobotDirectory) -> CliResult<NetdCli
         match classify_install_outcome(daemon_message, started.elapsed(), TRANSIENT_BUSY_WAIT) {
             BusyDecision::Settle | BusyDecision::GaveUp => {
                 outcome.map_err(access_error)?;
-                return Ok(client);
+                return Ok(());
             }
             BusyDecision::WaitAndRetry => std::thread::sleep(BUSY_RETRY_INTERVAL),
         }
@@ -382,69 +402,33 @@ pub struct VizRobotTarget {
 /// route and any already-selected account target always fail closed.
 pub fn prepare_viz_target(
     selector: &str,
-    connect: &[String],
-    listen: &[String],
+    _connect: &[String],
+    _listen: &[String],
 ) -> CliResult<VizRobotTarget> {
-    let explicit = parse_robot_route(selector)
-        .map_err(CliError::Validation)?
-        .is_some();
-    // An explicit selection waits on the full request deadline and may refresh
-    // the session (it is the one thing the command was asked to do); a listing
-    // uses `fetch_within` instead.
-    let directory = match account_robots::fetch() {
-        Ok(directory) => directory,
-        Err(error) if explicit => return Err(error),
-        Err(error) => {
-            return Ok(VizRobotTarget {
-                route: selector.into(),
-                diagnostics: vec![display_text(&error.to_string())],
-                _daemon_hold: None,
-            })
-        }
-    };
-    let mut lan_names = BTreeSet::new();
-    let mut diagnostics = Vec::new();
-    if !explicit
-        && directory
-            .robots
-            .iter()
-            .any(|robot| robot.hostname == selector)
-    {
-        let options = crate::topic_cmd::RemoteTopicsOptions {
-            connect: connect.to_vec(),
-            listen: listen.to_vec(),
-            scouting: true,
-        };
-        match crate::topic_cmd::query_remote_topics(&options) {
-            Ok(discovery) => {
-                lan_names.extend(discovery.robots.into_iter().map(|robot| robot.robot))
-            }
-            Err(error) => diagnostics.push(format!(
-                "LAN discovery unavailable while checking robot names: {}",
-                display_text(&error.to_string())
-            )),
-        }
+    if crate::graph_cmd::remote_network_suppressed() {
+        return Err(CliError::Validation(
+            "remote viz is disabled by the network kill switch".into(),
+        ));
     }
-    let selected = select_account_robot(&directory.robots, selector, &lan_names)?;
-    directory.validate_current_login()?;
-    let mut daemon_hold = None;
+    parse_robot_route(selector).map_err(CliError::Validation)?;
+    let mut directory = automatic::discover()?;
+    let selected = directory.select(selector)?;
     let route = match selected {
-        Some(robot) => {
-            let route = robot_route(&robot.robot_id.0);
-            // Refresh this robot's revocations before the dial; a failure is a
-            // diagnostic and never blocks the viewer.
-            if let Err(error) = directory.sync_robot_epoch(robot, EPOCH_SYNC_BUDGET) {
-                diagnostics.push(display_text(&error.to_string()));
-            }
-            daemon_hold = Some(install_directory(&directory)?);
-            route
+        Some(robot) => robot.route.clone(),
+        None if selector.starts_with("account:") => {
+            return Err(CliError::Validation(
+                "selected account robot is not in the current directory".into(),
+            ))
         }
         None => selector.into(),
     };
+    if let Err(error) = directory.sync_selected_epoch(&route) {
+        directory.diagnostics.push(display_text(&error.to_string()));
+    }
     Ok(VizRobotTarget {
         route,
-        diagnostics,
-        _daemon_hold: daemon_hold,
+        diagnostics: std::mem::take(&mut directory.diagnostics),
+        _daemon_hold: directory.take_hold(),
     })
 }
 
