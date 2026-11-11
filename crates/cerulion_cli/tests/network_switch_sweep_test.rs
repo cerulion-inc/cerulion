@@ -716,7 +716,16 @@ fn viz_robot_under_a_daemon_switch_refuses_before_the_login_gate() {
 fn graph_live_and_fires_under_the_netd_switch_refuse_before_the_login_gate() {
     // They ask robots through `cerulion-netd`, so its own switch refuses them
     // as `CERULION_NETWORK` does, before the gate.
-    for argv in [&["graph", "live"][..], &["graph", "fires"][..]] {
+    // With or without `--robot` and `--connect`: every form asks a robot.
+    for argv in [
+        &["graph", "live"][..],
+        &["graph", "live", "--robot", "bench-arm"][..],
+        &["graph", "live", "--connect", "tcp/127.0.0.1:7683"][..],
+        &["graph", "fires"][..],
+        &["graph", "fires", "--robot", "bench-arm"][..],
+        &["graph", "fires", "--connect", "tcp/127.0.0.1:7683"][..],
+    ] {
+        let verb = &argv[..2];
         let what = format!("{argv:?} under CERULION_NETD_NETWORK=off");
         let home = tempfile::tempdir().expect("a home");
         let run = spawn_with(
@@ -730,7 +739,7 @@ fn graph_live_and_fires_under_the_netd_switch_refuse_before_the_login_gate() {
         assert!(
             run.stderr.contains(&format!(
                 "Error: cerulion {}: asking robots is disabled by CERULION_NETD_NETWORK=off",
-                argv.join(" ")
+                verb.join(" ")
             )),
             "{what}: stderr={}",
             run.stderr

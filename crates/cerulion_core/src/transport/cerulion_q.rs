@@ -242,6 +242,30 @@ pub fn fires_selector(robot: &str, run_id: &str, after: Option<u64>) -> String {
     }
 }
 
+/// Why a fires GET for `robot` and `run_id` cannot be sent, or `None`.
+///
+/// The robot must be exactly one key chunk: a `/` or a key-expression wildcard
+/// would address other robots, and each answer arms a lease there. The run id
+/// must be the canonical text the run's `runs` entry carries, because the robot
+/// answers only that form and a different spelling would read as silence.
+/// `cerulion-netd` and the direct `--connect` path both check this before
+/// they build a [`fires_selector`].
+pub fn fires_target_error(robot: &str, run_id: &str) -> Option<String> {
+    if robot.is_empty() || robot.contains(['/', '*', '$', '?', '#']) {
+        return Some(format!(
+            "a fires query needs one robot name, not {robot:?}: it must be non-empty and \
+             hold no '/', '*', '$', '?' or '#'"
+        ));
+    }
+    if !is_canonical_run_id(run_id) {
+        return Some(format!(
+            "a fires query needs the run id in its canonical form, `0x` and 32 lowercase hex \
+             digits as the run's `runs` entry carries it, not {run_id:?}"
+        ));
+    }
+    None
+}
+
 /// The schema GET selector `cerulion_q/{robot}/schema/{requested}` — an EXPLICIT
 /// robot AND type. `requested` is the qualified `pkg/Type` (two chunks)
 /// OR a package-less bare `Name` (one chunk); the `/`
@@ -1843,9 +1867,10 @@ pub fn gather_runs_outcome<'a>(replies: impl IntoIterator<Item = &'a [u8]>) -> R
 /// payload or to the column order.
 pub const FIRES_WIRE_VERSION: u32 = 1;
 
-/// The most rows one [`FiresReply`] carries. A desk that receives a full page
-/// asks again with the reply's `next` to read on. A lost sequence takes no
-/// row, so a shorter page reached the newest fire the run had recorded.
+/// The most rows one [`FiresReply`] carries. A full page may have more
+/// waiting, so a desk that receives one asks again with the reply's `next`.
+/// That ask can come back empty. A lost sequence takes no row, so a shorter
+/// page reached the newest fire the run had recorded.
 pub const MAX_FIRES_PER_REPLY: usize = FIRE_SERVE_MAX;
 
 /// The most `in_tick` entries a served reply names: one per node, and a node
@@ -5005,6 +5030,39 @@ mod tests {
                 assert!(reason.starts_with("fires reply did not parse"), "{reason}");
             }
             other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
+    /// A fires GET names exactly one robot chunk and the canonical run id.
+    #[test]
+    fn fires_target_error_accepts_exactly_one_robot_chunk_and_the_canonical_run_id() {
+        const RUN: &str = "0x0000000000000000000000000000002a";
+        assert_eq!(fires_target_error("temi", RUN), None);
+        assert_eq!(
+            fires_target_error("go2-robot_7.lan", "0xffffffffffffffffffffffffffffffff"),
+            None
+        );
+        assert_eq!(
+            fires_target_error("temi", "0x00000000000000000000000000000000"),
+            None
+        );
+        for robot in ["", "*", "**", "a/b", "a*", "$*", "a?b", "a#b", "temi/**"] {
+            let error = fires_target_error(robot, RUN).expect("refused");
+            assert!(error.contains("one robot name"), "{robot:?}: {error}");
+        }
+        for run_id in [
+            "",
+            "0x",
+            "2a",
+            "0x2a",
+            "0X0000000000000000000000000000002a",
+            "0x0000000000000000000000000000002A",
+            "0x00000000000000000000000000000002a",
+            "0x000000000000000000000000000000-2",
+            " 0x0000000000000000000000000000002a",
+        ] {
+            let error = fires_target_error("temi", run_id).expect("refused");
+            assert!(error.contains("canonical form"), "{run_id:?}: {error}");
         }
     }
 }
