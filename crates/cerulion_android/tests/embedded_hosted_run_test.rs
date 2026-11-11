@@ -710,9 +710,11 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     );
     runtime.stop().expect("stop the paired graph");
 
-    // 7. A graph.yaml above the served cap: `runs` names the run
-    //    undescribable with the reason, and with no description to read
-    //    its fires by, the run serves none and reports no fire telemetry.
+    // 7. A graph name above the served cap: the graph.yaml is above it, and
+    //    so is the run.json with only its base keys, so no run.json is
+    //    rendered. `runs` names the run undescribable with the reason, and
+    //    with no description to read its fires by, the run serves none and
+    //    reports no fire telemetry.
     let long_name = "x".repeat(MAX_RUN_ARTIFACT_LEN);
     runtime
         .start(&config(&listen, "open", Some(graph_yaml(Some(&long_name)))))
@@ -727,7 +729,8 @@ fn an_embedded_graph_is_hosted_as_a_run_with_its_topology_and_node_fires() {
     match reply.undescribable.as_slice() {
         [UndescribableRun { run_id, reason }] => {
             assert_eq!(run_id, &undescribable);
-            assert!(reason.contains("graph.yaml"), "{reason}");
+            assert!(reason.contains("run.json"), "{reason}");
+            assert!(reason.contains("above the"), "{reason}");
         }
         other => panic!("expected one undescribable run, got {other:?}"),
     }
