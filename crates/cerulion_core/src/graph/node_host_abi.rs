@@ -269,13 +269,74 @@ impl HostContext {
         &self.native
     }
 
-    /// Exclusive host maintenance runs only after every accessor lease returned.
+    /// Unscoped native maintenance protects all borrowed input ports. Retained
+    /// output samples are independently owned and do not block input maintenance.
+    /// Named input operations use the narrower runtime helpers below.
     pub(crate) fn native_mut_for_runtime(&mut self) -> Result<&mut NodeContext, HostServiceError> {
         self.admit()?;
-        if self.leases.active() != 0 {
+        if self.ports.iter().any(|port| {
+            port.spec.direction == LeaseDirection::Read
+                && (port.busy || port.accumulated_borrows != 0)
+        }) {
             return Err(HostServiceError::InvalidState);
         }
         Ok(&mut self.native)
+    }
+
+    fn runtime_input_index(&self, name: &str) -> Result<usize, HostServiceError> {
+        self.admit()?;
+        let index = self
+            .ports
+            .iter()
+            .position(|port| port.spec.direction == LeaseDirection::Read && port.spec.name == name)
+            .ok_or(HostServiceError::InvalidDescriptor)?;
+        self.unborrowed(index)?;
+        Ok(index)
+    }
+
+    /// Host data-trigger boundary maintenance; only this input must be unborrowed.
+    pub fn runtime_drain_trigger_input(
+        &mut self,
+        name: &str,
+    ) -> Result<(u64, Option<u64>), HostServiceError> {
+        self.runtime_input_index(name)?;
+        Ok(self.native.drain_trigger_input(name))
+    }
+
+    /// Host data-trigger refill; other retained inputs and outputs remain intact.
+    pub fn runtime_refill_trigger_input(
+        &mut self,
+        name: &str,
+    ) -> Result<(u64, Option<u64>), HostServiceError> {
+        self.runtime_input_index(name)?;
+        Ok(self.native.refill_trigger_input(name))
+    }
+
+    /// Host sync maintenance preserves every borrowed port outside this operation.
+    pub fn runtime_sync_head_op(
+        &mut self,
+        name: &str,
+        operation: SyncHeadOp,
+    ) -> Result<SyncOpAnswer, HostServiceError> {
+        self.runtime_input_index(name)?;
+        Ok(self.native.sync_head_op(name, operation))
+    }
+
+    /// Host history maintenance changes publishers only, never input mappings.
+    pub fn runtime_pump_history(&mut self) -> Result<(), HostServiceError> {
+        self.admit()?;
+        self.native.pump_history();
+        Ok(())
+    }
+
+    /// Host history maintenance with the existing runtime cadence clock value.
+    pub fn runtime_pump_history_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<(), HostServiceError> {
+        self.admit()?;
+        self.native.pump_history_at(now);
+        Ok(())
     }
 
     /// Resolve names once and provision all lease rows before node creation.
@@ -459,13 +520,11 @@ impl HostContext {
         })
     }
 
-    /// Start one node invocation after the preceding invocation's accessors
-    /// returned. The loader calls this once before each user tick.
+    /// Start one node invocation, preserving every retained accessor's row,
+    /// mapping and port exclusion until its own release. The loader calls this
+    /// once before each user tick; retained leases never prevent a fire.
     pub fn begin_fire(&mut self) -> Result<(), HostServiceError> {
         self.admit()?;
-        if self.leases.active() != 0 {
-            return Err(HostServiceError::InvalidState);
-        }
         for bound in &mut self.ports {
             bound.offered_this_fire = false;
             bound.observed_frames.fill(false);
