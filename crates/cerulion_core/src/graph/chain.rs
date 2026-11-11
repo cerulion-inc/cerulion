@@ -3,25 +3,31 @@
 //! other edge cannot.
 //!
 //! Pure build-time analysis over [`GraphTopology`], [`TriggerEdges`],
-//! [`Levels`] and the run's colocation. It decides nothing at run time, changes
-//! no execution path, and is read by the chains block of `cerulion graph
-//! levels` and by the run directory's manifest. Nothing in the executor
-//! consumes the result yet.
+//! [`Levels`] and the run's colocation. It decides nothing at run time. The
+//! chains block of `cerulion graph levels` and the run directory's manifest
+//! print it, and when [`resolve_fusion`] is on the graph build calls every
+//! callable member of its chains.
 //!
 //! # What a fused chain is
 //!
 //! Inside one process, a linear single-consumer trigger chain
-//! `n_0 -> n_1 -> ... -> n_k` can execute as one synchronous call sequence: the
-//! executor fires `n_0`, its tick returns with the frame already committed to
-//! shared memory exactly as it is committed today, and the executor then calls
-//! `n_1` directly with a read-only view of those bytes instead of ending the
-//! level, crossing a level boundary and receiving the frame out of `n_1`'s own
-//! queue. The publish is untouched, so every observer sees the same frames in
-//! the same bytes with gap-free sequences. What the chain removes is the step
-//! machinery between the hops.
+//! `n_0 -> n_1 -> ... -> n_k` runs as one call sequence on the step thread.
+//! The head `n_0` fires in its own level's pass, and its tick commits the frame
+//! to shared memory as every fire does. When the head's level ends, the
+//! executor calls `n_1` to `n_k` in chain order, one after another in one
+//! loop: each member takes its frame off its own queue with the level drain's
+//! per-binding body, runs its QoS windows, decides, freezes its latest-value
+//! inputs and ticks, and its ordinary publish puts the next member's frame on
+//! that member's queue. A member's trace entries wait in its own buffer and are
+//! written when the level loop reaches the member's level, at its graph
+//! position there. Every hop is one publish and one dequeue, so every observer
+//! sees the same frames in the same bytes with gap-free sequences. What the
+//! chain removes is each member's wait for its own level's pass.
 //!
-//! This module answers only the first question: which edges qualify. Fusing
-//! them is separate work.
+//! This module decides which edges qualify. The graph runtime builds the calls
+//! and makes them on every step that has no barrier participant, replay fire
+//! plan, replay pauses or armed read gate; such a step runs every member at its
+//! own level.
 //!
 //! # The rules, and the reason each one exists
 //!
@@ -33,52 +39,79 @@
 //! | rule | bar | why |
 //! |---|---|---|
 //! | the edge is a trigger edge | [`ChainBar::LatestValueRead`] | a non-trigger input is a latest-value read, not a hop: the consumer is not woken by it |
-//! | the topic has exactly one in-graph producer | [`ChainBar::NoInGraphProducer`], [`ChainBar::MultipleProducers`] | an outside publisher hands over no slot, and two writers give the consumer no single producer to be called from |
+//! | the topic has exactly one in-graph producer | [`ChainBar::NoInGraphProducer`], [`ChainBar::MultipleProducers`] | an outside publisher fires at no level the consumer could be called after, and two writers give the consumer no single producer to be called after |
 //! | the topic has exactly one consumer edge | [`ChainBar::FanOut`] | the second consumer would wait for the first consumer's whole chain, which is a scheduling decision the level structure already makes |
 //! | the producer feeds exactly one fusable edge | [`ChainBar::ProducerBranches`] | the same wait, one level up: a node publishing two single-consumer topics is a fan-out across topics, and a chain ends at a fan-out |
-//! | producer and consumer run in one process | [`ChainBar::SeparateProcesses`] | another address space has no slot to hand over |
-//! | the edge is neither `block` nor `sample(N)` | [`ChainBar::BlockEdge`], [`ChainBar::SampleEdge`] | `block` means "defer the producer while the consumer is at threshold", and a consumer that runs inside the producer's own fire can never reach the threshold, so the declared contract could not be honoured; `sample(N)` states that the consumer reads less often than the producer publishes, and a synchronous call reads in lockstep with it |
+//! | producer and consumer run in one process | [`ChainBar::SeparateProcesses`] | a node in another process is not in the runtime that runs the head, so the end of the head's level cannot call it |
+//! | the edge is neither `block` nor `sample(N)` | [`ChainBar::BlockEdge`], [`ChainBar::SampleEdge`] | a `block` or `sample(N)` input is read through a second subscriber that counts arrivals, and a chain call drains only a trigger input read through its node's body subscriber |
 //! | the consumer fires on this frame | [`ChainBar::ConsumerPolicy`] | a period is a clock decision, a sync window is an alignment decision across several edges, and an external node fires from outside the graph |
 //! | this edge is the consumer's only trigger | [`ChainBar::ConsumerJoin`] | a join fires on a set of frames, not on one; the chain ends at it and its inbound edges stay queued |
-//! | the consumer sits on the level RIGHT AFTER the producer's | [`ChainBar::LevelNotAdjacent`] | a derived levelization already guarantees it for a single-trigger consumer, but a `level_assignments:` block may place one further down while the executor still opens the levels in between, so a synchronous call would fire it a step early |
-//! | the consumer declares no `throttle_ms` | [`ChainBar::ConsumerThrottled`] | a rate cap is a decision to defer a fire, and a synchronous call has nowhere to defer to |
+//! | the consumer sits on the level RIGHT AFTER the producer's | [`ChainBar::LevelNotAdjacent`] | a derived levelization already guarantees it for a single-trigger consumer, but a `level_assignments:` block may place one further down while the executor still opens the levels in between, so calling it when the producer's level ends would fire it before those levels, which the queued path fires first |
+//! | the consumer declares no `throttle_ms` | [`ChainBar::ConsumerThrottled`] | a rate cap can defer a fire past the step its frame arrives in, and a member is called to fire on that step |
 //! | neither end is block-involved | [`ChainBar::BlockInvolved`] | the executor already fires those nodes serially against a shared outstanding count, and a chain would reorder that pairing |
-//! | the consumer reads no context written at or after the head's level | [`ChainBar::LateContextInput`] | the determinism rule, derived below |
-//! | the chain is within [`MAX_FUSED_CHAIN_NODES`] | [`ChainBar::LengthCeiling`] | the synchronous call depth is the chain length, so the depth is bounded at build time |
+//! | the consumer reads no context written at or after the head's level | [`ChainBar::LateContextInput`] | the context rule, derived below |
+//! | no node reads the consumer's output as a latest value at a level after the head's and at or before the consumer's | [`ChainBar::EarlyLatestValueReader`] | the reader rule, derived below |
+//! | the chain is within [`MAX_FUSED_CHAIN_NODES`] | [`ChainBar::LengthCeiling`] | the members of a chain are called back to back when its head's level ends, so the ceiling bounds that run at build time |
 //!
 //! Every one of these is decidable from the graph's declarations, so the set is
 //! frozen at build and never re-derived from what the run happens to do. A
 //! fusion set that varied with load would make a replay a different program.
 //!
-//! One exclusion a fused executor would also need is NOT a rule here: a
-//! consumer that keeps a borrow of its trigger input alive past its own tick
-//! could not be served by a view that ends with the call. No declaration says
-//! that, and the accessors a node reads a trigger input through hand out a
-//! view scoped to the tick, so there is nothing for this analysis to read.
-//! Should such a declaration exist, it belongs in the table above.
+//! A called member takes its trigger frame off its own queue, as its level's
+//! drain would, so a borrow of that frame lives exactly as long as it does on
+//! the queued path and needs no rule here.
 //!
-//! # The context rule, derived
+//! # The context rule and the reader rule, derived
 //!
 //! The level executor snapshots a firing node's non-trigger inputs at the start
 //! of its OWN level phase, which is after every node at every earlier level has
-//! ticked. A fused consumer at level `L+1` is called during level `L`'s tick
-//! phase, when only part of level `L` has ticked. If that consumer reads a
-//! latest-value input written by another node at level `L`, the queued run and
-//! the fused run can observe different values, and the two stop being the same
-//! program.
+//! ticked. A member called at level `H+k` of a chain whose head sits on level
+//! `H` freezes its inputs when level `H` ends instead: after every node at
+//! level `H` and below has ticked, and before the level loop has run any level
+//! above `H`. If that member reads a latest-value input written by a node at a
+//! level above `H` and below `H+k`, the queued run freezes the value the
+//! writer published this step and the called run can freeze the one before,
+//! and the two stop being the same program.
 //!
-//! The rule closes it by refusal rather than by cleverness: a fused consumer
-//! may read no non-trigger input whose in-graph producer sits at a level at or
-//! after the CHAIN HEAD's level. Everything below the head has ticked and
-//! committed before the head fires, so its values are final; everything at or
-//! after the head has not. The head is the bound, not the consumer's own level,
-//! because the whole chain runs inside the head's level phase.
+//! The context rule closes it by refusal rather than by cleverness: a called
+//! member may read no non-trigger input whose in-graph producer sits at a level
+//! at or after the CHAIN HEAD's level. Everything below the head's level has
+//! ticked and committed before the head fires, so its values are final at both
+//! instants. A writer above the head's level may not have ticked when the
+//! member is called, or may itself be a chain member called before the level
+//! loop reaches its level. A writer on the head's own level has ticked by the
+//! call, and the rule refuses it as well. The head is the bound, not the
+//! member's own level, because every member of the chain is called when the
+//! head's level ends.
 //!
-//! The rule is scoped to in-graph producers, which is what level order decides.
-//! A non-trigger input fed from outside the graph is read at a slightly earlier
-//! instant of the same step; that is a change of when inside one step, not of
-//! which step, and it is measured by the executor's own firewall test when the
-//! chain is actually fused.
+//! The reader rule is the same instant seen from the other side. A node that
+//! reads one of the member's outputs as a latest value at a level above `H`
+//! and at or below `H+k` freezes that input after the called member has
+//! published, where the queued run freezes it before the member ticks. A reader
+//! at or below `H` has frozen its inputs before the call, and one above `H+k`
+//! freezes them after the member's own level, when the queued member has
+//! published too. So a member may have no latest-value reader in that band.
+//!
+//! A member may publish a topic another in-graph node publishes too, and
+//! neither rule refuses it. Calling the member can move its publish of that
+//! topic ahead of another producer's publish in the same step, which the
+//! queued run would have made first. In-graph readers do not see the move. A
+//! subscriber holds one queue per publisher, and a read takes the next frame
+//! of the first queue, in connection order, that holds one. A trigger reader
+//! of the topic sits above every producer's level, so it reads after both
+//! publishes and takes the publishers in connection order whichever came
+//! first. A latest-value reader that could read before the queued member
+//! publishes sits at a level above the head's and at or below the member's,
+//! which is the reader rule's band. An out-of-process drainer that lands
+//! between the two commits, such as the `bagd` recording tap or `topic echo`,
+//! does see the moved publish, as it does for any called member's publish
+//! against the nodes that publish in between.
+//!
+//! Both rules are scoped to in-graph nodes, which is what level order decides.
+//! A non-trigger input fed from outside the graph is frozen when the member is
+//! called rather than at the start of its own level, earlier in the same step:
+//! that changes when inside one step the input is read, not which step reads
+//! it.
 //!
 //! An edge refused here CUTS its chain rather than killing it: the refused
 //! consumer becomes the head of a new chain, which is judged against its own
@@ -109,16 +142,18 @@ use super::resolve_source;
 
 /// The longest chain the executor may fuse, in nodes.
 ///
-/// A fused hop is a direct call, so the call depth of a chain is its length and
-/// a graph could otherwise declare an unbounded one. A chain longer than this
-/// is SPLIT at the ceiling: the boundary edge keeps the queued path and the
-/// remainder starts a new chain, so nothing is silently dropped and the depth
-/// of any single chain stays bounded.
+/// When a chain head's level ends, the executor calls the chain's members back
+/// to back in one loop before the level loop moves on, and a graph could
+/// otherwise declare an unbounded run of them. A chain longer than this is
+/// SPLIT at the ceiling: the boundary edge keeps the queued path and the
+/// remainder starts a new chain, headed on its own level, so nothing is
+/// silently dropped and the run of calls for any single chain stays bounded.
 ///
 /// The value is far above any shape a real graph reaches: a linear chain of 32
 /// nodes is longer than the whole node count of every graph shipped with this
 /// repository, so the ceiling costs nothing today and exists so that a
-/// generated graph cannot hand the executor an unbounded recursion.
+/// generated graph cannot make the end of one level call an unbounded run of
+/// members.
 pub const MAX_FUSED_CHAIN_NODES: usize = 32;
 
 /// Where the run puts each node, for the one-process rule.
@@ -172,7 +207,7 @@ enum Placement<'a> {
 }
 
 /// How a consumer decides to fire, for the rule that a fused consumer fires on
-/// the frame it is handed.
+/// the frame its producer just published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerFireClass {
     /// Fires on a clock.
@@ -237,12 +272,23 @@ pub enum ChainBar {
     /// against the shared outstanding count.
     BlockInvolved { producer: bool, consumer: bool },
     /// The consumer reads a latest-value input written by a node at or after
-    /// the chain head's level, so a fused call would read it before it is
-    /// final.
+    /// the chain head's level, which a call made when the head's level ends
+    /// could freeze at a different value from the one its own level freezes.
     LateContextInput {
         input: String,
         written_by: String,
         written_at_level: usize,
+        head_level: usize,
+    },
+    /// A node reads one of the consumer's outputs as a latest value at a level
+    /// after the chain head's level and at or before the consumer's own. The
+    /// consumer is called when the head's level ends, so that reader's
+    /// snapshot would see a frame the queued path publishes only after it.
+    EarlyLatestValueReader {
+        output_topic: String,
+        reader: String,
+        reader_level: usize,
+        consumer_level: usize,
         head_level: usize,
     },
     /// Extending the chain would pass [`MAX_FUSED_CHAIN_NODES`]. The consumer
@@ -271,9 +317,10 @@ pub enum ChainBar {
     /// long as every trigger edge is strictly level-increasing and may
     /// therefore place a sole consumer two or more levels below its producer
     /// while the executor still opens every level in between. Calling that
-    /// consumer inside the producer's own level phase would run it a step
-    /// early, and a chain assembled from such edges would render a level band
-    /// it does not occupy, because a chain's band assumes one level per hop.
+    /// consumer when the producer's level ends would run it before those
+    /// levels, which the queued path runs first, and a chain assembled from
+    /// such edges would render a level band it does not occupy, because a
+    /// chain's band assumes one level per hop.
     /// A levelization supplied from a different graph reaches it too.
     ///
     /// Refusing it is also what keeps the surviving edges a set of disjoint
@@ -307,6 +354,7 @@ impl ChainBar {
             Self::ConsumerThrottled { .. } => "throttle",
             Self::BlockInvolved { .. } => "block-involved",
             Self::LateContextInput { .. } => "late-context-input",
+            Self::EarlyLatestValueReader { .. } => "early-latest-value-reader",
             Self::LengthCeiling { .. } => "length-ceiling",
             Self::LevelUnknown { .. } => "level-unknown",
             Self::LevelNotAdjacent { .. } => "level-not-adjacent",
@@ -354,7 +402,7 @@ impl std::fmt::Display for ChainBar {
             }
             Self::BlockEdge => write!(
                 f,
-                "the input declares `block`, whose deferral a consumer running inside the producer's own fire could never reach"
+                "the input declares `block`, which defers the producer while the consumer is at threshold"
             ),
             Self::SampleEdge { window_ms } => write!(
                 f,
@@ -371,7 +419,7 @@ impl std::fmt::Display for ChainBar {
             ),
             Self::ConsumerThrottled { throttle_ms } => write!(
                 f,
-                "the consumer declares `throttle_ms = {throttle_ms}`, and a direct call has nowhere to defer to"
+                "the consumer declares `throttle_ms = {throttle_ms}`, which can defer its fire past the step its frame arrives in"
             ),
             Self::BlockInvolved { producer, consumer } => {
                 let who = match (*producer, *consumer) {
@@ -392,6 +440,16 @@ impl std::fmt::Display for ChainBar {
             } => write!(
                 f,
                 "the consumer reads '{input}' as a latest value and '{written_by}' writes it at level {written_at_level}, at or after the chain head's level {head_level}"
+            ),
+            Self::EarlyLatestValueReader {
+                output_topic,
+                reader,
+                reader_level,
+                consumer_level,
+                head_level,
+            } => write!(
+                f,
+                "'{reader}' reads the consumer's output '{output_topic}' as a latest value at level {reader_level}, after the chain head's level {head_level} and at or before the consumer's level {consumer_level}"
             ),
             Self::LengthCeiling { ceiling } => write!(
                 f,
@@ -825,8 +883,8 @@ fn per_edge_bar(
     // always exactly one level below its producer under a derived
     // levelization, so what remains here is a `level_assignments:` block that
     // placed it further down while the executor still opens the levels in
-    // between: calling it inside the producer's own level phase would fire it
-    // a step early, and the chain would render a level band it does not
+    // between: calling it when the producer's level ends would fire it before
+    // those levels, and the chain would render a level band it does not
     // occupy.
     if consumer_level != producer_level + 1 {
         return Some(ChainBar::LevelNotAdjacent {
@@ -981,6 +1039,9 @@ fn assemble_chains(
                     levels,
                     topology,
                 )
+                .or_else(|| {
+                    early_reader_bar(&consumer, head_level, trigger_edges, levels, topology)
+                })
             };
             if let Some(bar) = cut {
                 edges[idx].bar = Some(bar);
@@ -1050,6 +1111,51 @@ fn late_context_bar(
     None
 }
 
+/// The reader rule for one candidate consumer: does a node read one of its
+/// outputs as a latest value at a level in `(head_level, consumer_level]`?
+///
+/// A fused consumer is called when its head's level ends. A latest-value
+/// reader at or below the head's level has frozen its inputs by then, and one
+/// above the consumer's level freezes them after the consumer's level, when
+/// the queued path has published too; a reader in between would freeze the
+/// called consumer's frame one level early.
+///
+/// Reports the FIRST offending reader in topic order.
+fn early_reader_bar(
+    consumer: &str,
+    head_level: usize,
+    trigger_edges: &TriggerEdges,
+    levels: &Levels,
+    topology: &GraphTopology,
+) -> Option<ChainBar> {
+    let consumer_level = levels.level_of(consumer)?;
+    for flow in topology.topics() {
+        if !flow.producers.iter().any(|p| p == consumer) {
+            continue;
+        }
+        for reader in &flow.consumers {
+            if trigger_edges.is_triggering(&reader.node_id, &flow.topic) {
+                continue;
+            }
+            let Some(reader_level) = levels.level_of(&reader.node_id) else {
+                return Some(ChainBar::LevelUnknown {
+                    node: reader.node_id.clone(),
+                });
+            };
+            if reader_level > head_level && reader_level <= consumer_level {
+                return Some(ChainBar::EarlyLatestValueReader {
+                    output_topic: flow.topic.clone(),
+                    reader: reader.node_id.clone(),
+                    reader_level,
+                    consumer_level,
+                    head_level,
+                });
+            }
+        }
+    }
+    None
+}
+
 // ==========================================================================
 // The resolved decision: does this graph ask for fused chains?
 // ==========================================================================
@@ -1096,7 +1202,15 @@ impl FusionSource {
 /// environment in one build could disagree, and a decision that varied within
 /// a build would make a replay a different program.
 ///
-/// NOTHING in the executor consumes this yet.
+/// When it is on, the graph build calls every callable member of each census
+/// chain (see
+/// [`GraphRuntime::chain_calls_made`](crate::graph::GraphRuntime::chain_calls_made)):
+/// a chain is cut at the first member that sits off the level its chain
+/// position names, is outside its level's non-block set, has a data-trigger
+/// binding count other than one, or drains on the separate discipline, and
+/// that member and the rest of its chain fire at their own levels. The build
+/// logs each cut at `warn`, naming the chain head, the member and the reason,
+/// and names the members it calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionDecision {
     enabled: bool,
@@ -1155,12 +1269,23 @@ pub fn resolve_fusion() -> FusionDecision {
 
 /// The behaviour an unset seam gets.
 ///
-/// `false` while no execution path fuses anything: a build with the seam
-/// unset must behave byte-identically to one made before the seam existed.
-/// It becomes `true` once a fused run and a queued run of one graph are proved
-/// to produce identical traces, which is what earns fusion the right to be the
-/// default.
+/// `false`: a build with the seam unset runs every hop through the level loop.
+/// `tests/chain_call_identity_test.rs` compares a chain-called run of one
+/// graph with its queued run, fire trace, read log and frames, entry for
+/// entry.
 const FUSE_CHAINS_DEFAULT: bool = false;
+
+/// Under the `oracle-mutants` feature, setting this variable makes a chain
+/// call write its trace entries into the shared trace when it fires, instead
+/// of at the member's position in its own level.
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_CALL_INLINE_TRACE_MUTANT_ENV: &str = "CERULION_CHAIN_CALL_INLINE_TRACE_MUTANT";
+
+/// Under the `oracle-mutants` feature, setting this variable makes a chain
+/// call skip the member's own dequeue and fire it once on whatever its input
+/// last held.
+#[cfg(feature = "oracle-mutants")]
+pub const CHAIN_CALL_SKIP_DEQUEUE_MUTANT_ENV: &str = "CERULION_CHAIN_CALL_SKIP_DEQUEUE_MUTANT";
 
 /// Log the fusion decision and the census it would apply to, once per graph
 /// build.
@@ -1178,7 +1303,8 @@ pub fn log_fusion_decision(decision: &FusionDecision, census: &ChainCensus) {
     tracing::info!(
         enabled = decision.enabled(),
         decided_by = decision.source().label(),
-        "chain fusion: the decision is resolved; no execution path consumes it yet"
+        "chain fusion: the decision is resolved; when enabled, every callable chain member is \
+         called from the step thread when its chain head's level ends"
     );
     tracing::info!(
         chains = census.chains().len(),

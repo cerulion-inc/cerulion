@@ -122,8 +122,9 @@ impl KeyProvider for KeyFiles {
 /// Which ops verb set a plane serves, with what each set needs.
 pub(crate) enum OpsHost {
     /// The `cerulion-remoted` daemon: every verb. `engage-estop` engages
-    /// `lease`, the act verbs check it, and the rcp plane engages and checks
-    /// a clone of it, so all of them share one latch and one engage count.
+    /// `lease`, the act verbs check it, `restart` checks it before its stop and
+    /// again before its start, and the rcp plane engages and checks a clone of
+    /// it, so all of them share one latch and one engage count.
     /// With `rcpd`, each `engage-estop` also sends an `estop` to the robot's
     /// rcpd until rcpd answers ([`crate::rcp`]).
     Daemon {
@@ -408,7 +409,8 @@ impl BoundPlane {
 
     /// Serve the wire and ops planes (and the rcp plane, on the daemon) until
     /// `shutdown` resolves or the endpoint closes, then close the endpoint, on
-    /// an error too. Access checks read the wall clock.
+    /// an error too. Access checks read the wall clock. `shutdown` is dropped
+    /// as soon as the accept loop stops, before the shutdown stage runs.
     pub async fn serve(
         self,
         shutdown: impl std::future::Future<Output = ()>,
