@@ -807,6 +807,13 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
         line.contains("spawned bagd recorder")
             && line.contains(&format!("bag={}", displayed_bag.display()))
     }));
+    let opened_path_field = format!("path={}", displayed_bag.display());
+    assert!(recorder_log.lines().any(|line| {
+        line.contains("bagd opened bag file")
+            && line
+                .split_whitespace()
+                .any(|field| field == opened_path_field)
+    }));
 
     let reader = cerulion_bag::BagReader::open(&bag).expect("open bag");
     let (_msgs, completeness) = reader.recover_messages().expect("recover");

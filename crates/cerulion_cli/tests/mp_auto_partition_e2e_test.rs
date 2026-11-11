@@ -2136,6 +2136,13 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
         line.contains("spawned bagd recorder")
             && line.contains(&format!("bag={}", displayed_bag.display()))
     }));
+    let opened_path_field = format!("path={}", displayed_bag.display());
+    assert!(log.lines().any(|line| {
+        line.contains("bagd opened bag file")
+            && line
+                .split_whitespace()
+                .any(|field| field == opened_path_field)
+    }));
     assert!(
         log.contains("graph running")
             && log.contains("nodes=2")
