@@ -345,6 +345,7 @@ pub struct LanAccessAuthorizer {
     access: LanAccess,
     inner: std::sync::Arc<dyn DemandAuthorizer>,
     refusals: LanRefusalLatches,
+    run_scope: Option<std::sync::Weak<super::TransportManager>>,
 }
 
 impl LanAccessAuthorizer {
@@ -354,7 +355,16 @@ impl LanAccessAuthorizer {
             access,
             inner,
             refusals: LanRefusalLatches::default(),
+            run_scope: None,
         }
+    }
+
+    pub(crate) fn with_run_scope(
+        mut self,
+        scope: Option<std::sync::Weak<super::TransportManager>>,
+    ) -> Self {
+        self.run_scope = scope;
+        self
     }
 
     /// The posture this authorizer applies.
@@ -365,6 +375,20 @@ impl LanAccessAuthorizer {
 
 impl DemandAuthorizer for LanAccessAuthorizer {
     fn authorize_demand(&self, subject: &DemandSubject, topic: &str) -> DemandDecision {
+        // Synthetic catalog/schema resources are gated separately; concrete topics
+        // must also satisfy their producer's policy, whatever peer authorizer is installed.
+        if topic.starts_with('/') {
+            if let Some(scope) = &self.run_scope {
+                if !scope
+                    .upgrade()
+                    .is_some_and(|manager| manager.remote_topic_allowed(topic).unwrap_or(false))
+                {
+                    return DemandDecision::deny(
+                        "the producing run excludes this topic from network egress",
+                    );
+                }
+            }
+        }
         match (self.access, subject) {
             // hot-path-alloc-ok: a refused demand is a control-plane reply, never the
             // per-frame publish/receive path.

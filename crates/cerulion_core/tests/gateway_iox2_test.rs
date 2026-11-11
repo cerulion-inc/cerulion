@@ -4461,6 +4461,20 @@ fn serving_gateway_names_runtime_route_via_hash_and_serves_schema() {
         served,
         "the schema-serving surface never served the custom type post-construction"
     );
+    // A cached custom doc must follow its current producer's scope.
+    let _scope = p
+        .exclude_remote_topic(&runtime_topic)
+        .expect("exclude source");
+    let reply = cerulion_core::transport::discovery::query_robot_schema(
+        session,
+        robot,
+        widget_q,
+        Duration::from_millis(300),
+    )
+    .expect("explicit schema refusal");
+    assert!(reply.docs.is_empty());
+    assert!(reply.error.is_some());
+    assert!(gateway.manager().remote_access_refusals() > 0);
 }
 
 /// The additive `GatewayRuntime::new_embedded` constructor boots a
@@ -6909,4 +6923,32 @@ fn merge_from_is_first_wins_additive_and_idempotent() {
     let mut fresh = cerulion_core::SchemaServing::default();
     fresh.merge_from(&acc);
     assert_eq!(fresh, acc, "an empty fold takes the whole serving");
+}
+
+/// An open daemon's probe cannot discover or register an excluded live service.
+#[test]
+fn permissive_probe_refuses_a_local_only_topic_before_a_data_tap_opens() {
+    let topic = format!("/scope/probe/{}", unique_id());
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowAll,
+        announce: vec![],
+        ingress: vec![],
+    };
+    let (producer, _clock, gateway, _pubs) = make_producer_and_gateway("scope_probe", plan, &[]);
+    let _scope = producer.exclude_remote_topic(&topic).unwrap();
+    let _publisher = producer
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+        .unwrap();
+    let before = producer.topic_subscriber_count(&topic);
+    assert_eq!(gateway.probe_verdict_for_test(&topic), "missing");
+    assert_eq!(gateway.probe_miss_count(), 1);
+    assert_eq!(gateway.probe_hit_count(), 0);
+    assert_eq!(producer.topic_subscriber_count(&topic), before);
+    assert!(!gateway.is_runtime_registered(&topic).unwrap());
+    assert!(!gateway
+        .manager()
+        .network()
+        .unwrap()
+        .announced_topics()
+        .contains(&topic));
 }

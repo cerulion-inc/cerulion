@@ -118,6 +118,14 @@ pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(100);
 /// below what the 16 MiB ops frame would allow.
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 1 << 20;
 
+fn remote_lease(
+    topic: &str,
+) -> CerudResult<cerulion_core::transport::egress_scope::RemoteTopicLease> {
+    cerulion_core::TransportManager::get_or_init()
+        .and_then(|manager| manager.acquire_remote_topic_lease(topic))
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))
+}
+
 fn schemas_dir() -> Option<PathBuf> {
     std::env::var_os(SCHEMAS_DIR_ENV)
         .filter(|v| !v.is_empty())
@@ -369,6 +377,7 @@ impl VerbHandler for TopicPublishVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
+        let _remote_lease = remote_lease(topic)?;
         refuse_reserved(topic)?;
         let type_arg = str_arg(args, "type")?;
         let message = text_arg(args, "message")?;
@@ -509,6 +518,9 @@ impl VerbHandler for ServiceCallVerb {
         let request = text_arg(args, "request")?;
         let timeout = seconds_arg(args, "timeout_s", service::DEFAULT_CALL_TIMEOUT)?;
         service::check_service_name(service_name).map_err(verb_error)?;
+        let _request_lease = remote_lease(&cerulion_core::transport::service::request_topic(
+            service_name,
+        ))?;
         refuse_under_estop(&self.lease, SERVICE_CALL)?;
         let types = service::resolve_store_service_types(type_arg, schemas_dir().as_deref())
             .map_err(verb_error)?;
@@ -557,6 +569,7 @@ impl VerbHandler for TopicSnapshotVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
+        let _remote_lease = remote_lease(topic)?;
         let timeout = seconds_arg(args, "timeout_s", DEFAULT_READ_TIMEOUT)?;
         let quality = match args.get("quality") {
             None | Some(Value::Null) => snapshot::DEFAULT_JPEG_QUALITY,
@@ -597,6 +610,7 @@ impl VerbHandler for TopicEchoOnceVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
+        let _remote_lease = remote_lease(topic)?;
         let timeout = seconds_arg(args, "timeout_s", DEFAULT_READ_TIMEOUT)?;
         let walker =
             cerulion_msgio::checked_walker(cerulion_msgio::store_schemas(schemas_dir().as_deref()))

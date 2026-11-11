@@ -3,6 +3,7 @@
 Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rules.
 
 ## Invariants
+- Local-only producer exclusions precede data services; every remote tap or mirror holds an opposite egress-scope lease until its data port drops. Never use a local capture tap for remote serving. Admission and refusal counts are cold-path work; no per-frame checks.
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.

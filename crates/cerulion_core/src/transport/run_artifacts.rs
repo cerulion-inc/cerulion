@@ -118,6 +118,19 @@ impl std::fmt::Display for RunArtifactError {
     }
 }
 
+/// Whether a described run permits off-machine metadata observation.
+/// Old descriptors without a network label retain their existing visibility;
+/// every current CLI run stamps the resolved label before registry publication.
+// hot-path-alloc-ok-fn: cold metadata admission, never frame delivery.
+pub fn remote_visible(entry: &RunEntry) -> bool {
+    let manifest: serde_json::Value =
+        serde_json::from_str(&entry.run_json).unwrap_or(serde_json::Value::Null);
+    !matches!(
+        manifest.get("network").and_then(serde_json::Value::as_str),
+        Some("off" | "inert")
+    )
+}
+
 /// Why a gathered `run_dir` was refused before anything under it was opened.
 ///
 /// Deliberately carries NO PATH: the reason travels to the DESK on the wire (as

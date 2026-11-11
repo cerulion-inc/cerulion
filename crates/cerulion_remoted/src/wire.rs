@@ -521,6 +521,10 @@ impl WirePlane {
         topic: &str,
         taps: &mut TapManager,
     ) -> Result<SchemaReply, WireError> {
+        let _scope = self
+            .manager()?
+            .acquire_remote_topic_lease(topic)
+            .map_err(|error| WireError::SchemaSource(error.to_string()))?;
         let Some(source) = &self.local_schemas else {
             return Ok(self.serve_schema(topic));
         };
@@ -957,6 +961,7 @@ async fn build_catalog(
         let per_topic = crate::tap::catalog_peek_budget();
         let rows: Vec<(String, Option<u64>, Option<u32>)> = topics
             .into_iter()
+            .filter(|topic| manager.remote_topic_allowed(topic).unwrap_or(false))
             .map(|topic| {
                 let hash = match known.get(&topic) {
                     Some(h) => Some(*h),

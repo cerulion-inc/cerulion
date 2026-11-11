@@ -25,6 +25,7 @@ Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic 
 - Create verbs (`node|graph|schema create`) complete nothing.
 
 ## Testing
+- `network_gateway_e2e_test` proves run-level local switches and egress exclusion against an independent open gateway and a real TCP peer, with local-delivery and declared-egress controls.
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
   They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field (Rust
   drops fields in declaration order).

@@ -6,6 +6,7 @@ Injected spy tests prove daemon wiring; real network tests prove delivery.
 - Protocol 10 adds paired directory discovery and isolated observer demands. Wire/2 names remain canonical; `/__cerulion/observers/` mirrors are source-qualified, refcounted and released on the last observer. Graph ingress stays canonical.
 
 ## Invariants
+- A remote demand cannot widen producer policy: the embedded gateway and permissive probe consult mandatory SHM egress scope, and taps retain remote leases. Local-only topics and produced topics omitted by an enabled egress block remain unavailable even under open LAN access.
 - One daemon per machine: an `flock`-held pidfile (`cerulion_hygiene::NETD`); the
   kernel drops the lock on death. Never add a second lock scheme. Android: abstract
   socket, same-UID peers only.

@@ -71,28 +71,11 @@
 //!   remains on the shared gateway until netd's idle self-exit drops the whole
 //!   session. Any topic announce token declared while LAN access was open also
 //!   lingers until then. Physical retraction is not implemented.
-//! - **Per-client / per-computer egress SCOPING (the AllowAll exposure).** The
-//!   embedded gateway boots PERMISSIVE (`AllowAll`), which installs a permissive SHM
-//!   probe. That probe serves a remote demand-by-name for ANY live local SHM topic
-//!   (except one the shared manager has registered as ingress — the loop exclusion),
-//!   NOT only the topics a plan registered. So a LAN peer can demand a live
-//!   local topic that NO graph pushed an egress plan for. That
-//!   is exactly the permissive-desk default (`graph run` with no
-//!   `network:` block already exposes every produced topic) — but per-graph
-//!   isolation (graph A's demand must not reach graph B's topic) is NOT provided.
-//!   Constraining the embedded gateway to the union of plan-registered topics is
-//!   STRUCTURALLY INFEASIBLE in the current [`GatewayRuntime`] without a multi-part
-//!   core change: (a) an empty-boot `AllowList` gateway starts NO demand surface
-//!   (the gateway's `!egress_flags.is_empty() || permissive` gate), so runtime
-//!   registrations would never become demandable; (b) `register_runtime_topic` adds
-//!   the bridge FLAG + announce but does NOT add the topic to the egress allow-list,
-//!   so a runtime topic under `AllowList` would not egress; and (c) the permissive
-//!   probe (the only path that serves an unregistered live topic) exists only under
-//!   `AllowAll`. Closing this needs a GatewayRuntime boot-gate + probe inclusion-set
-//!   change. The **account-scoped pairing gate** bounds it from the other side (the
-//!   LAN plane trends to existence-beacon-only and topic DATA rides the paired
-//!   identity plane — so a remote demand is account-gated before any topic, scoped or
-//!   not, is served). The exposure is the documented desk default, chosen by design.
+//! - **Producer scope.** The shared gateway's permissive probe can discover a
+//!   live local topic outside its registration set, but mandatory SHM producer
+//!   exclusion refuses a local-only run and a topic omitted by its enabled
+//!   egress block before any remote tap opens. Peer authorization is an additional
+//!   gate; replacing it cannot widen the producing run's policy.
 //! - **The CLI push side** (`graph run` registering its plan, and its per-run
 //!   gateway fallback) lives in `cerulion_cli_engine`, not here.
 

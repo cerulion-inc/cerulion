@@ -11,6 +11,7 @@ wireclient, connectd, cerud, accountd and cerulion-wire.
   Ops/RCP admissions, the e-stop latch and owed delivery retain the native shared
   fence. Netd's exclusive fence prevents new work racing idle stop; never unlink
   the file. Shutdown participants still run on explicit SIGTERM while holds exist.
+- Remote catalog/schema/demand and topic act verbs enforce producer egress scope before a data port opens. Remote taps and mirror injectors retain admission until after their data port drops; capability grants cannot override a local-only run. Safety operations remain independent.
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
   to capability table in `authorizer.rs` is the sacred security surface. An
   unclassified verb is DENIED (`authorizer_matrix_test.rs` pins every cell).
