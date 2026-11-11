@@ -1455,6 +1455,7 @@ dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "codegen_fixture_msgs",
  "dirs",
@@ -1632,6 +1633,14 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "zenoh",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "stabby",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
