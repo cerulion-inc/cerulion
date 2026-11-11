@@ -4,7 +4,7 @@
 /// CLI engine errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error("graph ingress producer identity changed during reconnect; restart the graph to select it explicitly")]
+    #[error("graph ingress producer identity changed during reconnect; restart the graph to resolve the source again")]
     GraphIngressSourceChanged,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

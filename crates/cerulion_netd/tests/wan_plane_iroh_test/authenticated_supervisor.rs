@@ -326,3 +326,91 @@ fn paired_supervisor_delivers_remote_oracle_payload_and_releases_canonical_ingre
     daemon.shutdown();
     robot.kill();
 }
+
+#[test]
+fn pairing_only_ros2_attachment_passes_local_serving_authority() {
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let workspace = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::create_dir(workspace.path().join("graphs")).unwrap();
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[workspace]\nmembers = []\n",
+    )
+    .unwrap();
+    let state = home.path().join("robot-state/remoted");
+    std::fs::create_dir_all(&state).unwrap();
+    let seed = [0x45; 32];
+    let mac = b"paired-cli-authority-integrity-key";
+    let identity = DeviceIdentity::from_seed(&seed).public_key();
+    std::fs::write(state.join("device_key"), seed).unwrap();
+    std::fs::write(state.join("trust_store.mac_key"), mac).unwrap();
+    let mut trust = TrustStore::provision(
+        RobotId([0x46; 32]),
+        identity,
+        RootSet::new(vec![DeviceIdentity::from_seed(&[0x47; 32]).public_key()], 1).unwrap(),
+        CHASSIS,
+        T_NOW,
+    )
+    .unwrap()
+    .with_path(state.join("trust_store"));
+    trust
+        .claim(OWNER, CHASSIS, PrincipalKind::Human, T_NOW)
+        .unwrap();
+    trust.save(mac).unwrap();
+    let mut index = DeviceAccountIndex::new().with_path(state.join("device_index.json"));
+    index.bind(DeviceIdentity::from_seed(&[0x48; 32]).public_key(), OWNER);
+    index.save(mac).unwrap();
+    assert!(!home.path().join("auth.json").exists());
+    let executable = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("cerulion{}", std::env::consts::EXE_SUFFIX));
+    let stdout_path = workspace.path().join("attach.stdout");
+    let stderr_path = workspace.path().join("attach.stderr");
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "ros2",
+            "attach",
+            "--iface",
+            "127.0.0.1",
+            "--domain",
+            "211",
+            "--timeout",
+            "0.02",
+            "--yes",
+        ])
+        .current_dir(workspace.path())
+        .env("CERULION_HOME", home.path())
+        .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:9")
+        .env("CERULION_TELEMETRY", "off")
+        .env("RUST_LOG", "cerulion_cli_engine=info")
+        .env_remove("CERULION_LOGIN_GATE")
+        .env_remove("CERULION_NETWORK")
+        .env_remove("CERULION_NETD_NETWORK")
+        .env_remove("CERULION_LAN_ACCESS")
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
+    let mut child = GraphChild::spawn(&mut command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.poll().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "ROS 2 authority check did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(
+        stderr.contains("ros2 attach: starting DDS discovery"),
+        "pairing must pass both CLI serving gates: {stderr}"
+    );
+    assert!(
+        !home.path().join("auth.json").exists(),
+        "the gate never enrolls"
+    );
+}

@@ -9,6 +9,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
 - Never gate `Completions`, `Clean` or the `doctor` family behind `command_needs_identity` -
   a shell rc file and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
+- Serving, including ROS 2 attach, uses netd require_serving_authority.
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.
@@ -49,9 +50,9 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
 - Signal tests assert exit code EXACTLY 0 (a signal kill is `code()==None`). Gateway-teardown
   tests also need the gateway's shutdown log line: a reap alone passes kill-on-drop too.
 - `mp_support::ChildGuard` has NO public field: `spawn_group_leader` if the child owns a
-  subtree (workers, gateway, ros2 entry), else `single_process`; reap/poll via its METHODS
-  (`wait_bounded`, `try_wait_noting`) so it notes live workers first, and it never caches an
-  EMPTY note, so a poll at t=0 cannot freeze the verdict. `Drop` only REPORTS a leak; arms
-  that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk checks constructors and bare reaps; await GO (`deployment live`) before a kill, else ABORT path.
+  subtree, else `single_process`; reap/poll via `wait_bounded`/`try_wait_noting` to note live
+  workers; never cache an empty note from t=0. `Drop` only reports leaks: assertions call
+  `#[must_use]` `finish().assert_clean()`. The walk checks constructors/bare reaps; await GO
+  (`deployment live`) before a kill, else ABORT path.
 
 Reference: docs/internals/cli.md (contracts, completion, verb families, test maps).

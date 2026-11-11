@@ -2524,7 +2524,9 @@ fn run(cli: Cli) -> CliResult<()> {
                 // The live ros2-client/rustdds backend is wired HERE (the
                 // composition root); the engine stays DDS-free over the seam.
                 if !opts.dry_run && !graph_cmd::remote_network_suppressed() {
-                    login_cmd::require_serving_login()?;
+                    login_cmd::require_serving_authority().map_err(|reason| {
+                        cerulion_cli_engine::error::CliError::Login(reason.into())
+                    })?;
                 }
                 let discovery = cerulion_dds::LiveDiscovery;
                 // Compose the production schema-acquisition

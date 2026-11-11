@@ -95,12 +95,12 @@ pub struct StreamPreamble {
     pub topic: String,
 }
 
-/// A control-stream request (desk → robot), length-prefixed JSON. The `verb` tag
-/// dispatches; each verb is answered with a [`WireResponse`].
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A control-stream request (desk → robot), length-prefixed JSON. The `verb` tag
+/// dispatches; each verb is answered with a [`WireResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum WireRequest {
