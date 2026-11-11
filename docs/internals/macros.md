@@ -208,8 +208,10 @@ Stable instances hold copied host callbacks and integer port/lease identities.
 The host retains transport, clocks, queues and sessions. Local schema writers
 publish only after the common success gate arms them. An adaptive spill is an
 explicit synchronous payload copy; the original lease stays live until the
-writer drops, then receives `SPILL_RELEASE`. Input views keep their host lease
-until their readers drop. State sinks borrow chunks synchronously; accumulator
+writer drops, then receives `SPILL_RELEASE`. Ordinary receive leases stay outside
+the callback view until the callback returns, so copied fixed readers remain
+valid after an early view drop. Accumulator views borrow the host's frozen fire
+batch. State sinks borrow chunks synchronously; accumulator
 records use the same canonical encoding as native state.
 
 `src/codegen.rs` emits the cdylib entry points (behind the `cdylib` feature). The

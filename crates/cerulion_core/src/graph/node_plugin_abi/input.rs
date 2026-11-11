@@ -22,10 +22,10 @@ impl ReadLease {
         Self { client, slot }
     }
 
-    pub(super) fn view<'a, T: ShmMessage + 'a>(
-        self,
+    fn native_view<'a, T: ShmMessage + 'a>(
+        &self,
         topic: &str,
-    ) -> TransportResult<InputView<'a, T>> {
+    ) -> TransportResult<NativeInputView<'a, T>> {
         if self.slot.alignment < crate::shm_runtime::FRAME_ALIGN as u32 {
             return Err(TransportError::Deserialization {
                 topic: "node input".into(),
@@ -41,9 +41,9 @@ impl ReadLease {
         }
         // ScheduledBytes owns only a local byte borrow, never a host sample.
         // The same constructor and validators serve the native receive path.
-        // SAFETY (U08): this immutable descriptor remains leased by the guard
-        // moved into the returned view. The native reader is destroyed before
-        // the guard; the view is !Send and cannot outlive the port borrow.
+        // SAFETY (U08): the caller keeps the guard live through the callback,
+        // or borrows a host batch frozen for the entire fire. Native accessor
+        // borrows cannot outlive that scope; no sample owner crosses C.
         let raw = unsafe {
             bytes::read(
                 self.slot.data,
@@ -52,15 +52,35 @@ impl ReadLease {
             )
         }
         .map_err(|error| super::span_error(topic, error))?;
-        let view = NativeInputView::from_borrowed(topic, raw)?;
-        Ok(InputView { view, _lease: self })
+        NativeInputView::from_borrowed(topic, raw)
+    }
+
+    fn view<'a, T: ShmMessage + 'a>(&'a self, topic: &str) -> TransportResult<InputView<'a, T>> {
+        Ok(InputView {
+            view: self.native_view::<T>(topic)?,
+            _lease: None,
+        })
+    }
+
+    fn batch_view<'a, T: ShmMessage + 'a>(
+        self,
+        topic: &'a str,
+    ) -> TransportResult<InputView<'a, T>> {
+        // Accumulated frames belong to the host's frozen fire batch, just as
+        // native Accumulated::iter borrows AccumulateBuffer. The borrowed
+        // accumulator topic ties 'a to this fire; releasing an indexed lease
+        // never mutates or clears that frozen batch during the node call.
+        Ok(InputView {
+            view: self.native_view::<T>(topic)?,
+            _lease: Some(self),
+        })
     }
 }
 
 /// A node-local typed reader and the integer lease keeping its backing live.
 pub struct InputView<'sample, T: ShmMessage + 'sample> {
     view: NativeInputView<'sample, T>,
-    _lease: ReadLease,
+    _lease: Option<ReadLease>,
 }
 
 impl<T: ShmMessage> InputView<'_, T> {
@@ -96,6 +116,9 @@ impl AnySubscriber {
         };
         let lease = ReadLease::new(HostClient::share(&self.client), slot);
         let view = lease.view::<T>(self.topic())?;
+        // Keep the owner OUTSIDE the callback's view. Fixed readers are copyable
+        // references: dropping a view early must not release bytes still read
+        // inside that callback. This matches native try_view's sample owner.
         Ok(Some(callback(view)))
     }
 }
@@ -152,7 +175,9 @@ impl<'a, T: ShmMessage + 'a> Accumulated<'a, T> {
             let client = client.as_ref()?;
             let result = client
                 .accumulate_frame(port, index as u32)
-                .and_then(|slot| ReadLease::new(HostClient::share(client), slot).view::<T>(topic));
+                .and_then(|slot| {
+                    ReadLease::new(HostClient::share(client), slot).batch_view::<T>(topic)
+                });
             match result {
                 Ok(view) => Some(view),
                 Err(error) => {
