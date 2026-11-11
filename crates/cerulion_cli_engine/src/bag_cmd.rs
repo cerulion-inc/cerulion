@@ -8384,6 +8384,7 @@ mod state_rings_section {
     #[test]
     fn the_state_rings_key_round_trips_between_the_writer_and_the_reader() {
         let run = cerulion_core::transport::run_registry::RunRecord {
+            remote_visible: true,
             run_id: 0x1234,
             supervisor_pid: 7,
             run_started_at_ns: 1,
@@ -12029,6 +12030,7 @@ mod run_attach {
 
     fn rec(id: u128, graph: &str, pid: u32) -> RunRecord {
         RunRecord {
+            remote_visible: true,
             run_id: id,
             supervisor_pid: pid,
             run_started_at_ns: 1_753_000_000_000_000_000,

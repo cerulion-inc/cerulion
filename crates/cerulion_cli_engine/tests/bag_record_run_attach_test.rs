@@ -218,6 +218,7 @@ fn publish_run_with_state_consumer(
     let handle = RunHandle::publish_on_config(
         config,
         RunRecord {
+            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             run_started_at_ns: nanos() as u64,

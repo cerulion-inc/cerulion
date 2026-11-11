@@ -1837,7 +1837,7 @@ impl PermissiveShmProbe {
         //    next demand once a slot frees). The probe subscriber is DROPPED
         //    immediately (existence check only; the drive loop attaches the real
         //    egress tap).
-        match manager.create_data_only_subscriber(&canonical) {
+        match manager.create_remote_data_only_subscriber(&canonical) {
             Ok(_probe_sub) => {
                 drop(_probe_sub);
                 // Register + announce = register_runtime_topic semantics (the
@@ -1981,7 +1981,7 @@ fn handle_query(
             handle_catalog_verb(query, bridge_mgr, robot, catalog, authorizer)
         }
         Some(QueryVerb::Schema { requested }) => {
-            handle_schema_verb(query, robot, schema, &requested, authorizer)
+            handle_schema_verb(query, robot, schema, &requested, authorizer, catalog)
         }
         Some(QueryVerb::Runs) => handle_runs_verb(query, robot, runs, authorizer),
         None => {
@@ -2173,7 +2173,16 @@ fn catalog_serve_decision(
         return cerulion_q::CatalogReply::refused(robot, reason);
     }
     note_lan_authorized(authorizer, "catalog GET", CATALOG_QUERY_RESOURCE);
-    build_catalog_reply_from_bridge(bridge_mgr, catalog, robot)
+    let mut reply = build_catalog_reply_from_bridge(bridge_mgr, catalog, robot);
+    if let Some(probe) = &catalog.producer_probe {
+        let Some(manager) = probe.upgrade() else {
+            return cerulion_q::CatalogReply::refused(robot, "producer policy is unavailable");
+        };
+        reply
+            .entries
+            .retain(|entry| manager.remote_topic_allowed(&entry.topic).unwrap_or(false));
+    }
+    reply
 }
 
 /// The `schema` verb - reply with the `.msg`/YAML TEXT of the
@@ -2195,8 +2204,9 @@ fn handle_schema_verb(
     schema: &SchemaSource,
     requested: &str,
     authorizer: &dyn DemandAuthorizer,
+    catalog: &CatalogSource,
 ) {
-    let reply = schema_serve_decision(schema, authorizer, robot, requested);
+    let reply = schema_serve_decision(schema, authorizer, robot, requested, Some(catalog));
     let served = reply.docs.len();
     let bytes = cerulion_q::encode_schema_reply(&reply);
     let reply_key = cerulion_q::schema_selector(robot, requested);
@@ -2227,6 +2237,7 @@ fn schema_serve_decision(
     authorizer: &dyn DemandAuthorizer,
     robot: &str,
     requested: &str,
+    catalog: Option<&CatalogSource>,
 ) -> cerulion_q::SchemaReply {
     if let DemandDecision::Deny { reason } =
         authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, requested)
@@ -2234,6 +2245,19 @@ fn schema_serve_decision(
         log_lan_refusal(authorizer, "schema GET", requested, &reason);
         return cerulion_q::SchemaReply::refused(robot, requested, reason);
     }
+    let producer_scope = match catalog.and_then(|catalog| catalog.producer_probe.as_ref()) {
+        Some(probe) => match probe.upgrade() {
+            Some(manager) => Some(manager),
+            None => {
+                return cerulion_q::SchemaReply::refused(
+                    robot,
+                    requested,
+                    "producer policy is unavailable",
+                );
+            }
+        },
+        None => None,
+    };
     note_lan_authorized(authorizer, "schema GET", requested);
     // Held for the WHOLE decision: `replace` swaps `docs` under this lock,
     // so a schema GET never mixes the old and new maps mid-closure.
@@ -2247,6 +2271,42 @@ fn schema_serve_decision(
         .docs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((catalog, manager)) = catalog.zip(producer_scope.as_ref()) {
+        let mut bindings: Vec<_> = catalog
+            .topic_schemas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(topic, root)| (topic.clone(), root.clone()))
+            .collect();
+        let hashes = catalog
+            .hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = catalog
+            .hash_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bindings.extend(
+            hashes.iter().filter_map(|(topic, hash)| {
+                names.get(hash).map(|root| (topic.clone(), root.clone()))
+            }),
+        );
+        bindings.sort();
+        bindings.dedup();
+        let visible = bindings.iter().any(|(topic, root)| {
+            manager.remote_topic_allowed(topic).unwrap_or(false)
+                && (root == requested
+                    || cerulion_q::collect_schema_closure(root, &docs).is_some_and(|closure| {
+                        closure.iter().any(|doc| doc.qualified == requested)
+                    }))
+        });
+        if !visible {
+            let reason = "no remotely visible producing topic declares this schema";
+            log_lan_refusal(authorizer, "schema GET", requested, reason);
+            return cerulion_q::SchemaReply::refused(robot, requested, reason);
+        }
+    }
     match cerulion_q::collect_schema_closure(requested, &docs) {
         Some(docs) => cerulion_q::SchemaReply::found(robot, requested, docs),
         None => cerulion_q::SchemaReply::not_found(
@@ -2314,13 +2374,10 @@ fn handle_runs_verb(
 ///    hosted runs are still served: they come from this process's memory, not
 ///    from the registry that failed.
 /// 3. **Gathered** - whatever the registry established plus the hosted runs,
-///    with the gather's OWN completeness verdict carried through unchanged. That
-///    passthrough is the whole reason [`cerulion_q::RunsCompleteness`] exists: a
+///    with a settled verdict or a non-claim without machine-wide writer counts. A
 ///    windowed LISTEN that expired with live writers unheard produces the SAME
 ///    empty list a genuinely idle machine produces, and only the verdict tells
-///    them apart (the same lesson the discovery marker and the checked mirror
-///    gather taught). A served hosted run does not change the verdict: the host
-///    knows it exactly.
+///    them apart. Unknown writers may be private, so their counts stay local.
 ///
 /// Runs whose directory could not be read are SKIPPED with a named reason (see
 /// [`run_artifacts::collect_run_entries`]) rather than served as entries carrying
@@ -2343,7 +2400,7 @@ fn runs_serve_decision(
     note_lan_authorized(authorizer, "runs GET", RUNS_QUERY_RESOURCE);
     let gathered = match run_registry::gather_runs_on_config(&runs.iox_config, runs.gather_window) {
         Ok(gather) => {
-            let fold = run_artifacts::collect_run_entries(&gather.records);
+            let fold = run_artifacts::collect_remote_run_entries(&gather.records);
             for skip in &fold.skipped {
                 tracing::warn!(
                     robot = %robot,
@@ -2355,7 +2412,15 @@ fn runs_serve_decision(
                      with no nodes"
                 );
             }
-            Some((fold, gather.completeness.into()))
+            // Unknown writers may be private. Preserve the non-claim without
+            // disclosing machine-wide writer counts to the remote reader.
+            let completeness: cerulion_q::RunsCompleteness = gather.completeness.into();
+            let completeness = if completeness.is_settled() {
+                completeness
+            } else {
+                cerulion_q::RunsCompleteness::not_established()
+            };
+            Some((fold, completeness))
         }
         Err(e) => {
             tracing::warn!(
@@ -2400,8 +2465,11 @@ fn assemble_runs_reply(
             cerulion_q::RunsCompleteness::not_established(),
         ),
     };
-    let entries: Vec<cerulion_q::RunEntry> =
-        gathered_entries.into_iter().chain(hosted.entries).collect();
+    let entries: Vec<cerulion_q::RunEntry> = gathered_entries
+        .into_iter()
+        .chain(hosted.entries)
+        .filter(run_artifacts::remote_visible)
+        .collect();
     // hot-path-alloc-ok: cold, one set of run ids per remote runs GET on the
     // control plane.
     let mut named: BTreeSet<String> = entries.iter().map(|e| e.run_id.clone()).collect();
@@ -2892,7 +2960,7 @@ pub(crate) fn schema_serve_decision_for_test(
     robot: &str,
     requested: &str,
 ) -> cerulion_q::SchemaReply {
-    schema_serve_decision(schema, authorizer, robot, requested)
+    schema_serve_decision(schema, authorizer, robot, requested, None)
 }
 
 /// SYNC SEAM (runs verb): run the EXACT runs-serve DECISION
@@ -3373,8 +3441,9 @@ pub struct IngressInjector {
     /// held only by an injector from
     /// [`TransportManager::create_ingress_injector_with`].
     data_service: Option<super::DataServiceFactory>,
-    // Dropped LAST: remote identity must outlive the injection publisher.
+    // Identity and remote admission both outlive the injection publisher.
     _origin: Option<super::mirror_origin::MirrorOrigin>,
+    remote_lease: Option<super::egress_scope::RemoteTopicLease>,
 }
 
 impl IngressInjector {
@@ -3407,7 +3476,16 @@ impl IngressInjector {
             warn: IngressWarnLatch::default(),
             data_service: None,
             _origin: origin,
+            remote_lease: None,
         }
+    }
+
+    pub(crate) fn with_remote_lease(
+        mut self,
+        lease: super::egress_scope::RemoteTopicLease,
+    ) -> Self {
+        self.remote_lease = Some(lease);
+        self
     }
 
     /// This injector holding `data_service`, the topic's data service, for
@@ -3618,6 +3696,19 @@ struct IngressHandles {
     _subscriber: Option<zenoh::pubsub::Subscriber<()>>,
 }
 
+struct DemandAuthorization {
+    access: LanAccess,
+    inner: Arc<dyn DemandAuthorizer>,
+    scope: Option<Weak<TransportManager>>,
+}
+
+// Announced names are remote metadata too. Withdraw the token before releasing
+// producer admission, so a private successor cannot inherit a stale announce.
+struct ScopedTopicAnnouncement {
+    _token: TopicToken,
+    _scope: Option<super::egress_scope::RemoteTopicLease>,
+}
+
 /// Manages the zenoh session and background network task lifecycle.
 ///
 /// The session is lazily created on first call to [`session()`](Self::session).
@@ -3665,7 +3756,7 @@ pub struct NetworkManager {
     /// (idempotent - a re-announce is a no-op, never a duplicate token);
     /// observable via [`Self::announced_topics`]. Dropping a token undeclares
     /// it (the topic goes off the network listing).
-    announced: Mutex<HashMap<String, TopicToken>>,
+    announced: Mutex<HashMap<String, ScopedTopicAnnouncement>>,
     /// The retained BARE identity announce token
     /// (`cerulion_ann/{robot}` - robot presence with no topic suffix). At most
     /// ONE per gateway process; declared via [`Self::announce_gateway_identity`]
@@ -3815,7 +3906,7 @@ pub struct NetworkManager {
     ingress_demand_state: Arc<DemandGetState>,
     /// The LAN posture and caller-installed inner demand authorizer, kept apart
     /// so replacing the inner authorizer cannot remove the posture.
-    demand_authorizer_parts: Mutex<(LanAccess, Arc<dyn DemandAuthorizer>)>,
+    demand_authorizer_parts: Mutex<DemandAuthorization>,
     /// The bridge manager driven by LAN demand paths, recorded when a demand path
     /// starts so a posture change can revoke its egress.
     /// Lock order: parts -> slot (drop slot), or parts -> gate -> bridges; no
@@ -3893,7 +3984,11 @@ impl NetworkManager {
             after_demand_authorizer_read: Arc::new(Mutex::new(None)),
             permissive_probe: Mutex::new(None),
             ingress_demand_state: Arc::new(DemandGetState::default()),
-            demand_authorizer_parts: Mutex::new((lan_access, Arc::clone(&inner_authorizer))),
+            demand_authorizer_parts: Mutex::new(DemandAuthorization {
+                access: lan_access,
+                inner: Arc::clone(&inner_authorizer),
+                scope: None,
+            }),
             lan_bridges: Mutex::new(None),
             demand_authorizer: Arc::new(Mutex::new(Arc::new(LanAccessAuthorizer::new(
                 lan_access,
@@ -3925,7 +4020,7 @@ impl NetworkManager {
             .lan_bridges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(bridges));
-        if let Err(e) = bridges.set_lan_closed(parts.0 == LanAccess::Paired) {
+        if let Err(e) = bridges.set_lan_closed(parts.access == LanAccess::Paired) {
             tracing::warn!(error = %e, "failed to apply LAN posture to bridge manager");
         }
     }
@@ -3940,13 +4035,31 @@ impl NetworkManager {
             .demand_authorizer_parts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        parts.1 = authorizer;
-        let live = Arc::new(LanAccessAuthorizer::new(parts.0, Arc::clone(&parts.1)));
+        parts.inner = authorizer;
+        let live = Arc::new(
+            LanAccessAuthorizer::new(parts.access, Arc::clone(&parts.inner))
+                .with_run_scope(parts.scope.clone()),
+        );
         let mut slot = self
             .demand_authorizer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = live;
+    }
+
+    /// Mandatory producer scope stays in front of replaceable peer authorization.
+    pub(crate) fn set_run_scope(&self, scope: Weak<TransportManager>) {
+        let mut parts = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parts.scope = Some(scope);
+        let live = LanAccessAuthorizer::new(parts.access, Arc::clone(&parts.inner))
+            .with_run_scope(parts.scope.clone());
+        *self
+            .demand_authorizer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(live);
     }
 
     /// Set the LAN posture applied in front of the installed demand authorizer.
@@ -4024,10 +4137,13 @@ impl NetworkManager {
                 .demand_authorizer_parts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            parts.0 = access;
+            parts.access = access;
             self.lan_paired
                 .store(access == LanAccess::Paired, Ordering::SeqCst);
-            let live = Arc::new(LanAccessAuthorizer::new(access, Arc::clone(&parts.1)));
+            let live = Arc::new(
+                LanAccessAuthorizer::new(access, Arc::clone(&parts.inner))
+                    .with_run_scope(parts.scope.clone()),
+            );
             {
                 let mut slot = self
                     .demand_authorizer
@@ -4083,7 +4199,7 @@ impl NetworkManager {
         self.demand_authorizer_parts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0
+            .access
     }
 
     /// TEST SEAM: the current authorizer, read the SAME way the demand
@@ -4448,15 +4564,27 @@ impl NetworkManager {
         local_publisher: CerulionPublisher,
         origin: Option<super::mirror_origin::MirrorOrigin>,
     ) -> TransportResult<()> {
-        // Bundle before every fallible check: data publisher drops before its
-        // origin even on invalid names, duplicate registration or session failure.
+        self.register_ingress_with_scope(topic, expected_schema_hash, local_publisher, origin, None)
+    }
+
+    pub(crate) fn register_ingress_with_scope(
+        &self,
+        topic: &str,
+        expected_schema_hash: u64,
+        local_publisher: CerulionPublisher,
+        origin: Option<super::mirror_origin::MirrorOrigin>,
+        lease: Option<super::egress_scope::RemoteTopicLease>,
+    ) -> TransportResult<()> {
+        // Bundle before every fallible check: data ports drop before their leases.
         let canonical = canonical_topic(topic).into_owned();
-        let injector = Arc::new(IngressInjector::new_with_origin(
+        let mut injector = IngressInjector::new_with_origin(
             canonical.clone(),
             expected_schema_hash,
             local_publisher,
             origin,
-        ));
+        );
+        injector.remote_lease = lease;
+        let injector = Arc::new(injector);
         // Empty name would canonicalize to "/" - a bridge keyed by a malformed
         // name no data key can ever match (crib the bridge-registration guard).
         if topic.is_empty() {
@@ -4954,8 +5082,26 @@ impl NetworkManager {
             }
         }
 
+        let producer_scope = self
+            .demand_authorizer_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scope
+            .clone();
+        let scope = producer_scope
+            .map(|weak| {
+                weak.upgrade()
+                    .ok_or_else(|| TransportError::Internal {
+                        reason: "producer policy is unavailable".into(),
+                    })?
+                    .acquire_remote_topic_lease(&canonical)
+            })
+            .transpose()?;
         let session = self.session()?;
-        let token = TopicToken::announce(session, &robot, &canonical)?;
+        let token = ScopedTopicAnnouncement {
+            _token: TopicToken::announce(session, &robot, &canonical)?,
+            _scope: scope,
+        };
 
         let mut announced = self
             .announced
@@ -5093,7 +5239,7 @@ impl NetworkManager {
             .iter()
             .map(|topic| canonical_topic(topic).into_owned())
             .collect();
-        let withdrawn: Vec<TopicToken> = {
+        let withdrawn: Vec<ScopedTopicAnnouncement> = {
             let mut announced = self
                 .announced
                 .lock()
@@ -8097,6 +8243,47 @@ mod hosted_runs_serve_tests {
     const GATHERED_YAML: &str = "# gathered\nname: perception\nprefix: /percep\n";
     const GATHERED_JSON: &str = "{\"version\":1,\"graph_name\":\"perception\"}\n";
 
+    #[test]
+    fn remote_run_lists_hide_local_only_and_inert_runs_without_hiding_networked_runs() {
+        let entries = ["off", "inert", "strict", "permissive"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, posture)| {
+                RunEntry::new(
+                    index as u128 + 1,
+                    "run",
+                    1,
+                    RunState::Live,
+                    GRAPH_YAML,
+                    format!("{{\"network\":\"{posture}\"}}"),
+                )
+                .unwrap()
+            })
+            .collect();
+        let reply = assemble_runs_reply(
+            ROBOT,
+            Some((
+                RunFold {
+                    entries,
+                    skipped: vec![],
+                },
+                RunsCompleteness::Settled,
+            )),
+            HostedServe::default(),
+        );
+        assert_eq!(
+            reply
+                .runs
+                .iter()
+                .map(|entry| entry.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "0x00000000000000000000000000000003",
+                "0x00000000000000000000000000000004"
+            ]
+        );
+    }
+
     struct DenyAll;
     impl DemandAuthorizer for DenyAll {
         fn authorize_demand(&self, _subject: &DemandSubject, resource: &str) -> DemandDecision {
@@ -8321,6 +8508,7 @@ mod hosted_runs_serve_tests {
         let _writer = RunHandle::publish_on_config(
             &namespace,
             RunRecord {
+                remote_visible: true,
                 run_id: 0x77,
                 supervisor_pid: std::process::id(),
                 run_started_at_ns: 1,
@@ -8522,6 +8710,7 @@ mod hosted_runs_serve_tests {
         let _writer = RunHandle::publish_on_config(
             &namespace,
             RunRecord {
+                remote_visible: true,
                 run_id: RUN,
                 supervisor_pid: std::process::id(),
                 run_started_at_ns: 1,
@@ -8651,6 +8840,7 @@ mod hosted_runs_serve_tests {
         let _writer = RunHandle::publish_on_config(
             &namespace,
             RunRecord {
+                remote_visible: true,
                 run_id: RUN,
                 supervisor_pid: std::process::id(),
                 run_started_at_ns: 20,

@@ -58,6 +58,7 @@ const TEST_GRACE: Duration = Duration::from_millis(1_500);
 /// A hand-built run record.
 fn run_record(run_id: u128, graph: &str) -> RunRecord {
     RunRecord {
+        remote_visible: true,
         run_id,
         supervisor_pid: std::process::id(),
         run_started_at_ns: 1_753_000_000_000_000_000,

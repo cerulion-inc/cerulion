@@ -885,6 +885,8 @@ pub struct DataOnlySubscriber {
     /// `dead_code = deny` satisfied without an `allow`.
     #[cfg(any(test, feature = "test-helpers"))]
     fault_inject_receive_after: Option<u32>,
+    // After the data port: a remote tap retains policy through port teardown.
+    remote_lease: Option<super::egress_scope::RemoteTopicLease>,
 }
 
 impl DataOnlySubscriber {
@@ -908,9 +910,14 @@ impl DataOnlySubscriber {
             subscriber,
             max_borrowed_samples,
             data_service,
+            remote_lease: None,
             #[cfg(any(test, feature = "test-helpers"))]
             fault_inject_receive_after: None,
         }
+    }
+
+    pub(crate) fn hold_remote_lease(&mut self, lease: super::egress_scope::RemoteTopicLease) {
+        self.remote_lease = Some(lease);
     }
 
     /// The receive-queue depth this tap was ACTUALLY created

@@ -494,6 +494,8 @@ pub struct RawIngressRoute {
     sequence: u32,
     published_total: u64,
     decode_failures_total: u64,
+    // Drop after the publisher, even if a pump outlives the graph supervisor.
+    _local_scope: Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
 }
 
 impl RawIngressRoute {
@@ -514,6 +516,13 @@ impl RawIngressRoute {
                 ros_type: ros_type.to_string(),
             });
         }
+        let local_scope = transport
+            .retain_local_topic_scope(cerulion_topic)
+            .map_err(|source| RawRouteError::PublisherCreate {
+                ros_type: ros_type.to_string(),
+                cerulion_topic: cerulion_topic.to_string(),
+                source: Box::new(source),
+            })?;
         let publisher = transport
             .create_ingress_publisher(cerulion_topic, max_slice_len)
             .map_err(|source| RawRouteError::PublisherCreate {
@@ -546,7 +555,10 @@ impl RawIngressRoute {
         // before any egress flag could exist for this topic (and that flag
         // lives in the GATEWAY process's bridge manager anyway, which this
         // worker-side check never reads).
-        match codec.schema_hash(ros_type) {
+        match codec
+            .schema_hash(ros_type)
+            .filter(|_| local_scope.is_none())
+        {
             Some(schema_hash) => {
                 match transport.register_dynamic_egress_topic(cerulion_topic, schema_hash) {
                     Ok(_) => {}
@@ -594,6 +606,7 @@ impl RawIngressRoute {
                     }
                 }
             }
+            None if local_scope.is_some() => {}
             None => {
                 // Unreachable in practice: `codec.knows(ros_type)` gated above,
                 // and every known layout carries a hash. Guarded loudly anyway —
@@ -613,6 +626,7 @@ impl RawIngressRoute {
             sequence: 0,
             published_total: 0,
             decode_failures_total: 0,
+            _local_scope: local_scope,
         })
     }
 

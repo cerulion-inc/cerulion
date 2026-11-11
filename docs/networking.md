@@ -28,13 +28,15 @@ default + gateway, the discovery ladder, and pairing.
   (gossip stays on); `CERULION_MULTICAST_SCOUTING=on` turns it back on. One
   loud breadcrumb prints at start:
 
-  > ``network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.``
+  > `LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.`
 
 - **The `network:` block TIGHTENS.** With an explicit enabled block the
   gateway runs STRICT: it announces + egresses exactly the declared `egress`
   allow-list, opens exactly the declared `ingress` bridges, and uses the
   block's locators VERBATIM (no scouting, no bind ladder). The block is
-  how you RESTRICT a robot, not how you enable networking.
+  how you RESTRICT a robot, not how you enable networking. Other Cerulion
+  gateways and remote servers on the same machine also enforce this run's list:
+  a peer naming an omitted produced topic is refused before opening a data tap.
 - **One robot = one network peer.** The gateway is a SEPARATE process that
   owns the entire network plane (one zenoh session per process). The graph/worker processes
   stay network-free: they publish into and read from shared memory only.
@@ -47,7 +49,21 @@ default + gateway, the discovery ladder, and pairing.
   `schema info`; `cerulion connect` and `cerulion-remoted` exit on it too, with
   the parsing differences listed under
   [Environment variables](user-api.md#environment-variables)) runs LOCAL-ONLY:
-  no gateway, no session, loud notice.
+  no gateway, no session, loud notice. Its topics, schemas and run metadata
+  are unavailable off-machine, including through an already running open gateway,
+  remote server or topic mirror. Local observers and recording still work.
+  Published graph recorder status names the full path of its MCAP file.
+  Recorder status follows the same scope. If another run already exports the
+  shared status topic, this recording disables its status publication.
+  Opaque `ros2:` graph children inherit the same run scope, including topics
+  discovered only when the child creates an endpoint. Config-mapped raw DDS
+  outputs obey the run's local-only scope and declared egress too. A separately launched
+  third-party DDS participant has its own transport settings.
+- **Producer policy survives a topic restart.** Remote taps, mirrors and open-LAN
+  announcement names hold admission until withdrawn. If earlier remote serving
+  still holds a topic when a local-only producer starts, startup refuses that
+  topic. Close the demand and withdraw its announcement, or restart the serving
+  daemon before starting the local-only run.
 - **Networked multi-process is FIRST-CLASS.** An enabled block is accepted on a
   multi-process run exactly as on a monolith. The supervisor spawns ONE
   gateway beside the workers; each worker stays network-free.
@@ -140,7 +156,7 @@ resolves to exactly one of these, in evaluation order:
 
 | Condition | Result |
 |---|---|
-| `--local` / `--network off` on graph/node run, **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway, no session; loud kill-switch notice. |
+| `--local` / `--network off` on graph/node run, **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway or session; other daemons cannot expose this run's topics, schemas or run metadata. Local observers and recording still work; loud kill-switch notice. |
 | `--time-source virtual` **or** `external` | Network INERT (replay-class: a zenoh session is a live side effect that would break replay byte-identity). Silent, no gateway. |
 | Enabled `network:` block + `--record` + declared `ingress:` | **Refused**, naming the topics + both workarounds. |
 | Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict** gateway: verbatim locators, egress allow-list, declared ingress. |

@@ -1,17 +1,14 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-The robot-side remote plane (daemon or `RemotePlane`): ONE iroh endpoint per
-robot (the device key's PUBLIC half IS the `EndpointId`, its 32-byte secret also
-seeds the pairing identity) multiplexing `cerulion/wire/2` and `cerulion/ops/1`. It
-also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
-`cerulion_wireclient`, `cerulion_connectd`, `cerud`, `cerulion_accountd` and
-`cerulion-wire`.
+Robot daemon/`RemotePlane`: ONE iroh endpoint, device public key = `EndpointId`,
+32-byte secret seeds pairing; multiplexes `cerulion/wire/2` and `cerulion/ops/1`.
+Also governs `cerulion_{pairing,link,wireclient,connectd,accountd}`, `cerud`,
+and `cerulion-wire`.
 
 ## Invariants
-- Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
-  to capability table in `authorizer.rs` is the sacred security surface. An
-  unclassified verb is DENIED; a new one must be classified there
-  (`authorizer_matrix_test.rs` pins it cell by cell).
+- Catalog/schema/demand/topic acts obey producer scope before ports open; taps/mirrors retain leases after data drops. Capabilities never override privacy; safety ops are independent.
+- Every accept uses `PairingAuthorizer`; `authorizer.rs` maps verbs to capabilities.
+  Unclassified verbs are DENIED; classify new ones there (`authorizer_matrix_test.rs`).
 - Bootstrap verbs self-gate on their own proof (chassis secret, cert chain, owner
   grant, CPace witness). The pairing subject is ALWAYS the TLS-authenticated device
   key, never a client arg, and validity, TTL and rollback checks use the robot's
