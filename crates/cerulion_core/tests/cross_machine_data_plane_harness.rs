@@ -225,7 +225,7 @@ fn run_desk(topic: &str, secs: u64) {
     );
     b.network()
         .expect("network fixture")
-        .set_lan_access(LanAccess::Open);
+        .set_lan_access(cerulion_core::LanAccess::Open);
 
     let sub = b.create_subscriber(topic).expect("desk subscriber");
     // HARNESS_HASH (hex, e.g. 0x697ef87e3ead41a1) = the topic's REAL wire
