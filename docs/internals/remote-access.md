@@ -168,7 +168,8 @@ the same entry instead of running the daemon.
   reading the key file (`daemon_wiring_test.rs`).
 - **Desk side, three consumers of the same robot surface**: the
   `cerulion connect` verb (spawns the `cerulion-connectd` sibling binary),
-  `cerulion pair` (spawns `cerulion-connectd pair`), and `cerulion_netd`'s
+  `cerulion-connectd pair` (the code ceremony; the `cerulion pair` verb that
+  spawned it is a hidden stub that refuses, §7), and `cerulion_netd`'s
   embedded iroh WAN plane (the `wan` feature). All three dial the same two
   ALPNs and share one client substrate (§7 to §8).
 
@@ -755,11 +756,19 @@ every slot is taken.
   into a `cerulion-connectd` argv and spawns the sibling binary
   (`connect_cmd.rs`, pure + oracle-tested; `CERULION_CONNECTD_BIN` overrides
   the binary). A positional name resolves via `~/.cerulion/robots.toml`, which
-  `cerulion pair` WRITES on success; a paired robot's name just works.
+  a successful `cerulion-connectd pair` ceremony WRITES (through `pair_cmd`);
+  a pinned robot's name just works.
   connectd's `worker::run_connect` dials, fetches the catalog, demands, and
   spawns one reader per accepted topic; the whole loop is pinned over real
   loopback iroh + real per-test SHM roots by `reinject_e2e_test.rs`.
-- **`cerulion pair <robot>`**: the desk is the CPace initiator over the robot's
+- **`cerulion pair`** is a hidden stub: no robot-side verb arms a pairing code
+  (`SharedCodePairSessions::arm` in `cerulion_remoted::pairing_verbs` has no
+  caller outside tests), so `main` refuses every spelling with
+  `PAIR_UNAVAILABLE_MSG` and exit 2 above the login gate, and records no
+  `pair_completed` event. The ceremony below lives on in
+  `cerulion_cli_engine::pair_cmd` and `cerulion-connectd pair`, which no
+  `cerulion` verb calls.
+- **The code ceremony** (`cerulion-connectd pair`): the desk is the CPace initiator over the robot's
   ops plane (`pair.rs`); a wrong code is detected structurally desk-side and
   mapped to a distinct exit code; stdout carries machine-parseable state lines
   for Studio, everything else goes to stderr. Pinned against a REAL in-process

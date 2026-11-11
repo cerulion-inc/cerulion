@@ -67,8 +67,8 @@ fn call_robot_verb_under(
     let eid = crate::connect_cmd::resolve_eid_with(Some(robot), None, &robots)?;
     let key = crate::connect_cmd::default_connect_key_file()?.ok_or_else(|| {
         VerbError::Usage(format!(
-            "this machine has no paired device key, so robot '{robot}' would refuse it: pair \
-             first with `cerulion pair {robot}`"
+            "this machine has no device key, so robot '{robot}' would refuse it: sign in \
+             first with `cerulion login`, which creates it"
         ))
     })?;
     let bin = crate::connect_cmd::resolve_connectd_bin()?;

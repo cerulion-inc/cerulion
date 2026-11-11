@@ -260,8 +260,7 @@ pub fn resolve_eid_with(
             } else {
                 Err(CliError::Validation(format!(
                     "unknown robot '{pos}': not a 64-char-hex endpoint id and not pinned in \
-                     ~/.cerulion/robots.toml. Pair it first with `cerulion pair {pos}` (which \
-                     pins it), pass `--eid <hex>`, or add a `[robots]` entry \
+                     ~/.cerulion/robots.toml. Pass `--eid <hex>`, or add a `[robots]` entry \
                      (`{pos} = \"<64-hex-eid>\"`)."
                 )))
             }

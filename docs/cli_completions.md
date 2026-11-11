@@ -80,7 +80,7 @@ it: re-run the command after an upgrade or a move.
 | `node delete\|modify\|build\|stage\|run\|info <TAB>` | node types | `nodes/*` in your workspace |
 | `graph run\|validate\|levels\|profile\|partition <TAB>`, `node stage -g <TAB>` | graph names | `graphs/*.yaml` stems |
 | `schema delete\|info <TAB>` | workspace schemas, the `.msg` store, and all 254 built-in ROS 2 types | `schemas/`, `native_ros2_messages` |
-| `viz --robot <TAB>`, `connect <TAB>`, `pair <TAB>` | robot names | `~/.cerulion/robots.toml` (paired) + `~/.cerulion/peers.json` (seen on the LAN) |
+| `viz --robot <TAB>`, `connect <TAB>` | robot names | `~/.cerulion/robots.toml` (pinned) + `~/.cerulion/peers.json` (seen on the LAN) |
 | `bag play\|info\|migrate <TAB>` | `.mcap` bags and directories | the filesystem |
 | `bag play --resim <TAB>` | `all`, the only selection that resolves | a constant |
 | any other path argument | files or directories, as appropriate | the filesystem |
@@ -160,6 +160,6 @@ NAME`.
 workspace. Completion resolves the workspace by walking up from the current
 directory exactly as the real commands do: `cd` into it.
 
-**A robot is missing from `--robot`.** Robot names come from robots you have
-paired (`cerulion pair`) or that were seen on the LAN within the last 7 days.
+**A robot is missing from `--robot`.** Robot names come from robots pinned in
+`~/.cerulion/robots.toml` or seen on the LAN within the last 7 days.
 Run `cerulion topic list` to refresh the peer cache.

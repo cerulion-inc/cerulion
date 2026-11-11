@@ -560,9 +560,8 @@ async fn push_epoch(
                 "cerulion connect: this desk has no pinned name for the robot it dialed, so it \
                  cannot tell WHICH cached revocation epoch is meant — pushing NONE. \
                  The robot's own reported name is deliberately NOT used to pick a cache file (a \
-                 dialed robot must not choose which artifact it is handed). Pair it \
-                 (`cerulion pair <name>`, which pins it) or add a `[robots]` entry to \
-                 ~/.cerulion/robots.toml, then dial it by that name."
+                 dialed robot must not choose which artifact it is handed). Add a `[robots]` \
+                 entry to ~/.cerulion/robots.toml, then dial it by that name."
             );
             return Ok(EpochPushOutcome::UnverifiedRobotIdentity);
         }

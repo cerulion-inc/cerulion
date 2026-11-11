@@ -205,12 +205,15 @@ which is correct: the operator is gone.
 
 ## It never bricks offline
 
+A desk joins a robot's access list by signing in with `cerulion login` to the
+account that owns the robot. Code pairing is not available in this release.
+
 On the LAN, an established pairing reaches the robot with no cloud anywhere in
 the connect path: a direct iroh dial to the robot address you give
 (`--addr ip:port`), with the relay disabled (`--relay-disabled`), and offline
-verification against the durable access list. mDNS supplies the robot's
-endpoint id to `cerulion pair`; it does not supply a dial address, so an
-offline connect needs `--addr`. Established pairings do not expire (a
+verification against the durable access list. The robot's mDNS record carries
+its endpoint id (`eid=`); it does not supply a dial address, so an offline
+connect needs `--addr`. Established pairings do not expire (a
 time-boxed guest grant from the owner is the exception), last until revoked
 (see [`docs/revocation.md`](revocation.md)), and never re-run the certificate
 chain per connect; the access row is the truth.
