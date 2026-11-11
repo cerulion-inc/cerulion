@@ -6,4 +6,4 @@
 //! sources, so disconnect cannot strand safety state. The native exclusive fence
 //! used by netd prevents fresh work from racing a committed idle stop.
 
-pub use cerulion_netd::serving_hold::{HoldReason, ServingHold, ServingHolds};
+pub use cerulion_netd::serving_hold::{fence_path, HoldReason, ServingHold, ServingHolds};

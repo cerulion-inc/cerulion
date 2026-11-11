@@ -116,6 +116,7 @@ impl Daemon {
             .env("CERULION_NETD_SOCK", &socket)
             .env("CERULION_NETD_IDLE_GRACE_MS", "60000")
             .env("CERULION_NETD_RELAY_DISABLED", "1")
+            .env("RUST_LOG", "warn,cerulion_remoted=info")
             .env_remove("CERULION_STATE_ROOT")
             .env_remove("CERULION_NETWORK")
             .env_remove("CERULION_NETD_LISTEN")
@@ -418,7 +419,7 @@ fn no_listen_serves_persisted_pairing_and_expired_login_and_reaps_on_last_releas
             "second registration retains server"
         );
         let holds = cerulion_remoted::serving_hold::ServingHolds::open(
-            &daemon.root.path().join("robot-state/remoted/serving.hold"),
+            &cerulion_remoted::serving_hold::fence_path(&daemon.root.path().join("robot-state")),
         )
         .unwrap();
         let shell = holds
@@ -435,6 +436,16 @@ fn no_listen_serves_persisted_pairing_and_expired_login_and_reaps_on_last_releas
         until(|| children(daemon.child.id()).is_empty());
         assert!(matches!(
             request(&mut a, register(3, TOPIC)),
+            Response::Egress(_)
+        ));
+        until(|| !children(daemon.child.id()).is_empty());
+        assert!(matches!(
+            request(&mut a, Request::ReleaseEgress { id: 4 }),
+            Response::EgressRelease(_)
+        ));
+        until(|| children(daemon.child.id()).is_empty());
+        assert!(matches!(
+            request(&mut a, register(5, TOPIC)),
             Response::Egress(_)
         ));
         until(|| !children(daemon.child.id()).is_empty());
@@ -555,16 +566,26 @@ fn engaged_ops_estop_survives_last_egress_disconnect_and_remains_observable() {
         pid,
         "idle cannot clear an engaged latch"
     );
-    // The shipped act verb reads the ops latch before opening any SHM publisher.
-    let status = runtime.block_on(ops_call(
-        address,
-        "topic-publish",
-        serde_json::json!({"topic":TOPIC,"type":"unknown_msgs/msg/Unknown","message":{}}),
-    ));
-    assert_eq!(status["status"], "err", "{status}");
-    assert_eq!(
-        status["message"],
-        "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+    assert!(
+        cerulion_netd::serving_hold::IdleFence::try_acquire(
+            &cerulion_remoted::serving_hold::fence_path(&daemon.root.path().join("robot-state"))
+        )
+        .unwrap()
+        .is_none(),
+        "the engaged latch independently blocks exclusive idle admission"
     );
+    // The shipped act verb reads the ops latch before opening any SHM publisher.
+    for _ in 0..16 {
+        let status = runtime.block_on(ops_call(
+            address.clone(),
+            "topic-publish",
+            serde_json::json!({"topic":TOPIC,"type":"unknown_msgs/msg/Unknown","message":{}}),
+        ));
+        assert_eq!(status["status"], "err", "{status}");
+        assert_eq!(
+            status["message"],
+            "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused"
+        );
+    }
     daemon.stop();
 }

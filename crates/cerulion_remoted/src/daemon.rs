@@ -193,11 +193,12 @@ pub(crate) async fn serve_core(
     let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
     let rcpd_estop = ops_host.rcpd_estop();
     let serving_holds = if server_name == DAEMON_SERVER_NAME {
-        let path = files
+        let root = files
             .beacon_facts_file
             .parent()
-            .ok_or_else(|| RemotedError::Config("remote state has no parent directory".into()))?
-            .join("serving.hold");
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| RemotedError::Config("remote state has no parent directory".into()))?;
+        let path = crate::serving_hold::fence_path(root);
         let holds = crate::serving_hold::ServingHolds::open(&path)
             .map_err(|error| RemotedError::Ops(format!("opening remote serving hold: {error}")))?;
         {
@@ -430,6 +431,11 @@ pub async fn serve_planes(
     let mut refresh = tokio::time::interval(Duration::from_millis(100));
     let mut refresh_failures =
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut admission_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    // accept_one owns an Incoming while its handshake completes. A refresh tick
+    // must not cancel it and close an otherwise valid new ops/wire connection.
+    let mut accepting = Box::pin(accept_one(endpoint));
     let closed_on_its_own = loop {
         tokio::select! {
             _ = &mut shutdown => break false,
@@ -447,7 +453,8 @@ pub async fn serve_planes(
                     }
                 }
             },
-            accepted = accept_one(endpoint) => {
+            accepted = &mut accepting => {
+                accepting.set(accept_one(endpoint));
                 match accepted {
                     // The endpoint's accept stream ended → the daemon is closing.
                     // This is the ONLY per-accept signal that terminates the loop.
@@ -455,9 +462,18 @@ pub async fn serve_planes(
                     Ok(Some(a)) => {
                         let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
                             match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
-                                Ok(hold) => hold,
+                                Ok(hold) => {
+                                    if let Some(suppressed) = admission_failures.on_success() {
+                                        tracing::info!(suppressed, "remote serving admission recovered");
+                                    }
+                                    hold
+                                },
                                 Err(error) => {
-                                    tracing::debug!(error = %error, "remote serving admission refused during idle stop");
+                                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                                    match admission_failures.on_failure() {
+                                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
+                                        RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
+                                    }
                                     a.connection.close(0u32.into(), b"remote server is stopping");
                                     continue;
                                 }
@@ -499,6 +515,7 @@ pub async fn serve_planes(
     // learns the accept loop stopped even when a log write blocks; the binary
     // arms its hard-exit deadline then.
     drop(shutdown);
+    drop(accepting);
     if closed_on_its_own {
         tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
     } else {

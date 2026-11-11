@@ -142,10 +142,17 @@ remove them before committing.
   daemon shutdown. Endpoint transfer closes the outgoing desk endpoint before
   spawning remoted and permits new outgoing ownership only after reap. The idle
   watcher retains the singleton while that endpoint is held, including teardown.
+  After the first idle release, one reaper waits across server generations until
+  shutdown. WAN teardown reserves the full server/fetch budget even before an
+  in-flight registration claims endpoint ownership; reading it never takes the
+  lifecycle mutex.
   Native admission uses `serving_hold::ServingHolds`, re-exported by remoted:
   acquire a guard before ops/RCP or shell/exec work and retain it through final
   drain and witness. Latch and owed-delivery sources refresh before the last
-  shared unlock. Netd takes the stable `serving.hold` inode exclusively through
+  shared unlock. Both daemons use `serving_hold::fence_path(state_root)` for
+  `<state_root>/serving/serving.hold`, outside the provisioned `remoted` directory.
+  Its parent is created owner-only before the file opens, so fresh provisioning
+  still requires no existing robot directory. Netd takes that inode exclusively through
   idle reap; never unlink it. Source mutations require an admitted guard and
   callbacks must not acquire the hold manager; missing daemon sources fail closed.
   Stop handling installs before daemon accept startup. Remoted has its own process

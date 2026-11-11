@@ -19,6 +19,23 @@ struct State {
     stopped: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    Stop,
+    Wait,
+    Reap,
+}
+
+fn idle_action(stopped: bool, has_registrations: bool, has_server: bool) -> IdleAction {
+    if stopped {
+        IdleAction::Stop
+    } else if has_registrations || !has_server {
+        IdleAction::Wait
+    } else {
+        IdleAction::Reap
+    }
+}
+
 /// Production egress wrapper. Query-only daemons construct it without starting
 /// a server. First successful egress starts one; last release reaps it after
 /// admitted work, owed e-stop delivery and its latch have cleared. An
@@ -80,23 +97,15 @@ impl SupervisedEgressPlane {
                 reason: "robot state root must be absolute and contain no traversal".into(),
             });
         }
-        let directory = root.join("remoted");
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| EgressError::Server {
-                reason: error.to_string(),
-            })?;
         // Create the stable fencing inode before a child can admit ops work.
-        let fence = crate::serving_hold::IdleFence::try_acquire(&directory.join("serving.hold"))
-            .map_err(|error| EgressError::Server {
-                reason: error.to_string(),
-            })?
-            .ok_or_else(|| EgressError::Server {
-                reason: "the remote serving endpoint still has active work".into(),
-            })?;
+        let fence =
+            crate::serving_hold::IdleFence::try_acquire(&crate::serving_hold::fence_path(&root))
+                .map_err(|error| EgressError::Server {
+                    reason: error.to_string(),
+                })?
+                .ok_or_else(|| EgressError::Server {
+                    reason: "the remote serving endpoint still has active work".into(),
+                })?;
         drop(fence);
         self.holds_endpoint.store(true, Ordering::Release);
         if let Err(reason) = self.mirror.begin_serving() {
@@ -163,11 +172,12 @@ impl SupervisedEgressPlane {
             .spawn(move || loop {
                 {
                     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                    if state.stopped || state.supervisor.is_none() {
+                    let action = idle_action(state.stopped, !state.registrations.is_empty(), state.supervisor.is_some());
+                    if action == IdleAction::Stop {
                         return;
                     }
-                    if state.registrations.is_empty() {
-                        let fence = cerulion_discovery::robot_state::resolve().ok_or_else(|| std::io::Error::other("no robot state root is available")).and_then(|root| crate::serving_hold::IdleFence::try_acquire(&root.join("remoted/serving.hold")));
+                    if action == IdleAction::Reap {
+                        let fence = cerulion_discovery::robot_state::resolve().ok_or_else(|| std::io::Error::other("no robot state root is available")).and_then(|root| crate::serving_hold::IdleFence::try_acquire(&crate::serving_hold::fence_path(&root)));
                         let fence = match fence {
                             Ok(fence) => fence,
                             Err(error) => {
@@ -181,7 +191,8 @@ impl SupervisedEgressPlane {
                             }
                             mirror.end_serving();
                             held.store(false, Ordering::Release);
-                            return;
+                            // Keep this worker for later server generations: a
+                            // release can race the old generation's reap.
                         }
                     }
                 }
@@ -195,13 +206,10 @@ impl SupervisedEgressPlane {
         }
     }
 
-    /// Extra shutdown budget for graceful server stop and a revocation fetch.
+    /// Extra shutdown budget for graceful server stop and a revocation fetch,
+    /// including a registration still starting before it claims the endpoint.
     pub fn stop_grace(&self) -> Duration {
-        if self.holds_serving_endpoint() {
-            self.stop_grace
-        } else {
-            Duration::ZERO
-        }
+        self.stop_grace
     }
 }
 
@@ -262,5 +270,51 @@ impl EgressPlane for SupervisedEgressPlane {
 impl Drop for SupervisedEgressPlane {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cerulion_core::testing::IsolatedRoot;
+    use cerulion_core::{TransportConfig, TransportManager};
+
+    #[test]
+    fn idle_worker_survives_reaped_generations_until_shutdown() {
+        for (stopped, registered, server, expected) in [
+            (false, false, false, IdleAction::Wait),
+            (false, false, true, IdleAction::Reap),
+            (false, true, false, IdleAction::Wait),
+            (false, true, true, IdleAction::Wait),
+            (true, false, false, IdleAction::Stop),
+            (true, false, true, IdleAction::Stop),
+            (true, true, false, IdleAction::Stop),
+            (true, true, true, IdleAction::Stop),
+        ] {
+            assert_eq!(idle_action(stopped, registered, server), expected);
+        }
+    }
+
+    #[test]
+    fn shutdown_reserves_server_grace_before_pending_registration_claims_endpoint() {
+        let root = IsolatedRoot::mint("r2");
+        let manager =
+            TransportManager::init_for_test(TransportConfig::default(), root.config()).unwrap();
+        let plane = Arc::new(SupervisedEgressPlane::new(
+            Arc::new(GatewayEgressPlane::new(Arc::clone(&manager))),
+            Arc::new(crate::mirror::GatewayMirrorPlane::new(manager)),
+            false,
+        ));
+        // A registration owns this mutex while the gateway boots, before the
+        // endpoint flag changes. Reading the watchdog budget must not wait on it.
+        let registration = plane.state.lock().unwrap();
+        assert!(!plane.holds_serving_endpoint());
+        let (send, receive) = std::sync::mpsc::channel();
+        let pending = Arc::clone(&plane);
+        let reader = std::thread::spawn(move || send.send(pending.stop_grace()).unwrap());
+        let budget = receive.recv_timeout(Duration::from_secs(1));
+        drop(registration);
+        reader.join().unwrap();
+        assert!(budget.unwrap() >= crate::robot_supervisor::remoted_stop_grace());
     }
 }
