@@ -1046,10 +1046,15 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
 
 ## 11. Test map
 
-Every crate in this family is PARALLEL-safe in CI, with none ignored by
-default (on a macOS desk at the 256-file soft limit, run `wire_plane_test` and
-`rcp_forward_e2e_test` with `-- --test-threads=1`): per-test SHM roots
-(`TransportManager::init_for_test`), per-test sockets/tempdirs, loopback-only
+Every crate in this family runs PARALLEL in CI, with none ignored by default
+(on a macOS desk at the 256-file soft limit, run `wire_plane_test` with
+`-- --test-threads=1`). The two `cerulion_remoted` files that call the
+default-namespace `TransportManager::get_or_init()` directly, `act_verbs_test`
+and `rcp_forward_e2e_test`, mark every test `#[serial]`. Tests in other files
+that drive `topic-publish` or `engage-estop` on a daemon host (`loopback_test`,
+`ops_loopback_test`, `estop_starvation_test`) reach that manager through the
+verbs without `#[serial]`. Isolation otherwise comes from per-test SHM roots
+(`TransportManager::init_for_test`), per-test sockets/tempdirs and loopback-only
 iroh (relay disabled + direct dial, every await bounded). Nothing dials a relay,
 a real robot, or multicast. Every crate here is named in a CI test step on BOTH
 platforms: most in the crate-tests job; `cerulion_connectd` and

@@ -13,7 +13,11 @@
 //! them runs in a child process of this binary with `CERULION_HOME` at a fresh
 //! directory: there each daemon's rcpd journal topics are excluded and its run
 //! is announced on the default iceoryx2 namespace too, under topic names and
-//! run ids that carry the child's pid.
+//! run ids that carry the child's pid. That child run calls
+//! `TransportManager::get_or_init()`, the process-wide default-namespace
+//! manager, directly, and a `tests/` file with a direct call marks every test
+//! `#[serial]` while its package runs parallel in CI, so no other test of this
+//! binary runs in the parent while the child uses that namespace.
 //!
 //! Every account row is established through a REAL certificate chain with a
 //! chosen scope (deterministic seeds). Expected values (the caller string, the
@@ -65,6 +69,7 @@ use cerulion_remoted::{
 use ed25519_dalek::SigningKey;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::{json, Value};
+use serial_test::serial;
 
 const STEP: Duration = Duration::from_secs(20);
 const T_NOW: u64 = 1_000_000_000_000;
@@ -824,6 +829,7 @@ fn denied(reply: &Value, code: i64) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn operator_with_teleop_calls_a_tool_under_its_own_identity() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -873,6 +879,7 @@ async fn operator_with_teleop_calls_a_tool_under_its_own_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn viewer_reads_resources_but_its_tool_call_never_reaches_rcpd() {
     let f = Fixture::new().await;
     let mut s = f.session(VIEWER.0).await;
@@ -913,6 +920,7 @@ async fn viewer_reads_resources_but_its_tool_call_never_reaches_rcpd() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
     let f = Fixture::new().await;
     let mut s = f.session(VIEWER.0).await;
@@ -955,6 +963,7 @@ async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_unpaired_key_is_refused_at_accept() {
     let f = Fixture::new().await;
     let mut s = f.session(UNPAIRED_SEED).await;
@@ -973,6 +982,7 @@ async fn an_unpaired_key_is_refused_at_accept() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn malformed_bodies_are_denied_and_the_session_continues() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1011,6 +1021,7 @@ async fn malformed_bodies_are_denied_and_the_session_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_revoke_mid_session_denies_the_next_call() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1038,6 +1049,7 @@ async fn a_revoke_mid_session_denies_the_next_call() {
 }
 
 #[test]
+#[serial]
 fn the_default_rcpd_address_matches_rcpd() {
     assert_eq!(
         cerulion_remoted::rcp::DEFAULT_RCPD_ADDR.to_string(),
@@ -1059,6 +1071,7 @@ fn the_default_rcpd_address_matches_rcpd() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn the_estop_never_waits_behind_full_request_slots() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1099,6 +1112,7 @@ async fn the_estop_never_waits_behind_full_request_slots() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_reply_is_withheld_when_the_scope_loses_its_class_mid_call() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1159,6 +1173,7 @@ fn revoke_operator_device_in(trust: &SharedTrust) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_quiet_revoked_session_is_closed_by_the_periodic_check() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1173,6 +1188,7 @@ async fn a_quiet_revoked_session_is_closed_by_the_periodic_check() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_connection_past_the_per_key_cap_supersedes_the_oldest() {
     let f = Fixture::new().await;
     let cap = RcpLimits::default().connections_per_key;
@@ -1209,6 +1225,7 @@ async fn a_connection_past_the_per_key_cap_supersedes_the_oldest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn estops_in_flight_are_bounded_and_the_excess_answered_at_once() {
     let f = Fixture::new().await;
     let mut s = f.session(VIEWER.0).await;
@@ -1237,6 +1254,7 @@ async fn estops_in_flight_are_bounded_and_the_excess_answered_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
     let mut f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1282,6 +1300,7 @@ async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_cancel_reaches_rcpd_while_every_request_slot_is_taken() {
     let f = Fixture::with_limits(|l| l.in_flight = 1).await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1321,6 +1340,7 @@ async fn a_cancel_reaches_rcpd_while_every_request_slot_is_taken() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_engaged_ops_estop_refuses_rcp_tool_calls_but_not_the_estop() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1402,6 +1422,7 @@ fn publish_unknown_type(lease: &EstopLease) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_rcp_estop_engages_the_latch_the_ops_act_verbs_obey() {
     let f = Fixture::new().await;
     let before = publish_unknown_type(&f.lease);
@@ -1646,6 +1667,7 @@ fn step_call(id: i64) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_rcp_estop_engages_the_ops_latch_while_rcpd_holds_a_ping() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1712,6 +1734,7 @@ async fn an_rcp_estop_engages_the_ops_latch_while_rcpd_holds_a_ping() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_act_call_queued_behind_a_held_ping_is_refused_after_an_ops_engage() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1735,6 +1758,7 @@ async fn an_act_call_queued_behind_a_held_ping_is_refused_after_an_ops_engage() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_queued_call_is_refused_when_its_scope_loses_the_class_before_it_is_sent() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1775,6 +1799,7 @@ async fn a_queued_call_is_refused_when_its_scope_loses_the_class_before_it_is_se
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn notifications_past_their_room_never_take_a_queued_estops_place() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1830,6 +1855,7 @@ async fn hold_a_call_at_its_connect(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_ops_engage_while_a_calls_connection_opens_refuses_the_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1853,6 +1879,7 @@ async fn an_ops_engage_while_a_calls_connection_opens_refuses_the_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_call_is_refused_when_its_scope_loses_the_class_while_its_connection_opens() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1892,6 +1919,7 @@ async fn a_call_is_refused_when_its_scope_loses_the_class_while_its_connection_o
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_cancel_reaches_rcpd_after_the_call_it_names_while_that_call_connects() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1924,6 +1952,7 @@ async fn a_cancel_reaches_rcpd_after_the_call_it_names_while_that_call_connects(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_key_revoked_after_accept_cannot_engage_the_estop() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1966,6 +1995,7 @@ async fn a_key_revoked_after_accept_cannot_engage_the_estop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_estop_after_rcpd_loses_the_session_still_engages_the_ops_latch() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -2046,6 +2076,7 @@ async fn ops_call(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn the_daemon_engages_the_ops_latch_from_an_rcp_estop_with_rcpd_down() {
     let dir = tempfile::tempdir().unwrap();
     let robot = endpoint(ROBOT_SEED).await;
@@ -2428,6 +2459,7 @@ const PUBLISH_REFUSED: &str =
     "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused";
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_ops_engage_estop_closes_rcpds_latch_and_rcpd_refuses_the_call_it_holds() {
     let mut d = Daemon::start(Gate::Open).await;
     let mut s = open_session(&d.endpoint, OPERATOR.0).await;
@@ -2512,6 +2544,7 @@ async fn an_ops_engage_estop_closes_rcpds_latch_and_rcpd_refuses_the_call_it_hol
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_ops_engage_estop_answers_before_its_estop_reaches_rcpd() {
     let mut d = Daemon::start(Gate::Shut).await;
     let (viewer, operator) = (endpoint(VIEWER.0).await, endpoint(OPERATOR.0).await);
@@ -2663,6 +2696,7 @@ impl LocalOnlyRun {
 /// directory, so the run directories resolve under the runs root while this
 /// binary's environment stays as it is.
 #[test]
+#[serial]
 fn an_estop_engage_reaches_the_graph_from_both_planes_while_a_local_only_run_holds_the_journal() {
     if std::env::var_os(LOCAL_ONLY_CHILD_ENV).is_some() {
         let home = std::env::var_os("CERULION_HOME").expect("the child runs with CERULION_HOME");
@@ -2874,6 +2908,7 @@ async fn rcp_estop_under_a_local_only_run(runs_root: &Path) -> Vec<LocalOnlyTopi
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn an_ops_engage_estop_with_rcpd_stopped_engages_and_its_estop_arrives_once_rcpd_serves() {
     let mut d = Daemon::start(Gate::Open).await;
     d.side.stop_rcpd();

@@ -4197,14 +4197,14 @@ jobs:
   # `TransportManager::get_or_init()`, the process-global manager on the
   # default namespace: the act verbs such as `topic-publish` take their remote
   # lease there and `engage-estop` asks the flashback recorder through it, so
-  # every test that calls those verbs reaches that manager. Two files also
-  # call it directly. In `tests/act_verbs_test.rs` every test
-  # carries `#[serial]`, which takes one lock shared by the whole test binary,
-  # so no two of them run at once. In `tests/rcp_forward_e2e_test.rs` one test
-  # runs in a child process that excludes topics and announces runs on the
-  # default namespace, under topic names and run ids that carry the child's
-  # pid; no test there asserts a process-wide counter. Every other transport
-  # these files build is an ISOLATED per-test SHM root via
+  # a call that passes the verb's argument checks on a daemon host reaches
+  # that manager (`engage-estop` only while `CERULION_FLASHBACK` is not off).
+  # Two files also call it directly, `tests/act_verbs_test.rs` and
+  # `tests/rcp_forward_e2e_test.rs` (whose local-only e-stop test excludes
+  # topics and announces runs on the default namespace from a child process).
+  # Every test in both carries `#[serial]`, which takes one lock shared by the
+  # whole test binary, so no two tests of either binary run at once. The
+  # package's other test files build ISOLATED per-test SHM roots via
   # `TransportManager::init_for_test` (their own headers say "parallel-safe
   # without `#[serial]`"), which is the same property that lets the
   # `cerulion_connectd` step above run parallel.
