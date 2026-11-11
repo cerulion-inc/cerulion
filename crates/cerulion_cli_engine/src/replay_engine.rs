@@ -33629,6 +33629,316 @@ mod resim_namespace_tests {
         );
     }
 
+    /// The message of the warn a claim logs for the first slot it passes over.
+    const PASSED_OVER: &str = "replay: passed over a resim namespace slot whose lock could not be \
+                               taken or whose namespace did not reclaim clean";
+    /// The message of the debug line for a further slot it passes over.
+    const PASSED_OVER_AGAIN: &str = "replay: passed over another resim namespace slot (suppressed)";
+    /// The message of the warn for the slot that takes the count across a
+    /// power of ten (the tenth, the hundredth).
+    const STILL_PASSING_OVER: &str = "replay: still passing over resim namespace slots";
+    /// The message of the info line of a claim that took a slot after
+    /// suppressing at least one repeat.
+    const CLAIMED_AFTER: &str = "replay: claimed a resim namespace slot after passing over others";
+
+    /// How many of `lines` (a `#[traced_test]`'s own) are `level` events that
+    /// contain every one of `texts` and carry every one of `fields`, each a
+    /// whole `name=value` token as the log writes it.
+    fn logged(lines: &[&str], level: &str, texts: &[&str], fields: &[&str]) -> usize {
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(" {level} "))
+                    && texts.iter().all(|text| line.contains(text))
+                    && fields
+                        .iter()
+                        .all(|field| line.split(' ').any(|token| token == *field))
+            })
+            .count()
+    }
+
+    /// `Ok` when every `(what, got, want)` count matches, else every count and
+    /// the lines read.
+    fn counts_match(lines: &[&str], counts: &[(&str, usize, usize)]) -> Result<(), String> {
+        if counts.iter().all(|(_, got, want)| got == want) {
+            Ok(())
+        } else {
+            Err(format!("(what, got, want): {counts:#?}\nlines: {lines:#?}"))
+        }
+    }
+
+    /// One slot passed over, then a claim: one warn naming the slot, what its
+    /// reclaim counted (each count distinct, so a swapped field shows) and why
+    /// it was refused. A lone pass-over closes without a recovery line.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_that_passes_over_one_slot_warns_naming_the_slot_and_its_counts() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            if slot > 0 {
+                return Ok(());
+            }
+            let reclaim = SlotReclaim {
+                segments_failed: 5,
+                ..holding(
+                    1,
+                    BoundedCleanup {
+                        cleanups: 2,
+                        failed_cleanups: 3,
+                        deferred: 4,
+                    },
+                )
+            };
+            let reason = reclaim.refusal().expect("a node is left");
+            Err(SlotPassedOver::Reclaim { reclaim, reason })
+        })
+        .expect("slot 1 is ready");
+        assert_eq!(claimed.slot, 1);
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(
+                            lines,
+                            "WARN",
+                            &[
+                                PASSED_OVER,
+                                "error=nodes still registered in its namespace after the \
+                                 dead-node sweep: 1 (the sweep removed 2, failed on 3 and \
+                                 deferred 4;",
+                            ],
+                            &[
+                                "slot=0",
+                                "nodes_left=1",
+                                "cleanups=2",
+                                "failed_cleanups=3",
+                                "deferred=4",
+                                "segments_failed=5",
+                            ],
+                        ),
+                        1,
+                    ),
+                    (
+                        "any pass-over line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains("replay: passed over"))
+                            .count(),
+                        1,
+                    ),
+                    (
+                        "a recovery line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(CLAIMED_AFTER))
+                            .count(),
+                        0,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// Two slots passed over, then a claim of the third: the first at warn,
+    /// the repeat at debug with one suppressed, and an info line for the slot
+    /// taken naming the one suppressed and both passed over. A slot refused
+    /// before any reclaim carries no reclaim count. The repeat never logs at
+    /// a loud level, and the recovery line, at info, carries the count in
+    /// every build.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_after_two_slots_passed_over_logs_the_repeat_at_debug_and_the_claim_at_info() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            if slot < 2 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 2 is ready");
+        assert_eq!(claimed.slot, 2);
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(
+                            lines,
+                            "WARN",
+                            &[PASSED_OVER, "error=refused by the test"],
+                            &["slot=0"],
+                        ),
+                        1,
+                    ),
+                    (
+                        "the debug repeat for slot 1",
+                        logged(
+                            lines,
+                            "DEBUG",
+                            &[PASSED_OVER_AGAIN, "error=refused by the test"],
+                            &["slot=1", "suppressed=1"],
+                        ),
+                        cerulion_core::testing::debug_lines_expected(1),
+                    ),
+                    (
+                        "the repeat at a loud level",
+                        logged(lines, "WARN", &[PASSED_OVER_AGAIN], &[])
+                            + logged(lines, "INFO", &[PASSED_OVER_AGAIN], &[]),
+                        0,
+                    ),
+                    (
+                        "a reclaim count on a slot refused before its reclaim",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(" nodes_left="))
+                            .count(),
+                        0,
+                    ),
+                    (
+                        "the info for the slot taken",
+                        logged(
+                            lines,
+                            "INFO",
+                            &[CLAIMED_AFTER],
+                            &["slot=2", "suppressed=1", "total_failures=2"],
+                        ),
+                        1,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// Ten slots passed over, then a claim of the eleventh: the first at
+    /// warn, the next eight at debug counting up the suppressed, the tenth at
+    /// warn again with the total, and the claim at info with all ten.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_that_passes_over_ten_slots_warns_again_at_the_tenth() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 12, |slot| {
+            if slot < 10 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 10 is ready");
+        assert_eq!(claimed.slot, 10);
+        logs_assert(|lines| {
+            let mut counts = vec![
+                (
+                    "the warn for slot 0".to_string(),
+                    logged(lines, "WARN", &[PASSED_OVER], &["slot=0"]),
+                    1,
+                ),
+                (
+                    "debug repeats".to_string(),
+                    logged(lines, "DEBUG", &[PASSED_OVER_AGAIN], &[]),
+                    cerulion_core::testing::debug_lines_expected(8),
+                ),
+                (
+                    "the warn for slot 9".to_string(),
+                    logged(
+                        lines,
+                        "WARN",
+                        &[STILL_PASSING_OVER],
+                        &["slot=9", "total_failures=10", "suppressed=8"],
+                    ),
+                    1,
+                ),
+                (
+                    "the info for the slot taken".to_string(),
+                    logged(
+                        lines,
+                        "INFO",
+                        &[CLAIMED_AFTER],
+                        &["slot=10", "suppressed=8", "total_failures=10"],
+                    ),
+                    1,
+                ),
+            ];
+            for slot in 1..9 {
+                counts.push((
+                    format!("the debug repeat for slot {slot}"),
+                    logged(
+                        lines,
+                        "DEBUG",
+                        &[PASSED_OVER_AGAIN],
+                        &[&format!("slot={slot}"), &format!("suppressed={slot}")],
+                    ),
+                    cerulion_core::testing::debug_lines_expected(1),
+                ));
+            }
+            let counts: Vec<(&str, usize, usize)> = counts
+                .iter()
+                .map(|(what, got, want)| (what.as_str(), *got, *want))
+                .collect();
+            counts_match(lines, &counts)
+        });
+    }
+
+    /// Lock files that cannot be opened: a warn for the first naming the slot
+    /// and the file, a debug repeat for the second, no reclaim count, and no
+    /// claim line, since nothing was claimed.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_warned_naming_the_slot_and_the_file() {
+        let dir = tempfile::tempdir().expect("a parent directory");
+        let missing = dir.path().join("absent");
+        claim_resim_slot(&missing, 2, |_| Ok(())).expect_err("nothing opens");
+        let first = format!(
+            "error=its lock file could not be opened or locked: {}",
+            missing.join("cer_resim_00000000.lock").display()
+        );
+        let second = format!(
+            "error=its lock file could not be opened or locked: {}",
+            missing.join("cer_resim_00000001.lock").display()
+        );
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(lines, "WARN", &[PASSED_OVER, &first], &["slot=0"]),
+                        1,
+                    ),
+                    (
+                        "the debug repeat for slot 1",
+                        logged(
+                            lines,
+                            "DEBUG",
+                            &[PASSED_OVER_AGAIN, &second],
+                            &["slot=1", "suppressed=1"],
+                        ),
+                        cerulion_core::testing::debug_lines_expected(1),
+                    ),
+                    (
+                        "a reclaim count",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(" nodes_left="))
+                            .count(),
+                        0,
+                    ),
+                    (
+                        "a claim line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains("replay: claimed"))
+                            .count(),
+                        0,
+                    ),
+                ],
+            )
+        });
+    }
+
     /// A namespace with no node: the reclaim removes the slot's segments in
     /// the segment directory and nothing else (another slot's segment, the
     /// slot's lock file, another namespace's segment, a directory). A zero
@@ -33701,6 +34011,51 @@ mod resim_namespace_tests {
         );
         assert_eq!(reclaimed.refusal(), None);
         assert_eq!(left(), kept);
+    }
+
+    /// A namespace with no node whose segment directory cannot be listed: a
+    /// warn naming the slot and the error, and a reclaim that removed nothing
+    /// and still reads clean.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_segment_directory_that_cannot_be_listed_is_warned_naming_the_slot() {
+        let root = IsolatedRoot::mint("rslotnodir");
+        let slot = unclaimable_slot(3);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let parent = tempfile::tempdir().expect("a parent directory");
+        let missing = parent.path().join("absent");
+        let reclaimed =
+            reclaim_resim_slot(&ix_config, slot, Some(&missing), Duration::from_secs(10));
+        assert_eq!(
+            reclaimed,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(reclaimed.refusal(), None);
+        let slot_field = format!("slot={slot}");
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[(
+                    "the warn for the unlisted directory",
+                    logged(
+                        lines,
+                        "WARN",
+                        &[
+                            "replay: could not list the shared-memory segment names to reclaim \
+                             a resim namespace slot",
+                            "(os error 2)",
+                        ],
+                        &[&slot_field],
+                    ),
+                    1,
+                )],
+            )
+        });
     }
 
     /// A namespace with a LIVE node is left as it is: the node is not reaped

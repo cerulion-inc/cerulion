@@ -1409,8 +1409,9 @@ fn subprocess_replay_of_thinned_trace_bag_exits_6_with_trace_divergence() {
 ///
 /// Runs the record on the GLOBAL iceoryx2 namespace (the production
 /// `graph run` path has no isolation seam, which IS the point of a closed-loop
-/// e2e) and each replay on its own private one; `#[serial]` and a unique
-/// per-run prefix keep it safe.
+/// e2e) and the replays on a private resim namespace, one after another, so
+/// each takes slot 0 again once the one before it has exited; `#[serial]` and
+/// a unique per-run prefix keep it safe.
 #[test]
 #[serial]
 fn real_recorded_bag_replays_end_to_end() {
@@ -2479,13 +2480,17 @@ fn a_resim_creates_no_service_an_egress_tap_on_the_shared_namespace_can_open() {
 
 /// Two resims of one bag, two processes on two private namespaces, write
 /// byte-identical reports: nothing a resim reports depends on its namespace
-/// or its process id. The report itself is a PASS that byte-compared the one
-/// produced topic.
+/// or its process id. The first runs on slot 0, the lowest free one. The
+/// second runs while this test holds slot 0's lock, so its claim skips that
+/// slot as it skips one a running resim holds and takes slot 1. Each leaves
+/// its node on its own slot. The report itself is a PASS that byte-compared
+/// the one produced topic.
 ///
 /// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
 #[test]
 #[serial]
 fn two_resims_of_one_bag_write_byte_identical_reports() {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let prefix = format!("rp{}two", std::process::id());
@@ -2500,8 +2505,58 @@ fn two_resims_of_one_bag_write_byte_identical_reports() {
         assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
         std::fs::read(&path).expect("the report is written")
     };
+    // The iceoryx2 nodes registered on `slot`'s namespace.
+    let nodes_on = |slot: u32| -> std::collections::BTreeSet<PathBuf> {
+        resim_namespace_files()
+            .remove(&slot)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| path.to_string_lossy().ends_with(".node_monitor"))
+            .collect()
+    };
+
+    let slot_0_before = nodes_on(0);
     let first = report("first.json");
+    let first_nodes = nodes_on(0);
+    assert_eq!(
+        first_nodes.len(),
+        1,
+        "the first resim leaves one node on slot 0: {first_nodes:?}"
+    );
+    assert!(
+        first_nodes.is_disjoint(&slot_0_before),
+        "the first resim ran on slot 0: {slot_0_before:?} then {first_nodes:?}"
+    );
+
+    let slot_0_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open("/dev/shm/cer_resim_00000000.lock")
+        .expect("open slot 0's lock file");
+    slot_0_lock
+        .try_lock()
+        .expect("no resim holds slot 0 once the first has exited");
+    let slot_1_before = nodes_on(1);
     let second = report("second.json");
+    drop(slot_0_lock);
+    assert_eq!(
+        nodes_on(0),
+        first_nodes,
+        "the second resim left slot 0, whose lock this test held, as the first left it"
+    );
+    let second_nodes = nodes_on(1);
+    assert_eq!(
+        second_nodes.len(),
+        1,
+        "the second resim leaves one node on slot 1: {second_nodes:?}"
+    );
+    assert!(
+        second_nodes.is_disjoint(&slot_1_before),
+        "the second resim ran on slot 1: {slot_1_before:?} then {second_nodes:?}"
+    );
     assert_eq!(
         String::from_utf8_lossy(&first),
         String::from_utf8_lossy(&second),
