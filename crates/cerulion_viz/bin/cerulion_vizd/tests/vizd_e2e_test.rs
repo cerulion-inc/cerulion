@@ -102,6 +102,11 @@ use cerulion_vizd::{
     start_with_demand_plane, NetdDemandPlane, RunningDaemon, DEFAULT_POLL_INTERVAL,
     MAX_REQUEST_LINE_BYTES,
 };
+// The SHIPPED control client and its request lines: a reply it reads arrives
+// inside its own 5 s deadline or fails with its own error.
+use cerulion_cli_engine::viz_client::{
+    attach_line, detach_line, discover_line, list_line, VizdConn,
+};
 use native_ros2_messages::geometry_msgs::Vector3;
 use native_ros2_messages::nav_msgs::Path;
 // The video-layout witness — a CompressedImage carrying H.264
@@ -6030,6 +6035,262 @@ fn discover_provenance_snapshot_is_cached_within_ttl_e2e() {
 
     daemon.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Attribution reads beside a provenance gather in flight ──────────────────
+
+/// A hermetic daemon on its own transport, for the provenance-gather arms below.
+/// Dropping it shuts the daemon down and removes its socket directory.
+struct HeldArm {
+    mgr: Arc<TransportManager>,
+    daemon: RunningDaemon,
+    socket: PathBuf,
+    dir: PathBuf,
+    _sink: (rerun::RecordingStream, rerun::sink::MemorySinkStorage),
+}
+
+impl HeldArm {
+    fn start(tag: &str) -> Self {
+        let mgr = isolated_transport(tag);
+        let (worker, flush, storage) = memory_worker(tag);
+        let (socket, dir) = temp_socket(tag);
+        let daemon = start_hermetic(
+            socket.clone(),
+            DEFAULT_POLL_INTERVAL,
+            Arc::clone(&mgr),
+            worker,
+            builtin_walker(),
+            None,
+        )
+        .expect("daemon starts");
+        Self {
+            mgr,
+            daemon,
+            socket,
+            dir,
+            _sink: (flush, storage),
+        }
+    }
+
+    /// A connection through the SHIPPED control client, whose 5 s I/O timeout,
+    /// armed at connect, bounds every reply read.
+    fn shipped(&self) -> VizdConn {
+        VizdConn::connect(&self.socket).expect("the shipped client connects")
+    }
+
+    /// A live producer on `topic`, attributed to `robot` in the mirror registry
+    /// exactly as netd's re-injector registers it.
+    fn mirror(&self, topic: &str, robot: &str) -> Publisher {
+        let producer = Publisher::spawn(Arc::clone(&self.mgr), topic);
+        assert!(
+            self.mgr
+                .register_mirror_provenance(topic, robot)
+                .expect("register mirror provenance"),
+            "{topic} is newly attributed to {robot}"
+        );
+        producer
+    }
+}
+
+impl Drop for HeldArm {
+    fn drop(&mut self) {
+        self.daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// One round trip through the shipped client. A reply that waits on a held
+/// gather fails here with the client's own timeout error.
+fn shipped_request(conn: &mut VizdConn, line: &str) -> Value {
+    conn.request(line).unwrap_or_else(|e| {
+        panic!("`{line}` got no reply inside the shipped client's reply deadline: {e}")
+    })
+}
+
+/// A request written now and read later, on its own connection, so a request
+/// that parks at the provenance gate needs no helper thread. Every read is bounded.
+struct UnreadReply(BufReader<UnixStream>);
+
+impl UnreadReply {
+    fn send(socket: &std::path::Path, line: &str) -> Self {
+        let stream = connect_bounded(socket);
+        stream
+            .set_read_timeout(Some(ATTRIBUTION_CONVERGENCE_BOUND))
+            .expect("arm the banner read bound");
+        let mut reader = BufReader::new(stream);
+        let mut banner = String::new();
+        reader.read_line(&mut banner).expect("read banner");
+        writeln!(reader.get_mut(), "{line}").expect("write request");
+        Self(reader)
+    }
+
+    fn read(mut self) -> Value {
+        let mut resp = String::new();
+        self.0
+            .read_line(&mut resp)
+            .unwrap_or_else(|e| panic!("no reply within {ATTRIBUTION_CONVERGENCE_BOUND:?}: {e}"));
+        serde_json::from_str(&resp).expect("response json")
+    }
+}
+
+/// Every row's `(topic, robot)`, keeping an ABSENT robot apart from any value
+/// (absent is the wire convention for an unattributed row, see [`row_for`]).
+fn robot_column(rows: &Value) -> Vec<(String, Option<Value>)> {
+    rows.as_array()
+        .expect("an array of rows")
+        .iter()
+        .map(|r| {
+            let topic = r["topic"].as_str().expect("every row names its topic");
+            (topic.to_string(), r.get("robot").cloned())
+        })
+        .collect()
+}
+
+/// Does `discover`'s ROBOTS section list `topic` under `robot`?
+fn folded_under(disc: &Value, robot: &str, topic: &str) -> bool {
+    disc["robots"].as_array().is_some_and(|robots| {
+        robots.iter().any(|r| {
+            r["robot"].as_str() == Some(robot)
+                && r["topics"]
+                    .as_array()
+                    .is_some_and(|t| t.iter().any(|e| e["topic"].as_str() == Some(topic)))
+        })
+    })
+}
+
+/// Poll `discover` then `list` until `topic`'s attached row names `robot`:
+/// `discover` refreshes the provenance snapshot on a miss and `list` reads it.
+fn converge_list_robot(conn: &mut VizdConn, topic: &str, robot: &str) {
+    let mut list = Value::Null;
+    let converged = wait_until(ATTRIBUTION_CONVERGENCE_BOUND, || {
+        shipped_request(conn, &discover_line(1));
+        list = shipped_request(conn, &list_line(2));
+        entry_for(&list["attached"], "topic", topic).and_then(|e| e["robot"].as_str())
+            == Some(robot)
+    });
+    assert!(converged, "`{topic}` never read `{robot}` on list: {list}");
+}
+
+/// Attach `topic` over the local path and require success.
+fn attach_ok(conn: &mut VizdConn, topic: &str) {
+    let att = shipped_request(conn, &attach_line(1, topic, None, None, None));
+    assert_eq!(att["ok"].as_bool(), Some(true), "attach {topic}: {att}");
+}
+
+/// A gather that read the registry before a `detach` never puts the detached
+/// topic's robot back: its store is refused, and the next read of that topic
+/// gathers again.
+#[test]
+fn a_gather_that_read_before_a_detach_never_resurrects_the_detached_topics_robot_e2e() {
+    let _statics = blueprint_statics_guard();
+    let arm = HeldArm::start("held_gen");
+    let topic = "/resurrect/scan";
+    let retiring = arm.mirror(topic, "ubuntu");
+    let mut conn = arm.shipped();
+    attach_ok(&mut conn, topic);
+    converge_list_robot(&mut conn, topic, "ubuntu");
+
+    assert!(
+        arm.daemon
+            .age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
+        "precondition: a gather stamped the snapshot"
+    );
+    let discarded = arm.daemon.provenance_gathers_discarded();
+    let hold = arm.daemon.hold_provenance_gather_for_test();
+    let held_discover = UnreadReply::send(&arm.socket, &discover_line(10));
+    assert!(
+        hold.wait_parked(1, ATTRIBUTION_CONVERGENCE_BOUND),
+        "precondition: the discover past the TTL gathers and parks at the gate"
+    );
+    let detached = shipped_request(&mut conn, &detach_line(11, topic));
+    assert_eq!(detached["ok"].as_bool(), Some(true), "{detached}");
+    arm.mgr
+        .unregister_mirror_provenance(topic)
+        .expect("unregister the retired mirror's provenance");
+    drop(retiring);
+    let _desk_pub = Publisher::spawn(Arc::clone(&arm.mgr), topic);
+    drop(hold);
+    let reply = held_discover.read();
+    assert!(
+        folded_under(&reply, "ubuntu", topic),
+        "precondition: the parked gather heard the mirror's robot, so only the \
+         refused store keeps that robot from the reads below: {reply}"
+    );
+
+    let started = arm.daemon.provenance_gathers_started();
+    let reattached = shipped_request(&mut conn, &attach_line(12, topic, None, None, None));
+    assert_eq!(reattached["ok"].as_bool(), Some(true), "{reattached}");
+    assert!(
+        reattached.get("robot").is_none(),
+        "the parked gather's pre-detach answer must not reach the re-attach: {reattached}"
+    );
+    assert_eq!(
+        arm.daemon.provenance_gathers_started() - started,
+        1,
+        "the refused store left the snapshot stale, so the re-attach gathered again"
+    );
+    let list = shipped_request(&mut conn, &list_line(13));
+    assert_eq!(
+        robot_column(&list["attached"]),
+        vec![(topic.to_string(), None)],
+        "{list}"
+    );
+    assert_eq!(
+        arm.daemon.provenance_gathers_discarded() - discarded,
+        1,
+        "the parked gather started before the detach, so its answer is not stored"
+    );
+}
+
+/// A failed provenance gather is counted, attributes nothing in the reply of the
+/// request that ran it, and is stored like an answer; the next refresh past the
+/// TTL brings the robot back.
+#[test]
+fn a_failed_provenance_gather_answers_without_robots_and_recovers_on_the_next_refresh_e2e() {
+    let _statics = blueprint_statics_guard();
+    let arm = HeldArm::start("held_fault");
+    let (topic, spare) = ("/fault/scan", "/fault/spare");
+    let _mirror_pub = arm.mirror(topic, "ubuntu");
+    let _spare_pub = Publisher::spawn(Arc::clone(&arm.mgr), spare);
+    let mut conn = arm.shipped();
+    attach_ok(&mut conn, topic);
+    attach_ok(&mut conn, spare);
+    converge_list_robot(&mut conn, topic, "ubuntu");
+
+    // Detaching the spare invalidates the snapshot, which clears its stamp, so from
+    // here only a store can stamp it again.
+    let detached = shipped_request(&mut conn, &detach_line(9, spare));
+    assert_eq!(detached["ok"].as_bool(), Some(true), "{detached}");
+    assert!(
+        !arm.daemon
+            .age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
+        "precondition: the invalidation cleared the stamp"
+    );
+    arm.daemon.fail_next_provenance_gathers_for_test(1);
+    let started = arm.daemon.provenance_gathers_started();
+    let failed = arm.daemon.provenance_gathers_failed();
+    let discover = shipped_request(&mut conn, &discover_line(10));
+    assert!(
+        !folded_under(&discover, "ubuntu", topic)
+            && entry_for(&discover["topics"], "topic", topic).is_some(),
+        "a failed gather attributes nothing, so the mirror is a LOCAL row: {discover}"
+    );
+    assert_eq!(
+        (
+            arm.daemon.provenance_gathers_started() - started,
+            arm.daemon.provenance_gathers_failed() - failed,
+        ),
+        (1, 1),
+        "the discover gathered once and that gather failed"
+    );
+
+    assert!(
+        arm.daemon
+            .age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
+        "the failed gather stored its empty answer: nothing else could stamp the \
+         snapshot the detach cleared"
+    );
+    converge_list_robot(&mut conn, topic, "ubuntu");
 }
 
 #[test]

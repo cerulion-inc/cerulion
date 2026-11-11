@@ -2937,6 +2937,12 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
     }
 }
 
+/// The node-side filter when the graph's environment snapshot carries no
+/// `RUST_LOG`: the node's own code at `info`, the framework inside the cdylib
+/// at `warn`. Its `error!`/`warn!` diagnostics (the `OutputProxy` discard
+/// error among them) stay visible.
+const CDYLIB_DEFAULT_FILTER: &str = "info,cerulion_core=warn";
+
 /// STOPGAP: install a cdylib-local stderr `fmt` tracing subscriber so
 /// node-side `tracing` events become host-visible.
 ///
@@ -2968,23 +2974,25 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
 /// - `rust_log_spec` comes from the node's [`NodeContext`] env snapshot
 ///   (`ctx.env_str("RUST_LOG", "")`), NEVER live `std::env` — the snapshot is
 ///   frozen at graph build for replay determinism (see [`NodeContext`]'s
-///   `env_lookup` docs). An empty/absent spec defaults to `info` (keeps
-///   error/warn/info visible — loud by design); a non-empty spec is applied via
-///   `tracing_subscriber::EnvFilter`. A spec that fails to parse emits a loud
-///   one-line `eprintln!` (tracing is not up yet, so `eprintln!` is the correct
-///   channel) and falls back to `info`.
+///   `env_lookup` docs). An empty/absent spec defaults to
+///   `info,cerulion_core=warn`: `info` for the node's own code (its
+///   `tracing::info!` lines stay visible) and `warn` for the `cerulion_core`
+///   linked into the cdylib, whose `info` lines are teardown bookkeeping. A
+///   non-empty spec is applied via `tracing_subscriber::EnvFilter`. A spec that
+///   fails to parse emits a loud one-line `eprintln!` (tracing is not up yet,
+///   so `eprintln!` is the correct channel) and falls back to `info`.
 /// - The `fmt` output disables ANSI escapes (`with_ansi(false)`): production
 ///   dylib-graph stderr is routinely piped/redirected, and escape codes would
 ///   corrupt log files.
-/// - A SUCCESSFUL install under a SET `RUST_LOG` (parseable or not) emits
-///   exactly one `eprintln!` BREADCRUMB naming the effective filter:
-///   `cerulion cdylib tracing: node-side logs -> stderr (filter: <F>)`. A
-///   typo'd-but-parseable RUST_LOG silently suppresses everything (`EnvFilter`
-///   semantics), so when the user supplied a spec the effective filter must be
-///   observable once per cdylib; the breadcrumb is also the behavioral pin for
-///   the single-install guarantee (`Once`). Under the DEFAULT (absent or empty
-///   `RUST_LOG`) nothing is printed: the filter is the documented `info`, and
-///   a line per cdylib on every run is noise a first user learns to skip.
+/// - A SUCCESSFUL install emits one `eprintln!` BREADCRUMB naming the
+///   effective filter, `cerulion cdylib tracing: node-side logs -> stderr
+///   (filter: <F>)`, ONLY when that filter differs from what the user wrote:
+///   the unparseable-spec fallback to `info` (the host ignores just the bad
+///   directive and keeps the rest, while this subscriber drops the whole spec).
+///   A spec that parses is applied as written, and it is the same `RUST_LOG`
+///   the host's own logging reads, so naming it once per cdylib on every run
+///   only repeated it; under the DEFAULT (absent or empty `RUST_LOG`) the
+///   filter is the documented default. Neither prints.
 /// - If a global default already exists in this linked copy (e.g. installed by
 ///   a link-time constructor before any node code ran),
 ///   `tracing::subscriber::set_global_default` returns `Err`; we do nothing and
@@ -3000,18 +3008,20 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
 pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
     static INSTALL_ONCE: std::sync::Once = std::sync::Once::new();
     INSTALL_ONCE.call_once(|| {
-        let (filter, filter_desc): (tracing_subscriber::EnvFilter, &str) =
+        // `fallback` names the filter only on the unparseable arm, the one
+        // filter that differs from what the user wrote.
+        let (filter, fallback): (tracing_subscriber::EnvFilter, Option<&str>) =
             if cdylib_rust_log_is_absent(rust_log_spec) {
                 (
-                    tracing_subscriber::EnvFilter::new("info"),
-                    "info (default: RUST_LOG absent)",
+                    tracing_subscriber::EnvFilter::new(CDYLIB_DEFAULT_FILTER),
+                    None,
                 )
             } else {
                 // `is_absent` is false, so `rust_log_spec` is `Some(non-empty)`;
                 // the `unwrap_or` default is unreachable but keeps this panic-free.
                 let spec = rust_log_spec.unwrap_or("info");
                 match tracing_subscriber::EnvFilter::try_new(spec) {
-                    Ok(f) => (f, spec),
+                    Ok(f) => (f, None),
                     Err(e) => {
                         // Name WHICH directive failed (multi-directive specs) and
                         // promise only what is certain here: the fallback filter
@@ -3023,7 +3033,7 @@ pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
                         );
                         (
                             tracing_subscriber::EnvFilter::new("info"),
-                            "info (fallback: RUST_LOG spec unparseable)",
+                            Some("info (fallback: RUST_LOG spec unparseable)"),
                         )
                     }
                 }
@@ -3033,19 +3043,11 @@ pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
             .with_ansi(false)
             .with_writer(std::io::stderr)
             .finish();
-        // A pre-existing global default in this linked copy wins (respected —
-        // not an error): stay quiet, no breadcrumb. On a successful install,
-        // the breadcrumb makes the effective filter observable (a parseable
-        // typo'd spec would otherwise silently suppress everything).
-        //
-        // The breadcrumb prints only when the user CHANGED something: a
-        // `RUST_LOG` that is set (parseable or not) is the one case in which
-        // the effective filter could differ from what they expect, so that is
-        // when it is named. Under the default (absent or empty spec) the
-        // filter is the documented `info`, and one line per cdylib on every
-        // run would only teach a first user to skim past output.
-        let announce = !cdylib_rust_log_is_absent(rust_log_spec);
-        if tracing::subscriber::set_global_default(subscriber).is_ok() && announce {
+        // A pre-existing global default in this linked copy wins (respected,
+        // not an error): stay quiet, no breadcrumb. On a successful install the
+        // breadcrumb confirms the fallback filter took effect.
+        let installed = tracing::subscriber::set_global_default(subscriber).is_ok();
+        if let (true, Some(filter_desc)) = (installed, fallback) {
             eprintln!("cerulion cdylib tracing: node-side logs -> stderr (filter: {filter_desc})");
         }
     });
