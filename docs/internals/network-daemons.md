@@ -165,10 +165,16 @@ remove them before committing.
   `serving_ready` to restore retained WAN pins once the owned socket admits work,
   and `end_serving` after child and fetch reap, also on transfer or spawn failure.
   Controllers preserve holders and schema pins or notify holders of failed restores.
-  Incoming TLS handshakes run in at most 32 concurrent workers for at most 10 s;
-  unvalidated addresses retry at half capacity, validated IPs hold at most four,
-  and each relay holds at most eight. Completed handshakes dispatch before new
-  arrivals, so stalled unvalidated peers cannot consume all safety admission slots. Safety refresh waits never cancel a handshake.
+  Incoming TLS handshakes run in at most 32 concurrent workers for at most 10 s.
+  Arrivals other than paired relay keys fill at most 24: unvalidated addresses
+  retry at half capacity, validated IPs hold at most four, unpaired relay arrivals
+  share eight per relay URL and custom transports four. The last eight are kept for
+  relay keys the trust snapshot reads as allowed on a claimed robot, at most four per
+  key, so stalled unpaired peers cannot refuse a paired desk's relayed e-stop dial.
+  A direct dial uses the 24; a relay key the snapshot does not read as allowed (such
+  as a desk not yet in the trust index) also shares its URL's eight. Each cap has
+  its own refusal latch. Completed handshakes dispatch before new arrivals, and safety
+  refresh waits never cancel a handshake.
   Shutdown aborts and joins pending handshakes before endpoint cleanup.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving

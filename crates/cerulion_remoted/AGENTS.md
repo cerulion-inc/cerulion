@@ -23,7 +23,7 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
-  TLS: 32; retry at 16; 4/IP; 8/relay.
+  TLS: 32 (last 8 for paired relay keys); retry 16; 4/IP or paired key; 8/unpaired URL.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - `cerulion_pairing`'s canonical signing bytes are pinned by INDEPENDENT
@@ -50,9 +50,9 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
 - The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
-  e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
-- remoted and link cold-compile the ~390-crate iroh tree. remoted, connectd,
-  wireclient, link and accountd are OUT of `default-members`: build them with `-p`.
+  e2e: loopback iroh and relays only, bounded awaits.
+- remoted and link cold-compile iroh. remoted, connectd, wireclient, link and
+  accountd are OUT of `default-members`: build with `-p`.
 
 Deep reference: docs/internals/remote-access.md, before touching the verb table,
 trust persistence, the wire plane, pairing formats or epoch delivery.

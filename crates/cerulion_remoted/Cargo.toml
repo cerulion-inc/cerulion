@@ -137,6 +137,10 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
+# Genuine loopback relay tests only; server features never enter normal builds.
+iroh-relay = { version = "=1.0.2", features = ["server"] }
+# `SinkExt`/`StreamExt` for iroh-relay's client sink and stream.
+futures-util = { version = "0.3", features = ["sink"] }
 # The loopback accept-gate test drives two endpoints in one runtime; `time`
 # bounds every await so CI can never hang (mirrors cerulion_link's loopback).
 # `sync` powers the `oneshot` shutdown channel the `serve`-loop tests use to stop

@@ -315,8 +315,9 @@ name = "iroh"
 # wrapper every other crate goes through (`cerulion_remoted`, `cerulion_netd`'s
 # WAN plane, `cerulion_wireclient`, `cerulion_connectd`). A second direct edge
 # means a second place iroh's version pin, relay config, and error mapping live.
-# `cerulion_remoted` is a DEV edge only: its wire-plane test needs iroh's
-# `VarInt`, which `cerulion_link` does not re-export.
+# `cerulion_remoted` is a DEV edge only: its tests need iroh's `VarInt`,
+# `SecretKey`, `RelayMode` and endpoint presets, and `iroh-relay`'s loopback
+# relay server and client, which `cerulion_link` does not re-export.
 wrappers = ["cerulion_link", "cerulion_remoted"]
 
 [[bans.deny]]
