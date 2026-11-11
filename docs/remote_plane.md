@@ -131,7 +131,9 @@ observer channels keep their source robot's access policy: read them on that
 source robot. A refused outbound demand or an unavailable robot during metadata
 discovery preserves the machine's other active readers. Outbound readers retain
 the owned server against idle shutdown; new admission returns a retryable
-refusal while shutdown is already committed.
+refusal while shutdown is already committed. Account ownership proofs survive
+the switch between consuming and serving. Reader restoration shares one bounded
+budget; unresolved readers receive a named loss notice and can reconnect.
 
 The zenoh LAN ingress compatibility path proves no identity per peer and is
 closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires

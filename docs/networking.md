@@ -698,6 +698,8 @@ their best-effort queue and can read every writer of a multi-publisher topic.
 Imported topics retain the source robot's access policy. A serving consumer
 exports its local producers; read its imported topics on their source robot.
 Metadata discovery and refused demands preserve other running ingress readers.
+Account authorization survives a switch to a shared serving endpoint. Restoration
+uses one total time budget and reports unresolved readers by name.
 
 The graph file stays the single source of truth: under a
 Strict block, which topics cross the machine boundary is declared in YAML.

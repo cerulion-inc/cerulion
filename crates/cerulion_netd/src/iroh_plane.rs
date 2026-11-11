@@ -76,7 +76,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cerulion_core::transport::cerulion_q::{
     CatalogReply, SchemaReply, CATALOG_WIRE_VERSION, SCHEMA_WIRE_VERSION,
@@ -197,6 +197,26 @@ struct RobotConn {
     /// Set when a control round-trip errors/times out — the framing is desynced, so
     /// this connection is fatal for future demands and must be re-dialed.
     control_poisoned: bool,
+}
+
+struct DemandGuard<'a> {
+    connection: &'a mut RobotConn,
+    completed: bool,
+}
+
+impl Drop for DemandGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Cancellation can leave framed control or a new tap half consumed.
+            self.connection.control_poisoned = true;
+            self.connection
+                .connection
+                .close(0u32.into(), b"mirror demand cancelled");
+            for reader in self.connection.readers.values() {
+                reader.abort();
+            }
+        }
+    }
 }
 
 struct CatalogFailure {
@@ -408,10 +428,62 @@ impl IrohMirrorPlane {
     }
 
     pub(crate) fn synchronize_shared_endpoint(&self) -> Result<Vec<TopicKey>, String> {
+        self.synchronize_shared_endpoint_until(
+            Instant::now() + crate::shared_endpoint::CONTROL_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn synchronize_shared_endpoint_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Vec<TopicKey>, String> {
         self.shared_control
             .as_ref()
             .ok_or_else(|| "mirror plane does not share an owned endpoint".to_owned())?
-            .sync()
+            .sync_until(deadline)
+    }
+
+    pub(crate) fn ensure_shared_mirror_until(
+        &self,
+        key: &TopicKey,
+        schema_hash: u64,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let control = self
+            .shared_control
+            .as_ref()
+            .ok_or_else(|| "mirror plane does not share an owned endpoint".to_owned())?;
+        if let DemandDecision::Deny { reason } = self.authorizer.authorize_demand(
+            &DemandSubject::Wan {
+                demander_key: self.desk_key,
+            },
+            &key.topic,
+        ) {
+            return Err(reason.to_string());
+        }
+        control.ensure_until(key, schema_hash, deadline)
+    }
+
+    pub(crate) fn ensure_mirror_until(
+        &self,
+        key: &TopicKey,
+        schema_hash: u64,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if self.shares_owned_endpoint() {
+            return self.ensure_shared_mirror_until(key, schema_hash, deadline);
+        }
+        if Instant::now() >= deadline {
+            return Err("WAN mirror restoration deadline expired".into());
+        }
+        self.rt.block_on(async {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.ensure_async(key, schema_hash),
+            )
+            .await
+            .map_err(|_| "WAN mirror restoration deadline expired".to_owned())?
+        })
     }
 
     /// Override the dial / await timeout (tests shorten it to catch a stalling /
@@ -1509,7 +1581,13 @@ impl IrohMirrorPlane {
                 .robots
                 .get_mut(&(key.robot.clone(), key.observer))
                 .expect("robot connection just inserted / already present");
-            self.demand_topic(robot_conn, key, schema_hash).await
+            let mut guard = DemandGuard {
+                connection: robot_conn,
+                completed: false,
+            };
+            let result = self.demand_topic(guard.connection, key, schema_hash).await;
+            guard.completed = true;
+            result
         };
         if result.is_err() {
             // A failed demand must leave NO orphaned connection: drop it when it is
@@ -1861,20 +1939,13 @@ impl MirrorPlane for IrohMirrorPlane {
     }
 
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
-        if let Some(control) = &self.shared_control {
-            if let DemandDecision::Deny { reason } = self.authorizer.authorize_demand(
-                &DemandSubject::Wan {
-                    demander_key: self.desk_key,
-                },
-                &key.topic,
-            ) {
-                return Err(MirrorError::Iroh {
-                    key: key.clone(),
-                    reason: reason.to_string(),
-                });
-            }
-            return control
-                .ensure(key, schema_hash)
+        if self.shares_owned_endpoint() {
+            return self
+                .ensure_mirror_until(
+                    key,
+                    schema_hash,
+                    Instant::now() + crate::shared_endpoint::CONTROL_TIMEOUT,
+                )
                 .map_err(|reason| MirrorError::Iroh {
                     key: key.clone(),
                     reason,
