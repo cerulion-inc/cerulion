@@ -1887,7 +1887,9 @@ pub struct HostedRunSpec<'a> {
 /// `topology.nodes`, so fires without it name no node), then `endpoints`.
 /// `omitted.full_len` is the byte length of the full render. Each size check
 /// counts the `omitted` key itself. The run is still served with its base
-/// keys and its `graph.yaml`.
+/// keys and its `graph.yaml`. [`HostedRunManifest::declares_fires`] tells the
+/// host whether the render kept `telemetry`, so a host whose render dropped it
+/// serves no fires.
 ///
 /// # Errors
 ///
@@ -1897,10 +1899,13 @@ pub struct HostedRunSpec<'a> {
 /// cap.
 pub fn render_hosted_run_manifest(
     spec: &HostedRunSpec<'_>,
-) -> Result<Vec<u8>, HostedRunManifestTooLarge> {
+) -> Result<HostedRunManifest, HostedRunManifestTooLarge> {
     let full = render_hosted_doc(spec, &[], None);
     if full.len() <= MAX_RUN_ARTIFACT_LEN {
-        return Ok(full);
+        return Ok(HostedRunManifest {
+            bytes: full,
+            declares_fires: spec.fires.is_some(),
+        });
     }
     let mut dropped = vec!["telemetry", "topology"];
     let mut slim = render_hosted_doc(spec, &dropped, Some(full.len()));
@@ -1914,7 +1919,22 @@ pub fn render_hosted_run_manifest(
             cap: MAX_RUN_ARTIFACT_LEN,
         });
     }
-    Ok(slim)
+    Ok(HostedRunManifest {
+        bytes: slim,
+        declares_fires: false,
+    })
+}
+
+/// A hosted `run.json` that [`render_hosted_run_manifest`] rendered within the
+/// served cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedRunManifest {
+    /// The `run.json` bytes.
+    pub bytes: Vec<u8>,
+    /// The render has `topology` and `telemetry`: the spec gave fires and the
+    /// render did not drop them to fit the cap. When false, a desk cannot name
+    /// the nodes of a fire record, so the host serves no fires.
+    pub declares_fires: bool,
 }
 
 /// A hosted `run.json` that is above the served cap with every key dropped
@@ -3914,7 +3934,15 @@ mod tests {
     };
 
     fn render_fitting(spec: &HostedRunSpec<'_>) -> Vec<u8> {
-        render_hosted_run_manifest(spec).expect("the hosted run.json fits the served cap")
+        render_hosted_run_manifest(spec)
+            .expect("the hosted run.json fits the served cap")
+            .bytes
+    }
+
+    fn declares_fires(spec: &HostedRunSpec<'_>) -> bool {
+        render_hosted_run_manifest(spec)
+            .expect("the hosted run.json fits the served cap")
+            .declares_fires
     }
 
     fn hosted_doc(spec: &HostedRunSpec<'_>) -> serde_json::Value {
@@ -4029,7 +4057,9 @@ mod tests {
             version: 1,
             nodes: vec![],
         };
-        let doc = hosted_doc(&hosted_spec(&[], &topology, None));
+        let spec = hosted_spec(&[], &topology, None);
+        assert!(!declares_fires(&spec));
+        let doc = hosted_doc(&spec);
         let keys: Vec<&str> = doc
             .as_object()
             .expect("an object")
@@ -4068,7 +4098,9 @@ mod tests {
             capacity: 64,
             lease_ms: 1234,
         };
-        let doc = hosted_doc(&hosted_spec(&[], &topology, Some(fires)));
+        let spec = hosted_spec(&[], &topology, Some(fires));
+        assert!(declares_fires(&spec));
+        let doc = hosted_doc(&spec);
         assert_eq!(
             doc["telemetry"],
             serde_json::json!({"fires": {"version": 7, "capacity": 64, "lease_ms": 1234}})
@@ -4295,6 +4327,10 @@ mod tests {
         );
         assert_eq!(doc["endpoints"], serde_json::json!(&endpoints));
         assert_eq!(doc["graph_name"], serde_json::json!("lobby"));
+        assert!(
+            !declares_fires(&spec),
+            "a render without topology declares no fires"
+        );
         served_entry(&spec, String::from_utf8(rendered).unwrap());
 
         let doc = hosted_doc(&hosted_spec(&endpoints, &topology, None));
@@ -4325,6 +4361,7 @@ mod tests {
             serde_json::json!(["endpoints", "telemetry", "topology"])
         );
         assert!(doc.get("endpoints").is_none(), "{doc}");
+        assert!(!declares_fires(&spec));
         served_entry(&spec, String::from_utf8(rendered).unwrap());
     }
 
