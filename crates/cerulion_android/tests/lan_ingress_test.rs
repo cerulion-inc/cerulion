@@ -526,8 +526,9 @@ fn relay_for(topic: &str) -> &'static str {
     }
 }
 
-/// One run of [`RUNS`]. Under `paired` authenticated ingress is refused
-/// before graph startup and no ingress bridge exists. Under `open` the right-hash frames on the ingress
+/// One run of [`RUNS`]. Under `paired` declared imports are refused before
+/// startup; a graph without imports starts and refuses the peer's LAN data.
+/// No ingress bridge exists. Under `open` the right-hash frames on the ingress
 /// topic reach its relay, the wrong-hash ones are counted drops that never
 /// reach it, and nothing reaches the relay of the other topic. The desk is
 /// demanded the ingress topic only.
