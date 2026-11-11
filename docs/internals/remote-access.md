@@ -147,8 +147,10 @@ the same entry instead of running the daemon.
   thread queues behind a full queue is dropped like any other. A writer
   thread that cannot start, or a runtime that cannot be built, exits the
   binary 1 after one error line. In a build with the test seam only,
-  `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a smaller line bound
-  (`test_queue_lines`: a positive whole number, at most `QUEUE_LINES`), as
+  `CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST` sets a line bound of at most
+  `QUEUE_LINES` (`test_queue_lines`: a positive whole number that fits a
+  `usize`, whitespace around it trimmed, a larger one than `QUEUE_LINES`
+  setting `QUEUE_LINES`; any other value, zero among them, sets none), as
   the crate's other `_FOR_TEST` variables set their seams; it takes effect
   once the daemon has logged that it listens (`shrink_queue_for_test`,
   called right after that line), so the lines before it are queued under the

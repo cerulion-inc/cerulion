@@ -57,7 +57,7 @@ pub const QUEUE_LINES: usize = 4096;
 pub const QUEUE_BYTES: usize = 1 << 20;
 
 /// Test-only: the environment variable that, in a build with the test seam,
-/// sets a smaller line bound for the binary's log queue
+/// sets a line bound of at most [`QUEUE_LINES`] for the binary's log queue
 /// (`test_queue_lines`), from the moment the daemon has logged that it
 /// listens (`shrink_queue_for_test`); the lines before that are queued under
 /// the full bound. A build without the test seam never reads it.
@@ -66,9 +66,11 @@ pub const QUEUE_BYTES: usize = 1 << 20;
 pub const QUEUE_LINES_FOR_TEST_ENV: &str = "CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST";
 
 /// Test-only: the line bound a [`QUEUE_LINES_FOR_TEST_ENV`] value sets, which
-/// can only shrink the queue: a positive whole number, at most [`QUEUE_LINES`].
-/// Any other value sets none, so the queue keeps [`QUEUE_LINES`]; no value
-/// leaves it unbounded or with no room. Pure.
+/// can only shrink the queue. A value that parses as a positive `usize`,
+/// whitespace around it trimmed, sets that many lines, clamped to
+/// [`QUEUE_LINES`]: a larger one, up to `usize::MAX`, sets [`QUEUE_LINES`].
+/// Any other value, zero among them, sets none, so the queue keeps
+/// [`QUEUE_LINES`]; no value leaves it unbounded or with no room. Pure.
 #[cfg(feature = "test-seam")]
 pub(crate) fn test_queue_lines(value: &str) -> Option<usize> {
     let lines = value.trim().parse::<usize>().ok()?;
@@ -78,7 +80,7 @@ pub(crate) fn test_queue_lines(value: &str) -> Option<usize> {
 /// Test-only: apply the line bound [`QUEUE_LINES_FOR_TEST_ENV`] sets to the
 /// writer [`start`] installed, if both are there. The daemon calls it right
 /// after it logs that it listens, so a test that waits for that line never
-/// loses it to the smaller bound.
+/// loses it to that bound.
 #[cfg(feature = "test-seam")]
 pub(crate) fn shrink_queue_for_test() {
     let lines = std::env::var(QUEUE_LINES_FOR_TEST_ENV)
@@ -165,8 +167,8 @@ struct Queue {
     /// thread only, before it clears `writing`.
     reported: AtomicU64,
     limits: Limits,
-    /// Test-only: a smaller line bound set once the daemon listens;
-    /// `usize::MAX` for none.
+    /// Test-only: a line bound of at most [`QUEUE_LINES`], set once the daemon
+    /// listens; `usize::MAX` for none.
     #[cfg(feature = "test-seam")]
     test_lines: std::sync::atomic::AtomicUsize,
 }
@@ -200,8 +202,8 @@ impl Queue {
         }
     }
 
-    /// The bounds in force: `limits`, with a test seam's smaller line bound
-    /// once one is set.
+    /// The bounds in force: `limits`, with a test seam's line bound of at most
+    /// [`QUEUE_LINES`] once one is set.
     fn bounds(&self) -> Limits {
         #[cfg(feature = "test-seam")]
         {
