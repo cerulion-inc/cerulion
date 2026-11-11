@@ -8,11 +8,17 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "Compiler-independent C interface for Cerulion node plugins"
 readme = "README.md"
-include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/", "tests/", "Cargo.toml", "README.md", "LICENSE"]
 
 [lints]
 workspace = true
 
+[features]
+loader = ["dep:libloading", "stabby/libloading"]
+
 [dependencies]
+# Match Stabby's integration range exactly so fresh resolves select one Library
+# type for its extension trait and this owner; no indirect pin is required.
+libloading = { version = ">=0.7.3, <0.10", optional = true }
 stabby = { version = "=72.1.16", default-features = false, features = ["std"] }
 thiserror = "2"

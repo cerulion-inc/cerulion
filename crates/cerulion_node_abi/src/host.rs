@@ -4,6 +4,19 @@ use crate::*;
 /// Host process-lifetime services. Handles are context-scoped and generation
 /// checked. All calls contain panics before returning across C. Output spans are
 /// borrowed only for the call; no owner allocation is freed on the other side.
+///
+/// Raw publisher create/loan/finish/discard/egress may run on any helper thread
+/// concurrently with tick, synchronized per raw publisher without the tick lock.
+/// They never return BUSY for thread contention; helper leases do not block fires.
+/// Clock access also runs on any thread, outside admission, without BUSY or
+/// INVALID_STATE, preserving the injected graph clock for helper publication.
+/// Ordinary ports, sync and state are admitted node-call services; out-of-call or
+/// concurrent use returns counted INVALID_STATE without changing any lease.
+/// BUSY means destroy must wait for
+/// outstanding leases: release them and retry. No NodeApi/StateApi/ExternalApi
+/// entries run concurrently for one NodeHandle. Every call-scoped ordinary lease
+/// ends before return; after destroy the host reclaims leaks as INVARIANT, without
+/// publication. Retained helper/Python leases instead live until process exit.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -18,23 +31,34 @@ pub struct HostApiV1 {
     /// Loan adaptive capacity, initialize prefix, retain native loan on host.
     pub loan_output:
         unsafe extern "C" fn(ContextHandle, PortHandle, LoanRequestV1, *mut WriteSlotV1) -> Status,
-    /// Commit initialized frame bytes in an existing loan. Consumes lease once.
+    /// Commit initialized frame bytes. An admitted terminal result other than
+    /// INVALID_HANDLE consumes once; INVALID_STATE admission refusal has no effect. Size outside `prefix_size..=capacity` counts INVARIANT and
+    /// returns INVALID_ARGUMENT. After submit_spill, return INVALID_HANDLE.
     pub finish_output: unsafe extern "C" fn(ContextHandle, LeaseHandle, u32) -> Status,
     /// Copy a node-owned initialized overflow PAYLOAD into a fresh host loan.
     /// Header/timestamp come from old lease; size includes header. The caller
     /// retains spill allocation until return. Original loan stays live on EVERY
     /// result until discard_output(SPILL_RELEASE) after writer destruction.
-    /// Records one attempt per lease; repeated submission cannot publish twice.
+    /// Tracks separate attempted/submitted states; repeated submission cannot publish twice.
+    /// Require size == header_len + payload.len and capacity < size <= configured
+    /// capacity. First submission fully accounts commit/send failure/INVARIANT.
+    /// Malformed spill is counted once; submission never consumes any lease.
+    /// Original storage remains live until writer Drop and SPILL_RELEASE.
     pub submit_spill: unsafe extern "C" fn(ContextHandle, LeaseHandle, Bytes, u32) -> Status,
     /// Consume original loan without consuming wire sequence. SPILL_RELEASE only
     /// releases an attempted spill and records no node discard; other reasons
     /// drive existing counters/latches. Never call while its writer is live.
+    /// After submission only SPILL_RELEASE is accepted; other reasons refuse.
+    /// SPILL_RELEASE without an attempt consumes as counted INVARIANT.
+    /// An admitted result except INVALID_HANDLE consumes once; INVALID_STATE
+    /// admission refusal preserves the lease. No-attempt release counts once.
     pub discard_output: unsafe extern "C" fn(ContextHandle, LeaseHandle, u32) -> Status,
     /// Receive through the existing queue/frozen read path and retain frame.
     /// Requested read_mode must match the cold binding classification.
     pub receive_input:
         unsafe extern "C" fn(ContextHandle, PortHandle, u32, *mut ReadSlotV1) -> Status,
-    /// End an immutable input borrow; consumes lease once.
+    /// End immutable input borrow. An admitted result except INVALID_HANDLE consumes
+    /// once; INVALID_STATE admission refusal leaves the owner and mapping intact.
     pub release_input: unsafe extern "C" fn(ContextHandle, LeaseHandle) -> Status,
     /// Apply head_op with explicit boundary/refill site through existing decisions.
     pub input_head:
@@ -59,7 +83,8 @@ pub struct HostApiV1 {
         unsafe extern "C" fn(ContextHandle, PortHandle, *mut PublisherCountersV1) -> Status,
     /// Copy diagnostic for token; short-buffer refusal does not consume it.
     pub copy_error: unsafe extern "C" fn(ContextHandle, u64, MutableBytes, *mut u64) -> Status,
-    /// Report a structured node-side diagnostic; host suppresses repeated regimes.
+    /// Report a structured node-side diagnostic at diagnostic_level. Zero port
+    /// selects a distinct node-wide latch; named ports retain their own regimes.
     pub diagnostic: unsafe extern "C" fn(ContextHandle, PortHandle, u32, Bytes) -> Status,
     /// Hand pending batch to this fire once, returning both drop observations.
     /// Repeated calls during the fire return the same frozen batch; subsequent
@@ -83,4 +108,22 @@ pub struct HostApiV1 {
     /// Restore exactly one matching per-port record; reject trailing bytes, wrong
     /// name/schema/capacity/counters before mutation. Caller retains byte storage.
     pub restore_accumulate: unsafe extern "C" fn(ContextHandle, PortHandle, Bytes) -> Status,
+    /// Cold create of a bounded host-owned raw-ingress publisher. All topic
+    /// bytes are borrowed only for this call; returned topic borrows immutable
+    /// context-lifetime storage. Exhausted publisher budget returns FAILED.
+    /// RESERVED_BLOCK returns UNSUPPORTED (7); unknown queue tags return
+    /// INVALID_ARGUMENT (5), with a named diagnostic and cold warning.
+    pub create_raw_publisher:
+        unsafe extern "C" fn(ContextHandle, RawPublisherRequestV1, *mut PortBindingV1) -> Status,
+    /// Consume a raw write lease once, including on failure. Preserve the complete
+    /// caller-supplied header, schema and initialized length; never stamp another
+    /// sequence/time. Return actual recipients; every error arm writes zero.
+    pub finish_raw_output:
+        unsafe extern "C" fn(ContextHandle, LeaseHandle, u32, *mut u64) -> Status,
+    /// Announce the bound topic/schema for dynamic egress through the existing
+    /// local control channel. A refusal leaves local ingress usable.
+    pub register_raw_egress: unsafe extern "C" fn(ContextHandle, PortHandle) -> Status,
+    /// Cold destroy; outstanding leases return BUSY. Handles are invalidated
+    /// without reuse; context teardown drops any remaining native raw ports.
+    pub destroy_raw_publisher: unsafe extern "C" fn(ContextHandle, PortHandle) -> Status,
 }

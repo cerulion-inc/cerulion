@@ -26,7 +26,7 @@
 //! `chunk_c_ffi_error_test.rs` for the canonical `#[serial]` pattern).
 
 use cerulion_core::clock::VirtualClock;
-use cerulion_core::graph::node::{DylibNodeEntry, NodeContext, NodeEntry};
+use cerulion_core::graph::node::{DylibNodeEntry, NodeEntry};
 use cerulion_core::graph::{parse_graph, GraphRuntime};
 use cerulion_core::transport::TransportManager;
 use cerulion_core::TransportError;
@@ -96,8 +96,7 @@ fn fixture_corrupt_json() -> Option<String> {
 /// Find the corrupt-info test cdylib in the target directory.
 ///
 /// Built by `cargo build -p test_node_corrupt_info_cdylib` (CI does
-/// this explicitly in the "Build test cdylibs" step; locally `cargo
-/// test --workspace` builds it transitively as a workspace member).
+/// this explicitly in the "Build test cdylibs" step; locally build this named fixture before running the test).
 fn find_corrupt_cdylib() -> std::path::PathBuf {
     cerulion_core::testing::find_fixture_cdylib("test_node_corrupt_info_cdylib")
 }
@@ -129,9 +128,11 @@ nodes:
     type: test_node_corrupt_info
 "#;
 
-fn load_fixture() -> DylibNodeEntry {
-    DylibNodeEntry::load(&find_corrupt_cdylib())
-        .expect("load must succeed — corruption surfaces at info-parse time, not symbol-load time")
+fn load_error() -> TransportError {
+    match DylibNodeEntry::load(&find_corrupt_cdylib()) {
+        Ok(_) => panic!("corrupt stable metadata must be refused before create"),
+        Err(error) => error,
+    }
 }
 
 // ============================================================
@@ -162,17 +163,13 @@ fn corrupt_json_const_matches_fixture() {
 // Direct `info()` surface
 // ============================================================
 
-/// `DylibNodeEntry::load` succeeds (all ABI v5 symbols present), then
-/// `info()` returns `Err(NodeInfoParse)` whose fields and Display carry
+/// `DylibNodeEntry::load` refuses the stable metadata with
+/// `Err(NodeInfoParse)` whose fields and Display carry
 /// json_len + prefix + diag_label.
 #[test]
 #[serial]
 fn info_returns_node_info_parse_with_full_diagnostics() {
-    let entry = load_fixture();
-
-    let err = entry
-        .info()
-        .expect_err("corrupted info JSON must be an Err, not a defaulted NodeInfo");
+    let err = load_error();
 
     match &err {
         TransportError::NodeInfoParse {
@@ -208,22 +205,16 @@ fn info_returns_node_info_parse_with_full_diagnostics() {
     assert_diagnostics(&err.to_string());
 }
 
-/// `init()` seeds the info cache via `info()?` — the corruption must
-/// fail init too (a hand-rolled host driving DylibNodeEntry directly,
-/// bypassing GraphRuntime, still cannot reach a ticking node).
+/// Repeated library discovery refuses the same immutable payload with exactly
+/// the same diagnostics; no instance or host context can be minted.
 #[test]
 #[serial]
-fn init_propagates_corrupt_info() {
-    let mut entry = load_fixture();
-    let ctx = NodeContext::for_tests(IndexMap::new(), IndexMap::new());
-    let err = entry
-        .init(ctx)
-        .expect_err("init must propagate the info-parse failure");
-    assert!(
-        matches!(err, TransportError::NodeInfoParse { .. }),
-        "expected NodeInfoParse from init; got: {err:?}"
-    );
-    assert_diagnostics(&err.to_string());
+fn repeated_discovery_refuses_the_same_corrupt_metadata() {
+    let first = load_error();
+    let second = load_error();
+    assert!(matches!(first, TransportError::NodeInfoParse { .. }));
+    assert_diagnostics(&first.to_string());
+    assert_eq!(first.to_string(), second.to_string());
 }
 
 // ============================================================
@@ -243,18 +234,22 @@ fn init_propagates_corrupt_info() {
 #[serial]
 fn build_ipc_refuses_corrupt_info_node() {
     let config = parse_graph(GRAPH_YAML).expect("graph YAML parses");
-    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
-    factories.insert("corrupt".to_string(), Box::new(load_fixture()));
-
     let transport = TransportManager::get_or_init().expect("transport init");
     let clock = Arc::new(VirtualClock::new());
-    let err = GraphRuntime::build(config, factories, &transport, clock)
-        .err()
-        .expect("build must refuse a node with corrupted info JSON");
-
-    assert!(
-        matches!(err, TransportError::NodeInfoParse { .. }),
-        "expected NodeInfoParse from build; got: {err:?}"
-    );
+    // Factory discovery is part of graph construction. A refused descriptor
+    // cannot enter GraphRuntime, so no node can reach init or a first tick.
+    let result = (|| {
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert(
+            "corrupt".into(),
+            Box::new(DylibNodeEntry::load(&find_corrupt_cdylib())?),
+        );
+        GraphRuntime::build(config, factories, &transport, clock)
+    })();
+    let err = match result {
+        Ok(_) => panic!("corrupt node cannot form a graph"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, TransportError::NodeInfoParse { .. }));
     assert_diagnostics(&err.to_string());
 }

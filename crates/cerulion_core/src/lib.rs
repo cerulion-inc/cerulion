@@ -842,7 +842,9 @@ pub mod wire;
 ///   `BackpressureProbe` that holds it from 120 to 136.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 31;
+///
+/// Compiler-independent node table; legacy Rust boundaries require a rebuild.
+pub const CERULION_ABI_VERSION: u32 = 32;
 
 // Re-export commonly used types
 #[cfg(unix)]

@@ -197,6 +197,23 @@ The module doc in `src/registry.rs` is the authority; the load-bearing facts:
 
 ## Generated cdylib FFI and ABI coupling
 
+`plugin_codegen.rs` also emits the optional checked `cerulion_node_api_v1`
+bootstrap with node-local lifecycle, state and external-source tables.
+`plugin_impl.rs` adapts the common rewritten init/tick/helper methods to
+`graph::node_plugin_abi` ports. Parameter defaults, metadata and trigger policy
+share the native emitters; both port directions include checked schema, fixed
+size, variable count and alignment facts.
+
+Stable instances hold copied host callbacks and integer port/lease identities.
+The host retains transport, clocks, queues and sessions. Local schema writers
+publish only after the common success gate arms them. An adaptive spill is an
+explicit synchronous payload copy; the original lease stays live until the
+writer drops, then receives `SPILL_RELEASE`. Ordinary receive leases stay outside
+the callback view until the callback returns, so copied fixed readers remain
+valid after an early view drop. Accumulator views borrow the host's frozen fire
+batch. State sinks borrow chunks synchronously; accumulator
+records use the same canonical encoding as native state.
+
 `src/codegen.rs` emits the cdylib entry points (behind the `cdylib` feature). The
 loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 
@@ -307,3 +324,13 @@ Further siblings (`macro_lifecycle_test`, `macro_shim_methods_test`,
 the `cdylib_*` policy/QoS/event files) each state their serial requirement and fixture
 prereqs in their file header; run serial binaries individually with
 `-- --test-threads=1`, never the whole workspace at once.
+
+The embedded Python `export_node!` uses the same stable export adapter with
+node-local Python context and buffer owners. The native and stable backends
+share input validation, touched-output preflight and tick failure cleanup.
+Stable frame reads pin host leases, and writable buffer exports retain their
+loan until released; dynamic variable frames use the explicit adaptive spill
+callback. The host supplies sequence and clock stamps. Python metadata requires
+process retention because CPython caches node-local pyclass code and retained
+memoryviews may still hold leases after a failed tick. Python nodes advertise
+no state or external-source capability and restart from init.

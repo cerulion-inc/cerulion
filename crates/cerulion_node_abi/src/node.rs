@@ -23,7 +23,7 @@ pub struct StateApiV1 {
     pub header: TableHeaderV1,
     /// Canonical state shape hash.
     pub shape: unsafe extern "C" fn(*mut u64) -> Status,
-    /// Capture canonical bytes. Sink must be live for the complete call.
+    /// Capture canonical bytes. Sink lives for the call; u64 is native capacity_hint.
     pub capture: unsafe extern "C" fn(NodeHandle, *const StateSinkV1, u64) -> Status,
     /// Restore borrowed canonical bytes, validating shape before mutation.
     pub restore: unsafe extern "C" fn(NodeHandle, Bytes) -> Status,
@@ -73,6 +73,9 @@ pub struct ExternalApiV1 {
 
 /// Library-lifetime node interface. Appending fields requires a new type, never
 /// prefix acceptance. New services belong in separately versioned extensions.
+/// Host serializes every NodeApi, StateApi and ExternalApi entry for one handle.
+/// Helpers may call raw HostApi services concurrently, never ordinary tick ports.
+/// Concurrent instance entry is INVALID_STATE, not a transient retry condition.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -87,6 +90,7 @@ pub struct NodeApiV1 {
     pub capabilities: u64,
     /// Allocate/init node-owned state. Host table remains process-lifetime;
     /// params are borrowed for this call. Zero handle is never a success.
+    /// Non-OK frees partial state and leaves no instance; host never destroys it.
     pub create:
         unsafe extern "C" fn(*const HostApiV1, ContextHandle, Bytes, *mut NodeHandle) -> Status,
     /// User tick; failure never arms unsent outputs.
@@ -94,8 +98,11 @@ pub struct NodeApiV1 {
     /// User shutdown while host services remain live.
     pub shutdown: unsafe extern "C" fn(NodeHandle) -> Status,
     /// Node allocator destroys its own state after all calls/helpers finish.
+    /// Called exactly once after successful create, even if shutdown failed.
     pub destroy: unsafe extern "C" fn(NodeHandle) -> Status,
-    /// Copy node diagnostic; short-buffer refusal retains pending text.
+    /// Copy library-scoped diagnostic. One pending slot per instance plus one for
+    /// create failures; new failure replaces that slot, full copy consumes it,
+    /// stale token returns INVALID_HANDLE, zero names none. Short copy retains.
     pub copy_error: unsafe extern "C" fn(u64, MutableBytes, *mut u64) -> Status,
     /// Query a separately versioned extension; unknown IDs return unsupported.
     pub query_extension: unsafe extern "C" fn(u64, u32, *mut ExtensionDescriptorV1) -> Status,

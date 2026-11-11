@@ -89,7 +89,7 @@
 15 crates/cerulion_cli_engine/src/state_arm_attach.rs
 6 crates/cerulion_cli_engine/src/subnet_sweep.rs
 8 crates/cerulion_cli_engine/src/system_deps.rs
-20 crates/cerulion_cli_engine/src/templates.rs
+4 crates/cerulion_cli_engine/src/templates.rs
 1 crates/cerulion_cli_engine/src/tolerance.rs
 72 crates/cerulion_cli_engine/src/topic_cmd.rs
 4 crates/cerulion_cli_engine/src/viz_client.rs
@@ -124,7 +124,7 @@
 1 crates/cerulion_core/src/flashback/switch.rs
 3 crates/cerulion_core/src/flashback/trigger.rs
 3 crates/cerulion_core/src/graph/mod.rs
-36 crates/cerulion_core/src/graph/node.rs
+21 crates/cerulion_core/src/graph/node.rs
 33 crates/cerulion_core/src/graph/partition.rs
 103 crates/cerulion_core/src/graph/runtime.rs
 20 crates/cerulion_core/src/graph/topology.rs

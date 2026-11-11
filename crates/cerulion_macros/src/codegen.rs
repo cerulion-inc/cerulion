@@ -501,6 +501,13 @@ fn strip_field_attrs_and_inject_hidden(
                 })
                 .expect("hidden field __cer_rt parses");
             fields.named.push(rt_field);
+            let plugin_field: syn::Field = syn::Field::parse_named
+                .parse2(quote! {
+                    #[doc(hidden)]
+                    pub __cer_plugin: ::std::option::Option<#__cer_root::graph::node_plugin_abi::HostClient>
+                })
+                .expect("hidden plugin field parses");
+            fields.named.push(plugin_field);
         }
     }
     output
@@ -585,6 +592,9 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn real_ns(&self) -> u64 {
+                if let ::std::option::Option::Some(client) = &self.__cer_plugin {
+                    return client.clock_real();
+                }
                 #__cer_root::clock::real_ns()
             }
 
@@ -626,6 +636,10 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn request_shutdown(&self) {
+                if let ::std::option::Option::Some(client) = &self.__cer_plugin {
+                    client.request_shutdown();
+                    return;
+                }
                 self.__cer_rt.shutdown_signal.request();
             }
         }
@@ -1805,11 +1819,19 @@ fn gen_cdylib(
         TokenStream::new()
     };
 
+    let stable = crate::plugin_codegen::generate(
+        entry_name,
+        node_name,
+        inputs,
+        outputs,
+        node_level.external,
+    );
     quote! {
         #[allow(unexpected_cfgs)]
         #[cfg(feature = "cdylib")]
         mod __cerulion_cdylib {
             use super::*;
+            #stable
 
             // Info JSON is built at first call
             // via `OnceLock` because each `#[output]` port's

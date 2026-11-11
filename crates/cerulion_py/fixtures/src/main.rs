@@ -16,6 +16,7 @@
 // extension module; its unit tests run here (see `align.rs`).
 #[path = "../../src/align.rs"]
 mod align;
+mod pinned;
 
 use cerulion_core::clock::real_ns;
 use cerulion_core::clock::RealClock;
@@ -127,8 +128,19 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
         .unwrap_or(("", &[]));
     match mode {
         "publish" | "subscribe" | "publish-typed" | "subscribe-typed" | "host-pynode"
-        | "write-bag" | "publish-hold" => {}
+        | "write-bag" | "publish-hold" | "host-pynode-pinned" => {}
         _ => return Err(format!("unknown mode '{mode}'\n{USAGE}")),
+    }
+    if mode == "host-pynode-pinned" {
+        if rest.len() != 1 {
+            return Err("host-pynode-pinned needs exactly one library path".into());
+        }
+        return Ok((
+            mode,
+            Args {
+                flags: std::collections::HashMap::new(),
+            },
+        ));
     }
     if mode == "host-pynode" {
         parse_host_pynode(rest)?;
@@ -220,6 +232,7 @@ fn run() -> Result<ExitCode, String> {
         "publish-typed" => cmd_publish_typed(&mgr, &args),
         "subscribe-typed" => cmd_subscribe_typed(&mgr, &args),
         "host-pynode" => cmd_host_pynode(&mgr, &argv[1..]),
+        "host-pynode-pinned" => pinned::run(&mgr, &argv[1]),
         _ => unreachable!("mode already validated"),
     }
 }
@@ -507,7 +520,9 @@ fn load_pynode(
 ) -> Result<LoadedNode, String> {
     let entry =
         DylibNodeEntry::load(std::path::Path::new(node_path)).map_err(|error| error.to_string())?;
-    let info = entry.info_json().map_err(|error| error.to_string())?;
+    let info = entry
+        .checked_info_json()
+        .map_err(|error| error.to_string())?;
     let document: serde_json::Value =
         serde_json::from_str(&info).map_err(|error| error.to_string())?;
     let node_name = std::path::Path::new(node_path)
