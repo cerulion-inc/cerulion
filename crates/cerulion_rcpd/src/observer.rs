@@ -75,13 +75,19 @@ impl GraphFeed {
             .upgrade()
             .ok_or("graph transport is unavailable")?;
         let mut graph = self.current().graph.clone();
-        graph
-            .catalog
-            .entries
-            .retain(|entry| manager.remote_topic_allowed(&entry.topic).unwrap_or(false));
-        graph
-            .monitors
-            .retain(|row| manager.remote_topic_allowed(&row.topic).unwrap_or(false));
+        graph.catalog.entries.retain(|entry| {
+            manager
+                .topic_publisher_count_checked(&entry.topic)
+                .is_some_and(|count| count > 0)
+                && manager.remote_topic_allowed(&entry.topic).unwrap_or(false)
+        });
+        graph.monitors.retain(|row| {
+            graph
+                .catalog
+                .entries
+                .iter()
+                .any(|entry| entry.topic == row.topic)
+        });
         let gather = manager
             .gather_live_runs(RUN_GATHER_WINDOW)
             .map_err(|error| error.to_string())?;

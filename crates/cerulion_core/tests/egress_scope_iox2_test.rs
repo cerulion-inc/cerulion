@@ -183,6 +183,8 @@ fn a_wrong_topic_attribute_cannot_authorize_remote_access() {
     let _service = node
         .service_builder(&name)
         .event()
+        .max_notifiers(64)
+        .max_listeners(64)
         .open_or_create_with_attributes(&verifier)
         .unwrap();
     let remote = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
@@ -243,9 +245,12 @@ fn a_matching_first_attribute_cannot_hide_a_different_topic_tail() {
     let _service = node
         .service_builder(&name)
         .event()
+        .max_notifiers(64)
+        .max_listeners(64)
         .open_or_create_with_attributes(&attributes)
         .unwrap();
     let remote = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
+    assert!(remote.remote_topic_allowed(&topic).is_err());
     assert!(remote.acquire_remote_topic_lease(&topic).is_err());
     assert!(remote.list_topics().unwrap().is_empty());
 }
