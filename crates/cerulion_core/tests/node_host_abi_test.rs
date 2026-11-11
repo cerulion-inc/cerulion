@@ -2639,3 +2639,388 @@ fn runtime_maintenance_protects_borrowed_input_and_delivers_an_unrelated_input()
         );
     }
 }
+
+#[derive(Clone, Default)]
+struct OutputLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for OutputLogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for OutputLogBuffer {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+impl OutputLogBuffer {
+    fn lines(&self) -> Vec<String> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("OutputProxy"))
+            .map(|line| line.trim_start().to_string())
+            .collect()
+    }
+}
+
+type LogImage = native_ros2_messages::sensor_msgs::Image;
+fn image_layout() -> PluginWireLayout {
+    PluginWireLayout {
+        schema_hash: LogImage::SCHEMA_HASH,
+        fixed_size: LogImage::WIRE_FIXED_SIZE as u32,
+        variable_fields: LogImage::VARIABLE_FIELD_COUNT as u32,
+        alignment: cerulion_core::shm_runtime::FRAME_ALIGN as u32,
+    }
+}
+fn fill_log_image(
+    writer: &mut native_ros2_messages::sensor_msgs::ImageShm<'_>,
+    data: &[u8],
+    complete: bool,
+) {
+    writer.height = 1;
+    writer.width = 1;
+    writer.is_bigendian = 0;
+    writer.step = 1;
+    writer
+        .with_header(|header| {
+            header.stamp.sec = 5;
+            if complete {
+                header.__cer_assign_frame_id("map")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    writer.__cer_assign_encoding("rgb8").unwrap();
+    writer.__cer_assign_data(data).unwrap();
+}
+fn assert_log_image(frame: &[u8], sequence: u32, data: &[u8]) {
+    let header = WireHeader::read_from_buf(frame).unwrap();
+    assert_eq!(header.schema_hash, LogImage::SCHEMA_HASH);
+    assert_eq!(header.sequence, sequence);
+    assert_eq!(header.timestamp_ns, 777);
+    assert_eq!(header.total_size as usize, frame.len());
+    let image = native_ros2_messages::sensor_msgs::ImageShm::from_bytes(&frame[40..]);
+    assert_eq!(
+        (image.height, image.width, image.is_bigendian, image.step),
+        (1, 1, 0, 1)
+    );
+    assert_eq!(image.encoding().unwrap(), "rgb8");
+    assert_eq!(image.data(), data);
+    let nested = native_ros2_messages::std_msgs::HeaderShm::from_bytes(image.header_bytes());
+    assert_eq!((nested.stamp.sec, nested.stamp.nanosec), (5, 0));
+    assert_eq!(nested.frame_id().unwrap(), "map");
+}
+fn stage_nested_error(h: &Harness, error: &str) {
+    let diagnostic =
+        format!("OutputProxy: staged nested-field flush failed; skipping publish\n{error}");
+    assert_eq!(
+        abi_call!((HOST_API.diagnostic)(
+            h.context,
+            h.output,
+            1,
+            bytes(diagnostic.as_bytes())
+        ))
+        .code,
+        0
+    );
+}
+fn native_log_oracle(topic: &str) -> Vec<String> {
+    let schema = LogImage::SCHEMA_HASH;
+    let nested = "Nested field 'header' published with an unwritten variable child field 'header.frame_id' — every variable-length field of a nested schema must be written each tick (e.g. `self.<port>.header.frame_id = …`), or write the whole field as bytes. Frame discarded.";
+    let missing = format!("ERROR OutputProxy dropped without writing all declared variable fields; skipping publish topic=\"{topic}\" schema_hash={schema}");
+    let missing_repeat = format!("DEBUG OutputProxy discard suppressed: incomplete output (missing declared variable field) recurred; skipping publish — first occurrence logged loudly at error topic=\"{topic}\" schema_hash={schema} suppressed_count=1");
+    let nested_first = format!("ERROR OutputProxy: staged nested-field flush failed; skipping publish topic=\"{topic}\" schema_hash={schema} error={nested}");
+    let nested_repeat = format!("DEBUG OutputProxy discard suppressed: staged nested-field flush recurred as a failure; skipping publish — first occurrence logged loudly at error topic=\"{topic}\" schema_hash={schema} error={nested} suppressed_count=1");
+    let recovery = format!("INFO OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again) topic=\"{topic}\" schema_hash={schema} suppressed_count=1");
+    let spill_recovery = format!("INFO OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again) topic={topic} schema_hash={schema} suppressed_count=1");
+    let tick = format!("DEBUG OutputProxy: tick did not complete — output discarded, loan released without publish topic=\"{topic}\" schema_hash={schema}");
+    vec![
+        missing.clone(),
+        missing_repeat,
+        recovery.clone(),
+        nested_first.clone(),
+        nested_repeat.clone(),
+        recovery,
+        missing,
+        nested_repeat,
+        spill_recovery,
+        nested_first,
+        tick.clone(),
+        tick,
+    ]
+}
+
+#[test]
+fn native_and_stable_output_diagnostics_match_exact_text_and_recovery_delivery() {
+    // Native's latch is keyed per output, so an alternating failure class is
+    // a suppressed repeat until a complete publish re-arms that same port.
+    for _ in 0..2 {
+        let h = Harness::new(image_layout(), None, 2);
+        let mut native = h
+            ._manager
+            .create_publisher("abi/native/logs", MaxSliceLen::try_new(4096).unwrap(), 0)
+            .unwrap();
+        let mut observer = h._manager.create_subscriber("abi/native/logs").unwrap();
+        let capture = OutputLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let spill_data = vec![0x5a; 3000];
+        // 0 missing, 1 nested, 2 normal recovery, 3 spill recovery, 4 tick failure.
+        let plan = [0, 0, 2, 1, 1, 2, 0, 1, 3, 1, 4, 4];
+        tracing::subscriber::with_default(subscriber, || {
+            for stable in [false, true] {
+                let mut sequence = 0;
+                // Deliver a complete native adaptive window before requiring
+                // an actual spill; initial capacity is the configured ceiling.
+                let warm = cerulion_core::transport::adaptive_sizer::WINDOW_SIZE;
+                for (action_index, action) in std::iter::repeat_n(2, warm).chain(plan).enumerate() {
+                    let data: &[u8] = if action == 3 { &spill_data } else { &[1] };
+                    if stable {
+                        let slot = h.loan();
+                        if action == 0 || action == 4 {
+                            h.discard(
+                                slot,
+                                if action == 0 {
+                                    abi::discard_reason::MISSING_VARIABLE
+                                } else if action_index == warm + 10 {
+                                    abi::discard_reason::TICK_FAILED
+                                } else {
+                                    abi::discard_reason::TICK_PANICKED
+                                },
+                            );
+                        } else {
+                            // SAFETY: this exclusive native lease owns the mapping until
+                            // the writer returns; no pointer or writer escapes this scope.
+                            let frame = unsafe {
+                                std::slice::from_raw_parts_mut(slot.data, slot.capacity as usize)
+                            };
+                            let mut writer = LogImage::build_writer(
+                                &mut frame[40..],
+                                cerulion_core::wire::MaxPayloadCapacity::from_max_slice_len(
+                                    MaxSliceLen::try_new(slot.configured_capacity).unwrap(),
+                                ),
+                                Arc::from("abi/oracle"),
+                            );
+                            fill_log_image(&mut writer, data, action != 1);
+                            if action == 1 {
+                                let error = LogImage::flush_staged_nested(&mut writer).unwrap_err();
+                                stage_nested_error(&h, &error.to_string());
+                                drop(writer);
+                                h.discard(slot, abi::discard_reason::NESTED_FAILED);
+                            } else {
+                                LogImage::flush_staged_nested(&mut writer).unwrap();
+                                let size = (40 + LogImage::payload_wire_size(&writer)) as u32;
+                                if action == 3 {
+                                    let spill = LogImage::overflow_view_bytes(&writer)
+                                        .expect("adaptive loan spills");
+                                    assert_eq!(
+                                        abi_call!((HOST_API.submit_spill)(
+                                            h.context,
+                                            slot.lease,
+                                            bytes(spill),
+                                            size
+                                        ))
+                                        .code,
+                                        0
+                                    );
+                                    drop(writer);
+                                    h.discard(slot, abi::discard_reason::SPILL_RELEASE);
+                                } else {
+                                    assert!(!LogImage::has_overflow(&writer));
+                                    drop(writer);
+                                    assert_eq!(
+                                        abi_call!((HOST_API.finish_output)(
+                                            h.context, slot.lease, size
+                                        ))
+                                        .code,
+                                        0
+                                    );
+                                }
+                            }
+                        }
+                        if action == 2 || action == 3 {
+                            let read = h.receive();
+                            inspect(&read, |frame| assert_log_image(frame, sequence, data));
+                            h.release(read);
+                            sequence += 1;
+                        } else {
+                            h.empty();
+                        }
+                    } else {
+                        let mut output = native.loan_proxy::<LogImage>().unwrap();
+                        match action {
+                            0 => {}
+                            4 => output.__cer_defer_publish(),
+                            _ => fill_log_image(&mut output, data, action != 1),
+                        }
+                        drop(output);
+                        let read = observer.view_raw_expecting(LogImage::SCHEMA_HASH).unwrap();
+                        if action == 2 || action == 3 {
+                            assert_log_image(&read.unwrap(), sequence, data);
+                            sequence += 1;
+                        } else {
+                            assert!(read.is_none());
+                        }
+                    }
+                }
+            }
+        });
+        let expected: Vec<_> = native_log_oracle("abi/native/logs")
+            .into_iter()
+            .chain(native_log_oracle("abi/oracle"))
+            .collect();
+        assert_eq!(capture.lines(), expected);
+        assert_eq!(native.output_discard_count(), 7);
+        let mut counters = MaybeUninit::uninit();
+        assert_eq!(
+            abi_call!((HOST_API.publisher_counters)(
+                h.context,
+                h.output,
+                counters.as_mut_ptr()
+            ))
+            .code,
+            0
+        );
+        // SAFETY: OK initializes the complete counter record.
+        let counters = unsafe { counters.assume_init() };
+        assert_eq!(
+            (counters.committed, counters.discarded),
+            (
+                cerulion_core::transport::adaptive_sizer::WINDOW_SIZE as u64 + 3,
+                7
+            )
+        );
+        assert_eq!(
+            with_context(h.context.value, |host| Ok((
+                host.outstanding_leases(),
+                host.counters().discarded
+            ))),
+            Ok((0, 9))
+        );
+    }
+}
+
+#[test]
+fn staged_nested_diagnostic_is_copied_without_logging_and_consumed_once() {
+    let h = Harness::new(vector_layout(), None, 2);
+    let capture = OutputLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(capture.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let record = b"OutputProxy: staged nested-field flush failed; skipping publish\nborrowed detail\nsecond line";
+        assert_eq!(
+            abi_call!((HOST_API.diagnostic)(h.context, h.output, 1, bytes(record))).code,
+            5
+        );
+        let slot = h.loan();
+        let mut borrowed = record.to_vec();
+        let before_staging = capture.0.lock().unwrap().len();
+        assert_eq!(
+            abi_call!((HOST_API.diagnostic)(
+                h.context,
+                h.output,
+                1,
+                bytes(&borrowed)
+            ))
+            .code,
+            0
+        );
+        borrowed.fill(b'x');
+        assert!(
+            capture.0.lock().unwrap().len() == before_staging,
+            "staging must not emit a second diagnostic"
+        );
+        // Invalid bytes and refused admission cannot replace the staged detail.
+        assert_eq!(
+            abi_call!((HOST_API.diagnostic)(
+                h.context,
+                h.output,
+                1,
+                bytes(&[0xff])
+            ))
+            .code,
+            5
+        );
+        with_context(h.context.value, |host| host.end_node_call()).unwrap();
+        assert_eq!(
+            abi_call!((HOST_API.diagnostic)(h.context, h.output, 1, bytes(record))).code,
+            9
+        );
+        assert_eq!(
+            abi_call!((HOST_API.discard_output)(
+                h.context,
+                slot.lease,
+                abi::discard_reason::NESTED_FAILED
+            ))
+            .code,
+            9
+        );
+        with_context(h.context.value, |host| host.begin_node_call()).unwrap();
+        h.discard(slot, abi::discard_reason::NESTED_FAILED);
+        assert_eq!(
+            abi_call!((HOST_API.discard_output)(
+                h.context,
+                slot.lease,
+                abi::discard_reason::NESTED_FAILED
+            ))
+            .code,
+            4
+        );
+        // A successful terminal consumes its unused detail without leaking it
+        // into a later nested failure on a new lease of the same port.
+        let complete = h.loan();
+        stage_nested_error(&h, "must not leak");
+        write_values(&complete, [1.0, 2.0, 3.0]);
+        assert_eq!(
+            abi_call!((HOST_API.finish_output)(h.context, complete.lease, 64)).code,
+            0
+        );
+        let delivered = h.receive();
+        inspect(&delivered, |frame| {
+            assert_eq!(frame, oracle_frame(0, 777, [1.0, 2.0, 3.0]))
+        });
+        h.release(delivered);
+        let empty_detail = h.loan();
+        stage_nested_error(&h, "");
+        h.discard(empty_detail, abi::discard_reason::NESTED_FAILED);
+        let missing_detail = h.loan();
+        h.discard(missing_detail, abi::discard_reason::NESTED_FAILED);
+        h.empty();
+    });
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("staged nested-field flush failed; skipping publish")
+            .count(),
+        2
+    );
+    assert!(logs.contains("error=borrowed detail\nsecond line\n"));
+    assert!(logs.contains(&format!("schema_hash={} error=\n", Vector3::SCHEMA_HASH)));
+    assert!(logs.contains(&format!(
+        "schema_hash={} suppressed_count=1\n",
+        Vector3::SCHEMA_HASH
+    )));
+    assert!(!logs.contains("must not leak"));
+    assert!(!logs.contains("node diagnostic"));
+    assert_eq!(
+        with_context(h.context.value, |host| Ok((
+            host.outstanding_leases(),
+            host.counters().discarded
+        ))),
+        Ok((0, 3))
+    );
+}

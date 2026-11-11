@@ -91,6 +91,8 @@ struct BoundPort {
     offered_this_fire: bool,
     observed_frames: Box<[bool]>,
     diagnostics: crate::transport::failure_regime_latch::FailureRegimeLatch,
+    // Cold, borrowed nested-flush diagnostic copied until its own terminal.
+    pending_nested_error: Option<String>,
 }
 
 enum NativeLease {
@@ -147,8 +149,10 @@ pub struct HostLeaseCounters {
 pub enum HostDiscardReason {
     /// User tick or input preamble did not complete.
     TickFailed,
-    /// Required variable writes or nested flush did not complete.
-    Incomplete,
+    /// Required variable writes did not complete.
+    MissingVariable,
+    /// A staged nested-field flush failed.
+    NestedFailed,
     /// An unsent output was abandoned during teardown.
     Teardown,
     /// Original spill slot is released after its writer has been destroyed.
@@ -412,6 +416,7 @@ impl HostContext {
                         accumulated_borrows: 0,
                         offered_this_fire: false,
                         observed_frames,
+                        pending_nested_error: None,
                         diagnostics:
                             crate::transport::failure_regime_latch::FailureRegimeLatch::new(),
                     }
@@ -752,6 +757,7 @@ impl HostContext {
                 invariant_counted: false,
             },
         )?;
+        self.ports[index].pending_nested_error = None;
         self.ports[index].busy = true;
         Ok(slot)
     }
@@ -788,6 +794,7 @@ impl HostContext {
             return Err(HostServiceError::InvalidDescriptor);
         };
         self.ports[index].busy = false;
+        self.ports[index].pending_nested_error = None;
         // The protected original header is host-authoritative, including the
         // loan timestamp, provisional sequence and current native step stamp.
         if suppressed {
@@ -942,6 +949,8 @@ impl HostContext {
         let suppressed = self.output_publisher(index)?.replay_suppress_active();
         let owner = self.leases.take(token, port, LeaseDirection::Write)?;
         self.ports[index].busy = false;
+        let nested_error = self.ports[index].pending_nested_error.take();
+        let schema_hash = self.ports[index].spec.layout.schema_hash;
         drop(owner);
         if suppressed || reason == HostDiscardReason::ReplaySuppressed {
             return Ok(());
@@ -950,22 +959,33 @@ impl HostContext {
             return Ok(());
         }
         let publisher = self.output_publisher(index)?;
-        if reason == HostDiscardReason::TickFailed {
-            publisher.bump_discard_signal();
-        }
-        if reason == HostDiscardReason::Incomplete {
-            use crate::transport::output_discard_latch::DiscardLogLevel;
-            match publisher.record_output_discard() {
-                DiscardLogLevel::Error => tracing::error!(
-                    topic = publisher.topic(),
-                    "plugin output incomplete; frame discarded"
-                ),
-                DiscardLogLevel::Debug { suppressed } => tracing::debug!(
-                    topic = publisher.topic(),
-                    suppressed_count = suppressed,
-                    "plugin incomplete-output discard repeated"
-                ),
+        use crate::transport::output_proxy::{
+            log_missing_variable, log_nested_failure, log_tick_failed,
+        };
+        match reason {
+            HostDiscardReason::TickFailed => {
+                publisher.bump_discard_signal();
+                log_tick_failed(publisher.topic(), schema_hash);
             }
+            HostDiscardReason::MissingVariable => {
+                let level = publisher.record_output_discard();
+                log_missing_variable(publisher.topic(), schema_hash, level);
+            }
+            HostDiscardReason::NestedFailed => {
+                let level = publisher.record_output_discard();
+                log_nested_failure(
+                    publisher.topic(),
+                    schema_hash,
+                    nested_error
+                        .as_ref()
+                        .map(|error| error as &dyn std::fmt::Display),
+                    level,
+                );
+            }
+            HostDiscardReason::Teardown
+            | HostDiscardReason::SpillRelease
+            | HostDiscardReason::ReplaySuppressed
+            | HostDiscardReason::Invariant => {}
         }
         if reason == HostDiscardReason::Invariant || missing_attempt {
             publisher.record_invariant_violation_drop();
@@ -1837,7 +1857,8 @@ host_callback!(callback_typed_discard(context, lease: abi::LeaseHandle, reason: 
     let port = lease_port(host, lease, LeaseDirection::Write)?;
     let reason = match reason {
         abi::discard_reason::TICK_FAILED | abi::discard_reason::TICK_PANICKED => HostDiscardReason::TickFailed,
-        abi::discard_reason::MISSING_VARIABLE | abi::discard_reason::NESTED_FAILED => HostDiscardReason::Incomplete,
+        abi::discard_reason::MISSING_VARIABLE => HostDiscardReason::MissingVariable,
+        abi::discard_reason::NESTED_FAILED => HostDiscardReason::NestedFailed,
         abi::discard_reason::REPLAY_SUPPRESSED => HostDiscardReason::ReplaySuppressed,
         abi::discard_reason::SPILL_RELEASE => HostDiscardReason::SpillRelease,
         abi::discard_reason::INVARIANT => HostDiscardReason::Invariant,
@@ -2091,6 +2112,14 @@ host_callback!(callback_diagnostic(context, port: abi::PortHandle, level: u32, t
         let index = (port.value as u32).checked_sub(1).ok_or(LeaseError::InvalidHandle)? as usize;
         let bound = host.ports.get(index).ok_or(LeaseError::InvalidHandle)?;
         host.port_index(context.value, port.value, bound.spec.direction)?;
+        if level == 1 && bound.spec.direction == LeaseDirection::Write {
+            if let Some(error) = text.strip_prefix("OutputProxy: staged nested-field flush failed; skipping publish\n") {
+                if !bound.busy { return Err(HostServiceError::InvalidDescriptor); }
+                // hot-path-alloc-ok: malformed nested output detail is copied only on the cold error path.
+                host.ports[index].pending_nested_error = Some(error.to_owned());
+                return Ok(status(abi::status_code::OK));
+            }
+        }
         &mut host.ports[index].diagnostics
     };
     if level <= 2 {
@@ -2417,7 +2446,8 @@ mod tests {
         .unwrap();
         for reason in [
             HostDiscardReason::TickFailed,
-            HostDiscardReason::Incomplete,
+            HostDiscardReason::MissingVariable,
+            HostDiscardReason::NestedFailed,
             HostDiscardReason::Invariant,
             HostDiscardReason::Teardown,
             HostDiscardReason::ReplaySuppressed,
