@@ -526,8 +526,8 @@ fn relay_for(topic: &str) -> &'static str {
     }
 }
 
-/// One run of [`RUNS`]. Under `paired` no frame reaches either relay and no
-/// ingress bridge exists. Under `open` the right-hash frames on the ingress
+/// One run of [`RUNS`]. Under `paired` authenticated ingress is refused
+/// before graph startup and no ingress bridge exists. Under `open` the right-hash frames on the ingress
 /// topic reach its relay, the wrong-hash ones are counted drops that never
 /// reach it, and nothing reaches the relay of the other topic. The desk is
 /// demanded the ingress topic only.
@@ -554,6 +554,36 @@ fn lan_run(
             "ingress": [ingress],
         })
     };
+    if paired {
+        for _ in 0..2 {
+            let error = runtime
+                .start(&config.to_string())
+                .expect_err("this embedded host cannot import authenticated graph inputs");
+            assert_eq!(error.code(), codes::INVALID_ARGUMENT);
+            assert_eq!(
+                error.to_string(),
+                "authenticated graph ingress is unavailable in this embedded host; use the explicit open LAN compatibility path"
+            );
+            assert_eq!(
+                runtime.status_handle().lock().unwrap().state,
+                RuntimeState::Failed
+            );
+            for topic in [ingress, other] {
+                assert!(!is_ingress_registered(topic));
+                assert!(ingress_stats(topic).is_none());
+            }
+            assert_eq!(demand_set_size(), 0);
+        }
+        // The existing paired listener remains closed to this real peer's
+        // catalog queries and attempted writes after the rejected start.
+        touch(dir, &format!("{run}.go"));
+        await_step(&mut desk.0, dir, &format!("{run}.done"), log_path);
+        assert_eq!(
+            fs::read_to_string(signal_path(dir, &format!("{run}.gets"))).unwrap(),
+            ""
+        );
+        return;
+    }
     runtime.start(&config.to_string()).unwrap();
     let manager = TransportManager::get().expect("initialized app transport manager");
     let ingress_echo = manager
@@ -565,7 +595,7 @@ fn lan_run(
     let mut ingress_echoes = Vec::new();
     let mut other_echoes = Vec::new();
     touch(dir, &format!("{run}.go"));
-    if !paired {
+    {
         // Until the first right-hash frame is echoed and a wrong-hash one
         // was counted.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -605,15 +635,7 @@ fn lan_run(
         "{run}: '{other}' has no bridge"
     );
     let gets = fs::read_to_string(signal_path(dir, &format!("{run}.gets"))).unwrap();
-    if paired {
-        assert_eq!(ingress_echoes, Vec::<f64>::new(), "{run}: '{ingress}'");
-        assert!(!is_ingress_registered(ingress), "{run}: '{ingress}'");
-        assert!(ingress_stats(ingress).is_none(), "{run}: '{ingress}'");
-        assert_eq!(gets, "", "{run}: a paired app sends no demand GET");
-        // The GET record covers less than one loop interval; the demand set
-        // the loop reads is empty, so no pass would GET a topic either.
-        assert_eq!(demand_set_size(), 0, "{run}: a paired app demands nothing");
-    } else {
+    {
         assert!(
             ingress_echoes.iter().all(|&x| x == RIGHT_X),
             "{run}: only right-hash frames reach the node: {ingress_echoes:?}"

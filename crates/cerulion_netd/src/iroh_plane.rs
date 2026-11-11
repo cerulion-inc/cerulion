@@ -1247,6 +1247,7 @@ impl IrohMirrorPlane {
             .robot_round_trip(
                 robot_conn,
                 &WireRequest::Demand {
+                    graph_ingress: !key.observer,
                     topic: key.topic.clone(),
                 },
             )

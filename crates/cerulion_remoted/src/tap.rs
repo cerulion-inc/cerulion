@@ -65,6 +65,7 @@ const CATALOG_PEEK_BUDGET: Duration = Duration::from_millis(750);
 /// [`Self::stop`] to also wait for the teardown: it joins the drain thread,
 /// so the SHM slot is released before it returns, and it reaps the writer.
 struct DemandedTopic {
+    graph_ingress: bool,
     channel: Arc<ForwardChannel>,
     drain: Option<JoinHandle<()>>,
     writer: task::JoinHandle<()>,
@@ -161,21 +162,25 @@ impl TapManager {
         connection: &Connection,
         topic: &str,
     ) -> Result<(), WireError> {
-        self.demand_with_qos(manager, connection, topic, None).await
+        self.demand_with_qos(manager, connection, topic, None, false)
+            .await
     }
 
     /// Demand with the producer's resolved queue policy. A graph policy is
-    /// authoritative; unsupported datagram delivery fails before a tap opens.
+    /// authoritative for imports; observers retain their best-effort queue.
     pub async fn demand_with_qos(
         &mut self,
         manager: &Arc<TransportManager>,
         connection: &Connection,
         topic: &str,
         qos: Option<&cerulion_core::EgressQos>,
+        graph_ingress: bool,
     ) -> Result<(), WireError> {
-        if qos.is_some_and(|qos| {
-            qos.topic != topic || qos.reliability != cerulion_core::EgressReliability::Reliable
-        }) {
+        if graph_ingress
+            && qos.is_some_and(|qos| {
+                qos.topic != topic || qos.reliability != cerulion_core::EgressReliability::Reliable
+            })
+        {
             return Err(WireError::DemandFailed {
                 topic: topic.to_owned(),
                 reason: "authenticated wire ingress requires a matching reliable producer policy"
@@ -184,6 +189,12 @@ impl TapManager {
         }
         if let Some(existing) = self.demanded.get(topic) {
             if existing.is_alive() {
+                if existing.graph_ingress != graph_ingress {
+                    return Err(WireError::DemandFailed {
+                        topic: topic.to_owned(),
+                        reason: "cannot change a retained stream's graph import mode".into(),
+                    });
+                }
                 return Ok(()); // idempotent: already tapped + streaming
             }
             // The topic's forward stream DIED (writer error). Reap the
@@ -210,18 +221,19 @@ impl TapManager {
                 reason: e.to_string(),
             })?;
 
-        if qos.is_some() && tap.publisher_count() != 1 {
+        if graph_ingress && tap.publisher_count() != 1 {
             return Err(WireError::DemandFailed {
                 topic: topic.to_owned(),
                 reason: "authenticated graph ingress requires exactly one live producer".into(),
             });
         }
-        let channel = Arc::new(match qos {
-            Some(qos) => ForwardChannel::reliable(qos.send_queue.unwrap_or_else(|| {
+        let channel = Arc::new(if graph_ingress {
+            ForwardChannel::reliable(qos.and_then(|qos| qos.send_queue).unwrap_or_else(|| {
                 std::num::NonZeroUsize::new(tap.buffer_size())
                     .expect("a live tap has a nonzero queue")
-            })),
-            None => ForwardChannel::new(),
+            }))
+        } else {
+            ForwardChannel::new()
         });
 
         // Open the per-topic uni data stream (robot → desk) and lead it with a
@@ -261,6 +273,7 @@ impl TapManager {
         self.demanded.insert(
             topic.to_string(),
             DemandedTopic {
+                graph_ingress,
                 channel,
                 drain: Some(drain),
                 writer,
@@ -386,8 +399,8 @@ fn run_drain(mut tap: DataOnlySubscriber, channel: Arc<ForwardChannel>, topic: S
 
 /// The writer task body: pop queued frames and `write_frame` them on the topic's
 /// uni stream. It ALONE blocks on QUIC flow control — a stall fills the channel,
-/// which drop-to-lives. Each `write_frame` runs to COMPLETION (never inside a
-/// `select!`) so the stream is never left mid-frame (framing cancel-safety).
+/// which drops old observer frames or refuses new import frames. Each write
+/// completes before another begins, preserving framing cancel-safety.
 async fn run_writer(
     mut send: cerulion_link::SendStream,
     channel: Arc<ForwardChannel>,
@@ -528,6 +541,7 @@ mod tests {
         });
         let writer = task::spawn(std::future::pending::<()>());
         drop(DemandedTopic {
+            graph_ingress: false,
             channel,
             drain: Some(drain),
             writer,

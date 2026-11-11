@@ -3145,7 +3145,7 @@ jobs:
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: |
-          cargo build -p cerulion_cli
+          cargo build -p cerulion_cli -p test_node_macro_data_trigger_cdylib
           cargo test -p cerulion_netd --features wan
       # The SKIP BRANCH of the gate above. A skipped step prints nothing of
       # its own, so the one line that says what the selection dropped lives
@@ -4000,7 +4000,7 @@ jobs:
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: |
-          cargo build -p cerulion_cli
+          cargo build -p cerulion_cli -p test_node_macro_data_trigger_cdylib
           cargo test -p cerulion_netd --features wan
       - name: selection marker, cerulion_netd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}

@@ -1,18 +1,18 @@
 # cerulion_cli_engine
 
-CLI logic; parser in `cerulion_cli`. Workspace writers (`node create/delete/modify`, `node stage`,
-`graph create/partition`, `graph run`'s auto-partition persist,
-`ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
+Logic; parser in `cerulion_cli`. Workspace writers (node/graph/schema edits,
+partition and ROS 2 writes) hold
 `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`, kernel flock shared with wsd) across check/write; same-thread reentrant, others wait (one warn); UNIX only, elsewhere no-op.
 Reads use `acquire_read` (creates nothing; refuses a same-thread re-entry); all
 refuse a symlinked `.cerulion`. ONLY `acquire_and_track_gitignore` writes a
 TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
-Stage nodes only via `graph_cmd::stage_declared_node` (declared ports).
+Stage via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
 - Bounded account/pair catalogs; source-qualified observers require collision selectors; offline caches fence identity.
 - Graph/node scope precedes services/workers, also recording: off/inert excludes all topics, strict outputs outside egress. Drop guards after ports/workers.
-- Engine enforces invariants; CLI checks are UX.
+- Paired graphs gate producers with serving_authority; resolve canonical ingress before GO, retain pinned demands, refuse schema/QoS/writer mismatches.
+- Engine enforces invariants; CLI aids users.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.
 - `account_robot_access`: only netd opens WAN. Probes share 4 s (500 ms/robot), never pair/demand. Automatic catalogs share another 4 s deadline, coalesce by endpoint key. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,

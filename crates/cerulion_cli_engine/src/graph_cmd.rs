@@ -12,6 +12,9 @@ use cerulion_core::DylibNodeEntry;
 
 use crate::error::{CliError, CliResult};
 use crate::workspace_lock::WorkspaceLock;
+
+#[cfg(unix)]
+mod authenticated_ingress;
 // The shared surgical-splice scanner `node stage` appends
 // through (the same one `partition_emit` rewrites `process_groups:` with).
 use crate::yaml_splice::{
@@ -4949,6 +4952,8 @@ struct NetdEgressGuard {
 enum NetworkEgressHandle {
     /// A spawned per-run gateway child (robot / degrade-fallback path).
     Child(GatewayChild),
+    #[cfg(unix)]
+    Paired(authenticated_ingress::PairedGraphNetwork),
     /// An egress registration held on the shared netd daemon (desk path). The guard is
     /// held ONLY for its Drop (connection-close = release), so its field is never read
     /// (Drop is not a read to the dead-code lint) — the `Netd(_)` arm in
@@ -4959,6 +4964,14 @@ enum NetworkEgressHandle {
 }
 
 impl NetworkEgressHandle {
+    fn check(&self) -> CliResult<()> {
+        #[cfg(unix)]
+        if let Self::Paired(network) = self {
+            return network.check();
+        }
+        Ok(())
+    }
+
     /// Forward a graceful teardown once the run loop has exited. For a
     /// gateway CHILD this forwards a SIGINT + bounded grace before its Drop SIGKILL
     /// backstop (closing the directed-kill gap). For the NETD path there is no child to
@@ -4968,6 +4981,8 @@ impl NetworkEgressHandle {
     fn forward_shutdown(&self, graph_name: &str) {
         match self {
             NetworkEgressHandle::Child(child) => child.forward_shutdown(graph_name),
+            #[cfg(unix)]
+            NetworkEgressHandle::Paired(_) => {}
             #[cfg(unix)]
             NetworkEgressHandle::Netd(_) => {
                 tracing::debug!(
@@ -5067,47 +5082,42 @@ pub(crate) fn netd_posture_acceptable(
         || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
-/// Establish the network-egress overlay for a real-clock live run. `None`
-/// launch ⇒ `None` (LOCAL-ONLY).
-///
-/// **netd is THE desk egress path BY DEFAULT.** A producing graph's egress converges
-/// onto the machine's ONE shared `cerulion-netd` session (Principle #8), spawning netd
-/// detached + refcounting exactly like the ingress consumers — so a desk producing +
-/// consuming remote topics runs ONE zenoh session, not a per-run gateway per graph. The
-/// per-run gateway CHILD remains for exactly two cases:
-///
-/// 1. **STRICT posture (a permanent routing rule, NOT a TODO).** An explicit `network:`
-///    block resolves to [`RunNetwork::Strict`] — VERBATIM zenoh locators + an egress
-///    ALLOW-LIST + declared ingress. netd's shared session has ITS OWN locator config
-///    and boots its embedded gateway PERMISSIVE (`AllowAll`), and — as documented in
-///    `cerulion_netd::egress` — constraining that shared gateway to a per-registration
-///    allow-list is structurally infeasible in the current `GatewayRuntime`. So a
-///    Strict run's two defining properties are un-representable on the shared session;
-///    it is routed to a per-run gateway child that honors the block VERBATIM. **Strict
-///    ⇒ child; Permissive ⇒ netd** is the standing routing rule.
-/// 2. **netd UNREACHABLE / a namespace MISMATCH.** A netd registration failure (netd
-///    unspawnable, or the run resolved a DIFFERENT iceoryx2 namespace than netd — netd
-///    verifies the forwarded `ix_config_json`) degrades LOUDLY to the per-run child
-///    (never silently networkless — the same warn-but-run posture as
-///    `spawn_gateway_or_warn`), which runs on the run's OWN namespace.
-///
-/// `ix_config_json` is the run's resolved iceoryx2 namespace — `Some` for a
-/// multi-process deployment (forwarded to netd for verification), `None` for a monolith
-/// (it shares netd's default namespace by construction). It is threaded to BOTH the
-/// netd registration (verification) AND the child gateway (which taps SHM on it).
+/// Paired runs hold authenticated egress registrations and canonical ingress
+/// demands on netd. Explicit open compatibility retains the locator-based path.
+/// Call after full-topology data services exist; every paired failure is loud.
 fn establish_network_egress(
     launch: Option<&GatewayLaunch>,
     graph_name: &str,
     workspace_root: &Path,
     ix_config_json: Option<String>,
-) -> Option<NetworkEgressHandle> {
-    let launch = launch?;
+    running: Arc<AtomicBool>,
+) -> CliResult<Option<NetworkEgressHandle>> {
+    #[cfg(not(unix))]
+    let _ = &running;
+    let Some(launch) = launch else {
+        return Ok(None);
+    };
+    if cerulion_core::LanAccess::from_env() == cerulion_core::LanAccess::Paired {
+        if launch.plan.announce.is_empty() && launch.plan.ingress.is_empty() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        return authenticated_ingress::PairedGraphNetwork::start(
+            launch,
+            ix_config_json.as_deref(),
+            graph_name,
+            running,
+        )
+        .map(|guard| Some(NetworkEgressHandle::Paired(guard)));
+        #[cfg(not(unix))]
+        return Err(CliError::Validation("authenticated graph networking requires the local netd control service on this platform".into()));
+    }
     // Permissive egress converges onto the shared cerulion-netd session (Unix only —
-    // netd is a Unix daemon). Strict is a permanent child-routing rule; non-Unix has no
+    // netd is a Unix daemon). Explicit Open strict uses its locator-based child; non-Unix has no
     // netd, so both fall through to the per-run gateway child below.
     #[cfg(unix)]
     if launch.posture == cerulion_core::NetworkPosture::Strict {
-        // Strict = child, by design (routing rule, not a degrade — see the doc above).
+        // Explicit Open strict preserves the declared locator-based path.
         tracing::debug!(
             graph = %graph_name,
             "STRICT egress posture (explicit `network:` block) is routed to a per-run gateway child, which honors the verbatim locators + egress allow-list — netd's shared permissive session cannot represent Strict"
@@ -5120,7 +5130,7 @@ fn establish_network_egress(
                     crate::tcp_idle_warning::EgressRoute::Netd,
                     &launch.plan,
                 );
-                return Some(NetworkEgressHandle::Netd(guard));
+                return Ok(Some(NetworkEgressHandle::Netd(guard)));
             }
             Err(e) => {
                 tracing::warn!(
@@ -5132,13 +5142,17 @@ fn establish_network_egress(
             }
         }
     }
-    let child = spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)?;
+    let Some(child) =
+        spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)
+    else {
+        return Ok(None);
+    };
     crate::tcp_idle_warning::warn_if_tcp_egress_idle_resets(
         graph_name,
         crate::tcp_idle_warning::EgressRoute::Child(&launch.network),
         &launch.plan,
     );
-    Some(NetworkEgressHandle::Child(child))
+    Ok(Some(NetworkEgressHandle::Child(child)))
 }
 
 /// An AddrInUse-class session-open failure — the ONLY class the
@@ -5209,7 +5223,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             handoff_path.display()
         ))
     })?;
-    crate::login_cmd::require_serving_login()?;
+    cerulion_netd::serving_login::require_serving_authority()
+        .map_err(|error| CliError::Validation(error.into()))?;
     let graph_name = handoff.graph_name.clone();
     let permissive = handoff.posture == GatewayPostureCarrier::PermissiveDefault;
 
@@ -6079,19 +6094,23 @@ pub fn graph_run(
         )));
     }
 
-    // Resolve the network DECISION EARLY, before the auto-partition
-    // pre-flight can write the graph file (the rule: a refused run leaves
-    // the file byte-untouched). Networked multi-process is FIRST-CLASS,
-    // so run SHAPE is NOT an input; the ONE
-    // decision drives both run shapes. Recording with a declared `ingress:`
-    // network block, and serving with no prior login, both refuse before any
-    // file mutation. The graph/worker processes
-    // stay network-free (`network: None`); the separate GATEWAY process owns
-    // the network plane. The `network:` block is unaffected by partitioning, so
-    // deciding on the pre-preflight config is stable.
+    // Resolve recording and producer authority before partitioning mutates files.
+    // Local workers share SHM; paired networking is held on netd, and explicit
+    // open compatibility uses its locator-based gateway.
     let run_network = resolve_run_network(&config, network_off, time_source, record.is_some())?;
-    if run_network.network_config().is_some() {
-        crate::login_cmd::require_serving_login()?;
+    let will_serve = match &run_network {
+        RunNetwork::Strict(_) => config
+            .network
+            .as_ref()
+            .is_some_and(|network| !network.egress.is_empty()),
+        RunNetwork::Permissive(_) => {
+            config.nodes.iter().any(|node| !node.outputs.is_empty()) || config.has_ros2_nodes()
+        }
+        RunNetwork::Off | RunNetwork::Inert => false,
+    };
+    if will_serve {
+        cerulion_netd::serving_login::require_serving_authority()
+            .map_err(|error| CliError::Validation(error.into()))?;
     }
     // The permissive default applies to every normal
     // real-clock live run reaching this function — `graph run`, `node run`'s
@@ -6734,26 +6753,17 @@ pub fn graph_run(
     // transport for the deterministic-live gating clock + the ordered bagd
     // handshake/teardown), so it fully replaces the `match time_source` below.
     if let Some(record_dir) = record {
-        // `--record` KEEPS the network — announces + egress stay ON
-        // while recording (the robot stays visible). The GATEWAY runs as a
-        // separate process tapping the recording graph's SHM, so the recording
-        // transport itself stays `network: None` (graph process is
-        // network-free). A record+declared-ingress run was already refused at
-        // `resolve_run_network`, so any `gateway_launch` here is
-        // egress-only or permissive. The guard's `Drop` reaps the gateway when
-        // the recording run returns (its network never bleeds into the bag).
-        // This arm still relies on the Drop SIGKILL backstop
-        // (no graceful `forward_shutdown` call on teardown, unlike the non-record
-        // monolith arm); a graceful forward here — so a directed
-        // `kill <graph-pid>` / SIGTERM also reaches the gateway cleanly — is not
-        // implemented. No orphan either way (Drop reaps on every exit path).
+        // Recording retains egress on the authenticated registration or explicit
+        // open gateway. Declared ingress was refused by resolve_run_network;
+        // graph data stays network-free and teardown releases the held handle.
         let _gateway = establish_network_egress(
             gateway_launch.as_ref(),
             config.identity(),
             workspace_root,
             None,
-        );
-        return ros2_children.finish(run_graph_recording(RecordingRun {
+            running.clone(),
+        )?;
+        let recorded = run_graph_recording(RecordingRun {
             embed_config: &embed_config,
             workspace_root,
             graphs_dir,
@@ -6785,7 +6795,11 @@ pub fn graph_run(
                 !ros2_entries.is_empty(),
                 _run_descriptor.is_some(),
             ),
-        }));
+        });
+        if let Some(network) = &_gateway {
+            network.check()?;
+        }
+        return ros2_children.finish(recorded);
     }
 
     // Inputs to the graph-aware CPU C-state cap, read once.
@@ -6926,25 +6940,8 @@ pub fn graph_run(
                     network: None,
                 })?;
             let _exclusions = exclude_run_topics(&transport, &excluded_topics)?;
-            // Spawn the network GATEWAY process (monolith arm). `None`
-            // ⇒ LOCAL-ONLY (Off/Inert). The guard is held across `run_live`
-            // and its `Drop` SIGKILLs + reaps the gateway on every exit path
-            // (clean, Ctrl+C, error). The gateway joins the DEFAULT iceoryx2
-            // namespace (this graph's `init` uses it too), so `ix_config_json =
-            // None`. `run_live` blocks this thread, so mid-run death detection
-            // is the guard's own watcher thread: a
-            // gateway crash warns once ("run continues LOCAL-ONLY") + reaps —
-            // no zombie, no silent drop off the network.
-            //
-            // The guard is actively used (not just held for Drop):
-            // once `run_live` returns (the run loop exited), the graph process
-            // FORWARDS a graceful SIGINT to it before the Drop SIGKILL backstop.
-            let gateway_child = establish_network_egress(
-                gateway_launch.as_ref(),
-                config.identity(),
-                workspace_root,
-                None,
-            );
+            // Build canonical services at their full consumer capacity before
+            // any authenticated remote injector acquires the single writer.
             // Resolve the live-loop monitor-wait park policy BEFORE
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
@@ -6991,6 +6988,13 @@ pub fn graph_run(
                     Some(&schema_hashes),
                     mw_policy,
                 )?;
+            let gateway_child = establish_network_egress(
+                gateway_launch.as_ref(),
+                graph_name,
+                workspace_root,
+                None,
+                running.clone(),
+            )?;
             // The effective park verdict (see
             // `effective_park_for_cap` — plan-time external-node predicate via
             // `external_policy_node_ids`; safe over-approximation of the runtime
@@ -7257,6 +7261,7 @@ pub fn graph_run(
             // path above this is skipped — Drop's SIGKILL is the backstop there.
             if let Some(gw) = gateway_child.as_ref() {
                 gw.forward_shutdown(graph_name);
+                gw.check()?;
             }
             tracing::info!(graph = %graph_name, "shutting down");
             fatal_nodes = runtime.node_fatal_errors();
@@ -12555,6 +12560,20 @@ fn graph_run_supervisor(
         }
     }
 
+    // Resolve authenticated ingress only after full-topology precreation and
+    // READY, before workers execute. A refusal tears down every waiting worker.
+    let _gateway_child = if running.load(Ordering::Relaxed) {
+        establish_network_egress(
+            gateway_launch.as_ref(),
+            config.identity(),
+            workspace_root,
+            Some(deploy_cfg_json.clone()),
+            running.clone(),
+        )?
+    } else {
+        None
+    };
+
     // (10.5) GO — every worker is built + READY (all publishers attached, all
     // subscribers connected) AND, when recording, bagd is armed (10.4), so
     // release them ALL at once: each worker blocks
@@ -12757,35 +12776,6 @@ fn graph_run_supervisor(
         &classify_state_ring_consumer(window_outcome, armed_tag.is_some()),
     );
 
-    // (10.6) spawn the network GATEWAY beside the workers — ONE per
-    // running graph, joining the SAME supervisor-minted deployment iceoryx2
-    // namespace (`deploy_cfg_json`) so it taps the workers' produced topics for
-    // egress. The gateway is NOT a DAG worker: it is held in a SEPARATE guard
-    // (its `Drop` SIGKILLs + reaps at every supervisor exit path), never in
-    // `guards`, so its death never trips the JOIN loop's `--peer-loss`
-    // semantics. Mid-run death detection is the guard's own watcher thread
-    // (the same once-loud LOCAL-ONLY warn as the monolith
-    // arms), so the JOIN loop carries no gateway polling. Spawned AFTER GO
-    // (services exist) and only while `running` (a Ctrl-C'd spawn phase skips
-    // it). `None` gateway ⇒ LOCAL-ONLY run.
-    //
-    // Like the `--record` monolith arm, the supervisor still
-    // relies on the guard's Drop SIGKILL backstop for the gateway (no graceful
-    // `forward_shutdown` on the directed-kill path — only the non-record
-    // monolith arm forwards a graceful SIGINT). The graceful forward is not wired into
-    // the supervisor teardown — no orphan either way (Drop reaps
-    // at every supervisor exit path).
-    let _gateway_child = if running.load(Ordering::Relaxed) {
-        establish_network_egress(
-            gateway_launch.as_ref(),
-            config.identity(),
-            workspace_root,
-            Some(deploy_cfg_json.clone()),
-        )
-    } else {
-        None
-    };
-
     // (11) JOIN loop — the multi-process lifecycle contract.
     //
     // States:
@@ -12837,6 +12827,10 @@ fn graph_run_supervisor(
     // node stopped on `NodeError::Fatal`. Folded into the verdict below (exit 3).
     let mut node_fatal_groups: Vec<String> = Vec::new();
     loop {
+        if let Some(network) = &_gateway_child {
+            network.check()?;
+        }
+
         // Ctrl-C → enter Draining AND SIGINT every remaining worker.
         // Sending NOTHING here would assume the workers "received the same
         // process-group SIGINT" — true only when the signal source targets the
@@ -31861,6 +31855,7 @@ process_groups:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // netd is THE desk egress path BY DEFAULT — no knob. A PERMISSIVE run with
         // a reachable netd routes through it, spawning NO per-run gateway child.
         let (netd, dir, egress) = start_spy_netd();
@@ -31875,8 +31870,15 @@ process_groups:
         );
         let ws = tempfile::tempdir().unwrap();
         // A MONOLITH run (ix_config_json None — it shares netd's default namespace).
-        let handle = establish_network_egress(Some(&launch), "deskgraph", ws.path(), None)
-            .expect("establish returns a handle on the reachable-netd path");
+        let handle = establish_network_egress(
+            Some(&launch),
+            "deskgraph",
+            ws.path(),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .expect("establish returns a handle on the reachable-netd path");
 
         // The DESK default: the netd variant — NO gateway child was spawned (the Child
         // variant is the ONLY spawning arm).
@@ -31915,6 +31917,7 @@ process_groups:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // A MULTI-PROCESS permissive run forwards its resolved namespace
         // (ix_config_json Some) THROUGH netd for verification. Against the accepting spy
         // plane it routes through netd (Netd handle, no child) AND the forwarded config
@@ -31932,9 +31935,15 @@ process_groups:
         );
         let ws = tempfile::tempdir().unwrap();
         let cfg = r#"{"global":{"prefix":"iox2_"}}"#.to_string();
-        let handle =
-            establish_network_egress(Some(&launch), "mpgraph", ws.path(), Some(cfg.clone()))
-                .expect("mp permissive run routes through netd");
+        let handle = establish_network_egress(
+            Some(&launch),
+            "mpgraph",
+            ws.path(),
+            Some(cfg.clone()),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .expect("mp permissive run routes through netd");
 
         assert!(
             matches!(handle, NetworkEgressHandle::Netd(_)),
@@ -31959,6 +31968,7 @@ process_groups:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // A permissive run, but netd is unreachable (no daemon on the socket) AND
         // unspawnable (a nonexistent binary) → `register_egress_with_netd` Errs →
         // establish DEGRADES LOUDLY to the per-run gateway CHILD path (never silently
@@ -31994,7 +32004,14 @@ process_groups:
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&missing_ws);
-        let handle = establish_network_egress(Some(&launch), "deskgraph", &missing_ws, None);
+        let handle = establish_network_egress(
+            Some(&launch),
+            "deskgraph",
+            &missing_ws,
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
         assert!(
             handle.is_none(),
             "netd unreachable AND the fallback child spawn also failing → LOCAL-ONLY (no handle)"
@@ -32020,6 +32037,7 @@ process_groups:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // STRICT posture (an explicit `network:` block) is a PERMANENT routing rule
         // — it goes to a per-run gateway child (which honors the verbatim locators +
         // egress allow-list), NOT netd, EVEN when netd is reachable. netd's shared
@@ -32049,7 +32067,14 @@ process_groups:
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&missing_ws);
-        let handle = establish_network_egress(Some(&launch), "deskgraph", &missing_ws, None);
+        let handle = establish_network_egress(
+            Some(&launch),
+            "deskgraph",
+            &missing_ws,
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
 
         // The netd path was NOT taken — the reachable daemon's egress plane was never
         // called.
