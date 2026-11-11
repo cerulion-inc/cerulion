@@ -2,7 +2,7 @@
 name = "test_node_sync_op_fail_cdylib"
 version = "0.1.0"
 edition = "2021"
-description = "Checked sync node fixture with inert legacy maintenance traps"
+description = "Checked sync node fixture"
 publish = false
 
 [lib]

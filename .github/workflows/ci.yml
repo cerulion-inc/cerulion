@@ -1384,7 +1384,7 @@ jobs:
             exit 1
           fi
           echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
-      # doc-pin: this binary checks actual compiler provenance, downstream
+      # This binary checks actual compiler provenance and downstream
       # delivery and literal full-frame oracles in two identical graph runs.
       - name: Load a node built by another compiler and verify downstream frames
         run: tools/scripts/check_stable_node_compiler_skew.sh
@@ -2147,6 +2147,11 @@ jobs:
       #     stay visible in the log rather than disappearing from a hand list.
       #
       # Everything else runs: ~16 s locally for the full set.
+      # stable_plugin_delivery_test loads the bridge cdylib; test builds produce an rlib.
+      - name: Build bridge library for stable plugin delivery
+        working-directory: examples/go2
+        run: cargo build -p dds_bridge
+
       - name: cargo test (everything but camera_jpeg)
         run: cd examples/go2 && cargo test --workspace --exclude camera_jpeg -- --test-threads=1
 

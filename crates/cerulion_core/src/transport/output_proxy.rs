@@ -26,13 +26,10 @@
 //! regime; repeats are demoted to `debug!`) and skips the publish. Drop must
 //! not panic. Every discard is counted, whatever the log level:
 //! `CerulionPublisher::output_discard_count()` on the port, and
-//! `NodeHandle::output_discard_count(output)` from outside the node. When this runs inside
-//! a macro-generated cdylib node (`#[cerulion_node]`), that `error!` lands on
-//! stderr via the cdylib-local subscriber the generated `cerulion_node_init`
-//! installs
-//! ([`install_cdylib_stderr_tracing`](crate::graph::node::install_cdylib_stderr_tracing)) —
-//! it is not a silent black hole. A hand-written raw-FFI cdylib gets that
-//! subscriber only if it calls the installer itself.
+//! `NodeHandle::output_discard_count(output)` from outside the node. For stable
+//! plugins the host owns the proxy and emits discard and recovery diagnostics
+//! through its own subscriber on stderr. Macro nodes and the raw-FFI template
+//! separately install a cdylib-local subscriber for the author's events.
 //!
 
 use std::marker::PhantomData;

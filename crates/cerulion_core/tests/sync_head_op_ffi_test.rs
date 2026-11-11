@@ -15,13 +15,15 @@ use std::sync::Arc;
 
 #[test]
 #[serial]
-fn a_null_name_pointer_is_refused_with_its_own_code_and_the_ladder_below_still_runs() {
+fn legacy_sync_head_op_is_absent_and_stable_input_head_refuses_each_bad_argument() {
     let path =
         cerulion_core::testing::find_fixture_cdylib("test_node_macro_sync_nontrigger_cdylib");
     // SAFETY: the trusted fixture stays loaded until its symbol lookup ends.
     let library = unsafe { libloading::Library::new(path) }.expect("load rebuilt sync fixture");
     // SAFETY: absence is tested without calling or dereferencing any symbol.
     assert!(unsafe { library.get::<*const ()>(b"cerulion_node_sync_head_op") }.is_err());
+    // SAFETY: the positive control resolves the trusted symbol without dereferencing it.
+    assert!(unsafe { library.get::<*const ()>(b"cerulion_node_api_v1") }.is_ok());
 
     let mut runs = Vec::new();
     for _ in 0..2 {

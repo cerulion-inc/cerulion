@@ -2,7 +2,7 @@
 name = "test_node_snapshot_fail_cdylib"
 version = "0.1.0"
 edition = "2021"
-description = "Checked node fixture with inert legacy maintenance traps"
+description = "Checked latest-value input snapshot fixture"
 publish = false
 
 [lib]

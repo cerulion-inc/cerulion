@@ -168,8 +168,8 @@ pub enum TransportError {
     /// This is what the node macros produce at the boundary and what the
     /// cdylib loader rebuilds from the stable Status kind, so the runtime acts on the KIND (a [`NodeErrorKind::Fatal`]
     /// stops the node) without reading message text. It renders exactly like
-    /// [`TransportError::NodeError`]. A cdylib that does not export the symbol
-    /// still reports the untyped [`TransportError::NodeError`].
+    /// [`TransportError::NodeError`]. A stable Status with no typed kind
+    /// reports the untyped [`TransportError::NodeError`].
     #[error("Node '{node_id}' error: {reason}")]
     NodeFailed {
         /// The label of the boundary that reported the error.

@@ -2,7 +2,7 @@
 name = "test_node_drain_fail_cdylib"
 version = "0.1.0"
 edition = "2021"
-description = "Checked node fixture with inert legacy maintenance traps"
+description = "Checked data-trigger node fixture"
 publish = false
 
 [lib]

@@ -45,10 +45,24 @@ struct MacroCounter {
 
     #[output]
     cmd_out: Vector3,
+
+    panic_on_shutdown: bool,
 }
 
 #[cerulion_node_impl]
 impl MacroCounter {
+    fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
+        let phase = ctx.env_opt("CER_TEST_STABLE_PANIC_PHASE");
+        assert_ne!(phase.as_deref(), Some("init"), "fixture init panic");
+        self.panic_on_shutdown = phase.as_deref() == Some("shutdown");
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), NodeError> {
+        assert!(!self.panic_on_shutdown, "fixture shutdown panic");
+        Ok(())
+    }
+
     fn tick(&mut self) -> Result<(), NodeError> {
         // Direct SHM-to-SHM copy of the three f64 fields. The impl macro
         // wraps the body in a nested `try_view` for `velocity_in` plus a

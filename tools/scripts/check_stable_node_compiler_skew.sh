@@ -80,12 +80,4 @@ if [ ! -f "$node_library" ]; then
     exit 1
 fi
 "${build_env[@]}" CARGO_TARGET_DIR="$host_target" cargo "+$host_toolchain" build --locked -p cerulion_core --test stable_node_abi_cross_compiler_test
-# Local runtime evidence uses the shared desk lock; hosted runners own their VM.
-if [ "${CI:-}" = true ] || [ "${CERULION_ABI_DESK_LOCK_HELD:-}" = 1 ]; then
-    "${build_env[@]}" CARGO_TARGET_DIR="$host_target" CERULION_TEST_NODE_ABI_DYLIB="$node_library" cargo "+$host_toolchain" test --locked -p cerulion_core --test stable_node_abi_cross_compiler_test different_compiler_delivers_oracle_frames_in_two_identical_runs -- --ignored --exact --test-threads=1
-else
-    case "$host_toolchain" in
-        *[!a-zA-Z0-9._-]*) echo 'unsupported toolchain name for local locked command' >&2; exit 1 ;;
-    esac
-    "${build_env[@]}" CARGO_TARGET_DIR="$host_target" CERULION_TEST_NODE_ABI_DYLIB="$node_library" /private/tmp/cerulion-flock.py -w 7200 /private/tmp/cerulion-build.lock -c "cargo +$host_toolchain test --locked -p cerulion_core --test stable_node_abi_cross_compiler_test different_compiler_delivers_oracle_frames_in_two_identical_runs -- --ignored --exact --test-threads=1"
-fi
+"${build_env[@]}" CARGO_TARGET_DIR="$host_target" CERULION_TEST_NODE_ABI_DYLIB="$node_library" cargo "+$host_toolchain" test --locked -p cerulion_core --test stable_node_abi_cross_compiler_test different_compiler_delivers_oracle_frames_in_two_identical_runs -- --ignored --exact --test-threads=1

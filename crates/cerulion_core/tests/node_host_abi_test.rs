@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Native host-table ownership and delivery oracles. Each test builds one
 //! isolated iceoryx2 manager and passes only C records through HOST_API.
-//! Run this binary alone with --test-threads=1 under the build desk lock.
+//! Parallel-safe: each test owns an isolated shared-memory root.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashMap;

@@ -133,12 +133,18 @@ directory when copying the workspace to the device. Do not flatten its libraries
 into `target/<profile>`.
 
 Workspaces created by `cerulion workspace create` or `cerulion workspace init`
-already carry the complete iceoryx2 family `[patch.crates-io]` block for host
-transport builds. The stable loader supports Android and the host owns the
-shared-memory transport. Nodes call it through opaque handles and borrowed slots;
-their compiler and linked iceoryx2 copy need not match the CLI. The host probes
-its Android shared-memory support before loading a node. Build the CLI with the
-complete fork patch block from the root `Cargo.toml` so those calls are supported.
+already carry the complete iceoryx2 family `[patch.crates-io]` block. A
+hand-written node workspace must carry the same complete fork patch block from
+the root `Cargo.toml`, as must the CLI build. The host owns the shared-memory
+transport, but each macro node also probes its own linked iceoryx2 copy during
+create. Without Android shared-memory support, create refuses the node:
+
+```text
+Node '<Type>' error: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
+```
+
+Nodes call the host through opaque handles and borrowed slots. Their Rust
+compiler may differ from the CLI's; both builds still need Android support.
 
 For an adb shell session, provide writable home and temporary directories:
 

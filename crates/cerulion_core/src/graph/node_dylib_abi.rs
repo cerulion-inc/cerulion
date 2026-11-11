@@ -14,9 +14,6 @@ use crate::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
 use cerulion_node_abi as abi;
 use std::path::Path;
 
-// Preserve the native log byte through a verified compile-time constant.
-const NATIVE_LOG_DASH: &str = "\u{2014}";
-
 #[derive(serde::Deserialize)]
 struct PortFact {
     name: String,
@@ -234,6 +231,7 @@ impl DylibNodeEntry {
             .api()
     }
     /// Test support for exercising real host admission refusals.
+    #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn __test_host_context_handle(&self) -> Option<u64> {
         // Tests hold this context's actual lock; no foreign pointer is exposed.
@@ -256,30 +254,12 @@ impl DylibNodeEntry {
         if status.code == abi::status_code::OK {
             return Ok(());
         }
-        let mut reason = self.diagnostic(status, phase.name());
-        if phase == Phase::Init {
-            reason = format!("init failed: {reason}");
-        }
-        if status.code == abi::status_code::PANICKED {
-            return Err(if phase == Phase::Tick {
-                TransportError::NodeTickPanicked {
-                    node_id: self.label.clone(),
-                    reason,
-                }
-            } else {
-                self.error(reason)
-            });
-        }
-        if let Some(kind) = NodeErrorKind::from_code(status.kind)
-            .filter(|_| (abi::error_kind::LOGIC..=abi::error_kind::IO).contains(&status.kind))
-        {
-            return Err(TransportError::NodeFailed {
-                node_id: self.label.clone(),
-                kind,
-                reason,
-            });
-        }
-        Err(self.error(reason))
+        Err(classify(
+            phase,
+            status,
+            self.diagnostic(status, phase.name()),
+            &self.label,
+        ))
     }
     // hot-path-alloc-ok-fn: diagnostic text copies only after failure.
     fn diagnostic(&self, status: abi::Status, operation: &str) -> String {
@@ -693,18 +673,21 @@ impl NodeEntry for DylibNodeEntry {
         let result = host::with_context(self.context.unwrap_or(0), |ctx| {
             ctx.runtime_sync_head_op(name, op)
         });
-        let code = result
-            .as_ref()
-            .err()
-            .map_or(abi::status_code::FAILED, |error| error.status);
+        let failure = result.as_ref().err().copied();
+        let status = failure.map_or(abi::status_code::FAILED, |error| error.status);
         let answer = result.unwrap_or(SyncOpAnswer::Failed);
         if answer == SyncOpAnswer::Failed {
             match self.head_errors.on_failure() {
                 RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                    tracing::error!(node = %self.label, input = %name, op = ?op, code, total_failures = self.head_errors.total_failures(), "cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here {NATIVE_LOG_DASH} no set member fabricated (suppressing further to debug until it recovers)");
+                    let detail = head_failure_detail(self.context.unwrap_or(0), failure, status);
+                    tracing::error!(
+                        node = %self.label, input = %name, op = ?op, status, error = %detail,
+                        total_failures = self.head_errors.total_failures(),
+                        "stable host Sync head op failed; the per-set Sync alignment pass ends here — no set member fabricated (suppressing further to debug until it recovers)" // dash-ok: native alignment message separator retained
+                    );
                 }
                 RegimeDecision::Suppressed { .. } => {
-                    tracing::debug!(node = %self.label, input = %name, op = ?op, code, "cdylib sync_head_op still failing (suppressed)");
+                    tracing::debug!(node = %self.label, input = %name, op = ?op, status, "stable host Sync head op still failing (suppressed)");
                 }
             }
         } else if self.head_errors.on_success().is_some() {
@@ -722,10 +705,8 @@ impl NodeEntry for DylibNodeEntry {
         let result = host::with_context(self.context.unwrap_or(0), |ctx| {
             ctx.runtime_sync_head_op(name, SyncHeadOp::ProbeNext)
         });
-        let code = result
-            .as_ref()
-            .err()
-            .map_or(abi::status_code::FAILED, |error| error.status);
+        let failure = result.as_ref().err().copied();
+        let status = failure.map_or(abi::status_code::FAILED, |error| error.status);
         let answer = result.unwrap_or(SyncOpAnswer::Failed);
         let latch = self
             .probe_errors
@@ -735,10 +716,18 @@ impl NodeEntry for DylibNodeEntry {
         if !matches!(answer, SyncOpAnswer::Present | SyncOpAnswer::Nothing) {
             match latch.on_failure() {
                 RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                    tracing::error!(node = %self.label, input = %name, code, total_failures = latch.total_failures(), "cdylib consume = latest body probe got no answer (op code 0 of cerulion_node_sync_head_op failed or answered a kind this host does not know); this input fires on every arrival its trigger subscriber counts, including a frame an earlier read already took, until the probe answers (suppressing further to debug until it recovers)");
+                    let detail = head_failure_detail(self.context.unwrap_or(0), failure, status);
+                    let kind = match answer {
+                        SyncOpAnswer::Nothing => abi::head_kind::NOTHING,
+                        SyncOpAnswer::Present => abi::head_kind::PRESENT,
+                        SyncOpAnswer::Stamp(_) => abi::head_kind::STAMP,
+                        SyncOpAnswer::Head(_) => abi::head_kind::HEAD,
+                        SyncOpAnswer::Failed => abi::head_kind::FAILED,
+                    };
+                    tracing::error!(node = %self.label, input = %name, status, kind, error = %detail, total_failures = latch.total_failures(), "stable consume = latest body probe got no answer (host head op PROBE_NEXT failed or answered an unsupported kind); this input fires on every arrival its trigger subscriber counts, including a frame an earlier read already took, until the probe answers (suppressing further to debug until it recovers)");
                 }
                 RegimeDecision::Suppressed { .. } => {
-                    tracing::debug!(node = %self.label, input = %name, code, "cdylib consume = latest body probe still failing (suppressed)");
+                    tracing::debug!(node = %self.label, input = %name, status, "stable consume = latest body probe still failing (suppressed)");
                 }
             }
         } else if latch.on_success().is_some() {
@@ -1003,8 +992,64 @@ unsafe extern "C" fn sink_write(context: *mut u8, bytes: abi::Bytes) -> abi::Sta
     }
 }
 
+// hot-path-alloc-ok-fn: only a loud failure copies the owner-local diagnostic.
+fn head_failure_detail(
+    context: u64,
+    failure: Option<host::HostCallFailure>,
+    status: u32,
+) -> String {
+    if let Some(failure) = failure.filter(|failure| failure.error_token != 0) {
+        let copied = host::with_context(context, |ctx| {
+            let required = match ctx.copy_diagnostic(failure.error_token, &mut []) {
+                Ok(length) => length,
+                Err(host::HostServiceError::BufferTooSmall(length)) => length,
+                Err(error) => return Err(error),
+            };
+            let mut bytes = vec![0; required];
+            ctx.copy_diagnostic(failure.error_token, &mut bytes)?;
+            String::from_utf8(bytes).map_err(|_| host::HostServiceError::InvalidDescriptor)
+        });
+        if let Ok(detail) = copied {
+            return detail;
+        }
+    }
+    format!("host head operation refused with status {status}")
+}
+
+// hot-path-alloc-ok-fn: only a failed boundary call constructs its diagnostic.
+fn classify(phase: Phase, status: abi::Status, mut reason: String, label: &str) -> TransportError {
+    if phase == Phase::Init {
+        reason = format!("init failed: {reason}");
+    }
+    if status.code == abi::status_code::PANICKED {
+        return if phase == Phase::Tick {
+            TransportError::NodeTickPanicked {
+                node_id: label.to_owned(),
+                reason,
+            }
+        } else {
+            TransportError::NodeError {
+                node_id: label.to_owned(),
+                reason,
+            }
+        };
+    }
+    if let Some(kind) = NodeErrorKind::from_code(status.kind)
+        .filter(|_| (abi::error_kind::LOGIC..=abi::error_kind::IO).contains(&status.kind))
+    {
+        return TransportError::NodeFailed {
+            node_id: label.to_owned(),
+            kind,
+            reason,
+        };
+    }
+    TransportError::NodeError {
+        node_id: label.to_owned(),
+        reason,
+    }
+}
+
 #[cfg(test)]
-#[cfg(not(feature = "local-transport"))]
 mod tests {
     use super::*;
 
@@ -1030,8 +1075,6 @@ mod tests {
 
     #[test]
     fn only_tick_panics_have_the_structural_tick_panic_class() {
-        let entry = DylibNodeEntry::load(&crate::testing::find_fixture_cdylib("test_node_cdylib"))
-            .expect("build test_node_cdylib first");
         for phase in [
             Phase::Init,
             Phase::Tick,
@@ -1040,16 +1083,16 @@ mod tests {
             Phase::Shape,
             Phase::External,
         ] {
-            let error = entry
-                .result(
-                    abi::Status {
-                        code: abi::status_code::PANICKED,
-                        kind: 0,
-                        error: 0,
-                    },
-                    phase,
-                )
-                .expect_err("a panic cannot succeed");
+            let error = classify(
+                phase,
+                abi::Status {
+                    code: abi::status_code::PANICKED,
+                    kind: 0,
+                    error: 0,
+                },
+                "panic reason".to_owned(),
+                "phase-test",
+            );
             assert_eq!(
                 matches!(error, TransportError::NodeTickPanicked { .. }),
                 phase == Phase::Tick
@@ -1058,7 +1101,7 @@ mod tests {
                 assert!(matches!(error, TransportError::NodeError { .. }));
             }
             if phase == Phase::Init {
-                assert!(error.to_string().contains("init failed: ")); // hot-path-alloc-ok: cold test-only assertion formats a diagnostic, never publish or receive.
+                assert!(error.to_string().contains("init failed: "));
             }
         }
     }

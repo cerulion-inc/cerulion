@@ -2020,8 +2020,8 @@ impl NodeContext {
     /// re-draining (the accounting-once contract — see
     /// [`crate::transport::subscriber::CerulionSubscriber::snapshot_latest`]). Called by the
     /// `#[cerulion_node]`-generated `NodeEntry::snapshot_inputs` (in-process) and
-    /// by the cdylib `cerulion_node_snapshot_inputs` FFI export on a
-    /// cdylib node's `NodeContext` (so cdylib nodes hold non-trigger inputs too).
+    /// by the stable loader on its host-owned `NodeContext`, so stable plugins
+    /// hold non-trigger inputs without a snapshot export.
     ///
     /// The runtime supplies these names
     /// from `build_snapshot_input_names`, the policy-mirror of the wiring that
@@ -2622,21 +2622,9 @@ pub const EXTERNAL_SOURCE_KIND_HOST_DRIVEN: i32 = 3;
 pub const EXTERNAL_SOURCE_KIND_ERROR: i32 = -1;
 
 // ---------------------------------------------------------------------------
-// Cdylib per-set Sync head-op FFI codes.
-//
-// SHARED between the `#[cerulion_node]` codegen (which emits the OPTIONAL
-// `cerulion_node_sync_head_op` export for a Sync node) and the host resolver
-// ([`DylibNodeEntry::sync_head_op`]), so the two spellings of one wire cannot
-// drift. The op code goes IN, the answer kind comes OUT beside a `u64` stamp
-// slot the host reads only for the two kinds that carry one.
-//
-// ONLY the four ops with no existing entry point cross this symbol: the two
-// FILL ops ride `cerulion_node_{drain,refill}_trigger_input`, which already
-// exist and already carry the boundary-vs-refill distinction the fills need.
-// Those four ops spell SIX codes, because the two CONSUMING descent ops carry
-// that same distinction themselves: the align site decides whether an empty
-// answer stages a read-log record, and a `u32` op code is the only field this
-// symbol has to say it in.
+// Native per-set Sync head-operation codes retained for in-process callers.
+// Stable plugins use the frozen HostApi input_head tags, which include both
+// fill operations and preserve the boundary-versus-refill distinction.
 // ---------------------------------------------------------------------------
 
 /// [`SyncHeadOp::ProbeNext`] — the NON-CONSUMING "has a second frame arrived?"
@@ -2653,13 +2641,9 @@ pub const SYNC_HEAD_OP_VOID: u32 = 3;
 /// [`SyncHeadOp::PeekNext`] from a POST-FIRE REFILL align pass.
 ///
 /// A separate code rather than a flag beside the op, because the op code is the
-/// whole of what this symbol carries about which read is being asked for, and
-/// the align site decides whether an EMPTY answer stages a read-log record (a
-/// refill pass runs only on the recording side, so a record there would hold a
-/// position no replay can fill). An older cdylib knows codes 0 to 3 only and
-/// answers "unknown op code", which the host reads as `Failed`: loud, and
-/// unreachable in practice because the ABI version gate refuses a cdylib built
-/// against a different `CERULION_ABI_VERSION`.
+/// native operation carries the read site, and the align site decides whether
+/// an empty answer stages a read-log record. A refill pass runs only on the
+/// recording side, so a record there would hold a position no replay can fill.
 pub const SYNC_HEAD_OP_PEEK_NEXT_REFILL: u32 = 4;
 /// [`SyncHeadOp::Advance`] from a POST-FIRE REFILL align pass. See
 /// [`SYNC_HEAD_OP_PEEK_NEXT_REFILL`] for why the site rides a code of its own.
@@ -3416,16 +3400,11 @@ pub trait NodeEntry: Send {
     /// `#[cerulion_node]` macro nodes OVERRIDE it to forward to
     /// [`NodeContext::snapshot_inputs`].
     ///
-    /// **Cdylib:** `DylibNodeEntry` now OVERRIDES this too: when the
-    /// cdylib exports the optional `cerulion_node_{set_,}snapshot_inputs` FFI
-    /// symbols, the override marshals the names ONCE and forwards the per-step
-    /// freeze across the FFI to the cdylib's `NodeContext`, so a cdylib's
-    /// non-trigger latest-value `#[input]` HOLDS its last-delivered value across
-    /// steps (instead of collapsing the tick to a no-op on a silent step). An
-    /// older cdylib lacking the symbols keeps this inherited no-op
-    /// (back-compat). The override does NOT make a cdylib rayon-eligible —
-    /// `performs_input_snapshot` stays `false` (cdylib fires serially); the
-    /// hold-vs-rayon distinction is [`Self::holds_input_snapshot`].
+    /// **Cdylib:** `DylibNodeEntry` registers snapshot names with the host once
+    /// and forwards each step's freeze to the host-owned `NodeContext`.
+    /// Non-trigger latest-value inputs hold their last-delivered value across
+    /// steps. The node fires serially: `performs_input_snapshot` stays false,
+    /// while `holds_input_snapshot` reports the borrowed-slot hold.
     fn snapshot_inputs(&mut self, _inputs: &[String]) {}
 
     /// Drain a single data-trigger input's body subscriber at the level
@@ -3507,7 +3486,7 @@ pub trait NodeEntry: Send {
     /// The matcher is PURE — it holds no transport — so it asks for a fact by
     /// returning a verdict, and the align driver performs the op through this
     /// seam and re-runs it. ONE multiplexed method rather than six, mirroring
-    /// the ONE FFI symbol it crosses on a cdylib (`cerulion_node_sync_head_op`):
+    /// the stable host-table `input_head` entry:
     /// the six ops are transitions of one state machine, and separate hooks
     /// would admit partial-capability nodes (advance-without-void) the degrade
     /// logic would then have to enumerate.
@@ -3589,9 +3568,8 @@ pub trait NodeEntry: Send {
     /// default does for an entry whose head ops answer
     /// [`SyncOpAnswer::Nothing`] outside its Sync inputs) leaves the input
     /// unfired. A `#[cerulion_node]` node and a `ClosureNodeEntry` answer
-    /// `true`. A [`DylibNodeEntry`] answers `true` when its library exports
-    /// `cerulion_node_probes_trigger_input` returning a positive value beside
-    /// `cerulion_node_sync_head_op`.
+    /// `true`. Every stable [`DylibNodeEntry`] answers `true`: its host-owned
+    /// input head operations probe the subscriber that the node reads.
     fn probes_trigger_input(&self) -> bool {
         false
     }
@@ -3660,11 +3638,9 @@ pub trait NodeEntry: Send {
     /// Distinct from [`Self::performs_input_snapshot`], which ALSO gates
     /// within-level RAYON eligibility. They COINCIDE for macro nodes (hold +
     /// rayon-eligible) and closures (neither). They DIVERGE for a
-    /// `DylibNodeEntry` (cdylib) that exports the optional snapshot FFI
-    /// symbols: its `snapshot_inputs` forwards the freeze across the FFI, so it
-    /// HOLDS (`true` here), yet it stays OFF the rayon path
-    /// (`performs_input_snapshot == false`, fired serially). An older cdylib
-    /// lacking the symbols returns `false` (no hold — back-compat).
+    /// `DylibNodeEntry`: its host-owned inputs hold their frozen mappings,
+    /// so it returns true here, while `performs_input_snapshot` stays false
+    /// and the node fires serially.
     ///
     /// Default: delegate to [`Self::performs_input_snapshot`] — a node that
     /// really freezes also holds; a no-op-snapshot node holds nothing.
@@ -3970,61 +3946,6 @@ impl NodeEntry for ClosureNodeEntry {
     }
 }
 
-/// cdylib-loaded node for production use.
-///
-/// Loads a dynamic library (.so/.dylib/.dll) and looks up the standard
-/// Cerulion node entry point symbols via `extern "C"` ABI.
-///
-/// # cdylib Entry Point Convention (ABI v3)
-///
-/// The cdylib must export these `extern "C"` functions:
-///
-/// - `cerulion_abi_version() -> u32`: Returns
-///   `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for
-///   cross-process nodes, with the transport id above bit 16 for in-process
-///   nodes. A host built before the transport id refuses an in-process node.
-/// - `cerulion_rustc_fingerprint() -> *const c_char`: Must return
-///   `RUSTC_FINGERPRINT` (ABI v22). Checked immediately after
-///   `cerulion_abi_version`; a mismatch refuses the load even when the ABI
-///   version matches, because two different rustc releases can encode the
-///   same struct layout's `Option::None` niche differently.
-/// - `cerulion_node_info() -> *const c_char` — Returns port metadata as JSON
-/// - `cerulion_node_init(ctx: *mut NodeContext) -> u64` — Takes ownership of context, returns handle (0 = error)
-/// - `cerulion_node_tick(handle: u64) -> i32` — Execute one tick for the given handle
-/// - `cerulion_node_pump_history(handle: u64) -> i32`: Service quiescent late joiners for the given handle (ABI v7). Best-effort liveness; a non-zero return is logged, never propagated.
-/// - `cerulion_node_shutdown(handle: u64) -> i32` — Clean shutdown for the given handle
-/// - `cerulion_take_last_error() -> *mut c_char`: Pulls the most recent error message off the cdylib's per-thread buffer; null if no error.
-/// - `cerulion_free_error(*mut c_char)` — Pairs with `cerulion_take_last_error`; allocator-paired free.
-/// - `cerulion_node_platform_check() -> i32`: Probes the cdylib's own iceoryx2 copy for platform support (0 = supported; nonzero sets `LAST_ERROR`). Required on Android, optional elsewhere.
-///
-/// `cerulion_node_info()` carries no `node_type` field — the node
-/// type is the folder name and is resolved by the loader, not by
-/// the cdylib. The JSON shape is
-/// `{"inputs": [...], "outputs": [...], "policy": {...}?}`.
-///
-/// Handle-based design allows multiple instances from the same cdylib.
-///
-/// A `DylibNodeEntry` OVERRIDES [`NodeEntry::snapshot_inputs`] to
-/// forward the per-step non-trigger latest-value freeze across the FFI via the
-/// optional `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs`
-/// symbols — so a cdylib node HOLDS its non-trigger `#[input]`s across steps,
-/// exactly like an in-process macro node. An older cdylib that doesn't
-/// export the symbols keeps the inherited no-op (back-compat; the symbols are
-/// additive and do NOT bump the ABI version). It still fires SERIALLY off the
-/// rayon path — [`NodeEntry::performs_input_snapshot`] stays `false`; the hold is
-/// reported via [`NodeEntry::holds_input_snapshot`] (which drives the host's
-/// borrow-3 provisioning of its snapshot-source topics). See
-/// [`NodeEntry::snapshot_inputs`].
-///
-/// # Safety
-///
-/// DylibNodeEntry uses `unsafe` for:
-/// 1. Loading the library (`libloading::Library::new`)
-/// 2. Looking up symbols (`lib.get::<fn>`)
-/// 3. Calling `extern "C"` functions
-/// 4. Passing `NodeContext` ownership across FFI boundary
-///
-/// The ABI contract is enforced by convention, not by the type system.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SnapshotState {
@@ -4789,18 +4710,6 @@ pub(crate) fn flood_log_action(latched: &mut bool, failed: bool) -> FloodLogActi
     }
 }
 
-/// A [`DylibNodeEntry`]'s [`NodeEntry::probes_trigger_input`], from what
-/// `load` resolved: `export_ret` is the return of
-/// `cerulion_node_probes_trigger_input` (`None` when the library does not
-/// export it), and `has_head_op` is whether `cerulion_node_sync_head_op`, the
-/// symbol op code [`SYNC_HEAD_OP_PROBE_NEXT`] crosses, resolved. `true` only
-/// for a positive return beside the head-op symbol; a zero, a negative return
-/// (the exporter could not answer) or an absent symbol is `false`.
-#[cfg(test)]
-fn dylib_probes_trigger_input(export_ret: Option<i32>, has_head_op: bool) -> bool {
-    has_head_op && export_ret.is_some_and(|ret| ret > 0)
-}
-
 /// [`flood_log_action`] with one latch per `key`. `latched` holds the keys
 /// whose last call failed; a key is inserted on its first failure and removed
 /// on its recovery, so one key's failures and recoveries leave another key's
@@ -5097,7 +5006,7 @@ mod tests {
         );
         assert!(
             !Failed.should_invoke_snapshot(),
-            "KEY: Failed must NOT snapshot — that is the silent-mask bug"
+            "KEY: Failed must NOT snapshot: that is the silent-mask bug"
         );
 
         // The composed contract walked as the runtime drives it:
@@ -5220,33 +5129,6 @@ mod tests {
             FloodLogAction::FirstFailure,
             "a new regime on the same key is loud again"
         );
-    }
-
-    /// The probe capability a `DylibNodeEntry` reads at load: only a positive
-    /// return of `cerulion_node_probes_trigger_input` beside the head-op
-    /// symbol declares it. Each row is `(export return, has head op, probes)`.
-    #[test]
-    fn dylib_probe_capability_needs_a_positive_return_and_the_head_op() {
-        let rows = [
-            (None, false, false),
-            (None, true, false),
-            (Some(0), false, false),
-            (Some(0), true, false),
-            (Some(-1), false, false),
-            (Some(-1), true, false),
-            (Some(i32::MIN), true, false),
-            (Some(1), false, false),
-            (Some(1), true, true),
-            (Some(2), false, false),
-            (Some(2), true, true),
-        ];
-        for (export_ret, has_head_op, probes) in rows {
-            assert_eq!(
-                dylib_probes_trigger_input(export_ret, has_head_op),
-                probes,
-                "export return {export_ret:?}, head op {has_head_op}"
-            );
-        }
     }
 
     #[test]

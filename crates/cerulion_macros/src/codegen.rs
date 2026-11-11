@@ -2094,8 +2094,8 @@ fn gen_cdylib(
             //
             // Init returns u64 handle (0 = failure; LAST_ERROR also set).
 
-            // Legacy diagnostic export only. Stable nodes use host-owned
-            // transport; Android support is checked on the host before loading.
+            // Legacy diagnostic export only. Stable create also probes the
+            // node's linked iceoryx2 copy; Android node workspaces need the fork patch.
             #[no_mangle]
             pub extern "C" fn cerulion_node_platform_check() -> i32 {
                 let result = ::std::panic::catch_unwind(|| {
