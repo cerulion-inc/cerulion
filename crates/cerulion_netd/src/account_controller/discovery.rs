@@ -252,14 +252,20 @@ impl AccountWanController {
         let advertised = cerulion_mdns::browse_iroh_peers(browse_budget);
         for robot in membership.values_mut() {
             let key = robot.eid.to_string();
-            if let Some(address) = cached_direct.get(&key) {
-                robot.direct_addrs.push(*address);
-            }
-            for (_, address) in advertised.iter().filter(|(eid, _)| eid == &key).take(16) {
-                if !robot.direct_addrs.contains(address) {
-                    robot.direct_addrs.push(*address);
-                }
-            }
+            // Keep the TLS-seen address ahead of untrusted advertised hints.
+            robot.direct_addrs = crate::shared_endpoint::bounded_direct_addresses(
+                cached_direct
+                    .get(&key)
+                    .copied()
+                    .into_iter()
+                    .chain(robot.direct_addrs.iter().copied())
+                    .chain(
+                        advertised
+                            .iter()
+                            .filter(|(eid, _)| eid == &key)
+                            .map(|(_, address)| *address),
+                    ),
+            );
         }
         // Address candidates do not change endpoint identity or retire live readers.
         state.registry.replace_membership(membership)?;

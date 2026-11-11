@@ -3,7 +3,7 @@
 One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
-- Catalog/schema/demand/acts obey producer scope before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops are independent.
+- Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.

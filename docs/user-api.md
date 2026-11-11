@@ -2304,6 +2304,9 @@ Imported topics retain the source robot's access policy and are read remotely
 on that source robot, including when the consuming machine also serves graphs.
 Account ownership proofs remain valid when serving begins; a bounded restoration
 reports any unresolved ingress so it can reconnect.
+Only graph runs that export producers require local serving authority, supplied
+by a prior login or an established local pairing. The serving gate starts no
+login transaction for producer-free runs.
 
 The zenoh LAN plane refuses topic reads, catalog/schema requests and inbound
 frames while paired. `CERULION_LAN_ACCESS=open` explicitly enables unauthenticated

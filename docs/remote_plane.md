@@ -124,8 +124,9 @@ and e-stop checks.
 Each robot exports its own local producers. Imported graph topics and private
 observer channels keep their source robot's access policy: read them on that
 source robot. A refused outbound demand or an unavailable robot during metadata
-discovery preserves the machine's other active readers. Outbound readers retain
-the owned server against idle shutdown; new admission returns a retryable
+discovery preserves the machine's other active readers. Ops snapshot, one-shot
+echo, publish and service calls enforce the same source restriction. Outbound
+readers retain the owned server against idle shutdown; new admission returns a retryable
 refusal while shutdown is already committed. Account ownership proofs survive
 the switch between consuming and serving. Reader restoration shares one bounded
 budget; unresolved readers receive a named loss notice and can reconnect.

@@ -6116,7 +6116,8 @@ pub fn graph_run(
     // real-clock live run reaching this function — `graph run`, `node run`'s
     // temp single-node graph, AND `ros2 attach` (the flagship automagic surface:
     // attach a robot and it is network-viewable with zero config). Serving
-    // requires a saved prior login; network suppressors are `--network off` /
+    // requires saved local authority for producers; producer-free runs skip
+    // that gate. Network suppressors are `--network off` /
     // `CERULION_NETWORK=off`, the virtual/external clocks, and the
     // record+declared-ingress refusal — all already folded into `run_network`
     // above. (`graph profile` never routes through this function — see the

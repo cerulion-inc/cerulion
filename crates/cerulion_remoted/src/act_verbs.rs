@@ -35,7 +35,8 @@
 //! publish still running
 //! [`PUBLISH_DEADLINE`] after it started is stopped too. A `message` or
 //! `request` longer than [`MAX_MESSAGE_TEXT_BYTES`] is refused. A topic under
-//! the reserved `/__cerulion` namespace is refused.
+//! the reserved `/__cerulion` namespace or a network mirror is refused by every
+//! act verb; read imported topics on their source robot.
 //!
 //! A failure is `CerudError::Verb` with a message that starts with the
 //! error's class (`usage: `, `encode: `, `unavailable: `, `internal: `,
@@ -124,6 +125,20 @@ fn remote_lease(
     cerulion_core::TransportManager::get_or_init()
         .and_then(|manager| manager.acquire_remote_topic_lease(topic))
         .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))
+}
+
+fn servable(topic: &str) -> CerudResult<()> {
+    let canonical;
+    let topic = if topic.starts_with('/') {
+        topic
+    } else {
+        canonical = format!("/{topic}");
+        &canonical
+    };
+    let manager = cerulion_core::TransportManager::get_or_init()
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
+    crate::wire::wire_servable(&manager, topic)
+        .map_err(|message| verb_error(VerbError::Unavailable(message)))
 }
 
 fn schemas_dir() -> Option<PathBuf> {
@@ -320,27 +335,6 @@ fn send_unless_estop(lease: &EstopLease, send: &mut dyn FnMut()) -> bool {
     }
 }
 
-/// Refuse a topic in the reserved control-plane namespace.
-fn refuse_reserved(topic: &str) -> CerudResult<()> {
-    let canonical = if topic.starts_with('/') {
-        topic.to_string()
-    } else {
-        format!("/{topic}")
-    };
-    if canonical == cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX
-        || canonical.starts_with(&format!(
-            "{}/",
-            cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX
-        ))
-    {
-        return Err(usage(format!(
-            "'{}' is in Cerulion's reserved control-plane namespace",
-            topic.escape_debug()
-        )));
-    }
-    Ok(())
-}
-
 /// `topic-publish`: publish frames of one message on a local topic. Refused
 /// while the e-stop is engaged; each frame goes out only with the latch read
 /// clear and no engage counted under the lease's lock at its send, so an
@@ -377,8 +371,8 @@ impl VerbHandler for TopicPublishVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
+        servable(topic)?;
         let _remote_lease = remote_lease(topic)?;
-        refuse_reserved(topic)?;
         let type_arg = str_arg(args, "type")?;
         let message = text_arg(args, "message")?;
         let times = match args.get("times") {
@@ -514,10 +508,14 @@ impl VerbHandler for ServiceCallVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let service_name = str_arg(args, "service")?;
+        servable(service_name)?;
         let type_arg = str_arg(args, "type")?;
         let request = text_arg(args, "request")?;
         let timeout = seconds_arg(args, "timeout_s", service::DEFAULT_CALL_TIMEOUT)?;
         service::check_service_name(service_name).map_err(verb_error)?;
+        servable(&cerulion_core::transport::service::request_topic(
+            service_name,
+        ))?;
         let _request_lease = remote_lease(&cerulion_core::transport::service::request_topic(
             service_name,
         ))?;
@@ -569,6 +567,7 @@ impl VerbHandler for TopicSnapshotVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
+        servable(topic)?;
         let _remote_lease = remote_lease(topic)?;
         let timeout = seconds_arg(args, "timeout_s", DEFAULT_READ_TIMEOUT)?;
         let quality = match args.get("quality") {
@@ -610,6 +609,7 @@ impl VerbHandler for TopicEchoOnceVerb {
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
+        servable(topic)?;
         let _remote_lease = remote_lease(topic)?;
         let timeout = seconds_arg(args, "timeout_s", DEFAULT_READ_TIMEOUT)?;
         let walker =
@@ -653,6 +653,11 @@ fn echo_result(walker: &cerulion_core::codegen::FrameWalker, frame: &[u8]) -> Ce
 
 /// The newest frame of the local topic within `timeout`.
 fn newest_frame(topic: &str, timeout: Duration) -> CerudResult<Vec<u8>> {
+    let manager = cerulion_core::TransportManager::get_or_init()
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
+    let _local_source = manager
+        .acquire_local_topic_lease(topic)
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
     let running = running();
     let deadline = Instant::now() + timeout;
     let (_transport, subscriber) =
@@ -695,7 +700,7 @@ mod tests {
             let err = TopicPublishVerb::new(lease())
                 .execute(&json!({"topic": topic, "type": "std_msgs/String"}))
                 .unwrap_err();
-            assert_eq!(class_of(err), "usage", "{topic}");
+            assert_eq!(class_of(err), "unavailable", "{topic}");
         }
     }
 

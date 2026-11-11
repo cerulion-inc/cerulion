@@ -55,6 +55,60 @@ fn walker() -> cerulion_core::codegen::FrameWalker {
     cerulion_msgio::checked_walker(cerulion_msgio::store_schemas(Some(store()))).unwrap()
 }
 
+#[test]
+#[serial]
+fn act_reads_refuse_mirrors_and_reserved_channels() {
+    store();
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let topic = "/act_verbs_test/mirror";
+    let _mirror = manager
+        .create_remote_ingress_injector(topic, 11, MaxSliceLen::try_new(64).unwrap())
+        .unwrap();
+    let publish = TopicPublishVerb::new(lease());
+    let call = ServiceCallVerb::new(lease());
+    for topic in [topic, "/__cerulion", "/__cerulion/observers/x/y"] {
+        for handler in [
+            &TopicSnapshotVerb as &dyn VerbHandler,
+            &TopicEchoOnceVerb,
+            &publish,
+            &call,
+        ] {
+            let error = handler
+                .execute(&json!({"topic": topic, "service": topic, "timeout_s": 0}))
+                .unwrap_err();
+            assert!(
+                matches!(error, CerudError::Verb(ref message) if message == &format!(
+                    "unavailable: '{topic}' is a network mirror of another robot; read it on its source robot"
+                )),
+                "{}: {error}",
+                handler.name()
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn act_reads_allow_reserved_prefix_neighbor_and_local_sources() {
+    store();
+    for topic in ["/__cerulionx", "/act_verbs_test/local_oracle"] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let publisher = publish_until(
+            topic,
+            "std_msgs/String",
+            "{\"data\":\"local oracle\"}".into(),
+            stop.clone(),
+        );
+        let result = TopicEchoOnceVerb.execute(&json!({"topic":topic,"timeout_s":5}));
+        stop.store(true, Ordering::SeqCst);
+        publisher.join().unwrap();
+        let result = result.unwrap();
+        assert_eq!(result["type"], "std_msgs/String");
+        assert_eq!(result["stamp_ns"], 77);
+        assert_eq!(result["message"], json!({"data":"local oracle"}));
+    }
+}
+
 /// Publish `text` as `ty` on `topic` every 20 ms until `stop`.
 fn publish_until(
     topic: &'static str,
