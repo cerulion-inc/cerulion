@@ -5771,6 +5771,15 @@ impl NetdDemandPlane {
         f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
     ) -> Result<R, String> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        // A kept connection netd closed is dropped before this call uses it, so
+        // a call that would send nothing (a version refusal) still notices the
+        // close and reconnects to the netd running now.
+        if guard
+            .as_ref()
+            .is_some_and(|client| peer_hung_up(client.control_fd()))
+        {
+            *guard = None;
+        }
         if guard.is_none() {
             let client = match &self.socket {
                 Some(sock) => NetdClient::connect_or_spawn_at(sock.clone()),
@@ -5797,17 +5806,6 @@ impl NetdDemandPlane {
         }
     }
 
-    /// Drop the kept client if netd closed its end, so the next call reconnects.
-    /// A call that sends nothing would not notice the close on its own.
-    fn drop_client_if_hung_up(&self) {
-        let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        if guard
-            .as_ref()
-            .is_some_and(|client| peer_hung_up(client.control_fd()))
-        {
-            *guard = None;
-        }
-    }
 }
 
 /// Whether the idle control connection on `fd` can no longer carry a request:
@@ -5904,9 +5902,9 @@ impl DemandPlane for NetdDemandPlane {
         // Checked here because the client reports its own version refusal as a
         // protocol error, which drops the connection: a follower would then open
         // a new one on every poll, to a daemon that stays this old while it runs.
-        // The refusal sends nothing, so the kept connection is checked first: once
-        // the old daemon has exited, this poll reconnects to the one now running.
-        self.drop_client_if_hung_up();
+        // The refusal sends nothing, so `with_client` checks the kept connection
+        // first: once the old daemon has exited, this poll reconnects to the one
+        // now running.
         self.with_client(|c| {
             let daemon = c.daemon_protocol();
             if daemon < FIRES_MIN_DAEMON_VERSION {
