@@ -1256,6 +1256,9 @@ fn run(cli: Cli) -> CliResult<()> {
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }
+                // Building nodes needs Rust; workspace setup itself does not,
+                // so there is no build to hand a Cargo directory to.
+                cerulion_cli_engine::rust_setup::check_rust(&ws.root);
                 Ok(())
             }
             WorkspaceAction::Init { location } => {
@@ -1267,6 +1270,9 @@ fn run(cli: Cli) -> CliResult<()> {
                 if let Some(source) = &ws.dependency_source {
                     println!("  dependencies: {source}");
                 }
+                // Building nodes needs Rust; workspace setup itself does not,
+                // so there is no build to hand a Cargo directory to.
+                cerulion_cli_engine::rust_setup::check_rust(&ws.root);
                 Ok(())
             }
         },
@@ -1635,13 +1641,24 @@ fn run(cli: Cli) -> CliResult<()> {
                     // Cargo's output is captured, so the progress line is the
                     // only thing on screen while it runs. It goes to stderr
                     // with the notice: stdout carries the result alone.
+                    //
+                    // A missing or too old Rust is offered for install first,
+                    // for a node that exists, so a mistyped name is refused
+                    // before anything is asked.
+                    let cargo_dir = ws
+                        .nodes_dir
+                        .join(&node_type)
+                        .exists()
+                        .then(|| cerulion_cli_engine::rust_setup::check_rust(&ws.root))
+                        .flatten();
                     let started = std::time::Instant::now();
-                    let outcome = node_cmd::node_build_with_progress(
+                    let outcome = node_cmd::node_build_with_cargo_dir(
                         &ws.root,
                         &node_type,
                         release,
                         &mut |notice| eprint!("{notice}"),
                         &mut |line| eprintln!("{line}"),
+                        cargo_dir.as_deref(),
                     );
                     telemetry::emit(
                         telemetry_events::NODE_BUILD_COMPLETED,

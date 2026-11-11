@@ -20,8 +20,8 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
-- `node build` uses Cargo compiler selection/MSRV; load checks the frozen boundary,
-  never compiler provenance.
+- `node build`: Cargo's rustc/MSRV, no toolchain pin; load checks the boundary,
+  never provenance. `rust_setup` asks on TTY stdin+stderr only.
 - Android: cdylib lookup prefers `<target>/<triple>/<profile>`, then `<target>/<profile>`;
   `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
 - `node_metadata::parse_node_metadata` is the sole port/trigger source; only `INFO_END`
