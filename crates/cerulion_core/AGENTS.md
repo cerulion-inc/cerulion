@@ -7,6 +7,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
+- LAN access defaults to Paired on every platform. Open LAN transport fixtures
+  select Open explicitly; a locator or sign-in never opens the paired gate.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
 - The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
