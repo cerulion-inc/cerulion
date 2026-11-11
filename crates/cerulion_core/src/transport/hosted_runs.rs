@@ -178,6 +178,45 @@ impl HostedRuns {
                 reason: refusal_reason(error),
             }
         });
+        self.insert(run_id, live, fires, served)
+    }
+
+    /// Host a run that cannot be described under `run_id`, until the returned
+    /// guard drops: the `runs` verb names it undescribable with the reason
+    /// `error` gives, and it serves no fires.
+    ///
+    /// For a host that learns, before it builds a [`RunEntry`], that the entry
+    /// would fail the served-entry checks (a `run.json` that is above the
+    /// served cap with every optional key dropped). The run is still listed,
+    /// so a desk learns why it has no description. Replacement and the guard
+    /// work as in [`Self::host`].
+    pub fn host_undescribable(&self, run_id: u128, error: RunEntryError) -> HostedRunGuard {
+        let canonical = format_run_id(run_id);
+        tracing::warn!(
+            run_id = %canonical,
+            error = %error,
+            "hosted run: the entry cannot be built within the served-entry checks; the runs \
+             verb names it undescribable"
+        );
+        let served = Err(UndescribableRun {
+            run_id: canonical,
+            reason: refusal_reason(error),
+        });
+        // An undescribable run serves no state, so its live flag is never read.
+        // hot-path-alloc-ok: one flag per hosted run, when the host starts it.
+        let live = Arc::new(AtomicBool::new(false));
+        self.insert(run_id, live, None, served)
+    }
+
+    /// Put one slot under `run_id`, replacing any slot there, and return the
+    /// guard that withdraws it.
+    fn insert(
+        &self,
+        run_id: u128,
+        live: Arc<AtomicBool>,
+        fires: Option<Arc<FireTap>>,
+        served: Result<RunEntry, UndescribableRun>,
+    ) -> HostedRunGuard {
         let mut slots = self.lock();
         slots.next_generation += 1;
         let generation = slots.next_generation;
@@ -651,6 +690,57 @@ mod tests {
                 "temi".to_string(),
                 RunEntryState::Live
             )]
+        );
+    }
+
+    #[test]
+    fn a_run_hosted_as_undescribable_is_named_with_its_reason_and_serves_no_fires() {
+        let runs = HostedRuns::default();
+        let (good, _live) = run(RUN_B, "other", true);
+        let _good = runs.host(RUN_B, good);
+        let guard = runs.host_undescribable(RUN_A, RunEntryError::RunJsonTooLong { len: 262_145 });
+        let served = runs.served();
+        assert_eq!(
+            served.undescribable,
+            vec![withheld(
+                RUN_A_TEXT,
+                "the hosted entry's run.json is 262145 bytes, above the 262144-byte served cap"
+            )]
+        );
+        assert_eq!(
+            listed(&runs),
+            vec![(
+                RUN_B_TEXT.to_string(),
+                "other".to_string(),
+                RunEntryState::Live
+            )],
+            "a run hosted as undescribable does not hide the runs beside it"
+        );
+        assert_eq!(
+            runs.serve_fires(RUN_A, Cursor::Now),
+            FiresOutcome::NotServed
+        );
+        drop(guard);
+        assert!(runs.served().undescribable.is_empty());
+        assert_eq!(listed(&runs).len(), 1, "only its own run is withdrawn");
+    }
+
+    #[test]
+    fn a_run_hosted_as_undescribable_is_replaced_like_any_other() {
+        let runs = HostedRuns::default();
+        let old = runs.host_undescribable(RUN_A, RunEntryError::EmptyRunJson);
+        let (good, _live) = run(RUN_A, "temi", true);
+        let _good = runs.host(RUN_A, good);
+        drop(old);
+        assert!(runs.served().undescribable.is_empty());
+        assert_eq!(
+            listed(&runs),
+            vec![(
+                RUN_A_TEXT.to_string(),
+                "temi".to_string(),
+                RunEntryState::Live
+            )],
+            "the replaced guard does not withdraw its replacement"
         );
     }
 
