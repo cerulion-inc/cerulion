@@ -27,8 +27,8 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
 - Idle reap waits for work/latch/owed delivery, retains singleton and exclusive
   `serving.hold`; guards/sources share it, never unlink. Own process group, direct
   TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
-- Controller lock fences outgoing at `begin_serving`; `end_serving` follows reap;
-  facts use `discovery::robot_state`.
+- Lifecycle I/O runs off verbs and unlocked; outbound readers fence idle reap.
+  begin/ready/end preserve WAN pins; facts use `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY

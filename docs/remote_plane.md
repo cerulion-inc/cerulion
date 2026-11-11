@@ -213,9 +213,12 @@ time.
 exhaustion and network delivery still decide whether a remote `engage-estop`
 arrives. Each session is bounded by a 120 s deadline that closes an
 authenticated-then-stalled connection, which is a per-session resource guard
-rather than a serialization point. Two caps that would bound the total footprint
-under a distributed flood, a global concurrency cap with a reserved safety-floor
-slot and the daemon's accept-loop cap, are **not implemented**.
+rather than a serialization point. At most 32 TLS handshakes are pending, each
+for at most 10 s. Once 16 are pending, an unvalidated address must answer a
+QUIC Retry before admission. A validated IP holds at most four pending slots;
+relay arrivals share eight per relay URL, and custom transports share four.
+A flood from many validated addresses or many relay URLs can still exhaust
+the handshake capacity. Established sessions are not globally capped.
 
 ## A dropped connection does not drop the lease
 

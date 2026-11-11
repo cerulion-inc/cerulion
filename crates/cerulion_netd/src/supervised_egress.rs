@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -13,33 +13,45 @@ use crate::egress::{EgressError, EgressId, EgressPlane, GatewayEgressPlane};
 use crate::mirror::MirrorPlane;
 use crate::robot_supervisor::RobotSupervisor;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Starting,
+    Serving,
+    Reaping,
+    Stopped,
+}
+
 struct State {
     registrations: BTreeSet<EgressId>,
-    supervisor: Option<RobotSupervisor>,
+    phase: Phase,
+    standing_requested: bool,
     stopped: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum IdleAction {
     Stop,
+    Start,
     Wait,
     Reap,
 }
 
-fn idle_action(stopped: bool, has_registrations: bool, has_server: bool) -> IdleAction {
+fn idle_action(stopped: bool, wanted: bool, has_server: bool, readers: bool) -> IdleAction {
     if stopped {
         IdleAction::Stop
-    } else if has_registrations || !has_server {
-        IdleAction::Wait
-    } else {
+    } else if wanted && !has_server {
+        IdleAction::Start
+    } else if has_server && !wanted && !readers {
         IdleAction::Reap
+    } else {
+        IdleAction::Wait
     }
 }
 
-/// Production egress wrapper. Query-only daemons construct it without starting
-/// a server. First successful egress starts one; last release reaps it after
-/// admitted work, owed e-stop delivery and its latch have cleared. An
-/// explicitly configured standing gateway retains it until shutdown.
+/// First successful egress wakes one lifecycle worker. Registrations never wait
+/// for endpoint transfer, bootstrap or graceful child teardown. Idle teardown
+/// waits for outbound readers, admitted work, owed delivery and the e-stop latch.
 pub struct SupervisedEgressPlane {
     gateway: Arc<GatewayEgressPlane>,
     mirror: Arc<dyn MirrorPlane>,
@@ -47,7 +59,8 @@ pub struct SupervisedEgressPlane {
     holds_endpoint: Arc<AtomicBool>,
     stop_grace: Duration,
     state: Arc<Mutex<State>>,
-    reaper: Mutex<Option<JoinHandle<()>>>,
+    wake: Arc<Condvar>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SupervisedEgressPlane {
@@ -70,146 +83,190 @@ impl SupervisedEgressPlane {
             .saturating_add(crate::robot_supervisor::remoted_stop_grace()),
             state: Arc::new(Mutex::new(State {
                 registrations: BTreeSet::new(),
-                supervisor: None,
+                phase: Phase::Idle,
+                standing_requested: false,
                 stopped: false,
             })),
-            reaper: Mutex::new(None),
+            wake: Arc::new(Condvar::new()),
+            worker: Mutex::new(None),
         }
     }
 
-    fn ensure_server(&self, state: &mut State) -> Result<(), EgressError> {
-        if state.supervisor.is_some() {
-            return Ok(());
-        }
-        let root =
-            cerulion_discovery::robot_state::resolve().ok_or_else(|| EgressError::Server {
-                reason: "no robot state root is available".into(),
-            })?;
-        if !root.is_absolute()
-            || root.components().any(|part| {
-                matches!(
-                    part,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
-        {
+    fn ensure_worker(&self) -> Result<(), EgressError> {
+        let mut worker = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).stopped {
             return Err(EgressError::Server {
-                reason: "robot state root must be absolute and contain no traversal".into(),
+                reason: "network daemon is shutting down".into(),
             });
         }
-        // Create the stable fencing inode before a child can admit ops work.
-        let fence =
-            crate::serving_hold::IdleFence::try_acquire(&crate::serving_hold::fence_path(&root))
-                .map_err(|error| EgressError::Server {
-                    reason: error.to_string(),
-                })?
-                .ok_or_else(|| EgressError::Server {
-                    reason: "the remote serving endpoint still has active work".into(),
-                })?;
-        drop(fence);
-        self.holds_endpoint.store(true, Ordering::Release);
-        if let Err(reason) = self.mirror.begin_serving() {
-            self.mirror.end_serving();
-            self.holds_endpoint.store(false, Ordering::Release);
-            return Err(EgressError::Server { reason });
+        if worker.is_none() {
+            let state = Arc::clone(&self.state);
+            let wake = Arc::clone(&self.wake);
+            let gateway = Arc::clone(&self.gateway);
+            let mirror = Arc::clone(&self.mirror);
+            let held = Arc::clone(&self.holds_endpoint);
+            *worker = Some(
+                std::thread::Builder::new()
+                    .name("netd-idle-server".into())
+                    .spawn(move || lifecycle_worker(state, wake, gateway, mirror, held))
+                    .map_err(|error| EgressError::Server {
+                        reason: error.to_string(),
+                    })?,
+            );
         }
-        match RobotSupervisor::start(Arc::new(AtomicBool::new(true)), Arc::clone(&self.gateway)) {
-            Ok(supervisor) => state.supervisor = Some(supervisor),
-            Err(error) => {
-                self.mirror.end_serving();
-                self.holds_endpoint.store(false, Ordering::Release);
-                return Err(EgressError::Server {
-                    reason: error.to_string(),
-                });
-            }
-        }
+        self.wake.notify_all();
         Ok(())
     }
 
     /// Explicit LISTEN serving starts after the daemon acquires its singleton.
     pub fn start_standing(&self) -> Result<(), EgressError> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.standing && !state.stopped {
-            self.ensure_server(&mut state)?;
+        if self.standing {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .standing_requested = true;
+            self.ensure_worker()?;
         }
         Ok(())
     }
 
-    fn stop_server(&self, state: &mut State) {
-        if let Some(mut supervisor) = state.supervisor.take() {
-            supervisor.shutdown();
-            self.mirror.end_serving();
-            self.holds_endpoint.store(false, Ordering::Release);
-        }
-    }
-
-    /// Stop accepting registrations and reap before the singleton is released.
+    /// Stop accepting registrations; join graceful teardown outside bookkeeping.
     pub fn shutdown(&self) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.stopped = true;
-            state.registrations.clear();
-            self.stop_server(&mut state);
-        }
-        if let Some(reaper) = self.reaper.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = reaper.join();
-        }
-    }
-
-    fn reap_when_idle(&self) {
-        let mut reaper = self.reaper.lock().unwrap_or_else(|e| e.into_inner());
-        if reaper.as_ref().is_some_and(|thread| !thread.is_finished()) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped {
+            while state.phase != Phase::Stopped {
+                state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
             return;
         }
-        if let Some(thread) = reaper.take() {
-            let _ = thread.join();
+        state.stopped = true;
+        state.registrations.clear();
+        drop(state);
+        self.wake.notify_all();
+        let worker = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(worker) = worker {
+            if worker.join().is_err() {
+                tracing::error!("remote serving lifecycle worker failed during shutdown");
+            }
         }
-        let state = Arc::clone(&self.state);
-        let mirror = Arc::clone(&self.mirror);
-        let held = Arc::clone(&self.holds_endpoint);
-        let spawned = std::thread::Builder::new()
-            .name("netd-idle-server".into())
-            .spawn(move || loop {
-                {
-                    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                    let action = idle_action(state.stopped, !state.registrations.is_empty(), state.supervisor.is_some());
-                    if action == IdleAction::Stop {
-                        return;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Stopped;
+        self.wake.notify_all();
+    }
+
+    /// Extra graceful server/fetch budget, including a registration still starting.
+    pub fn stop_grace(&self) -> Duration {
+        self.stop_grace
+    }
+}
+
+fn lifecycle_worker(
+    state: Arc<Mutex<State>>,
+    wake: Arc<Condvar>,
+    gateway: Arc<GatewayEgressPlane>,
+    mirror: Arc<dyn MirrorPlane>,
+    held: Arc<AtomicBool>,
+) {
+    use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+    let mut supervisor: Option<RobotSupervisor> = None;
+    let mut failures = FailureRegimeLatch::new();
+    loop {
+        // The controller may be busy with WAN I/O. Never hold lifecycle state
+        // while sampling it: registrations still get an immediate reply.
+        let readers = mirror.holds_outbound_readers();
+        let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
+        let wanted = current.standing_requested || !current.registrations.is_empty();
+        match idle_action(
+            current.stopped,
+            wanted,
+            current.phase == Phase::Serving,
+            readers,
+        ) {
+            IdleAction::Stop => {
+                current.phase = Phase::Reaping;
+                drop(current);
+                if let Some(mut server) = supervisor.take() {
+                    server.shutdown();
+                }
+                state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Stopped;
+                return;
+            }
+            IdleAction::Start => {
+                current.phase = Phase::Starting;
+                drop(current);
+                match RobotSupervisor::start(
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::clone(&gateway),
+                    Arc::clone(&mirror),
+                    Arc::clone(&held),
+                ) {
+                    Ok(server) => {
+                        supervisor = Some(server);
+                        state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Serving;
+                        if let Some(suppressed) = failures.on_success() {
+                            tracing::info!(suppressed, "remote serving lifecycle recovered");
+                        }
+                        continue;
                     }
-                    if action == IdleAction::Reap {
-                        let fence = cerulion_discovery::robot_state::resolve().ok_or_else(|| std::io::Error::other("no robot state root is available")).and_then(|root| crate::serving_hold::IdleFence::try_acquire(&crate::serving_hold::fence_path(&root)));
-                        let fence = match fence {
-                            Ok(fence) => fence,
-                            Err(error) => {
-                                tracing::error!(error = %error, "remote server idle fence failed; serving retained until shutdown");
-                                return;
+                    Err(error) => {
+                        state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Idle;
+                        match failures.on_failure() {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                                tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote serving supervisor could not start; retrying")
                             }
-                        };
-                        if let Some(_fence) = fence {
-                            if let Some(mut supervisor) = state.supervisor.take() {
-                                supervisor.shutdown();
+                            RegimeDecision::Suppressed { .. } => {
+                                tracing::debug!(error = %error, total_failures = failures.total_failures(), "remote serving supervisor start still unavailable")
                             }
-                            mirror.end_serving();
-                            held.store(false, Ordering::Release);
-                            // Keep this worker for later server generations: a
-                            // release can race the old generation's reap.
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_millis(100));
-            });
-        match spawned {
-            Ok(thread) => *reaper = Some(thread),
-            Err(error) => {
-                tracing::error!(error = %error, "remote server idle reaper could not start; serving retained until shutdown")
             }
+            IdleAction::Reap => {
+                drop(current);
+                let fence = cerulion_discovery::robot_state::resolve()
+                    .ok_or_else(|| std::io::Error::other("no robot state root is available"))
+                    .and_then(|root| {
+                        crate::serving_hold::IdleFence::try_acquire(
+                            &crate::serving_hold::fence_path(&root),
+                        )
+                    });
+                match fence {
+                    Ok(Some(fence)) => {
+                        // Outbound Ensure also takes this native fence in shared
+                        // mode. Once exclusive, no new reader can race the stop.
+                        let readers = mirror.holds_outbound_readers();
+                        let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
+                        if !current.stopped
+                            && current.registrations.is_empty()
+                            && !current.standing_requested
+                            && !readers
+                        {
+                            current.phase = Phase::Reaping;
+                            drop(current);
+                            if let Some(mut server) = supervisor.take() {
+                                server.shutdown();
+                            }
+                            state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Idle;
+                            // Retain both the endpoint owner and exclusive fence
+                            // until server, epoch worker and end_serving finish.
+                            drop(fence);
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => match failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                            tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote serving idle fence unavailable; retrying")
+                        }
+                        RegimeDecision::Suppressed { .. } => {
+                            tracing::debug!(error = %error, total_failures = failures.total_failures(), "remote serving idle fence remains unavailable")
+                        }
+                    },
+                }
+            }
+            IdleAction::Wait => drop(current),
         }
-    }
-
-    /// Extra shutdown budget for graceful server stop and a revocation fetch,
-    /// including a registration still starting before it claims the endpoint.
-    pub fn stop_grace(&self) -> Duration {
-        self.stop_grace
+        let current = state.lock().unwrap_or_else(|e| e.into_inner());
+        let _wait = wake.wait_timeout(current, Duration::from_millis(100));
     }
 }
 
@@ -225,8 +282,7 @@ impl EgressPlane for SupervisedEgressPlane {
         serving: &SchemaServing,
         ix_config_json: Option<&str>,
     ) -> Result<bool, EgressError> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stopped {
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).stopped {
             return Err(EgressError::Server {
                 reason: "network daemon is shutting down".into(),
             });
@@ -234,24 +290,36 @@ impl EgressPlane for SupervisedEgressPlane {
         let booted = self
             .gateway
             .register_egress(id, plan, serving, ix_config_json)?;
-        if let Err(error) = self.ensure_server(&mut state) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped {
+            drop(state);
+            self.gateway.release_egress(id);
+            return Err(EgressError::Server {
+                reason: "network daemon is shutting down".into(),
+            });
+        }
+        state.registrations.insert(id);
+        drop(state);
+        if let Err(error) = self.ensure_worker() {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .registrations
+                .remove(&id);
             self.gateway.release_egress(id);
             return Err(error);
         }
-        state.registrations.insert(id);
         Ok(booted)
     }
 
     fn release_egress(&self, id: EgressId) {
-        let idle = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            self.gateway.release_egress(id);
-            state.registrations.remove(&id);
-            state.registrations.is_empty() && !self.standing && state.supervisor.is_some()
-        };
-        if idle {
-            self.reap_when_idle();
-        }
+        self.gateway.release_egress(id);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .registrations
+            .remove(&id);
+        self.wake.notify_all();
     }
 
     fn serving_schema_snapshot(&self) -> Result<crate::protocol::ServingSchemaSnapshot, String> {
@@ -280,18 +348,24 @@ mod tests {
     use cerulion_core::{TransportConfig, TransportManager};
 
     #[test]
-    fn idle_worker_survives_reaped_generations_until_shutdown() {
+    fn idle_decision_preserves_outbound_readers_and_starts_queued_registrations() {
         for (stopped, registered, server, expected) in [
             (false, false, false, IdleAction::Wait),
             (false, false, true, IdleAction::Reap),
-            (false, true, false, IdleAction::Wait),
+            (false, true, false, IdleAction::Start),
             (false, true, true, IdleAction::Wait),
             (true, false, false, IdleAction::Stop),
             (true, false, true, IdleAction::Stop),
             (true, true, false, IdleAction::Stop),
             (true, true, true, IdleAction::Stop),
         ] {
-            assert_eq!(idle_action(stopped, registered, server), expected);
+            assert_eq!(idle_action(stopped, registered, server, false), expected);
+            let held = if expected == IdleAction::Reap {
+                IdleAction::Wait
+            } else {
+                expected
+            };
+            assert_eq!(idle_action(stopped, registered, server, true), held);
         }
     }
 
@@ -305,8 +379,8 @@ mod tests {
             Arc::new(crate::mirror::GatewayMirrorPlane::new(manager)),
             false,
         ));
-        // A registration owns this mutex while the gateway boots, before the
-        // endpoint flag changes. Reading the watchdog budget must not wait on it.
+        // Brief registration bookkeeping must not delay the cached shutdown budget,
+        // including when endpoint ownership has not yet transferred.
         let registration = plane.state.lock().unwrap();
         assert!(!plane.holds_serving_endpoint());
         let (send, receive) = std::sync::mpsc::channel();

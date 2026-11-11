@@ -75,21 +75,29 @@ pub struct RobotSupervisor {
 
 impl RobotSupervisor {
     /// Start after netd acquires its singleton and a run registers egress (or
-    /// explicit LISTEN requests standing serving). Endpoint transfer comes first.
+    /// explicit LISTEN requests standing serving). Endpoint transfer happens on
+    /// this worker after provisioning, immediately before the real child starts.
     pub fn start(
         running: Arc<AtomicBool>,
         gateway: Arc<crate::GatewayEgressPlane>,
+        mirror: Arc<dyn crate::mirror::MirrorPlane>,
+        holds_endpoint: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let worker_running = Arc::clone(&running);
         let stop_grace = epoch_sync_stop_grace_from_env();
         let thread = std::thread::Builder::new()
             .name("netd-robot-supervisor".into())
             .spawn(move || {
+                let ownership = EndpointOwnership {
+                    mirror,
+                    held: holds_endpoint,
+                    stop_grace,
+                };
                 let mut attempt = 0u32;
                 while worker_running.load(Ordering::SeqCst) {
                     attempt += 1;
                     let started = Instant::now();
-                    let result = run(&worker_running, stop_grace, |eid| {
+                    let result = run(&worker_running, &ownership, |eid| {
                         gateway
                             .refresh_robot_beacon(eid)
                             .map_err(|error| error.to_string())
@@ -201,7 +209,7 @@ fn validate_prepared(prepared: &Prepared, root: &Path) -> Result<(), String> {
 
 fn run(
     running: &AtomicBool,
-    stop_grace: Duration,
+    ownership: &EndpointOwnership,
     refresh_facts: impl Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     let root = cerulion_discovery::robot_state::resolve()
@@ -248,7 +256,7 @@ fn run(
             cli,
             provisioned,
             running,
-            stop_grace,
+            ownership,
             refresh_facts,
         );
     }
@@ -284,9 +292,38 @@ fn run(
         Some(cli),
         provisioned,
         running,
-        stop_grace,
+        ownership,
         refresh_facts,
     )
+}
+
+struct EndpointOwnership {
+    mirror: Arc<dyn crate::mirror::MirrorPlane>,
+    held: Arc<AtomicBool>,
+    stop_grace: Duration,
+}
+
+struct OwnedEndpoint<'a>(&'a EndpointOwnership);
+
+impl EndpointOwnership {
+    fn begin(&self, root: &Path) -> Result<OwnedEndpoint<'_>, String> {
+        let _fence =
+            crate::serving_hold::IdleFence::try_acquire(&crate::serving_hold::fence_path(root))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "remote serving endpoint still has active work".to_owned())?;
+        self.held.store(true, Ordering::Release);
+        let lease = OwnedEndpoint(self);
+        // The guard restores ownership even if transfer or child spawn fails.
+        self.mirror.begin_serving()?;
+        Ok(lease)
+    }
+}
+
+impl Drop for OwnedEndpoint<'_> {
+    fn drop(&mut self) {
+        self.0.mirror.end_serving();
+        self.0.held.store(false, Ordering::Release);
+    }
 }
 
 fn serve(
@@ -295,10 +332,14 @@ fn serve(
     cli: Option<PathBuf>,
     provisioned: Provisioned,
     running: &AtomicBool,
-    stop_grace: Duration,
+    ownership: &EndpointOwnership,
     refresh_facts: impl Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
+    if !running.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let endpoint = ownership.begin(root)?;
     if !running.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -322,9 +363,21 @@ fn serve(
         remoted_stop_grace(),
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
+    if let Err(error) = ownership.mirror.serving_ready() {
+        // A failed outbound migration must notify its affected holders. It must
+        // not stop an otherwise live ops plane and erase an engaged e-stop.
+        tracing::warn!(error = %error, "remote outbound reader migration failed; robot ops plane remains available");
+    }
     let period = epoch_sync_period_from_env();
-    let mut epoch_sync =
-        cli.map(|cli| EpochSync::new(cli, root.to_path_buf(), period, stop_grace, Instant::now()));
+    let mut epoch_sync = cli.map(|cli| {
+        EpochSync::new(
+            cli,
+            root.to_path_buf(),
+            period,
+            ownership.stop_grace,
+            Instant::now(),
+        )
+    });
     let result = supervise_server(
         &mut child.0,
         &mut epoch_sync,
@@ -332,12 +385,13 @@ fn serve(
         &provisioned.endpoint_id,
         &refresh_facts,
     );
-    // Dropping the server child kills and reaps it, so the robot stops serving
-    // before the wait for a running fetch.
+    // Gracefully reap the child, then finish the revocation fetch before
+    // returning the shared endpoint and restoring outgoing reader pins.
     drop(child);
     if let Some(sync) = epoch_sync.as_mut() {
         sync.stop();
     }
+    drop(endpoint);
     result
 }
 
