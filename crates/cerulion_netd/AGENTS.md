@@ -6,6 +6,8 @@ split: tests drive an in-process daemon over a temp socket with an injected spy
 mirror plane - green there proves the wiring, not the live network planes.
 
 ## Invariants
+- LAN access defaults to Paired on every platform; only explicit Open warns at
+  startup. LAN transport fixtures select Open explicitly when testing delivery.
 - One daemon per machine: an `flock`-held pidfile (`cerulion_hygiene::NETD`); the
   kernel drops the lock on death. Never add a second lock scheme. Android: abstract
   socket, same-UID peers only.

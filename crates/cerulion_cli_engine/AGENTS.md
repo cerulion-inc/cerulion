@@ -16,6 +16,8 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
 - Enforce invariants at the engine boundary; CLI checks are UX.
+- Paired LAN startup is quiet. Explicit Open warns for strict and permissive
+  export plans alike; describe the serving daemon's reported posture.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
   share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
