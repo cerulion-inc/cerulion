@@ -33,12 +33,12 @@ pub struct StreamPreamble {
 /// A control-stream request (desk → robot), length-prefixed JSON. The `verb` tag
 /// dispatches; each verb is answered with a [`WireResponse`].
 ///
-/// Mirror of `cerulion_remoted::WireRequest` (the `#[serde(tag = "verb")]`
-/// snake_case shape must stay byte-identical — pinned by the parity test).
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Mirror of `cerulion_remoted::WireRequest` (the `#[serde(tag = "verb")]`
+/// snake_case shape stays byte-identical, pinned by the parity test).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum WireRequest {

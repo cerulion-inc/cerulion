@@ -182,9 +182,7 @@ fn open_session(
                 ))
             }
         })?;
-    if expected.is_some_and(|expected| expected != producers) {
-        return Err(CliError::GraphIngressSourceChanged);
-    }
+    require_same_producers(expected, &producers)?;
     for producer in &producers {
         check_cancelled(cancelled)?;
         catalogs.sync_selected_epoch(&producer.route)?;
@@ -218,6 +216,13 @@ fn check_cancelled(cancelled: &impl Fn() -> bool) -> CliResult<()> {
         return Err(CliError::Validation(
             "authenticated graph network setup was interrupted".into(),
         ));
+    }
+    Ok(())
+}
+
+fn require_same_producers(expected: Option<&[Producer]>, selected: &[Producer]) -> CliResult<()> {
+    if expected.is_some_and(|expected| expected != selected) {
+        return Err(CliError::GraphIngressSourceChanged);
     }
     Ok(())
 }
@@ -478,6 +483,32 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn canonical_ingress_reconnect_refuses_any_source_identity_change() {
+        let original = select_producer(&input(), &[robot("paired-camera")]).unwrap();
+        let expected = [original.clone()];
+        require_same_producers(None, &expected).unwrap();
+        require_same_producers(Some(&expected), &expected).unwrap();
+        let changes: [fn(&mut Producer); 4] = [
+            |p| p.key = [4; 32],
+            |p| p.route = "another-paired-camera".into(),
+            |p| p.topic = "/other/input".into(),
+            |p| p.schema_hash = 8,
+        ];
+        for change in changes {
+            let mut selected = original.clone();
+            change(&mut selected);
+            assert!(matches!(
+                require_same_producers(Some(&expected), &[selected]),
+                Err(CliError::GraphIngressSourceChanged)
+            ));
+        }
+        assert!(matches!(
+            require_same_producers(Some(&expected), &[]),
+            Err(CliError::GraphIngressSourceChanged)
+        ));
     }
 
     #[test]
