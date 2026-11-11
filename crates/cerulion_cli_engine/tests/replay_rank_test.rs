@@ -326,6 +326,142 @@ fn membership_follows_the_manifests_even_when_the_graph_declares_other_groups() 
 }
 
 // ===========================================================================
+// The sibling-produced set: a correct cross-rank edge is not a typo
+// ===========================================================================
+
+fn sibling_topics_of(plan: &RankPlan) -> Vec<&str> {
+    plan.sibling_produced().iter().map(String::as_str).collect()
+}
+
+/// Each rank names exactly the topics ANOTHER rank produces for it: rank 1's
+/// two cross-rank reads (the relative `mid/out` the split absolutized and the
+/// hand-written absolute `/mp/special_bus`), never the external `/external/feed`
+/// that no rank produces. Rank 0 reads only in-rank, and the whole-graph
+/// lockstep plan has no sibling at all.
+#[test]
+fn each_rank_names_the_topics_another_rank_produces_for_it() {
+    let config = two_rank_config();
+    let plans = plan_ranks(&config, &two_rank_manifests(), &two_rank_boundaries())
+        .expect("the two-rank fixture plans");
+    assert_eq!(sibling_topics_of(plan_of(&plans, 0)), Vec::<&str>::new());
+    assert_eq!(
+        sibling_topics_of(plan_of(&plans, 1)),
+        vec!["/mp/mid/out", "/mp/special_bus"]
+    );
+
+    let lockstep = plan_ranks(
+        &config,
+        &[RankManifest {
+            rank: 0,
+            node_ids: vec!["src".into(), "mid".into(), "sink".into()],
+        }],
+        &[summary(0, 0, 41, 1_700_000_000_000)],
+    )
+    .expect("the lockstep shape plans");
+    assert_eq!(sibling_topics_of(&lockstep[0]), Vec::<&str>::new());
+}
+
+/// The lines a validation of `view` logged that call an in-prefix source a
+/// possible typo, by the source each names.
+fn typo_warned_sources(lines: &[&str]) -> Vec<String> {
+    let mut named: Vec<String> = lines
+        .iter()
+        .filter(|l| l.contains("matches no declared output"))
+        .filter_map(|l| {
+            let at = l.find("source=")? + "source=".len();
+            Some(l[at..].split_whitespace().next()?.to_string())
+        })
+        .collect();
+    named.sort();
+    named
+}
+
+/// THE symptom on the replay side: rank 1's view, validated with its plan's
+/// sibling set as the pass build validates it, draws no typo warning for its two
+/// correct cross-rank sources. The control is the same view validated with no
+/// set, which is what every free-run replay pass did and which warned once per
+/// cross-rank source.
+#[test]
+#[tracing_test::traced_test]
+fn a_rank_view_validated_with_its_sibling_set_draws_no_typo_warning() {
+    let config = two_rank_config();
+    let plans = plan_ranks(&config, &two_rank_manifests(), &two_rank_boundaries())
+        .expect("the two-rank fixture plans");
+    let r1 = plan_of(&plans, 1);
+
+    cerulion_core::graph::validate_graph_with(
+        r1.subgraph(),
+        cerulion_core::graph::ValidationOptions {
+            sibling_topics: Some(r1.sibling_produced()),
+            ..Default::default()
+        },
+    )
+    .expect("rank 1's view validates");
+    logs_assert(
+        |lines: &[&str]| match typo_warned_sources(lines).as_slice() {
+            [] => Ok(()),
+            named => Err(format!(
+                "a correct cross-rank edge drew a typo warning: {named:?}"
+            )),
+        },
+    );
+
+    cerulion_core::graph::validate_graph(r1.subgraph()).expect("validates");
+    logs_assert(|lines: &[&str]| {
+        let named = typo_warned_sources(lines);
+        if named == ["/mp/mid/out", "/mp/special_bus"] {
+            Ok(())
+        } else {
+            Err(format!(
+                "the no-set control must warn once per cross-rank source, got {named:?}"
+            ))
+        }
+    });
+}
+
+/// Adversarial: a real typo on the consuming rank still warns with the sibling
+/// set in hand, because no rank produces the misspelled topic.
+#[test]
+#[tracing_test::traced_test]
+fn a_typod_source_still_warns_with_the_sibling_set() {
+    let mut config = two_rank_config();
+    let sink = config
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "sink")
+        .expect("the fixture's sink node");
+    sink.inputs.push(cerulion_core::graph::config::InputDef {
+        name: "typo".into(),
+        source: "/mp/mid/otu".into(),
+    });
+    let plans = plan_ranks(&config, &two_rank_manifests(), &two_rank_boundaries())
+        .expect("the two-rank fixture plans");
+    let r1 = plan_of(&plans, 1);
+    assert_eq!(
+        sibling_topics_of(r1),
+        vec!["/mp/mid/out", "/mp/special_bus"],
+        "a topic no rank produces is never a sibling topic"
+    );
+
+    cerulion_core::graph::validate_graph_with(
+        r1.subgraph(),
+        cerulion_core::graph::ValidationOptions {
+            sibling_topics: Some(r1.sibling_produced()),
+            ..Default::default()
+        },
+    )
+    .expect("rank 1's view validates");
+    logs_assert(|lines: &[&str]| {
+        let named = typo_warned_sources(lines);
+        if named == ["/mp/mid/otu"] {
+            Ok(())
+        } else {
+            Err(format!("the typo must warn exactly once, got {named:?}"))
+        }
+    });
+}
+
+// ===========================================================================
 // Lockstep is ONE rank plan
 // ===========================================================================
 

@@ -1123,12 +1123,13 @@ fed:
 effort. A free-run bag that starts mid-run replays this way only when it holds
 one worker rank.
 
-The verdict's second line says how reads were fed: `reads: fed by recorded
-identity (R reads, F frames, ...)`, or `reads: best effort, no read identity
-(<reason>)` for a bag recorded before format 8, a lockstep bag, and a resim
-without `--verify`. A resim without `--verify` keeps each consumer's queue so a
-changed node's own frames reach its in-rank consumers. The `--report` JSON
-carries the same fact as `read_identity`.
+The `--report` JSON says how reads were fed, as `read_identity`: fed by
+recorded identity (with its read and frame counts), or best effort for a bag
+recorded before format 8, a lockstep bag, and a resim without `--verify`. The
+terminal verdict prints a line only for best effort, `reads: best effort, no
+read identity (<reason>)`, because that narrows what the verdict covers. A
+resim without `--verify` keeps each consumer's queue so a changed node's own
+frames reach its in-rank consumers.
 
 ### The kind-6 annotations ride INSIDE the record kind
 

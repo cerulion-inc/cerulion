@@ -331,6 +331,13 @@ still reports its zero count).
   departure ring (header `rank == u32::MAX`, the multi-process departure
   sentinel) gets passthrough, never the head-step gate; that decision lives in
   `bagd::ring_head_gate`, deliberately not in the core ring layer.
+- **State rings follow the recorder, declared or discovered**: a recorder
+  present from the run's start (`attached_mid_run == false`, every
+  `graph run --record`) opens each node-state ring with `open`, from record 0,
+  so the step-0 anchor a rank publishes before the first discovery sweep is in
+  the bag; only a mid-run attach uses `open_at_live` and the head-discarding
+  ledger. A backpressure ring cannot lap before its first consumer (the
+  producer checks `free_records` before every anchor).
 - **Two recorders on one run is allowed** and mechanically safe: ring
   consumers keep local read cursors and the producer never reads consumer
   state. One bag = one run; one run may have several bags. A restarted run is

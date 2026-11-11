@@ -163,6 +163,11 @@ is unsupported.
   provenance gather (refreshed on miss, aged by `PROVENANCE_CACHE_TTL`), so a
   missed gather is served stale for the TTL. Tests poll attribution to a
   deadline; reading `list` once right after `attach` is a known flake shape.
+- A `detach` or remote `attach` drops its own topic from the cached snapshot
+  and moves its generation. A gather that started before the mutation and
+  stores after it is refused, so later reads cannot get the old robot back
+  from it (the request that ran it still answers from its own gather); one
+  that stored before it loses that topic with the invalidation.
 - `runs` lists ONE row per `run_id`. A desk whose own netd announces sees each
   local graph twice: from the registry gather (`robot` absent) and echoed back
   over the LAN under its own hostname; `runs.rs::fold_runs` keeps the first row
