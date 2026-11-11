@@ -395,7 +395,7 @@ fn msg_store_names_in(schemas_dir: &Path) -> Vec<Candidate> {
 ///   A pinned robot completes even if it has never been seen on THIS LAN,
 ///   which is the point of a pin.
 ///
-/// A fourth source was measured and REJECTED: the origin robots of the mirrors
+/// A third source was measured and REJECTED: the origin robots of the mirrors
 /// live in local SHM. Reading them means
 /// `mirror_registry::gather_current_provenance`, which opens an iceoryx2 node —
 /// MEASURED at 620 ms on an idle desk with zero topics, four times the whole

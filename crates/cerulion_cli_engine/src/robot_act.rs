@@ -98,7 +98,7 @@ fn call_robot_verb_under(
 
 /// The refusal of an act-verb call while `network` (the `CERULION_NETWORK`
 /// value, `None` = unset) engages the kill-switch, under the run and query
-/// parse that `cerulion pair` and `cerulion viz --robot` use
+/// parse that `cerulion viz --robot` uses
 /// ([`crate::graph_cmd::network_env_kill_from`]): `off` after trimming,
 /// ASCII case-insensitively, engages it, any other non-empty value fails
 /// closed and engages it too, and an empty or whitespace-only value is

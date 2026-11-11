@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion-connectd` — the desk-side iroh sibling binary.
 //!
-//! Three subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
+//! Four subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
 //! and SPAWNS this, exactly as it spawns the gateway / `vizd`):
 //!
 //! - `cerulion-connectd connect …`, dial a robot's `cerulion/wire/2` ALPN, demand
@@ -46,7 +46,8 @@ use cerulion_core::transport::cerulion_q::CatalogReply;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{RelayConfig, RelayUrl};
 
-/// The desk-side iroh sibling `cerulion connect` and `cerulion rcp` spawn.
+/// The desk-side iroh sibling `cerulion connect`, `cerulion rcp` and the
+/// `--robot` forms of `topic pub`, `topic snapshot` and `service call` spawn.
 //
 // `about` is spelled out here. A bare `about` takes the crate's manifest
 // description, which is written for crates.io, not for a terminal.
@@ -240,8 +241,8 @@ struct ConnectCli {
 #[derive(Parser)]
 struct PairCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
-    /// 32-byte device key). `cerulion pair` resolves it from the robot name you
-    /// typed (mDNS `eid=`, else `robots.toml`) or takes it from `--eid`.
+    /// 32-byte device key), from the robot's mDNS `eid=` record or the robot
+    /// operator.
     #[arg(long, value_name = "HEX")]
     eid: String,
 
@@ -251,8 +252,8 @@ struct PairCli {
 
     /// The desk device key file (32 raw bytes: an ed25519 seed). REQUIRED for
     /// pairing (an ephemeral key the robot added to its access list would
-    /// vanish on exit). `cerulion pair` creates and passes
-    /// `~/.cerulion/desk.key`.
+    /// vanish on exit). Pass this machine's key,
+    /// `~/.cerulion/identity/device.key`, which `cerulion login` creates.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -270,7 +271,7 @@ struct PairCli {
     account: Option<String>,
 
     /// The human label the robot stores on its access-list row (so the owner
-    /// recognizes this desk). `cerulion pair` defaults it to the desk hostname.
+    /// recognizes this desk). Default: the desk hostname.
     #[arg(long, value_name = "NAME")]
     label: Option<String>,
 
@@ -727,10 +728,10 @@ async fn run_connect_command(cli: ConnectCli) -> ExitCode {
             match &e {
                 ConnectError::Refused(reason) => tracing::error!(
                     reason = %sanitize_peer_text(reason),
-                    "cerulion connect: the robot refused the wire plane: this desk's key is not on \
-                     its access list; a desk signed in with `cerulion login` to the robot's \
-                     account is added the first time it reads one of the robot's topics, for \
-                     example with `cerulion viz --robot`"
+                    "cerulion connect: the robot refused the wire plane (the reason says why); a \
+                     desk signed in with `cerulion login` to the robot's account joins its access \
+                     list the first time this machine's network daemon reads one of the robot's \
+                     topics, which `cerulion viz --robot` does"
                 ),
                 other => tracing::error!(
                     error = %sanitize_peer_text(&other.to_string()),
