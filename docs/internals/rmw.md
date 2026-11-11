@@ -605,6 +605,27 @@ unset); `rmw_wait_spin_test` carries the explicit-env clamp-at-`u64::MAX` pins a
 
 ## Type bridges (codec contracts)
 
+The heap hook's load-time winner check compares defining modules, using its
+private constructor to identify its own module. A non-PIE executable such as
+Python 3.8 can give an undefined `malloc` import a canonical PLT address, which
+glibc returns from `dlsym(RTLD_DEFAULT, "malloc")` even when calls bind to the
+hook. `dladdr1(RTLD_DL_SYMENT)` distinguishes that `SHN_UNDEF` import from a
+definition. Only that import takes the fallback: enumerate loaded objects in
+loader order, open existing handles with `RTLD_NOLOAD`, and accept a lookup
+only when the address lies inside that object's `PT_LOAD` segments. This skips
+definitions found through a dependency. Uninspectable objects fail closed;
+an earlier foreign definition keeps the always-on loss diagnostic and the
+copying fallback. The lookup runs once under the control guard, before message
+processing, and adds no publish or receive work.
+
+`crates/cerulion_heaphook/tests/heaphook_e2e_test.rs` compiles the non-PIE
+`crates/cerulion_heaphook/tests/fixtures/canonical_plt.c` oracle with `cc` on
+Linux/GNU. Build `cerulion_heaphook`, `heaphook_probe` and `heaphook_shim` first
+under the same profile, then run `cargo test -p cerulion_heaphook`. Literal
+facts pin canonical-import detection, handshake status, actual slot addresses
+and written bytes, both preload orders, both linked orders, a non-allocator
+dependency, and loud loss with debug off and on.
+
 - **Wire identity.** Bridged frames carry the schema hash computed by
   `MessageSchema::schema_hash` in `cerulion_core`, the same recipe
   `native_ros2_messages` compiles against. Never hand-compute or copy hash literals;
