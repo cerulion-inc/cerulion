@@ -2470,6 +2470,43 @@ impl CerulionPublisher {
         // `promise_within_ms` watchdog (no-op unless one is wired).
         self.record_promise_within_published();
 
+        self.complete_raw_publish(data);
+
+        Ok(recipients)
+    }
+
+    /// Publish a fully initialized exact raw frame without replacing its stamps.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_raw_frame(
+        &mut self,
+        mut loan: RawShmLoan,
+    ) -> TransportResult<usize> {
+        let mut header = [0; WireHeader::SIZE];
+        header.copy_from_slice(&loan.bytes_mut()[..WireHeader::SIZE]);
+        let recipients = self
+            .send_raw_loan(loan)
+            .inspect_err(|_| self.record_send_fail_drop())?;
+        self.complete_raw_publish(&header);
+        Ok(recipients)
+    }
+
+    /// Loan an exact-size raw ingress frame. Header is initialized for validation;
+    /// the caller must overwrite its complete initialized frame before finishing.
+    #[doc(hidden)]
+    pub(crate) fn loan_plugin_raw_frame(&mut self, size: u32) -> TransportResult<RawShmLoan> {
+        let mut loan = self.loan_raw_uninit(size as usize)?;
+        for byte in &mut loan.bytes_uninit_mut()[..WireHeader::SIZE] {
+            byte.write(0);
+        }
+        // SAFETY: POSIX SHM supplies defined mapping bytes, as in loan_proxy.
+        // The prefix is initialized, the host retains the native owner, and the
+        // trusted raw caller initializes its complete frame before finish. Shape
+        // validation refuses an unwritten/malformed header; no lifetime extends.
+        Ok(unsafe { loan.assume_init_shm_defined() })
+    }
+
+    // Preserve the existing raw publish trace/notify effects in one shared path.
+    fn complete_raw_publish(&mut self, data: &[u8]) {
         // Regime A: record the publish into the trace
         // (when attached). Parsing 24 bytes of WireHeader is cheap
         // relative to the iceoryx2 send that just completed.
@@ -2536,8 +2573,6 @@ impl CerulionPublisher {
             // off-gate arm is the pin: its producer publishes exactly this way.
             self.unannounced_publish.store(true, Ordering::Relaxed);
         }
-
-        Ok(recipients)
     }
 
     /// Non-blocking check for subscriber events.
