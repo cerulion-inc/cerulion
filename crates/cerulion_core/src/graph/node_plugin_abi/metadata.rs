@@ -6,13 +6,14 @@ use std::ffi::{CStr, CString};
 use crate::error::TransportResult;
 use crate::node_abi::LoanRequestV1;
 
-/// Preserve common params, triggers and QoS while adding checked wire facts.
+/// Preserve common params, triggers and QoS with wire facts and declared inline safety.
 // hot-path-alloc-ok-fn: bootstrap builds immutable stable metadata once per library.
 pub fn metadata(
     base: &CStr,
     inputs: &[LoanRequestV1],
     outputs: &[LoanRequestV1],
     accumulate_caps: &[Option<usize>],
+    inline_safe: bool,
 ) -> TransportResult<CString> {
     let mut value: serde_json::Value = serde_json::from_slice(base.to_bytes())
         .map_err(|error| super::argument_error(&error.to_string()))?;
@@ -55,6 +56,10 @@ pub fn metadata(
             .ok_or_else(|| super::argument_error("input metadata is not an object"))?
             .insert("accumulate_cap".into(), (*capacity).into());
     }
+    value
+        .as_object_mut()
+        .ok_or_else(|| super::argument_error("common metadata is not an object"))?
+        .insert("inline_safe".into(), inline_safe.into());
     let bytes =
         serde_json::to_vec(&value).map_err(|error| super::argument_error(&error.to_string()))?;
     CString::new(bytes).map_err(|error| super::argument_error(&error.to_string()))
@@ -93,7 +98,13 @@ pub fn raw_metadata(
         serde_json::to_vec(&value).map_err(|error| super::argument_error(&error.to_string()))?;
     let normalized =
         CString::new(bytes).map_err(|error| super::argument_error(&error.to_string()))?;
-    metadata(&normalized, inputs, outputs, &vec![None; inputs.len()])
+    metadata(
+        &normalized,
+        inputs,
+        outputs,
+        &vec![None; inputs.len()],
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -114,7 +125,7 @@ mod tests {
     fn stable_facts_preserve_common_metadata_and_leave_the_legacy_bytes_untouched() {
         let base = c"{\"inputs\":[{\"name\":\"input\",\"schema_hash\":7,\"trigger\":true}],\"outputs\":[{\"name\":\"output\",\"schema_hash\":9}],\"params\":[{\"name\":\"scale\",\"default\":2}],\"policy\":{\"kind\":\"data_trigger\",\"input\":\"input\"}}";
         for _ in 0..2 {
-            let enriched = metadata(base, &[facts(7)], &[facts(9)], &[None]).unwrap();
+            let enriched = metadata(base, &[facts(7)], &[facts(9)], &[None], false).unwrap();
             let value: serde_json::Value = serde_json::from_slice(enriched.to_bytes()).unwrap();
             assert_eq!(value["inputs"][0]["trigger"], true);
             assert_eq!(value["inputs"][0]["wire_fixed_size"], 24);
@@ -130,6 +141,21 @@ mod tests {
     }
 
     #[test]
+    fn inline_safe_metadata_is_the_declared_bool_and_preserves_common_bytes() {
+        let base = c"{\"inputs\":[],\"outputs\":[],\"policy\":{\"period_ms\":1}}";
+        for inline in [false, true] {
+            let bytes = metadata(base, &[], &[], &[], inline).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(bytes.to_bytes()).unwrap();
+            assert_eq!(value["inline_safe"], serde_json::Value::Bool(inline));
+            assert_eq!(value["policy"]["period_ms"], 1);
+        }
+        assert!(!base
+            .to_bytes()
+            .windows(11)
+            .any(|bytes| bytes == b"inline_safe"));
+    }
+
+    #[test]
     fn malformed_shape_count_and_schema_are_refused() {
         for base in [
             c"x",
@@ -138,7 +164,7 @@ mod tests {
             c"{\"inputs\":[3],\"outputs\":[]}",
             c"{\"inputs\":[{\"schema_hash\":8}],\"outputs\":[]}",
         ] {
-            assert!(metadata(base, &[facts(7)], &[], &[None]).is_err());
+            assert!(metadata(base, &[facts(7)], &[], &[None], false).is_err());
         }
     }
 }

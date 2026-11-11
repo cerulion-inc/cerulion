@@ -223,6 +223,7 @@ pub(crate) fn generate(
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#input_types>()),*],
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#output_types>()),*],
                         &[#(#input_caps),*],
+                        <#node as #root::state::CerulionState>::INLINE_SAFE,
                     ).expect("generated wire facts match the common metadata")
                 }).as_bytes();
                 // hot-path-alloc-ok: bootstrap owns one immutable table for the library lifetime.
@@ -237,5 +238,26 @@ pub(crate) fn generate(
             }) as *const _
         }
         #root::node_abi::export_node_api!(__cer_stable_api);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stable_author_metadata_emits_the_native_inline_safe_type_constant() {
+        let tokens = generate(
+            &syn::parse_quote!(Entry),
+            &syn::parse_quote!(Node),
+            &[],
+            &[],
+            false,
+        );
+        let compact: String = tokens.to_string().split_whitespace().collect();
+        assert!(compact.contains("metadata("));
+        assert!(compact.contains("<Nodeas"));
+        assert!(compact.contains("::state::CerulionState>::INLINE_SAFE"));
+        assert!(compact.contains("fninline_safe(&self)->bool"));
+        assert!(!compact.contains("capability::INLINE_SAFE"));
     }
 }
