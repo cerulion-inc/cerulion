@@ -22,9 +22,7 @@ use cerulion_core::graph::{
     parse_graph, resolve_ingress_schema_hash, resolve_output_topic, DylibNodeEntry, GraphConfig,
     GraphTopology, NodeDef, NodeEntry, NodeInfo, NodeTickPanicRecords, RunTopology,
 };
-use cerulion_core::transport::cerulion_q::{
-    format_run_id, RunEntry, RunEntryError, FIRES_WIRE_VERSION,
-};
+use cerulion_core::transport::cerulion_q::{RunEntry, RunEntryError, FIRES_WIRE_VERSION};
 use cerulion_core::transport::gateway::{
     GatewayEgressPolicy, GatewayIngressEntry, GatewayPlan, GatewayRuntime, SchemaServing,
     TopicSchema,
@@ -888,7 +886,7 @@ impl EmbeddedRuntime {
         run.hosted.as_ref()?;
         run.hosted_plan
             .as_ref()
-            .map(|hosted| format_run_id(hosted.run_id))
+            .map(|hosted| cerulion_core::transport::cerulion_q::format_run_id(hosted.run_id))
     }
 
     pub(crate) fn start_accepted(&mut self, config_json: &str) -> Result<(), EmbedError> {
