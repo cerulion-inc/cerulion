@@ -676,7 +676,12 @@ consumer capacity before an injector opens. Authenticated wire producers
 carry explicit Reliable/send_queue metadata: congestion refuses new frames
 and preserves queued frames, with `wan_refused` distinct from `wan_dropped`.
 A missing policy is unverified; best-effort datagram graph ingress is refused
-on the authenticated wire path.
+on the authenticated wire path. Before releasing graph workers, the CLI resolves
+each declared ingress topic to exactly one authenticated account or paired
+producer and checks its schema, reliable policy and single live writer.
+Missing or ambiguous producers fail startup. Held demands reconnect to the
+same pinned producer and release when the run stops. Observer reads retain
+their best-effort queue and can read every writer of a multi-publisher topic.
 
 The graph file stays the single source of truth: under a
 Strict block, which topics cross the machine boundary is declared in YAML.
