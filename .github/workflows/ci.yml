@@ -21,6 +21,15 @@ on:
   # Manual trigger, primarily so the latency job (gated off the
   # per-PR critical path below) can be run on demand against any ref.
   workflow_dispatch:
+    inputs:
+      rmw_baseline:
+        description: Baseline commit for an optional RMW percentile comparison
+        type: string
+        default: ''
+      rmw_candidate:
+        description: Candidate commit for an optional RMW percentile comparison
+        type: string
+        default: ''
 
 # Declared explicitly rather than inherited from the repository's
 # `default_workflow_permissions` setting. That setting reads `read` today, but
@@ -4805,7 +4814,7 @@ jobs:
 
   rmw-latency-comparison:
     name: RMW latency comparison (Linux)
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.rmw_candidate != '' && inputs.rmw_baseline != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -4821,10 +4830,12 @@ jobs:
       - name: Check RMW report parser oracles
         run: python3 tools/scripts/test_compare_rmw_latency.py
       - name: Compare real RMW release percentiles
+        env:
+          RMW_BASELINE: ${{ inputs.rmw_baseline }}
+          RMW_CANDIDATE: ${{ inputs.rmw_candidate }}
         run: |
-          git fetch origin main
-          baseline_ref=$(git merge-base HEAD origin/main)
-          python3 tools/scripts/compare_rmw_latency.py --baseline "$baseline_ref" --output rmw-latency
+          git fetch origin "$RMW_BASELINE" "$RMW_CANDIDATE"
+          python3 tools/scripts/compare_rmw_latency.py --baseline "$RMW_BASELINE" --candidate "$RMW_CANDIDATE" --output rmw-latency
       - name: Preserve RMW measurements
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

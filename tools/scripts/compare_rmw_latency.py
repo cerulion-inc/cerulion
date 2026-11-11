@@ -84,29 +84,32 @@ def summarize(pairs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
+    parser.add_argument("--candidate", required=True)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     root = Path(command(["git", "rev-parse", "--show-toplevel"], Path.cwd(),
                         stdout=subprocess.PIPE, text=True).stdout.strip())
-    baseline_sha = command(["git", "rev-parse", args.baseline + "^{commit}"],
+    baseline_sha = command(["git", "rev-parse", "--verify", "--end-of-options",
+                            args.baseline + "^{commit}"],
                            root, stdout=subprocess.PIPE, text=True).stdout.strip()
-    candidate_sha = command(["git", "rev-parse", "HEAD"], root,
+    candidate_sha = command(["git", "rev-parse", "--verify", "--end-of-options",
+                             args.candidate + "^{commit}"], root,
                             stdout=subprocess.PIPE, text=True).stdout.strip()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="rmw-comparison-") as temporary:
         scratch = Path(temporary)
-        baseline = scratch / "baseline"
-        command(["git", "clone", "--quiet", "--no-checkout", "--shared",
-                 str(root), str(baseline)], root)
-        command(["git", "checkout", "--quiet", "--detach", baseline_sha], baseline)
         target = root / "target"
         hashes = {}
-        for label, checkout in (("baseline", baseline), ("candidate", root)):
-            binary = baseline / "rmw-oracle" if label == "baseline" else scratch / "rmw-candidate"
-            hashes[label] = build(checkout, target, binary, output / (label + "-build.log"))
-        binaries = {"baseline": baseline / "rmw-oracle",
-                    "candidate": scratch / "rmw-candidate"}
+        binaries = {}
+        for label, sha in (("baseline", baseline_sha), ("candidate", candidate_sha)):
+            checkout = scratch / label
+            command(["git", "clone", "--quiet", "--no-checkout", "--shared",
+                     str(root), str(checkout)], root)
+            command(["git", "checkout", "--quiet", "--detach", sha], checkout)
+            binaries[label] = scratch / (label + "-rmw-oracle")
+            hashes[label] = build(checkout, target, binaries[label],
+                                  output / (label + "-build.log"))
         pairs = []
         for index in range(1, 6):
             pair = {}
