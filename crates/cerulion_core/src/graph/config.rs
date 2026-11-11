@@ -407,10 +407,14 @@ fn is_default_reliability(r: &EgressReliability) -> bool {
 ///     external: true                  # published by a process outside this graph
 ///   - topic: /robot/camera/image
 ///     send_queue: 32                  # frames the gateway queues while the link is congested
+///   - topic: /robot/status
+///     backpressure: drop_oldest       # what egress always does; `block` is refused
 /// ```
 ///
 /// The bare string is the map with no `reliability`, no `send_queue` and
 /// `external: false`, and such an entry serializes back to the bare string.
+/// `backpressure:` is accepted only as `drop_oldest`, which parses to the
+/// same entry as no key; `backpressure: block` is refused by name.
 /// Unknown map keys are a parse error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTopic {
@@ -595,8 +599,8 @@ impl<'de> Deserialize<'de> for EgressTopic {
             type Value = EgressTopic;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(
-                    "a topic name, or a map with `topic` and optional `reliability`, `external` \
-                     and `send_queue`",
+                    "a topic name, or a map with `topic` and optional `reliability`, `external`, \
+                     `send_queue` and `backpressure`",
                 )
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EgressTopic, E> {
@@ -1136,7 +1140,85 @@ nodes:
             "{err}"
         );
         let ok: GraphConfig = serde_yaml::from_str(&yaml("drop_oldest")).unwrap();
-        assert_eq!(ok.network.unwrap().egress[0].topic, "/robo/cmd");
+        let entry = &ok.network.unwrap().egress[0];
+        // `drop_oldest` leaves the entry as the bare topic name would.
+        assert_eq!(*entry, EgressTopic::new("/robo/cmd"));
+        assert_eq!(serde_yaml::to_string(entry).unwrap(), "/robo/cmd\n");
+    }
+
+    /// The keys a `network.egress` map entry accepts, hand-listed in the
+    /// order `EgressTopicMap` declares them.
+    const EGRESS_ENTRY_KEYS: [&str; 5] = [
+        "topic",
+        "reliability",
+        "external",
+        "send_queue",
+        "backpressure",
+    ];
+
+    /// The egress map keys the parser accepts are [`EGRESS_ENTRY_KEYS`], and
+    /// each one is named where a user reads what an entry may carry: the
+    /// parse error for an entry that is neither a name nor a map, the egress
+    /// row of `docs/networking.md`, and the `egress` bullet of
+    /// `docs/user-api.md`.
+    #[test]
+    fn every_egress_entry_key_is_named_where_a_user_reads_the_entry() {
+        let graph = |entry: &str| {
+            format!("prefix: robo\nnodes: []\nnetwork:\n  mode: peer\n  egress:\n    - {entry}\n")
+        };
+        let unknown =
+            serde_yaml::from_str::<GraphConfig>(&graph("{topic: /robo/cmd, sendqueue: 4}"))
+                .expect_err("an unknown egress key must be refused")
+                .to_string();
+        let accepted: Vec<&str> = unknown
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("the refusal lists no accepted keys: {unknown}"))
+            .1
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        assert_eq!(accepted, EGRESS_ENTRY_KEYS, "{unknown}");
+
+        let not_a_map = serde_yaml::from_str::<GraphConfig>(&graph("5"))
+            .expect_err("an integer egress entry must be refused")
+            .to_string();
+        for key in EGRESS_ENTRY_KEYS {
+            assert!(
+                not_a_map.contains(&format!("`{key}`")),
+                "{key}: {not_a_map}"
+            );
+        }
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |path: std::path::PathBuf| {
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        };
+        let networking = read(manifest.join("../../docs/networking.md"));
+        let rows: Vec<&str> = networking
+            .lines()
+            .filter(|l| l.starts_with("| `egress` |"))
+            .collect();
+        assert_eq!(rows.len(), 1, "docs/networking.md egress rows: {rows:?}");
+        let map = format!("`{{{}}}`", EGRESS_ENTRY_KEYS.join(", "));
+        assert!(
+            rows[0].contains(&map),
+            "networking.md lacks {map}: {}",
+            rows[0]
+        );
+
+        let user_api = read(manifest.join("../../docs/user-api.md"));
+        let bullet = user_api
+            .split_once("\n- `egress`: topics this graph exports")
+            .and_then(|(_, rest)| rest.split_once("\n- `").map(|(b, _)| b))
+            .expect("docs/user-api.md carries the network block's `egress` bullet");
+        for key in EGRESS_ENTRY_KEYS {
+            assert!(
+                bullet.contains(&format!("`{key}`")),
+                "user-api.md egress bullet lacks `{key}`"
+            );
+        }
     }
 
     /// A no-`network:` YAML parses to `network == None` AND leaves every

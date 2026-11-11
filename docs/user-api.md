@@ -2313,11 +2313,17 @@ network:
   outside the graph publishes on this machine (a ROS 2 program on
   `rmw_cerulion`, for example) is listed as `{topic: /chatter, external:
   true}`, and must have no in-graph producer.
-  An entry is a topic name or a map, `{topic: /r/scan, reliability:
+  An entry is a topic name or a map with `topic` and optional
+  `reliability`, `external`, `send_queue` (see the send queue below) and
+  `backpressure`, for example `{topic: /r/scan, reliability:
   best_effort}`; `reliability` is `reliable` or `best_effort`, which puts
   the topic on QUIC datagrams over a `mixed_rel=1` QUIC locator. An entry
   with no `reliability` (a bare name included) is put at
-  `default_reliability`.
+  `default_reliability`. An entry may also set `backpressure: drop_oldest`,
+  which is what network egress always does, so the entry is put the same
+  with or without it. `backpressure: block` is refused at parse, naming the
+  topic: the gateway's zenoh put never blocks, so no credit can reach the
+  producer from another host.
 - `default_reliability`: `reliable` (the default) or `best_effort`, for
   every `egress` entry that sets no `reliability`. An entry's own
   `reliability` wins in both directions: `{topic: /r/cmd, reliability:
