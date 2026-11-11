@@ -2979,6 +2979,16 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test -p test_node_macro_cdylib --lib
+      - name: selection marker, test_node_macro_cdylib
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
+
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
       #
@@ -3963,6 +3973,16 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test -p test_node_macro_cdylib --lib
+      - name: selection marker, test_node_macro_cdylib
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
+
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
       # is the single most expensive package step on this job (10.4 min warm)
@@ -4813,7 +4833,7 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: |
           set -eu
-          for manifest in fixtures/pynodes/*/Cargo.toml; do
+          for manifest in fixtures/pynodes/*/Cargo.toml fixtures/pynodes/shared/nodes/*/Cargo.toml; do
             CARGO_TARGET_DIR="$PWD/target/pynodes" cargo build --release --manifest-path "$manifest"
           done
           cd ../..

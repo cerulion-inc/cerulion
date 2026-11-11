@@ -25,6 +25,8 @@ pub enum CallError {
     DecoderPanic,
     /// A host state sink refused a write, including a caught host sink panic.
     StateSinkFull(String),
+    /// A canonical state codec refused with its complete native diagnostic.
+    StateCodec(String),
     /// A poisoned registry or instance mutex prevented admission.
     Poisoned {
         operation: &'static str,

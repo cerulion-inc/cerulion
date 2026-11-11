@@ -136,6 +136,7 @@ impl<T: PluginNode> NodeExports<T> {
                 "cerulion_node_restore_state: the node's state decoder panicked; the node is PARTIALLY restored and the run must fail".into(),
             ),
             CallError::StateSinkFull(text) => (status_code::BUFFER_TOO_SMALL, 0, text),
+            CallError::StateCodec(text) => (status_code::FAILED, 0, text),
             CallError::Poisoned { operation, mutex } => (
                 status_code::FAILED,
                 0,
@@ -278,7 +279,7 @@ impl<T: PluginNode> NodeExports<T> {
         capture: bool,
         call: impl FnOnce(&mut T) -> TransportResult<()>,
     ) -> Result<(), CallError> {
-        self.registry.call_with(handle, |node| {
+        let result = self.registry.call_with(handle, |node| {
             // Admission and deferred releases retain the outer entry guard.
             node.flush_deferred().map_err(CallError::Node)?;
             if capture {
@@ -294,6 +295,18 @@ impl<T: PluginNode> NodeExports<T> {
                     }
                 })?
                 .map_err(CallError::Node)
+        });
+        result.map_err(|error| match error {
+            CallError::Node(crate::error::TransportError::GraphError { reason }) => {
+                let operation = if capture {
+                    "cerulion_node_capture_state"
+                } else {
+                    "cerulion_node_restore_state"
+                };
+                // hot-path-alloc-ok: format the native operation only on a cold state-codec refusal.
+                CallError::StateCodec(format!("{operation}: {reason}"))
+            }
+            error => error,
         })
     }
 
@@ -442,6 +455,7 @@ impl<T: PluginNode> NodeExports<T> {
             }
             if sink.failure().is_some() {
                 let text = match result {
+                    Err(CallError::StateCodec(text)) => text,
                     Err(CallError::Node(error)) => {
                         let reason = match &error {
                             crate::error::TransportError::GraphError { reason } => std::borrow::Cow::Borrowed(reason.as_str()),

@@ -2015,10 +2015,9 @@ fn shard_matrices(job: &str) -> Vec<Vec<String>> {
     out
 }
 
-/// Fixture crates carry no tests, so they are correctly absent from the
-/// coverage set — and that absence is asserted, not assumed. If a fixture ever
-/// grows a `#[test]`, the gate above starts demanding a step for it, and this
-/// test is where a reader learns that is intended.
+/// Fixture crates carry no tests except explicitly covered feature-specific
+/// harnesses. A new fixture test needs its own required CI step and a reason
+/// here; it must never disappear from the package coverage checks.
 #[test]
 fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
     let with_tests = packages_with_tests();
@@ -2027,10 +2026,17 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .filter(|(_, dir)| dir.to_string_lossy().contains("test_fixtures/"))
         .map(|(name, _)| name)
         .collect();
+    // The cdylib feature is required to compile the node context migration
+    // cases; required Linux and macOS shards run this fixture's lib harness.
+    let allowed = BTreeSet::from(["test_node_macro_cdylib"]);
+    let unexpected: Vec<_> = fixtures
+        .iter()
+        .filter(|name| !allowed.contains(name.as_str()))
+        .collect();
     assert!(
-        fixtures.is_empty(),
+        unexpected.is_empty(),
         "these test_fixtures crates now carry their own tests and so need a CI \
-         step (or an exemption): {fixtures:?}"
+         step (or an exemption): {unexpected:?}"
     );
 }
 

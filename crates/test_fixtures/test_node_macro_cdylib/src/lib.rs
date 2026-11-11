@@ -91,6 +91,8 @@ mod context_compile_tests {
         cases.pass("tests/ui/annotated_context_helper.rs");
         cases.pass("tests/ui/data_only_helpers.rs");
         cases.pass("tests/ui/qualified_context_helper.rs");
+        // The stderr oracle pins rustc 1.99.1 context names; compiler upgrades
+        // may require re-blessing while preserving the migration error.
         cases.compile_fail("tests/ui/free_context_helper.rs");
     }
 }
