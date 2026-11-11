@@ -3312,7 +3312,8 @@ fn resolve_remote_topic_schema_for_robot(
         &options,
         false,
     ) {
-        return SchemaResolve::NoProducer;
+        // Skipped catalog discovery reads nothing and licenses no absence claim.
+        return classify_transient_miss(topic, true);
     }
     // Production path — resolve over the shared cerulion-netd query plane
     // (ONE zenoh session per computer). Only fall through to a transient session when

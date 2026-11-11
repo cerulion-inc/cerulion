@@ -1835,14 +1835,75 @@ mod tests {
         state.expires_at_ns = 1;
         auth::write_to(&path, &state).unwrap();
         let _held = auth::hold_refresh_lock(&path).unwrap();
+        let budget = Duration::from_millis(50);
         let started = std::time::Instant::now();
-        let error = refresh_session_if_stale_within(Duration::from_millis(50)).unwrap_err();
-        assert!(
-            error.to_string().contains("did not finish within 50ms"),
-            "{error}"
+        let error = refresh_session_if_stale_within(budget).unwrap_err();
+        let elapsed = started.elapsed();
+        let error_text = error.to_string();
+        let prefix = format!(
+            "could not refresh the session: another Cerulion process is refreshing the session in {} and did not finish within ",
+            path.display()
         );
-        assert!(started.elapsed() < Duration::from_millis(250));
+        // Setup spends part of the nominal budget; the diagnostic reports its
+        // remaining lock budget rounded down to whole milliseconds.
+        let reported_ms: u128 = error_text
+            .strip_prefix(&prefix)
+            .and_then(|text| text.strip_suffix("ms"))
+            .expect("the held refresh lock must cause the refusal")
+            .parse()
+            .unwrap();
+        assert!(reported_ms <= budget.as_millis(), "{error}");
+        assert!(elapsed >= budget, "the lock wait ended early: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
         assert_eq!(auth::load_from(&path).state().unwrap(), &state);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_refresh_waits_for_a_peer_and_uses_the_persisted_session() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        auth::seed_logged_in_at(dir.path(), "acct").unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", dir.path().to_str().unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _svc = EnvGuard::set(
+            ACCOUNT_SERVICE_ENV,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let path = dir.path().join("auth.json");
+        let mut state = auth::load_from(&path).state().unwrap().clone();
+        state.expires_at_ns = 1;
+        auth::write_to(&path, &state).unwrap();
+        let mut fresh = state.clone();
+        fresh.session_token = "peer-fresh-session".into();
+        fresh.refresh_token = "peer-fresh-refresh".into();
+        fresh.expires_at_ns = auth::now_unix_ns().saturating_add(60_000_000_000);
+        let expected = fresh.clone();
+        let held = auth::hold_refresh_lock(&path).unwrap();
+        let peer_path = path.clone();
+        let (start, started) = std::sync::mpsc::channel();
+        let peer_hold = Duration::from_millis(100);
+        let peer = std::thread::spawn(move || {
+            started.recv().unwrap();
+            std::thread::sleep(peer_hold);
+            auth::write_to(&peer_path, &fresh).unwrap();
+            drop(held);
+        });
+        let began = std::time::Instant::now();
+        start.send(()).unwrap();
+        let refreshed = refresh_session_if_stale_within(Duration::from_secs(2));
+        let elapsed = began.elapsed();
+        peer.join().unwrap();
+        assert!(refreshed.unwrap().is_none(), "the peer already refreshed");
+        assert!(elapsed >= peer_hold, "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(auth::load_from(&path).state().unwrap(), &expected);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "waiting for the peer must not spend another refresh token"
+        );
     }
 
     #[test]

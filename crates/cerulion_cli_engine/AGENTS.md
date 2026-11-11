@@ -6,14 +6,14 @@ partition persistence, ros2 attach/migrate --write, schema create/delete) hold
 `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` across writes:
 UNIX flock shared with wsd, thread reentrant, others wait with one warn;
 elsewhere a no-op. Reads use `acquire_read`: create nothing, refuse re-entry.
-All refuse symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits a tracked
-file, existing `.gitignore` when creating `.cerulion/`. Migration uses polling
+Reject symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits existing
+tracked `.gitignore` when creating `.cerulion/`. Migration uses polling
 `acquire_interruptibly(root, interrupted)` -> `AcquireError` (no From).
 Locks are per root; --workspace is the COLCON root. Stage declared ports via
 `graph_cmd::stage_declared_node`. Paired skips implicit LAN catalogs; Open,
 locators and scan retain them. Broken pairings are diagnostics. Observer channels
 are private per source; ambiguity needs selectors; caches bind account/key.
-Stale sessions refresh on caller within 2 s; cached reads log at debug.
+Refresh stale sessions on caller within 2 s; cache logs debug. Unread catalogs prove no absence.
 
 ## Invariants
 - Enforce invariants at the engine boundary; CLI checks are UX.
@@ -42,7 +42,7 @@ Stale sessions refresh on caller within 2 s; cached reads log at debug.
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
 ## Workspace dependency contract
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
-pins. See `docs/internals/cli.md` §11 for the contract and compiler checks.
+pins. See `docs/internals/cli.md` §11 for contract and compiler checks.
 ## Testing
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
@@ -55,5 +55,5 @@ pins. See `docs/internals/cli.md` §11 for the contract and compiler checks.
 - `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use
   `parse_int_literal` or `syn::LitInt::base10_parse`.
 - Numeric false-pass classes (NaN folds, >2^53 widening, length fields).
-Read `docs/internals/cli.md` before edits to topics/local scope, starters,
+Read `docs/internals/cli.md` before topics/local scope, starters,
 replay, completions, Python (§13), or graph run/profile/partition.
