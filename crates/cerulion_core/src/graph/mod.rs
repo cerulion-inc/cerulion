@@ -33,6 +33,7 @@ pub mod node;
 pub mod param_resume;
 pub mod params;
 pub mod partition;
+pub mod run_topology;
 pub mod runtime;
 // The two sibling topic sets a split worker is told about, one type per
 // direction, so the producer gate cannot be handed the set it reads.
@@ -90,6 +91,9 @@ pub use partition::{
     AutoPartition, AutoPartitionOptions, BlockColocationSeed, CreditableSplitEdge,
     FireTargetPolicy, FusionRecord, HopCosts, PartitionCosts, ProcessGroup, ProfileResult,
     WarmupObservation, REMEDY_CO_LOCATE, REMEDY_SINGLE_PROCESS,
+};
+pub use run_topology::{
+    RunTopology, TopologyNode, TopologyPort, TopologyTrigger, RUN_TOPOLOGY_VERSION,
 };
 pub use runtime::{
     build_trigger_edges, compute_gateway_plan, resolve_ingress_schema_hash,
