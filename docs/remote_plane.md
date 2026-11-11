@@ -111,10 +111,17 @@ While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
 `cerulion rcp` is refused the same way.
 
-The only other desk to robot topic path today is LAN ingress (an `ingress:`
-block in a graph), which proves no identity per peer and is closed when
-`CERULION_LAN_ACCESS=paired`, the default on every platform. Open LAN access
-requires an explicit `CERULION_LAN_ACCESS=open` selection and warns at startup.
+A graph with declared `ingress:` can pull an exported topic from a unique
+same-account or explicitly paired producer over the authenticated remote plane.
+The receiving graph checks the declared topic, schema, QoS and single-writer
+rules. The producer serves its stream; the consumer does not send arbitrary data
+frames to the producer. A machine can serve and consume through the same owned
+endpoint. This is distinct from the ops `topic-publish` verb and its capability
+and e-stop checks.
+
+The zenoh LAN ingress compatibility path proves no identity per peer and is
+closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires
+explicit `CERULION_LAN_ACCESS=open` and warns at startup. Authenticated discovery is described in [networking](networking.md#making-a-robot-discoverable).
 
 ## The deadman: a quiet operator loses the lease
 

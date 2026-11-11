@@ -159,12 +159,13 @@ export CERULION_LOGIN_GATE=off
 mkdir -p "$HOME" "$TMPDIR"
 ```
 
-`CERULION_LOGIN_GATE=off` skips only the command-wide sign-in check. Serving
-the network still needs a saved login: a netd started with
-`CERULION_NETD_LISTEN`, a networked `graph run` (and its gateway), `node run`
-and `ros2 attach` refuse until one exists. Run `cerulion login` once in this
-shell, or point `CERULION_HOME` at a directory holding the state of a machine
-that signed in.
+`CERULION_LOGIN_GATE=off` skips only the command-wide sign-in check. An
+account's first serving registration still needs a saved login; run
+`cerulion login` once in this shell, or point `CERULION_HOME` at its existing
+signed-in state. A robot with durable explicit pairing state can serve that
+pairing without a new sign-in. The legacy `CERULION_NETD_LISTEN` configuration
+retains its prior-login gate. Authenticated serving begins with a live export,
+without requiring a zenoh listen setting.
 
 On Android, netd and a `graph run` gateway refuse every LAN peer unless
 `CERULION_LAN_ACCESS=open` is set, the same posture as the app's
@@ -755,8 +756,11 @@ The gateway is not open by default. Under `"lan_access": "paired"` every LAN
 request (topic demand, catalog and schema) is refused, and LAN ingress is
 refused too: no host on the network can publish into the app's topics. The robot identity can
 still appear in discovery, but topic announce tokens are withheld, so the topics
-the app publishes are not named on the LAN; `topic list` warns that the robot refused to serve
-its catalog. The posture stays in front of every installed demand authorizer.
+the app publishes are not named on the LAN. A paired desk reads its catalog
+through the authenticated remote plane the app hosts. The posture stays in front of every installed demand authorizer.
+Embedded apps do not resolve account or saved pairing graph imports. Declared
+paired ingress is refused at startup; use a native CLI graph for authenticated
+imports, or explicitly select open LAN compatibility for the app.
 Choose the posture at runtime startup with the app's `lan_access` key. A start
 keeps access paired while it builds the gateway and opens the configured posture
 only once every component is ready; an `open` start announces its topics at that
@@ -905,8 +909,10 @@ cerulion topic list --connect tcp/127.0.0.1:7683
 
 ### Dial a desk
 
-Some networks block multicast or connections into the device, so a desk can
-neither discover the app nor dial it. When the app can still reach the desk,
+The following is the explicit open-LAN compatibility path. The authenticated
+remote plane the app hosts uses paired direct or relayed connectivity instead.
+Some networks block multicast or connections into the device, so the LAN
+ladder can neither discover the app nor dial it. When the app can still reach the desk,
 it can dial the desk instead: list the desk's locator in `connect`. The desk must listen on that locator, for
 example through a desk network daemon started with `CERULION_NETD_LISTEN` (see
 [Making a robot discoverable](networking.md#making-a-robot-discoverable)).

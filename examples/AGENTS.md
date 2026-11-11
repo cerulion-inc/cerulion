@@ -1,9 +1,8 @@
 # examples: agent notes
 
-Seven user workspaces, run end to end via the `cerulion` verbs: `basic_timer`,
-`obstacle_avoidance` (the quickstart), `camera_pipeline`, `perception`, `v4l2_camera`,
-`realsense`, `aspire_arm`. `moveit_hero` is a Docker gate for `rmw_cerulion`, not a
-workspace; `go2`: the quadruped demo. Each is standalone (own manifest + lockfile).
+CLI workspaces: `basic_timer`, `obstacle_avoidance`, `camera_pipeline`, `perception`,
+`v4l2_camera`, `realsense`, `aspire_arm`, `go2`; each has its own manifest/lockfile.
+`moveit_hero` is the `rmw_cerulion` Docker gate.
 
 ## Shipped surface (gate: `check_public_surface.sh`)
 
@@ -23,8 +22,9 @@ workspace; `go2`: the quadruped demo. Each is standalone (own manifest + lockfil
   import of internals (`cerulion_core::...` beyond the prelude) needs a comment at the use
   site saying why the public surface cannot express it. The one exception is the
   protocol bridge (`examples/go2/nodes/dds_bridge` speaks CDR/DDS).
-- Runbooks (`examples/go2/README.md`, `examples/go2/ROBOT-DAY.md`) must match the CURRENT CLI:
-  verify every command and flag against the shipped `cerulion` help; a removed flag fails the demo.
+- Go2 runbooks match shipped CLI help. Paired discovery needs account/pairing,
+  no LISTEN/address setup; keep egress/ingress scope. Label zenoh locators as open
+  LAN compatibility. Retain vendor DDS interface and hardware safety requirements.
 - Same rules as `benches/`: a harness that RUNS an example spawns `cerulion graph run` as a
   SUBPROCESS (statically-linked transport singletons do not rendezvous in-process); a node
   crate's own `tests/` may build a runtime in-process over an isolated transport. Exact-pin
