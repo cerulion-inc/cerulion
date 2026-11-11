@@ -19,7 +19,8 @@ pub struct NodeHandle {
     pub value: u64,
 }
 
-/// Host-owned port scoped to a context; zero is invalid. Never encodes a pointer.
+/// Host-owned port scoped to a context; zero is invalid except for node-wide diagnostics.
+/// Never encodes a pointer.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,12 +67,29 @@ pub struct MutableBytes {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Status {
-    /// Diagnostic token, scoped to the context or instance that returned it.
+    /// Owner-local diagnostic token; host tokens are context-scoped, node tokens library-scoped.
+    /// Zero means none. New failure replaces pending text; a full copy consumes it.
     pub error: u64,
     /// Operation result from status_code.
     pub code: u32,
-    /// Existing NodeErrorKind wire code, or zero for an untyped failure.
+    /// Frozen error_kind code, or zero for an untyped failure. Unknown codes are untyped.
     pub kind: u32,
+}
+
+/// Frozen node error kinds; unknown received codes are treated as untyped.
+pub mod error_kind {
+    /// User logic failure.
+    pub const LOGIC: u32 = 1;
+    /// Invalid node input.
+    pub const INVALID_INPUT: u32 = 2;
+    /// Fatal node failure.
+    pub const FATAL: u32 = 3;
+    /// Custom node failure.
+    pub const CUSTOM: u32 = 4;
+    /// Transport failure.
+    pub const TRANSPORT: u32 = 5;
+    /// I/O failure.
+    pub const IO: u32 = 6;
 }
 
 /// Frozen operation result codes. Empty is meaningful only for read/event polls.
@@ -88,12 +106,14 @@ pub mod status_code {
     pub const INVALID_HANDLE: u32 = 4;
     /// Malformed arguments, frame or descriptor.
     pub const INVALID_ARGUMENT: u32 = 5;
-    /// Borrow budget exhausted or instance busy.
+    /// Raw publisher or context destruction refused while leases remain live.
     pub const BUSY: u32 = 6;
     /// Required capability unavailable.
     pub const UNSUPPORTED: u32 = 7;
     /// State sink or caller buffer refused the write; pending data is retained.
     pub const BUFFER_TOO_SMALL: u32 = 8;
+    /// Concurrent node entry or tick-scoped service outside its admitted call.
+    pub const INVALID_STATE: u32 = 9;
 }
 
 /// Every table starts with this header; its full type is immutable within major 1.
@@ -381,6 +401,8 @@ pub struct EventV1 {
     pub policy_value: u64,
     /// Liveliness cause from event_detail; otherwise zero.
     pub cause: u32,
+    /// Always zero; explicit tail storage prevents uninitialized padding.
+    pub reserved: u32,
 }
 
 /// Frozen fire batch observations. Repeated queries in one fire return the same batch.
@@ -411,7 +433,8 @@ pub struct PublisherCountersV1 {
     pub send_failures: u64,
 }
 
-/// Capability bits refer to complete immutable extension tables, never versions.
+/// Capabilities name optional extensions or base-table service families.
+/// Unavailable base services retain non-null UNSUPPORTED stubs.
 pub mod capability {
     /// Canonical state capture/restore.
     pub const STATE: u64 = 1;
@@ -424,7 +447,7 @@ pub mod capability {
 }
 
 /// Cold discovery of an independently versioned immutable extension table.
-/// Validate full size and layout identity before converting the byte pointer.
+/// Validate alignment, full size and layout identity before converting the byte pointer.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -463,6 +486,6 @@ pub mod full_queue {
     pub const CONFIG_DEFAULT: u32 = 0;
     /// Non-waiting send skips full subscriber queues.
     pub const DISCARD: u32 = 1;
-    /// Explicit retry-until-delivered strategy.
-    pub const BLOCK: u32 = 2;
+    /// Reserved explicit blocking strategy; refused by raw-ingress creation.
+    pub const RESERVED_BLOCK: u32 = 2;
 }

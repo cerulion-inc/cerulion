@@ -195,7 +195,7 @@ mod tests {
             [
                 full_queue::CONFIG_DEFAULT,
                 full_queue::DISCARD,
-                full_queue::BLOCK
+                full_queue::RESERVED_BLOCK
             ],
             [0, 1, 2]
         );

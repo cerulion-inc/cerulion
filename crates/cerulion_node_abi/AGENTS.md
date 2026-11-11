@@ -6,4 +6,5 @@ IStable ID; field-offset equality and prefix report comparison are insufficient.
 No Rust container, trait object, allocator ownership, clock object or native transport port crosses. Integer handles never encode pointers. Borrowed slot and
 spill pointers retain their originating owner; spill copies once on the host. Every unsafe site names its lifetime, alignment and aliasing argument.
 
-Run this package's tests through the desk test lock. Compile-only checks may run without that lock with four build jobs and a lane-owned target directory.
+Module paths, type names and field names are part of the frozen ID. Stabby is
+pinned; an update must preserve the committed ID, size and field-offset oracle.

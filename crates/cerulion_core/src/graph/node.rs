@@ -4358,10 +4358,6 @@ impl DylibNodeEntry {
             "schema_hash",
             // The declared consumption mode of a trigger input.
             "consume",
-            "wire_fixed_size",
-            "variable_count",
-            "alignment",
-            "accumulate_cap",
         ];
         const LEGAL_OUTPUT_KEYS: &[&str] = &[
             "name",
