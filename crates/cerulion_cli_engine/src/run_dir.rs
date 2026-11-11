@@ -1885,35 +1885,32 @@ pub struct HostedRunSpec<'a> {
 /// above the cap drops keys until it fits, and names them in `omitted`:
 /// first `topology` and `telemetry` (fire records index into
 /// `topology.nodes`, so fires without it name no node), then `endpoints`.
-/// `omitted.full_len` is the byte length of the full render. The run is
-/// still served with its base keys and its `graph.yaml`. Only names above the
-/// cap on their own still give a render above it, which the served-entry
-/// check refuses.
+/// `omitted.full_len` is the byte length of the full render. Each size check
+/// counts the `omitted` key itself. The run is still served with its base
+/// keys and its `graph.yaml`. Only names above the cap on their own still give
+/// a render above it, which the served-entry check refuses.
 #[must_use]
 pub fn render_hosted_run_manifest(spec: &HostedRunSpec<'_>) -> Vec<u8> {
-    let full = render_hosted_doc(spec, &[]);
+    let full = render_hosted_doc(spec, &[], None);
     if full.len() <= MAX_RUN_ARTIFACT_LEN {
         return full;
     }
     let mut dropped = vec!["telemetry", "topology"];
-    let mut slim = render_hosted_doc(spec, &dropped);
+    let mut slim = render_hosted_doc(spec, &dropped, Some(full.len()));
     if slim.len() > MAX_RUN_ARTIFACT_LEN {
         dropped.insert(0, "endpoints");
-        slim = render_hosted_doc(spec, &dropped);
+        slim = render_hosted_doc(spec, &dropped, Some(full.len()));
     }
-    let mut doc: serde_json::Value =
-        serde_json::from_slice(&slim).expect("the slim render is the JSON just written");
-    let omitted: Vec<&str> = dropped
-        .iter()
-        .copied()
-        .filter(|key| *key != "telemetry" || spec.fires.is_some())
-        .collect();
-    doc["omitted"] = serde_json::json!({ "keys": omitted, "full_len": full.len() });
-    to_manifest_bytes(&doc)
+    debug_assert!(
+        slim.len() <= MAX_RUN_ARTIFACT_LEN || dropped.contains(&"endpoints"),
+        "a render above the cap has dropped every key it can drop"
+    );
+    slim
 }
 
-/// The hosted `run.json` without the keys in `drop`.
-fn render_hosted_doc(spec: &HostedRunSpec<'_>, drop: &[&str]) -> Vec<u8> {
+/// The hosted `run.json` without the keys in `drop`. With `full_len`, it also
+/// has the `omitted` key that names them.
+fn render_hosted_doc(spec: &HostedRunSpec<'_>, drop: &[&str], full_len: Option<usize>) -> Vec<u8> {
     let mut doc = serde_json::json!({
         "version": RUN_MANIFEST_VERSION,
         "run_id": format!("0x{:032x}", spec.run_id),
@@ -1938,8 +1935,14 @@ fn render_hosted_doc(spec: &HostedRunSpec<'_>, drop: &[&str]) -> Vec<u8> {
     let map = doc
         .as_object_mut()
         .expect("the hosted run.json is an object");
+    let mut omitted = Vec::new();
     for key in drop {
-        map.remove(*key);
+        if map.remove(*key).is_some() {
+            omitted.push(*key);
+        }
+    }
+    if let Some(full_len) = full_len {
+        doc["omitted"] = serde_json::json!({ "keys": omitted, "full_len": full_len });
     }
     to_manifest_bytes(&doc)
 }
@@ -4241,7 +4244,7 @@ mod tests {
         let endpoints = lobby_endpoints();
         let topology = oversized_topology();
         let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
-        let full_len = render_hosted_doc(&spec, &[]).len();
+        let full_len = render_hosted_doc(&spec, &[], None).len();
         assert!(
             full_len > MAX_RUN_ARTIFACT_LEN,
             "the fixture is past the cap"
@@ -4288,6 +4291,48 @@ mod tests {
             serde_json::json!(["endpoints", "telemetry", "topology"])
         );
         assert!(doc.get("endpoints").is_none(), "{doc}");
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+    }
+
+    /// A render that fits only without `omitted` drops its endpoints too, so
+    /// the `omitted` key never pushes run.json past the cap.
+    #[test]
+    fn a_hosted_manifest_counts_its_omitted_key_against_the_cap() {
+        let endpoints_with = |topic: String| {
+            [RunEndpoint {
+                id: "app".into(),
+                publishes: vec![EndpointPort {
+                    topic,
+                    schema: "std_msgs/String".into(),
+                }],
+                subscribes: vec![],
+            }]
+        };
+        let topology = lobby_topology();
+        let slim = ["telemetry", "topology"];
+        let short = endpoints_with(String::new());
+        let base = render_hosted_doc(
+            &hosted_spec(&short, &topology, Some(LOBBY_FIRES)),
+            &slim,
+            None,
+        )
+        .len();
+        let endpoints = endpoints_with("t".repeat(MAX_RUN_ARTIFACT_LEN - 10 - base));
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        assert_eq!(
+            render_hosted_doc(&spec, &slim, None).len(),
+            MAX_RUN_ARTIFACT_LEN - 10,
+            "the render without topology and without omitted fits"
+        );
+        assert!(render_hosted_doc(&spec, &slim, Some(1)).len() > MAX_RUN_ARTIFACT_LEN);
+
+        let rendered = render_hosted_run_manifest(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN, "{}", rendered.len());
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            doc["omitted"]["keys"],
+            serde_json::json!(["endpoints", "telemetry", "topology"])
+        );
         served_entry(&spec, String::from_utf8(rendered).unwrap());
     }
 
