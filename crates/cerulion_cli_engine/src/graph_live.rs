@@ -1390,22 +1390,81 @@ pub fn follow_fires(
 // Where the answers come from.
 // ---------------------------------------------------------------------------
 
+/// How the session checks one `--connect` locator before it dials.
+#[derive(Debug, PartialEq, Eq)]
+enum LocatorCheck {
+    /// A TCP-based link (`tcp/`, `tls/`): probe this plain
+    /// `tcp/<host>:<port>` form, without the locator's `?metadata` or
+    /// `#config`, for a TCP accept.
+    Tcp(String),
+    /// A UDP-based link (`udp/`, `quic/`): no TCP probe can tell whether it
+    /// answers, so the session dials it as given.
+    Unprobed,
+}
+
+/// Parse one `--connect` locator with zenoh's endpoint parser, so the
+/// `?<metadata>` and `#<config>` parts zenoh accepts stay valid (for example
+/// `udp/10.0.0.5:7684?rel=1;mixed_rel=1` or `tcp/10.0.0.5:7683#iface=en0`).
+/// The address must be `<host>:<port>` and the protocol one this build
+/// links: `tcp`, `tls`, `udp` or `quic`. `None` means malformed.
+fn locator_check(locator: &str) -> Option<LocatorCheck> {
+    use std::str::FromStr as _;
+    let endpoint = zenoh::config::EndPoint::from_str(locator).ok()?;
+    let plain = format!("tcp/{}", endpoint.address().as_str());
+    if !crate::discovery_ladder::locator_is_syntactically_valid(&plain) {
+        return None;
+    }
+    match endpoint.protocol().as_str() {
+        "tcp" | "tls" => Some(LocatorCheck::Tcp(plain)),
+        "udp" | "quic" => Some(LocatorCheck::Unprobed),
+        _ => None,
+    }
+}
+
+/// The `--connect` locators that may join the session: each TCP-based one
+/// whose host accepts a TCP connection within `timeout`, and every UDP-based
+/// one. zenoh tries the locators one by one under a 1 s bound for all of
+/// them, so a TCP locator that does not accept would make the open fail and
+/// lose every other robot. A TCP probe cannot tell whether a UDP or QUIC link
+/// answers, so a dead UDP-based locator can still use up that bound and fail
+/// the open. A malformed locator is never in the set.
+fn reachable_locators(connect: &[String], timeout: Duration) -> HashSet<String> {
+    let mut reachable = HashSet::new();
+    let mut probed: Vec<(&String, String)> = Vec::new();
+    for locator in connect {
+        match locator_check(locator) {
+            Some(LocatorCheck::Tcp(plain)) => probed.push((locator, plain)),
+            Some(LocatorCheck::Unprobed) => {
+                reachable.insert(locator.clone());
+            }
+            None => {}
+        }
+    }
+    let plain: Vec<String> = probed.iter().map(|(_, plain)| plain.clone()).collect();
+    let accepted = crate::discovery_ladder::probe_reachable_locators(&plain, timeout);
+    for (locator, plain) in probed {
+        if accepted.contains(&plain) {
+            reachable.insert(locator.clone());
+        }
+    }
+    reachable
+}
+
 /// The `--connect` locators a session dials: those in `reachable`, in the
-/// order given. zenoh tries the locators one by one under a 1 s bound for
-/// all of them, so one that does not accept a connection would make the
-/// open fail and lose every other robot. A malformed locator, or a list with
-/// no reachable locator, is refused with the remedy.
+/// order given (see [`reachable_locators`]). A malformed locator, or a list
+/// with no reachable locator, is refused with the remedy.
 fn connect_set(connect: &[String], reachable: &HashSet<String>) -> CliResult<Vec<String>> {
-    use crate::discovery_ladder::{locator_is_syntactically_valid, EXPLICIT_PROBE_TIMEOUT};
+    use crate::discovery_ladder::EXPLICIT_PROBE_TIMEOUT;
     let malformed: Vec<String> = connect
         .iter()
-        .filter(|locator| !locator_is_syntactically_valid(locator))
+        .filter(|locator| locator_check(locator).is_none())
         .map(|locator| clean(locator))
         .collect();
     if !malformed.is_empty() {
         return Err(CliError::Validation(format!(
-            "malformed --connect locator {}; a locator has the form tcp/<host>:<port>, for \
-             example tcp/127.0.0.1:7683",
+            "malformed --connect locator {}; a locator has the form \
+             <protocol>/<host>:<port>[?<metadata>][#<config>] with the protocol tcp, tls, \
+             udp or quic, for example tcp/127.0.0.1:7683",
             malformed.join(", ")
         )));
     }
@@ -1473,10 +1532,8 @@ impl ZenohPlane {
     /// connect phase is bounded.
     pub fn open(connect: &[String]) -> CliResult<Self> {
         use cerulion_core::transport::network::{NetworkConfig, NetworkManager};
-        let reachable = crate::discovery_ladder::probe_reachable_locators(
-            connect,
-            crate::discovery_ladder::EXPLICIT_PROBE_TIMEOUT,
-        );
+        let reachable =
+            reachable_locators(connect, crate::discovery_ladder::EXPLICIT_PROBE_TIMEOUT);
         let connect = connect_set(connect, &reachable)?;
         let manager = NetworkManager::new(NetworkConfig {
             connect_endpoints: connect.clone(),
@@ -4012,10 +4069,57 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             Err(CliError::Validation(text)) => assert_eq!(
                 text,
                 "malformed --connect locator 127.0.0.1:7683; a locator has the form \
-                 tcp/<host>:<port>, for example tcp/127.0.0.1:7683"
+                 <protocol>/<host>:<port>[?<metadata>][#<config>] with the protocol tcp, tls, \
+                 udp or quic, for example tcp/127.0.0.1:7683"
             ),
             other => panic!("expected the syntax error, got {other:?}"),
         }
+    }
+
+    /// zenoh's own endpoint parser decides what a locator is: its
+    /// `?metadata` and `#config` parts stay valid, an IPv6 host is
+    /// bracketed, and only a TCP-based link gets a TCP probe.
+    #[test]
+    fn a_locator_with_zenoh_options_is_accepted_and_only_tcp_is_probed() {
+        let tcp = |plain: &str| Some(LocatorCheck::Tcp(plain.to_string()));
+        for (locator, check) in [
+            (
+                "udp/192.168.1.10:7684?rel=1;mixed_rel=1",
+                Some(LocatorCheck::Unprobed),
+            ),
+            ("quic/10.0.0.5:7684", Some(LocatorCheck::Unprobed)),
+            ("tcp/127.0.0.1:7683", tcp("tcp/127.0.0.1:7683")),
+            ("tcp/127.0.0.1:7683#iface=lo0", tcp("tcp/127.0.0.1:7683")),
+            ("tls/robot.local:7683?a=1#b=2", tcp("tcp/robot.local:7683")),
+            ("tcp/[::1]:7447", tcp("tcp/[::1]:7447")),
+            ("127.0.0.1:7683", None),
+            ("tcp/127.0.0.1", None),
+            ("tcp/127.0.0.1:port", None),
+            ("tcp/127.0.0.1:7683?", None),
+            ("serial/dev/ttyUSB0", None),
+            ("tcp/", None),
+        ] {
+            assert_eq!(locator_check(locator), check, "{locator}");
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let port = listener.local_addr().expect("its address").port();
+        let open_iface = format!("tcp/127.0.0.1:{port}#iface=lo0");
+        let udp = "udp/192.168.1.10:7684?rel=1;mixed_rel=1".to_string();
+        let closed = closed_locator();
+        let connect = [
+            closed.clone(),
+            open_iface.clone(),
+            udp.clone(),
+            "bad".to_string(),
+        ];
+        let reachable = reachable_locators(&connect, Duration::from_millis(500));
+        assert_eq!(reachable, HashSet::from([open_iface.clone(), udp.clone()]));
+        assert_eq!(
+            connect_set(&connect[..3], &reachable).expect("two reachable"),
+            [open_iface, udp]
+        );
+        drop(listener);
     }
 
     /// The first-contact wait stops when Ctrl+C clears the flag, returns an
