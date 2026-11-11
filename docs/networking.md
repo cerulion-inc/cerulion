@@ -52,7 +52,6 @@ compatibility and pairing.
 
   > `LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.`
 
-<<<<<<< HEAD
 - **Every plane enforces producer scope.** Topics, schemas and run metadata of a
   local-only run remain unavailable off-machine through an already-running
   gateway, remote server or mirror. Other daemons also refuse outputs omitted
@@ -66,8 +65,10 @@ compatibility and pairing.
   announcements retain admission until withdrawn. If an earlier remote operation
   still holds a topic, a local-only successor refuses startup. Close the demand
   and withdraw the announcement, or restart the serving daemon first.
-- **Discovery keeps source and reachability evidence.** Account lookup has a
-  two-second deadline; robot catalogs share a four-second budget. Offline and
+- **Discovery keeps source and reachability evidence.** Stale-session refresh has
+  a two-second request budget; a successful rotation can wait one additional second
+  for publication. Account lookup has a two-second deadline; robot catalogs share
+  a four-second budget. Offline and
   unknown robot rows remain visible, and online rows show the actual direct or
   relay path. Topic rows name their source. `find` and `viz --robot`
   use these catalogs too; duplicate sources require `--robot NAME` or `--local`
@@ -76,109 +77,6 @@ compatibility and pairing.
   locators or `--scan` compatibility; account and saved-pair discovery is the
   default authenticated route. Paired access skips implicit LAN discovery and
   stranger catalog queries. `topic snapshot --robot` uses authenticated ops.
-=======
-- **The `network:` block TIGHTENS.** With an explicit enabled block the
-  gateway runs STRICT: it announces + egresses exactly the declared `egress`
-  allow-list, opens exactly the declared `ingress` bridges, and uses the
-  block's locators VERBATIM (no scouting, no bind ladder). The block is
-  how you RESTRICT a robot, not how you enable networking.
-- **One robot = one network peer.** The gateway is a SEPARATE process that
-  owns the entire network plane (one zenoh session per process). The graph/worker processes
-  stay network-free: they publish into and read from shared memory only.
-  The gateway taps their SHM zero-copy (listener-less capture subscribers)
-  and forwards frames; the tap adds no copy of its own.
-- **Kill-switches.** `cerulion graph run <g> --local` (also on `node
-  run`; `--network off` remains supported) or the env knob `CERULION_NETWORK=off`
-  (honored by the run and query entry points: `graph run`, `node run`,
-  `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`,
-  `schema info`; `cerulion connect` and `cerulion-remoted` exit on it too, with
-  the parsing differences listed under
-  [Environment variables](user-api.md#environment-variables)) runs LOCAL-ONLY:
-  no gateway, no session, loud notice.
-- **Networked multi-process is FIRST-CLASS.** An enabled block is accepted on a
-  multi-process run exactly as on a monolith. The supervisor spawns ONE
-  gateway beside the workers; each worker stays network-free.
-- **Recording KEEPS the network.** `--record` does not force local-only:
-  the robot stays visible while recording. The ONE exception: `--record`
-  plus an explicit block that declares `ingress:` is refused (because
-  recorded ingress re-injection is not replay-faithful).
-- **`topic list` discovers local topics and your robots anywhere.** `cerulion topic list` lists
-  LOCAL topics instantly, then lists account-owned and explicitly paired robots
-  through the authenticated iroh remote plane. Robot rows include offline and
-  unknown reachability; online rows show the selected direct or relay path.
-  Each topic row names its robot. Stale-session refresh has a two-second request
-  budget; a successful rotation can wait one additional second for publication.
-  Account lookup has a two-second deadline and
-  robot catalogs share one four-second budget. Saved directory and authenticated
-  direct-address hints let explicitly paired robots remain usable offline.
-  `find` matches those catalogs. `echo`, `hz`, `info`, `snapshot`, and `viz --robot`
-  demand remote topics automatically; the last observer releases its private
-  shared-memory channel.
-  Duplicate topic names require `--robot NAME` for reads, or `--local` for a local
-  producer. Explicit `--connect` and `--listen` remain available for LAN use.
-  Paired access skips implicit LAN discovery and stranger catalog queries.
-  Explicit open access, locators or `--scan` enable the LAN half: the discovery ladder (~1.5 s ceiling), a
-  connect phase hard-bounded at 1 s, and the demand/announce reply gathers
-  (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
-  LOCAL list has already printed by then. `--local` (also spelled
-  `--no-network`), `CERULION_NETWORK=off` or `CERULION_NETD_NETWORK=off` skips the remote query; the
-  environment parser preserves its fail-closed behavior for other nonempty values; extra `--connect`/`--listen` locators reach peers the ladder can't
-  find.
-- **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
-  gateway beacon and the PRIMARY discovery mechanism on every network: "your
-  robot shows up like a Chromecast"; SRV = the bound port, TXT `robot=<name>`.
-  **The beacon is gated on a nonzero fixed LISTEN port**, so which path you are on
-  decides whether it exists: a per-run gateway child binds 7683 and beacons; the
-  default netd-hosted plane listens and beacons **only when
-  `CERULION_NETD_LISTEN` is set** (see "Making a robot discoverable" below).
-  A robot with neither is not advertised over mDNS, so a default desk does not
-  find it. The client-side
-  discovery LADDER (mDNS browse, cached peers, hostname convention; in
-  parallel, ~1.5 s ceiling) produces candidate locators for `topic list`,
-  which prints a `ROBOTS` section above the remote topics. A ROBOTS row is
-  LIVE PRESENCE: a robot appears iff its ANNOUNCE tokens actually arrive in
-  the gather (each announce key carries the producing robot as its first
-  chunk, `cerulion_ann/{robot}{topic}`, so even absolute mirror topics
-  attribute exactly) OR an mDNS browse answers for it (a browse answer is
-  itself a live gateway); mDNS also enriches announce rows with the
-  locator. Port-zero and loopback TCP endpoints are not advertised. The Android
-  beacon is withdrawn when its gateway stops; netd holds its beacon for the
-  plane lifetime. Never a mere candidate. mDNS finds robots; zenoh connects and
-  does everything after. (There is no per-candidate verify probe: presence
-  IS the verification.)
-- **Open access is unauthenticated.** On non-Android platforms, a robot with
-  no `network:` block is viewable by any peer on the LAN; restrict it with a
-  `network:` block or `--network off`, or refuse every LAN peer with
-  `CERULION_LAN_ACCESS=paired`, which also stops LAN peers publishing into
-  the robot's ingress topics.
-- **Android is paired by default.** On an Android device the gateway and
-  `cerulion-netd` refuse every LAN request (demand, catalog, schema) and
-  re-inject no frame a LAN peer publishes, so the LAN can neither read nor
-  write topics, unless `CERULION_LAN_ACCESS=open` is set. While the app is
-  `paired`, a desk reads its topics only through the remote plane the app hosts
-  with its `remote` runtime key. A robot or app that runs the remote plane lets a paired desk with observe access
-  (`CAP_OBSERVE`) read topics over it, from robot to desk on
-  its `cerulion/wire/2` protocol. The `cerulion-remoted` daemon also lets a
-  paired desk with the teleoperate capability (`CAP_TELEOP`) and at least the
-  operator role publish a message on a robot topic or call a
-  robot service on its ops protocol (`cerulion topic pub --robot`,
-  `cerulion service call --robot`; see [remote access](remote_plane.md)),
-  refused while the robot's e-stop is engaged; the plane an app hosts refuses
-  both, so a desk cannot write into the app. The `teleop` verb
-  has no handler yet, so no remote command holds a control lease. An
-  Android app selects the same posture with its `lan_access` key (see [Android](android.md)). The gateway keeps the
-  posture in front of every installed demand authorizer; changing an inner
-  authorizer does not disable it. Choose the posture at startup with
-  `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
-  mode, the robot identity announcement remains, but topic announce tokens are
-  withheld, so the topics this robot publishes are not named on the LAN. A
-  gateway that receives topics from the network still names each of those
-  topics in its demand queries on the LAN. The mDNS beacon remains available
-  when the first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
-  access after a paired start does not replay topic announcements withheld
-  while paired; an Android app started with open access announces its
-  registered topics when its start completes.
->>>>>>> 4123422f3bbe8615f66b3aa6d58a5bf2acdea6dd
 
 The paired gate stays in front of every installed LAN authorizer. Identity
 beacons may remain visible, but topic announcements are withheld while paired.
@@ -239,8 +137,7 @@ The inspection verbs and `schema info` also stay local under the network
 daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
 parse), opening no discovery session of their own. `cerulion viz --robot`
 refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
-`CERULION_VIZD_NETWORK=off`, and `cerulion pair` refuses under
-`CERULION_NETWORK`.
+`CERULION_VIZD_NETWORK=off`.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and

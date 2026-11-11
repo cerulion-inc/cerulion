@@ -1,82 +1,37 @@
 # cerulion_cli_engine
-<<<<<<< HEAD
-=======
-
-CLI parses.
-Writers (`node create/delete/modify/stage`, graph create/partition/run
-partition saves, ros2 attach/migrate --write, schema create/delete) hold
-`workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` across writes:
-UNIX flock: shared with wsd, thread reentrant, waiters warn once;
-elsewhere a no-op. Reads: `acquire_read`: create nothing, refuse re-entry.
-No symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits existing
-tracked `.gitignore` when creating `.cerulion/`. Migration uses polling
-`acquire_interruptibly(root, interrupted)` -> `AcquireError` (no From).
-Locks are per root; --workspace is COLCON root. Stage declared ports via
-`graph_cmd::stage_declared_node`. Paired skips implicit LAN catalogs; Open,
-locators and scan retain them. Bad pairings are diagnostics. Observer channels
-are private per source; ambiguity needs selectors; caches bind account/key.
-Refresh 2 s, save 1 s; enroll 2 s, enroll once/process, existing key, no browser; cache debug.
-Unread catalogs cannot prove absence; keys need re-login, never offline; run warns if registration fails.
->>>>>>> 4123422f3bbe8615f66b3aa6d58a5bf2acdea6dd
 
 Parser: `cerulion_cli`. Writers hold `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` through check/write: UNIX flock shared with wsd, reentrant, others wait (one warn); elsewhere no-op.
-Reads use `acquire_read` (creates nothing; refuses same-thread re-entry); all
+Reads: `acquire_read` (creates nothing; refuses same-thread re-entry); all
 refuse a symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
-a tracked `.gitignore` when creating `.cerulion/`; migrate polls with
+tracked `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
 Stage ports via `graph_cmd::stage_declared_node`.
 ## Invariants
-<<<<<<< HEAD
-- Account/pair catalogs bind identity; selectors resolve collisions. Paired skips implicit LAN; Open/locators/scan retain it; broken pairs diagnose. Refresh/enroll <=2s; enroll once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; run warns on registration failure.
+- Catalogs bind account/key; selectors resolve collisions. Paired skips implicit LAN; Open/locators/scan retain it; broken pairs diagnose. Refresh <=2s, save <=1s; enroll <=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; run warns if registration fails.
 - Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
 - Paired graph producers need serving_authority; canonical ingress before GO retains pinned demands; refuse schema/QoS/writer mismatches.
-- Observers pin source/hash/channel; probes use demand-free clients and busy is unknown. Loss re-demands; graph inputs revalidate identity.
+- Observers pin source/hash/channel; demand-free probes treat busy as unknown. Loss re-demands; graph inputs revalidate identity.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.
-- `account_robot_access`: only netd opens WAN. Probes: 4 s (500 ms/robot), never pair/demand. Catalogs: another 4 s; coalesce by endpoint key. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
+- `account_robot_access`: netd opens WAN. Probes: 4 s (500 ms/robot), never pair/demand. Catalogs: 4 s; coalesce endpoint keys. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
-- node build rustc advises; load-time cdylib fingerprint counts.
-- Android libs: <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn (docs/android.md).
+- node build: rustc advisory; cdylib load fingerprint counts.
+- Android libs: <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn; account TLS: system roots, no JVM.
 - Ports/triggers: only `node_metadata::parse_node_metadata`; INFO_END before INFO_START is fatal.
 - Pinned hashes: run `pinned_hashes`, copy into `topic_cmd.rs`; never hand-compute.
 - Completions never hang/spawn/network (`run_bounded`, `completions_test`).
 - Size port spellings before acceptance; unverifiable = `CliError::SchemaUnchecked`.
   Any un-carryable duplicate bearer refuses, never warn-and-accept.
-=======
-- Engine: invariants; CLI: UX checks.
-- `account_robot_access`: netd alone opens WAN. Probes: 4 s total, 500 ms per robot,
-  never pair/demand. Automatic catalogs share another 4 s; owned/paired coalesce by
-  endpoint key. LAN/account merge requires robot ID AND key. Auth keeps
-  `/v1/me.account_id`; pairing maps via `account_identity::pairing_account_id`.
-  Login checks mapping/challenge/registration/leaf/key before writes;
-  `device-chain.json` commits LAST.
-- `node build`'s rustc probe is advisory; the cdylib fingerprint, checked at load, counts.
-- Android: cdylibs prefer `<target>/<triple>/<profile>`, then `<target>/<profile>`;
-  viz refuses before connecting/spawning. Account TLS: system roots, no JVM.
-- `node_metadata::parse_node_metadata` is the port/trigger authority; `INFO_END`
-  before `INFO_START` is fatal.
-- Pinned schema hashes: never hand-compute; run `pinned_hashes`, copy to `topic_cmd.rs`.
-- Completions never hang, spawn, or open the network (`run_bounded`, `completions_test`).
-- Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
-  never accept with a warn. Duplicate identities refuse iff ANY bearer is un-carryable.
->>>>>>> 4123422f3bbe8615f66b3aa6d58a5bf2acdea6dd
 - Rewrite `node modify` sources with `syn` spans, never `str::replace`.
 - iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
 - Interrupted waits check running; retry <= MAX_CONSECUTIVE_WAIT_ERRORS, never sleep-retry errors. SIGINT foreign children via child_signals (exec inherits ignore/blocks), self_exe excepted.
-- After changing `templates.rs`, regenerate its fixture from the repo root:
+- After `templates.rs` changes, regenerate its fixture at repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-<<<<<<< HEAD
 ## Dependencies
-Dependencies follow binary, never cwd: checkout paths or exact registry pins.
+Dependencies follow binary, never cwd: checkout or exact registry pins.
 Checks: `docs/internals/cli.md` §11.
-## Testing
-=======
-## Workspace dependencies
-Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
-pins. See `docs/internals/cli.md` §11 for contract and compiler checks.
-## Testing: lib env: test_env::env_lock
->>>>>>> 4123422f3bbe8615f66b3aa6d58a5bf2acdea6dd
+## Testing: lib env `test_env::env_lock`
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
   root; no bash-only construct in a `container:` run step lacking `shell: bash`.

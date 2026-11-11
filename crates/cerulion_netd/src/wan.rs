@@ -58,7 +58,7 @@ pub const WAN_ROBOTS_ENV: &str = "CERULION_NETD_WAN_ROBOTS";
 /// identity + the pairing key the robot access-lists). Unset ⇒ an EPHEMERAL desk
 /// key is generated — which an un-paired robot REFUSES (the iroh dial is refused
 /// LOUDLY at demand time), so a real WAN deployment points this at
-/// `~/.cerulion/desk.key` (the SAME key `cerulion pair` creates). Mirrors
+/// `~/.cerulion/desk.key` (the SAME key `cerulion login` creates). Mirrors
 /// `cerulion-connectd connect --key-file`.
 pub const DESK_KEY_ENV: &str = "CERULION_NETD_DESK_KEY";
 

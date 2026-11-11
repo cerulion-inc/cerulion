@@ -612,9 +612,9 @@ const WAN_ENV_VARS: [&str; 6] = [
 /// are using.
 ///
 /// - `CERULION_EPOCH_DIR` — the shared revocation-cache directory (`cerulion_wireclient::epoch`).
-/// - `CERULION_RELAY_URL` — read by `cerulion-connectd`'s `connect` AND `pair` subcommands
-///   via clap's `env` attribute, so a relay override reaches every desk dial and every
-///   pairing ceremony regardless of how netd was built.
+/// - `CERULION_RELAY_URL`: read by `cerulion-connectd`'s `connect`, `act`, `rcp` and
+///   `pair` subcommands via clap's `env` attribute, so a relay override reaches every
+///   cerulion-connectd dial regardless of how netd was built.
 ///
 /// Every entry must also appear in [`WAN_ENV_VARS`] (pinned by
 /// [`tests::desk_wide_env_vars_are_a_subset_of_the_wan_set`]).
@@ -626,7 +626,8 @@ const DESK_WIDE_ENV_VARS: [(&str, &str); 2] = [
     ),
     (
         "CERULION_RELAY_URL",
-        "`cerulion connect` and `cerulion pair` (cerulion-connectd reads it on both)",
+        "`cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, `topic snapshot` \
+         and `service call` (cerulion-connectd reads it on each)",
     ),
 ];
 
@@ -1168,7 +1169,14 @@ mod tests {
         }
         // `CERULION_RELAY_URL` specifically: this exact string is what the test pins.
         let relay = lean_build_env_warn_message("CERULION_RELAY_URL");
-        assert!(relay.contains("`cerulion pair`"), "{relay}");
+        assert!(
+            relay.contains(
+                "`cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, \
+                 `topic snapshot` and `service call` (cerulion-connectd reads it on each)"
+            ),
+            "{relay}"
+        );
+        assert!(!relay.contains("cerulion pair"), "{relay}");
 
         for var in [
             "CERULION_NETD_WAN_ROBOTS",

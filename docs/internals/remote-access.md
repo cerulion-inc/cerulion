@@ -3,7 +3,9 @@
 Scope: the remote-plane family: `cerulion_remoted` (the robot daemon), `cerud`
 (the robot ops-verb service), `cerulion_pairing` (identity + trust), `cerulion_link`
 (iroh dial-by-key QUIC), `cerulion_wireclient` (desk client substrate),
-`cerulion_connectd` (the `cerulion connect` / `cerulion pair` worker),
+`cerulion_connectd` (the worker behind `cerulion connect`, `cerulion rcp` and `--robot`
+on `topic pub`, `topic snapshot` and `service call`; its hidden `pair` subcommand
+has no `cerulion` caller),
 `cerulion_accountd` (the cloud issuer/CA + accounts), `cerulion-wire` (the
 permissive frame decoder), and `cerulion_netd`'s iroh WAN plane. Read this
 alongside `docs/internals/network-daemons.md` (the LAN zenoh half; its §8 and §10
@@ -168,7 +170,8 @@ the same entry instead of running the daemon.
   reading the key file (`daemon_wiring_test.rs`).
 - **Desk side, three consumers of the same robot surface**: the
   `cerulion connect` verb (spawns the `cerulion-connectd` sibling binary),
-  `cerulion pair` (spawns `cerulion-connectd pair`), and `cerulion_netd`'s
+  `cerulion-connectd pair` (the code ceremony; the `cerulion pair` verb that
+  spawned it is a hidden stub that refuses, §7), and `cerulion_netd`'s
   embedded iroh WAN plane (the `wan` feature). All three dial the same two
   ALPNs and share one client substrate (§7 to §8).
 
@@ -183,7 +186,7 @@ the same entry instead of running the daemon.
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
-| `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the `cerulion connect`/`pair` worker binary (session driver + CPace initiator) |
+| `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the worker binary behind `cerulion connect`, `cerulion rcp` and `topic pub`/`topic snapshot`/`service call --robot` (session driver; its hidden `pair` subcommand is the CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
 
 Load-bearing boundary contracts:
@@ -762,12 +765,22 @@ every slot is taken.
 - **`cerulion connect <robot>`**: the CLI resolves robot address + demand set
   into a `cerulion-connectd` argv and spawns the sibling binary
   (`connect_cmd.rs`, pure + oracle-tested; `CERULION_CONNECTD_BIN` overrides
-  the binary). A positional name resolves via `~/.cerulion/robots.toml`, which
-  `cerulion pair` WRITES on success; a paired robot's name just works.
+  the binary). A positional name resolves via `~/.cerulion/robots.toml`; a
+  pinned robot's name just works. No `cerulion` verb writes the file: `pair_cmd`
+  pins a name after a successful `cerulion-connectd pair` ceremony, and nothing
+  calls `pair_cmd`, so it holds hand-written pins and any a 1.x `cerulion pair`
+  wrote.
   connectd's `worker::run_connect` dials, fetches the catalog, demands, and
   spawns one reader per accepted topic; the whole loop is pinned over real
   loopback iroh + real per-test SHM roots by `reinject_e2e_test.rs`.
-- **`cerulion pair <robot>`**: the desk is the CPace initiator over the robot's
+- **`cerulion pair`** is a hidden stub: no robot-side verb arms a pairing code
+  (`SharedCodePairSessions::arm` in `cerulion_remoted::pairing_verbs` has no
+  caller outside tests), so `dispatch` in `main.rs` refuses every spelling
+  with `PAIR_UNAVAILABLE_MSG` and exit 2 above the login gate, and sends only
+  its `cli_command_run` (verb `pair`, exit 2). The ceremony below lives on in
+  `cerulion_cli_engine::pair_cmd` and `cerulion-connectd pair`, which no
+  `cerulion` verb calls.
+- **The code ceremony** (`cerulion-connectd pair`): the desk is the CPace initiator over the robot's
   ops plane (`pair.rs`); a wrong code is detected structurally desk-side and
   mapped to a distinct exit code; stdout carries machine-parseable state lines
   for Studio, everything else goes to stderr. Pinned against a REAL in-process
@@ -1014,8 +1027,8 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   `cerulion_pairing::identity` (0700 directories; the key goes to a synced 0600
   dot-named sibling hard-linked into place, so it never overwrites and is never
   seen partly written),
-  which `cerulion login`, `cerulion pair` and `wireclient`'s `--key-file`
-  creation all call.
+  which `cerulion login`, `cerulion-connectd pair` and `wireclient`'s
+  `--key-file` creation all call.
 - Every per-machine config file under `~/.cerulion` resolves from one rule,
   `cerulion_pairing::identity::config_dir` (`CERULION_HOME` verbatim when set
   and non-empty). The crates without `cerulion_pairing` (`cerulion_core` run
@@ -1025,10 +1038,10 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   `home_dir` or `"HOME"` mention, outside its allowed list. Daemon
   sockets (`cerulion_hygiene`) and the downloaded video decoder keep their own
   location rules.
-- `cerulion connect` and `cerulion pair` hand `cerulion-connectd` the key's
+- `cerulion connect` and `pair_cmd` hand `cerulion-connectd` the key's
   legacy name `desk.key`: `connect` resolves `epochs/` next to its key file,
-  and `pair` recognizes the path as the machine key and loads it through the
-  identity layout.
+  and `cerulion-connectd pair` recognizes the path as the machine key and loads
+  it through the identity layout.
 - Desk inventory (`~/.cerulion/`): `identity/device.key` (the 32-byte machine
   seed; `desk.key` is a hard link to it or an equal copy, adopted byte for byte when it is the
   only one present, and two different keys are refused), `identity/<team>/high_water`

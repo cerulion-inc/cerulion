@@ -276,6 +276,54 @@ fn viz_robot_completes_the_paired_robot_from_the_isolated_home() {
     assert_eq!(values(&["cerulion", "viz", "--robot", ""]), ["spot_lab"]);
 }
 
+/// Every candidate the engine returns for the last of `words`, hidden ones
+/// included, as `(value, description)` exactly as the engine returns them
+/// (the shells print these, bash only the values); unlike [`complete`],
+/// nothing is filtered. The top level reads no local source, so no fixture
+/// is needed.
+fn raw_top_level(words: &[&str]) -> Vec<(String, String)> {
+    let mut cmd = cli_command();
+    let args: Vec<OsString> = words.iter().map(OsString::from).collect();
+    let index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, index, None)
+        .expect("completion engine")
+        .into_iter()
+        .map(|c| {
+            (
+                c.get_value().to_string_lossy().into_owned(),
+                c.get_help().map(ToString::to_string).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// The hidden `pair` stub is not among the verbs `cerulion <TAB>` offers. For
+/// a word no visible verb starts with, clap_complete offers the hidden verbs
+/// that match, so `cerulion p<TAB>` offers `pair` alone, described by the
+/// stub's refusal rather than by a pairing ceremony.
+#[test]
+fn the_hidden_pair_stub_completes_only_for_its_own_prefix() {
+    let top = raw_top_level(&["cerulion", ""]);
+    assert!(
+        top.iter().any(|(value, _)| value == "connect"),
+        "the verb list is not empty: {top:?}"
+    );
+    assert!(
+        !top.iter().any(|(value, _)| value == "pair"),
+        "`cerulion <TAB>` offers `pair`: {top:?}"
+    );
+    for word in ["p", "pa"] {
+        assert_eq!(
+            raw_top_level(&["cerulion", word]),
+            [(
+                "pair".to_string(),
+                "Code pairing is not available in this release".to_string()
+            )],
+            "`cerulion {word}<TAB>`"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The create arms complete NOTHING
 // ---------------------------------------------------------------------------
@@ -468,7 +516,6 @@ fn the_wired_completer_inventory_is_exactly_the_declared_set() {
         "cerulion node run::node_type",
         "cerulion node stage::graph",
         "cerulion node stage::node_type",
-        "cerulion pair::robot",
         "cerulion rcp::robot",
         "cerulion service call::robot",
         "cerulion topic pub::robot",
@@ -630,7 +677,6 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion node run::id",
         "cerulion node run::prefix",
         "cerulion node stage::id",
-        "cerulion pair::label",
         "cerulion ros2 attach::robot_name",
         "cerulion ros2 attach::topic_prefix",
         // ---- Port declarations: `SCHEMA NAME` pairs where NAME is invented.
@@ -644,19 +690,14 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion node modify::output",
         "cerulion node modify::trigger_input",
         "cerulion node stage::input_binding",
-        // ---- Opaque identifiers: hex endpoint ids, account ids, device ids,
-        // pairing codes. Nothing local enumerates them.
+        // ---- Opaque identifiers: hex endpoint ids and device ids. Nothing
+        // local enumerates them.
         "cerulion account devices revoke::device_id",
         "cerulion connect::eid",
-        "cerulion pair::account",
-        "cerulion pair::code",
-        "cerulion pair::eid",
         "cerulion rcp::eid",
         // ---- Network locators, URLs and interface addresses.
         "cerulion connect::addrs",
         "cerulion connect::relay_url",
-        "cerulion pair::addrs",
-        "cerulion pair::relay_url",
         "cerulion rcp::addrs",
         "cerulion rcp::relay_url",
         "cerulion ros2 attach::iface",
@@ -687,6 +728,10 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         // shells never offer it — this entry only classifies the swallowing
         // arg for this walk, which visits hidden commands too.
         "cerulion ros::args",
+        // ---- The hidden `cerulion pair` stub, for the same reason: it
+        // swallows the old argv so `main` can print its refusal, and
+        // completing anything would suggest the verb works.
+        "cerulion pair::args",
         // ---- Topics whose set is NOT locally knowable. `connect --topic`
         // names a topic on a robot this desk has not mirrored yet — that is
         // the entire point of the verb — so the local SHM scan would offer
