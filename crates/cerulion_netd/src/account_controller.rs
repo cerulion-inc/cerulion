@@ -71,6 +71,7 @@ struct State {
     pending_all: bool,
     pending_robots: BTreeSet<String>,
     busy_since: Option<Instant>,
+    serving_gateway: bool,
 }
 
 /// Owns at most one outgoing endpoint. This type never exposes its device seed.
@@ -105,6 +106,7 @@ impl AccountWanController {
         }) {
             return Err("manual WAN robot names cannot use the reserved account: prefix".into());
         }
+        let serving_gateway = config.serving_gateway;
         Ok(Self {
             lan: GatewayMirrorPlane::new(Arc::clone(&manager)),
             manager,
@@ -122,6 +124,7 @@ impl AccountWanController {
                 pending_all: false,
                 pending_robots: BTreeSet::new(),
                 busy_since: None,
+                serving_gateway,
             }),
         })
     }
@@ -157,9 +160,6 @@ impl AccountWanController {
         if !self.config.network_enabled {
             return Err(NETWORK_OFF.into());
         }
-        if self.config.serving_gateway {
-            return Err(crate::wan::SERVING_MACHINE_WAN_REFUSAL.into());
-        }
         Ok(())
     }
 
@@ -181,10 +181,18 @@ impl AccountWanController {
             return Err(NEED_INSTALL.into());
         }
         if state.plane.is_none() {
-            state.plane = Some(
+            let plane = if state.serving_gateway {
+                let root = cerulion_discovery::robot_state::resolve()
+                    .ok_or("owned remote endpoint state root is unavailable")?;
+                IrohMirrorPlane::new_shared(
+                    Arc::clone(&self.manager),
+                    Arc::clone(&state.registry),
+                    crate::shared_endpoint::socket_path(&root),
+                )?
+            } else {
                 IrohMirrorPlane::new(Arc::clone(&self.manager), Arc::clone(&state.registry))?
-                    .with_authorizer(Arc::clone(&self.authorizer)),
-            );
+            };
+            state.plane = Some(plane.with_authorizer(Arc::clone(&self.authorizer)));
         }
         state
             .plane
