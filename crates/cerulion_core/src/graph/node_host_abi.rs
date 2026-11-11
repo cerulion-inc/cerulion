@@ -204,6 +204,20 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// Host runtime maintenance may inspect its own native ports without crossing C.
+    pub(crate) fn native_for_runtime(&self) -> &NodeContext {
+        &self.native
+    }
+
+    /// Exclusive host maintenance runs only after every accessor lease returned.
+    pub(crate) fn native_mut_for_runtime(&mut self) -> Result<&mut NodeContext, HostServiceError> {
+        self.admit()?;
+        if self.leases.active() != 0 {
+            return Err(HostServiceError::Busy);
+        }
+        Ok(&mut self.native)
+    }
+
     /// Resolve names once and provision all lease rows before node creation.
     /// The environment is the same immutable snapshot used to build `native`.
     // hot-path-alloc-ok-fn: binding and fixed lease allocation occur at graph build

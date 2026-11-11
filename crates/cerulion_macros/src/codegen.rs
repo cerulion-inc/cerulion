@@ -501,6 +501,13 @@ fn strip_field_attrs_and_inject_hidden(
                 })
                 .expect("hidden field __cer_rt parses");
             fields.named.push(rt_field);
+            let plugin_field: syn::Field = syn::Field::parse_named
+                .parse2(quote! {
+                    #[doc(hidden)]
+                    pub __cer_plugin: ::std::option::Option<#__cer_root::graph::node_plugin_abi::HostClient>
+                })
+                .expect("hidden plugin field parses");
+            fields.named.push(plugin_field);
         }
     }
     output
@@ -585,6 +592,9 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn real_ns(&self) -> u64 {
+                if let ::std::option::Option::Some(client) = &self.__cer_plugin {
+                    return client.clock_real();
+                }
                 #__cer_root::clock::real_ns()
             }
 
@@ -626,6 +636,10 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn request_shutdown(&self) {
+                if let ::std::option::Option::Some(client) = &self.__cer_plugin {
+                    client.request_shutdown();
+                    return;
+                }
                 self.__cer_rt.shutdown_signal.request();
             }
         }
@@ -1503,6 +1517,13 @@ fn gen_cdylib(
         .map(|i| json_escape(&i.field_name.to_string()))
         .collect();
     let input_field_types: Vec<&syn::Type> = inputs.iter().map(|i| &i.field_type).collect();
+    let input_accumulate_caps: Vec<String> = inputs
+        .iter()
+        .map(|i| {
+            i.accumulate
+                .map_or_else(|| "null".to_owned(), |cap| cap.to_string())
+        })
+        .collect();
     let input_key_suffixes: Vec<String> = inputs
         .iter()
         .map(|i| {
@@ -1805,11 +1826,14 @@ fn gen_cdylib(
         TokenStream::new()
     };
 
+    let stable =
+        crate::plugin_codegen::generate(entry_name, node_name, inputs, node_level.external);
     quote! {
         #[allow(unexpected_cfgs)]
         #[cfg(feature = "cdylib")]
         mod __cerulion_cdylib {
             use super::*;
+            #stable
 
             // Info JSON is built at first call
             // via `OnceLock` because each `#[output]` port's
@@ -1835,10 +1859,15 @@ fn gen_cdylib(
                 #(
                     if !first_input { inputs.push(','); }
                     first_input = false;
+                    let _: () = <#input_field_types as #__cer_root::message::ShmMessage>::_SHM_INVARIANTS;
                     inputs.push_str(&::std::format!(
-                        r#"{{"name":"{}","schema_hash":{}{}}}"#,
+                        r#"{{"name":"{}","schema_hash":{},"wire_fixed_size":{},"variable_count":{},"alignment":{},"accumulate_cap":{}{}}}"#,
                         #input_field_names,
                         <#input_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
+                        <#input_field_types as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
+                        <#input_field_types as #__cer_root::message::ShmMessage>::VARIABLE_FIELD_COUNT,
+                        #__cer_root::shm_runtime::FRAME_ALIGN,
+                        #input_accumulate_caps,
                         #input_key_suffixes,
                     ));
                 )*
@@ -1849,6 +1878,7 @@ fn gen_cdylib(
                 #(
                     if !first { outputs.push(','); }
                     first = false;
+                    let _: () = <#output_field_types as #__cer_root::message::ShmMessage>::_SHM_INVARIANTS;
                     let max_slice_len_default =
                         match <#output_field_types as #__cer_root::message::ShmMessage>::MAX_SLICE_LEN {
                             ::std::option::Option::Some(n) =>
@@ -1869,12 +1899,14 @@ fn gen_cdylib(
                     // that has not learned it defaults the field to "no
                     // claim" and sizes from the file exactly as before.
                     outputs.push_str(&::std::format!(
-                        r#"{{"name":"{}","schema_hash":{},"max_slice_len_default":{},"promise_within_ms":{},"wire_fixed_size":{}}}"#,
+                        r#"{{"name":"{}","schema_hash":{},"max_slice_len_default":{},"promise_within_ms":{},"wire_fixed_size":{},"variable_count":{},"alignment":{}}}"#,
                         #output_field_names,
                         <#output_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
                         max_slice_len_default,
                         #output_promise_within,
                         <#output_field_types as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
+                        <#output_field_types as #__cer_root::message::ShmMessage>::VARIABLE_FIELD_COUNT,
+                        #__cer_root::shm_runtime::FRAME_ALIGN,
                     ));
                 )*
                 outputs.push(']');

@@ -1639,6 +1639,7 @@ dependencies = [
 name = "cerulion_node_abi"
 version = "2.0.0"
 dependencies = [
+ "libloading",
  "stabby",
  "thiserror 2.0.21",
 ]
@@ -9083,6 +9084,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]
@@ -9618,6 +9620,15 @@ name = "test_node_snapshot_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+]
+
+[[package]]
+name = "test_node_stable_abi_cross_compiler"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+ "stabby",
 ]
 
 [[package]]

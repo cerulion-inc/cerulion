@@ -33,6 +33,35 @@ pub enum AbiError {
     /// Capability bits and extension presence disagree.
     #[error("node capability bits disagree with its extension tables")]
     Extensions,
+    /// Opening a native library failed before discovery.
+    #[error("node library could not be opened: {reason}")]
+    Library {
+        /// Native loader diagnostic.
+        reason: String,
+    },
+    /// Stable bootstrap discovery failed; legacy exports cannot be executed.
+    #[error("node stable interface could not be discovered; rebuild the node: {reason}")]
+    Bootstrap {
+        /// Checked discovery diagnostic.
+        reason: String,
+    },
+    /// A descriptor violates a frozen pointer/length contract.
+    #[error("node interface descriptor is invalid: {reason}")]
+    Descriptor {
+        /// Bounded validation diagnostic.
+        reason: &'static str,
+    },
+    /// A required C callback is null.
+    #[error("node interface {table} is missing required callback {callback}")]
+    Callback {
+        /// Complete table type.
+        table: &'static str,
+        /// Required callback field.
+        callback: &'static str,
+    },
+    /// Native plugins are supported only on the existing POSIX targets.
+    #[error("native node plugins are unsupported on this platform")]
+    Platform,
 }
 
 /// Validate the complete immutable table, never a prefix or only field offsets.
@@ -161,6 +190,15 @@ mod tests {
     #[test]
     fn frozen_port_event_accumulator_and_sync_tags_match_wire_oracles() {
         assert_eq!(core::mem::size_of::<PortBindingV1>(), 32);
+        assert_eq!(core::mem::size_of::<RawPublisherRequestV1>(), 32);
+        assert_eq!(
+            [
+                full_queue::CONFIG_DEFAULT,
+                full_queue::DISCARD,
+                full_queue::BLOCK
+            ],
+            [0, 1, 2]
+        );
         assert_eq!(core::mem::size_of::<AccumulateInfoV1>(), 24);
         assert_eq!(core::mem::size_of::<EventV1>(), 88);
         assert_eq!(

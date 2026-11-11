@@ -197,6 +197,21 @@ The module doc in `src/registry.rs` is the authority; the load-bearing facts:
 
 ## Generated cdylib FFI and ABI coupling
 
+`plugin_codegen.rs` also emits the optional checked `cerulion_node_api_v1`
+bootstrap with node-local lifecycle, state and external-source tables.
+`plugin_impl.rs` adapts the common rewritten init/tick/helper methods to
+`graph::node_plugin_abi` ports. Parameter defaults, metadata and trigger policy
+share the native emitters; both port directions include checked schema, fixed
+size, variable count and alignment facts.
+
+Stable instances hold copied host callbacks and integer port/lease identities.
+The host retains transport, clocks, queues and sessions. Local schema writers
+publish only after the common success gate arms them. An adaptive spill is an
+explicit synchronous payload copy; the original lease stays live until the
+writer drops, then receives `SPILL_RELEASE`. Input views keep their host lease
+until their readers drop. State sinks borrow chunks synchronously; accumulator
+records use the same canonical encoding as native state.
+
 `src/codegen.rs` emits the cdylib entry points (behind the `cdylib` feature). The
 loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
 
