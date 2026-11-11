@@ -1,6 +1,6 @@
 # cerulion_core - agent notes
 
-Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial tests.
+Core runtime; test maps and transport ownership: core-testing.md/core-transport.md.
 
 ## Invariants
 
@@ -32,10 +32,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
 
-- Stable node/host tests: `core-transport.md`; readers/writers drop before release.
-- Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
-  graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
-  a string literal (a removed dash lowers the file's ledger line).
+- Shipped surface: in-code graphs are tests only; apply root public-text gates.
 
 ## Testing
 
@@ -60,6 +57,4 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
 
-Stable node diagnostic copies retain the original reason text. Host callback
-errors use an identity display locally so raw helpers and user transport-error
-wrapping keep the original message. Caller/phase labels are added by the loader.
+Stable diagnostics keep exact text; the loader adds phase labels (core-dynamic.md).
