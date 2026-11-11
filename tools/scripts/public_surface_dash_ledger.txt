@@ -189,7 +189,7 @@
 8 crates/cerulion_macros/src/state_derive.rs
 7 crates/cerulion_macros/src/validate.rs
 5 crates/cerulion_mdns/src/lib.rs
-9 crates/cerulion_netd/src/beacon.rs
+8 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
 16 crates/cerulion_netd/src/client.rs
 2 crates/cerulion_netd/src/convergence.rs

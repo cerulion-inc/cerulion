@@ -41,10 +41,16 @@ impl AccountWanController {
         action: &AccountAccessRequest,
     ) -> Result<AccountAccessReply, String> {
         action.validate()?;
+        if let AccountAccessRequest::Discover { budget_ms } = action {
+            return self
+                .discover(Duration::from_millis(*budget_ms))
+                .map(|robots| AccountAccessReply::Discovery { robots });
+        }
         let (robot_id, budget) = match action {
-            AccountAccessRequest::Install { .. } => {
+            AccountAccessRequest::Install { .. } | AccountAccessRequest::InstallPaired { .. } => {
                 return Err("account installation requires daemon registry coordination".into())
             }
+            AccountAccessRequest::Discover { .. } => unreachable!("discovery returned above"),
             AccountAccessRequest::Probe {
                 robot_id,
                 budget_ms,
@@ -92,7 +98,9 @@ impl AccountWanController {
             AccountAccessRequest::Schema { topic, .. } => plane
                 .query_schema(&route, topic, remaining(deadline)?)
                 .map(|schema| AccountAccessReply::Schema { robot_id, schema }),
-            AccountAccessRequest::Install { .. } => {
+            AccountAccessRequest::Install { .. }
+            | AccountAccessRequest::InstallPaired { .. }
+            | AccountAccessRequest::Discover { .. } => {
                 unreachable!("install was refused before identity and I/O")
             }
         };
@@ -172,6 +180,41 @@ impl AccountWanController {
 }
 
 impl MirrorPlane for AccountWanController {
+    fn begin_serving(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "account robot controller state is poisoned".to_owned())?;
+        // Fence construction under the SAME lock every endpoint operation holds.
+        // Principle #8: outgoing ownership ends before the server can bind.
+        state.serving_gateway = true;
+        state.pending_all = true;
+        state.pending_robots.clear();
+        let proof = state.registry.owner_certificate()?;
+        if let Some(plane) = state.plane.take() {
+            plane.invalidate_account()?;
+        }
+        state.registry.replace_owner_certificate(proof)?;
+        Ok(())
+    }
+
+    fn end_serving(&self) {
+        // Reap ends the owned endpoint; fence all shared readers before another
+        // outgoing endpoint can be constructed. Pins retire on the demand path.
+        if let Ok(mut state) = self.state.lock() {
+            let proof = state.registry.owner_certificate();
+            state.pending_all = true;
+            state.pending_robots.clear();
+            if let Some(plane) = state.plane.take() {
+                let _retired = plane.invalidate_account();
+            }
+            if let Ok(proof) = proof {
+                let _restored = state.registry.replace_owner_certificate(proof);
+            }
+            state.serving_gateway = self.config.serving_gateway;
+        }
+    }
+
     fn account_access(&self, action: &AccountAccessRequest) -> Result<AccountAccessReply, String> {
         self.account_operation(action)
     }
@@ -195,8 +238,38 @@ impl MirrorPlane for AccountWanController {
         self.named_schema(robot_id, requested)
     }
 
+    fn install_paired_robots(
+        &self,
+        robots: &[crate::account_access::PairedRobot],
+        registry: &mut DemandRegistry,
+    ) -> Result<(), String> {
+        self.install_paired(robots, registry)
+    }
+
+    fn paired_catalog(&self, robot: &str) -> Option<Result<CatalogReply, String>> {
+        self.paired_metadata(robot, None)
+            .map(|result| result.map(|(catalog, _)| catalog))
+    }
+
+    fn paired_schema(&self, robot: &str, requested: &str) -> Option<Result<SchemaReply, String>> {
+        self.paired_metadata(robot, Some(requested)).map(|result| {
+            result.and_then(|(_, schema)| {
+                schema.ok_or_else(|| "paired schema response was absent".into())
+            })
+        })
+    }
+
     fn refresh_identity(&self, registry: &mut DemandRegistry) -> Result<(), String> {
         self.refresh(registry)
+    }
+
+    /// Observer channel on WAN; legacy LAN mirrors keep their canonical channel.
+    fn local_channel(&self, key: &TopicKey) -> String {
+        if matches!(self.route(key), Ok(Route::Wan)) {
+            key.local_topic()
+        } else {
+            key.topic.clone()
+        }
     }
 
     /// The route this controller PINNED when it ensured the mirror, never the route

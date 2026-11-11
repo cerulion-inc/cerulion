@@ -424,3 +424,6 @@ fn serving_machine_refuses_wan_before_constructing_a_client_runtime() {
 
 #[path = "owner_pair_controller.rs"]
 mod controller;
+
+#[path = "owner_pair_shared_endpoint.rs"]
+mod shared_endpoint;

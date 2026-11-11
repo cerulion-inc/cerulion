@@ -55,12 +55,8 @@ use serde::Deserialize;
 use crate::auth::{self, AuthState, LocalGate};
 use crate::error::{CliError, CliResult};
 
-/// Require a saved prior login before serving, including when tokens have expired.
-/// This local check never starts the interactive login flow.
-pub fn require_serving_login() -> CliResult<()> {
-    cerulion_netd::serving_login::require_prior_login()
-        .map_err(|reason| CliError::Login(reason.to_string()))
-}
+/// Existing local authority shared by serving and frontend command gates.
+pub use cerulion_netd::serving_login::require_serving_authority;
 
 /// The production account-service base URL: the Supabase-backed issuer the web
 /// app serves (`/v1/auth/device/*`, `/v1/auth/refresh`, `/v1/auth/revoke`,
@@ -318,6 +314,12 @@ fn gate_with(
     interactive: bool,
     telemetry_anon_id: impl FnOnce() -> Option<String>,
 ) -> CliResult<Option<LoginOutcome>> {
+    // The same local authority as supervised serving and graph registration:
+    // a validated claimed robot keeps working without an auth.json or enrollment.
+    #[cfg(unix)]
+    if cerulion_netd::serving_login::require_serving_authority().is_ok() {
+        return Ok(None);
+    }
     let loaded = auth::load();
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
         LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(None),

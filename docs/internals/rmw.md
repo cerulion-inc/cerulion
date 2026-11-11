@@ -418,13 +418,15 @@ direct C-ABI caller can produce one), and there is deliberately no alias for the
 slash-stripped spelling. `ros_graph_type_name` maps the introspection-derived `pkg/Name` to the ROS graph's
 `pkg/msg/Type`.
 
-Network egress: every `rmw_create_publisher` also registers its topic (canonical name
+Network egress: every eligible `rmw_create_publisher` also registers its topic (canonical name
 plus the bridge's schema hash) on the transport's runtime-egress registration channel,
 exactly as the `ros2 attach` bridge does for its raw routes: best-effort and network-free
 (a registration-hostile name warns per topic; a local control-plane failure warns once
 per process, repeats at debug). A gateway on the machine drains that channel and
 announces the topic; the rmw itself opens no network session, so without a gateway the
 registration is inert. Subscriptions never register (egress is produced topics only).
+Local-only processes and opaque `ros2:` children whose run excludes a topic acquire native producer exclusions before creating publishers, subscriptions, services or clients. Excluded publishers do not register egress. The process retains exclusions until its additive endpoint registrations end; a service family exclusion protects requests and every per-client reply. The CLI passes its resolved child scope before spawning ROS processes; `CERULION_NETWORK=off` also applies to a directly launched rmw process.
+
 There is no unregister and nothing to build one on: the channel is an additive
 per-process set republished until the process exits, and a gateway keeps a runtime
 registration until it restarts, so a destroyed publisher's topic stays announced with

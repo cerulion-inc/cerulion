@@ -613,6 +613,10 @@ fn netd_and_vizd_on_one_root(
         root.clone(),
     )
     .expect("init netd manager (reaches G)");
+    netd_mgr
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let vizd_mgr = TransportManager::init_for_test(
         TransportConfig {
             node_name: format!("vizdmgr_{tag}"),
@@ -634,7 +638,7 @@ fn isolated_transport_inner(
     network: Option<NetworkConfig>,
 ) -> Arc<TransportManager> {
     let clock = Arc::new(VirtualClock::new());
-    TransportManager::init_for_test(
+    let manager = TransportManager::init_for_test(
         TransportConfig {
             node_name: node_name.to_string(),
             clock,
@@ -643,7 +647,11 @@ fn isolated_transport_inner(
         },
         cerulion_core::testing::iceoryx_test_config(),
     )
-    .expect("init isolated transport")
+    .expect("init isolated transport");
+    if let Some(network) = manager.network() {
+        network.set_lan_access(cerulion_core::LanAccess::Open);
+    }
+    manager
 }
 
 /// A never-block worker over a fresh in-memory Rerun sink. Returns the worker, a
@@ -3532,6 +3540,7 @@ fn a_remote_topic_re_attaches_right_after_detach_on_both_surfaces_e2e() {
     // A BUILT-IN type, so the catalog resolve needs no fetch — this test is about
     // attach ROUTING, not schema acquisition (which has its own e2e).
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
             schema_name: "geometry_msgs/Vector3".to_string(),
@@ -3735,6 +3744,9 @@ fn boot_serving_gateway(
             root.clone(),
         )
         .expect("init gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         match GatewayRuntime::new_with_schema_serving(g, plan.clone(), serving.clone()) {
             Ok(gateway) => return (p, clock, gateway, port),
             Err(e) => {
@@ -3795,6 +3807,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
     assert_ne!(widget_hash, 0, "the custom type has a real wire hash");
 
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![
             TopicSchema {
                 topic: widget_topic.to_string(),
@@ -4037,6 +4050,7 @@ fn schema_less_resolve_is_served_by_netd_not_vizds_own_network() {
         deps: vec![],
     };
     let serving = SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![
             TopicSchema {
                 topic: widget_topic.to_string(),
@@ -5090,6 +5104,7 @@ fn oracle_catalog(robot: &str, entries: &[(&str, Option<&str>)]) -> cerulion_cor
         entries: entries
             .iter()
             .map(|(topic, schema_name)| CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(7),
                 schema_name: schema_name.map(str::to_string),
@@ -8661,6 +8676,7 @@ fn big_catalog(robot: &str, n: usize) -> cerulion_core::CatalogReply {
         robot: robot.to_string(),
         entries: (0..n)
             .map(|i| CatalogEntry {
+                egress_qos: None,
                 topic: format!(
                     "/discover/big/topic/{i:06}/padding/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb"
                 ),
@@ -12270,6 +12286,7 @@ fn liveness_catalog(
         entries: entries
             .iter()
             .map(|(topic, liveness)| CatalogEntry {
+                egress_qos: None,
                 topic: (*topic).to_string(),
                 schema_hash: Some(7),
                 schema_name: Some("geometry_msgs/Vector3".to_string()),
@@ -13581,6 +13598,7 @@ fn a_live_local_run_is_gathered_from_this_managers_namespace_e2e() {
     let _run = RunHandle::publish_on_config(
         &mgr.iox_config(),
         RunRecord {
+            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_700_000_000_000_000_000,
@@ -13860,6 +13878,7 @@ fn a_robot_scoped_runs_request_asks_only_that_robot_e2e() {
     let _run = RunHandle::publish_on_config(
         &mgr.iox_config(),
         RunRecord {
+            remote_visible: true,
             run_id: 0x00d1,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_700_000_000_000_000_000,

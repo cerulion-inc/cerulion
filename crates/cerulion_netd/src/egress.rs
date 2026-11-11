@@ -71,28 +71,11 @@
 //!   remains on the shared gateway until netd's idle self-exit drops the whole
 //!   session. Any topic announce token declared while LAN access was open also
 //!   lingers until then. Physical retraction is not implemented.
-//! - **Per-client / per-computer egress SCOPING (the AllowAll exposure).** The
-//!   embedded gateway boots PERMISSIVE (`AllowAll`), which installs a permissive SHM
-//!   probe. That probe serves a remote demand-by-name for ANY live local SHM topic
-//!   (except one the shared manager has registered as ingress — the loop exclusion),
-//!   NOT only the topics a plan registered. So a LAN peer can demand a live
-//!   local topic that NO graph pushed an egress plan for. That
-//!   is exactly the permissive-desk default (`graph run` with no
-//!   `network:` block already exposes every produced topic) — but per-graph
-//!   isolation (graph A's demand must not reach graph B's topic) is NOT provided.
-//!   Constraining the embedded gateway to the union of plan-registered topics is
-//!   STRUCTURALLY INFEASIBLE in the current [`GatewayRuntime`] without a multi-part
-//!   core change: (a) an empty-boot `AllowList` gateway starts NO demand surface
-//!   (the gateway's `!egress_flags.is_empty() || permissive` gate), so runtime
-//!   registrations would never become demandable; (b) `register_runtime_topic` adds
-//!   the bridge FLAG + announce but does NOT add the topic to the egress allow-list,
-//!   so a runtime topic under `AllowList` would not egress; and (c) the permissive
-//!   probe (the only path that serves an unregistered live topic) exists only under
-//!   `AllowAll`. Closing this needs a GatewayRuntime boot-gate + probe inclusion-set
-//!   change. The **account-scoped pairing gate** bounds it from the other side (the
-//!   LAN plane trends to existence-beacon-only and topic DATA rides the paired
-//!   identity plane — so a remote demand is account-gated before any topic, scoped or
-//!   not, is served). The exposure is the documented desk default, chosen by design.
+//! - **Producer scope.** The shared gateway's permissive probe can discover a
+//!   live local topic outside its registration set, but mandatory SHM producer
+//!   exclusion refuses a local-only run and a topic omitted by its enabled
+//!   egress block before any remote tap opens. Peer authorization is an additional
+//!   gate; replacing it cannot widen the producing run's policy.
 //! - **The CLI push side** (`graph run` registering its plan, and its per-run
 //!   gateway fallback) lives in `cerulion_cli_engine`, not here.
 
@@ -117,6 +100,11 @@ pub type EgressId = ConnId;
 /// protocol error and rolls the registry's egress accounting back.
 #[derive(Debug)]
 pub enum EgressError {
+    /// The machine could not safely start its owned authenticated server.
+    Server {
+        /// Endpoint transfer or supervisor startup failed before a child started.
+        reason: String,
+    },
     /// The shared embedded gateway could not boot, or a produced topic could not be
     /// pushed onto it — carries the underlying transport cause. Boxed because
     /// `TransportError` is a large enum (clippy `result_large_err`).
@@ -145,6 +133,7 @@ pub enum EgressError {
 impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EgressError::Server { reason } => write!(f, "remote server startup failed: {reason}"),
             EgressError::Gateway { source } => {
                 write!(f, "failed to register the network egress plan: {source}")
             }
@@ -164,6 +153,7 @@ impl std::fmt::Display for EgressError {
 impl std::error::Error for EgressError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            EgressError::Server { .. } => None,
             EgressError::Gateway { source } => Some(source.as_ref()),
             EgressError::NamespaceMismatch { .. } => None,
         }
@@ -176,6 +166,12 @@ impl std::error::Error for EgressError {
 /// on release / disconnect. `Send + Sync`: shared across the daemon's per-connection
 /// threads.
 pub trait EgressPlane: Send + Sync {
+    /// True until the owned remote server has been reaped. The idle watcher must
+    /// retain the daemon singleton through this interval, including last release.
+    fn holds_serving_endpoint(&self) -> bool {
+        false
+    }
+
     /// Read only this plane's accumulated metadata. No gateway boot, network query,
     /// mirror registration or discovery occurs here. A plane without metadata
     /// reports an error instead of a positive empty snapshot.
@@ -628,6 +624,24 @@ impl GatewayEgressPlane {
                 .accumulated_serving
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // A live remote tap can retain the earlier queue policy. Refuse a
+            // conflicting replacement until the shared daemon is restarted.
+            for (index, policy) in serving.egress_qos.iter().enumerate() {
+                if serving.egress_qos[..index]
+                    .iter()
+                    .chain(acc.egress_qos.iter())
+                    .any(|have| have.topic == policy.topic && have != policy)
+                {
+                    return Err(EgressError::Gateway {
+                        source: Box::new(TransportError::InvalidTransportConfig {
+                            reason: format!(
+                                "topic '{}' has a different retained wire queue policy; restart cerulion-netd before changing it",
+                                policy.topic
+                            ),
+                        }),
+                    });
+                }
+            }
             acc.merge_from(serving);
             acc.clone()
         };
@@ -1008,6 +1022,7 @@ mod tests {
     #[test]
     fn hash_for_topic_resolves_from_serving_else_zero() {
         let serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![TopicSchema {
                 topic: "/robot/odom".to_string(),
                 schema_name: "nav_msgs/Odometry".to_string(),

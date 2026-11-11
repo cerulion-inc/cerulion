@@ -24,6 +24,7 @@ use crate::mirror::{GatewayMirrorPlane, MirrorPlane};
 use crate::registry::{DemandRegistry, TopicKey};
 use crate::wan::{WanRegistry, WanRobot};
 
+mod discovery;
 mod operations;
 
 use crate::account_access::{CONTROLLER_BUSY as BUSY, IDENTITY_BUSY};
@@ -62,6 +63,7 @@ enum Route {
 }
 
 struct State {
+    serving_gateway: bool,
     registry: Arc<WanRegistry>,
     plane: Option<IrohMirrorPlane>,
     account_mode: bool,
@@ -71,7 +73,6 @@ struct State {
     pending_all: bool,
     pending_robots: BTreeSet<String>,
     busy_since: Option<Instant>,
-    serving_gateway: bool,
 }
 
 /// Owns at most one outgoing endpoint. This type never exposes its device seed.
@@ -81,6 +82,7 @@ pub struct AccountWanController {
     authorizer: Arc<dyn DemandAuthorizer>,
     config: AccountControllerConfig,
     manual: HashMap<String, WanRobot>,
+    paired: Mutex<HashMap<String, WanRobot>>,
     pins: Mutex<BTreeMap<TopicKey, Route>>,
     state: Mutex<State>,
 }
@@ -113,8 +115,10 @@ impl AccountWanController {
             authorizer,
             config,
             manual: robots,
+            paired: Mutex::new(HashMap::new()),
             pins: Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
+                serving_gateway,
                 registry: Arc::new(manual),
                 plane: None,
                 account_mode: false,
@@ -124,7 +128,6 @@ impl AccountWanController {
                 pending_all: false,
                 pending_robots: BTreeSet::new(),
                 busy_since: None,
-                serving_gateway,
             }),
         })
     }
@@ -149,11 +152,20 @@ impl AccountWanController {
         if let Some(route) = self.pins()?.get(key) {
             return Ok(*route);
         }
-        Ok(if account || self.manual.contains_key(&key.robot) {
-            Route::Wan
-        } else {
-            Route::Lan
-        })
+        Ok(
+            if account
+                || self.manual.contains_key(&key.robot)
+                || self
+                    .paired
+                    .lock()
+                    .map_err(|_| "paired robot state is poisoned")?
+                    .contains_key(&key.robot)
+            {
+                Route::Wan
+            } else {
+                Route::Lan
+            },
+        )
     }
 
     fn network_allowed(&self) -> Result<(), String> {
@@ -229,6 +241,13 @@ impl AccountWanController {
         state: &mut State,
         registry: &mut DemandRegistry,
     ) -> Result<(), String> {
+        if state
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.take_shared_transport_loss())
+        {
+            state.pending_all = true;
+        }
         let keys = self.pending_keys(state)?;
         registry.invalidate_mirrors(&keys).map_err(|_| {
             "previous WAN mirrors are still being retired; retry the operation".to_owned()
@@ -289,6 +308,12 @@ impl AccountWanController {
 
     fn membership(&self, snapshot: &AccountSnapshot) -> Result<HashMap<String, WanRobot>, String> {
         let mut robots = self.manual.clone();
+        robots.extend(
+            self.paired
+                .lock()
+                .map_err(|_| "paired robot state is poisoned")?
+                .clone(),
+        );
         for robot in &snapshot.robots {
             if let Some(key) = robot.endpoint_key {
                 let eid = EndpointId::from_bytes(&key)
@@ -349,7 +374,7 @@ impl AccountWanController {
             let old = state.registry.membership_snapshot()?;
             let changed: BTreeSet<_> = old
                 .iter()
-                .filter(|(name, peer)| robots.get(*name) != Some(*peer))
+                .filter(|(name, peer)| robots.get(*name).is_none_or(|next| next.eid != peer.eid))
                 .map(|(name, _)| name.clone())
                 .collect();
             let keys: BTreeSet<_> = self

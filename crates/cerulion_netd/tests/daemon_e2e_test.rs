@@ -690,6 +690,7 @@ fn one_catalog(robot: &str, topic: &str, schema_name: &str) -> CatalogReply {
         version: 1,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(9),
             schema_name: Some(schema_name.to_string()),

@@ -151,6 +151,7 @@ async fn read(endpoint: &str, port: u16, topic: &str, schema: &str) -> Result<St
     }
 
     let demand = WireRequest::Demand {
+        graph_ingress: false,
         topic: topic.to_string(),
     };
     match exchange(&mut send, &mut recv, demand).await? {

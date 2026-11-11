@@ -21,7 +21,7 @@ and `cerulion_dds`.
 | Recorder | Yes | Yes | App and graph recording use the same recorder. |
 | netd and zenoh TCP gateway | Yes | Yes | Android can listen on a TCP endpoint, and an app can dial a `tcp/` locator. |
 | mDNS discovery | Yes | Yes | Android needs a multicast lock and a LAN-dialable nonzero TCP listen port for its beacon. |
-| LAN access default | Open | Paired | The device identity remains discoverable, but topic announcements are withheld and LAN catalog, schema, and data requests are refused. |
+| LAN access default | Paired | Paired | The device identity remains discoverable, but topic announcements are withheld and LAN catalog, schema, and data requests are refused. |
 | wsd | Yes | Yes | Android control sockets use the abstract namespace. |
 | Node build | Yes | Host only | Build Android node libraries with cargo-ndk on a host. |
 | viz | Yes | No | The visualization daemon requires a desktop. |
@@ -159,12 +159,13 @@ export CERULION_LOGIN_GATE=off
 mkdir -p "$HOME" "$TMPDIR"
 ```
 
-`CERULION_LOGIN_GATE=off` skips only the command-wide sign-in check. Serving
-the network still needs a saved login: a netd started with
-`CERULION_NETD_LISTEN`, a networked `graph run` (and its gateway), `node run`
-and `ros2 attach` refuse until one exists. Run `cerulion login` once in this
-shell, or point `CERULION_HOME` at a directory holding the state of a machine
-that signed in.
+`CERULION_LOGIN_GATE=off` skips only the command-wide sign-in check. An
+account's first serving registration still needs a saved login; run
+`cerulion login` once in this shell, or point `CERULION_HOME` at its existing
+signed-in state. A robot with durable explicit pairing state can serve that
+pairing without a new sign-in. The legacy `CERULION_NETD_LISTEN` configuration
+retains its prior-login gate. Authenticated serving begins with a live export,
+without requiring a zenoh listen setting.
 
 On Android, netd and a `graph run` gateway refuse every LAN peer unless
 `CERULION_LAN_ACCESS=open` is set, the same posture as the app's
@@ -608,7 +609,7 @@ The configuration keys are:
 | `subscribe` | Optional array of `{ "topic", "schema", "depth" }` entries, read with `poll`. Defaults to `[]`. |
 | `lan_access` | `"paired"` (the default) refuses every LAN peer; `"open"` serves any LAN peer, for local development. Any other value is rejected with error code 3. |
 | `egress` | Optional array of canonical topics: the only topics the gateway sends to a LAN peer under `"lan_access": "open"`. `[]` sends none. Without the key, an `open` gateway sends every topic. Each topic must be a graph output or a publish topic. A non-canonical, duplicate or unknown topic, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` nothing is sent either way. See [Choose which topics leave the device](#choose-which-topics-leave-the-device). |
-| `ingress` | Optional array of canonical topics a LAN peer may publish into under `"lan_access": "open"`. Defaults to `[]`. Each topic must be read by a graph input and must be neither a graph output nor a publish topic; each frame must carry the schema hash of the inputs that read it. A non-canonical, duplicate or unread topic, a topic with another writer, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"` no frame gets in. See [Let a LAN peer publish into the graph](#let-a-lan-peer-publish-into-the-graph). |
+| `ingress` | Optional array of canonical topics a LAN peer may publish into under `"lan_access": "open"`. Defaults to `[]`. Each topic must be read by a graph input and must be neither a graph output nor a publish topic; each frame must carry the schema hash of the inputs that read it. A non-canonical, duplicate or unread topic, a topic with another writer, or a value that is not an array of strings (`null` included), is rejected with error code 3. Under `"paired"`, or without listen or connect, a nonempty ingress list fails the start with error code 3. See [Let a LAN peer publish into the graph](#let-a-lan-peer-publish-into-the-graph). |
 | `mdns` | Raise the `_cerulion._tcp` mDNS beacon while the gateway has a LAN-dialable nonzero fixed TCP listen port. Port-zero and loopback endpoints do not raise a beacon, and neither do `connect` locators. Defaults to `true`. Android passes multicast to the app only while it holds a `WifiManager.MulticastLock`, which needs the `android.permission.CHANGE_WIFI_MULTICAST_STATE` permission; see [Discovery and access](#discovery-and-access). |
 | `log_level` | Lowest level of the runtime's and the nodes' `tracing` lines written to logcat: `"error"`, `"warn"`, `"info"` (the default), `"debug"` or `"trace"`. Any other value is rejected with error code 3. See [Logs in logcat](#logs-in-logcat). |
 | `remote` | Optional object `{ "enabled", "relay", "state_dir" }` that hosts the paired remote plane. `enabled` is required. `relay` is `"public"` (the default, for development only), `"disabled"`, or an array of relay URLs. `state_dir` defaults to `"remote"` and is a relative path inside the app files directory, without `.` or `..`. A missing `enabled`, an unknown key, another `relay` value, an empty relay list or a `state_dir` outside the files directory is rejected with error code 3. See [Host the paired remote plane](#host-the-paired-remote-plane). |
@@ -755,8 +756,11 @@ The gateway is not open by default. Under `"lan_access": "paired"` every LAN
 request (topic demand, catalog and schema) is refused, and LAN ingress is
 refused too: no host on the network can publish into the app's topics. The robot identity can
 still appear in discovery, but topic announce tokens are withheld, so the topics
-the app publishes are not named on the LAN; `topic list` warns that the robot refused to serve
-its catalog. The posture stays in front of every installed demand authorizer.
+the app publishes are not named on the LAN. A paired desk reads its catalog
+through the authenticated remote plane the app hosts. The posture stays in front of every installed demand authorizer.
+Embedded apps do not resolve account or saved pairing graph imports. Declared
+paired ingress is refused at startup; use a native CLI graph for authenticated
+imports, or explicitly select open LAN compatibility for the app.
 Choose the posture at runtime startup with the app's `lan_access` key. A start
 keeps access paired while it builds the gateway and opens the configured posture
 only once every component is ready; an `open` start announces its topics at that
@@ -875,11 +879,10 @@ nor a publish topic, because a topic has one writer. A start that breaks one of
 these rules fails with error code 3, or with error code 5 for a schema no input
 declares or the inputs do not agree on, and the error names the topic.
 
-Under `"paired"` the gateway opens no ingress: it subscribes to no `ingress`
-topic on the LAN and demands none, so it refuses every frame a LAN peer
-publishes, and the start logs a warning. A start with `ingress` and an empty
-`listen` and `connect` builds no gateway, so the list has no effect and the
-start logs a warning too.
+A nonempty `ingress` list under `"paired"`, or with empty `listen` and
+`connect`, fails the start with error code 3. This embedded host supports the
+explicit open LAN compatibility path shown above; authenticated graph
+producer discovery is unavailable in the embedded host.
 
 Ingress has no sender identity. Under `open`, any host that reaches the
 gateway can publish into every `ingress` topic, and the app cannot tell one
@@ -906,8 +909,10 @@ cerulion topic list --connect tcp/127.0.0.1:7683
 
 ### Dial a desk
 
-Some networks block multicast or connections into the device, so a desk can
-neither discover the app nor dial it. When the app can still reach the desk,
+The following is the explicit open-LAN compatibility path. The authenticated
+remote plane the app hosts uses paired direct or relayed connectivity instead.
+Some networks block multicast or connections into the device, so the LAN
+ladder can neither discover the app nor dial it. When the app can still reach the desk,
 it can dial the desk instead: list the desk's locator in `connect`. The desk must listen on that locator, for
 example through a desk network daemon started with `CERULION_NETD_LISTEN` (see
 [Making a robot discoverable](networking.md#making-a-robot-discoverable)).

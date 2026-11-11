@@ -2210,6 +2210,10 @@ impl Owing {
 }
 
 impl RcpdEstop {
+    pub(crate) fn is_owing(&self) -> bool {
+        self.owing.running.load(Ordering::Acquire) != 0
+    }
+
     /// A sender to the rcpd of `link`, its attempts bounded by
     /// [`estop_head_bound`] of [`RcpLimits::head_timeout`] and by
     /// [`OPS_ESTOP_ANSWER`], that names each engager's account from `shared`

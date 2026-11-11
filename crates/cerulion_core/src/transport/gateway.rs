@@ -327,6 +327,10 @@ pub struct SchemaServing {
     /// only the current run's topics plus any registered later.
     #[serde(default)]
     pub served_topics: Vec<String>,
+    /// Resolved producer policies for authenticated graph ingress. Missing
+    /// entries are unverified; they do not imply a reliable wire queue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_qos: Vec<super::carrier::EgressQos>,
 }
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
@@ -640,6 +644,15 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
+        for policy in &other.egress_qos {
+            if !self
+                .egress_qos
+                .iter()
+                .any(|have| have.topic == policy.topic)
+            {
+                self.egress_qos.push(policy.clone());
+            }
+        }
         // A non-empty `served_topics` is EXPLICIT: folding another serving's
         // explicit list into an accumulator that only had implicit
         // (topic_schemas-derived) topics would silently drop the
@@ -1006,6 +1019,10 @@ impl GatewayRuntime {
             });
         }
 
+        manager
+            .network()
+            .expect("gateway network checked above")
+            .set_run_scope(Arc::downgrade(&manager));
         // 1. Install the egress posture FIRST (before the watch can flip a flag).
         match &plan.egress_policy {
             GatewayEgressPolicy::AllowAll => manager.bridge_manager().set_egress_allow_all()?,
@@ -1628,13 +1645,13 @@ impl GatewayRuntime {
                     // ~1 kHz drive pass while the observer only re-attaches once
                     // per 200 ms sweep.
                     self.liveness.release_own_tap(topic);
-                    let attached =
-                        self.manager
-                            .create_data_only_subscriber(topic)
-                            .and_then(|tap| {
-                                self.open_egress_lane(topic, flag, tap.buffer_size())?;
-                                Ok(tap)
-                            });
+                    let attached = self
+                        .manager
+                        .create_remote_data_only_subscriber(topic)
+                        .and_then(|tap| {
+                            self.open_egress_lane(topic, flag, tap.buffer_size())?;
+                            Ok(tap)
+                        });
                     match attached {
                         Ok(tap) => {
                             self.record_attach_success(topic);
@@ -3001,6 +3018,7 @@ mod schema_serving_handles_tests {
             deps: vec![],
         };
         let serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![
                 TopicSchema {
                     topic: "chatter".to_string(),
@@ -3183,6 +3201,7 @@ mod hosted_runs_tests {
                 crate::testing::iceoryx_test_config(),
             )
             .expect("init gateway manager");
+            manager.network().unwrap().set_lan_access(LanAccess::Open);
             match GatewayRuntime::new(Arc::clone(&manager), allow_all_plan()) {
                 Ok(gateway) => return (manager, gateway, port),
                 Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
@@ -3219,6 +3238,7 @@ mod hosted_runs_tests {
             crate::testing::iceoryx_test_config(),
         )
         .expect("init gateway manager");
+        manager.network().unwrap().set_lan_access(LanAccess::Open);
         let hosted = manager
             .network()
             .expect("a configured network")

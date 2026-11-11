@@ -78,6 +78,14 @@ access can:
   `cerulion-remoted` dropped (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
+The topic CLI and `viz --robot` also use this plane automatically for account-owned
+and explicitly paired robots. `topic list` shows the robot's reachability and its
+catalog without a manual connect command. Desk observers use private channels
+under `/__cerulion/observers/`, keeping a robot's topic separate from a local topic
+with the same canonical name; wire/2 still names the original topic. Observers of
+one source share a demand, and the last observer releases the channel. Graph
+ingress keeps canonical names and the single-writer contract.
+
 A desk cannot write a topic on the robot or send it teleop commands over
 `cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
 never reads a data stream from the desk. The `teleop` and `deploy` verbs
@@ -93,19 +101,46 @@ act verbs, work on the robot's own shared memory; with `--robot`,
   `service-call` calls a robot service once. Both are refused while the
   robot's e-stop is engaged, and one already running stops when it engages.
   They check the e-stop, not the control lease, so the deadman does not cover
-  them. `topic-publish` refuses a topic under the reserved `/__cerulion`
-  namespace.
+  them.
 - With observe access, `topic-snapshot` reads the newest frame of a camera
   topic as a JPEG and `topic-echo-once` reads the newest message of a topic,
   decoded.
+
+Every act verb refuses a network mirror and topics under the reserved
+`/__cerulion` namespace. A live mirror is read on its source robot; other
+reserved topics produce a usage error. Producer exclusions name the refused
+topic and preserve its remote-access policy context.
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
 `cerulion rcp` is refused the same way.
 
-The only other desk to robot topic path today is LAN ingress (an `ingress:`
-block in a graph), which proves no identity per peer and is closed when
-`CERULION_LAN_ACCESS=paired`.
+A graph with declared `ingress:` can pull an exported topic from a unique
+same-account or explicitly paired producer over the authenticated remote plane.
+The receiving graph checks the declared topic, schema, QoS and single-writer
+rules. Declared imports require a native service provisioned for one publisher;
+a multi-publisher service is refused even with only one live writer. The
+producer serves its stream; the consumer does not send arbitrary data
+frames to the producer. A machine can serve and consume through the same owned
+endpoint. This is distinct from the ops `topic-publish` verb and its capability
+and e-stop checks.
+
+Each robot exports its own local producers. Imported graph topics and private
+observer channels keep their source robot's access policy: read them on that
+source robot. Schema reads without topic data use current producer metadata
+without opening a data reader; privacy and authorization are checked again
+after the metadata source returns. A refused outbound demand or an unavailable
+robot during metadata discovery preserves the machine's other active readers. Failed membership
+cleanup fences the outbound connection and reports transport loss. Ops snapshot, one-shot
+echo, publish and service calls enforce the same source restriction. Outbound
+readers retain the owned server against idle shutdown; new admission returns a retryable
+refusal while shutdown is already committed. Account ownership proofs survive
+the switch between consuming and serving. Reader restoration shares one bounded
+budget; unresolved readers receive a named loss notice and can reconnect.
+
+The zenoh LAN ingress compatibility path proves no identity per peer and is
+closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires
+explicit `CERULION_LAN_ACCESS=open` and warns at startup. Authenticated discovery is described in [networking](networking.md#making-a-robot-discoverable).
 
 ## The deadman: a quiet operator loses the lease
 
@@ -230,3 +265,17 @@ pairing on the LAN.
   access back.
 - [`docs/networking.md`](networking.md): the LAN plane, discovery and what a run
   exposes by default.
+
+## Graph ingress queue policy
+
+A graph producer declares its reliable queue policy with its served topic
+metadata. Wire forwarding sizes that queue to `send_queue`, or the actual tap
+depth when omitted. At capacity it refuses the new frame, retains queued
+frames in order, and exposes `wan_refused` separately from `wan_dropped`.
+A source without policy metadata is unverified for graph ingress.
+Best-effort datagram graph ingress is refused on this wire path.
+Changing a retained topic's queue policy requires restarting `cerulion-netd`.
+
+Observer reads use their existing bounded best-effort queue, including exports
+with BestEffort policy and multiple publishers. The reliable-policy and
+single-writer refusals apply to canonical graph imports.

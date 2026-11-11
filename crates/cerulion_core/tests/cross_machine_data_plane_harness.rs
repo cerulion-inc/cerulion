@@ -138,6 +138,9 @@ fn run_robot(topic: &str, secs: u64) {
         root.clone(),
     )
     .expect("init G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
 
     let mut publisher = p
         .create_publisher_simple(topic, MaxSliceLen::const_new(256))
@@ -220,6 +223,9 @@ fn run_desk(topic: &str, secs: u64) {
         )
         .expect("init desk"),
     );
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
 
     let sub = b.create_subscriber(topic).expect("desk subscriber");
     // HARNESS_HASH (hex, e.g. 0x697ef87e3ead41a1) = the topic's REAL wire

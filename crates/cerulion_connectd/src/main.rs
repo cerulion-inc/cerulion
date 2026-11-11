@@ -1018,6 +1018,7 @@ mod tests {
     #[test]
     fn catalog_lines_neuter_and_bound_every_peer_string() {
         let entry = |topic: &str| CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(0xdead_beef),
             schema_name: None,

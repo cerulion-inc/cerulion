@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The iroh WAN [`IrohMirrorPlane`] / [`DualMirrorPlane`] end-to-end
-//! over REAL loopback iroh endpoints + REAL iceoryx2 (DISTINCT per-test SHM roots for
-//! the robot and the desk — parallel-safe, no `#[serial]`).
+//! over real loopback iroh and iceoryx2 with distinct robot and desk SHM roots.
+//! CLI fixtures share the global manager; run with `-- --test-threads=1`.
 //!
 //! The headline: an in-process ROBOT (`cerulion_remoted::WirePlane` +
 //! `PairingAuthorizer` over SHM root A, a real producer publishing hand-oracle
@@ -19,7 +19,7 @@
 //! Whole file `#![cfg(feature = "wan")]`. `wan` is DEFAULT-ON, so `cargo test -p
 //! cerulion_netd` already compiles this file; `--no-default-features` compiles it to
 //! nothing. Run it explicitly with
-//! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test`.
+//! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- --test-threads=1`.
 #![cfg(feature = "wan")]
 
 use std::collections::HashMap;
@@ -47,9 +47,7 @@ use cerulion_netd::{DualMirrorPlane, IrohMirrorPlane, Plane, WanRegistry, WanRob
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
-use cerulion_remoted::{
-    handle_accepted_with_wire, DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane,
-};
+use cerulion_remoted::{DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane};
 use cerulion_wireclient::protocol::{StreamPreamble, WireRequest, WireResponse};
 
 const T_NOW: u64 = 1_000_000_000_000;
@@ -248,10 +246,9 @@ fn expired_grant_authorizer(device: [u8; 32]) -> PairingAuthorizer {
 /// Serve wire connections in a LOOP until aborted — so a demand→release (which drops
 /// the connection) can be followed by a re-demand (a fresh dial the loop accepts).
 async fn robot_serve_loop(daemon: Endpoint, authz: Arc<PairingAuthorizer>, plane: Arc<WirePlane>) {
-    // A non-`Ok(Some(..))` (Err / Ok(None)) ends the loop — the desk went away.
-    while let Ok(Some(accepted)) = accept_one(&daemon).await {
-        handle_accepted_with_wire(accepted, authz.clone(), None, Some(plane.clone())).await;
-    }
+    cerulion_remoted::serve_with_wire(&daemon, authz, None, Some(plane), std::future::pending())
+        .await
+        .expect("robot wire accept loop");
 }
 
 /// A live in-process robot: its own tokio runtime + iroh endpoint + a WirePlane over
@@ -270,17 +267,62 @@ struct RobotFixture {
 
 impl RobotFixture {
     fn start(tag: &str, authz: Arc<PairingAuthorizer>) -> Self {
+        Self::start_with_schema(tag, authz, None)
+    }
+
+    fn start_with_schema(
+        tag: &str,
+        authz: Arc<PairingAuthorizer>,
+        schema: Option<(String, cerulion_core::SchemaDoc)>,
+    ) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("robot runtime");
         let manager = test_manager(&format!("robot_{tag}"));
-        let plane = Arc::new(WirePlane::with_manager(
-            format!("robot-{tag}"),
-            manager.clone(),
-        ));
+        let mut plane = WirePlane::with_manager(format!("robot-{tag}"), manager.clone());
+        if let Some((topic, doc)) = schema {
+            let serving = cerulion_core::SchemaServing {
+                egress_qos: Vec::new(),
+                topic_schemas: vec![cerulion_core::TopicSchema {
+                    topic: topic.clone(),
+                    schema_name: doc.qualified.clone(),
+                }],
+                schema_docs: vec![doc],
+                schema_hashes: Vec::new(),
+                served_topics: vec![topic],
+            };
+            plane = plane.with_in_process_schema_provider(Arc::new(move || serving.clone()));
+        }
+        let plane = Arc::new(plane);
         let daemon = rt.block_on(disabled_endpoint(unique_secret()));
         let eid = daemon.id();
         let addrs = loopback_sockets(&daemon.bound_sockets());
         let endpoint = daemon.clone();
         let serve = rt.spawn(robot_serve_loop(daemon, authz, plane));
+        Self {
+            rt,
+            endpoint,
+            eid,
+            addrs,
+            manager,
+            _serve: serve,
+        }
+    }
+
+    fn start_graph(
+        tag: &str,
+        authz: Arc<PairingAuthorizer>,
+        manager: Arc<TransportManager>,
+        serving: cerulion_core::SchemaServing,
+        secret: [u8; 32],
+    ) -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("robot runtime");
+        let plane = Arc::new(
+            WirePlane::with_manager(format!("robot-{tag}"), manager.clone())
+                .with_in_process_schema_provider(Arc::new(move || serving.clone())),
+        );
+        let endpoint = rt.block_on(disabled_endpoint(secret));
+        let eid = endpoint.id();
+        let addrs = loopback_sockets(&endpoint.bound_sockets());
+        let serve = rt.spawn(robot_serve_loop(endpoint.clone(), authz, plane));
         Self {
             rt,
             endpoint,
@@ -513,6 +555,9 @@ fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         .expect("iroh plane")
         .with_dial_timeout(DIAL_TIMEOUT);
     let key = TopicKey::new("ubuntu", &topic);
+    assert!(plane
+        .local_channel(&TopicKey::observed("ubuntu", &topic))
+        .starts_with("/__cerulion/observers/"));
 
     plane
         .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
@@ -555,12 +600,15 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
     ));
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("outbound.sock");
-    let service = cerulion_netd::shared_endpoint::OutboundServer::start(
+    let fence = cerulion_netd::serving_hold::fence_path(directory.path());
+    let holds = cerulion_netd::serving_hold::ServingHolds::open(&fence).unwrap();
+    let service = cerulion_netd::shared_endpoint::OutboundServer::start_with_holds(
         socket.clone(),
         endpoint.clone(),
         rt.handle().clone(),
         seed,
         manager.clone(),
+        holds.clone(),
     )
     .unwrap();
     let wrong_identity = IrohMirrorPlane::new_shared(
@@ -646,19 +694,90 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
     observer
         .ensure_mirror(&served_key, ORACLE_SCHEMA_HASH)
         .unwrap();
+    let observed_key = TopicKey::observed("producer", &topic);
+    let (_, path, direct) = plane
+        .query_catalog_with_path("producer", Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(path, cerulion_netd::account_access::RobotPath::Direct);
+    assert!(remote
+        .addrs
+        .contains(&direct.expect("selected loopback path")));
+    let idle = cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+        .unwrap()
+        .expect("metadata connections hold no outbound readers");
+    let refusal = plane
+        .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("stopping; retry outbound demand"),
+        "{refusal}"
+    );
+    assert!(!plane.has_reader(&key).unwrap());
+    drop(idle);
     for _ in 0..2 {
         plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
+        plane
+            .ensure_mirror(&observed_key, ORACLE_SCHEMA_HASH)
+            .unwrap();
+        assert_ne!(plane.local_channel(&observed_key), topic);
+        assert!(cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+            .unwrap()
+            .is_none());
+        let catalog = observer
+            .query_catalog("serving-consumer", Duration::from_secs(3))
+            .unwrap();
+        for hidden in [&topic, &observed_key.local_topic()] {
+            assert!(!catalog.entries.iter().any(|entry| &entry.topic == hidden));
+            let leaked = TopicKey::new("serving-consumer", hidden);
+            let refusal = observer
+                .ensure_mirror(&leaked, ORACLE_SCHEMA_HASH)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refusal.contains(&format!(
+                    "'{hidden}' is a network mirror of another robot; read it on its source robot"
+                )),
+                "{refusal}"
+            );
+            assert!(observer
+                .query_schema("serving-consumer", hidden, Duration::from_secs(3))
+                .unwrap_err()
+                .contains("network mirror of another robot"));
+        }
         assert_oracle_and_gap_free(&collect_frames(&manager, &topic, 3));
+        assert_oracle_and_gap_free(&collect_frames(&manager, &observed_key.local_topic(), 3));
+        assert_eq!(plane.release_mirror(&observed_key), MirrorRelease::Retired);
+        assert!(plane.has_reader(&key).unwrap());
+        assert!(!plane.has_reader(&observed_key).unwrap());
         assert_eq!(plane.release_mirror(&key), MirrorRelease::Retired);
+        assert!(cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+            .unwrap()
+            .is_some());
         assert_oracle_and_gap_free(&collect_frames(&observer_manager, &served_topic, 3));
     }
+    plane
+        .ensure_mirror(&observed_key, ORACLE_SCHEMA_HASH)
+        .unwrap();
+    let retired = plane.update_membership(HashMap::new()).unwrap();
+    assert_eq!(retired, vec![observed_key.clone()]);
+    plane
+        .update_membership(HashMap::from([(
+            "producer".into(),
+            WanRobot {
+                eid: remote.eid,
+                direct_addrs: remote.addrs.clone(),
+            },
+        )]))
+        .unwrap();
     drop(service);
-    let service = cerulion_netd::shared_endpoint::OutboundServer::start(
+    let service = cerulion_netd::shared_endpoint::OutboundServer::start_with_holds(
         directory.path().join("outbound.sock"),
         endpoint.clone(),
         rt.handle().clone(),
         seed,
         manager.clone(),
+        holds,
     )
     .unwrap();
     assert!(
@@ -690,10 +809,12 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
         .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
         .expect("dropping a shared mirror synchronously frees its writer slot");
     drop(freed);
+    // Release while the producer is live; its shutdown can naturally end the stream.
+    assert!(observer.has_reader(&served_key).unwrap());
+    assert_eq!(observer.release_mirror(&served_key), MirrorRelease::Retired);
     stop.store(true, Ordering::Relaxed);
     producer.join().unwrap();
     served_producer.join().unwrap();
-    assert_eq!(observer.release_mirror(&served_key), MirrorRelease::Retired);
     drop(service);
     serve.abort();
     rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), endpoint.close()).await })
@@ -890,6 +1011,13 @@ fn dual_plane_routes_wan_robot_to_iroh_and_delivers() {
         .with_dial_timeout(DIAL_TIMEOUT);
     let zenoh = GatewayMirrorPlane::new(manager_b.clone());
     let dual = DualMirrorPlane::new(zenoh, iroh, Arc::clone(&registry));
+    assert!(dual
+        .local_channel(&TopicKey::observed("ubuntu", &topic))
+        .starts_with("/__cerulion/observers/"));
+    assert_eq!(
+        dual.local_channel(&TopicKey::observed("not-configured", &topic)),
+        topic
+    );
 
     // The routing decision (the picker through the DualMirrorPlane surface).
     assert_eq!(
@@ -1287,6 +1415,7 @@ async fn recording_robot_recording_epochs(
                 entries: catalog_topics
                     .iter()
                     .map(|(t, h)| CatalogEntry {
+                        egress_qos: None,
                         topic: t.clone(),
                         schema_hash: Some(*h),
                         schema_name: None,
@@ -1297,7 +1426,7 @@ async fn recording_robot_recording_epochs(
                     .collect(),
                 error: None,
             }),
-            WireRequest::Demand { topic } => {
+            WireRequest::Demand { topic, .. } => {
                 if let Ok(mut ustream) = open_uni_frame_stream(&conn).await {
                     let preamble = serde_json::to_vec(&StreamPreamble {
                         topic: topic.clone(),
@@ -2310,3 +2439,19 @@ mod poison_retirement;
 
 #[path = "wan_plane_iroh_test/serving_plane.rs"]
 mod serving_plane;
+
+#[path = "wan_plane_iroh_test/automatic_cli.rs"]
+mod automatic_cli;
+
+#[path = "wan_plane_iroh_test/authenticated_graph.rs"]
+mod authenticated_graph;
+
+#[cfg(unix)]
+#[path = "wan_plane_iroh_test/authenticated_supervisor.rs"]
+mod authenticated_supervisor;
+
+#[path = "wan_plane_iroh_test/shared_endpoint_regressions.rs"]
+mod shared_endpoint_regressions;
+
+#[path = "wan_plane_iroh_test/shared_endpoint_membership.rs"]
+mod shared_endpoint_membership;

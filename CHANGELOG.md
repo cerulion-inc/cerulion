@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Changed
+- Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
+- Declared authenticated imports require native single-writer provisioning; a multi-publisher service with one live writer remains readable by observers.
+- Authenticated shared-endpoint control preserves signed account ownership proofs and bounds each reader restoration by one total deadline.
+- Ops act verbs refuse imported topics and keep reserved-topic usage errors. Membership validation refusals preserve live readers; failed cleanup and identity fences report transport loss.
+- Shared outbound readers survive refused operations and metadata discovery failures, retain the server against idle shutdown, and keep imported topics bound to their source robot's access policy.
 
+- LAN topic access defaults to paired on every platform. Unpaired LAN peers
+  cannot demand topics or publish into graph ingress through the zenoh plane.
+  Paired desks use the authenticated remote plane. Explicit
+  `CERULION_LAN_ACCESS=open` remains available for development and warns at startup.
+- Networking guides and the Go2 graph pair describe automatic account and saved
+  pairing discovery, authenticated declared imports, shared serving and consuming,
+  and explicit open-LAN compatibility without requiring addresses for paired access.
+
+### Fixed
+- Remote schema reads accept producer registrations made after a reader connects, without creating temporary privacy services for topics that have no data. Privacy changes while metadata is pending still refuse the response.
+- Local-only graph and node runs exclude their topics, schemas and run metadata from every remote serving plane, including an already running open gateway. An enabled `network:` block's egress list is enforced for that producing run by other daemons too.
+- Network-enabled runs start the authenticated remote server on their first egress registration without requiring `CERULION_NETD_LISTEN`. Query-only desks and local-only runs start no server; the last serving registration's release or disconnect reaps it after active work, owed e-stop delivery and its latch clear. Saved robot pairings and expired saved logins preserve offline serving. Owned remote servers receive SIGTERM and a bounded graceful cleanup window before forced reap.
+- Topic discovery lists account-owned and explicitly paired robots anywhere, with direct or relayed reachability and visible offline status. Topic reads and remote visualization demand authenticated wire/2 streams automatically, keep identical local and remote names separate, and release streams when their observers exit. `topic echo`, `hz`, and `info` accept `--robot NAME` and refuse ambiguous names with exit 2.
 - A machine serving authenticated remote topics can also consume topics through
   the same device endpoint. Outbound mirror release preserves incoming serving.
 
@@ -216,7 +234,7 @@ Semantic Versioning covers the graph YAML format, the `cerulion` command line an
   program with a hard real time budget should know it is there. The cause is
   eclipse-iceoryx/iceoryx2 issue 2035 and this note goes away when it is fixed.
 - An app that embeds `cerulion_android` copies the iceoryx2 `[patch.crates-io]` block of Cerulion's root `Cargo.toml` into its runtime crate's `Cargo.toml`, also when it depends on the crate from crates.io: a patch applies only in the workspace that declares it, and a published crate carries none. `cerulion_android_remote`, the crate that hosts the paired remote plane in an app, is not published to crates.io, so an app that hosts the plane takes it and `cerulion_android` from git at one commit. See `docs/android.md`, `Graph nodes in an app`.
-- LAN sessions do not authenticate peers. The default `tcp/` carrier is not encrypted either; `quic/` and `tls/` locators encrypt the link, but the listener does not check who connects. On Linux and macOS a run with no `network:` block is viewable by any peer on the LAN, and any LAN peer can publish into the topics a `network:` block lists under `ingress:` and into any remote topic this machine mirrors for a reader such as `cerulion topic echo`. A run's `network:` block, `--network off` and `CERULION_LAN_ACCESS=paired` act only on that run's own gateway. While `cerulion-netd` on the same machine serves the LAN with open access, a LAN peer that names a live topic of any local run is sent it, including a topic of a `--network off` run and one a `network:` block leaves out of `egress:`. An open `cerulion-netd` serves the LAN from its start when `CERULION_NETD_LISTEN` is set, and otherwise from the first run with no `network:` block or the first `cerulion topic pub` on a `/` topic until `cerulion-netd` exits, which can be long after that command ends. To refuse every LAN peer on a machine, reads and publishes alike, set `CERULION_LAN_ACCESS=paired` in the environment of every Cerulion command and daemon on it. `cerulion-netd` reads it once, at start, from the environment of the command that started it, so restart a `cerulion-netd` that is already running. Android apps default to `paired`. See `docs/networking.md`.
+- An explicitly open LAN session does not authenticate peers. The `tcp/` carrier is not encrypted; `quic/` and `tls/` encrypt the link without authenticating its peer. A local-only run (`--local`, `--network off` or `CERULION_NETWORK=off`) cannot be served by another daemon on the machine, and a run's enabled `network:` block limits every serving plane to its declared `egress:` topics. Local readers and recording still work. Upgrade every Cerulion daemon on a machine together and restart running daemons. See `docs/networking.md`.
 - The remote e-stop (`engage-estop`) does not stop motion by itself, and a restart of `cerulion-remoted` clears its engaged state. The e-stop does not gate LAN ingress either: while it is engaged and LAN access is open, a LAN peer can still publish into a graph's `ingress:` topics and into any topic this machine mirrors. A robot needs its own stop path, such as a hardwired e-stop. See `docs/remote_plane.md`.
 
 ## [1.0.0] - 2026-09-21

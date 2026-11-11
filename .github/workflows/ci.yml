@@ -3139,12 +3139,14 @@ jobs:
       # explicitly, redundant-but-harmless). netd is excluded from default-members, so
       # the default-feature test steps above never build it — this step is its coverage.
       # Runs the netd lib/bin unit tests + the daemon/mirror/client integration tests +
-      # the loopback-iroh WAN-plane e2e (real iceoryx2 + loopback iroh, per-test SHM
-      # roots + per-test iroh identities ⇒ parallel-safe).
+      # the loopback-iroh WAN-plane e2e. CLI fixtures share the process-global
+      # manager, so this package runs one test at a time.
       # doc-pin: cerulion_netd::networking_doc_banner_test reads docs
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
-        run: cargo test -p cerulion_netd --features wan
+        run: |
+          cargo build -p cerulion_cli -p test_node_macro_data_trigger_cdylib
+          cargo test -p cerulion_netd --features wan -- --test-threads=1
       # The SKIP BRANCH of the gate above. A skipped step prints nothing of
       # its own, so the one line that says what the selection dropped lives
       # here, beside it, under the exact negation of its condition.
@@ -3997,7 +3999,9 @@ jobs:
       # so it gates on both runners.
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
-        run: cargo test -p cerulion_netd --features wan
+        run: |
+          cargo build -p cerulion_cli -p test_node_macro_data_trigger_cdylib
+          cargo test -p cerulion_netd --features wan -- --test-threads=1
       - name: selection marker, cerulion_netd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
         env:

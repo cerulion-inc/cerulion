@@ -192,15 +192,46 @@ pub(crate) async fn serve_core(
     // in flight ends when the planes stop.
     let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
     let rcpd_estop = ops_host.rcpd_estop();
-    let ops = Arc::new(OpsServing::for_host(
-        ops_host,
-        shared,
-        sessions,
-        access_clock.clone(),
-        &files.receipt_file,
-        files.log_root.clone(),
-        server_name,
-    )?);
+    let serving_holds = if server_name == DAEMON_SERVER_NAME {
+        let root = files
+            .beacon_facts_file
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| RemotedError::Config("remote state has no parent directory".into()))?;
+        let path = crate::serving_hold::fence_path(root);
+        let holds = crate::serving_hold::ServingHolds::open(&path)
+            .map_err(|error| RemotedError::Ops(format!("opening remote serving hold: {error}")))?;
+        {
+            let lease = estop_lease.clone().ok_or_else(|| {
+                RemotedError::Config("owned daemon is missing its e-stop idle hold source".into())
+            })?;
+            holds
+                .register_source(Arc::new(move || lease.holds()))
+                .map_err(|error| RemotedError::Ops(format!("registering e-stop hold: {error}")))?;
+        }
+        if let Some(rcpd) = rcpd_estop.clone() {
+            holds
+                .register_source(Arc::new(move || rcpd.is_owing()))
+                .map_err(|error| {
+                    RemotedError::Ops(format!("registering owed delivery hold: {error}"))
+                })?;
+        }
+        Some(holds)
+    } else {
+        None
+    };
+    let ops = Arc::new(
+        OpsServing::for_host(
+            ops_host,
+            shared,
+            sessions,
+            access_clock.clone(),
+            &files.receipt_file,
+            files.log_root.clone(),
+            server_name,
+        )?
+        .with_serving_holds(serving_holds),
+    );
 
     // Install the SAME `PairingAuthorizer` as the wire plane's per-demand
     // authorization gate (this line is the wiring a daemon-level test pins). The serving
@@ -396,15 +427,58 @@ pub async fn serve_planes(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     let mut shutdown = Box::pin(shutdown);
+    let holds = ops.as_ref().and_then(|ops| ops.serving_holds()).cloned();
+    let mut refresh = tokio::time::interval(Duration::from_millis(100));
+    let mut refresh_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut admission_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    // accept_one owns an Incoming while its handshake completes. A refresh tick
+    // must not cancel it and close an otherwise valid new ops/wire connection.
+    let mut accepting = Box::pin(accept_one(endpoint));
     let closed_on_its_own = loop {
         tokio::select! {
             _ = &mut shutdown => break false,
-            accepted = accept_one(endpoint) => {
+            _ = refresh.tick() => {
+                if let Some(holds) = &holds {
+                    match holds.refresh() {
+                        Ok(()) => if let Some(suppressed) = refresh_failures.on_success() { tracing::info!(suppressed, "remote serving hold refresh recovered"); },
+                        Err(error) => {
+                            use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                            match refresh_failures.on_failure() {
+                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::error!(error = %error, total_failures = refresh_failures.total_failures(), "remote serving hold refresh failed"),
+                                RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = refresh_failures.total_failures(), "remote serving hold refresh failed"),
+                            }
+                        }
+                    }
+                }
+            },
+            accepted = &mut accepting => {
+                accepting.set(accept_one(endpoint));
                 match accepted {
                     // The endpoint's accept stream ended → the daemon is closing.
                     // This is the ONLY per-accept signal that terminates the loop.
                     Ok(None) => break true,
                     Ok(Some(a)) => {
+                        let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
+                            match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
+                                Ok(hold) => {
+                                    if let Some(suppressed) = admission_failures.on_success() {
+                                        tracing::info!(suppressed, "remote serving admission recovered");
+                                    }
+                                    hold
+                                },
+                                Err(error) => {
+                                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                                    match admission_failures.on_failure() {
+                                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
+                                        RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
+                                    }
+                                    a.connection.close(0u32.into(), b"remote server is stopping");
+                                    continue;
+                                }
+                            }
+                        } else { None };
                         if let Some(pull) = &pull {
                             pull.note_accept(a.remote_id.as_bytes());
                         }
@@ -413,6 +487,7 @@ pub async fn serve_planes(
                         let wire = wire.clone();
                         let rcp = rcp.clone();
                         tokio::spawn(async move {
+                            let _hold = hold;
                             handle_accepted_planes(a, classify, ops, wire, rcp).await;
                         });
                     }
@@ -440,6 +515,7 @@ pub async fn serve_planes(
     // learns the accept loop stopped even when a log write blocks; the binary
     // arms its hard-exit deadline then.
     drop(shutdown);
+    drop(accepting);
     if closed_on_its_own {
         tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
     } else {

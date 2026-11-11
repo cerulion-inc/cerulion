@@ -1,17 +1,15 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-Robot plane: ONE iroh endpoint, device public key = `EndpointId`, same secret
-for pairing; multiplexes wire/2 and ops/1. This guide also covers pairing, link,
-wireclient, connectd, cerud, accountd and cerulion-wire.
+One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
-- Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
-  to capability table in `authorizer.rs` is the sacred security surface. An
-  unclassified verb is DENIED (`authorizer_matrix_test.rs` pins every cell).
-- Bootstrap verbs self-gate on their own proof (chassis secret, cert chain, owner
-  grant, CPace witness). The pairing subject is ALWAYS the TLS-authenticated device
-  key, never a client arg, and validity, TTL and rollback checks use the robot's
-  `RemotedClock`.
+- Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
+- Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
+  final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
+  fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
+- `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
+  verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
+- Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes exactly ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
   key, owner, chain, scope, clocks and revocation, preserve the owner row, persist
@@ -23,35 +21,31 @@ wireclient, connectd, cerud, accountd and cerulion-wire.
   concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
-- `cerulion_pairing`'s canonical signing bytes are pinned by INDEPENDENT
-  hand-serializer vectors (`format_vectors_test.rs`): a format change updates encoder
-  AND oracle. A store-format bump migrates or refuses old files loudly (v3 -> v4
-  migrates); epoch apply is monotonic wholesale-replace.
+- Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
-- Peer text is sanitized and bounded where it ENTERS an error or log (`sanitize_peer_text`).
+- Sanitize/bound peer text at entry (`sanitize_peer_text`).
 - Desk key files are exactly 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
-- Metadata reads the EXISTING netd snapshot (namespace checked; never starts netd)
-  or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
-  CAP_OBSERVE after async provider work (`local_schema_provider_test`).
-- Same-user outbound control reuses the endpoint, runtime and transport node.
-  Refuse key/namespace mismatch before dialing; retire outbound sessions only.
+- Metadata: namespace-checked netd snapshots or in-process `SchemaSource`; no startup.
+  Recheck CAP_OBSERVE/privacy after awaits. Schema-only reads use no leases.
+- Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
+- Outbound shares endpoint/runtime/node; key/namespace gate before dial. Refusals
+  keep readers; cleanup failure fences. Retire only outbound.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
-- The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
-  e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
-- remoted, connectd, wireclient, link and accountd are OUT of default members;
-  use `-p`. remoted/link cold-compile the iroh tree.
+- Family tests parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
+  e2e: loopback iroh only, relay off, direct dial, bounded awaits.
+- remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p` (not default-members).
 
-Deep reference: docs/internals/remote-access.md, before touching the verb table,
-trust persistence, the wire plane, pairing formats or epoch delivery.
+Read docs/internals/remote-access.md before verb table, trust persistence, wire,
+pairing formats or epoch changes.

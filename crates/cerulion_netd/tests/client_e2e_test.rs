@@ -1755,6 +1755,7 @@ fn client_query_catalog_and_schema_round_trip_against_a_real_daemon() {
         version: 1,
         robot: "ubuntu".to_string(),
         entries: vec![CatalogEntry {
+            egress_qos: None,
             topic: "/tf".to_string(),
             schema_hash: Some(7),
             schema_name: Some("tf2_msgs/TFMessage".to_string()),

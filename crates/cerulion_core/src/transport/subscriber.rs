@@ -885,6 +885,10 @@ pub struct DataOnlySubscriber {
     /// `dead_code = deny` satisfied without an `allow`.
     #[cfg(any(test, feature = "test-helpers"))]
     fault_inject_receive_after: Option<u32>,
+    // After the data port: a remote tap retains policy through port teardown.
+    remote_lease: Option<super::egress_scope::RemoteTopicLease>,
+    // Export taps retain local source identity until their data port drops.
+    local_lease: Option<super::mirror_origin::LocalObservationLease>,
 }
 
 impl DataOnlySubscriber {
@@ -908,9 +912,19 @@ impl DataOnlySubscriber {
             subscriber,
             max_borrowed_samples,
             data_service,
+            remote_lease: None,
+            local_lease: None,
             #[cfg(any(test, feature = "test-helpers"))]
             fault_inject_receive_after: None,
         }
+    }
+
+    pub(crate) fn hold_remote_lease(&mut self, lease: super::egress_scope::RemoteTopicLease) {
+        self.remote_lease = Some(lease);
+    }
+
+    pub(crate) fn hold_local_lease(&mut self, lease: super::mirror_origin::LocalObservationLease) {
+        self.local_lease = Some(lease);
     }
 
     /// The receive-queue depth this tap was ACTUALLY created
@@ -992,6 +1006,17 @@ impl DataOnlySubscriber {
     pub fn publisher_count(&self) -> u32 {
         use iceoryx2::prelude::PortFactory as _;
         self.data_service.dynamic_config().number_of_publishers() as u32
+    }
+
+    /// The native service's publisher capacity, fixed when the service is created.
+    ///
+    /// Principle #4: a declared graph import requires capacity one so a second
+    /// writer cannot join after admission. A live count of one does not establish
+    /// that invariant on a multi-publisher service. This static read allocates no
+    /// memory and opens no additional port.
+    pub fn max_publishers(&self) -> usize {
+        use iceoryx2::prelude::PortFactory as _;
+        self.data_service.static_config().max_publishers()
     }
 
     /// Returns the topic name.

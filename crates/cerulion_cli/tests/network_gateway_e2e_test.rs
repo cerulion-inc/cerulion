@@ -346,6 +346,7 @@ fn spawn_graph_run(
         .args(extra)
         .current_dir(root)
         .env("CERULION_HOME", &login_home)
+        .env("CERULION_LAN_ACCESS", "open")
         .env_remove("CERULION_LOGIN_GATE")
         .env_remove("CERULION_NETWORK")
         .env_remove("CARGO_TARGET_DIR")
@@ -1031,4 +1032,177 @@ fn tcp_idle_warning_does_not_fire_for_a_gateway_without_a_tcp_locator() {
         !out.contains(TCP_SLOW_START_AFTER_IDLE_WARNING),
         "a gateway with no tcp/ locator must not warn\ncombined:\n{out}"
     );
+}
+
+/// The real CLI producer and an independent open gateway share SHM; the peer
+/// has its own namespace and names the topic without a CLI registration.
+#[test]
+#[serial]
+fn local_run_switches_and_omitted_egress_refuse_an_independent_lan_peer() {
+    for (tag, env_off, flags, strict) in [
+        ("offflag", false, vec!["--network", "off"], false),
+        ("localflag", false, vec!["--local"], false),
+        ("offenv", true, vec![], false),
+        ("strictempty", false, vec![], true),
+    ] {
+        cli_producer_scope_arm(tag, env_off, &flags, strict, false);
+    }
+    cli_producer_scope_arm("strictallowed", false, &[], true, true);
+}
+
+fn cli_producer_scope_arm(tag: &str, env_off: bool, flags: &[&str], strict: bool, allowed: bool) {
+    use cerulion_core::message::ShmMessage;
+    use cerulion_core::{
+        GatewayEgressPolicy, GatewayIngressEntry, GatewayRuntime, NetworkConfig, TransportConfig,
+        TransportManager,
+    };
+    use native_ros2_messages::geometry_msgs::Vector3;
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = format!("egress_scope_{tag}_{}", std::process::id());
+    let topic = format!("/{prefix}/ticker/cmd");
+    let block = if strict {
+        format!(
+            "network:\n  enabled: true\n  egress: [{}]\n",
+            if allowed { topic.as_str() } else { "" }
+        )
+    } else {
+        String::new()
+    };
+    build_single_producer_workspace(tmp.path(), &prefix, tag, &block);
+    let namespace = cerulion_core::testing::iceoryx_test_config();
+    std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+    std::fs::write(
+        tmp.path().join("config/iceoryx2.toml"),
+        toml::to_string(&namespace).unwrap(),
+    )
+    .unwrap();
+    let port = probe_ephemeral_port();
+    let server = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("scope_server_{tag}"),
+            network: Some(NetworkConfig {
+                listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                robot_identity: Some("scope-server".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        namespace,
+    )
+    .unwrap();
+    let mut serving = GatewayRuntime::new(
+        server.clone(),
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowAll,
+            announce: vec![],
+            ingress: vec![],
+        },
+    )
+    .unwrap();
+    server
+        .network()
+        .unwrap()
+        .set_lan_access(cerulion_core::LanAccess::Open);
+    let (sock_dir, sock) = unique_netd_socket(tag);
+    let (netd, _spy) = start_spy_netd(&sock);
+    let (mut child, stdout, stderr) = spawn_graph_run(
+        tmp.path(),
+        tag,
+        env_off,
+        probe_ephemeral_port(),
+        &sock,
+        flags,
+    );
+    wait_for_merged_line(
+        &stdout,
+        &stderr,
+        "starting graph (live)",
+        Duration::from_secs(60),
+    );
+    let mut local = server
+        .create_data_only_subscriber(&topic)
+        .expect("real CLI topic");
+    let mut local_frames = Vec::new();
+    assert!(
+        wait_until(
+            || {
+                local.drain_owned(1, &mut local_frames).unwrap();
+                !local_frames.is_empty()
+            },
+            Duration::from_secs(10)
+        ),
+        "CLI delivered no local frame"
+    );
+    assert_eq!(
+        &local_frames[0].payload()[cerulion_core::wire::WireHeader::SIZE..],
+        &[0; 24]
+    );
+    drop(local_frames);
+    let peer = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("scope_peer_{tag}"),
+            network: Some(NetworkConfig {
+                connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
+                robot_identity: Some("scope-peer".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .unwrap();
+    peer.network()
+        .unwrap()
+        .set_lan_access(cerulion_core::LanAccess::Open);
+    let received = peer.create_subscriber(&topic).unwrap();
+    let mut demand = GatewayRuntime::new(
+        peer,
+        GatewayPlan {
+            egress_policy: GatewayEgressPolicy::AllowList(vec![]),
+            announce: vec![],
+            ingress: vec![GatewayIngressEntry {
+                topic: topic.clone(),
+                schema_hash: Vector3::SCHEMA_HASH,
+            }],
+        },
+    )
+    .unwrap();
+    let before = server.remote_access_refusals();
+    let mut delivered = Vec::new();
+    assert!(
+        wait_until(
+            || {
+                demand.demand_get_once().unwrap();
+                serving.drive_once().unwrap();
+                received
+                    .try_receive(|frame| delivered.push(frame.payload().to_vec()))
+                    .unwrap();
+                if allowed {
+                    !delivered.is_empty()
+                } else {
+                    server.remote_access_refusals() > before
+                }
+            },
+            Duration::from_secs(15)
+        ),
+        "scope admission was never observed"
+    );
+    if allowed {
+        assert!(serving.demand_grant_count() > 0);
+        assert_eq!(&delivered[0], &[0; 24]);
+    } else {
+        assert_eq!(serving.demand_grant_count(), 0);
+        assert!(delivered.is_empty());
+        assert!(serving.active_tap_topics().is_empty());
+    }
+    drop(demand);
+    drop(serving);
+    send_signal(child.id(), libc::SIGINT);
+    assert!(child
+        .wait_bounded(Duration::from_secs(60))
+        .unwrap()
+        .success());
+    child.finish().assert_clean();
+    drop(netd);
+    let _ = std::fs::remove_dir_all(sock_dir);
 }
