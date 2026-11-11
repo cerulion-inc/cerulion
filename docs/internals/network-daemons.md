@@ -142,10 +142,13 @@ remove them before committing.
   daemon shutdown. Endpoint transfer closes the outgoing desk endpoint before
   spawning remoted and permits new outgoing ownership only after reap. The idle
   watcher retains the singleton while that endpoint is held, including teardown.
-  After the first idle release, one reaper waits across server generations until
-  shutdown. WAN teardown reserves the full server/fetch budget even before an
-  in-flight registration claims endpoint ownership; reading it never takes the
-  lifecycle mutex.
+  One lazy lifecycle worker queues accepted registration ids and controls startup,
+  endpoint transfer and reap outside the registration mutex. A registration during
+  teardown replies without waiting and starts one replacement after the old owner
+  has stopped. Outbound WAN readers also prevent idle reap; their shared native
+  holds serialize new demands against an exclusive stop. WAN teardown reserves the
+  full server/fetch budget before endpoint ownership; reading it takes no lifecycle
+  lock.
   Native admission uses `serving_hold::ServingHolds`, re-exported by remoted:
   acquire a guard before ops/RCP or shell/exec work and retain it through final
   drain and witness. Latch and owed-delivery sources refresh before the last
@@ -158,11 +161,14 @@ remove them before committing.
   Stop handling installs before daemon accept startup. Remoted has its own process
   group; direct SIGTERM starts within its hard-exit budget plus 500 ms, followed
   by forced reap if necessary and revocation-fetch grace. Endpoint transfer calls
-  `MirrorPlane::begin_serving` before spawn and `end_serving` after both reap,
-  retiring outgoing assignments under the account controller's state lock.
-  Incoming TLS handshakes run in bounded concurrent workers with deadlines;
-  completed handshakes dispatch before new arrivals, so a stalled peer cannot
-  serialize e-stop admission. Safety refresh waits never cancel a handshake.
+  `MirrorPlane::begin_serving` after provisioning and before child spawn,
+  `serving_ready` to restore retained WAN pins once the owned socket admits work,
+  and `end_serving` after child and fetch reap, also on transfer or spawn failure.
+  Controllers preserve holders and schema pins or notify holders of failed restores.
+  Incoming TLS handshakes run in at most 32 concurrent workers for at most 10 s;
+  unvalidated addresses retry at half capacity, validated IPs hold at most four,
+  and each relay holds at most eight. Completed handshakes dispatch before new
+  arrivals, so stalled unvalidated peers cannot consume all safety admission slots. Safety refresh waits never cancel a handshake.
   Shutdown aborts and joins pending handshakes before endpoint cleanup.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving

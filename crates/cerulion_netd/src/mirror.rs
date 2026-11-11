@@ -185,7 +185,25 @@ pub trait MirrorPlane: Send + Sync {
         Ok(())
     }
 
-    /// Return endpoint ownership after the remote server has been killed/reaped.
+    /// Restore retained WAN pins after the owned child starts. An owned WAN
+    /// controller waits for its outbound socket to admit operations, then
+    /// migrates live key/schema pins or notifies their holders of each loss.
+    /// Runs on the supervisor thread, never a verb or registry handler.
+    /// LAN-only planes have no endpoint migration to perform.
+    fn serving_ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Live outbound WAN readers keep the owned server alive after last egress.
+    /// An owned controller answers true while its reader state is unavailable.
+    /// Shared Ensure must additionally hold the native serving fence until the
+    /// last Release or Retire, serializing new readers against an idle stop.
+    /// LAN-only planes own no outbound WAN readers.
+    fn holds_outbound_readers(&self) -> bool {
+        false
+    }
+
+    /// Return endpoint ownership after the remote server and fetch worker are reaped.
     fn end_serving(&self) {}
 
     /// Cold control operations through the same controller that owns WAN mirrors.

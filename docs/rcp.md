@@ -484,8 +484,10 @@ so a stderr that takes no more lines delays no attempt (see
 When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
 the middle of an attempt first deletes the MCP session rcpd issued it, within
 2 s, inside the 5 s the stop waits for the delivery's task. A stop the
-hard-exit deadline or a second signal ends, a SIGKILL (as a `cerulion-netd`
-stop sends) or a crash may end it with no line and no `DELETE`.
+hard-exit deadline or a second signal ends, a SIGKILL or a crash may end it
+with no line and no `DELETE`. A `cerulion-netd` stop sends SIGTERM, and sends
+SIGKILL only if `cerulion-remoted` has not exited within
+`CERULION_REMOTED_HARD_EXIT_MS` plus 500 ms.
 
 The latch clears only when `cerulion-remoted` restarts. To recover, restart
 `cerulion-remoted`, then clear rcpd's own latch: `estop_clear` under

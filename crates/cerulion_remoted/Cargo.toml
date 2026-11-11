@@ -43,6 +43,7 @@ test-seam = ["cerud/test-seam"]
 # is EXCLUDED from the workspace `default-members` (a plain `cargo build` stays
 # iroh-free); build it via `cargo build -p cerulion_remoted` or `--workspace`.
 cerulion_link = { path = "../cerulion_link" }
+indexmap.workspace = true
 # What the SHM WIRE PLANE takes from core: the listener-less `DataOnlySubscriber`
 # capture tap (`create_data_only_subscriber` / `drain_owned`), the shared
 # `cerulion_q` catalog/demand/schema vocabulary (`CatalogReply`/`SchemaReply` —

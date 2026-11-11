@@ -117,9 +117,9 @@ pub type EgressId = ConnId;
 /// protocol error and rolls the registry's egress accounting back.
 #[derive(Debug)]
 pub enum EgressError {
-    /// The machine could not safely start its owned authenticated server.
+    /// The machine could not queue its owned authenticated server lifecycle.
     Server {
-        /// Endpoint transfer or supervisor startup failed before a child started.
+        /// The daemon is stopping or its lifecycle worker could not start.
         reason: String,
     },
     /// The shared embedded gateway could not boot, or a produced topic could not be
