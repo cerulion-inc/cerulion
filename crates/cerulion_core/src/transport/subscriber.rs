@@ -887,6 +887,8 @@ pub struct DataOnlySubscriber {
     fault_inject_receive_after: Option<u32>,
     // After the data port: a remote tap retains policy through port teardown.
     remote_lease: Option<super::egress_scope::RemoteTopicLease>,
+    // Export taps retain local source identity until their data port drops.
+    local_lease: Option<super::mirror_origin::LocalObservationLease>,
 }
 
 impl DataOnlySubscriber {
@@ -911,6 +913,7 @@ impl DataOnlySubscriber {
             max_borrowed_samples,
             data_service,
             remote_lease: None,
+            local_lease: None,
             #[cfg(any(test, feature = "test-helpers"))]
             fault_inject_receive_after: None,
         }
@@ -918,6 +921,10 @@ impl DataOnlySubscriber {
 
     pub(crate) fn hold_remote_lease(&mut self, lease: super::egress_scope::RemoteTopicLease) {
         self.remote_lease = Some(lease);
+    }
+
+    pub(crate) fn hold_local_lease(&mut self, lease: super::mirror_origin::LocalObservationLease) {
+        self.local_lease = Some(lease);
     }
 
     /// The receive-queue depth this tap was ACTUALLY created

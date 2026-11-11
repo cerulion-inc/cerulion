@@ -126,6 +126,13 @@ frames to the producer. A machine can serve and consume through the same owned
 endpoint. This is distinct from the ops `topic-publish` verb and its capability
 and e-stop checks.
 
+Each robot exports its own local producers. Imported graph topics and private
+observer channels keep their source robot's access policy: read them on that
+source robot. A refused outbound demand or an unavailable robot during metadata
+discovery preserves the machine's other active readers. Outbound readers retain
+the owned server against idle shutdown; new admission returns a retryable
+refusal while shutdown is already committed.
+
 The zenoh LAN ingress compatibility path proves no identity per peer and is
 closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires
 explicit `CERULION_LAN_ACCESS=open` and warns at startup. Authenticated discovery is described in [networking](networking.md#making-a-robot-discoverable).

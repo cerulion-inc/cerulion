@@ -37,15 +37,15 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
-- Declared imports require Reliable/send_queue, native capacity one and one live writer. Observers keep best-effort/all writers; proxies preserve the import flag.
-- Reuse same-user endpoint/runtime/node; refuse key/namespace mismatch before dialing, retire only outbound sessions.
+- Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
+- Same-user outbound shares endpoint/runtime/node; key/namespace gate before dial. Metadata per-call; refusals keep readers and idle fence. Retire only outbound.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
-- The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
-  e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
+- Family tests parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
+  e2e: loopback iroh only, relay off, direct dial, bounded awaits.
 - remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p` (not default-members).
 
-Deep reference: docs/internals/remote-access.md, before touching the verb table,
-trust persistence, the wire plane, pairing formats or epoch delivery.
+Read docs/internals/remote-access.md before verb table, trust persistence, wire,
+pairing formats or epoch changes.

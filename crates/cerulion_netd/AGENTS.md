@@ -34,10 +34,10 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
   bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY
   demand calls `prepare_demand`: stale identity or dead reader cannot acknowledge
   a phantom mirror. Validate `account:` before `TopicKey` trims ordinary names.
-- Serving controllers use remoted's bounded same-user `outbound.sock`, endpoint
-  and runtime. Key and SHM namespace must match before dialing. Close retires
-  mirrors; account fencing preserves the owned endpoint. Never bind its key twice.
-- Identity snapshots are public bytes, auth-store locked across reads; busy writers refuse. Expiry gates enrollment, never durable bindings; account/key change fences the controller.
+- Bounded same-user `outbound.sock` shares owned endpoint/runtime; key/namespace
+  gate before dial. Metadata per-call; refusals keep readers, which hold idle fence.
+  Transport loss retires keys; account fences retain owner; never bind key twice.
+- Public identity bytes are auth-locked across reads; busy writers refuse. Expiry gates enrollment, never durable bindings; account/key changes fence controller.
 - Release removes debug; operator outcomes use info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is reader-only: no peers.json writes.
 
 ## Testing

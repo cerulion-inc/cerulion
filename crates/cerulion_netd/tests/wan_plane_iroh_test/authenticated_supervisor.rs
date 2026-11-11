@@ -61,17 +61,23 @@ impl GraphChild {
         }
         status
     }
-    fn signal(&self, signal: &str) {
-        if !self.reaped {
-            assert!(Command::new("/bin/kill")
-                .args([signal, &format!("-{}", self.child.id())])
-                .status()
-                .unwrap()
-                .success());
+    fn signal(&self, signal: rustix::process::Signal) -> rustix::io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
+        let pid = i32::try_from(self.child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or(rustix::io::Errno::INVAL)?;
+        // The group belongs to this unreaped child; no external PID lookup.
+        match rustix::process::kill_process_group(pid, signal) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error),
         }
     }
     fn stop(&mut self) -> ExitStatus {
-        self.signal("-INT");
+        self.signal(rustix::process::Signal::INT)
+            .expect("signal the owned graph process group");
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = self.poll() {
@@ -90,13 +96,18 @@ impl Drop for GraphChild {
         if self.reaped {
             return;
         }
-        self.signal("-TERM");
+        if let Err(error) = self.signal(rustix::process::Signal::TERM) {
+            tracing::warn!(error = %error, "owned graph process group refused graceful shutdown");
+        }
         let deadline = Instant::now() + Duration::from_secs(15);
         while self.poll().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         if !self.reaped {
-            self.signal("-KILL");
+            if let Err(error) = self.signal(rustix::process::Signal::KILL) {
+                tracing::warn!(error = %error, "owned graph process group refused forced shutdown");
+                let _killed = self.child.kill();
+            }
             let _reaped = self.child.wait();
             self.reaped = true;
         }

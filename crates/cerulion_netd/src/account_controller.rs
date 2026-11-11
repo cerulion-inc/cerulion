@@ -241,6 +241,13 @@ impl AccountWanController {
         state: &mut State,
         registry: &mut DemandRegistry,
     ) -> Result<(), String> {
+        if state
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.take_shared_transport_loss())
+        {
+            state.pending_all = true;
+        }
         let keys = self.pending_keys(state)?;
         registry.invalidate_mirrors(&keys).map_err(|_| {
             "previous WAN mirrors are still being retired; retry the operation".to_owned()

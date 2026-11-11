@@ -3,10 +3,10 @@
 Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
 
 ## Invariants
-- Producers exclude before ports; remote taps/mirrors/announces hold opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame-path checks.
+- Producers exclude before ports; exports pin local source/policy leases, mirrors/announces opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame checks.
 
-- ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
-  a fused chain may serve a frame it just committed, in-process.
+- ONE read path: iceoryx2 queue receive, no bypass/raw-handle read;
+  fused chains may serve their just-committed frame in-process.
 - LAN defaults to Paired; fixtures select Open. Locators/login never open it.
 - FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs;
   the loader also refuses a differing `RUSTC_FINGERPRINT`.
