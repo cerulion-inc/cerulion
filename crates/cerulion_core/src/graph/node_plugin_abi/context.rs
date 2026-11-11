@@ -162,6 +162,11 @@ impl NodeContext {
     pub fn subscriber_names(&self) -> impl Iterator<Item = &str> {
         self.subscribers.keys().map(String::as_str)
     }
+    /// Access host-owned raw-ingress publishers without a native transport owner.
+    pub fn raw_ingress(&self) -> TransportResult<super::RawIngress> {
+        Ok(super::RawIngress::plugin(HostClient::share(&self.client)))
+    }
+
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
     }

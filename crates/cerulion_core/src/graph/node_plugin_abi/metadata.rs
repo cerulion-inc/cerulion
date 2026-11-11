@@ -13,6 +13,22 @@ pub fn metadata(
     inputs: &[LoanRequestV1],
     outputs: &[LoanRequestV1],
 ) -> TransportResult<CString> {
+    metadata_with_accumulation(base, inputs, outputs, &[])
+}
+
+/// Add explicit accumulation limits without changing common legacy metadata.
+// hot-path-alloc-ok-fn: checked cold bootstrap metadata, once per library.
+pub fn metadata_with_accumulation(
+    base: &CStr,
+    inputs: &[LoanRequestV1],
+    outputs: &[LoanRequestV1],
+    caps: &[Option<u32>],
+) -> TransportResult<CString> {
+    if !caps.is_empty() && caps.len() != inputs.len() {
+        return Err(super::argument_error(
+            "accumulation limits differ from input count",
+        ));
+    }
     let mut value: serde_json::Value = serde_json::from_slice(base.to_bytes())
         .map_err(|error| super::argument_error(&error.to_string()))?;
     for (direction, facts) in [("inputs", inputs), ("outputs", outputs)] {
@@ -25,7 +41,7 @@ pub fn metadata(
                 "wire facts differ from the common port count",
             ));
         }
-        for (port, facts) in ports.iter_mut().zip(facts) {
+        for (index, (port, facts)) in ports.iter_mut().zip(facts).enumerate() {
             let port = port
                 .as_object_mut()
                 .ok_or_else(|| super::argument_error("common port metadata is not an object"))?;
@@ -39,6 +55,14 @@ pub fn metadata(
             port.insert("wire_fixed_size".into(), facts.wire_fixed_size.into());
             port.insert("variable_count".into(), facts.variable_count.into());
             port.insert("alignment".into(), facts.alignment.into());
+            if direction == "inputs" {
+                if let Some(Some(cap)) = caps.get(index) {
+                    if *cap == 0 {
+                        return Err(super::argument_error("accumulation limit is zero"));
+                    }
+                    port.insert("accumulate_cap".into(), (*cap).into());
+                }
+            }
         }
     }
     let bytes =

@@ -37,6 +37,8 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
   Adapter oracle tests: `cargo test -p cerulion_core --lib graph::node_plugin_abi`.
   Bootstrap/metadata/refusal fixture: `node_plugin_exports_test` (build
   `test_node_macro_cdylib` first; no transport is created).
+  `node_plugin_raw_test` exercises both raw SDK backends with actual SHM delivery;
+  run it alone with `--test-threads=1`.
 - Stable node/host tests: `core-transport.md`; readers/writers drop before release.
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
   graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside

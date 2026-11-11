@@ -16,6 +16,12 @@ pub(crate) fn generate(
 ) -> TokenStream {
     let root = crate_root::root();
     let input_types = inputs.iter().map(|input| &input.field_type);
+    let input_caps = inputs.iter().map(|input| match input.accumulate {
+        Some(cap) => {
+            quote!(Some(u32::try_from(#cap).expect("accumulation limit fits the host bound")))
+        }
+        None => quote!(None),
+    });
     let output_types = outputs.iter().map(|output| &output.field_type);
     let register = crate::input_accumulate::register_calls_for(inputs, &quote! { instance });
     let required = if inputs.iter().any(|input| input.accumulate.is_some()) {
@@ -207,10 +213,11 @@ pub(crate) fn generate(
         fn __cer_stable_api() -> *const #root::node_abi::NodeApiV1 {
             *__CER_STABLE_API.get_or_init(|| {
                 let metadata = __CER_STABLE_METADATA.get_or_init(|| {
-                    #root::graph::node_plugin_abi::metadata(
+                    #root::graph::node_plugin_abi::metadata_with_accumulation(
                         INFO_JSON.get_or_init(__cer_build_info_json).as_c_str(),
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#input_types>()),*],
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#output_types>()),*],
+                        &[#(#input_caps),*],
                     ).expect("generated wire facts match the common metadata")
                 }).as_bytes();
                 // hot-path-alloc-ok: bootstrap owns one immutable table for the library lifetime.
