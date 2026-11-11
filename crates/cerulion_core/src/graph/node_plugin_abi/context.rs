@@ -164,7 +164,10 @@ impl NodeContext {
     }
     /// Access host-owned raw-ingress publishers without a native transport owner.
     pub fn raw_ingress(&self) -> TransportResult<super::RawIngress> {
-        Ok(super::RawIngress::plugin(HostClient::share(&self.client)))
+        Ok(super::RawIngress::plugin(
+            HostClient::share(&self.client),
+            Arc::clone(&self.clock),
+        ))
     }
 
     pub fn clock(&self) -> &Arc<dyn Clock> {

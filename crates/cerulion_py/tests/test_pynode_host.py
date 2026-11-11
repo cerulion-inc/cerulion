@@ -103,7 +103,7 @@ def test_host_pynode_loans_builtin_output_without_workspace_schemas():
         "outputs": [{"name": "out", "schema_hash": 15293913555552287199,
                      "max_slice_len_default": 64, "promise_within_ms": None,
                      "wire_fixed_size": 24, "variable_count": 0, "alignment": 8}],
-        "policy": {"period_ms": 1}, "retain_process": True,
+        "policy": {"period_ms": 1},
     }
     assert lines[1:] == [
         "tick=0 code=0 out=000000000000f83f00000000000000c0000000000000d03f",
@@ -310,7 +310,6 @@ def test_stable_python_adapter_delivers_oracle_frames_and_host_sequences():
         result = subprocess.run([FIXTURE, "host-pynode", counter, "3", "--seed", "41"],
                                 capture_output=True, text=True, check=True, env=_node_env("counter"))
         metadata = json.loads(result.stdout.splitlines()[0].removeprefix("node_info="))
-        assert metadata["retain_process"] is True
         assert metadata["inputs"][0]["schema_hash"] == 15583965953746584896
         assert metadata["inputs"][0]["wire_fixed_size"] == 8
         assert metadata["inputs"][0]["variable_count"] == 0
@@ -351,7 +350,9 @@ def test_stable_python_bootstrap_refuses_null_host_and_stale_handles():
     assert api.header.layout_id != 0
     assert api.capabilities == api.required == 0
     assert api.state is None and api.external is None
-    assert b"\0" not in ctypes.string_at(api.metadata.ptr, api.metadata.len)
+    raw_metadata = ctypes.string_at(api.metadata.ptr, api.metadata.len)
+    assert b"\0" not in raw_metadata
+    assert json.loads(raw_metadata)["retain_process"] is True
     create = ctypes.CFUNCTYPE(_Status, ctypes.c_void_p, ctypes.c_uint64, _Bytes,
                               ctypes.POINTER(ctypes.c_uint64))(api.create)
     handle = ctypes.c_uint64(999)
@@ -619,3 +620,15 @@ def test_failed_init_invalidates_a_retained_context():
     assert "RuntimeError: fixture init failure" in result.stderr
     assert "stale context answered" not in result.stderr
     assert "tick=0 code=0 out=00000000" in result.stdout, result.stdout
+
+
+def test_escaped_python_memoryview_survives_destroy_and_never_reuses_its_lease():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "retain_after_destroy"
+    result = subprocess.run([FIXTURE, "host-pynode-pinned", path],
+                            capture_output=True, text=True,
+                            env=env, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "pinned after_destroy=1 outstanding=1 refused=9" in result.stdout
+    assert "pinned after_unload=1 bytes=d4c3b2a1 outstanding=1" in result.stdout

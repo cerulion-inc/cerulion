@@ -60,3 +60,13 @@ fn state_error(error: crate::state::StateError) -> TransportError {
         reason: error.to_string(),
     }
 }
+
+// Unwind payloads are user-owned objects too. Their destructors must not
+// escape a C callback or poison the execution gate after the first catch.
+fn contain_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(nested) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+        // A second user destructor can panic again. Retain only that exceptional
+        // payload rather than run an unbounded chain of unwinding destructors.
+        std::mem::forget(nested);
+    }
+}

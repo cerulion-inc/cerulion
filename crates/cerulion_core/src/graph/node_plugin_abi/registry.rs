@@ -16,7 +16,7 @@ pub enum CallError {
     /// A required host capability is missing.
     Unsupported,
     /// Another operation owns the instance gate, or the handle counter is full.
-    Busy,
+    InvalidState,
     /// Node code unwound; the unwind was caught inside the execution gate.
     Panic,
     /// A typed user/transport error returned normally.
@@ -54,7 +54,7 @@ impl<T> NodeRegistry<T> {
     pub fn insert(&self, value: T) -> Result<u64, CallError> {
         let mut rows = self.rows.lock().map_err(|_| CallError::Panic)?;
         let mut next = self.next.lock().map_err(|_| CallError::Panic)?;
-        let following = next.checked_add(1).ok_or(CallError::Busy)?;
+        let following = next.checked_add(1).ok_or(CallError::InvalidState)?;
         let handle = *next;
         rows.push(Row {
             handle,
@@ -86,12 +86,15 @@ impl<T> NodeRegistry<T> {
     ) -> Result<R, CallError> {
         let instance = self.instance(handle)?;
         let mut gate = instance.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => CallError::Busy,
+            TryLockError::WouldBlock => CallError::InvalidState,
             TryLockError::Poisoned(_) => CallError::Panic,
         })?;
         let value = gate.as_mut().ok_or(CallError::InvalidHandle)?;
         catch_unwind(AssertUnwindSafe(|| call(value)))
-            .map_err(|_| CallError::Panic)?
+            .map_err(|payload| {
+                super::contain_panic_payload(payload);
+                CallError::Panic
+            })?
             .map_err(CallError::Node)
     }
 
@@ -100,14 +103,17 @@ impl<T> NodeRegistry<T> {
     pub fn destroy(&self, handle: u64) -> Result<(), CallError> {
         let instance = self.instance(handle)?;
         let mut gate = instance.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => CallError::Busy,
+            TryLockError::WouldBlock => CallError::InvalidState,
             TryLockError::Poisoned(_) => CallError::Panic,
         })?;
         let value = gate.take().ok_or(CallError::InvalidHandle)?;
         let mut rows = self.rows.lock().map_err(|_| CallError::Panic)?;
         rows.retain(|row| row.handle != handle);
         drop(rows);
-        catch_unwind(AssertUnwindSafe(|| drop(value))).map_err(|_| CallError::Panic)
+        catch_unwind(AssertUnwindSafe(|| drop(value))).map_err(|payload| {
+            super::contain_panic_payload(payload);
+            CallError::Panic
+        })
     }
 }
 
@@ -163,9 +169,12 @@ mod tests {
             .call(first, |_| {
                 assert!(matches!(
                     registry.call(first, |_| Ok(())),
-                    Err(CallError::Busy)
+                    Err(CallError::InvalidState)
                 ));
-                assert!(matches!(registry.destroy(first), Err(CallError::Busy)));
+                assert!(matches!(
+                    registry.destroy(first),
+                    Err(CallError::InvalidState)
+                ));
                 assert_eq!(registry.call(second, |value| Ok(*value)).unwrap(), 22);
                 Ok(())
             })
@@ -176,7 +185,10 @@ mod tests {
     fn exhausted_handle_counter_does_not_insert_or_wrap() {
         let registry = NodeRegistry::default();
         *registry.next.lock().unwrap() = u64::MAX;
-        assert!(matches!(registry.insert(7_u64), Err(CallError::Busy)));
+        assert!(matches!(
+            registry.insert(7_u64),
+            Err(CallError::InvalidState)
+        ));
         assert!(registry.rows.lock().unwrap().is_empty());
         assert_eq!(*registry.next.lock().unwrap(), u64::MAX);
     }
@@ -201,5 +213,29 @@ mod tests {
         ));
         registry.call(second, |_| Ok(())).unwrap();
         registry.destroy(second).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod panic_payload_test {
+    use super::*;
+    struct DestructingPayload;
+    impl Drop for DestructingPayload {
+        fn drop(&mut self) {
+            panic!("panic payload destructor");
+        }
+    }
+    #[test]
+    fn hostile_panic_payload_does_not_poison_the_instance_or_escape() {
+        let registry = NodeRegistry::default();
+        let handle = registry.insert(41u64).unwrap();
+        assert!(matches!(
+            registry.call::<()>(handle, |_| {
+                std::panic::panic_any(DestructingPayload);
+            }),
+            Err(CallError::Panic)
+        ));
+        assert_eq!(registry.call(handle, |value| Ok(*value)).unwrap(), 41);
+        registry.destroy(handle).unwrap();
     }
 }

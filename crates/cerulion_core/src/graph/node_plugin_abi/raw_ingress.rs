@@ -18,7 +18,10 @@ pub struct RawIngress {
 #[derive(Clone)]
 enum Backend {
     Native(Arc<TransportManager>),
-    Plugin(HostClient),
+    Plugin {
+        client: HostClient,
+        clock: Arc<dyn crate::clock::Clock>,
+    },
 }
 impl RawIngress {
     /// Wrap the existing process transport for an in-process node.
@@ -27,11 +30,19 @@ impl RawIngress {
             backend: Backend::Native(transport),
         }
     }
-    pub(super) fn plugin(client: HostClient) -> Self {
+    pub(super) fn plugin(client: HostClient, clock: Arc<dyn crate::clock::Clock>) -> Self {
         Self {
-            backend: Backend::Plugin(client),
+            backend: Backend::Plugin { client, clock },
         }
     }
+    /// Share the existing native clock or the node-local host clock facade.
+    pub fn clock_arc(&self) -> Arc<dyn crate::clock::Clock> {
+        match &self.backend {
+            Backend::Native(manager) => manager.clock_arc(),
+            Backend::Plugin { clock, .. } => Arc::clone(clock),
+        }
+    }
+
     /// Create a publisher using the existing ingress configuration and QoS.
     // hot-path-alloc-ok-fn: cold topic creation copies names and configures one bounded host port.
     pub fn create_publisher(
@@ -54,7 +65,7 @@ impl RawIngress {
                     schema_hash,
                 },
             }),
-            Backend::Plugin(client) => {
+            Backend::Plugin { client, .. } => {
                 let request = RawPublisherRequestV1 {
                     topic: super::client::bytes_span(topic.as_bytes()),
                     schema_hash,

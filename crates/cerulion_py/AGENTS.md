@@ -71,3 +71,7 @@ pin leases after shutdown, so the loader retains code and context until exit.
 Python nodes advertise neither state nor external-source capability.
 Stable create/error-copy forwarding adds two checked C-call unsafe sites;
 their U06/U12 lifetime and descriptor validation live in the shared export adapter.
+
+The escaped-buffer fixture runs in a fresh process: an exported memoryview
+survives node destruction, its lease is refused for reuse, and the old bytes
+remain readable after the extra library owner is dropped.

@@ -31,6 +31,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph and gateway; per-binary serial t
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
+
 - Stable node/host tests: `core-transport.md`; readers/writers drop before release.
 - Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
   graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
