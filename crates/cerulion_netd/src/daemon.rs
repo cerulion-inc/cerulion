@@ -1952,6 +1952,20 @@ fn handle_connection(mut stream: UnixStream, ctx: Ctx, shutdown: Arc<AtomicBool>
                 return; // consumer gone / wedged — only this connection dies.
             }
         }
+        let losses = ctx
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_mirror_losses(conn);
+        for key in losses {
+            if !write_line(
+                &mut stream,
+                &crate::protocol::MirrorLost::new(&key).to_json_line(),
+            ) {
+                cleanup_connection(&ctx, conn);
+                return;
+            }
+        }
         // Wait for socket-readable OR push-slot-filled, instead of
         // blocking in `read` and discovering the push only when that timed out. The
         // drain ABOVE runs before every wait, so a push that landed while we were

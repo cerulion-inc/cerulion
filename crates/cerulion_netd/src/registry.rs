@@ -273,6 +273,8 @@ pub struct DemandRegistry {
     /// Connection → the set of keys it currently holds (dedup: a connection holds
     /// a key at most once — the per-connection idempotency invariant).
     per_conn: HashMap<ConnId, BTreeSet<TopicKey>>,
+    /// Deduplicated loss notifications for holders, drained by their writer thread.
+    mirror_losses: HashMap<ConnId, BTreeSet<TopicKey>>,
     /// Connection → its canonical EGRESS topic set (the produced topics
     /// it registered for the shared gateway to announce + egress-on-demand). A
     /// connection has an entry here iff it holds ≥1 egress topic. Connection-close
@@ -320,6 +322,7 @@ impl DemandRegistry {
         Self {
             topics: BTreeMap::new(),
             per_conn: HashMap::new(),
+            mirror_losses: HashMap::new(),
             egress: HashMap::new(),
             egress_topics: BTreeMap::new(),
             egress_announced: BTreeSet::new(),
@@ -467,6 +470,7 @@ impl DemandRegistry {
     /// is released BEFORE `refresh_idle` here). Unknown / double disconnect is a no-op
     /// returning an empty outcome.
     pub fn disconnect(&mut self, conn: ConnId, now: Instant) -> DisconnectOutcome {
+        self.mirror_losses.remove(&conn);
         let Some(held) = self.per_conn.remove(&conn) else {
             return DisconnectOutcome::default();
         };
@@ -535,10 +539,19 @@ impl DemandRegistry {
             .filter(|key| self.topics.remove(*key).is_some())
             .cloned()
             .collect();
-        for held in self.per_conn.values_mut() {
+        for (conn, held) in &mut self.per_conn {
+            let lost: BTreeSet<_> = held.intersection(keys).cloned().collect();
+            if !lost.is_empty() {
+                self.mirror_losses.entry(*conn).or_default().extend(lost);
+            }
             held.retain(|key| !keys.contains(key));
         }
         Ok(removed)
+    }
+
+    /// Drain one holder's losses in canonical key order, without socket I/O.
+    pub fn take_mirror_losses(&mut self, conn: ConnId) -> BTreeSet<TopicKey> {
+        self.mirror_losses.remove(&conn).unwrap_or_default()
     }
 
     /// CLAIM a lingering key for teardown — atomically mark it `tearing`
@@ -911,6 +924,69 @@ mod tests {
             reg.mark_mirror_present(k); // ensure succeeded
         }
         outcome
+    }
+
+    #[test]
+    fn mirror_loss_notifies_every_holder_once_in_sorted_order_and_purges_disconnects() {
+        fn run() -> Vec<BTreeSet<TopicKey>> {
+            let now = Instant::now();
+            let mut reg = DemandRegistry::new(now);
+            let a = reg.connect(now);
+            let b = reg.connect(now);
+            let idle = reg.connect(now);
+            let first = key("robot", "/a");
+            let second = key("robot", "/z");
+            let lingering = key("robot", "/unused");
+            for k in [&second, &first, &lingering] {
+                demand_and_ensure(&mut reg, a, k, HASH_A);
+            }
+            demand_and_ensure(&mut reg, b, &first, HASH_A);
+            reg.release(a, &lingering, now);
+            let selected = BTreeSet::from([second.clone(), first.clone(), lingering]);
+            reg.invalidate_mirrors(&selected).unwrap();
+            reg.invalidate_mirrors(&selected).unwrap();
+            let result = vec![
+                reg.take_mirror_losses(a),
+                reg.take_mirror_losses(b),
+                reg.take_mirror_losses(idle),
+                reg.take_mirror_losses(a),
+            ];
+            assert_eq!(
+                result,
+                vec![
+                    BTreeSet::from([first.clone(), second]),
+                    BTreeSet::from([first.clone()]),
+                    BTreeSet::new(),
+                    BTreeSet::new()
+                ]
+            );
+            demand_and_ensure(&mut reg, a, &first, HASH_A);
+            reg.invalidate_mirrors(&BTreeSet::from([first])).unwrap();
+            reg.disconnect(a, now);
+            assert!(reg.take_mirror_losses(a).is_empty());
+            result
+        }
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn busy_invalidation_queues_no_false_loss_before_the_reader_is_retired() {
+        let now = Instant::now();
+        let mut reg = DemandRegistry::new(now);
+        let conn = reg.connect(now);
+        let live = key("robot", "/live");
+        let dying = key("robot", "/dying");
+        demand_and_ensure(&mut reg, conn, &live, HASH_A);
+        demand_and_ensure(&mut reg, conn, &dying, HASH_A);
+        reg.release(conn, &dying, now);
+        assert!(reg.claim_tearing(&dying));
+        let keys = BTreeSet::from([live.clone(), dying.clone()]);
+        assert_eq!(reg.invalidate_mirrors(&keys), Err(vec![dying.clone()]));
+        assert!(reg.take_mirror_losses(conn).is_empty());
+        assert_eq!(reg.refcount(&live), 1);
+        reg.clear_tearing(&dying);
+        reg.invalidate_mirrors(&keys).unwrap();
+        assert_eq!(reg.take_mirror_losses(conn), BTreeSet::from([live]));
     }
 
     #[test]

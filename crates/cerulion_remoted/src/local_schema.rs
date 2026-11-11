@@ -162,6 +162,9 @@ fn client_failure(error: ClientError) -> WireError {
             failure("local schema protocol is invalid or incompatible; restart the network daemon")
         }
         ClientError::Netd { .. } => failure("local network daemon refused the schema snapshot"),
+        ClientError::MirrorLost(_) => {
+            failure("local schema connection reported a retired mirror; retry the query")
+        }
         ClientError::Spawn { .. } => {
             failure("local schema client attempted an unsupported daemon startup")
         }
@@ -243,6 +246,11 @@ mod tests {
                 robot: Some(PRIVATE.into()),
                 topic: Some(PRIVATE.into()),
             },
+            ClientError::MirrorLost(cerulion_netd::MirrorLost {
+                event: "mirror_lost".into(),
+                robot: "/private/robot".into(),
+                topic: "/private/topic".into(),
+            }),
             ClientError::Spawn {
                 bin: PRIVATE.into(),
                 source: io_error(),
