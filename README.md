@@ -21,6 +21,7 @@
 - **Hindsight, in early access.** Recording-analysis tools your agent calls over MCP. Hindsight investigates MCAP recordings and cites topics and timestamps. Hindsight and the hosted MCP server are closed source. [Request access](https://docs.cerulion.com/cerulion/hindsight).
 - **Open source.** The runtime is AGPL-3.0-only, with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side wire crates are MIT OR Apache-2.0.
 - **ROS 2.** `rmw_cerulion` runs ROS 2 nodes on Cerulion's transport and is validated on Jazzy. `cerulion ros2 attach` bridges a running robot's ROS 2 topics. It is validated on Jazzy, and on Foxy and Humble through local type resolution only. See [ROS 2 compatibility](docs/ros2_compatibility.md).
+- **Python, new in 2.0.** `cerulion node create <type> --lang python --policy period_ms=<N>` writes a Python node that `graph run`, recording and replay treat like a Rust node. `import cerulion` publishes and subscribes to topics on the local machine over the same shared memory as Rust nodes, with no copy on receive. Both need the `cerulion` Python package, which you build from a Cerulion source checkout: the release downloads carry no wheel. A Python node also needs a `cerulion` CLI built from that checkout (`cargo install --path crates/cerulion_cli`). See [Python](docs/python.md).
 
 ## Why it's fast
 
@@ -442,7 +443,7 @@ The direction is **review for robot changes**: bring recordings, simulations and
 | Area | What's next |
 |---|---|
 | **Faster execution** | Chain-fused nodes that pass data directly within a process; nanosecond-scale handoff as a measured target; lower macOS cross-process wake-up latency. |
-| **Python and C++** | First-class node authoring and client libraries, with clear boundaries for zero-copy access, scheduling and reproducible execution. |
+| **C++** | First-class node authoring and a client library, with clear boundaries for zero-copy access, scheduling and reproducible execution. |
 | **Robot building blocks** | Native transforms and URDF support, parameters and lifecycle, with a clear path from the corresponding ROS 2 concepts. |
 | **Flashback from node code** | Declare an incident from a node's own code, so a bumper or a grasp check saves the moment it sees. |
 | **Services and actions** | A native request/response API for node authors on the shipped deterministic service layer, then actions: long-running goals with feedback, cancellation and streaming replies. |
