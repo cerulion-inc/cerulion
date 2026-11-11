@@ -114,6 +114,7 @@ async fn a_client_reads_the_fixture_graphs_nodes_topics_rates_and_run() {
     let _run = RunHandle::publish_on_config(
         &mgr.iox_config(),
         RunRecord {
+            remote_visible: true,
             run_id: RUN_ID,
             graph_name: "rcp_fixture".to_string(),
             run_dir: dir.path().to_string_lossy().into_owned(),

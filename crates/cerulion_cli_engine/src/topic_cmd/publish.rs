@@ -99,6 +99,15 @@ pub fn topic_pub(
         wait_subscribers: req.wait_subscribers,
     };
     let scope = req.scope;
+    let _exclusion = if scope.local_only() {
+        Some(
+            cerulion_core::TransportManager::get_or_init()
+                .and_then(|manager| manager.exclude_remote_topic(req.topic))
+                .map_err(|error| VerbError::Unavailable(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     cerulion_msgio::publish::publish_message(&core, &walker, &name, running, |schema_hash| {
         if scope.local_only() {
             None

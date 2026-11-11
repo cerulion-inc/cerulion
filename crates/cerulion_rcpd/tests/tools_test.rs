@@ -1065,3 +1065,48 @@ async fn an_estop_while_a_clear_waits_behind_a_call_is_not_cleared_by_it() {
         pairs(&[(ESTOP_CLEAR_TOOL, "error:estop_overtaken")])
     );
 }
+
+#[tokio::test]
+async fn local_only_journal_refuses_remote_tools_but_delivers_local_calls_and_emergency_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = unique("local_only");
+    let loaded = manifest(dir.path(), &prefix);
+    let mgr = manager("local_only");
+    let _scope = mgr
+        .exclude_remote_topic(&loaded.journal.calls_topic)
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let graph = spawn_graph(mgr.clone(), prefix, stop.clone());
+    let host = open_host(&mgr, &loaded, &dir.path().join("receipts/log.jsonl")).unwrap();
+    let args = json!({"q":[1.25,-2.5]}).as_object().unwrap().clone();
+    let before = mgr.remote_access_refusals();
+    let denied = cerulion_rcpd::caller::scope(
+        "iroh:peer".into(),
+        host.call("arm.step", Some(args.clone())),
+    )
+    .await;
+    assert_eq!(denied.is_error, Some(true));
+    assert!(denied.content[0]
+        .as_text()
+        .unwrap()
+        .text
+        .contains("local_only"));
+    assert!(mgr.remote_access_refusals() > before);
+    let local = host.call("arm.step", Some(args)).await;
+    assert_ne!(local.is_error, Some(true));
+    let stopped = cerulion_rcpd::caller::scope(
+        "iroh:peer".into(),
+        host.call(
+            ESTOP_TOOL,
+            Some(json!({"reason":"halt"}).as_object().unwrap().clone()),
+        ),
+    )
+    .await;
+    assert_ne!(stopped.is_error, Some(true));
+    stop.store(true, Ordering::Relaxed);
+    let delivered = graph.join().unwrap();
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered[0]["tool"], "arm.step");
+    assert_eq!(delivered[0]["args"], json!({"q":[1.25,-2.5]}));
+    assert_eq!(delivered[1]["tool"], ESTOP_TOOL);
+}

@@ -1,11 +1,10 @@
 # cerulion_netd - agent notes
 
-The one-per-computer network gateway daemon: owns the machine's single zenoh session
-and serves refcounted remote-topic demands over a UDS NDJSON control seam. lib + bin
-split: tests drive an in-process daemon over a temp socket with an injected spy
-mirror plane - green there proves the wiring, not the live network planes.
+One machine gateway/zenoh session, refcounted remote demands over UDS NDJSON; lib + bin.
+In-process temp-socket tests inject a spy mirror and prove wiring only, not live planes.
 
 ## Invariants
+- Gateway/probe/taps obey SHM producer scope even on open LAN: local-only and outputs omitted from declared egress stay private; taps retain leases.
 - One daemon per machine: an `flock`-held pidfile (`cerulion_hygiene::NETD`); the
   kernel drops the lock on death. Never add a second lock scheme. Android: abstract
   socket, same-UID peers only.

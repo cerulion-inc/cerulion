@@ -1,23 +1,22 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
-Every workspace-file writer (`node create/delete/modify`, `node stage`,
+CLI logic; `cerulion_cli` parses. Tests need no children.
+Workspace writers (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
 `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`, a kernel
-flock shared with `cerulion-wsd`) across check-and-write; nesting on one
-thread is reentrant, others wait (one `warn!`) - UNIX only; elsewhere a no-op.
+flock shared with `cerulion-wsd`) across check/write; same-thread reentrant,
+others wait (one `warn!`); UNIX only, elsewhere no-op.
 Reads use `acquire_read` (creates nothing; refuses a same-thread re-entry); all
 refuse a symlinked `.cerulion`. ONLY `acquire_and_track_gitignore` writes a
-TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
-`acquire_interruptibly(root, interrupted)`, which polls and returns
-`AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
-Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
+TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
+`acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
+Stage nodes only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
-- Enforce invariants at the engine boundary; CLI checks are UX.
+- Graph/node guards precede services/workers, including recording: off/inert excludes every topic, strict excludes outputs outside egress. Drop guards after all ports/workers.
+- Engine enforces invariants; CLI checks are UX.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
-  share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
+  share 4 s (500 ms/robot); never pair or demand. LAN and account rows merge only on
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
@@ -28,17 +27,15 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
   before `INFO_START` is fatal.
 - Never hand-compute pinned schema hashes: run `pinned_hashes`, copy into `topic_cmd.rs`.
 - Completions never hang, spawn, or open the network (`run_bounded`, `completions_test`).
-- Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
-  never warn-and-accept. A duplicated identity refuses iff ANY bearer is un-carryable.
+- Size port spellings before acceptance; unverifiable = `CliError::SchemaUnchecked`.
+  ANY un-carryable duplicate bearer refuses the identity, never warn-and-accept.
 - Rewrite `node modify` sources with `syn` spans, never `str::replace`.
 - iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
-- Blocking waits check `running` after interrupted ERRORS and retry only within
-  `MAX_CONSECUTIVE_WAIT_ERRORS`; never sleep-retry an ERROR. FOREIGN children Cerulion SIGINTs go via `child_signals`
-  (SIG_IGN/blocks survive exec); self_exe excepted.
+- Waits check `running` after interrupted errors; retry <= `MAX_CONSECUTIVE_WAIT_ERRORS`, never sleep-retry errors. FOREIGN children Cerulion SIGINTs use `child_signals` (SIG_IGN/blocks survive exec); self_exe excepted.
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-## Workspace dependency contract
+## Workspace dependencies
 Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
 pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
 ## Testing

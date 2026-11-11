@@ -138,6 +138,37 @@ fn drain_frames(sub: &cerulion_core::CerulionSubscriber) -> Vec<Vec<u8>> {
     frames
 }
 
+#[test]
+fn a_private_raw_route_retains_scope_and_delivers_locally_after_the_run_guard_drops() {
+    let manager = build_mgr("private");
+    let topic = "/raw/private";
+    let scope = manager.exclude_remote_topic(topic).unwrap();
+    let codec = bridge_codec();
+    let mut route = RawIngressRoute::open(
+        &manager,
+        &codec,
+        "geometry_msgs/Vector3",
+        topic,
+        MaxSliceLen::const_new(4096),
+    )
+    .unwrap();
+    let local = manager.create_subscriber(topic).unwrap();
+    drop(scope);
+    let remote =
+        TransportManager::init_for_test(TransportConfig::default(), manager.iox_config()).unwrap();
+    assert!(remote.create_remote_data_only_subscriber(topic).is_err());
+    assert_eq!(manager.dynamic_egress_record_hash_for_test(topic), None);
+    route
+        .publish_dds_payload(&codec, &vector3_dds_payload(1.25, -2.5, 3.75), 100)
+        .unwrap();
+    assert_eq!(
+        drain_frames(&local),
+        vec![vector3_expected_frame(1.25, -2.5, 3.75, 0, 100)]
+    );
+    drop(route);
+    assert!(remote.acquire_remote_topic_lease(topic).is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -125,6 +125,7 @@ struct Rig {
     /// G_prod's egress bridge flag for the topic (the observable the queryable
     /// flips + the tap reads).
     flag: Arc<AtomicBool>,
+    _exclusion: Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
 }
 
 /// Build machine A (producer P + gateway G_prod) and machine B (gateway G_cons +
@@ -132,6 +133,10 @@ struct Rig {
 /// queryable is the sole enable path. Bounded retry absorbs the probe→rebind
 /// port race. `egress` is G_prod's egress posture.
 fn setup_rig(tag: &str, egress: GatewayEgressPolicy) -> Rig {
+    setup_scoped_rig(tag, egress, false)
+}
+
+fn setup_scoped_rig(tag: &str, egress: GatewayEgressPolicy, excluded: bool) -> Rig {
     let id = unique_id();
     let topic = format!("/inv/{tag}/{id}");
     let root_a = cerulion_core::testing::iceoryx_test_config();
@@ -170,7 +175,11 @@ fn setup_rig(tag: &str, egress: GatewayEgressPolicy) -> Rig {
         .expect("init G_prod");
         let plan = GatewayPlan {
             egress_policy: egress.clone(),
-            announce: vec![topic.clone()],
+            announce: if excluded {
+                vec![]
+            } else {
+                vec![topic.clone()]
+            },
             ingress: vec![],
         };
         match GatewayRuntime::new(g, plan) {
@@ -184,6 +193,11 @@ fn setup_rig(tag: &str, egress: GatewayEgressPolicy) -> Rig {
     let Some((p_transport, a_clock, gateway_prod, port)) = a else {
         panic!("could not establish G_prod's listening session in 3 attempts");
     };
+    let exclusion = excluded.then(|| {
+        p_transport
+            .exclude_remote_topic(&topic)
+            .expect("producer exclusion")
+    });
     // P's producer publisher creates the topic's SHM data service (G_prod taps it).
     let a_pub = p_transport
         .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
@@ -232,6 +246,7 @@ fn setup_rig(tag: &str, egress: GatewayEgressPolicy) -> Rig {
         gateway_cons,
         b_sub,
         flag,
+        _exclusion: exclusion,
     }
 }
 
@@ -518,4 +533,58 @@ fn suppressed_producer_refuses_get_without_enabling_or_stamping() {
         !rig.flag.load(Ordering::Relaxed),
         "the egress bridge flag must stay disabled under suppression (no egress)"
     );
+}
+
+/// A live local producer cannot be tapped by a separately running open gateway,
+/// even when that gateway already registered its topic and the peer names it.
+#[test]
+fn local_only_producer_refuses_a_real_lan_demand_and_delivers_no_frames() {
+    let mut rig = setup_scoped_rig("local_only", GatewayEgressPolicy::AllowAll, true);
+    rig.gateway_prod
+        .manager()
+        .network()
+        .expect("network")
+        .set_lan_access(cerulion_core::LanAccess::Open);
+    rig.gateway_prod
+        .manager()
+        .network()
+        .expect("network")
+        .set_demand_authorizer(Arc::new(
+            cerulion_core::transport::demand_authorizer::AllowAllAuthorizer,
+        ));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rig.gateway_prod.demand_refusal_count() + rig.gateway_prod.demand_grant_count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no explicit demand refusal reached the peer"
+        );
+        rig.gateway_cons.demand_get_once().expect("real LAN demand");
+    }
+    assert!(
+        rig.gateway_prod.demand_refusal_count() > 0,
+        "an excluded live topic was granted to the LAN peer"
+    );
+    assert!(!rig.flag.load(Ordering::Relaxed));
+    assert!(rig.gateway_prod.manager().remote_access_refusals() > 0);
+    for (stamp, (x, y, z)) in PLAN {
+        rig.a_clock.set(stamp);
+        let mut proxy = rig.a_pub.loan_proxy::<Vector3>().expect("loan");
+        proxy.x = x;
+        proxy.y = y;
+        proxy.z = z;
+    }
+    rig.gateway_prod
+        .drive_once()
+        .expect("drive excluded producer");
+    assert!(rig.gateway_prod.active_tap_topics().is_empty());
+    assert_eq!(rig.gateway_prod.demand_grant_count(), 0);
+    assert!(!rig
+        .b_sub
+        .try_receive_one(|_| panic!("local-only frame reached LAN peer"))
+        .expect("peer receive"));
+    assert!(rig
+        .gateway_prod
+        .catalog_serve_for_test(PROD_ROBOT)
+        .entries
+        .is_empty());
 }

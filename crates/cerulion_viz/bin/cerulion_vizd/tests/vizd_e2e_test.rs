@@ -13581,6 +13581,7 @@ fn a_live_local_run_is_gathered_from_this_managers_namespace_e2e() {
     let _run = RunHandle::publish_on_config(
         &mgr.iox_config(),
         RunRecord {
+            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_700_000_000_000_000_000,
@@ -13860,6 +13861,7 @@ fn a_robot_scoped_runs_request_asks_only_that_robot_e2e() {
     let _run = RunHandle::publish_on_config(
         &mgr.iox_config(),
         RunRecord {
+            remote_visible: true,
             run_id: 0x00d1,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_700_000_000_000_000_000,

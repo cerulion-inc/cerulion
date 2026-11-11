@@ -1006,6 +1006,10 @@ impl GatewayRuntime {
             });
         }
 
+        manager
+            .network()
+            .expect("gateway network checked above")
+            .set_run_scope(Arc::downgrade(&manager));
         // 1. Install the egress posture FIRST (before the watch can flip a flag).
         match &plan.egress_policy {
             GatewayEgressPolicy::AllowAll => manager.bridge_manager().set_egress_allow_all()?,
@@ -1628,13 +1632,13 @@ impl GatewayRuntime {
                     // ~1 kHz drive pass while the observer only re-attaches once
                     // per 200 ms sweep.
                     self.liveness.release_own_tap(topic);
-                    let attached =
-                        self.manager
-                            .create_data_only_subscriber(topic)
-                            .and_then(|tap| {
-                                self.open_egress_lane(topic, flag, tap.buffer_size())?;
-                                Ok(tap)
-                            });
+                    let attached = self
+                        .manager
+                        .create_remote_data_only_subscriber(topic)
+                        .and_then(|tap| {
+                            self.open_egress_lane(topic, flag, tap.buffer_size())?;
+                            Ok(tap)
+                        });
                     match attached {
                         Ok(tap) => {
                             self.record_attach_success(topic);

@@ -1,19 +1,18 @@
 # cerulion_core - agent notes
 
-Core runtime: wire format, codegen, iceoryx2 transport, scheduler/level executor, graph
-runtime, gateway plane; 260+ test binaries with per-binary serial rules.
+Wire/codegen, iceoryx2, scheduler/graph and gateway runtime; 260+ binaries have per-binary serial rules.
 
 ## Invariants
+- Excluded producers hold guards before data ports; remote taps, mirrors and announces retain opposite leases until withdrawal. Remote metadata uses `collect_remote_run_entries`: v2 private/v1 public, local accepts both; hide private ids and counts. No frame-path checks.
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
-- Any change to a generated-cdylib FFI signature or error-code meaning bumps
-  `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
+- FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs;
+  the loader also refuses a differing `RUSTC_FINGERPRINT`.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
-- Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
-  strings and bytes ride variable fields via the offset table, the slot is the backing.
+- No pointer-bearing raw SHM types (`String`, `Vec`, `HashMap`); strings/bytes use
+  variable-field offsets backed by the slot.
 - Wire `sequence` is consumed at COMMIT (`OutputProxy::Drop`), never at loan: a discarded
   loan burns no sequence, so streams stay gap-free.
 - A publisher drains its OWN event listener on every notifying path (iceoryx2 delivers
@@ -22,8 +21,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   totals log as `total_failures=`, site keys as `topic=`/`service=`.
 - Sync fires ONCE PER COMPLETE ALIGNED SET, each trigger consumed by at most one set; verdicts
   from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
-- Graph YAML denies unknown fields - a typo'd key is a loud parse error, never a silent
-  default; a new field needs round-trip + rejection oracle arms.
+- Graph YAML denies unknown fields loudly; new fields need round-trip and rejection oracles.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
@@ -32,9 +30,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
-- Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
-  graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
-  a string literal (a removed dash lowers the file's ledger line).
+- `check_public_surface.sh`: in-code graphs belong in tests, including this crate's examples;
+  no shipped tracker ids/typographic dashes. Never bulk-edit strings; removed dashes lower ledgers.
 
 ## Testing
 

@@ -45,13 +45,13 @@ workspace; `go2`: the quadruped demo. Each is standalone (own manifest + lockfil
   the schema to the vendor docs: decoding stops.
 
 ## Publication checks
-- Go2 DDS clouds publish complete payloads or count a dropped write; never trim data while
-  keeping the old geometry. Decoded variable-size payloads use the size-aware setter so a
-  small adaptive loan is not a false ceiling (`bridge_publish_test`).
+- Go2 DDS clouds publish complete payloads or count drops; geometry stays consistent. Use
+  size-aware setters for variable payloads (`bridge_publish_test`). Raw routes retain local
+  scope through publisher lifetime and skip private egress registration.
 - Go2 TF fixed geometry and encoder buffers are built at construction and reused each tick;
   encoding stays in `go2_tf`, never in node-local byte offsets. A codec boundary may need
   owned memory: document each application copy apart from local SHM delivery.
-- Generated-data examples fill payload loans directly: width, height, step, encoding and data
+- Generated images fill payload loans directly: width, height, step, encoding and data
   length agree, every loaned byte is initialized, advertised outputs reach a subscriber. Label
   generated images and teaching detectors as synthetic; the perception twin keeps
   byte-identical `algorithm.rs`/`tests.rs` copies, differing from the detector in one constant.

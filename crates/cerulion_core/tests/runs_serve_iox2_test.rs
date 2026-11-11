@@ -167,6 +167,7 @@ fn write_run_dir(dir: &Path, graph_yaml: &str, run_json: &str) {
 /// names an exact value.
 fn record_at(run_id: u128, graph_name: &str, started_at_ns: u64, dir: &Path) -> RunRecord {
     RunRecord {
+        remote_visible: true,
         run_id,
         supervisor_pid: std::process::id(),
         run_started_at_ns: started_at_ns,
@@ -381,11 +382,8 @@ fn a_gather_that_cannot_hear_a_live_writer_never_claims_the_machine_is_idle() {
             live_writers,
             writers_heard,
         } => {
-            assert!(
-                live_writers >= 1,
-                "the registry service reports the silent publisher live"
-            );
-            assert_eq!(writers_heard, 0, "it never answered");
+            assert_eq!(live_writers, 0, "unknown writers may be private");
+            assert_eq!(writers_heard, 0, "remote aggregate counts are withheld");
         }
         RunsCompleteness::Settled => panic!(
             "an empty answer with a live-but-unheard writer must NOT be settled — that is a \
@@ -447,12 +445,8 @@ fn a_gather_that_could_not_run_at_all_is_neither_a_refusal_nor_an_absence_claim(
         "a FAULT is not a refusal — the `error` field means 'the robot refused you', and \
          reporting a fault there would point an operator at their own credentials"
     );
-    // EXACTLY `not_established` — and that exact shape is what tells this arm
-    // apart from the unheard-writer one. A gather that RAN with a live publisher
-    // present reports `live_writers >= 1` (the precondition above proves one is
-    // live), so `live_writers: 0` is reachable only when no gather happened at
-    // all. Without this the two failure paths are indistinguishable and the arm
-    // would pass on either.
+    // A failed gather and an unknown writer both withhold aggregate counts:
+    // neither establishes an idle machine or reveals a private writer.
     assert_eq!(
         reply.completeness,
         RunsCompleteness::not_established(),

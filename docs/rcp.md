@@ -12,6 +12,8 @@ agent drives this way, with a recording that replays with no agent. Its demo
 script expects an [ASPIRE](https://github.com/NVlabs/ASPIRE) embodiment that is
 not yet published; the plant and the replay run from this repository alone.
 
+Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep their graph, state and tool journal local. Remote requests are refused before reaching those topics; configured external eye requests also respect this scope. Local observation and tool calls remain available. Emergency-stop operations remain available independently of network scope.
+
 ## Run it
 
 ```bash
