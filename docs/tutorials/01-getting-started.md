@@ -852,9 +852,13 @@ one group contained to its own process.
 >   `source:`. Nothing is misspelled: in a multi-process run each worker sees only
 >   its own part of the graph, so its upstream looks external to it.
 > - `WARN network egress OPEN BY DEFAULT`: with no `network:` block, the topics
->   are visible to other Cerulion machines on your LAN. `--network off` keeps a
->   run local-only. The first networked run also starts the shared `cerulion-netd`
->   daemon and says so; it exits by itself when idle.
+>   are open to every machine on your LAN, with no peer authentication.
+>   `--network off` turns off only this run's own gateway; while `cerulion-netd`
+>   serves the LAN it still sends a live local topic to a LAN peer that names it.
+>   To refuse every LAN peer, set `CERULION_LAN_ACCESS=paired` for every Cerulion
+>   command and daemon and restart a running `cerulion-netd`. The first networked
+>   run also starts the shared `cerulion-netd` daemon and says so; it exits by
+>   itself when idle.
 
 Leave it running and open a second terminal.
 

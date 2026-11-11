@@ -69,7 +69,7 @@ Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-c
 - **Flashback when you forgot to record.** Save the moments before and after a failure from a rolling in-memory history, then inspect the incident or replay its recorded topics.
 - **Your robots, wherever they are.** Automatic account-based pairing connects owned and shared robots, with access grants controlling authenticated pub/sub. Discover nearby robots with mDNS; reach remote ones through Iroh hole punching or a relay.
 - **A path from ROS 2.** Run an existing stack through `rmw_cerulion`, attach to one already running, or combine ROS 2 processes and native nodes in the same graph.
-- **Tools your coding agent can use.** Cerulion MCP exposes graph, node, topic, recording and replay operations. Hindsight investigates recordings with evidence tied to topics and timestamps.
+- **Tools your coding agent can use.** Cerulion MCP gives an agent tools for analyzing MCAP recordings, and Hindsight investigates recordings with evidence tied to topics and timestamps.
 - **One workflow across machines.** Native single- and multi-process execution on Linux and macOS, with LAN topic delivery and remote data mirrored locally for your tools.
 
 ## Install
@@ -191,7 +191,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
-By default a run is visible to other machines on your network, so the CLI on another computer can find it; the log says so when the run starts. Add `--network off` to keep a run on this machine.
+By default a run is open to every machine on your LAN, so the CLI on another computer can find and read it: LAN peers are not authenticated and the default `tcp/` carrier is not encrypted. The log says so when the run starts. `--network off` turns off only this run's own gateway; while `cerulion-netd` serves the LAN, a LAN peer that names a live topic of any local run is still sent it. To refuse every LAN peer on this machine, set `CERULION_LAN_ACCESS=paired` in the environment of every Cerulion command and daemon, and restart a `cerulion-netd` that is already running.
 
 In a second terminal, watch the controller react:
 
@@ -415,12 +415,12 @@ Re-execution uses the capture's execution trace and any state anchors its starti
 
 Guides: [Flashback](docs/flashback.md) · [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay) · [Bags and replay](docs/bag.md)
 
-## Give your agent access to the robot
+## Tools for your coding agent
 
 <details>
 <summary>Cerulion MCP and Hindsight: tools for your coding agent</summary>
 
-**Cerulion MCP** gives Claude Code, Codex and other MCP clients tools for graphs, nodes, topics, robots, recordings, Flashback and replay verification. An agent can inspect live data, rebuild a node and re-run a captured recording.
+**Cerulion MCP** gives Claude Code, Codex and other MCP clients tools for analyzing MCAP recordings served over `https://`. The hosted endpoint has no local workspace tools: build, run and inspect nodes and topics with the `cerulion` CLI.
 
 **Hindsight** investigates MCAP recordings with answers grounded in specific topics and timestamps.
 
