@@ -10,6 +10,10 @@
 //!   resumes, and the release touches that slot only;
 //! - after a timeout release, a FIFO consumer that resumes between two
 //!   publishes receives every frame published after the release;
+//! - after a timeout release, a send that reaches no queue takes its count
+//!   back through the real publisher and restores the forgiven backlog that
+//!   count clamped, and the next frame is delivered; the drains of forgiven
+//!   frames report no clip, one frame at a time or in one read;
 //! - after a timeout release, a frame the release forgave that the per-set
 //!   Sync matcher moves into a slot (the trigger fill or refill, the
 //!   descent's peek) stays forgiven, a skipped forgiven head refilled with a
@@ -71,6 +75,7 @@ use cerulion_core::graph::{BuildPurpose, CrossProcessWiring, GraphRuntime};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::scheduler::BackpressureCounters;
+use cerulion_core::transport::publisher::BlockSendHook;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
@@ -867,6 +872,180 @@ fn frames_published_after_a_timeout_release_are_never_evicted() {
         "every frame published after the release is received"
     );
     assert_eq!(local.outstanding(), 0, "the drains emptied the slot");
+}
+
+/// One `block` input over a real depth-2 iceoryx2 queue on its own SHM root,
+/// whose probe drains through `word`, and a publisher on its topic that counts
+/// every frame on `word` before the send, as the publisher of a `block`
+/// producer does. With `fifo` each read pops one frame, as a FIFO input's
+/// does; without it a read drains the queue and keeps the newest frame.
+fn counting_edge(
+    tag: &str,
+    word: &CreditWord,
+    fifo: bool,
+) -> (Arc<TransportManager>, CerulionPublisher, CerulionSubscriber) {
+    let mgr = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: format!("bsr_counted_{tag}"),
+            clock: Arc::new(VirtualClock::new()),
+            subscriber_buffer_size: 2,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("per-test SHM transport");
+    let topic = format!("bsr_counted_{tag}");
+    let mut publisher = mgr
+        .create_publisher(&topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+        .expect("publisher");
+    publisher.register_block_outstanding_for_test(word.clone());
+    let mut sub = mgr.create_subscriber(&topic).expect("subscriber");
+    sub.register_block_probe_for_test(
+        word.clone(),
+        2,
+        Arc::new(BackpressureCounters::new()),
+        Arc::from("inp"),
+        2,
+    );
+    if fifo {
+        sub.mark_fifo_consume_for_test();
+    }
+    (mgr, publisher, sub)
+}
+
+/// Publish one `Vector3` carrying `x` through `publisher`'s typed publish.
+fn publish_x(publisher: &mut CerulionPublisher, x: u32) {
+    let mut p = publisher.loan_proxy::<Vector3>().expect("loan");
+    p.x = f64::from(x);
+    drop(p);
+}
+
+/// One read of a `Vector3` input: the `x` it served, if any.
+fn read_x(sub: &mut CerulionSubscriber) -> Option<u32> {
+    sub.try_view::<Vector3, u32>(|v| v.x as u32)
+        .expect("the read does not fail")
+}
+
+/// `(outstanding, forgiven)`: the two counts a slot's gate and its forgiven
+/// backlog read.
+fn counts(word: &CreditWord) -> (u64, u64) {
+    (word.outstanding(), word.forgiven())
+}
+
+/// A send that reaches no queue on a forgiven LOCAL word takes its count back
+/// and restores the forgiven backlog that count clamped, through the real
+/// publisher and a real depth-2 queue, and the next frame is delivered and
+/// stays counted until it is read.
+///
+/// Oracle, by hand, as `(outstanding, forgiven)`, frames `x = 1, 2, ...` in
+/// publish order: frames 1 and 2 are published (2, 0) and the timeout release
+/// forgives them (0, 2). Frame 3's send is refused after its count
+/// (`BlockSendHook::FailNextSend`) and the word reads (0, 2) again. The
+/// consumer reads frame 1 (0, 1), frame 4 is published (1, 1), the consumer
+/// reads frame 2, the last forgiven frame (1, 0), and then frame 4 (0, 0); no
+/// drain clipped. A take-back that only subtracted the queued count would
+/// leave (0, 1) after frame 3, the read of frame 2 would take frame 4's count,
+/// and the read of frame 4 would clip.
+#[test]
+fn a_failed_send_on_a_forgiven_local_word_restores_its_backlog() {
+    let word = CreditWord::local(2);
+    let (_mgr, mut publisher, mut sub) = counting_edge("undo_forgiven", &word, true);
+    publish_x(&mut publisher, 1);
+    publish_x(&mut publisher, 2);
+    assert_eq!(
+        counts(&word),
+        (2, 0),
+        "the publisher counted frames 1 and 2"
+    );
+    assert_eq!(
+        word.forgive_outstanding(),
+        2,
+        "the timeout release forgives both"
+    );
+    assert_eq!(counts(&word), (0, 2));
+
+    publisher.set_block_send_hook_for_test(BlockSendHook::FailNextSend);
+    publish_x(&mut publisher, 3);
+    assert_eq!(
+        counts(&word),
+        (0, 2),
+        "frame 3 reached no queue: its take-back restores the backlog its count clamped"
+    );
+
+    assert_eq!(read_x(&mut sub), Some(1), "frame 1");
+    assert_eq!(counts(&word), (0, 1));
+    publish_x(&mut publisher, 4);
+    assert_eq!(counts(&word), (1, 1), "frame 4 is counted");
+    assert_eq!(
+        read_x(&mut sub),
+        Some(2),
+        "frame 2, the last forgiven frame"
+    );
+    assert_eq!(counts(&word), (1, 0), "frame 4 is still counted");
+    assert_eq!(read_x(&mut sub), Some(4), "frame 4 is delivered");
+    assert_eq!(counts(&word), (0, 0));
+    assert_eq!(read_x(&mut sub), None, "and nothing else is queued");
+    assert_eq!(sub.block_drains_clipped(), 0, "no drain clipped");
+}
+
+/// After a timeout release, the consumer's drains of the frames the release
+/// forgave pay the forgiven backlog and report no clip: each forgiven frame was
+/// counted when it was sent, so its drain removes no frame its word never
+/// counted.
+///
+/// Oracle, by hand, on depth-2 local words over real depth-2 queues, as
+/// `(outstanding, forgiven)`. A FIFO input: frames 1 and 2 are published and
+/// released (0, 2), and the reads of frame 1 and frame 2 leave (0, 1) and
+/// (0, 0). An input whose read drains the queue: frames 1 and 2 are published
+/// and released (0, 2), frame 3 is published and evicts frame 1 (1, 1), and
+/// one read removes frames 2 and 3, one forgiven and one counted, and serves
+/// frame 3 (0, 0). `block_drains_clipped()` reads 0 after every drain. A clip
+/// reckoned against the counted frames alone would count each of those
+/// drains as a clip.
+#[test]
+fn a_drain_of_forgiven_frames_reports_no_clip() {
+    let fifo = CreditWord::local(2);
+    let (_fifo_mgr, mut publisher, mut sub) = counting_edge("noclip_fifo", &fifo, true);
+    publish_x(&mut publisher, 1);
+    publish_x(&mut publisher, 2);
+    assert_eq!(
+        fifo.forgive_outstanding(),
+        2,
+        "the release forgives frames 1 and 2"
+    );
+    assert_eq!(read_x(&mut sub), Some(1));
+    assert_eq!(counts(&fifo), (0, 1));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        0,
+        "the drain of forgiven frame 1 pays the backlog and clips nothing"
+    );
+    assert_eq!(read_x(&mut sub), Some(2));
+    assert_eq!(counts(&fifo), (0, 0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        0,
+        "and so does the drain of forgiven frame 2"
+    );
+
+    let latest = CreditWord::local(2);
+    let (_latest_mgr, mut publisher, mut sub) = counting_edge("noclip_latest", &latest, false);
+    publish_x(&mut publisher, 1);
+    publish_x(&mut publisher, 2);
+    assert_eq!(latest.forgive_outstanding(), 2);
+    publish_x(&mut publisher, 3);
+    assert_eq!(counts(&latest), (1, 1), "frame 3 evicted forgiven frame 1");
+    assert_eq!(
+        read_x(&mut sub),
+        Some(3),
+        "the read drains frames 2 and 3 and serves the newest"
+    );
+    assert_eq!(counts(&latest), (0, 0));
+    assert_eq!(
+        sub.block_drains_clipped(),
+        0,
+        "a drain of a forgiven frame and a counted one clips nothing"
+    );
 }
 
 /// One operation of a hand-driven walk over the two slots of a per-set Sync

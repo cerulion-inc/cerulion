@@ -2711,6 +2711,72 @@ mod tests {
         }
     }
 
+    /// A drain splits the frames it removed three ways: the forgiven backlog
+    /// it paid, the queued frames it took off, and the frames it clipped past
+    /// both. Held frames take no part. Oracle vectors, by hand, as `(queued,
+    /// backlog, held, removed) -> (paid, clipped, counts after)`:
+    ///
+    /// - `(0, 2, 0, 3) -> (2, 1, (0, 0, 0))`: the backlog, then one frame past it;
+    /// - `(0, 2, 0, 1) -> (1, 0, (0, 1, 0))`: a drain of a forgiven frame is no clip;
+    /// - `(1, 0, 1, 2) -> (0, 1, (0, 0, 1))`: a held frame does not mask a clip;
+    /// - `(2, 0, 0, 1) -> (0, 0, (1, 0, 0))`;
+    /// - `(3, 0, 0, 0) -> (0, 0, (3, 0, 0))`: an idle drain changes nothing;
+    /// - `(3, 0, 0, u64::MAX) -> (0, u64::MAX - 3, (0, 0, 0))`: past
+    ///   `u32::MAX`, where the queued subtraction saturates.
+    ///
+    /// A local word's `record_drained_to_empty` returns the same split, read
+    /// off the drain half of its RMW, and then zeroes the queued count and the
+    /// backlog it finds left; the held frame stays.
+    #[test]
+    fn a_drain_reports_what_it_paid_and_what_it_clipped() {
+        let counts = |queued, backlog, held| Counts {
+            queued,
+            backlog,
+            held,
+            held_forgiven: 0,
+        };
+        let vectors: [(Counts, u64, u64, u64, Counts); 6] = [
+            (counts(0, 2, 0), 3, 2, 1, counts(0, 0, 0)),
+            (counts(0, 2, 0), 1, 1, 0, counts(0, 1, 0)),
+            (counts(1, 0, 1), 2, 0, 1, counts(0, 0, 1)),
+            (counts(2, 0, 0), 1, 0, 0, counts(1, 0, 0)),
+            (counts(3, 0, 0), 0, 0, 0, counts(3, 0, 0)),
+            (counts(3, 0, 0), u64::MAX, 0, u64::MAX - 3, counts(0, 0, 0)),
+        ];
+        for (before, removed, paid, clipped, after) in vectors {
+            let w = CreditWord::local(4);
+            w.counts.store(before.pack(), Ordering::Release);
+            assert_eq!(
+                w.record_drained(removed),
+                Drained { paid, clipped },
+                "a drain of {removed} on {before:?}"
+            );
+            assert_eq!(
+                counts_of(&w),
+                after,
+                "leaves {after:?} (a drain of {removed} on {before:?})"
+            );
+
+            let emptied = CreditWord::local(4);
+            emptied.counts.store(before.pack(), Ordering::Release);
+            assert_eq!(
+                emptied.record_drained_to_empty(removed),
+                Drained { paid, clipped },
+                "a drain of {removed} to empty on {before:?} splits as the drain alone does"
+            );
+            assert_eq!(
+                counts_of(&emptied),
+                Counts {
+                    queued: 0,
+                    backlog: 0,
+                    ..after
+                },
+                "and the resync zeroes the queued count and the backlog (a drain of {removed} \
+                 to empty on {before:?})"
+            );
+        }
+    }
+
     /// Two clones of one LOCAL word are one word — the property every wiring
     /// site depends on (the publisher's increment and the subscriber's drain
     /// hold separate clones of the same handle).
