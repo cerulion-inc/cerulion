@@ -24,8 +24,12 @@ fusion remains the fastest path.
 > its barrier, are outside Semantic Versioning and may change or be removed in a
 > 2.x minor release. A multi-process run already free-runs by default. To order
 > a split edge between two nodes on the same level, mark the edge
-> `#[input(trigger)]` or co-locate both nodes in one `process_groups:` group; to
-> keep every node in one process, run `cerulion graph run --single-process`.
+> `#[input(trigger)]` on a data-triggered consumer (the macro refuses it beside
+> `period_ms`), or co-locate both nodes in one `process_groups:` group that runs
+> as one executor unit (`cerulion graph plan` shows the units; a
+> `graphs/<NAME>.costs.yaml` profile or an `isolate: true` node can split a
+> group, and a plain `#[input]` between two units is not ordered); to keep every
+> node in one process, run `cerulion graph run --single-process`.
 > Replaying a bag stamped `coordination: lockstep` is not deprecated. See
 > [Multi-process execution](user-api.md#multi-process-execution).
 

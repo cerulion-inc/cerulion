@@ -37,7 +37,7 @@ deterministic on its own recorded boundary stream rather than against the
 other's. The deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out adds the
 shared level-boundary barrier, the mode that does order the publish before the
 read across a process split. Co-locating both nodes in one `process_groups:`
-group, or running `--single-process`, keeps the edge inside one rank instead;
+group, or running `--single-process`, keeps the edge inside one rank instead while that process runs as one executor unit (no `graphs/obstacle_avoidance.costs.yaml` profile and no `isolate: true` node; `cerulion graph plan obstacle_avoidance` shows the units);
 these are the supported fixes. See
 "Scope of the data guarantee" in `docs/multi_process.md`.
 
