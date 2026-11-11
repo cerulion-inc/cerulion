@@ -83,8 +83,13 @@ fn stable_bridge_raw_ingress_delivers_exact_frame_with_host_clock() {
     std::env::set_var(dds_bridge::config::CONFIG_ENV, config.path());
     let _env = EnvGuard;
     let mut source = entry.external_source().expect("stable external descriptor");
-    assert!(matches!(source, ExternalSource::Blocking(_) | ExternalSource::Fd(_)), "bridge must expose its real DDS helper");
-    if let ExternalSource::Blocking(step) = &mut source { let _ = step(); }
+    assert!(
+        matches!(source, ExternalSource::Blocking(_) | ExternalSource::Fd(_)),
+        "bridge must expose its real DDS helper"
+    );
+    if let ExternalSource::Blocking(step) = &mut source {
+        let _ = step();
+    }
     let participant =
         Go2Participant::new(&ParticipantConfig::new(domain, Vec::new())).expect("local DDS peer");
     let mut node = participant
@@ -111,7 +116,9 @@ fn stable_bridge_raw_ingress_delivers_exact_frame_with_host_clock() {
                 z: 3.25,
             })
             .expect("real DDS publish");
-        if let ExternalSource::Blocking(step) = &mut source { let _ = step(); }
+        if let ExternalSource::Blocking(step) = &mut source {
+            let _ = step();
+        }
         entry
             .tick()
             .expect("ordinary ticks remain admitted during raw ingress");

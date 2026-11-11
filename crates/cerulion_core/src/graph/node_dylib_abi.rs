@@ -71,6 +71,8 @@ pub struct DylibNodeEntry {
     maintenance: FailureRegimeLatch,
     snapshot_errors: FailureRegimeLatch,
     head_errors: FailureRegimeLatch,
+    probe_errors: Vec<(String, FailureRegimeLatch)>,
+    unknown_probe_errors: FailureRegimeLatch,
     external_errors: FailureRegimeLatch,
 }
 
@@ -190,6 +192,13 @@ impl DylibNodeEntry {
             }
             ports.push(port_spec(fact, LeaseDirection::Write, abi::read_mode::ONE).map_err(error)?);
         }
+        // One preallocated row per declared input keeps probe regimes independent
+        // without allocating during publish, receive or scheduler maintenance.
+        let probe_errors = info
+            .input_meta()
+            .iter()
+            .map(|port| (port.name.clone(), FailureRegimeLatch::new()))
+            .collect();
         let mut entry = Self {
             library: Some(library),
             instance: None,
@@ -208,6 +217,8 @@ impl DylibNodeEntry {
             maintenance: FailureRegimeLatch::new(),
             snapshot_errors: FailureRegimeLatch::new(),
             head_errors: FailureRegimeLatch::new(),
+            probe_errors,
+            unknown_probe_errors: FailureRegimeLatch::new(),
             external_errors: FailureRegimeLatch::new(),
         };
         entry.shape = entry.query_state_shape();
@@ -218,6 +229,12 @@ impl DylibNodeEntry {
             .as_ref()
             .expect("library retained for entry lifetime")
             .api()
+    }
+    /// Test support for exercising real host admission refusals.
+    #[doc(hidden)]
+    pub fn __test_host_context_handle(&self) -> Option<u64> {
+        // Tests hold this context's actual lock; no foreign pointer is exposed.
+        self.context
     }
     // hot-path-alloc-ok-fn: invalid lifecycle admission allocates only on refusal
     fn handle(&self) -> TransportResult<abi::NodeHandle> {
@@ -417,7 +434,7 @@ fn port_spec(
 fn state_failure_code(status: abi::Status) -> i32 {
     match status.code {
         abi::status_code::BUFFER_TOO_SMALL => -6,
-        abi::status_code::PANICKED => -7,
+        abi::status_code::PANICKED => -4,
         abi::status_code::INVALID_HANDLE => -2,
         abi::status_code::INVALID_ARGUMENT => -3,
         _ => -5,
@@ -670,16 +687,27 @@ impl NodeEntry for DylibNodeEntry {
         result.unwrap_or((0, None))
     }
     fn sync_head_op(&mut self, name: &str, op: SyncHeadOp) -> SyncOpAnswer {
-        let answer = host::with_context(self.context.unwrap_or(0), |ctx| {
+        let result = host::with_context(self.context.unwrap_or(0), |ctx| {
             ctx.runtime_sync_head_op(name, op)
-        })
-        .unwrap_or(SyncOpAnswer::Failed);
-        observe(
-            &self.label,
-            "sync head",
-            &mut self.head_errors,
-            answer == SyncOpAnswer::Failed,
-        );
+        });
+        let code = result
+            .as_ref()
+            .err()
+            .map_or(abi::status_code::FAILED, |error| error.status);
+        let answer = result.unwrap_or(SyncOpAnswer::Failed);
+        if answer == SyncOpAnswer::Failed {
+            match self.head_errors.on_failure() {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                    tracing::error!(node = %self.label, input = %name, op = ?op, code, total_failures = self.head_errors.total_failures(), "cdylib sync_head_op FFI call failed; the per-set Sync alignment pass ends here — no set member fabricated (suppressing further to debug until it recovers)");
+                    // dash-ok: native sync failure text kept byte-identical
+                }
+                RegimeDecision::Suppressed { .. } => {
+                    tracing::debug!(node = %self.label, input = %name, op = ?op, code, "cdylib sync_head_op still failing (suppressed)");
+                }
+            }
+        } else if self.head_errors.on_success().is_some() {
+            tracing::info!(node = %self.label, input = %name, "cdylib sync_head_op recovered");
+        }
         answer
     }
     fn supports_sync_head_ops(&self) -> bool {
@@ -689,7 +717,32 @@ impl NodeEntry for DylibNodeEntry {
         true
     }
     fn probe_trigger_input(&mut self, name: &str) -> TriggerProbe {
-        match self.sync_head_op(name, SyncHeadOp::ProbeNext) {
+        let result = host::with_context(self.context.unwrap_or(0), |ctx| {
+            ctx.runtime_sync_head_op(name, SyncHeadOp::ProbeNext)
+        });
+        let code = result
+            .as_ref()
+            .err()
+            .map_or(abi::status_code::FAILED, |error| error.status);
+        let answer = result.unwrap_or(SyncOpAnswer::Failed);
+        let latch = self
+            .probe_errors
+            .iter_mut()
+            .find(|(input, _)| input == name)
+            .map_or(&mut self.unknown_probe_errors, |(_, latch)| latch);
+        if !matches!(answer, SyncOpAnswer::Present | SyncOpAnswer::Nothing) {
+            match latch.on_failure() {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                    tracing::error!(node = %self.label, input = %name, code, total_failures = latch.total_failures(), "cdylib consume = latest body probe got no answer (op code 0 of cerulion_node_sync_head_op failed or answered a kind this host does not know); this input fires on every arrival its trigger subscriber counts, including a frame an earlier read already took, until the probe answers (suppressing further to debug until it recovers)");
+                }
+                RegimeDecision::Suppressed { .. } => {
+                    tracing::debug!(node = %self.label, input = %name, code, "cdylib consume = latest body probe still failing (suppressed)");
+                }
+            }
+        } else if latch.on_success().is_some() {
+            tracing::info!(node = %self.label, input = %name, "cdylib consume = latest body probe recovered");
+        }
+        match answer {
             SyncOpAnswer::Present => TriggerProbe::Unread,
             SyncOpAnswer::Nothing => TriggerProbe::Empty,
             _ => TriggerProbe::Unknown,
@@ -952,6 +1005,27 @@ unsafe extern "C" fn sink_write(context: *mut u8, bytes: abi::Bytes) -> abi::Sta
 #[cfg(not(feature = "local-transport"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_failure_codes_preserve_the_native_export_contract() {
+        for (code, native) in [
+            (abi::status_code::BUFFER_TOO_SMALL, -6),
+            (abi::status_code::PANICKED, -4),
+            (abi::status_code::INVALID_HANDLE, -2),
+            (abi::status_code::INVALID_ARGUMENT, -3),
+            (abi::status_code::FAILED, -5),
+        ] {
+            assert_eq!(
+                state_failure_code(abi::Status {
+                    code,
+                    error: 0,
+                    kind: 0,
+                }),
+                native
+            );
+        }
+    }
+
     #[test]
     fn only_tick_panics_have_the_structural_tick_panic_class() {
         let entry = DylibNodeEntry::load(&crate::testing::find_fixture_cdylib("test_node_cdylib"))
@@ -982,7 +1056,7 @@ mod tests {
                 assert!(matches!(error, TransportError::NodeError { .. }));
             }
             if phase == Phase::Init {
-                assert!(error.to_string().contains("init failed: "));
+                assert!(error.to_string().contains("init failed: ")); // hot-path-alloc-ok: cold test-only assertion formats a diagnostic, never publish or receive.
             }
         }
     }

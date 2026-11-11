@@ -1501,6 +1501,10 @@ fn a_panicking_state_encoder_fails_its_own_capture_without_poisoning_the_cdylibs
         refusal.contains("encoder panicked"),
         "names what happened, not merely that something did: {refusal}"
     );
+    assert!(
+        refusal.contains("(code -4)"),
+        "preserves the native encoder panic code: {refusal}"
+    );
 
     // And the node that panicked is not itself dead: it captures again as soon
     // as its encoder does.
@@ -1544,6 +1548,10 @@ fn a_panicking_state_decoder_fails_its_own_restore_without_poisoning_the_cdylibs
     assert!(
         refusal.contains("decoder panicked"),
         "names what happened, not merely that something did: {refusal}"
+    );
+    assert!(
+        refusal.contains("(code -4)"),
+        "preserves the native decoder panic code: {refusal}"
     );
     assert!(
         refusal.contains("PARTIALLY restored"),

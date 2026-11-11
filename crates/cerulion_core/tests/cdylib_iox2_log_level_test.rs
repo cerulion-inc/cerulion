@@ -598,11 +598,6 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// * `cerulion_macros/src/codegen.rs` — that is the generator (its emitted
 ///   init carries the call), pinned behaviorally by
 ///   `cdylib_defaults_to_error_not_iceoryx2s_info`.
-/// * `test_fixtures/**` — fixtures are minimal raw-FFI probes; requiring the
-///   call in all of them would change what they pin. `test_node_cdylib` carries
-///   it deliberately (it IS the raw-FFI behavioral vehicle above), and
-///   `test_node_raw_ffi_template_cdylib` carries it because it is the
-///   byte-for-byte emit of the scaffolding template, which does.
 /// * this test file — it holds the definition probe as a string literal, which
 ///   comment-stripping cannot remove, so the walk still sees itself. It defines
 ///   no cdylib and no init; excluding it explicitly (and asserting the walk
@@ -616,9 +611,8 @@ fn every_hand_written_cdylib_init_applies_the_iox2_log_level() {
 
     /// Paths (relative to the workspace root, `/`-separated) whose hand-written
     /// init is out of scope. A directory prefix ends with `/`.
-    const EXCLUSIONS: [&str; 3] = [
+    const EXCLUSIONS: [&str; 2] = [
         "crates/cerulion_macros/src/codegen.rs",
-        "crates/test_fixtures/",
         "crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs",
     ];
 
