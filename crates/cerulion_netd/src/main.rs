@@ -86,7 +86,7 @@ ENVIRONMENT:
     CERULION_NETD_IDLE_GRACE_MS  Idle grace before self-exit, in ms (default 30000).
     CERULION_NETD_HARD_EXIT_MS   Deadline for graceful shutdown before the daemon
                                  HARD-exits (nonzero) to avoid a zombie, in ms
-                                 (default 5000). A robot daemon also budgets
+                                 (default 5000). A WAN daemon also budgets
                                  CERULION_REMOTED_HARD_EXIT_MS (default 30000),
                                  a 500 ms margin, and
                                  CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S.
@@ -443,7 +443,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown() returns well within the deadline, `main` returns, and the process
     // exits normally before the watchdog fires. The deadline includes the robot
     // supervisor's stop grace, during which its shutdown can wait for a running
-    // revocation fetch.
+    // revocation fetch. Reserve it even before endpoint ownership: an accepted
+    // registration can still be booting while shutdown waits for its mutex.
     let supervisor_grace = supervised_egress
         .as_ref()
         .map_or(Duration::ZERO, |plane| plane.stop_grace());
@@ -509,7 +510,7 @@ fn lifecycle_status_line(standing_gateway: bool) -> &'static str {
 }
 
 /// The watchdog deadline for a shutdown: the robot supervisor's stop grace
-/// (zero without a supervisor), during which its stop may wait for a running
+/// (zero without WAN serving), during which its stop may wait for a running
 /// revocation fetch, plus the hard-exit deadline for the rest of teardown.
 fn shutdown_deadline(hard_exit: Duration, supervisor_grace: Duration) -> Duration {
     hard_exit + supervisor_grace

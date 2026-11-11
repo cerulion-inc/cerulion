@@ -11,7 +11,7 @@
 //!
 //! # Who uses it
 //!
-//! Users install it with `cargo install --locked cerulion_cli cerulion_netd cerulion_remoted` and
+//! Users install it with `cargo install --locked cerulion_cli cerulion_netd` and
 //! normally never start it by hand: the first command that needs a remote topic
 //! spawns it detached through [`NetdClient`]. The first egress registration also
 //! starts the owned authenticated remote server, without a LISTEN locator. Its
@@ -21,6 +21,9 @@
 //! `cerulion-netd --help` lists every environment variable. Library consumers (the
 //! CLI engine, the visualization daemon, the recorder) use [`NetdClient`] to
 //! connect, demand a topic and query the catalog.
+//! Automatic serving needs `cerulion-remoted` beside `cerulion-netd`: the release
+//! installer and Debian package place it. From a source checkout, install it with
+//! `cargo install --locked --path crates/cerulion_remoted`.
 //!
 //! # Modules
 //!

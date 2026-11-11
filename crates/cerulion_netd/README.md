@@ -14,12 +14,16 @@ the recording guide.
 ## Install
 
 ```bash
-cargo install --locked cerulion_cli cerulion_netd cerulion_remoted
+cargo install --locked cerulion_cli cerulion_netd
 ```
 
 The release installer and the Homebrew and Debian packages already place
 `cerulion-netd` beside the `cerulion` binary; see the
 [installation guide](https://docs.cerulion.com/cerulion/installation).
+
+Automatic serving needs `cerulion-remoted` beside `cerulion-netd`: the release
+installer and Debian package place it. From a source checkout, install it with
+`cargo install --locked --path crates/cerulion_remoted`.
 
 ## Running it
 
