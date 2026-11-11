@@ -792,67 +792,84 @@ fn accumulator_repeat_views_and_state_use_native_order_and_exact_bytes() {
 }
 #[test]
 fn accumulator_restore_refusals_preserve_frames_and_counters() {
-    let h = Harness::new(vector_layout(), Some(1), 2);
-    h.publish([10.0, 20.0, 30.0]);
-    collect(&h);
-    let baseline = canonical_state(&[oracle_frame(0, 777, [10.0, 20.0, 30.0])], 0, 0);
-    let mut wrong_name = baseline.clone();
-    wrong_name[4] = b'x';
-    let mut wrong_counters = baseline.clone();
-    wrong_counters[14..22].copy_from_slice(&1u64.to_le_bytes());
-    let mut wrong_schema = baseline.clone();
-    wrong_schema[30] ^= 1;
-    let mut trailing = baseline.clone();
-    trailing.push(0);
-    let over_capacity = canonical_state(
-        &[
-            oracle_frame(0, 777, [1.0, 2.0, 3.0]),
-            oracle_frame(1, 777, [4.0, 5.0, 6.0]),
-        ],
-        0,
-        0,
-    );
-    let truncated = baseline[..baseline.len() - 1].to_vec();
-    for refused in [
-        wrong_name,
-        wrong_counters,
-        wrong_schema,
-        trailing,
-        over_capacity,
-        truncated,
-    ] {
+    for _ in 0..2 {
+        let h = Harness::new(vector_layout(), Some(1), 2);
+        h.publish([10.0, 20.0, 30.0]);
+        collect(&h);
+        let baseline = canonical_state(&[oracle_frame(0, 777, [10.0, 20.0, 30.0])], 0, 0);
+        let mut wrong_name = baseline.clone();
+        wrong_name[4] = b'x';
+        let mut wrong_schema = baseline.clone();
+        wrong_schema[30] ^= 1;
+        let mut trailing = baseline.clone();
+        trailing.push(0);
+        let over_capacity = canonical_state(
+            &[
+                oracle_frame(0, 777, [1.0, 2.0, 3.0]),
+                oracle_frame(1, 777, [4.0, 5.0, 6.0]),
+            ],
+            0,
+            0,
+        );
+        let truncated = baseline[..baseline.len() - 1].to_vec();
+        for refused in [wrong_name, wrong_schema, trailing, over_capacity, truncated] {
+            assert_eq!(
+                abi_call!((HOST_API.restore_accumulate)(
+                    h.context,
+                    h.input,
+                    bytes(&refused)
+                ))
+                .code,
+                2
+            );
+            let mut storage = [0; 256];
+            let (status, len) = capture(&h, &mut storage);
+            assert_eq!(status.code, 0);
+            assert_eq!(&storage[..len], baseline);
+        }
+        // Native restore accepts these counters independently; preserve that state.
+        let pending_above_total =
+            canonical_state(&[oracle_frame(0, 777, [10.0, 20.0, 30.0])], 0, 1);
         assert_eq!(
             abi_call!((HOST_API.restore_accumulate)(
                 h.context,
                 h.input,
-                bytes(&refused)
+                bytes(&pending_above_total)
             ))
             .code,
-            2
+            0
         );
         let mut storage = [0; 256];
         let (status, len) = capture(&h, &mut storage);
         assert_eq!(status.code, 0);
-        assert_eq!(&storage[..len], baseline);
+        assert_eq!(&storage[..len], pending_above_total);
+        begin_fire(&h);
+        let info = accumulated_info(&h);
+        assert_eq!((info.count, info.dropped, info.dropped_total), (1, 1, 0));
+        let read = accumulated_frame(&h, 0);
+        inspect(&read, |frame| {
+            assert_eq!(frame, oracle_frame(0, 777, [10.0, 20.0, 30.0]))
+        });
+        h.release(read);
+        let restored = canonical_state(&[oracle_frame(7, 500, [40.0, 50.0, 60.0])], 9, 3);
+        assert_eq!(
+            abi_call!((HOST_API.restore_accumulate)(
+                h.context,
+                h.input,
+                bytes(&restored)
+            ))
+            .code,
+            0
+        );
+        begin_fire(&h);
+        let info = accumulated_info(&h);
+        assert_eq!((info.count, info.dropped, info.dropped_total), (1, 3, 9));
+        let read = accumulated_frame(&h, 0);
+        inspect(&read, |frame| {
+            assert_eq!(frame, oracle_frame(7, 500, [40.0, 50.0, 60.0]))
+        });
+        h.release(read);
     }
-    let restored = canonical_state(&[oracle_frame(7, 500, [40.0, 50.0, 60.0])], 9, 3);
-    assert_eq!(
-        abi_call!((HOST_API.restore_accumulate)(
-            h.context,
-            h.input,
-            bytes(&restored)
-        ))
-        .code,
-        0
-    );
-    begin_fire(&h);
-    let info = accumulated_info(&h);
-    assert_eq!((info.count, info.dropped, info.dropped_total), (1, 3, 9));
-    let read = accumulated_frame(&h, 0);
-    inspect(&read, |frame| {
-        assert_eq!(frame, oracle_frame(7, 500, [40.0, 50.0, 60.0]))
-    });
-    h.release(read);
 }
 #[test]
 fn accumulator_sink_refusal_does_not_consume_pending_state() {
