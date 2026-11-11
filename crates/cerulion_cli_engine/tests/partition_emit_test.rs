@@ -1976,12 +1976,14 @@ fn code_only_strips_comments_and_keeps_code() {
 }
 
 // ==========================================================================
-// Section F — `node stage` over the untouched `graph create` scaffold.
+// Section F: `node stage` over a graph file only the CLI has written.
 //
-// The README quick start is `graph create perception` then `node stage sensor
-// -g perception`. Step 2 must not warn "overwriting an existing graph file —
-// the previous file (including any hand edits) was backed up" or leave a
-// `.bak` on a first run with no hand edit anywhere. Every arm drives the
+// The `docs/user-api.md` quick start is `graph create perception` then
+// `node stage sensor -g perception`; the docs-site quick start adds
+// `-n perception` and a second `node stage detector -g perception -I image
+// sensor/image`. No stage on either route may log the "overwriting an
+// existing graph file" warning or leave a `.bak` while the file holds only
+// what `graph create` and `node stage` write. Every arm drives the
 // real verbs over a real scratch workspace (a `graphs/` dir; the workspace
 // lock lands beside it) — still parallel-safe: no transport, no clock. The
 // oracles are the LOG and the DIRECTORY LISTING: a warning that fires, or a
@@ -2055,78 +2057,137 @@ fn staging_into_the_untouched_graph_create_scaffold_neither_warns_nor_backs_up()
     assert_eq!(reloaded.nodes[0].id, "sensor");
 }
 
-/// User-edited prefixes must not
-/// bypass backup protection: a user who edits ONLY the canonical `prefix:`
-/// value — leaving `nodes: []` and every other byte untouched — must NOT be
-/// mistaken for the pristine scaffold. The check renders the expected
-/// scaffold from the CREATE-TIME input (the graph name → `default_prefix`
-/// hostname default), never from the file's parsed prefix, so the edited prefix
-/// does not match and the backup+warn fire. Rendered from the file's own prefix, this file
-/// would match a scaffold for its edited prefix and be silently discarded.
+/// An edited `prefix:` value on a `graph create -n` scaffold renders the same
+/// bytes as `graph create -n <that value>`, so it stages without a backup, and
+/// the splice keeps the edited line: nothing the user wrote is lost.
 #[tracing_test::traced_test]
 #[test]
-fn editing_only_the_prefix_line_still_warns_and_backs_up() {
+fn editing_only_the_prefix_line_of_an_explicit_prefix_scaffold_loses_nothing() {
     let (_tmp, graphs) = scratch_graphs_dir();
-    // Create with the default (hostname) prefix — the file `node stage` can
-    // prove pristine from the graph name alone.
-    graph_create(&graphs, "perception", None).expect("graph create");
-    let created = std::fs::read_to_string(graphs.join("perception.yaml")).expect("created");
-
-    // Edit ONLY the prefix value; keep `nodes: []` and every other byte. The
-    // edited value is derived from the create-time default so it is GUARANTEED
-    // to differ from it, whatever this machine's hostname resolves to.
-    let default_prefix = cerulion_core::graph::default_prefix("perception");
-    let edited = format!("prefix: {default_prefix}-edited\nnodes: []\n");
-    assert_ne!(edited, created, "the edit must actually change the file");
-    std::fs::write(graphs.join("perception.yaml"), &edited).expect("edit prefix");
+    graph_create(&graphs, "perception", Some("robot1")).expect("graph create");
+    std::fs::write(
+        graphs.join("perception.yaml"),
+        "prefix: robot2\nnodes: []\n",
+    )
+    .expect("edit prefix");
 
     node_stage(&graphs, "perception", sensor_def()).expect("node stage");
 
-    assert!(
-        logs_contain(OVERWRITE_WARNING),
-        "an edited prefix is a hand edit — it must warn, not be taken for pristine"
+    assert_eq!(
+        std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable"),
+        ROBOT1_WITH_SENSOR.replace("prefix: robot1", "prefix: robot2"),
+        "the edited prefix survives the splice byte for byte"
     );
-    assert!(logs_contain("was backed up"));
+    assert_eq!(
+        graph_read(&graphs, "perception").expect("re-read").prefix,
+        "robot2"
+    );
+    assert!(!logs_contain(OVERWRITE_WARNING));
+    assert_eq!(listing(&graphs), vec!["perception.yaml".to_string()]);
+}
+
+/// The docs-site quick start's `sensor`: one `image` output.
+fn camera_sensor_def() -> NodeDef {
+    build_node_def(
+        "sensor",
+        None,
+        &[("image".to_string(), Some("sensor_msgs/Image".to_string()))],
+        &[],
+    )
+}
+
+/// The docs-site quick start's `detector`: `-I image sensor/image`.
+fn detector_def() -> NodeDef {
+    build_node_def(
+        "detector",
+        None,
+        &[],
+        &[("image".to_string(), "sensor/image".to_string())],
+    )
+}
+
+/// The docs-site quick start's graph after both stages. Hand-written.
+const PERCEPTION_QUICKSTART: &str = "prefix: perception\nnodes:\n  - id: sensor\n    type: sensor\n    \
+                                     outputs:\n      - name: image\n        schema: sensor_msgs/Image\n  \
+                                     - id: detector\n    type: detector\n    inputs:\n      - name: image\n        \
+                                     source: sensor/image\n";
+
+/// `graph create perception -n perception` then two stages and nothing else.
+fn run_quickstart(graphs: &std::path::Path) {
+    graph_create(graphs, "perception", Some("perception")).expect("graph create");
+    node_stage(graphs, "perception", camera_sensor_def()).expect("stage sensor");
+    node_stage(graphs, "perception", detector_def()).expect("stage detector");
+}
+
+/// THE docs-site path: `graph create -n perception`, then `node stage sensor`
+/// and `node stage detector -I image sensor/image`. Neither stage warns or
+/// leaves a `.bak`, each logs the INFO line for its arm, and the file is the
+/// two-node graph.
+#[tracing_test::traced_test]
+#[test]
+fn the_explicit_prefix_quickstart_neither_warns_nor_backs_up() {
+    let (_tmp, graphs) = scratch_graphs_dir();
+    run_quickstart(&graphs);
+
+    assert!(
+        !logs_contain(OVERWRITE_WARNING),
+        "no stage of a CLI-written graph may warn"
+    );
+    assert!(!logs_contain("was backed up"));
+    assert!(logs_contain("untouched `graph create` scaffold"));
+    assert!(logs_contain(
+        "graph file holds only what `graph create` and `node stage` wrote"
+    ));
     assert_eq!(
         listing(&graphs),
-        vec![
-            "perception.yaml".to_string(),
-            "perception.yaml.bak".to_string()
-        ],
-        "the edited prefix must be backed up, not silently discarded"
+        vec!["perception.yaml".to_string()],
+        "no `.bak`, no temp file"
     );
     assert_eq!(
-        std::fs::read_to_string(graphs.join("perception.yaml.bak")).expect("bak readable"),
-        edited,
-        "the backup carries the user's edited prefix bytes"
+        std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable"),
+        PERCEPTION_QUICKSTART
     );
 }
 
-/// `graph create -n <prefix>` freezes an explicit prefix whose only on-disk
-/// record is the editable `prefix:` line — indistinguishable from a user who
-/// edited that same line by hand. So it CANNOT be proven pristine from an
-/// immutable input, and the check conservatively backs it up rather than trust
-/// the file's own prefix. (Skipping this arm would reopen
-/// that hole.) The common README `graph create <name>` (default prefix) path
-/// stays backup-free; only the explicit-prefix flow pays one harmless `.bak`.
+/// Two runs of the docs-site path in two fresh workspaces write byte-identical
+/// graph files and identical listings.
+#[test]
+fn the_explicit_prefix_quickstart_writes_identical_bytes_on_every_run() {
+    let (_tmp_a, graphs_a) = scratch_graphs_dir();
+    let (_tmp_b, graphs_b) = scratch_graphs_dir();
+    run_quickstart(&graphs_a);
+    run_quickstart(&graphs_b);
+
+    let a = std::fs::read(graphs_a.join("perception.yaml")).expect("run a");
+    let b = std::fs::read(graphs_b.join("perception.yaml")).expect("run b");
+    assert_eq!(a, b);
+    assert_eq!(a, PERCEPTION_QUICKSTART.as_bytes());
+    assert_eq!(listing(&graphs_a), listing(&graphs_b));
+}
+
+/// A hand edit made BETWEEN the two stages is a byte the CLI did not write:
+/// the second stage warns, the `.bak` carries the edited one-node file, and
+/// the edit survives the splice.
 #[tracing_test::traced_test]
 #[test]
-fn an_explicit_prefix_scaffold_conservatively_backs_up() {
+fn a_hand_edit_after_the_first_stage_warns_and_backs_up_on_the_second() {
     let (_tmp, graphs) = scratch_graphs_dir();
-    // An explicit prefix derived to differ from this host's default, so the
-    // test is deterministic regardless of the machine's hostname.
-    let explicit = format!(
-        "{}-explicit",
-        cerulion_core::graph::default_prefix("perception")
+    graph_create(&graphs, "perception", Some("perception")).expect("graph create");
+    node_stage(&graphs, "perception", camera_sensor_def()).expect("stage sensor");
+    assert!(
+        !logs_contain(OVERWRITE_WARNING),
+        "the first stage is the CLI-written arm"
     );
-    graph_create(&graphs, "perception", Some(&explicit)).expect("graph create");
-    let created = std::fs::read_to_string(graphs.join("perception.yaml")).expect("created");
 
-    node_stage(&graphs, "perception", sensor_def()).expect("node stage");
+    let after_first = std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable");
+    let edited = format!("# the front camera rig\n{after_first}");
+    std::fs::write(graphs.join("perception.yaml"), &edited).expect("hand edit");
+
+    node_stage(&graphs, "perception", detector_def()).expect("stage detector");
 
     assert!(
         logs_contain(OVERWRITE_WARNING),
-        "an explicit prefix is unprovable from immutable inputs — back it up"
+        "a hand edit must still warn"
     );
     assert!(logs_contain("was backed up"));
     assert_eq!(
@@ -2138,8 +2199,48 @@ fn an_explicit_prefix_scaffold_conservatively_backs_up() {
     );
     assert_eq!(
         std::fs::read_to_string(graphs.join("perception.yaml.bak")).expect("bak readable"),
-        created,
-        "the backup carries the untouched explicit-prefix scaffold"
+        edited,
+        "the backup carries the edited bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable"),
+        format!("# the front camera rig\n{PERCEPTION_QUICKSTART}"),
+        "the comment survives the splice"
+    );
+}
+
+/// A value edited in the spelling the CLI writes (here the sensor's
+/// `schema:`) renders the same bytes as staging a node that declares it, so
+/// the next stage takes no backup, and the splice keeps the edited value.
+#[tracing_test::traced_test]
+#[test]
+fn a_value_edit_in_cli_spelling_stages_without_a_backup_and_is_kept() {
+    let (_tmp, graphs) = scratch_graphs_dir();
+    graph_create(&graphs, "perception", Some("perception")).expect("graph create");
+    node_stage(&graphs, "perception", camera_sensor_def()).expect("stage sensor");
+
+    let after_first = std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable");
+    let edited = after_first.replace(
+        "schema: sensor_msgs/Image",
+        "schema: sensor_msgs/CompressedImage",
+    );
+    assert_ne!(
+        edited, after_first,
+        "the edit must actually change the file"
+    );
+    std::fs::write(graphs.join("perception.yaml"), &edited).expect("value edit");
+
+    node_stage(&graphs, "perception", detector_def()).expect("stage detector");
+
+    assert!(!logs_contain(OVERWRITE_WARNING));
+    assert_eq!(listing(&graphs), vec!["perception.yaml".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable"),
+        PERCEPTION_QUICKSTART.replace(
+            "schema: sensor_msgs/Image",
+            "schema: sensor_msgs/CompressedImage"
+        ),
+        "the edited schema survives the splice"
     );
 }
 
@@ -2180,23 +2281,22 @@ fn a_hand_edited_scaffold_still_warns_and_backs_up() {
     );
 }
 
-/// The check is EXACT: a graph that already holds one staged node is not the
-/// scaffold, so the SECOND stage backs up and warns as it always did.
+/// The `docs/user-api.md` quick start continued: a second stage onto the
+/// default-prefix graph the first stage wrote is CLI-written too, so it
+/// neither warns nor backs up.
 #[tracing_test::traced_test]
 #[test]
-fn a_second_stage_onto_the_same_graph_backs_up_as_before() {
+fn a_second_stage_onto_a_cli_written_graph_neither_warns_nor_backs_up() {
     let (_tmp, graphs) = scratch_graphs_dir();
-    // Default (hostname) prefix so the FIRST stage takes the pristine arm; an
-    // explicit prefix would conservatively back up on the first stage too.
     graph_create(&graphs, "perception", None).expect("graph create");
+    // The prefix is this machine's hostname, so the oracle is built around
+    // the bytes `graph create` wrote above its `nodes: []` line.
+    let created = std::fs::read_to_string(graphs.join("perception.yaml")).expect("created");
+    let created_head = created
+        .strip_suffix("nodes: []\n")
+        .expect("the scaffold ends with an empty nodes list")
+        .to_string();
     node_stage(&graphs, "perception", sensor_def()).expect("first stage");
-    assert!(
-        !logs_contain(OVERWRITE_WARNING),
-        "the first stage is the pristine arm"
-    );
-    // The one-node revision the second stage will replace — captured because
-    // the prefix is this machine's hostname, not a fixed literal.
-    let after_first = std::fs::read_to_string(graphs.join("perception.yaml")).expect("after first");
 
     let filter = build_node_def(
         "filter",
@@ -2207,19 +2307,16 @@ fn a_second_stage_onto_the_same_graph_backs_up_as_before() {
     node_stage(&graphs, "perception", filter).expect("second stage");
 
     assert!(
-        logs_contain(OVERWRITE_WARNING),
-        "the file now holds a node — it is not the scaffold"
+        !logs_contain(OVERWRITE_WARNING),
+        "the file holds only what the CLI wrote"
     );
+    assert!(!logs_contain("was backed up"));
+    assert_eq!(listing(&graphs), vec!["perception.yaml".to_string()]);
+    let expected = ROBOT1_WITH_SENSOR.replace("prefix: robot1\n", &created_head)
+        + "  - id: filter\n    type: filter\n    inputs:\n      - name: reading\n        \
+           source: sensor/reading\n";
     assert_eq!(
-        listing(&graphs),
-        vec![
-            "perception.yaml".to_string(),
-            "perception.yaml.bak".to_string()
-        ]
-    );
-    assert_eq!(
-        std::fs::read_to_string(graphs.join("perception.yaml.bak")).expect("bak readable"),
-        after_first,
-        "the backup is the one-node revision the second stage replaced"
+        std::fs::read_to_string(graphs.join("perception.yaml")).expect("readable"),
+        expected
     );
 }

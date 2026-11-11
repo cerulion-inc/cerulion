@@ -2561,7 +2561,12 @@ pub(crate) fn subgraph_for(
 /// here are the names the worker's subgraph carries. An absolute source the
 /// author wrote by hand counts too: in the full graph it wires to its in-graph
 /// producer, and only the split makes it look external.
-fn sibling_topics_for(
+///
+/// `pub(crate)` for the same reason [`subgraph_for`] is: the per-rank replay
+/// planner ([`crate::replay_rank`]) restricts each recorded rank through
+/// `subgraph_for` and names that rank's sibling topics through this function,
+/// so a replayed rank validates exactly as its live worker did.
+pub(crate) fn sibling_topics_for(
     config: &GraphConfig,
     members: &[String],
 ) -> cerulion_core::graph::SiblingProducedTopics {

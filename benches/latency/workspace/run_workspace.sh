@@ -1086,9 +1086,10 @@ file_size() { wc -c <"$1" 2>/dev/null | tr -d '[:space:]'; }
 # A POSITIVE witness that the mode this row is labeled with is the mode the
 # run EXECUTED: every worker logs one INFO line, "worker build path resolved
 # from the stamped execution mode", carrying `execution_mode=<Lockstep|FreeRun>`
-# (graph_cmd.rs). It passes the CLI's default `cerulion=info` filter for
-# workers; an exported RUST_LOG that drops cerulion INFO removes the line, and
-# the witness then fails the leg loudly rather than passing it. The log
+# (graph_cmd.rs). `graph run` and its workers default to `warn`, so RUN_CMD
+# below sets RUST_LOG=error,cerulion=info itself when none is exported; an
+# exported RUST_LOG that drops cerulion INFO removes the line, and the
+# witness then fails the leg loudly rather than passing it. The log
 # carries ANSI escapes between a field's name and its `=`, so they are
 # stripped first. Exactly RANKS lines, every one naming WANT_MODE; anything
 # else (a missing worker line, a stale binary that logs no such line, the
@@ -1253,6 +1254,12 @@ run_size_once() {
         CER_BENCH_RAW_DUMP_DIR="$CER_BENCH_RAW_DUMP_DIR"
         CER_BENCH_RAW_NAME="$CER_BENCH_RAW_NAME"
         IOX2_LOG_LEVEL=error
+        # `graph run`, its workers and its recorder default to `warn`, which
+        # hides the INFO lines this harness reads: the execution-mode witness
+        # and the host's "live loop delivery telemetry". `error` keeps the
+        # error floor for iceoryx2 and zenoh, which an explicit spec would
+        # otherwise drop. An exported RUST_LOG still wins.
+        RUST_LOG="${RUST_LOG:-error,cerulion=info}"
         # Guarded like `DMA_ENV` above, and for the same reason: under `set -u`
         # bash 3.2, which is the only bash on a stock macOS host, refuses
         # `"${ARR[@]}"` when ARR is EMPTY. `PACING_FLAGS` is empty for a pacing

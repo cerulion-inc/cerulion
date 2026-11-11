@@ -1379,14 +1379,8 @@ pub fn graph_create(graphs_dir: &Path, name: &str, prefix: Option<&str>) -> CliR
 /// leaves no byte either: the bytes are a function of `prefix` alone.
 ///
 /// ONE renderer, two callers: `graph_create` writes this verbatim, and
-/// [`node_stage`] renders it again to recognise a file that is STILL exactly
-/// this ([`is_pristine_scaffold`]). A second template would let the two drift
-/// and turn the README's `graph create` → `node stage` pair back into a
-/// warning.
-///
-/// The pristine check MUST render this for `default_prefix(graph_name)` — the
-/// create-time input — not for a prefix parsed back out of the file: see
-/// [`is_pristine_scaffold`].
+/// [`node_stage`] renders it again as the base of [`is_cli_written_graph`],
+/// which recognises a file holding only what the CLI wrote.
 fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     let config = GraphConfig {
         level_assignments: None,
@@ -1402,26 +1396,34 @@ fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     Ok(serde_yaml::to_string(&config)?)
 }
 
-/// Is `existing` — a graph file's exact bytes — still the untouched
-/// [`render_graph_scaffold`] output?
+/// Is `existing`, a graph file's exact bytes, exactly what the CLI's own
+/// writes produce: [`render_graph_scaffold`] for `prefix`, then each of
+/// `prior_nodes` appended in order through [`append_node_to_nodes_block`]?
 ///
-/// `scaffold` MUST be rendered from a CREATE-TIME input the caller can trust —
-/// `render_graph_scaffold(default_prefix(graph_name))`, the graph name — and
-/// NEVER from a prefix parsed back out of `existing`. Rendering it from the
-/// file's own parsed prefix would let a user who edited ONLY the `prefix:`
-/// value produce bytes that match their own edited scaffold, silently skipping
-/// the backup of a genuine hand edit. Because
-/// the create-time default is the only prefix
-/// that can be reconstructed without reading editable file content, an explicit
-/// `graph create -n <prefix>` conservatively fails this check and backs up.
-///
-/// Byte equality, deliberately: no trimming, no comment stripping, no YAML
-/// re-parse. A trailing comment, a blank line, a re-quoted prefix or a legacy
-/// `name:` line is a hand edit, and a hand edit is exactly what the
-/// backup-and-warn arm of [`write_yaml_atomically`] exists to keep. Only a
-/// file that provably holds nothing of the user's may skip it.
-fn is_pristine_scaffold(existing: &str, scaffold: &str) -> bool {
-    existing == scaffold
+/// `prefix` is the value parsed from `existing`, so a file `graph create`
+/// wrote with the default prefix and one written with `-n <prefix>` are both
+/// recognised. Byte equality: no trimming, no comment stripping, no YAML
+/// re-parse. A comment, a blank line, a re-quoted prefix, a `name:` line, a
+/// `network:` block or a node in any spelling [`render_node_entry`] does not
+/// produce fails it, and [`node_stage`] then takes the backup-and-warn arm of
+/// [`write_yaml_atomically`]. A re-render whose append is refused matches
+/// nothing.
+fn is_cli_written_graph(existing: &str, prefix: &str, prior_nodes: &[NodeDef]) -> CliResult<bool> {
+    let mut rendered = render_graph_scaffold(prefix)?;
+    for node in prior_nodes {
+        rendered = match append_node_to_nodes_block(&rendered, node, "re-rendered graph") {
+            Ok(next) => next,
+            Err(e) => {
+                tracing::debug!(
+                    node_id = %node.id,
+                    error = %e,
+                    "re-rendering the graph file as the CLI writes it was refused; staging keeps a backup"
+                );
+                return Ok(false);
+            }
+        };
+    }
+    Ok(rendered == existing)
 }
 
 /// Read and parse a graph YAML file.
@@ -2009,55 +2011,38 @@ pub fn node_stage(
         .last()
         .expect("a node was just pushed onto the config");
     let rewritten = append_node_to_nodes_block(&raw, staged, &graph_path.display().to_string())?;
-    // A file that is STILL the untouched `graph create` scaffold holds nothing
-    // of the user's, so the README's `graph create` → `node stage` pair gets
-    // no "hand edits were backed up" warning and no `.bak` on every first run.
+    // The splice above copies every byte of the prior file into `rewritten`
+    // (the one rewrite is an empty `nodes: []` becoming `nodes:`), so neither
+    // arm below loses a byte. The `.bak` and its warning mark a prior
+    // file the re-render below does not reproduce byte for byte.
     //
-    // The expected scaffold is rendered from the SAME create-time input
-    // `graph create` derives its default from — the graph NAME, fed through
-    // `default_prefix` — NEVER from the file's parsed `config.prefix`. That
-    // distinction is the whole safety check:
-    // `config.prefix` is parsed FROM the current file,
-    // so a user who edits ONLY the `prefix:` value would make the file match a
-    // scaffold rendered for that same edited prefix — silently suppressing the
-    // backup of a real hand edit. Rendering from `default_prefix(graph_name)`
-    // instead means an edited prefix no longer matches, and the backup+warn
-    // correctly fire.
+    // `is_cli_written_graph` re-renders what the CLI's own writes produce: the
+    // `graph create` scaffold for the file's own `prefix:` value (the default
+    // prefix or a `-n <prefix>` alike), then each node already in the file
+    // appended in file order through `append_node_to_nodes_block`. A file
+    // byte-identical to that render takes `PriorFile::Discard`: no `.bak`, no
+    // warning, one INFO line. Any other
+    // byte (a comment, a `name:` line, a `network:` block, a blank line, a
+    // node in any spelling `render_node_entry` does not produce) breaks the
+    // equality and takes `PriorFile::BackUp` with the warning.
     //
-    // Consequence, deliberately conservative: `graph create -n <prefix>` (an
-    // explicit prefix that differs from the create-time default) is NOT skipped
-    // — its pristineness could only be proven from the file's editable
-    // `prefix:` line, which is exactly what we refuse to trust. We skip the
-    // backup ONLY when pristineness is provable from the immutable graph name;
-    // any other byte — a comment, a `name:` line, an earlier staged node, or an
-    // edited/explicit prefix — takes the backup arm.
-    // Skipping the `.bak` is a COURTESY, not a correctness lever: the write
-    // above is a surgical append that copies every pre-existing byte
-    // — comments, key order, a `network:` block, an edited `prefix:` — verbatim,
-    // so `node stage` never loses a hand edit whichever arm we take here. The
-    // `.bak` is only a rollback convenience, so we skip it exactly when there is
-    // nothing worth a rollback copy: a graph that (a) has NO staged nodes yet
-    // (this stage is adding the first one — `config` holds only the node we just
-    // pushed) AND (b) is byte-identical to the freshly-rendered scaffold. That
-    // is the README `graph create` → `node stage` pair, which then gets no
-    // "hand edits were backed up" warning and no `.bak` on every first run.
-    //
-    // The moment a graph carries a prior staged node it takes the backup arm —
-    // extending a real graph is where a rollback copy actually matters, and
-    // "no prior nodes" is an immutable fact about the file, independent of the
-    // hostname or the editable `prefix:` line.
-    // `default_prefix` is hostname-derived, so a scaffold created on
-    // another host no longer matches and conservatively backs up; and a
-    // `prefix:` edited to the current host that slips through loses nothing,
-    // because the append preserved it.
-    let is_first_node = config.nodes.len() == 1;
-    let default_scaffold =
-        render_graph_scaffold(&cerulion_core::graph::default_prefix(graph_name))?;
-    let prior_file = if is_first_node && is_pristine_scaffold(&raw, &default_scaffold) {
-        tracing::info!(
-            graph = %graph_name,
-            "graph file is the untouched `graph create` scaffold with no staged nodes; staging the first node without a backup"
-        );
+    // A value edited, or a node field added, by hand in the spelling
+    // `render_node_entry` writes (a `prefix:` value, a `schema:`, a `topic:`
+    // under an output) renders the same bytes and takes the discard arm; the
+    // splice keeps it in the new file verbatim.
+    let prior_nodes = &config.nodes[..config.nodes.len() - 1];
+    let prior_file = if is_cli_written_graph(&raw, &config.prefix, prior_nodes)? {
+        if prior_nodes.is_empty() {
+            tracing::info!(
+                graph = %graph_name,
+                "graph file is the untouched `graph create` scaffold with no staged nodes; staging the first node without a backup"
+            );
+        } else {
+            tracing::info!(
+                graph = %graph_name,
+                "graph file holds only what `graph create` and `node stage` wrote; staging the node without a backup"
+            );
+        }
         PriorFile::Discard
     } else {
         PriorFile::BackUp
@@ -6880,6 +6865,7 @@ pub fn graph_run(
                 monitor_wait_active: false,
             }));
             tracing::info!(graph = %graph_name, time_source = ?time_source, "graph running (deterministic VirtualClock) — press Ctrl+C to stop");
+            announce_running(&running_line(graph_name, RunStatus::OneProcess));
             while running.load(Ordering::Relaxed) {
                 if runtime.shutdown_requested() {
                     tracing::info!(graph = %graph_name, "node requested graph shutdown");
@@ -7258,6 +7244,7 @@ pub fn graph_run(
                 ),
             );
             tracing::info!(graph = %graph_name, time_source = ?time_source, "starting graph (live) — press Ctrl+C to stop");
+            announce_running(&running_line(graph_name, RunStatus::OneProcessStarting));
             // `run_live` REFUSES the live run (returns
             // Err) if ANY external node is provably inert at launch — the full
             // `InertReason` class (host-driven / no-source / invalid-or-duplicate
@@ -12625,10 +12612,7 @@ fn graph_run_supervisor(
                 })?,
             })?;
         } else {
-            tracing::info!(
-                graph = %config.identity(),
-                "Ctrl-C during spawn phase — recording not started (no data was recorded)"
-            );
+            warn_recording_not_started(config.identity(), RecordingNotStarted::DuringSpawn);
         }
     }
 
@@ -12666,6 +12650,13 @@ fn graph_run_supervisor(
             mode = "multi-process",
             "graph running - GO signaled; deployment live; press Ctrl+C to stop"
         );
+        announce_running(&running_line(
+            config.identity(),
+            RunStatus::Deployed {
+                nodes: embed_config.nodes.len(),
+                processes: guards.len(),
+            },
+        ));
     } else {
         tracing::info!(
             graph = %config.identity(),
@@ -15684,8 +15675,9 @@ pub enum ExpectedPrior<'a> {
 ///   both paths (`file_kind` labels what was overwritten). The backup path is
 ///   returned (`Some`) so the CLI stanza can surface it; `None` = fresh write,
 ///   no backup. ONE exception, reachable only inside this module: `node stage`
-///   over the untouched `graph create` scaffold (`is_pristine_scaffold`) has
-///   nothing of the user's to keep and takes neither the backup nor the warn.
+///   over a file byte-identical to the CLI's own `graph create` and
+///   `node stage` writes (`is_cli_written_graph`) takes neither the backup nor
+///   the warn.
 /// * **Never clobber a CONCURRENT writer** — a caller that
 ///   passes [`ExpectedPrior::Contents`] has its precondition checked twice:
 ///   once before anything is staged, and again immediately before the rename.
@@ -15711,7 +15703,7 @@ pub enum ExpectedPrior<'a> {
 /// Parent directories are created as needed. Pinned by the pure tests in
 /// `tests/graph_profile_test.rs` (fresh-write shape, backup+warn arm, no stray
 /// temp files) and `tests/partition_emit_test.rs` (the graph-rewrite caller,
-/// the concurrent-change refusal, and `node stage`'s pristine-scaffold arm).
+/// the concurrent-change refusal, and `node stage`'s CLI-written-file arm).
 pub fn write_yaml_atomically(
     dest: &Path,
     contents: &str,
@@ -15726,9 +15718,11 @@ pub(crate) enum PriorFile {
     /// Copy them to `<path>.bak` and `warn!` — the contract every hand-edit
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
-    /// Drop them, silently. Only for a file the caller has PROVED holds
-    /// nothing a user wrote: [`node_stage`] over the untouched `graph create`
-    /// scaffold ([`is_pristine_scaffold`]). Everything else backs up.
+    /// Drop them, silently. Only for a write whose new contents keep every
+    /// byte of the prior file except the ` []` of an empty `nodes: []`, over
+    /// a file the caller has PROVED is
+    /// byte-identical to what the CLI's own writes produce: [`node_stage`]
+    /// ([`is_cli_written_graph`]). Everything else backs up.
     Discard,
 }
 
@@ -18760,6 +18754,148 @@ struct FlashbackSpawnSpec<'a> {
     /// recording's bagd would. Consumed on Linux only (see
     /// `spawn_flashback_recorder`).
     record_cpu: RecordCpu,
+}
+
+/// What `graph run` can truthfully say about its run when it prints its
+/// status line ([`running_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunStatus {
+    /// A multi-process deployment: every worker is READY and GO is signalled.
+    Deployed {
+        /// Nodes in the deployed graph.
+        nodes: usize,
+        /// Worker processes running them.
+        processes: usize,
+    },
+    /// A one-process run whose loop is stepping (`--time-source virtual`,
+    /// after its launch refusal check).
+    OneProcess,
+    /// A one-process LIVE run about to enter `run_live`, which can still
+    /// refuse it at launch (an inert external node), so the line says
+    /// "starting", never "running".
+    OneProcessStarting,
+}
+
+/// The line `graph run` prints on stderr when its graph starts: which graph,
+/// in how many processes when it is split, and how to stop it.
+///
+/// It is the run's own output, printed at every filter: `graph run` defaults to
+/// `warn`, which hides the `info` lifecycle line logged beside it, and a run
+/// that prints nothing between its start and Ctrl+C reads as a hang.
+fn running_line(graph: &str, status: RunStatus) -> String {
+    match status {
+        RunStatus::Deployed { nodes, processes } => format!(
+            "graph '{graph}' running: {nodes} node(s) in {processes} process(es); press Ctrl+C to \
+             stop"
+        ),
+        RunStatus::OneProcess => {
+            format!("graph '{graph}' running in one process; press Ctrl+C to stop")
+        }
+        RunStatus::OneProcessStarting => {
+            format!("graph '{graph}' starting in one process; press Ctrl+C to stop")
+        }
+    }
+}
+
+/// Print [`running_line`]'s line on stderr.
+// `print_stderr` exception: this is CLI output (the run's status line), the
+// stderr twin of `recording written to <path>`'s stdout line, and it must
+// print under the quiet default that filters the `info` line beside it.
+#[allow(clippy::print_stderr)]
+fn announce_running(line: &str) {
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod running_line_tests {
+    use super::{running_line, RunStatus};
+
+    /// Hand-written oracles for every status: the multi-process line names the
+    /// node and process counts, the one-process lines name neither, and a live
+    /// one-process run that can still refuse says it is starting.
+    #[test]
+    fn the_running_line_names_the_graph_its_processes_and_how_to_stop() {
+        assert_eq!(
+            running_line(
+                "obstacle_avoidance",
+                RunStatus::Deployed {
+                    nodes: 2,
+                    processes: 2
+                }
+            ),
+            "graph 'obstacle_avoidance' running: 2 node(s) in 2 process(es); press Ctrl+C to stop"
+        );
+        assert_eq!(
+            running_line("demo", RunStatus::OneProcess),
+            "graph 'demo' running in one process; press Ctrl+C to stop"
+        );
+        assert_eq!(
+            running_line("demo", RunStatus::OneProcessStarting),
+            "graph 'demo' starting in one process; press Ctrl+C to stop"
+        );
+    }
+}
+
+/// Where a `--record` run was when Ctrl+C stopped it before its recorder was
+/// armed ([`warn_recording_not_started`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingNotStarted {
+    /// The multi-process supervisor was still spawning its workers, so the
+    /// recorder was never spawned.
+    DuringSpawn,
+    /// The recorder was spawned and had not reported ready.
+    DuringRecorderStartup,
+}
+
+/// Say that a `--record` run wrote no bag because Ctrl+C arrived before its
+/// recorder was armed.
+///
+/// A `warn`: the run was asked to record and ends with no
+/// `recording written to <path>` line, and `graph run`'s quiet default hides
+/// `info`, so this is the line that says no bag exists.
+#[cfg(unix)]
+fn warn_recording_not_started(graph_name: &str, when: RecordingNotStarted) {
+    match when {
+        RecordingNotStarted::DuringSpawn => tracing::warn!(
+            graph = %graph_name,
+            "Ctrl-C during spawn phase: recording not started (no data was recorded)"
+        ),
+        RecordingNotStarted::DuringRecorderStartup => tracing::warn!(
+            graph = %graph_name,
+            "recording cancelled before start (Ctrl-C during recorder startup): no data \
+             was recorded"
+        ),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod recording_not_started_tests {
+    use super::{warn_recording_not_started, RecordingNotStarted};
+
+    /// Both cancel points say at `warn`, which `graph run`'s quiet default
+    /// prints, that no bag was written; an `info` twin would be hidden.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_recording_stopped_before_its_recorder_is_armed_warns_that_nothing_was_recorded() {
+        warn_recording_not_started("demo", RecordingNotStarted::DuringSpawn);
+        warn_recording_not_started("demo", RecordingNotStarted::DuringRecorderStartup);
+        logs_assert(|lines: &[&str]| {
+            let at =
+                |level: &str, marker: &str| cerulion_core::testing::count_at(lines, level, marker);
+            match (
+                at("WARN", "recording not started (no data was recorded)"),
+                at("WARN", "recording cancelled before start"),
+                at("INFO", "no data"),
+            ) {
+                (1, 1, 0) => Ok(()),
+                (spawn, startup, infos) => Err(format!(
+                    "expected one WARN per cancel point and no INFO twin, got {spawn} and \
+                     {startup} WARN, {infos} INFO"
+                )),
+            }
+        });
+    }
 }
 
 /// PURE — the argv an always-on recorder is spawned with.
@@ -21894,11 +22030,7 @@ fn start_supervisor_recording(
             bagd.signal_term();
             let _ = wait_for_child_bounded(&mut bagd, RECORDING_FINALIZE_DEADLINE);
             bagd.kill_and_reap();
-            tracing::info!(
-                graph = %graph_name,
-                "recording cancelled before start (Ctrl-C during recorder startup) — no data \
-                 was recorded"
-            );
+            warn_recording_not_started(graph_name, RecordingNotStarted::DuringRecorderStartup);
             return Ok(None);
         }
     }
@@ -22219,15 +22351,14 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
             guard.signal_term();
             let _ = wait_for_child_bounded(&mut guard, RECORDING_FINALIZE_DEADLINE);
             guard.kill_and_reap();
-            tracing::info!(
-                graph = %graph_name,
-                "recording cancelled before start (Ctrl-C during recorder startup) — no data \
-                 was recorded"
-            );
+            warn_recording_not_started(graph_name, RecordingNotStarted::DuringRecorderStartup);
             return Ok(());
         }
     }
     tracing::info!(graph = %graph_name, "bagd ready — starting recorded graph run (press Ctrl+C to stop)");
+    // `run_live` below can still refuse the run at launch, as on the
+    // unrecorded live arm.
+    announce_running(&running_line(graph_name, RunStatus::OneProcessStarting));
 
     // ---- (8) C-state cap (mirrors the live arm) + the live wall-following loop.
     let env_lock = std::env::var(CPU_DMA_LOCK_ENV).ok();
@@ -23570,18 +23701,58 @@ mod tests {
         assert_eq!(on_disk, "prefix: robot1\nnodes: []\n");
     }
 
-    #[test]
-    fn a_byte_identical_scaffold_is_pristine() {
-        let scaffold = "prefix: robot1\nnodes: []\n";
-        assert!(is_pristine_scaffold(scaffold, scaffold));
+    /// `sensor` with one output, as `node stage` builds it.
+    fn sensor_node() -> NodeDef {
+        build_node_def(
+            "sensor",
+            None,
+            &[("image".to_string(), Some("sensor_msgs/Image".to_string()))],
+            &[],
+        )
     }
 
-    /// Every hand edit a user plausibly makes to a fresh file — and every
-    /// "harmless" difference a looser check (trim, re-parse, comment strip)
-    /// would forgive — is NOT pristine: each of these takes the backup arm.
+    /// The `robot1` scaffold with `sensor` staged into it. Hand-written; the
+    /// shape `append_node_to_nodes_block` gives a `nodes: []`.
+    const ROBOT1_WITH_SENSOR: &str = "prefix: robot1\nnodes:\n  - id: sensor\n    type: sensor\n    \
+                                      outputs:\n      - name: image\n        schema: sensor_msgs/Image\n";
+
+    #[test]
+    fn a_byte_identical_scaffold_is_cli_written() {
+        let scaffold = "prefix: robot1\nnodes: []\n";
+        assert!(is_cli_written_graph(scaffold, "robot1", &[]).unwrap());
+        // `graph create -n ""` drops the prefix line.
+        assert!(is_cli_written_graph("nodes: []\n", "", &[]).unwrap());
+    }
+
+    /// The scaffold is rendered for the prefix handed in and no other.
+    #[test]
+    fn a_scaffold_matches_only_its_own_prefix() {
+        let scaffold = "prefix: robot1\nnodes: []\n";
+        assert!(!is_cli_written_graph(scaffold, "robot2", &[]).unwrap());
+        assert!(!is_cli_written_graph(scaffold, "", &[]).unwrap());
+    }
+
+    /// A file holding the scaffold plus a node the CLI staged is CLI-written
+    /// when that node is the prior node, and only then.
+    #[test]
+    fn a_staged_node_in_cli_spelling_is_cli_written() {
+        let sensor = sensor_node();
+        assert!(
+            is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", std::slice::from_ref(&sensor))
+                .unwrap()
+        );
+        // The same bytes with no prior node to explain them are a hand edit.
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", &[]).unwrap());
+        // A prior node the file does not hold matches nothing.
+        let other = build_node_def("camera", None, &[], &[]);
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", &[other]).unwrap());
+    }
+
+    /// Each edit below, a byte `graph create` never writes or a difference a
+    /// looser check (trim, re-parse, comment strip) would forgive, is NOT
+    /// CLI-written: each of these takes the backup arm.
     #[test]
     fn any_byte_beyond_the_scaffold_is_a_hand_edit() {
-        let scaffold = "prefix: robot1\nnodes: []\n";
         for edited in [
             "# perception\nprefix: robot1\nnodes: []\n",
             "prefix: robot1\nnodes: []\n\n",
@@ -23589,11 +23760,46 @@ mod tests {
             "prefix: 'robot1'\nnodes: []\n",
             "name: perception\nprefix: robot1\nnodes: []\n",
             "prefix: robot1\nnodes:\n  - id: a\n    type: a\n",
+            "prefix: robot1\r\nnodes: []\r\n",
+            "nodes: []\nprefix: robot1\n",
+            "args:\n  ns: robot1\nprefix: ${ns}\nnodes: []\n",
             "",
         ] {
             assert!(
-                !is_pristine_scaffold(edited, scaffold),
-                "must not count as pristine: {edited:?}"
+                !is_cli_written_graph(edited, "robot1", &[]).unwrap(),
+                "must not count as CLI-written: {edited:?}"
+            );
+        }
+    }
+
+    /// The same hand-edit classes on a file that already holds a staged node:
+    /// each byte the CLI did not write breaks the match.
+    #[test]
+    fn any_byte_beyond_the_staged_nodes_is_a_hand_edit() {
+        let sensor = vec![sensor_node()];
+        for edited in [
+            format!("# perception\n{ROBOT1_WITH_SENSOR}"),
+            format!("{ROBOT1_WITH_SENSOR}\n"),
+            format!("{ROBOT1_WITH_SENSOR}    # the front camera\n"),
+            format!("name: perception\n{ROBOT1_WITH_SENSOR}"),
+            format!("{ROBOT1_WITH_SENSOR}network:\n  zenoh: {{}}\n"),
+            ROBOT1_WITH_SENSOR.replace("schema: sensor_msgs/Image", "schema: sensor_msgs::Image"),
+            ROBOT1_WITH_SENSOR.replace("  - id: sensor", "- id: sensor"),
+            ROBOT1_WITH_SENSOR.replace("prefix: robot1", "prefix: 'robot1'"),
+            ROBOT1_WITH_SENSOR.replace('\n', "\r\n"),
+            ROBOT1_WITH_SENSOR.replace("  - id: sensor", "\t- id: sensor"),
+            ROBOT1_WITH_SENSOR.replace(
+                "    type: sensor\n",
+                "    type: sensor\n    isolate: true\n",
+            ),
+            ROBOT1_WITH_SENSOR.replace(
+                "  - id: sensor\n    type: sensor\n",
+                "  - type: sensor\n    id: sensor\n",
+            ),
+        ] {
+            assert!(
+                !is_cli_written_graph(&edited, "robot1", &sensor).unwrap(),
+                "must not count as CLI-written: {edited:?}"
             );
         }
     }

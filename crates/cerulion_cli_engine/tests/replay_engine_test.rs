@@ -3059,6 +3059,109 @@ fn changed_relay_factory_diverges_on_relay_topic_only() {
     );
 }
 
+/// The source and relay bag replayed against a relay that adds 101 instead of
+/// 100, under `purpose`: the outcome, plus the bag path for the renderers.
+fn replay_changed_relay(
+    dir: &std::path::Path,
+    purpose: replay_engine::ReplayPurpose,
+) -> (ReplayOutcome, std::path::PathBuf) {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let bag = dir.join("changed_relay.mcap");
+    write_bag(&rec, &bag, None);
+    let candidate = || {
+        factories(vec![
+            ("source", Box::new(SourceNodeEntry::new())),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 101.0,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let (outcome, _) = ri_replay(&bag, candidate, purpose);
+    let outcome = outcome.expect("the changed relay replays to a verdict");
+    // Hand oracle: every relay frame carries the new addend, so the topic's
+    // ONE violation is a byte mismatch at its first frame, and the unchanged
+    // source matches.
+    match outcome.violations.as_slice() {
+        [v] if v.topic == "/sr/relay/out" => assert!(
+            matches!(v.class, ViolationClass::ByteMismatch { index: 0, .. }),
+            "{v:?}"
+        ),
+        other => panic!("expected exactly one violation, on /sr/relay/out: {other:?}"),
+    }
+    (outcome, bag)
+}
+
+/// A bare `--resim` warns each data violation, naming its topic: its neutral
+/// summary only COUNTS the differing topics (pinned below), so the warn is the
+/// one place its terminal names which topic changed and where.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_bare_resim_warns_each_data_violation_by_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_changed_relay(dir.path(), replay_engine::ReplayPurpose::Resim);
+
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+        &bag,
+    );
+    assert!(
+        summary.contains("1 of 2 topic(s) differ") && !summary.contains("/sr/relay/out"),
+        "the neutral summary counts the topic without naming it: {summary}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: data violation")
+            })
+            .collect();
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+        ) {
+            ([line], 0) if line.contains("/sr/relay/out") => Ok(()),
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming /sr/relay/out and no INFO twin, got {other:?} and \
+                 {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// `--verify` states each data violation in its verdict block, so the engine
+/// logs it at `info` rather than printing the same frame twice on the terminal.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_states_each_data_violation_in_its_verdict_and_logs_it_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_changed_relay(dir.path(), replay_engine::ReplayPurpose::Verify);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("FRAME-CONTENT DIVERGENCE") && verdict.contains("/sr/relay/out"),
+        "the verdict block names the topic: {verdict}"
+    );
+    // The absence guard is paired with a positive count over the same capture.
+    logs_assert(|lines: &[&str]| {
+        match (
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+            cerulion_core::testing::count_at(lines, "WARN", "replay: data violation"),
+        ) {
+            (1, 0) => Ok(()),
+            (infos, warns) => Err(format!(
+                "expected ONE INFO and no WARN, got {infos} INFO and {warns} WARN line(s)"
+            )),
+        }
+    });
+}
+
 // ===========================================================================
 // 5. Missing / extra MESSAGES (count mismatches, both directions)
 // ===========================================================================
@@ -12908,6 +13011,334 @@ fn a_partial_report_write_failure_never_masks_the_aborting_error() {
     );
 }
 
+/// The `sy` rank-0 producer A, panicking from its third fire on: the shape
+/// that leaves a COMPLETED rank 0 with a panic-class node failure.
+#[cerulion_node(period_ms = 33)]
+#[derive(Default)]
+struct PanicAtTick3SyncProdA {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl PanicAtTick3SyncProdA {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        if self.counter >= 3.0 {
+            panic!("injected candidate crash at tick {}", self.counter);
+        }
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// Write the `sy` bag with rank 1's staging rows stated, the shape a
+/// `--verify` replay fed by read identity needs (the rows
+/// `a_two_rank_free_run_bag_with_per_edge_rims_still_verifies` measured:
+/// `fusion`'s two body stages; rank 0 has no read stage and states none).
+fn write_sy_verify_bag(rec: Recording, path: &std::path::Path, edit: impl FnOnce(&mut Recording)) {
+    let staging = |rank: u32| -> Option<serde_json::Value> {
+        (rank == 1)
+            .then(|| serde_json::json!({ "capacities": { "fusion": [[0, 0, 64], [1, 0, 64]] } }))
+    };
+    write_sy_bag_overridden(
+        rec,
+        path,
+        edit,
+        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        None,
+        Some(&staging),
+    );
+}
+
+/// **An aborted `--verify` warns the data violation its completed rank
+/// found.**
+///
+/// A run a rank aborts returns the aborting error, and the CLI prints that
+/// error and no verdict, so the completed ranks' findings reach the terminal
+/// only as log lines: they must be `WARN`, never the `INFO` a completed
+/// `--verify` uses beside its verdict block.
+///
+/// Hand oracle: the `sy` bag with the first payload byte of `/sy/prod_a/out`
+/// frame 2 flipped, so rank 0 re-produces the original frame and its one
+/// violation is a byte mismatch on that topic at index 2; rank 1 refuses to
+/// init. The partial report holds exactly that violation, and the log names
+/// it once at `WARN` with no `INFO` twin.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_verify_warns_the_data_violation_its_completed_rank_found() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("aborted_verify_violation.mcap");
+    write_sy_verify_bag(rec, &bag, |rec| {
+        let frame = &mut rec.messages.get_mut(SY_A_TOPIC).unwrap()[2];
+        frame[WireHeader::SIZE] ^= 0xFF;
+    });
+    let report = dir.path().join("aborted_verify_violation.json");
+
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        sy_rank1_init_fails_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let err = outcome.expect_err("rank 1's node refuses to init, so the run aborts");
+    let ReplayError::Internal { reason } = &err else {
+        panic!("a build failure is the exit-5 Internal class: {err:?}");
+    };
+    assert!(
+        reason.contains("rank 1") && reason.contains("refuses to init"),
+        "the aborting error is what returns: {reason}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    let violations = json["violations"].as_array().expect("violations array");
+    assert_eq!(violations.len(), 1, "{json}");
+    assert_eq!(violations[0]["topic"], SY_A_TOPIC, "{json}");
+    assert_eq!(
+        (
+            violations[0]["class"]["kind"].as_str(),
+            violations[0]["class"]["index"].as_u64(),
+            violations[0]["class"]["first_diff_byte_offset"].as_u64(),
+        ),
+        (Some("ByteMismatch"), Some(2), Some(WireHeader::SIZE as u64)),
+        "the flipped byte is a byte mismatch at frame 2, first payload byte: {}",
+        violations[0]
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: data violation")
+            })
+            .collect();
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+        ) {
+            ([line], 0) if line.contains(SY_A_TOPIC) => Ok(()),
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming {SY_A_TOPIC} and no INFO twin, got {other:?} and \
+                 {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// **An aborted `--verify` warns the node failure its completed rank
+/// suffered.**
+///
+/// The same abort as above with rank 0's producer A panicking from its third
+/// fire: the partial report names `prod_a` as the one failed node, and the log
+/// names it once at `WARN`. No finding of the completed rank is logged at
+/// `INFO`, because no verdict and no summary is printed to state it.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_verify_warns_the_node_failure_its_completed_rank_suffered() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("aborted_verify_failure.mcap");
+    write_sy_verify_bag(rec, &bag, |_| {});
+    let report = dir.path().join("aborted_verify_failure.json");
+    let make = || {
+        factories(vec![
+            (
+                "prod_a",
+                Box::new(PanicAtTick3SyncProdAEntry::new()) as Box<dyn NodeEntry>,
+            ),
+            (
+                "prod_b",
+                Box::new(SyncProdBEntry::new()) as Box<dyn NodeEntry>,
+            ),
+            (
+                "fusion",
+                Box::new(InitFailsEntry {
+                    inner: Box::new(SumFusionNodeEntry::new()),
+                }) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        make,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let err = outcome.expect_err("rank 1's node refuses to init, so the run aborts");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("rank 1")),
+        "{err:?}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    let failed: Vec<&str> = json["node_failures"]
+        .as_array()
+        .expect("node_failures array")
+        .iter()
+        .map(|f| f["node_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(failed, vec!["prod_a"], "{json}");
+
+    logs_assert(|lines: &[&str]| {
+        let marker = "replay: node suffered a panic-class failure";
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| cerulion_core::testing::line_level(l) == Some("WARN") && l.contains(marker))
+            .collect();
+        let infos = [
+            marker,
+            "replay: data violation",
+            "replay: structural trace divergence",
+        ]
+        .iter()
+        .map(|m| cerulion_core::testing::count_at(lines, "INFO", m))
+        .sum::<usize>();
+        match (warned.as_slice(), infos) {
+            ([line], 0) if line.contains("node_id=prod_a") => Ok(()),
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming prod_a and no INFO finding, got {other:?} and \
+                 {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// The source and relay bag replayed under `purpose` against a source that
+/// panics from tick 3 (the fixture of
+/// `panicking_candidate_reports_node_failure_and_renders_all_blocks`): one
+/// failed node, `source`, and a fire-schedule divergence downstream of it.
+fn replay_panicking_source(
+    dir: &std::path::Path,
+    purpose: replay_engine::ReplayPurpose,
+) -> (ReplayOutcome, std::path::PathBuf) {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 6);
+    let bag = dir.join("panicking_source.mcap");
+    write_bag(&rec, &bag, None);
+    let make = || {
+        factories(vec![
+            ("source", Box::new(PanicAtTick3SourceNodeEntry::new())),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 100.0,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let (outcome, _) = ri_replay(&bag, make, purpose);
+    let outcome = outcome.expect("the panicking candidate replays to an outcome");
+    let failed: Vec<&str> = outcome
+        .node_failures
+        .iter()
+        .map(|f| f.node_id.as_str())
+        .collect();
+    assert_eq!(failed, vec!["source"], "{:?}", outcome.node_failures);
+    assert!(
+        outcome.trace_divergence.is_some(),
+        "the thinner replayed schedule is a fire-schedule divergence"
+    );
+    (outcome, bag)
+}
+
+/// A completed `--verify` states the schedule divergence and the node failure
+/// in its own blocks, so it logs each of them once at `INFO` and never at
+/// `WARN`.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_logs_its_schedule_divergence_and_node_failure_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_panicking_source(dir.path(), replay_engine::ReplayPurpose::Verify);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("FIRE-SCHEDULE DIVERGENCE") && verdict.contains("NODE FAILURE"),
+        "the verdict states both in their own blocks: {verdict}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let counts = [
+            "replay: structural trace divergence",
+            "replay: node suffered a panic-class failure",
+        ]
+        .map(|m| {
+            (
+                cerulion_core::testing::count_at(lines, "INFO", m),
+                cerulion_core::testing::count_at(lines, "WARN", m),
+            )
+        });
+        match counts {
+            [(1, 0), (1, 0)] => Ok(()),
+            other => Err(format!(
+                "expected ONE INFO and no WARN for the divergence and the failure, got \
+                 (info, warn) {other:?}"
+            )),
+        }
+    });
+}
+
+/// A bare `--resim` warns the schedule divergence with its position, which
+/// its neutral summary does not state, and logs the node failure, which the
+/// summary names, at `INFO`.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_bare_resim_warns_its_schedule_divergence_by_position_and_logs_a_node_failure_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_panicking_source(dir.path(), replay_engine::ReplayPurpose::Resim);
+    let position = outcome
+        .trace_divergence
+        .as_ref()
+        .map(|td| td.position)
+        .expect("a divergence");
+
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+        &bag,
+    );
+    assert!(
+        summary.contains("NODE FAILURE: 'source'"),
+        "the neutral summary names the failed node: {summary}"
+    );
+    let at = format!("position={position}");
+    logs_assert(|lines: &[&str]| {
+        let marker = "replay: structural trace divergence";
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| cerulion_core::testing::line_level(l) == Some("WARN") && l.contains(marker))
+            .collect();
+        let failure = "replay: node suffered a panic-class failure";
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", marker),
+            cerulion_core::testing::count_at(lines, "INFO", failure),
+            cerulion_core::testing::count_at(lines, "WARN", failure),
+        ) {
+            ([line], 0, 1, 0) if line.contains(&at) => Ok(()),
+            (other, infos, failure_infos, failure_warns) => Err(format!(
+                "expected ONE WARN divergence naming {at} with no INFO twin, and the failure \
+                 at INFO only; got {other:?}, {infos} INFO divergence line(s), \
+                 {failure_infos} INFO and {failure_warns} WARN failure line(s)"
+            )),
+        }
+    });
+}
+
 // ===========================================================================
 // Reporter structural pins (count, accounting, no-payload-dump)
 // ===========================================================================
@@ -19716,11 +20147,9 @@ fn assert_edge_read_verdict(outcome: &ReplayOutcome, label: &str) {
 }
 
 /// (a) CLEAN BAG → the verifier runs, WARNS nothing, and claims its clean
-/// verification POSITIVELY: no report field, no warn, verdict untouched —
-/// and the verdict prints the `read log: verified clean (N edge(s)
-/// compared)` line, which this arm asserts ("silent" here
-/// means no WARN-class output, not no output — the positive status line is
-/// deliberate, it is what makes a clean cycle auditable). The recording's
+/// verification POSITIVELY in the `--report` JSON (`read_log.status ==
+/// "verified_clean"` with its edge count), while the terminal verdict leaves a
+/// clean verification to its PASS line and prints no `read log:` line. The recording's
 /// kind-6 content is anchored to a HAND oracle first (anti-vacuity: a
 /// verifier that never saw a record would also warn nothing — the oracle
 /// proves the bag really carries the read log, and
@@ -19803,11 +20232,16 @@ fn read_log_clean_bag_verifies_clean_with_no_warns() {
     // The always-present status field, internally tagged snake_case.
     assert_eq!(parsed["read_log"]["status"], "verified_clean");
     assert_eq!(parsed["read_log"]["edges_compared"], 1);
-    // And the human verdict carries the one-line status on the PASS path.
+    // The human verdict leaves a clean verification to the PASS line: the
+    // report above carries the status and its edge count.
     let verdict = replay_engine::render_verdict(&outcome, &bag);
     assert!(
-        verdict.contains("read log: verified clean (1 edge(s) compared)"),
-        "verdict: {verdict}"
+        !verdict.contains("read log:"),
+        "a clean verification prints no `read log:` line: {verdict}"
+    );
+    assert!(
+        verdict.contains("replay PASS: "),
+        "the PASS line carries the verdict: {verdict}"
     );
 }
 
@@ -23696,10 +24130,10 @@ fn an_explicitly_lockstep_bag_replays_byte_identically_and_says_so() {
         }
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert_eq!(
-        verdict.lines().next(),
-        Some("coordination: lockstep"),
-        "an EXPLICIT stamp carries no inferred suffix: {verdict}"
+    assert!(
+        !verdict.contains("coordination:"),
+        "an EXPLICIT stamp is the contract the recording ran under, so the verdict \
+         prints no coordination line (the report below carries it): {verdict}"
     );
     assert_eq!(
         read_report(&report)["coordination"],
@@ -23827,13 +24261,10 @@ fn free_run_crafted_bag_replays_byte_exact_per_rank() {
         }
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert_eq!(
-        verdict.lines().next(),
-        Some(
-            "coordination: free_run (per-rank boundary streams + read-log agreement; \
-             cross-rank lockstep equality not applicable)"
-        ),
-        "the skip is stated on the provenance line: {verdict}"
+    assert!(
+        !verdict.contains("coordination:"),
+        "a stamped free_run contract prints no coordination line; the outcome above \
+         and the report's coordination block carry it: {verdict}"
     );
     // The replay RAN — phase 2 refuses BEFORE the first step, so a non-empty
     // tap is the discriminator against a refusal that merely changed shape.
@@ -29242,6 +29673,72 @@ fn a_two_rank_free_run_bag_with_per_edge_rims_still_verifies() {
     // governs. With the exempting helper, a regression declining every topic on a
     // rim-carrying free-run bag passed here.
     assert_clean_verdict(&outcome, "free-run bag stating per-edge rims");
+}
+
+/// A two-rank FREE-RUN resim does not call the consuming rank's correct
+/// cross-rank sources possible typos.
+///
+/// `fusion` (rank 1) reads `prod_a/out` and `prod_b/out` (rank 0), written
+/// relative, the starter graph's shape. The per-rank split absolutizes both and
+/// drops their producers from rank 1's view, so the pass build re-validated a
+/// graph whose two in-prefix sources had no producer and warned "matches no
+/// declared output" once per source on every verify of a multi-process
+/// recording. The live worker hands the same view its sibling set; the pass now
+/// does too.
+///
+/// The positive half proves the rank-1 pass was BUILT and ran (its two edges were
+/// compared), so the absence below cannot pass on a pass that never validated.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_two_rank_free_run_resim_does_not_call_a_correct_cross_rank_source_a_typo() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("free_run_cross_rank_sources.mcap");
+    let staging = |rank: u32| -> Option<serde_json::Value> {
+        (rank == 1)
+            .then(|| serde_json::json!({ "capacities": { "fusion": [[0, 0, 64], [1, 0, 64]] } }))
+    };
+    write_sy_bag_overridden(
+        rec,
+        &bag,
+        |_| {},
+        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        None,
+        Some(&staging),
+    );
+
+    let outcome = replay(&bag, sy_bounded_factories, None, None).expect("replay runs");
+    assert_eq!(
+        outcome.coordination.mode,
+        replay_engine::CoordinationMode::FreeRun
+    );
+    assert_clean_verdict(&outcome, "two-rank free-run bag");
+    match outcome.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(
+                edges_compared, 2,
+                "rank 1's two edges: {:?}",
+                outcome.read_log
+            );
+        }
+        other => panic!("the rank-1 pass must have run and compared its edges: {other:?}"),
+    }
+
+    logs_assert(|lines: &[&str]| {
+        let typo_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("matches no declared output"))
+            .collect();
+        if typo_lines.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "a correct cross-rank source was reported as a possible typo: {typo_lines:?}"
+            ))
+        }
+    });
 }
 
 /// **The PRODUCTION shape whose decline must be
@@ -41252,6 +41749,25 @@ fn ri_replay_bounded(
     duration_bound_ns: Option<u64>,
     feed_index_budget: Option<u64>,
 ) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_reporting(
+        bag,
+        make,
+        purpose,
+        duration_bound_ns,
+        feed_index_budget,
+        None,
+    )
+}
+
+/// [`ri_replay_bounded`] that also writes `--report` to `report_path`.
+fn ri_replay_reporting(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+    report_path: Option<std::path::PathBuf>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
     ri_take();
     let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(bag);
     let clock = Arc::new(VirtualClock::new());
@@ -41276,7 +41792,7 @@ fn ri_replay_bounded(
         record_health: RecordHealthReport::Absent,
         duration_bound_ns,
         feed_index_budget,
-        report_path: None,
+        report_path,
         fire_tap: None,
         tolerance: None,
         strict_state: false,
@@ -41495,8 +42011,9 @@ fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
     assert!(
-        verdict.contains("reads: fed by recorded identity"),
-        "the verdict says how reads were fed: {verdict}"
+        !verdict.contains("reads:"),
+        "reads fed by identity print no line; `ri_assert_fed` read it off the outcome: \
+         {verdict}"
     );
 }
 

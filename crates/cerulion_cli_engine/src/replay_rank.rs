@@ -61,9 +61,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cerulion_core::graph::{resolve_output_topic, resolve_source, GraphConfig};
+use cerulion_core::graph::{
+    resolve_output_topic, resolve_source, GraphConfig, SiblingProducedTopics,
+};
 
-use crate::multiprocess::subgraph_for;
+use crate::multiprocess::{sibling_topics_for, subgraph_for};
 
 /// One rank's recorded node table — the `node_ids` of its
 /// `__cerulion/trace_manifest_rank{N}.json` attachment, plus the rank the
@@ -252,6 +254,7 @@ pub struct RankPlan {
     produced: BTreeSet<String>,
     cross_rank_consumed: Vec<CrossRankEdge>,
     external_consumed: BTreeSet<String>,
+    sibling_produced: SiblingProducedTopics,
     first_step: u64,
     last_step: u64,
     first_target_ns: u64,
@@ -312,6 +315,21 @@ impl RankPlan {
     #[must_use]
     pub fn external_consumed(&self) -> &BTreeSet<String> {
         &self.external_consumed
+    }
+
+    /// The absolute topics another rank PRODUCES that this rank's subgraph
+    /// reads, the set a live worker hands its validation
+    /// (`multiprocess::sibling_topics_for`, the same function).
+    ///
+    /// The split absolutizes each such source and drops its producer from this
+    /// rank's view, so without the set the pass build reads a correct cross-rank
+    /// edge as an in-prefix source with no producer and warns that it may be a
+    /// typo. Validation only: the set changes which warnings a build emits, never
+    /// how it is wired. EMPTY for a rank that owns the whole graph (every
+    /// lockstep plan).
+    #[must_use]
+    pub fn sibling_produced(&self) -> &SiblingProducedTopics {
+        &self.sibling_produced
     }
 
     /// The first recorded step index this rank must be driven to.
@@ -710,6 +728,7 @@ pub fn plan_ranks(
         } else {
             subgraph_for(config, &format!("rank{rank}"), &members)
         };
+        let sibling_produced = sibling_topics_for(config, &members);
         let summary = summary_of[&rank];
         plans.push(RankPlan {
             rank,
@@ -718,6 +737,7 @@ pub fn plan_ranks(
             produced,
             cross_rank_consumed,
             external_consumed,
+            sibling_produced,
             first_step: summary.first_step,
             last_step: summary.last_step,
             first_target_ns: summary.first_target_ns,

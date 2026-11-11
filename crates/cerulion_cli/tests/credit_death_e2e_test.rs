@@ -274,9 +274,9 @@ const IOX2_LEVEL: (&str, &str) = ("IOX2_LOG_LEVEL", "debug");
 
 /// The `tracing` directive that lets the bridged lines through.
 ///
-/// It is NOT the baseline plus one target. The runtime's own default is
-/// `cerulion=info` under a global ERROR floor (`log_verb_class` in `main.rs`,
-/// where one-shot verbs take `warn` and long-running ones keep `info`), and the
+/// It is NOT the baseline plus one target. The runtime's own default for
+/// `graph run` is `cerulion=warn` under a global ERROR floor (`log_verb_class`
+/// in `cli.rs`, where `graph run` takes the quiet class), and the
 /// baseline these two arms replace is the harness's per-crate spec, so besides
 /// moving iceoryx2 to debug this directive brings every target the baseline does
 /// not name up to `info`. The three the harness names are already there, and
