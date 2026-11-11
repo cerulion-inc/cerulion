@@ -2261,8 +2261,12 @@ route egress through ONE network gateway that opens the robot's single
 zenoh session and announces every produced topic when LAN access is open;
 one loud breadcrumb prints at start. On the default Unix path that gateway is hosted by the machine's
 `cerulion-netd`, which listens and advertises itself over mDNS only when
-`CERULION_NETD_LISTEN` is set, so a stock robot is not found by a default
-desk. The per-run fallback gateway child listens on the well-known port
+`CERULION_NETD_LISTEN` is set. In a WAN build, the first egress registration
+also starts the authenticated remote server without a listen locator; a saved
+login or established robot pairing permits it, including an expired saved login.
+Query-only desks and local-only runs start no remote server. The last serving
+registration's release or disconnect reaps the server after active shell/exec work,
+an owed e-stop delivery and its latch have cleared. The per-run fallback gateway child listens on the well-known port
 **7683** (bind-probing upward on conflict; override with
 `CERULION_GATEWAY_PORT`) and advertises itself over mDNS. The
 optional top-level `network:` block below RESTRICTS this (a Strict
@@ -3724,7 +3728,7 @@ queueing more than 8 MiB in all cancels the build.
 | `CERULION_NETD_TLS_CERTIFICATE` | Absolute path of the PEM certificate a `quic/` or `tls/` listen locator presents (graph `tls.certificate`). It must not be marked `CA:TRUE`. |
 | `CERULION_NETD_TLS_PRIVATE_KEY` | Absolute path of the PEM private key for `CERULION_NETD_TLS_CERTIFICATE` (graph `tls.private_key`). A `quic/` or `tls/` listen locator needs both, and both are refused when no listen locator is `quic/` or `tls/`. `cerulion-netd` applies the graph-load carrier rules to these variables and to `CERULION_NETD_CONNECT` / `CERULION_NETD_LISTEN` at start-up, and refuses to start, naming the variable, on a setting that cannot work. |
 | `CERULION_NETD_IDLE_GRACE_MS` | How long a consumer-less `cerulion-netd` waits before self-exiting, in ms (default **30 000**). |
-| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A robot daemon adds its `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` to this deadline. |
+| `CERULION_NETD_HARD_EXIT_MS` | Deadline for graceful shutdown before the daemon hard-exits, in ms (default **5000**). A wedged teardown must never leave a zombie holding the control socket. A network-enabled daemon in a WAN build, whether or not it is serving, adds `CERULION_REMOTED_HARD_EXIT_MS` (default 30000) plus 500 ms and `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` (default 35) to this deadline. |
 | `CERULION_NETD_BIN` | Path to the `cerulion-netd` binary, when it is not beside the `cerulion` executable. If you point this at a wrapper script, the wrapper must `exec` the daemon rather than run it as a child; the readiness wait watches the process it spawned, and a non-`exec` wrapper exits as soon as it has forked, which reads as "the daemon died". |
 
 WSD graph and node reads include a `version` field containing the lowercase

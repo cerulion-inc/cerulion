@@ -117,6 +117,11 @@ pub type EgressId = ConnId;
 /// protocol error and rolls the registry's egress accounting back.
 #[derive(Debug)]
 pub enum EgressError {
+    /// The machine could not queue its owned authenticated server lifecycle.
+    Server {
+        /// The daemon is stopping or its lifecycle worker could not start.
+        reason: String,
+    },
     /// The shared embedded gateway could not boot, or a produced topic could not be
     /// pushed onto it — carries the underlying transport cause. Boxed because
     /// `TransportError` is a large enum (clippy `result_large_err`).
@@ -145,6 +150,7 @@ pub enum EgressError {
 impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EgressError::Server { reason } => write!(f, "remote server startup failed: {reason}"),
             EgressError::Gateway { source } => {
                 write!(f, "failed to register the network egress plan: {source}")
             }
@@ -164,6 +170,7 @@ impl std::fmt::Display for EgressError {
 impl std::error::Error for EgressError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            EgressError::Server { .. } => None,
             EgressError::Gateway { source } => Some(source.as_ref()),
             EgressError::NamespaceMismatch { .. } => None,
         }
@@ -176,6 +183,12 @@ impl std::error::Error for EgressError {
 /// on release / disconnect. `Send + Sync`: shared across the daemon's per-connection
 /// threads.
 pub trait EgressPlane: Send + Sync {
+    /// True until the owned remote server has been reaped. The idle watcher must
+    /// retain the daemon singleton through this interval, including last release.
+    fn holds_serving_endpoint(&self) -> bool {
+        false
+    }
+
     /// Read only this plane's accumulated metadata. No gateway boot, network query,
     /// mirror registration or discovery occurs here. A plane without metadata
     /// reports an error instead of a positive empty snapshot.

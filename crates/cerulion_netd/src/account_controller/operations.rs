@@ -172,6 +172,32 @@ impl AccountWanController {
 }
 
 impl MirrorPlane for AccountWanController {
+    fn begin_serving(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "account robot controller state is poisoned".to_owned())?;
+        // Fence construction under the SAME lock every endpoint operation holds.
+        // Principle #8: outgoing ownership ends before the server can bind.
+        state.serving_gateway = true;
+        state.pending_all = true;
+        state.pending_robots.clear();
+        let proof = state.registry.owner_certificate()?;
+        if let Some(plane) = state.plane.take() {
+            plane.invalidate_account()?;
+        }
+        state.registry.replace_owner_certificate(proof)?;
+        Ok(())
+    }
+
+    fn end_serving(&self) {
+        // Only called after the server has been reaped. Retained pins are
+        // retired by the existing identity watch / prepare_demand path.
+        if let Ok(mut state) = self.state.lock() {
+            state.serving_gateway = self.config.serving_gateway;
+        }
+    }
+
     fn account_access(&self, action: &AccountAccessRequest) -> Result<AccountAccessReply, String> {
         self.account_operation(action)
     }

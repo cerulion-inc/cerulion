@@ -130,6 +130,46 @@ remove them before committing.
   paired-only access withholds those tokens while preserving robot identity
   presence. The beacon rises at boot; such a daemon never idle-self-exits (§3).
   `CERULION_NETD_NETWORK=off` wins over LISTEN: a local-only daemon boots nothing.
+- **Authenticated serving**: in a WAN build, `SupervisedEgressPlane` starts the
+  existing `robot_supervisor` on the first accepted nonempty egress registration,
+  with no LISTEN prerequisite. A saved login or authenticated persistent robot
+  pairing permits serving; expired login tokens preserve established offline
+  operation. Account registration uses the existing bounded bootstrap worker.
+  A robot paired without account enrollment reuses its claimed persistent state
+  and does not enroll again. Query-only desks start no server. Last release or
+  disconnect reaps the child after active work, owed e-stop delivery and its latch
+  clear; explicit LISTEN keeps its standing child until
+  daemon shutdown. Endpoint transfer closes the outgoing desk endpoint before
+  spawning remoted and permits new outgoing ownership only after reap. The idle
+  watcher retains the singleton while that endpoint is held, including teardown.
+  One lazy lifecycle worker queues accepted registration ids and controls startup,
+  endpoint transfer and reap outside the registration mutex. A registration during
+  teardown replies without waiting and starts one replacement after the old owner
+  has stopped. Outbound WAN readers also prevent idle reap; their shared native
+  holds serialize new demands against an exclusive stop. WAN teardown reserves the
+  full server/fetch budget before endpoint ownership; reading it takes no lifecycle
+  lock.
+  Native admission uses `serving_hold::ServingHolds`, re-exported by remoted:
+  acquire a guard before ops/RCP or shell/exec work and retain it through final
+  drain and witness. Latch and owed-delivery sources refresh before the last
+  shared unlock. Both daemons use `serving_hold::fence_path(state_root)` for
+  `<state_root>/serving/serving.hold`, outside the provisioned `remoted` directory.
+  Its parent is created owner-only before the file opens, so fresh provisioning
+  still requires no existing robot directory. Netd takes that inode exclusively through
+  idle reap; never unlink it. Source mutations require an admitted guard and
+  callbacks must not acquire the hold manager; missing daemon sources fail closed.
+  Stop handling installs before daemon accept startup. Remoted has its own process
+  group; direct SIGTERM starts within its hard-exit budget plus 500 ms, followed
+  by forced reap if necessary and revocation-fetch grace. Endpoint transfer calls
+  `MirrorPlane::begin_serving` after provisioning and before child spawn,
+  `serving_ready` to restore retained WAN pins once the owned socket admits work,
+  and `end_serving` after child and fetch reap, also on transfer or spawn failure.
+  Controllers preserve holders and schema pins or notify holders of failed restores.
+  Incoming TLS handshakes run in at most 32 concurrent workers for at most 10 s;
+  unvalidated addresses retry at half capacity, validated IPs hold at most four,
+  and each relay holds at most eight. Completed handshakes dispatch before new
+  arrivals, so stalled unvalidated peers cannot consume all safety admission slots. Safety refresh waits never cancel a handshake.
+  Shutdown aborts and joins pending handshakes before endpoint cleanup.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway
