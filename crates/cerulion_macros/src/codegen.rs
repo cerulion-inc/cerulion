@@ -2130,7 +2130,7 @@ fn gen_cdylib(
                 params_json: ::std::option::Option<&[u8]>,
             ) -> u64 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    use #__cer_root::graph::node::NodeEntry;
+                    use #__cer_root::graph::node::NodeEntry as _;
 
                     if ctx_ptr.is_null() {
                         __cer_set_last_error(::std::string::String::from(

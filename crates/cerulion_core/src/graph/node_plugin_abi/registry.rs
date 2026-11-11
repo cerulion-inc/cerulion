@@ -18,9 +18,24 @@ pub enum CallError {
     /// Another operation owns the instance gate, or the handle counter is full.
     InvalidState,
     /// Node code unwound; the unwind was caught inside the execution gate.
-    Panic,
+    Panic(&'static str),
+    /// A poisoned registry or instance mutex prevented admission.
+    Poisoned {
+        operation: &'static str,
+        mutex: &'static str,
+    },
     /// A typed user/transport error returned normally.
     Node(TransportError),
+}
+
+impl CallError {
+    pub(super) fn at_operation(self, operation: &'static str) -> Self {
+        match self {
+            Self::Panic(_) => Self::Panic(operation),
+            Self::Poisoned { mutex, .. } => Self::Poisoned { operation, mutex },
+            error => error,
+        }
+    }
 }
 
 struct Row<T> {
@@ -52,8 +67,14 @@ impl<T> NodeRegistry<T> {
     /// Insert initialized node-local state and mint a nonzero handle.
     // hot-path-alloc-ok-fn: node create allocates node-owned instance storage once.
     pub fn insert(&self, value: T) -> Result<u64, CallError> {
-        let mut rows = self.rows.lock().map_err(|_| CallError::Panic)?;
-        let mut next = self.next.lock().map_err(|_| CallError::Panic)?;
+        let mut rows = self.rows.lock().map_err(|_| CallError::Poisoned {
+            operation: "",
+            mutex: "NODES",
+        })?;
+        let mut next = self.next.lock().map_err(|_| CallError::Poisoned {
+            operation: "",
+            mutex: "NODES",
+        })?;
         let following = next.checked_add(1).ok_or(CallError::InvalidState)?;
         let handle = *next;
         rows.push(Row {
@@ -68,7 +89,10 @@ impl<T> NodeRegistry<T> {
         if handle == 0 {
             return Err(CallError::InvalidHandle);
         }
-        let rows = self.rows.lock().map_err(|_| CallError::Panic)?;
+        let rows = self.rows.lock().map_err(|_| CallError::Poisoned {
+            operation: "",
+            mutex: "NODES",
+        })?;
         rows.iter()
             .find(|row| row.handle == handle)
             .map(|row| Arc::clone(&row.instance))
@@ -87,13 +111,16 @@ impl<T> NodeRegistry<T> {
         let instance = self.instance(handle)?;
         let mut gate = instance.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => CallError::InvalidState,
-            TryLockError::Poisoned(_) => CallError::Panic,
+            TryLockError::Poisoned(_) => CallError::Poisoned {
+                operation: "",
+                mutex: "node instance",
+            },
         })?;
         let value = gate.as_mut().ok_or(CallError::InvalidHandle)?;
         catch_unwind(AssertUnwindSafe(|| call(value)))
             .map_err(|payload| {
                 super::contain_panic_payload(payload);
-                CallError::Panic
+                CallError::Panic("")
             })?
             .map_err(CallError::Node)
     }
@@ -112,23 +139,29 @@ impl<T> NodeRegistry<T> {
         let instance = self.instance(handle)?;
         let mut gate = instance.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => CallError::InvalidState,
-            TryLockError::Poisoned(_) => CallError::Panic,
+            TryLockError::Poisoned(_) => CallError::Poisoned {
+                operation: "",
+                mutex: "node instance",
+            },
         })?;
         let value = gate.as_mut().ok_or(CallError::InvalidHandle)?;
         catch_unwind(AssertUnwindSafe(|| before(value)))
             .map_err(|payload| {
                 super::contain_panic_payload(payload);
-                CallError::Panic
+                CallError::Panic("")
             })
             .and_then(|result| result.map_err(CallError::Node))?;
         let value = gate.take().ok_or(CallError::InvalidHandle)?;
-        let mut rows = self.rows.lock().map_err(|_| CallError::Panic)?;
+        let mut rows = self.rows.lock().map_err(|_| CallError::Poisoned {
+            operation: "",
+            mutex: "NODES",
+        })?;
         rows.retain(|row| row.handle != handle);
         drop(rows);
         invalidated();
         catch_unwind(AssertUnwindSafe(|| drop(value))).map_err(|payload| {
             super::contain_panic_payload(payload);
-            CallError::Panic
+            CallError::Panic("")
         })?;
         Ok(())
     }
@@ -137,6 +170,26 @@ impl<T> NodeRegistry<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_instance_is_distinct_from_a_caught_execution_panic() {
+        let registry = NodeRegistry::default();
+        let handle = registry.insert(7_u64).unwrap();
+        let instance = registry.instance(handle).unwrap();
+        let poison = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = instance.lock().unwrap();
+            panic!("instance mutex poison oracle");
+        }));
+        assert!(poison.is_err());
+        let error = registry.call(handle, |value| Ok(*value)).unwrap_err();
+        assert!(matches!(
+            error.at_operation("cerulion_node_tick"),
+            CallError::Poisoned {
+                operation: "cerulion_node_tick",
+                mutex: "node instance"
+            }
+        ));
+    }
 
     #[test]
     fn deferred_pre_destroy_refusal_preserves_the_live_instance_and_handle() {
@@ -159,7 +212,7 @@ mod tests {
                 |_| panic!("deferred flush panic oracle"),
                 || invalidated.set(true)
             ),
-            Err(CallError::Panic)
+            Err(CallError::Panic(""))
         ));
         assert!(!invalidated.get());
         assert_eq!(registry.call(handle, |value| Ok(*value)).unwrap(), 17);
@@ -206,7 +259,7 @@ mod tests {
                 *value = 7;
                 panic!("node callback oracle");
             }),
-            Err(CallError::Panic)
+            Err(CallError::Panic(""))
         ));
         assert_eq!(registry.call(handle, |value| Ok(*value)).unwrap(), 7);
         registry.destroy(handle).unwrap();
@@ -258,7 +311,7 @@ mod tests {
         let registry = NodeRegistry::default();
         let first = registry.insert(Drops { panic: true }).unwrap();
         let second = registry.insert(Drops { panic: false }).unwrap();
-        assert!(matches!(registry.destroy(first), Err(CallError::Panic)));
+        assert!(matches!(registry.destroy(first), Err(CallError::Panic(""))));
         assert!(matches!(
             registry.call(first, |_| Ok(())),
             Err(CallError::InvalidHandle)
@@ -285,7 +338,7 @@ mod panic_payload_test {
             registry.call::<()>(handle, |_| {
                 std::panic::panic_any(DestructingPayload);
             }),
-            Err(CallError::Panic)
+            Err(CallError::Panic(""))
         ));
         assert_eq!(registry.call(handle, |value| Ok(*value)).unwrap(), 41);
         registry.destroy(handle).unwrap();

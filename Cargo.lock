@@ -9394,6 +9394,7 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+ "trybuild",
 ]
 
 [[package]]

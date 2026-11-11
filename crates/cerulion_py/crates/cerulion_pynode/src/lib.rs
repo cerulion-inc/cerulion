@@ -6,11 +6,9 @@
 //! SIGINT disposition. Build one node cdylib per CPython minor:
 //! the resulting library has a `libpython` `NEEDED` entry and is not an abi3
 //! extension. This host is intended for deterministic graph ticks, not kHz
-//! Python loops. The input-discipline exports a `#[cerulion_node]` cdylib
-//! carries (input snapshot, trigger drain and refill, Sync head ops) are
-//! exported too, so the scheduler serves a Python node's inputs exactly as a
-//! Rust node's; the state capture and restore exports are not, so a Python
-//! node restarts from `init` like a Rust node that declares no state. A leaked
+//! Python loops. The stable table uses host-owned snapshot, trigger drain
+//! and Sync services, so the scheduler serves Python inputs exactly as Rust
+//! inputs. Python nodes restart from `init` without state capture or restore. A leaked
 //! memoryview of a discarded loan pins one publisher pool slot until Python
 //! releases it.
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -65,19 +63,32 @@ fn builtin_schemas() -> Vec<MessageSchema> {
 /// (`<workspace>/nodes/<type>`, the first `sys_path` entry), else the cwd.
 fn node_workspace(ctx: &NodeContext, sys_path: &[&str]) -> Result<std::path::PathBuf, String> {
     let explicit = ctx.env_str("CERULION_WORKSPACE", "");
-    if !explicit.is_empty() {
-        return Ok(explicit.into());
-    }
-    if let Some(root) = sys_path
+    resolve_node_workspace(Some(std::path::Path::new(&explicit)), sys_path)
+}
+
+fn workspace_choice<'a>(
+    explicit: Option<&'a std::path::Path>,
+    inferred: Option<&'a std::path::Path>,
+) -> Option<&'a std::path::Path> {
+    explicit
+        .filter(|path| !path.as_os_str().is_empty())
+        .or(inferred)
+}
+
+fn resolve_node_workspace(
+    explicit: Option<&std::path::Path>,
+    sys_path: &[&str],
+) -> Result<std::path::PathBuf, String> {
+    let inferred = sys_path
         .first()
         .map(std::path::Path::new)
         .and_then(std::path::Path::parent)
         .and_then(std::path::Path::parent)
-        .filter(|root| root.join("nodes").is_dir())
-    {
-        return Ok(root.to_path_buf());
+        .filter(|root| root.join("nodes").is_dir());
+    match workspace_choice(explicit, inferred) {
+        Some(root) => Ok(root.to_path_buf()),
+        None => std::env::current_dir().map_err(|error| error.to_string()),
     }
-    std::env::current_dir().map_err(|error| error.to_string())
 }
 
 /// The node's schema set: the built-ins under the workspace's own schemas,
@@ -972,7 +983,6 @@ impl Host {
             sys_path,
             info,
             first_instance,
-            None,
         )
     }
 
@@ -982,7 +992,6 @@ impl Host {
         sys_path: &[&str],
         info: &[u8],
         first_instance: bool,
-        params: Option<&[u8]>,
     ) -> Result<Self, String> {
         initialize_python()?;
         Python::attach(|py| -> Result<Self, String> {
@@ -1042,16 +1051,7 @@ impl Host {
                 .call1((
                     classes[0].1.clone(),
                     host_ctx,
-                    match params {
-                        Some(bytes) if !bytes.is_empty() => {
-                            let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
-                            py.import("json")
-                                .and_then(|m| m.call_method1("loads", (text,)))
-                                .map_err(python_error)?
-                                .unbind()
-                        }
-                        _ => py.None(),
-                    },
+                    py.None(),
                     workspace.to_string_lossy().into_owned(),
                     sys_path.first().copied(),
                 ))
@@ -1482,6 +1482,42 @@ macro_rules! export_node {
 #[cfg(test)]
 mod tests {
     use super::Host;
+
+    #[test]
+    fn workspace_resolution_uses_explicit_then_node_ancestor_then_cwd() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../examples/go2")
+            .canonicalize()
+            .unwrap();
+        let explicit = workspace.parent().unwrap();
+        assert_eq!(
+            super::workspace_choice(Some(explicit), Some(&workspace)),
+            Some(explicit)
+        );
+        assert_eq!(
+            super::workspace_choice(Some(std::path::Path::new("")), Some(&workspace)),
+            Some(workspace.as_path())
+        );
+        assert_eq!(super::workspace_choice(None, None), None);
+        let node = workspace.join("nodes/dds_bridge");
+        let paths = [node.to_str().unwrap()];
+        assert_eq!(
+            super::resolve_node_workspace(Some(&workspace), &[]).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::resolve_node_workspace(None, &paths).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::resolve_node_workspace(Some(std::path::Path::new("")), &paths).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::resolve_node_workspace(None, &[]).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+    }
 
     const INFO: &[u8] =
         br#"{"inputs":[],"outputs":[{"name":"out","schema_hash":7}],"policy":{"period_ms":10}}"#;

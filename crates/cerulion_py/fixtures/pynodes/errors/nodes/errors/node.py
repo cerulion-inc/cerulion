@@ -72,6 +72,10 @@ else:
 
         def tick(self):
             case = os.environ.get("CERULION_PYNODE_CASE")
+            if case == "unwired_output":
+                if self.inp is None or self.inp.value not in (0, 1):
+                    raise RuntimeError("unwired graph input was not delivered")
+                return
             if case == "retain_after_destroy":
                 import builtins
 

@@ -257,6 +257,7 @@ struct HostPynodeArgs<'a> {
     /// Tick the loaded nodes in turn (tick 0 of each, then tick 1 of each),
     /// as a single-process graph schedules them, instead of one node at a time.
     interleave: bool,
+    unwired_outputs: bool,
 }
 
 fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
@@ -275,6 +276,7 @@ fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
         input_ticks: None,
         sync_probe: false,
         interleave: false,
+        unwired_outputs: false,
     };
     let mut options = options.iter();
     while let Some(option) = options.next() {
@@ -287,6 +289,7 @@ fn parse_host_pynode(argv: &[String]) -> Result<HostPynodeArgs<'_>, String> {
             "--snapshot" => args.snapshot = true,
             "--sync-probe" => args.sync_probe = true,
             "--interleave" => args.interleave = true,
+            "--unwired-outputs" => args.unwired_outputs = true,
             "--input-ticks" => {
                 let count = options
                     .next()
@@ -443,6 +446,7 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
         input_ticks,
         sync_probe,
         interleave,
+        unwired_outputs,
     } = parse_host_pynode(argv)?;
     // Every node's ports are created before any node runs `init`, every node
     // is initialised before any node ticks, and every node is shut down after
@@ -457,10 +461,15 @@ fn cmd_host_pynode(mgr: &TransportManager, argv: &[String]) -> Result<ExitCode, 
     let mut init_failed = false;
     let mut initialised = Vec::with_capacity(nodes.len());
     for mut node in nodes {
-        let context = node
+        let mut context = node
             .context
             .take()
             .ok_or("node context was already taken")?;
+        if unwired_outputs {
+            context.split_publishers_subscribers_mut().0.clear();
+            assert_eq!(context.publisher_names().count(), 0);
+            println!("unwired publisher_none=1");
+        }
         match node.entry.init(context) {
             Ok(()) => initialised.push(node),
             Err(error) => {
@@ -1293,7 +1302,7 @@ fn cmd_subscribe(mgr: &TransportManager, args: &Args) -> Result<ExitCode, String
     Ok(ExitCode::SUCCESS)
 }
 
-const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture publish-hold --topic T --schema-hash H --count N --size S [--borrow-floor F] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave]\n  cerulion_py_fixture write-bag --path FILE";
+const USAGE: &str = "usage:\n  cerulion_py_fixture publish --topic T --schema-hash H --count N --size S [--timestamp-ns TS] [--linger-ms L]\n  cerulion_py_fixture publish-hold --topic T --schema-hash H --count N --size S [--borrow-floor F] [--linger-ms L]\n  cerulion_py_fixture subscribe --topic T --count N --timeout-ms M\n  cerulion_py_fixture publish-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N [--wait-ms W] [--linger-ms L]\n  cerulion_py_fixture subscribe-typed --topic T --schema geometry_msgs/Vector3|sensor_msgs/LaserScan --count N --timeout-ms M\n  cerulion_py_fixture host-pynode <path> <ticks> [--also <path>] [--bench] [--seed <n>] [--snapshot] [--input-ticks <n>] [--sync-probe] [--interleave] [--unwired-outputs]\n  cerulion_py_fixture write-bag --path FILE";
 
 fn main() -> ExitCode {
     match run() {

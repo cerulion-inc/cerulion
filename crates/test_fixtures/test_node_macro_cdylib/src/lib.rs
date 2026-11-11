@@ -68,3 +68,15 @@ impl MacroCounter {
 pub extern "C" fn cerulion_test_get_tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
+
+#[cfg(test)]
+mod context_compile_tests {
+    #[test]
+    fn stable_context_helpers_compile_with_the_author_migration() {
+        let cases = trybuild::TestCases::new();
+        cases.pass("tests/ui/annotated_context_helper.rs");
+        cases.pass("tests/ui/data_only_helpers.rs");
+        cases.pass("tests/ui/qualified_context_helper.rs");
+        cases.compile_fail("tests/ui/free_context_helper.rs");
+    }
+}

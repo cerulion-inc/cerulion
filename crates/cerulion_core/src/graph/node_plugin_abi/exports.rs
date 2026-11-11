@@ -63,7 +63,10 @@ impl<T> Default for NodeExports<T> {
 impl<T: PluginNode> NodeExports<T> {
     // hot-path-alloc-ok-fn: provision one local diagnostic slot per cold instance creation.
     fn register_diagnostic(&self, handle: u64) -> Result<(), CallError> {
-        let mut errors = self.errors.lock().map_err(|_| CallError::Panic)?;
+        let mut errors = self.errors.lock().map_err(|_| CallError::Poisoned {
+            operation: "cerulion_node_init",
+            mutex: "diagnostic",
+        })?;
         errors.instances.push(DiagnosticSlot {
             handle,
             pending: None,
@@ -113,10 +116,15 @@ impl<T: PluginNode> NodeExports<T> {
             return super::status(status_code::INVALID_STATE);
         };
         let (code, kind, text) = match error {
-            CallError::Panic => (
+            CallError::Panic(operation) => (
                 status_code::PANICKED,
                 0,
-                "node panic caught inside the execution gate".into(),
+                format!("{operation}: panic caught by catch_unwind"),
+            ),
+            CallError::Poisoned { operation, mutex } => (
+                status_code::FAILED,
+                0,
+                format!("{operation}: {mutex} mutex poisoned"),
             ),
             CallError::Node(error) => (
                 if matches!(error, crate::error::TransportError::NodeTickPanicked { .. }) {
@@ -152,30 +160,47 @@ impl<T: PluginNode> NodeExports<T> {
             }
         }
     }
-    fn guarded(&self, call: impl FnOnce() -> Result<(), CallError>) -> Status {
-        self.guarded_for(0, call)
+    fn guarded(
+        &self,
+        operation: &'static str,
+        call: impl FnOnce() -> Result<(), CallError>,
+    ) -> Status {
+        self.guarded_for(0, operation, call)
     }
     fn guarded_node(
         &self,
         handle: NodeHandle,
+        operation: &'static str,
         call: impl FnOnce() -> Result<(), CallError>,
     ) -> Status {
-        self.guarded_for(handle.value, call)
+        self.guarded_for(handle.value, operation, call)
     }
-    fn guarded_for(&self, owner: u64, call: impl FnOnce() -> Result<(), CallError>) -> Status {
-        self.guarded_status(|| match catch_unwind(AssertUnwindSafe(call)) {
-            Ok(Ok(())) => super::status(status_code::OK),
-            Ok(Err(error)) => self.error_for(owner, error),
-            Err(payload) => {
-                super::contain_panic_payload(payload);
-                self.error_for(owner, CallError::Panic)
+    fn guarded_for(
+        &self,
+        owner: u64,
+        operation: &'static str,
+        call: impl FnOnce() -> Result<(), CallError>,
+    ) -> Status {
+        self.guarded_status(owner, operation, || {
+            match catch_unwind(AssertUnwindSafe(call)) {
+                Ok(Ok(())) => super::status(status_code::OK),
+                Ok(Err(error)) => self.error_for(owner, error.at_operation(operation)),
+                Err(payload) => {
+                    super::contain_panic_payload(payload);
+                    self.error_for(owner, CallError::Panic(operation))
+                }
             }
         })
     }
-    fn guarded_status(&self, call: impl FnOnce() -> Status) -> Status {
+    fn guarded_status(
+        &self,
+        owner: u64,
+        operation: &'static str,
+        call: impl FnOnce() -> Status,
+    ) -> Status {
         catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
             super::contain_panic_payload(payload);
-            super::status(status_code::PANICKED)
+            self.error_for(owner, CallError::Panic(operation))
         })
     }
 
@@ -201,7 +226,7 @@ impl<T: PluginNode> NodeExports<T> {
         // initialize the invalid sentinel before any node/transport side effect.
         let output = unsafe { &mut *output };
         *output = NodeHandle::default();
-        self.guarded(|| {
+        self.guarded("cerulion_node_init", || {
             // SAFETY (U05): caller's immutable table/context lifetime is the
             // documented create contract; connect validates full shape first.
             let client =
@@ -244,16 +269,20 @@ impl<T: PluginNode> NodeExports<T> {
     }
 
     pub fn tick(&self, handle: NodeHandle) -> Status {
-        self.guarded_node(handle, || self.call_node(handle.value, T::tick))
+        self.guarded_node(handle, "cerulion_node_tick", || {
+            self.call_node(handle.value, T::tick)
+        })
     }
 
     pub fn shutdown(&self, handle: NodeHandle) -> Status {
-        self.guarded_node(handle, || self.call_node(handle.value, T::shutdown))
+        self.guarded_node(handle, "cerulion_node_shutdown", || {
+            self.call_node(handle.value, T::shutdown)
+        })
     }
 
     pub fn destroy(&self, handle: NodeHandle) -> Status {
         let invalidated = std::cell::Cell::new(false);
-        let status = self.guarded_node(handle, || {
+        let status = self.guarded_node(handle, "cerulion_node_destroy", || {
             self.registry.destroy_with(
                 handle.value,
                 |node| node.flush_deferred(),
@@ -290,7 +319,7 @@ impl<T: PluginNode> NodeExports<T> {
         if !valid_output(required) {
             return super::status(status_code::INVALID_ARGUMENT);
         }
-        self.guarded_status(|| {
+        self.guarded_status(0, "cerulion_take_last_error", || {
             let Ok(mut errors) = self.errors.lock() else {
                 return super::status(status_code::PANICKED);
             };
@@ -350,7 +379,7 @@ impl<T: PluginNode> NodeExports<T> {
         if !valid_output(output) {
             return self.error_for(0, CallError::InvalidArgument);
         }
-        self.guarded(|| {
+        self.guarded("cerulion_node_state_shape", || {
             let shape = T::state_shape();
             // SAFETY (U12): caller-owned output was checked non-null/aligned.
             unsafe {
@@ -370,7 +399,7 @@ impl<T: PluginNode> NodeExports<T> {
         sink: *const StateSinkV1,
         capacity: u64,
     ) -> Status {
-        self.guarded_status(|| {
+        self.guarded_status(handle.value, "cerulion_node_capture_state", || {
             // SAFETY (U12/U07): live caller-owned sink for this entire call;
             // new validates its pointer/callback before any state is captured.
             let mut sink = match unsafe { super::state::CallbackSink::new(sink, capacity) } {
@@ -379,9 +408,10 @@ impl<T: PluginNode> NodeExports<T> {
             };
             let result = self.call_node(handle.value, |node| node.capture(&mut sink));
             match sink.failure() {
-                Some(status) if status.code == status_code::PANICKED => {
-                    self.error_for(handle.value, CallError::Panic)
-                }
+                Some(status) if status.code == status_code::PANICKED => self.error_for(
+                    handle.value,
+                    CallError::Panic("cerulion_node_capture_state"),
+                ),
                 Some(status) if status.code == status_code::BUFFER_TOO_SMALL => {
                     self.clear_instance_diagnostic(handle.value);
                     super::status(status_code::BUFFER_TOO_SMALL)
@@ -392,7 +422,10 @@ impl<T: PluginNode> NodeExports<T> {
                 ),
                 None => match result {
                     Ok(()) => super::status(status_code::OK),
-                    Err(error) => self.error_for(handle.value, error),
+                    Err(error) => self.error_for(
+                        handle.value,
+                        error.at_operation("cerulion_node_capture_state"),
+                    ),
                 },
             }
         })
@@ -403,7 +436,7 @@ impl<T: PluginNode> NodeExports<T> {
     /// # Safety
     /// Payload is immutable initialized caller storage retained until return.
     pub unsafe fn restore(&self, handle: NodeHandle, payload: Bytes) -> Status {
-        self.guarded_node(handle, || {
+        self.guarded_node(handle, "cerulion_node_restore_state", || {
             // SAFETY (U12): host owns/live-retains the immutable payload; the
             // local state cursor borrows it only through this synchronous call.
             let bytes = unsafe { super::bytes::read(payload.ptr, payload.len, 1) }
@@ -420,7 +453,7 @@ impl<T: PluginNode> NodeExports<T> {
         if !valid_output(output) {
             return self.error_for(handle.value, CallError::InvalidArgument);
         }
-        self.guarded_node(handle, || {
+        self.guarded_node(handle, "cerulion_node_inline_safe", || {
             self.call_node(handle.value, |node| {
                 // SAFETY (U12): the caller owns this checked scalar output.
                 unsafe {
@@ -437,10 +470,12 @@ impl<T: PluginNode> NodeExports<T> {
         })) {
             Ok(Ok(true)) => super::status(status_code::OK),
             Ok(Ok(false)) => self.error_for(handle.value, CallError::InvalidState),
-            Ok(Err(error)) => self.error_for(handle.value, error),
+            Ok(Err(error)) => {
+                self.error_for(handle.value, error.at_operation("cerulion_node_cer_probe"))
+            }
             Err(payload) => {
                 super::contain_panic_payload(payload);
-                self.error_for(handle.value, CallError::Panic)
+                self.error_for(handle.value, CallError::Panic("cerulion_node_cer_probe"))
             }
         }
     }
@@ -453,7 +488,7 @@ impl<T: PluginNode> NodeExports<T> {
         if !valid_output(output) {
             return self.error_for(handle.value, CallError::InvalidArgument);
         }
-        self.guarded_node(handle, || {
+        self.guarded_node(handle, "cerulion_node_external_source", || {
             self.call_node(handle.value, |node| {
                 let source = node.external_source()?;
                 // SAFETY (U12): caller owns the checked complete scalar descriptor.
@@ -603,12 +638,121 @@ mod tests {
     }
 
     #[test]
+    fn every_execution_panic_keeps_its_legacy_entry_name_and_the_gate_recovers() {
+        struct Panics;
+        impl PluginNode for Panics {
+            fn create(_: HostClient, _: &[u8]) -> TransportResult<Self> {
+                panic!("create panic oracle")
+            }
+            fn tick(&mut self) -> TransportResult<()> {
+                panic!("tick panic oracle")
+            }
+            fn shutdown(&mut self) -> TransportResult<()> {
+                panic!("shutdown panic oracle")
+            }
+            fn state_shape() -> u64 {
+                panic!("shape panic oracle")
+            }
+            fn capture(&self, _: &mut dyn StateSink) -> TransportResult<()> {
+                panic!("capture panic oracle")
+            }
+            fn restore(&mut self, _: &[u8]) -> TransportResult<()> {
+                panic!("restore panic oracle")
+            }
+            fn inline_safe(&self) -> bool {
+                panic!("inline panic oracle")
+            }
+            fn probe(&self) -> bool {
+                panic!("probe panic oracle")
+            }
+            fn external_source(&mut self) -> TransportResult<ExternalSourceV1> {
+                panic!("source panic oracle")
+            }
+        }
+        let exports = NodeExports::<Panics>::default();
+        let value = exports.registry.insert(Panics).unwrap();
+        exports.register_diagnostic(value).unwrap();
+        let handle = NodeHandle { value };
+        let check = |status: Status, oracle: &str| {
+            assert_eq!(status.code, status_code::PANICKED);
+            assert_eq!(copied_reason(&exports, status.error), oracle);
+        };
+        check(
+            exports.tick(handle),
+            "cerulion_node_tick: panic caught by catch_unwind",
+        );
+        check(
+            exports.shutdown(handle),
+            "cerulion_node_shutdown: panic caught by catch_unwind",
+        );
+        check(
+            exports.probe(handle),
+            "cerulion_node_cer_probe: panic caught by catch_unwind",
+        );
+        let mut storage = [0_u8; 8];
+        let mut sink = BoundedSink::new(&mut storage);
+        let mut bridge = super::super::state::SinkBridge::new(&mut sink);
+        let descriptor = bridge.descriptor();
+        let mut shape = 0_u64;
+        let mut inline = 0_u32;
+        let mut source = ExternalSourceV1 {
+            fd: -1,
+            kind: 0,
+            flags: 0,
+        };
+        // SAFETY: registered node is exclusive, every output/span/sink owns
+        // complete aligned initialized storage for these synchronous calls.
+        unsafe {
+            check(
+                exports.shape(&mut shape),
+                "cerulion_node_state_shape: panic caught by catch_unwind",
+            );
+            check(
+                exports.capture(handle, &descriptor, 8),
+                "cerulion_node_capture_state: panic caught by catch_unwind",
+            );
+            check(
+                exports.restore(handle, super::super::client::bytes_span(b"")),
+                "cerulion_node_restore_state: panic caught by catch_unwind",
+            );
+            check(
+                exports.inline_safe(handle, &mut inline),
+                "cerulion_node_inline_safe: panic caught by catch_unwind",
+            );
+            check(
+                exports.external(handle, &mut source),
+                "cerulion_node_external_source: panic caught by catch_unwind",
+            );
+        }
+        assert_eq!(sink.written(), b"");
+        assert_eq!(shape, 0);
+        assert_eq!(inline, 0);
+        assert_eq!(source.fd, -1);
+        check(
+            exports.guarded("cerulion_node_init", || panic!("create guard oracle")),
+            "cerulion_node_init: panic caught by catch_unwind",
+        );
+        let poisoned = exports.guarded_node(handle, "cerulion_node_tick", || {
+            Err(CallError::Poisoned {
+                operation: "",
+                mutex: "node instance",
+            })
+        });
+        assert_eq!(poisoned.code, status_code::FAILED);
+        assert_eq!(
+            copied_reason(&exports, poisoned.error),
+            "cerulion_node_tick: node instance mutex poisoned"
+        );
+        assert_eq!(exports.destroy(handle).code, status_code::OK);
+    }
+
+    #[test]
     fn diagnostic_query_short_retry_complete_copy_and_stale_token_are_distinct() {
         let (exports, _) = installed();
-        let status = exports.error(CallError::Panic);
+        let status = exports.error(CallError::Panic("cerulion_node_tick"));
         assert_eq!(status.code, status_code::PANICKED);
         assert_eq!(status.error, 1);
-        let oracle = b"node panic caught inside the execution gate";
+        let oracle = b"cerulion_node_tick: panic caught by catch_unwind";
         let mut required = 0;
         // SAFETY: empty span requires no storage; required is a live output.
         let query = unsafe {
@@ -636,7 +780,7 @@ mod tests {
         };
         assert_eq!(retry.code, status_code::BUFFER_TOO_SMALL);
         assert_eq!(short, [0xa5; 3]);
-        let mut text = [0u8; 43];
+        let mut text = [0u8; 48];
         assert_eq!(text.len(), oracle.len());
         // SAFETY: complete live caller-owned destination.
         assert_eq!(
@@ -666,7 +810,10 @@ mod tests {
             .code,
             status_code::INVALID_HANDLE
         );
-        assert_eq!(exports.error(CallError::Panic).error, 2);
+        assert_eq!(
+            exports.error(CallError::Panic("cerulion_node_tick")).error,
+            2
+        );
     }
 
     #[test]
@@ -705,7 +852,10 @@ mod tests {
             previous = status.error;
         }
         for _ in 0..100 {
-            assert_eq!(exports.error(CallError::Panic).code, status_code::PANICKED);
+            assert_eq!(
+                exports.error(CallError::Panic("cerulion_node_tick")).code,
+                status_code::PANICKED
+            );
         }
         let errors = exports.errors.lock().unwrap();
         assert_eq!(errors.instances.len(), 1);
@@ -721,7 +871,9 @@ mod tests {
         drop(errors);
         exports.errors.lock().unwrap().next = u64::MAX;
         assert_eq!(
-            exports.error_for(handle.value, CallError::Panic).code,
+            exports
+                .error_for(handle.value, CallError::Panic("cerulion_node_tick"))
+                .code,
             status_code::INVALID_STATE
         );
         assert!(exports.errors.lock().unwrap().instances[0]
@@ -731,7 +883,7 @@ mod tests {
         assert!(exports.errors.lock().unwrap().instances.is_empty());
     }
 
-    fn copied_reason(exports: &NodeExports<CounterNode>, token: u64) -> String {
+    fn copied_reason<T: PluginNode>(exports: &NodeExports<T>, token: u64) -> String {
         let mut bytes = [0u8; 128];
         let mut required = 0;
         // SAFETY: exclusive initialized bytes and aligned required scalar
@@ -948,7 +1100,7 @@ mod tests {
     #[test]
     fn typed_user_failure_and_caught_panic_preserve_boundary_class() {
         let (exports, handle) = installed();
-        let error = exports.guarded(|| {
+        let error = exports.guarded("cerulion_node_init", || {
             exports.registry.call(handle.value, |_| {
                 Err(TransportError::NodeFailed {
                     node_id: "counter".into(),
@@ -961,7 +1113,7 @@ mod tests {
             (error.code, error.kind),
             (status_code::FAILED, NodeErrorKind::Logic.code())
         );
-        let panic = exports.guarded(|| {
+        let panic = exports.guarded("cerulion_node_init", || {
             exports
                 .registry
                 .call::<()>(handle.value, |_| panic!("counter panic oracle"))
@@ -977,7 +1129,7 @@ mod tests {
             exports.error(CallError::Unsupported).code,
             status_code::UNSUPPORTED
         );
-        let busy = exports.guarded(|| {
+        let busy = exports.guarded("cerulion_node_init", || {
             exports.registry.call(handle.value, |_| {
                 assert_eq!(exports.tick(handle).code, status_code::INVALID_STATE);
                 Ok(())
