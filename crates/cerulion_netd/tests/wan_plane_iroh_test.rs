@@ -47,9 +47,7 @@ use cerulion_netd::{DualMirrorPlane, IrohMirrorPlane, Plane, WanRegistry, WanRob
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
-use cerulion_remoted::{
-    handle_accepted_with_wire, DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane,
-};
+use cerulion_remoted::{DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane};
 use cerulion_wireclient::protocol::{StreamPreamble, WireRequest, WireResponse};
 
 const T_NOW: u64 = 1_000_000_000_000;
@@ -299,6 +297,32 @@ impl RobotFixture {
         let addrs = loopback_sockets(&daemon.bound_sockets());
         let endpoint = daemon.clone();
         let serve = rt.spawn(robot_serve_loop(daemon, authz, plane));
+        Self {
+            rt,
+            endpoint,
+            eid,
+            addrs,
+            manager,
+            _serve: serve,
+        }
+    }
+
+    fn start_graph(
+        tag: &str,
+        authz: Arc<PairingAuthorizer>,
+        manager: Arc<TransportManager>,
+        serving: cerulion_core::SchemaServing,
+        secret: [u8; 32],
+    ) -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("robot runtime");
+        let plane = Arc::new(
+            WirePlane::with_manager(format!("robot-{tag}"), manager.clone())
+                .with_in_process_schema_provider(Arc::new(move || serving.clone())),
+        );
+        let endpoint = rt.block_on(disabled_endpoint(secret));
+        let eid = endpoint.id();
+        let addrs = loopback_sockets(&endpoint.bound_sockets());
+        let serve = rt.spawn(robot_serve_loop(endpoint.clone(), authz, plane));
         Self {
             rt,
             endpoint,
@@ -1356,7 +1380,7 @@ async fn recording_robot_recording_epochs(
                     .collect(),
                 error: None,
             }),
-            WireRequest::Demand { topic } => {
+            WireRequest::Demand { topic, .. } => {
                 if let Ok(mut ustream) = open_uni_frame_stream(&conn).await {
                     let preamble = serde_json::to_vec(&StreamPreamble {
                         topic: topic.clone(),
@@ -2372,3 +2396,10 @@ mod serving_plane;
 
 #[path = "wan_plane_iroh_test/automatic_cli.rs"]
 mod automatic_cli;
+
+#[path = "wan_plane_iroh_test/authenticated_graph.rs"]
+mod authenticated_graph;
+
+#[cfg(unix)]
+#[path = "wan_plane_iroh_test/authenticated_supervisor.rs"]
+mod authenticated_supervisor;

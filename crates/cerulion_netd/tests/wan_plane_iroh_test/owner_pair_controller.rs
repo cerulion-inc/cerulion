@@ -417,7 +417,13 @@ fn new_demand_after_actual_reader_death_reopens_same_identity_and_delivers() {
                 .lock()
                 .unwrap()
                 .push(accepted.connection.clone());
-            handle_accepted_with_wire(accepted, authz.clone(), None, Some(plane.clone())).await;
+            cerulion_remoted::handle_accepted_with_wire(
+                accepted,
+                authz.clone(),
+                None,
+                Some(plane.clone()),
+            )
+            .await;
         }
     });
     let desk = Desk::start(&login, &[(ROBOT, &robot)], true, false);
