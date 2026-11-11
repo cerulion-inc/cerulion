@@ -25,9 +25,8 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   over `connect_existing`) and verifies every served doc by recomputing its
   hash against the wire before naming a channel - a mismatch records
   `Unresolved`, never a wrong name.
-- A message emitted from code that cannot know which verb invoked it
-  (`cerulion bag record` vs `cerulion bagd`) names NO flag - the two verbs
-  spell their schema-wait/settle levers differently.
+- Code that cannot distinguish `cerulion bag record` from `cerulion bagd`
+  names NO flag: their schema-wait/settle flags differ.
 
 ## Testing
 

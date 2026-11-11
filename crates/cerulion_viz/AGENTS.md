@@ -14,8 +14,8 @@ Crates: lib/cerulion_viz (render/sink), lib/go2_tf (pure TFMessage), bin/cerulio
   before waits; wakes signal, never count.
 - `account:<robot-id>` routes keep netd's refusals and never fall back to LAN; validate before
   pinned-schema fast paths (`account_route_test`).
-- The four topic surfaces (discover/list/status/attach) read ONE attribution map
-  (`Ctx::attribution_snapshot`); only discover/local attach refresh it, so poll discover then list.
+- Discover/list/status/attach use `Ctx::attribution_snapshot`; only discover/local
+  attach refresh it. Poll discover then list.
 - Dump-companion panes are gated on `RenderProof` (per input, sticky); a new layout-affecting
   signal joins the drain-loop comparison or it never reflows.
 - MarkerArray is a stateful mutation stream: never auto-clear absent markers, never coalesce
