@@ -880,8 +880,12 @@ fn write_topic_list(
         Default::default()
     };
     #[cfg(unix)]
-    for diagnostic in &directory.diagnostics {
-        writeln!(err, "cerulion topic list: {diagnostic}")?;
+    if !directory.diagnostics.is_empty() {
+        writeln!(
+            err,
+            "cerulion topic list: {}",
+            directory.diagnostics.join("; ")
+        )?;
     }
     #[cfg(unix)]
     let account_rows =

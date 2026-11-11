@@ -159,9 +159,12 @@ explicit pairing directory. Each robot shows `online, direct`, `online, relayed`
 complete. `--all` also shows whether its trust comes from the account or a pairing.
 Each remote topic row names its robot; identical topic names remain separate rows.
 The local section prints and flushes before account or robot requests. Account
-listing waits at most two seconds, and the robot metadata sweep has one four-second
-budget regardless of the number of robots. A saved directory and authenticated
-direct-address hints preserve paired access when the account service is unavailable.
+directory fetches wait at most two seconds. An expired session first gets another
+two-second budget to refresh and save its tokens. The robot metadata sweep has one
+four-second budget regardless of the number of robots. A saved directory and
+authenticated direct-address hints preserve paired access when the account service
+is unavailable. Cache-backed reads keep service diagnostics at debug; `topic list`
+reports them on one stderr line.
 
 `topic echo`, `hz`, `info`, `find`, `snapshot`, and `viz --robot` use the existing
 authenticated remote plane automatically for those robots. Reads demand the topic
