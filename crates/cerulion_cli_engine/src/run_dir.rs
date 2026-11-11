@@ -84,6 +84,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cerulion_core::graph::RunTopology;
+use cerulion_core::transport::cerulion_q::MAX_RUN_ARTIFACT_LEN;
 use cerulion_core::transport::run_registry::{RunHandle, RunRecord, RunState};
 
 /// Minting a run's IDENTITY and PERSISTING its description are two
@@ -1878,8 +1879,38 @@ pub struct HostedRunSpec<'a> {
 /// keys that describe a run directory (`run_dir`, `network`, `partition`,
 /// `gating`, `shm`, `chains`) are absent, which every run-directory reader
 /// reads as undeclared.
+///
+/// The `runs` verb serves at most [`MAX_RUN_ARTIFACT_LEN`] bytes of
+/// `run.json`, and `topology` and `endpoints` grow with the graph. So a render
+/// above the cap drops keys until it fits, and names them in `omitted`:
+/// first `topology` and `telemetry` (fire records index into
+/// `topology.nodes`, so fires without it name no node), then `endpoints`.
+/// `omitted.full_len` is the byte length of the full render. Each size check
+/// counts the `omitted` key itself. The run is still served with its base
+/// keys and its `graph.yaml`. Only names above the cap on their own still give
+/// a render above it, which the served-entry check refuses.
 #[must_use]
 pub fn render_hosted_run_manifest(spec: &HostedRunSpec<'_>) -> Vec<u8> {
+    let full = render_hosted_doc(spec, &[], None);
+    if full.len() <= MAX_RUN_ARTIFACT_LEN {
+        return full;
+    }
+    let mut dropped = vec!["telemetry", "topology"];
+    let mut slim = render_hosted_doc(spec, &dropped, Some(full.len()));
+    if slim.len() > MAX_RUN_ARTIFACT_LEN {
+        dropped.insert(0, "endpoints");
+        slim = render_hosted_doc(spec, &dropped, Some(full.len()));
+    }
+    debug_assert!(
+        slim.len() <= MAX_RUN_ARTIFACT_LEN || dropped.contains(&"endpoints"),
+        "a render above the cap has dropped every key it can drop"
+    );
+    slim
+}
+
+/// The hosted `run.json` without the keys in `drop`. With `full_len`, it also
+/// has the `omitted` key that names them.
+fn render_hosted_doc(spec: &HostedRunSpec<'_>, drop: &[&str], full_len: Option<usize>) -> Vec<u8> {
     let mut doc = serde_json::json!({
         "version": RUN_MANIFEST_VERSION,
         "run_id": format!("0x{:032x}", spec.run_id),
@@ -1901,7 +1932,23 @@ pub fn render_hosted_run_manifest(spec: &HostedRunSpec<'_>) -> Vec<u8> {
             },
         });
     }
-    let mut bytes = serde_json::to_vec_pretty(&doc)
+    let map = doc
+        .as_object_mut()
+        .expect("the hosted run.json is an object");
+    let mut omitted = Vec::new();
+    for key in drop {
+        if map.remove(*key).is_some() {
+            omitted.push(*key);
+        }
+    }
+    if let Some(full_len) = full_len {
+        doc["omitted"] = serde_json::json!({ "keys": omitted, "full_len": full_len });
+    }
+    to_manifest_bytes(&doc)
+}
+
+fn to_manifest_bytes(doc: &serde_json::Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(doc)
         .expect("the hosted run.json has only string keys; serialization cannot fail");
     bytes.push(b'\n');
     bytes
@@ -2238,6 +2285,7 @@ pub fn begin_run_descriptor(spec: RunDescriptorSpec<'_>) -> Option<RunDescriptor
 mod tests {
     use super::*;
     use cerulion_core::graph::{TopologyNode, TopologyPort, TopologyTrigger};
+    use cerulion_core::transport::cerulion_q::RunEntry;
 
     /// `CERULION_HOME` is PROCESS-global, so every arm that redirects it takes
     /// the CRATE-WIDE env lock — not a private one.
@@ -4054,7 +4102,7 @@ mod tests {
     /// entry's canonical run id is the manifest's, zero padding included.
     #[test]
     fn a_hosted_manifest_mints_a_runs_entry_for_the_same_run() {
-        use cerulion_core::transport::cerulion_q::{format_run_id, RunEntry};
+        use cerulion_core::transport::cerulion_q::format_run_id;
 
         let endpoints = lobby_endpoints();
         let topology = lobby_topology();
@@ -4163,5 +4211,137 @@ mod tests {
         ] {
             assert_eq!(value, &serde_json::json!(hostile));
         }
+    }
+
+    /// A topology big enough to push the full render past the served cap.
+    fn oversized_topology() -> RunTopology {
+        let node = lobby_topology().nodes[1].clone();
+        let nodes: Vec<TopologyNode> = (0..2000)
+            .map(|i| TopologyNode {
+                id: format!("logic_{i}"),
+                ..node.clone()
+            })
+            .collect();
+        RunTopology { version: 1, nodes }
+    }
+
+    fn served_entry(spec: &HostedRunSpec<'_>, run_json: String) -> RunEntry {
+        RunEntry::new(
+            spec.run_id,
+            spec.graph_name,
+            spec.run_started_at_ns,
+            RunState::Live,
+            "name: lobby\nprefix: lobby\n",
+            run_json,
+        )
+        .expect("the runs verb accepts the render")
+    }
+
+    /// A topology past the served cap is dropped with the fires that index
+    /// into it, and `omitted` names both, so the run is still served.
+    #[test]
+    fn a_hosted_manifest_past_the_cap_omits_its_topology_and_still_serves() {
+        let endpoints = lobby_endpoints();
+        let topology = oversized_topology();
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        let full_len = render_hosted_doc(&spec, &[], None).len();
+        assert!(
+            full_len > MAX_RUN_ARTIFACT_LEN,
+            "the fixture is past the cap"
+        );
+
+        let rendered = render_hosted_run_manifest(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN);
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert!(doc.get("topology").is_none(), "{doc}");
+        assert!(doc.get("telemetry").is_none(), "{doc}");
+        assert_eq!(
+            doc["omitted"],
+            serde_json::json!({"keys": ["telemetry", "topology"], "full_len": full_len})
+        );
+        assert_eq!(doc["endpoints"], serde_json::json!(&endpoints));
+        assert_eq!(doc["graph_name"], serde_json::json!("lobby"));
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+
+        let doc = hosted_doc(&hosted_spec(&endpoints, &topology, None));
+        assert_eq!(doc["omitted"]["keys"], serde_json::json!(["topology"]));
+    }
+
+    /// Endpoints past the cap on their own are dropped too, after the topology.
+    #[test]
+    fn a_hosted_manifest_past_the_cap_without_topology_omits_its_endpoints() {
+        let ports: Vec<EndpointPort> = (0..8000)
+            .map(|i| EndpointPort {
+                topic: format!("/lobby/in_{i}"),
+                schema: "std_msgs/String".into(),
+            })
+            .collect();
+        let endpoints = [RunEndpoint {
+            id: "app".into(),
+            publishes: ports,
+            subscribes: vec![],
+        }];
+        let topology = lobby_topology();
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        let rendered = render_hosted_run_manifest(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN);
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            doc["omitted"]["keys"],
+            serde_json::json!(["endpoints", "telemetry", "topology"])
+        );
+        assert!(doc.get("endpoints").is_none(), "{doc}");
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+    }
+
+    /// A render that fits only without `omitted` drops its endpoints too, so
+    /// the `omitted` key never pushes run.json past the cap.
+    #[test]
+    fn a_hosted_manifest_counts_its_omitted_key_against_the_cap() {
+        let endpoints_with = |topic: String| {
+            [RunEndpoint {
+                id: "app".into(),
+                publishes: vec![EndpointPort {
+                    topic,
+                    schema: "std_msgs/String".into(),
+                }],
+                subscribes: vec![],
+            }]
+        };
+        let topology = lobby_topology();
+        let slim = ["telemetry", "topology"];
+        let short = endpoints_with(String::new());
+        let base = render_hosted_doc(
+            &hosted_spec(&short, &topology, Some(LOBBY_FIRES)),
+            &slim,
+            None,
+        )
+        .len();
+        let endpoints = endpoints_with("t".repeat(MAX_RUN_ARTIFACT_LEN - 10 - base));
+        let spec = hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES));
+        assert_eq!(
+            render_hosted_doc(&spec, &slim, None).len(),
+            MAX_RUN_ARTIFACT_LEN - 10,
+            "the render without topology and without omitted fits"
+        );
+        assert!(render_hosted_doc(&spec, &slim, Some(1)).len() > MAX_RUN_ARTIFACT_LEN);
+
+        let rendered = render_hosted_run_manifest(&spec);
+        assert!(rendered.len() <= MAX_RUN_ARTIFACT_LEN, "{}", rendered.len());
+        let doc: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(
+            doc["omitted"]["keys"],
+            serde_json::json!(["endpoints", "telemetry", "topology"])
+        );
+        served_entry(&spec, String::from_utf8(rendered).unwrap());
+    }
+
+    /// A render under the cap has no `omitted` key.
+    #[test]
+    fn a_hosted_manifest_under_the_cap_omits_nothing() {
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        let doc = hosted_doc(&hosted_spec(&endpoints, &topology, Some(LOBBY_FIRES)));
+        assert!(doc.get("omitted").is_none(), "{doc}");
     }
 }
