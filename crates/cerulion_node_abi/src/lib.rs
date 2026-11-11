@@ -14,6 +14,9 @@ mod validation;
 
 pub use checker::*;
 pub use host::*;
+/// Native loader dependency matched to the maintained Stabby integration.
+#[cfg(feature = "loader")]
+pub use libloading;
 #[cfg(feature = "loader")]
 pub use loader::*;
 pub use node::*;
