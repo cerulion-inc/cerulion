@@ -344,6 +344,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let announce_plane: Arc<dyn AnnounceWatchPlane> =
         Arc::new(GatewayAnnounceWatchPlane::new(manager));
 
+    // Install stop handling before clients can register or standing serving
+    // can spawn a child. A startup signal must enter the same graceful reap.
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running = Arc::clone(&running);
+        ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
+    }
+
     let idle_grace =
         daemon::resolve_idle_grace(std::env::var(daemon::IDLE_GRACE_ENV).ok().as_deref());
     let socket = default_socket_path();
@@ -415,11 +423,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Block until a signal flips `running` OR the idle-watch requests self-exit.
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let running = Arc::clone(&running);
-        ctrlc::set_handler(move || running.store(false, Ordering::SeqCst))?;
-    }
     while running.load(Ordering::SeqCst) && !netd.self_exit_requested() {
         std::thread::sleep(Duration::from_millis(200));
     }

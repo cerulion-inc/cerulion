@@ -643,24 +643,39 @@ struct OwnedRemoted(OwnedChild, Duration);
 
 impl Drop for OwnedRemoted {
     fn drop(&mut self) {
-        if !matches!(self.0 .0.try_wait(), Ok(Some(_))) {
-            let signal = Command::new("kill")
-                .args(["-TERM", &self.0 .0.id().to_string()])
-                .status();
-            if !matches!(signal, Ok(status) if status.success()) {
-                tracing::error!("could not signal the owned remote server to stop gracefully");
-            }
-            let started = Instant::now();
-            while started.elapsed() < self.1 {
-                if matches!(self.0 .0.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
-            tracing::error!("owned remote server exceeded its graceful stop deadline");
-        }
+        stop_remoted(&mut self.0, self.1, send_sigterm);
         // OwnedChild escalates only after the deadline, then reaps.
     }
+}
+
+fn send_sigterm(pid: u32) -> io::Result<()> {
+    // Child ids are positive. Never turn an invalid id into a group signal.
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid owned child id"))?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(Into::into)
+}
+
+fn stop_remoted(
+    child: &mut OwnedChild,
+    grace: Duration,
+    signal: impl FnOnce(u32) -> io::Result<()>,
+) {
+    if matches!(child.0.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let started = Instant::now();
+    if let Err(error) = signal(child.0.id()) {
+        tracing::error!(error = %error, "could not signal the owned remote server to stop gracefully; waiting within its stop deadline");
+    }
+    while started.elapsed() < grace {
+        if matches!(child.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL.min(grace.saturating_sub(started.elapsed())));
+    }
+    tracing::error!("owned remote server exceeded its graceful stop deadline");
 }
 
 impl Drop for OwnedChild {

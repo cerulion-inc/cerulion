@@ -65,6 +65,37 @@ fn remote_owner_waits_for_sigterm_cleanup_and_escalates_only_after_its_deadline(
 }
 
 #[test]
+#[tracing_test::traced_test]
+fn signal_errors_stay_inside_the_stop_deadline_and_invalid_ids_never_signal_groups() {
+    for pid in [0, u32::MAX] {
+        assert_eq!(
+            send_sigterm(pid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+        let mut child = OwnedChild(Command::new("sleep").arg("30").spawn().unwrap());
+        let pid = child.0.id();
+        let started = Instant::now();
+        stop_remoted(&mut child, Duration::from_millis(100), |signalled| {
+            assert_eq!(signalled, pid);
+            Err(io::Error::from(kind))
+        });
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(child.0.try_wait().unwrap().is_none());
+        drop(child);
+        assert!(!Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
+    assert!(logs_contain("could not signal the owned remote server"));
+    assert!(logs_contain("exceeded its graceful stop deadline"));
+}
+
+#[test]
 fn sibling_resolution_uses_the_executable_then_its_symlink_target() {
     let current = Path::new("/launcher/cerulion-netd");
     let canonical = Path::new("/release/cerulion-netd");
