@@ -177,7 +177,14 @@ its `intent`, deletes the
 file and opens the latch inside the same lock. The receipt log therefore
 orders engages and clears as they took effect. An `estop` that lands while
 a clear holds that lock closes the latch at once and publishes its frame
-after the clear's receipt write.
+after the clear's receipt write. When `estop` cannot write the latch file or
+its `intent` receipt, it logs the error after its frame is queued and the
+lock is released, so writing that error line does not hold the frame. A
+receipt `estop_clear` cannot write is logged after it releases the lock,
+so that line does not hold an `estop` waiting for the lock. The error line
+for a receipt that could not be written, from any tool call or eye answer,
+is also written after the receipt log's lock is released; an `estop` takes
+that lock before it queues its frame.
 
 A latch-gated call (a motion call or `estop_clear`) whose MCP request was
 already cancelled when the journal takes it from its queue is dropped, not
@@ -471,7 +478,9 @@ while one runs starts none, since the one running keeps sending, and when that
 `engage-estop` came after the attempt rcpd answers began, the delivery sends
 the `estop` once more. A delivery that ends before rcpd answers logs at error;
 one that ends after rcpd answered that its latch closed, while it deletes
-its MCP session, logs nothing.
+its MCP session, logs nothing. These lines go through the daemon's log queue,
+so a stderr that takes no more lines delays no attempt (see
+[`docs/remote_plane.md`](remote_plane.md#e-stop-does-not-wait-behind-another-session)).
 When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
 the middle of an attempt first deletes the MCP session rcpd issued it, within
 2 s, inside the 5 s the stop waits for the delivery's task. A stop the

@@ -508,6 +508,10 @@ def test_rust_period_node_metadata_matches_python_declaration():
 
     python_info = json.loads(PeriodNode.__cerulion_info__(schemas))
     assert python_info["outputs"][0].pop("schema") == "geometry_msgs/Vector3"
+    # Only a #[cerulion_node] (macro) node needs a publisher for every output;
+    # a Python node takes one only when it writes, so its info omits the key.
+    assert rust_info.pop("publisher_for_every_output") is True
+    assert "publisher_for_every_output" not in python_info
     assert rust_info == python_info
 
 

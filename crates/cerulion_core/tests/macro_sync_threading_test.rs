@@ -50,6 +50,18 @@ fn sync_cdylib_has_two_inputs_and_sync_policy() {
     ));
 }
 
+/// The sync cdylib's declared output, listed so the build gives it a
+/// publisher.
+fn fused_output() -> OutputDef {
+    OutputDef {
+        name: "fused".to_string(),
+        schema: "u8".to_string(),
+        max_slice_len: None,
+        history_size: 0,
+        topic: None,
+    }
+}
+
 /// Building a GraphRuntime with a macro Sync node
 /// AND YAML-wired inputs (`cam` ← `producer/cam_out`, `imu` ←
 /// `producer/imu_out`) succeeds. The runtime threads both inputs
@@ -130,7 +142,9 @@ fn macro_sync_with_two_yaml_wired_inputs_builds_successfully() {
                         ..Default::default()
                     },
                 ],
-                outputs: vec![],
+                // The cdylib declares `fused`; the build refuses a declared
+                // output the graph does not list.
+                outputs: vec![fused_output()],
             },
         ],
     };
@@ -185,7 +199,7 @@ fn macro_sync_with_zero_yaml_wired_inputs_fails_to_build_with_diagnostic() {
             id: "fuser".to_string(),
             node_type: "fuser".to_string(),
             inputs: vec![], // ZERO YAML-wired inputs
-            outputs: vec![],
+            outputs: vec![fused_output()],
         }],
     };
 

@@ -130,7 +130,9 @@ jobs:
     # rmw build's wall time and nothing else.
     needs: rmw
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 45
+    # The x86_64-apple-darwin leg runs past 45 minutes on macos-15-intel: its
+    # release build, cargo-about install and license inventory.
+    timeout-minutes: 90
     env:
       # The compiler of every leg: the runner's toolchain on macOS and the
       # toolchain the Linux build container installs.
@@ -151,7 +153,7 @@ jobs:
           - target: x86_64-apple-darwin
             runs_on: macos-15-intel
           - target: aarch64-apple-darwin
-            runs_on: macos-14
+            runs_on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -620,7 +622,7 @@ jobs:
           - target: x86_64-apple-darwin
             runs_on: macos-15-intel
           - target: aarch64-apple-darwin
-            runs_on: macos-14
+            runs_on: macos-15
     steps:
       - name: Checkout release source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

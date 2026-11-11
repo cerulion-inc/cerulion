@@ -485,6 +485,15 @@ pub struct NodeInfo {
     /// [`Self::with_sync_capture_stamps`]; the graph build refuses a node whose
     /// map misses a trigger input.
     pub(crate) sync_capture: Option<IndexMap<String, HeaderStampLocation>>,
+    /// `true` when the node fails each tick for which a declared output has
+    /// no publisher. A `#[cerulion_node]` node sets it (through
+    /// [`Self::with_publisher_for_every_output`] in process, and the
+    /// `"publisher_for_every_output":true` info JSON key for a cdylib). A
+    /// Python node, a raw FFI node and a hand-written entry leave it
+    /// `false`: such a node takes a publisher only for an output it writes.
+    /// The graph build refuses an unlisted declared output only when this is
+    /// `true`.
+    pub(crate) publisher_for_every_output: bool,
 }
 
 /// Macro-declared trigger policy. Mirrors
@@ -681,6 +690,7 @@ impl NodeInfo {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         }
     }
 
@@ -721,6 +731,7 @@ impl NodeInfo {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         }
     }
 
@@ -766,6 +777,7 @@ impl NodeInfo {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         }
     }
 
@@ -800,6 +812,22 @@ impl NodeInfo {
     #[doc(hidden)]
     pub fn sync_capture_stamps(&self) -> Option<&IndexMap<String, HeaderStampLocation>> {
         self.sync_capture.as_ref()
+    }
+
+    /// Builder that marks the node as one that needs a publisher for every
+    /// output it declares: the node fails each tick for which a declared
+    /// output has no publisher. `#[cerulion_node]` emits this call. The graph
+    /// build then refuses an output the node declares and its graph entry
+    /// does not list, before the graph starts.
+    pub fn with_publisher_for_every_output(mut self) -> Self {
+        self.publisher_for_every_output = true;
+        self
+    }
+
+    /// `true` when the node needs a publisher for every output it declares.
+    /// See [`Self::with_publisher_for_every_output`].
+    pub fn publisher_for_every_output(&self) -> bool {
+        self.publisher_for_every_output
     }
 
     /// Builder that attaches a per-node
@@ -5192,6 +5220,13 @@ impl DylibNodeEntry {
             // below (a hand-written info block has no macro behind it).
             #[serde(default)]
             params: Option<Vec<ParamSpec>>,
+            // `true` from a `#[cerulion_node]` library: the node fails each
+            // tick for which a declared output has no publisher. Additive,
+            // no ABI bump: absent (a raw FFI or Python info block, or a macro
+            // library built before this key) means `false`, and the graph
+            // build does not refuse an unlisted declared output.
+            #[serde(default)]
+            publisher_for_every_output: bool,
         }
 
         // ABI v6: each `inputs` entry is either a
@@ -5441,6 +5476,7 @@ impl DylibNodeEntry {
             "tick_within_ms",
             "throttle_ms",
             "params",
+            "publisher_for_every_output",
         ];
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json_str) {
             // Same `unknown_key` field name and the same did-you-mean as the
@@ -5794,6 +5830,7 @@ impl DylibNodeEntry {
         info.tick_within_ms = parsed.tick_within_ms;
         info.throttle_ms = parsed.throttle_ms;
         info.params = params;
+        info.publisher_for_every_output = parsed.publisher_for_every_output;
         Ok(info)
     }
 }
@@ -9025,6 +9062,7 @@ mod tests {
             throttle_ms: None,
             params: Vec::new(),
             sync_capture: None,
+            publisher_for_every_output: false,
         };
         assert_eq!(info.input_meta.len(), 1);
         assert!(info.input_meta[0].trigger);

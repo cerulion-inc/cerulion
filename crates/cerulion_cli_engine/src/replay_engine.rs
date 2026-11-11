@@ -4339,6 +4339,13 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // the bag's own staging rows and refuses here, before rank 0 has run a step.
     // What stays per rank is the pair that needs a built runtime (see
     // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
+    // ── 4a'. Every rank's unlisted `#[cerulion_node]` output, BEFORE the
+    //         first pass ─────────────────────────────────────────────────
+    //
+    // The same whole-RUN rule: a later rank's node with an unlisted output
+    // is a fact about the recording, so it refuses the replay before rank 0
+    // has run a step.
+    refuse_unlisted_macro_output_in_every_pass(&plans, &factories)?;
     let bag_side = plan_bag_side_admissions(
         &plans,
         &trace,
@@ -8141,6 +8148,62 @@ fn build_pass_runtime(
             plan.rank()
         ),
     })
+}
+
+/// Refuse a replay in which a `#[cerulion_node]` node of ANY pass declares an
+/// output that its entry does not list.
+///
+/// The run calls this once, before the first pass, so a later rank's fault
+/// stops the replay before an earlier rank runs. Each pass is checked in plan
+/// order over its own subgraph, and the first fault is the error.
+fn refuse_unlisted_macro_output_in_every_pass(
+    plans: &[RankPlan],
+    entries: &IndexMap<String, Box<dyn NodeEntry>>,
+) -> Result<(), ReplayError> {
+    plans
+        .iter()
+        .try_for_each(|plan| refuse_unlisted_macro_output(plan.subgraph(), entries))
+}
+
+/// Refuse a graph in which a `#[cerulion_node]` node declares an output that
+/// its entry does not list.
+///
+/// The runtime build refuses the same graph, but its words tell the operator
+/// to edit a YAML file, and here the graph comes from the bag. So the replay
+/// refuses it first, as a bag fault (exit 2), and names the graph the bag
+/// embeds. Only a node that needs a publisher for every output it declares
+/// ([`cerulion_core::graph::node::NodeInfo::publisher_for_every_output`]) is
+/// checked: such a node fails every tick for an unlisted output. A node whose
+/// info cannot be read is left to the runtime build, which reports it.
+fn refuse_unlisted_macro_output(
+    subgraph: &GraphConfig,
+    entries: &IndexMap<String, Box<dyn NodeEntry>>,
+) -> Result<(), ReplayError> {
+    for node in &subgraph.nodes {
+        let Some(Ok(info)) = entries.get(&node.id).map(|entry| entry.info()) else {
+            continue;
+        };
+        if !info.publisher_for_every_output() {
+            continue;
+        }
+        let unlisted = info
+            .output_names()
+            .iter()
+            .find(|declared| !node.outputs.iter().any(|listed| &listed.name == *declared));
+        if let Some(output) = unlisted {
+            return Err(ReplayError::BagInvalidAttachment {
+                name: crate::replay_cmd::GRAPH_ATTACHMENT.to_string(),
+                reason: format!(
+                    "node '{}' declares output '{output}' and the graph the bag embeds does \
+                     not list it, so the node has no publisher for it and fails every tick. \
+                     This bag cannot be replayed with this node; record it again from a graph \
+                     that lists '{output}' under the node's `outputs:`",
+                    node.id
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// WHICH runtimes this replay stands up.
@@ -32633,5 +32696,105 @@ mod trailing_refill_tests {
         let v = verification(&[(5, 2), (6, CAP + 1)], false);
         let got = derive(&v, &[(5, 3), (6, CAP)], true, true);
         assert_eq!(got, vec![(5, vec![]), (6, vec!["n".to_string()])]);
+    }
+}
+
+/// The replay refuses a `#[cerulion_node]` node's unlisted declared output as
+/// a bag fault, before the runtime build.
+#[cfg(test)]
+mod unlisted_macro_output_tests {
+    use super::*;
+    use cerulion_core::graph::node::{ClosureNodeEntry, NodeInfo};
+
+    fn subgraph() -> GraphConfig {
+        cerulion_core::graph::parse_graph(
+            "prefix: replay_unlisted\nnodes:\n  - id: relay\n    type: relay\n",
+        )
+        .expect("graph parses")
+    }
+
+    fn entries(info: NodeInfo) -> IndexMap<String, Box<dyn NodeEntry>> {
+        let mut entries: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        entries.insert(
+            "relay".to_string(),
+            Box::new(ClosureNodeEntry::new(info, |_ctx| Ok(()))),
+        );
+        entries
+    }
+
+    #[test]
+    fn a_macro_node_output_the_embedded_graph_does_not_list_is_a_bag_fault() {
+        let info = NodeInfo::from_names(vec![], vec!["echo".to_string()])
+            .with_publisher_for_every_output();
+        let error = refuse_unlisted_macro_output(&subgraph(), &entries(info))
+            .expect_err("an unlisted macro output is refused");
+        assert_eq!(error.exit_code(), 2, "a bag fault, never exit 5");
+        assert_eq!(
+            error.to_string(),
+            "bag attachment `graph.yaml` is present but invalid: node 'relay' declares output \
+             'echo' and the graph the bag embeds does not list it, so the node has no publisher \
+             for it and fails every tick. This bag cannot be replayed with this node; record it \
+             again from a graph that lists 'echo' under the node's `outputs:`"
+        );
+    }
+
+    /// A two-rank graph: `src` on rank 0 lists its output, and `sink` on
+    /// rank 1 lists none.
+    fn two_rank_plans() -> Vec<RankPlan> {
+        let config = cerulion_core::graph::parse_graph(
+            "prefix: replay_unlisted\nnodes:\n  - id: src\n    type: src\n    outputs:\n      \
+             - name: out\n        schema: geometry_msgs/Vector3\n  - id: sink\n    type: sink\n",
+        )
+        .expect("graph parses");
+        let tables: Vec<Vec<Arc<str>>> = vec![vec![Arc::from("src")], vec![Arc::from("sink")]];
+        let summaries = vec![
+            RankBoundarySummary::new(0, 0, 9, 1_000),
+            RankBoundarySummary::new(1, 0, 9, 1_001),
+        ];
+        build_rank_plans(CoordinationMode::FreeRun, &config, &tables, &summaries)
+            .expect("the two-rank graph plans")
+    }
+
+    fn two_rank_entries() -> IndexMap<String, Box<dyn NodeEntry>> {
+        let mut entries: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        let src =
+            NodeInfo::from_names(vec![], vec!["out".to_string()]).with_publisher_for_every_output();
+        let sink = NodeInfo::from_names(vec![], vec!["echo".to_string()])
+            .with_publisher_for_every_output();
+        entries.insert(
+            "src".to_string(),
+            Box::new(ClosureNodeEntry::new(src, |_ctx| Ok(()))),
+        );
+        entries.insert(
+            "sink".to_string(),
+            Box::new(ClosureNodeEntry::new(sink, |_ctx| Ok(()))),
+        );
+        entries
+    }
+
+    #[test]
+    fn a_later_rank_unlisted_output_refuses_the_replay_before_the_first_pass() {
+        let plans = two_rank_plans();
+        let entries = two_rank_entries();
+        assert_eq!(plans.len(), 2, "one pass per recorded rank");
+        assert!(
+            refuse_unlisted_macro_output(plans[0].subgraph(), &entries).is_ok(),
+            "rank 0 alone has no fault"
+        );
+        let error = refuse_unlisted_macro_output_in_every_pass(&plans, &entries)
+            .expect_err("rank 1's unlisted output refuses the whole replay");
+        assert_eq!(error.exit_code(), 2, "a bag fault, never exit 5");
+        assert!(
+            error
+                .to_string()
+                .contains("node 'sink' declares output 'echo'"),
+            "the message names rank 1's node: {error}"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_node_output_the_embedded_graph_does_not_list_is_not_refused() {
+        let info = NodeInfo::from_names(vec![], vec!["echo".to_string()]);
+        assert!(refuse_unlisted_macro_output(&subgraph(), &entries(info)).is_ok());
     }
 }
