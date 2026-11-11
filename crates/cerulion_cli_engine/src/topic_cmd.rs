@@ -661,7 +661,7 @@ fn ensure_topic_available_with_selection(
     ) {
         RemoteResolve::Found(target) => target,
         // Every non-Found outcome routes through ONE place — see
-        // `unresolved_remote_error`, which is where the three different failures are
+        // `unresolved_remote_error`, where the distinct failure outcomes are
         // kept different.
         other => {
             let error = unresolved_remote_error(topic, other);
@@ -917,7 +917,7 @@ fn open_mirror_after_demand(
 }
 
 /// Turn a NON-`Found` remote resolve into the error the user sees. The ONE
-/// routing point for the three DIFFERENT ways a remote observe can come up empty, so
+/// routing point for the distinct ways a remote observe can come up empty, so
 /// they cannot drift into each other:
 ///
 /// - [`RemoteResolve::NoProducer`] — discovery RAN and no robot catalogs the topic.
@@ -925,6 +925,8 @@ fn open_mirror_after_demand(
 /// - [`RemoteResolve::DiscoveryNotConverged`] — `cerulion-netd` completed no discovery
 ///   pass, so nothing was searched. UNKNOWN, never absence
 ///   ([`discovery_not_converged_message`]).
+/// - [`RemoteResolve::LanNotQueried`]: paired access skipped implicit LAN queries.
+///   Names the searched scope without retry advice or a LAN absence claim.
 /// - [`RemoteResolve::SchemaUnavailable`] — a robot DID catalog it but its schema is
 ///   unresolvable. Names the robot + cause.
 ///
@@ -950,6 +952,10 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
              unresolved-remote error path — this is a Cerulion bug, please report it"
         )),
         RemoteResolve::NoProducer => topic_not_found_anywhere(topic),
+        RemoteResolve::LanNotQueried => CliError::Validation(lan_not_queried_message(
+            topic,
+            has_canonical_slash_twin(topic),
+        )),
         RemoteResolve::DiscoveryNotConverged => CliError::Validation(
             discovery_not_converged_message(topic, has_canonical_slash_twin(topic)),
         ),
@@ -989,6 +995,16 @@ fn unresolved_remote_error(topic: &str, resolve: RemoteResolve) -> CliError {
 /// misleading `topic list` steer).
 fn topic_not_found_anywhere(topic: &str) -> CliError {
     CliError::Validation(not_found_message(topic, has_canonical_slash_twin(topic)))
+}
+
+fn lan_not_queried_message(topic: &str, has_slashed_twin: bool) -> String {
+    let hint = canonical_slash_hint(topic, has_slashed_twin);
+    format!(
+        "topic '{}' was not found on this machine or on any account or paired robot{hint}. \
+         LAN robots are queried only once this machine is paired with them, or with \
+         CERULION_LAN_ACCESS=open.",
+        sanitize_display(topic)
+    )
 }
 
 /// Does `topic` differ from a LOCALLY-LISTED topic only by its leading
@@ -1718,6 +1734,10 @@ fn query_lan_when_allowed(
     if lan_discovery_allowed(access, opts, scan) {
         query()
     } else {
+        tracing::info!(
+            lan_access = "paired",
+            "discovery ladder skipped: LAN robots are queried with --scan, --connect or --listen, or with CERULION_LAN_ACCESS=open"
+        );
         Ok((RemoteDiscovery::empty(), CatalogGather::default()))
     }
 }
@@ -2684,6 +2704,7 @@ pub fn resolve_remote_walker_for_topic_with_opts(
         // with the others into "no remote walker".
         SchemaResolve::Ambiguous { .. }
         | SchemaResolve::NoProducer
+        | SchemaResolve::LanNotQueried
         | SchemaResolve::DiscoveryNotConverged
         // A cancelled resolve degrades to hex exactly like the others —
         // this seam renders no claim, so it has nothing to say about the wait.
@@ -2728,6 +2749,8 @@ pub enum RemoteResolve {
     /// Session/harvest FAILURES never land here — they searched nothing,
     /// so they route to [`RemoteResolve::DiscoveryNotConverged`].
     NoProducer,
+    /// Paired access skipped implicit LAN discovery; no LAN absence is known.
+    LanNotQueried,
     /// Discovery never completed a pass — `cerulion-netd` spent its
     /// cold-start grace without a single robot answering, so NOTHING was searched.
     /// The caller must say THAT, not "the topic does not exist": the two are
@@ -2839,6 +2862,7 @@ fn remote_ingress_from_schema(resolution: SchemaResolve) -> RemoteResolve {
     match resolution {
         SchemaResolve::Ambiguous { candidates } => RemoteResolve::Ambiguous { candidates },
         SchemaResolve::NoProducer => RemoteResolve::NoProducer,
+        SchemaResolve::LanNotQueried => RemoteResolve::LanNotQueried,
         // Carried through DISTINCT — collapsing it into `NoProducer` here
         // would re-create the exact false-absence claim this issue removed.
         SchemaResolve::DiscoveryNotConverged => RemoteResolve::DiscoveryNotConverged,
@@ -2899,6 +2923,8 @@ enum SchemaResolve {
     /// Session/harvest FAILURES never land here — they searched nothing,
     /// so they route to [`SchemaResolve::DiscoveryNotConverged`].
     NoProducer,
+    /// Paired access skipped implicit LAN discovery; no LAN absence is known.
+    LanNotQueried,
     /// Discovery has NOT completed a pass — `cerulion-netd` has never seen
     /// a robot answer, so nothing at all was searched. Distinct from
     /// [`SchemaResolve::NoProducer`]: an empty answer here proves NOTHING about the
@@ -3242,7 +3268,7 @@ fn netd_resolve_topic_schema(
 /// Both halves now obey the same rule — **only claim absence about a catalog you
 /// actually read**. The transient path derives that locally (`classify_transient_miss`
 /// on whether the gather read anything) and reports
-/// [`SchemaResolve::DiscoveryNotConverged`] for every "we read nothing" outcome,
+/// [`SchemaResolve::DiscoveryNotConverged`] for failed "we read nothing" outcomes,
 /// including the three failure arms (session would not open, session unusable,
 /// announce harvest errored). Returning `NoProducer` there with the error silently
 /// DROPPED would render to the user as proof the topic does not exist. Those arms
@@ -3313,7 +3339,7 @@ fn resolve_remote_topic_schema_for_robot(
         false,
     ) {
         // Skipped catalog discovery reads nothing and licenses no absence claim.
-        return classify_transient_miss(topic, true);
+        return SchemaResolve::LanNotQueried;
     }
     // Production path — resolve over the shared cerulion-netd query plane
     // (ONE zenoh session per computer). Only fall through to a transient session when
@@ -8411,10 +8437,30 @@ mod tests {
         );
     }
 
-    /// The ROUTING from a resolve outcome to the user's error — the arm a
-    /// false absence claim surfaces through. Pins that each of the three failures
-    /// reaches ITS OWN message; a mis-routed arm (the easy regression, since all
-    /// three are `CliError::Validation`) fails here.
+    /// A policy skip keeps its own message, local slash hint and no retry advice.
+    #[test]
+    fn paired_lan_skip_has_its_own_non_absence_error() {
+        let resolved = remote_ingress_from_schema(SchemaResolve::LanNotQueried);
+        assert!(matches!(resolved, RemoteResolve::LanNotQueried));
+        let error = unresolved_remote_error("/t", resolved);
+        let CliError::Validation(message) = error else {
+            panic!("paired LAN skip must be a validation refusal")
+        };
+        assert_eq!(
+            message,
+            "topic '/t' was not found on this machine or on any account or paired robot. LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open."
+        );
+        assert!(!message.contains(RETRY_CLAUSE));
+        assert!(!message.contains("any discovered robot"));
+        assert!(!message.contains("--scan"));
+        assert!(!message.contains("--connect"));
+        assert_eq!(
+            lan_not_queried_message("foo", true),
+            "topic 'foo' was not found on this machine or on any account or paired robot \u{2014} did you mean '/foo'? (canonical Cerulion topics start with '/'). LAN robots are queried only once this machine is paired with them, or with CERULION_LAN_ACCESS=open."
+        );
+    }
+
+    /// Each failure reaches its own message rather than an absence claim.
     #[test]
     fn unresolved_remote_error_routes_each_failure_to_its_own_message() {
         // Discovery RAN, nobody has it → the absence claim (correct here).
