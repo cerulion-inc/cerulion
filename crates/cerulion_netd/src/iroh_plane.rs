@@ -1682,6 +1682,10 @@ fn finish_retirement(state: tokio::sync::MutexGuard<'_, IrohState>, cleanup: imp
 mod cleanup_tests;
 
 impl MirrorPlane for IrohMirrorPlane {
+    fn local_channel(&self, key: &TopicKey) -> String {
+        key.local_topic()
+    }
+
     /// This plane has exactly one transport, so every key it serves crossed the
     /// internet plane.
     fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {

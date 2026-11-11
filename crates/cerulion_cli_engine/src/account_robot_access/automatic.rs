@@ -339,6 +339,12 @@ pub fn select<'a>(
     robots: &'a [RobotCatalog],
     selector: &str,
 ) -> CliResult<Option<&'a RobotCatalog>> {
+    if cerulion_netd::account_access::parse_robot_route(selector)
+        .map_err(CliError::Validation)?
+        .is_some()
+    {
+        return Ok(robots.iter().find(|robot| robot.route == selector));
+    }
     let matching: Vec<_> = robots
         .iter()
         .filter(|robot| robot.name == selector || robot.route == selector)
@@ -524,14 +530,15 @@ mod tests {
 
     #[test]
     fn owned_robot_coalescing_preserves_its_durable_pairing_alias() {
+        let route = cerulion_netd::account_access::robot_route(&[1; 32]);
         let robot = RobotCatalog {
-            route: "account:owned".into(),
+            route: route.clone(),
             name: "owned".into(),
             endpoint_key: Some([7; 32]),
             trust: RobotTrustSource::Account,
             presence: RobotPresence::Online,
             path: RobotPath::Direct,
-            catalog: Some(catalog("account:owned", "/state")),
+            catalog: Some(catalog(&route, "/state")),
         };
         let mut directory = RemoteCatalogs {
             robots: vec![robot],
@@ -541,14 +548,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(
-            directory.select("alias").unwrap().unwrap().route,
-            "account:owned"
-        );
+        assert_eq!(directory.select("alias").unwrap().unwrap().route, route);
         assert!(directory.select("missing").unwrap().is_none());
         let mut duplicate = directory.robots[0].clone();
-        duplicate.route = "account:other".into();
+        duplicate.route = cerulion_netd::account_access::robot_route(&[2; 32]);
+        duplicate.name = route.clone();
         directory.robots.push(duplicate);
+        assert_eq!(directory.select(&route).unwrap().unwrap().route, route);
+        assert!(directory.select("account:malformed").is_err());
         assert!(directory.select("alias").is_err());
     }
 

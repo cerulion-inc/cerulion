@@ -47,7 +47,9 @@ use cerulion_netd::{DualMirrorPlane, IrohMirrorPlane, Plane, WanRegistry, WanRob
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
 use cerulion_pairing::verify::TrustStore;
-use cerulion_remoted::{DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane};
+use cerulion_remoted::{
+    handle_accepted_with_wire, DeviceAccountIndex, PairingAuthorizer, SharedTrust, WirePlane,
+};
 use cerulion_wireclient::protocol::{StreamPreamble, WireRequest, WireResponse};
 
 const T_NOW: u64 = 1_000_000_000_000;
@@ -444,6 +446,9 @@ fn run_headline(tag: &str, n: usize) -> Vec<(u32, Vec<u8>)> {
         .expect("iroh plane")
         .with_dial_timeout(DIAL_TIMEOUT);
     let key = TopicKey::new("ubuntu", &topic);
+    assert!(plane
+        .local_channel(&TopicKey::observed("ubuntu", &topic))
+        .starts_with("/__cerulion/observers/"));
 
     plane
         .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
@@ -642,6 +647,13 @@ fn dual_plane_routes_wan_robot_to_iroh_and_delivers() {
         .with_dial_timeout(DIAL_TIMEOUT);
     let zenoh = GatewayMirrorPlane::new(manager_b.clone());
     let dual = DualMirrorPlane::new(zenoh, iroh, Arc::clone(&registry));
+    assert!(dual
+        .local_channel(&TopicKey::observed("ubuntu", &topic))
+        .starts_with("/__cerulion/observers/"));
+    assert_eq!(
+        dual.local_channel(&TopicKey::observed("not-configured", &topic)),
+        topic
+    );
 
     // The routing decision (the picker through the DualMirrorPlane surface).
     assert_eq!(
