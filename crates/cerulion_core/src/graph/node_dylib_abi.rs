@@ -81,7 +81,43 @@ impl DylibNodeEntry {
         let metadata = std::str::from_utf8(bytes)
             .map_err(|e| error(format!("node metadata is not UTF-8: {e}")))?
             .to_owned();
-        let info = Self::parse_info_json_labeled(&metadata, &label).map_err(|reason| {
+        let mut author_metadata: serde_json::Value = serde_json::from_str(&metadata)
+            .map_err(|e| error(format!("node metadata is invalid: {e}")))?;
+        let retain_process = match author_metadata.get("retain_process") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| error("retain_process metadata must be a bool".to_owned()))?,
+        };
+        author_metadata
+            .as_object_mut()
+            .ok_or_else(|| error("node metadata must be an object".to_owned()))?
+            .remove("retain_process");
+        for (direction, keys) in [
+            (
+                "inputs",
+                &[
+                    "wire_fixed_size",
+                    "variable_count",
+                    "alignment",
+                    "accumulate_cap",
+                ][..],
+            ),
+            ("outputs", &["variable_count", "alignment"][..]),
+        ] {
+            if let Some(ports) = author_metadata[direction].as_array_mut() {
+                for port in ports {
+                    if let Some(port) = port.as_object_mut() {
+                        for key in keys {
+                            port.remove(*key);
+                        }
+                    }
+                }
+            }
+        }
+        let author_metadata = serde_json::to_string(&author_metadata)
+            .map_err(|e| error(format!("node metadata could not be decoded: {e}")))?;
+        let info = Self::parse_info_json_labeled(&author_metadata, &label).map_err(|reason| {
             TransportError::NodeInfoParse {
                 diag_label: label.clone(),
                 json_len: metadata.len(),
@@ -134,7 +170,7 @@ impl DylibNodeEntry {
             label,
             snapshot_configured: false,
             snapshot_failed: false,
-            retain_process: false,
+            retain_process,
             doorbell: false,
             maintenance: FailureRegimeLatch::new(),
             snapshot_errors: FailureRegimeLatch::new(),
@@ -210,7 +246,9 @@ impl DylibNodeEntry {
                 reason,
             });
         }
-        if let Some(kind) = NodeErrorKind::from_code(status.kind) {
+        if let Some(kind) = NodeErrorKind::from_code(status.kind)
+            .filter(|_| (abi::error_kind::LOGIC..=abi::error_kind::IO).contains(&status.kind))
+        {
             return Err(TransportError::NodeFailed {
                 node_id: self.label.clone(),
                 kind,
@@ -340,13 +378,17 @@ impl NodeEntry for DylibNodeEntry {
             )
         };
         if let Err(error) = self.result(status, "init") {
-            let _ = host::remove_context(handle);
-            self.context = None;
+            if !self.retain_process {
+                let _ = host::remove_context(handle);
+                self.context = None;
+            }
             return Err(error);
         }
         if instance.value == 0 {
-            let _ = host::remove_context(handle);
-            self.context = None;
+            if !self.retain_process {
+                let _ = host::remove_context(handle);
+                self.context = None;
+            }
             return Err(self.error("node init returned an invalid zero handle".to_owned()));
         }
         self.instance = Some(instance);
@@ -651,7 +693,9 @@ unsafe extern "C" fn sink_write(context: *mut u8, bytes: abi::Bytes) -> abi::Sta
         code,
         kind: 0,
     };
-    if context.is_null() || (context as usize) % std::mem::align_of::<SinkBridge<'_>>() != 0 {
+    if context.is_null()
+        || !(context as usize).is_multiple_of(std::mem::align_of::<SinkBridge<'_>>())
+    {
         return failure(abi::status_code::INVALID_ARGUMENT);
     }
     // SAFETY: capture passes its live exclusive stack bridge. Node callback

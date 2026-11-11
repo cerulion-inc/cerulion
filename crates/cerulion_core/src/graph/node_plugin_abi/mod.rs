@@ -21,7 +21,7 @@ pub use client::HostClient;
 pub use context::{AnyPublisher, AnySubscriber, NodeContext};
 pub use exports::{NodeExports, PluginNode};
 pub use input::{Accumulated, InputView};
-pub use metadata::metadata;
+pub use metadata::{metadata, raw_metadata};
 pub use output::{LazyOutput, OutputProxy};
 pub use registry::NodeRegistry;
 
