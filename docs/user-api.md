@@ -3540,8 +3540,10 @@ Read by `cerulion ros2 run` / `ros2 launch` and by `graph run` for a graph's
 | `CERULION_RMW_ADOPT_TAKE_BUDGET` | Read by `rmw_cerulion` in the ROS 2 CHILD: a positive integer capping how many samples ONE subscription may hold adopted at once (each adopted take holds its sample until the application frees the forged pointers). Unset uses the built-in borrow budget; a value that is not a positive integer (or not valid UTF-8) warns and uses the default (once per subscription that reads it, not once per process: creates are rare and each is its own report). Raising it past the topic's provisioned borrow capacity does not raise that capacity, and a take beyond it is a REFUSAL, not a copy: `rmw_take` returns success with `taken = false`, the frame stays queued (nothing is consumed and nothing is delivered), and the refusal is counted and reported. It self-heals (freeing any one adopted message lets the next take succeed), so a caller that holds messages faster than it frees them sees empty takes rather than degraded ones. |
 | `CERULION_HEAPHOOK_DEBUG` | When truthy (set, non-empty, not `0`), `libcerulion_heaphook.so` writes a one-line load breadcrumb to stderr naming its ABI version and whether it won `malloc` resolution (`cerulion heap hook loaded: abi vN won_malloc=1`). Diagnostic only: a stock ROS 2 process installs no `tracing` subscriber, so this raw line is how you confirm the preloaded hook actually loaded. The load breadcrumb is off by default; a real allocator loss always warns, including with debug disabled. |
 
-The winner check follows the loaded `malloc` definition. Python 3.8's executable
-import stub does not disable the hook when its calls reach the hook's allocator.
+The winner check follows the loaded `malloc` definition. A non-PIE Python
+interpreter, including Python 3.8 on Ubuntu 20.04 and Python 3.12 in ROS 2 Jazzy,
+can expose an executable import stub. That stub does not disable the hook when
+its calls reach the hook's allocator.
 The handshake stays active, so eligible fields can still fill a borrow slot.
 If an earlier preloaded or linked allocator supplies `malloc`, the hook reports
 the loss and unbounded borrowing falls back to copying. Put the hook first if

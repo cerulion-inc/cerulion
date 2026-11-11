@@ -607,7 +607,8 @@ unset); `rmw_wait_spin_test` carries the explicit-env clamp-at-`u64::MAX` pins a
 
 The heap hook's load-time winner check compares defining modules, using its
 private constructor to identify its own module. A non-PIE executable such as
-Python 3.8 can give an undefined `malloc` import a canonical PLT address, which
+Python 3.8 on Ubuntu 20.04 or Python 3.12 in ROS 2 Jazzy can give an undefined
+`malloc` import a canonical PLT address, which
 glibc returns from `dlsym(RTLD_DEFAULT, "malloc")` even when calls bind to the
 hook. `dladdr1(RTLD_DL_SYMENT)` distinguishes that `SHN_UNDEF` import from a
 definition. Only that import takes the fallback: enumerate loaded objects in

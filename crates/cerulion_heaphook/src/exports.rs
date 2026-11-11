@@ -432,7 +432,7 @@ fn malloc_location(addr: *const c_void) -> Option<MallocLocation> {
     }
     // SAFETY: a non-null RTLD_DL_SYMENT result is a loader-owned ElfW(Sym).
     // Preload definitions remain loaded; the fallback holds a NOLOAD reference
-    // and the loader lock while inspecting other objects.
+    // and dl_iterate_phdr's dl_load_write_lock while inspecting other objects.
     if !sym.is_null() && unsafe { (*sym.cast::<ElfSym>()).st_shndx == SHN_UNDEF } {
         Some(MallocLocation::CanonicalPlt)
     } else {
@@ -446,7 +446,7 @@ fn malloc_location(addr: *const c_void) -> Option<MallocLocation> {
 fn first_malloc_definition() -> Option<*mut c_void> {
     let mut module = None;
     // SAFETY: glibc calls the callback synchronously with valid dl_phdr_info
-    // pointers while holding its loader lock; data is our live Option out-slot.
+    // pointers under dl_load_write_lock; data is our live Option out-slot.
     unsafe {
         libc::dl_iterate_phdr(
             Some(find_malloc_definition),
@@ -473,8 +473,9 @@ unsafe extern "C" fn find_malloc_definition(
         return 0;
     }
     // hot-path-alloc-ok: handle lookup is confined to the load constructor.
-    // SAFETY: the name is loader-owned; NOLOAD forbids loading another object,
-    // and LAZY does not force eager binding of the object's other PLT entries.
+    // SAFETY: the name is loader-owned; NOLOAD requires a mapped object, but
+    // dlopen runs its initializers if it is an uninitialized startup object.
+    // LAZY does not force eager binding of the object's other PLT entries.
     let handle = unsafe { libc::dlopen(info.dlpi_name, libc::RTLD_NOLOAD | libc::RTLD_LAZY) };
     if handle.is_null() {
         return 1; // Cannot establish load order: fail closed.
