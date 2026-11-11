@@ -373,20 +373,28 @@ fn service_call_with_no_server_is_unavailable() {
 #[serial]
 fn an_estop_engaged_during_the_server_wait_stops_the_call_as_unavailable() {
     store();
+    let service = "/act_verbs_test/call/estop";
     let l = lease();
     let engager = {
         let l = l.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            // The call opens its request publisher after the handler's latch
+            // check and the watcher's start, then waits for a server: engage
+            // once it has opened it, at the start of that wait.
+            let transport = cerulion_core::TransportManager::get_or_init().unwrap();
+            let request = cerulion_core::transport::service::request_topic(service);
+            let mut polls = 0;
+            while transport.topic_publisher_count(&request) == 0 {
+                polls += 1;
+                assert!(polls < 5000, "the call never opened its client");
+                std::thread::sleep(Duration::from_millis(2));
+            }
             l.lock().unwrap().engage_estop("test");
         })
     };
     let started = std::time::Instant::now();
     let err = ServiceCallVerb::new(l)
-        .execute(
-            &json!({"service": "/act_verbs_test/call/estop", "type": "demo_srvs/srv/Ping",
-                         "timeout_s": 10}),
-        )
+        .execute(&json!({"service": service, "type": "demo_srvs/srv/Ping", "timeout_s": 10}))
         .unwrap_err();
     engager.join().unwrap();
     match err {
@@ -527,20 +535,28 @@ fn an_estop_engaged_after_the_latch_checks_and_before_a_frame_publishes_no_frame
 #[serial]
 fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable() {
     store();
+    let topic = "/c1_act/publish/estop";
     let l = lease();
     let engager = {
         let l = l.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            // The publish opens its publisher after the handler's latch check
+            // and the watcher's start, then waits for a subscriber: engage
+            // once it has opened it, at the start of that wait.
+            let transport = cerulion_core::TransportManager::get_or_init().unwrap();
+            let mut polls = 0;
+            while transport.topic_publisher_count(topic) == 0 {
+                polls += 1;
+                assert!(polls < 5000, "the publish never opened its publisher");
+                std::thread::sleep(Duration::from_millis(2));
+            }
             l.lock().unwrap().engage_estop("test");
         })
     };
     let started = std::time::Instant::now();
     let err = TopicPublishVerb::new(l)
-        .execute(
-            &json!({"topic": "/c1_act/publish/estop", "type": "std_msgs/String",
-                         "message": {"data": "x"}, "wait_subscribers_s": 10}),
-        )
+        .execute(&json!({"topic": topic, "type": "std_msgs/String",
+                         "message": {"data": "x"}, "wait_subscribers_s": 10}))
         .unwrap_err();
     engager.join().unwrap();
     match err {

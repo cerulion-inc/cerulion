@@ -112,7 +112,7 @@ const DOORS: &[(&str, &str, &str)] = &[
     (
         "cerulion_remoted",
         "iroh",
-        "DEV edge only: its wire-plane test needs iroh's VarInt, which cerulion_link does not re-export",
+        "DEV edge only: its tests need iroh's VarInt, SecretKey, RelayMode and endpoint presets, and iroh-relay's loopback relay server and client, which cerulion_link does not re-export",
     ),
     (
         "cerulion_viz",

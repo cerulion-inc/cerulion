@@ -19,7 +19,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
-  TLS: 32; retry at 16; 4/IP; 8/relay.
+  TLS: 32 (last 8 for paired relay keys); retry 16; 4/IP or paired key; 8/unpaired URL.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
@@ -45,7 +45,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   256-file soft limit hit iceoryx service/port errors.
 - Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct
   `TransportManager::get_or_init()` callers are `#[serial]`;
-  e2e: loopback iroh only, relay off, direct dial, bounded awaits.
+  e2e: loopback iroh and relays only, bounded awaits.
 - remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
 Read docs/internals/remote-access.md before verb, trust, wire, pairing and epoch edits.

@@ -159,6 +159,34 @@ impl SupervisedEgressPlane {
     }
 }
 
+/// Supervisor start failures and idle-fence failures are separate conditions,
+/// each with its own failure regime.
+struct LifecycleLatches {
+    start: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    fence: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+}
+
+impl LifecycleLatches {
+    fn new() -> Self {
+        Self {
+            start: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
+            fence: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
+        }
+    }
+    fn start_failed(&mut self) -> cerulion_core::transport::failure_regime_latch::RegimeDecision {
+        self.start.on_failure()
+    }
+    fn started(&mut self) -> Option<u64> {
+        self.start.on_success()
+    }
+    fn fence_failed(&mut self) -> cerulion_core::transport::failure_regime_latch::RegimeDecision {
+        self.fence.on_failure()
+    }
+    fn fence_ok(&mut self) -> Option<u64> {
+        self.fence.on_success()
+    }
+}
+
 fn lifecycle_worker(
     state: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
@@ -166,9 +194,9 @@ fn lifecycle_worker(
     mirror: Arc<dyn MirrorPlane>,
     held: Arc<AtomicBool>,
 ) {
-    use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
     let mut supervisor: Option<RobotSupervisor> = None;
-    let mut failures = FailureRegimeLatch::new();
+    let mut failures = LifecycleLatches::new();
     loop {
         // The controller may be busy with WAN I/O. Never hold lifecycle state
         // while sampling it: registrations still get an immediate reply.
@@ -202,19 +230,19 @@ fn lifecycle_worker(
                     Ok(server) => {
                         supervisor = Some(server);
                         state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Serving;
-                        if let Some(suppressed) = failures.on_success() {
-                            tracing::info!(suppressed, "remote serving lifecycle recovered");
+                        if let Some(suppressed) = failures.started() {
+                            tracing::info!(suppressed, "remote serving supervisor start recovered");
                         }
                         continue;
                     }
                     Err(error) => {
                         state.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Idle;
-                        match failures.on_failure() {
+                        match failures.start_failed() {
                             RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                                tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote serving supervisor could not start; retrying")
+                                tracing::warn!(error = %error, total_failures = failures.start.total_failures(), "remote serving supervisor could not start; retrying")
                             }
                             RegimeDecision::Suppressed { .. } => {
-                                tracing::debug!(error = %error, total_failures = failures.total_failures(), "remote serving supervisor start still unavailable")
+                                tracing::debug!(error = %error, total_failures = failures.start.total_failures(), "remote serving supervisor start still unavailable")
                             }
                         }
                     }
@@ -229,6 +257,11 @@ fn lifecycle_worker(
                             &crate::serving_hold::fence_path(&root),
                         )
                     });
+                if fence.is_ok() {
+                    if let Some(suppressed) = failures.fence_ok() {
+                        tracing::info!(suppressed, "remote serving idle fence recovered");
+                    }
+                }
                 match fence {
                     Ok(Some(fence)) => {
                         // Outbound Ensure also takes this native fence in shared
@@ -253,12 +286,12 @@ fn lifecycle_worker(
                         }
                     }
                     Ok(None) => {}
-                    Err(error) => match failures.on_failure() {
+                    Err(error) => match failures.fence_failed() {
                         RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
-                            tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote serving idle fence unavailable; retrying")
+                            tracing::warn!(error = %error, total_failures = failures.fence.total_failures(), "remote serving idle fence unavailable; retrying")
                         }
                         RegimeDecision::Suppressed { .. } => {
-                            tracing::debug!(error = %error, total_failures = failures.total_failures(), "remote serving idle fence remains unavailable")
+                            tracing::debug!(error = %error, total_failures = failures.fence.total_failures(), "remote serving idle fence remains unavailable")
                         }
                     },
                 }
@@ -346,6 +379,47 @@ mod tests {
     use super::*;
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::{TransportConfig, TransportManager};
+
+    #[test]
+    fn lifecycle_conditions_rearm_independently_after_fence_recovery() {
+        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+        let mut latches = LifecycleLatches::new();
+        assert_eq!(latches.fence_failed(), RegimeDecision::Loud);
+        assert_eq!(
+            latches.fence_failed(),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        );
+        assert_eq!(latches.start_failed(), RegimeDecision::Loud);
+        assert_eq!(
+            latches.fence_failed(),
+            RegimeDecision::Suppressed { suppressed: 2 }
+        );
+        assert_eq!(latches.fence_ok(), Some(2));
+        assert_eq!(latches.fence_ok(), None);
+        assert_eq!(latches.fence_failed(), RegimeDecision::Loud);
+        assert_eq!(
+            latches.start_failed(),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        );
+        assert_eq!(latches.started(), Some(1));
+        assert_eq!(latches.start_failed(), RegimeDecision::Loud);
+        assert_eq!(latches.fence_ok(), None);
+        assert_eq!(latches.fence_failed(), RegimeDecision::Loud);
+        // A start recovery leaves the open fence regime open.
+        assert_eq!(
+            latches.fence_failed(),
+            RegimeDecision::Suppressed { suppressed: 1 }
+        );
+        assert_eq!(latches.started(), None);
+        assert_eq!(
+            latches.fence_failed(),
+            RegimeDecision::Suppressed { suppressed: 2 }
+        );
+        assert_eq!(latches.fence_ok(), Some(2));
+        // Totals count every failure and never reset on recovery.
+        assert_eq!(latches.start.total_failures(), 3);
+        assert_eq!(latches.fence.total_failures(), 7);
+    }
 
     #[test]
     fn idle_decision_preserves_outbound_readers_and_starts_queued_registrations() {
