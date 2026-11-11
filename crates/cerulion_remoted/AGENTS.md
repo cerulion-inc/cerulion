@@ -46,6 +46,9 @@ also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
 - Metadata reads the EXISTING netd snapshot (namespace checked; never starts netd)
   or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
   CAP_OBSERVE after async provider work (`local_schema_provider_test`).
+- The daemon hosts same-user outbound mirror control on its existing endpoint
+  and transport node. Reject key or namespace mismatches before dialing;
+  retirement closes only outbound sessions, never the shared endpoint.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft

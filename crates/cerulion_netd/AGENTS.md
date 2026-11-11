@@ -33,14 +33,19 @@ mirror plane - green there proves the wiring, not the live network planes.
   and injected daemons are exempt. `register_egress` rechecks before mutating.
 - A WAN LISTEN machine owns ONE remoted child via `robot_supervisor`: registration
   is deadline-bound, retried with capped backoff; shutdown reaps before releasing
-  the singleton, and the machine REFUSES outgoing WAN demands rather than building a second
-  endpoint or falling back to LAN. Beacon facts share `discovery::robot_state`.
+  the singleton; outbound WAN demands reuse that child's endpoint through the
+  local control seam. Beacon facts share `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata, and pins survive tearing. EVERY
   demand calls `prepare_demand`, even an already-mirrored topic: a stale identity
   or dead reader must not acknowledge a phantom mirror. Validate the reserved
   `account:` route before `TopicKey` trims ordinary names.
+- Serving controllers delegate outbound mirrors through remoted's private
+  `outbound.sock`; never bind a second endpoint with the owned device key.
+  The live endpoint key and SHM namespace must match before any dial. Local
+  control has bounded messages and clients; closing its connection retires all
+  mirrors, while account fencing never closes the shared serving endpoint.
 - Identity snapshots carry public bytes only, hold the auth-store lock across every
   read, and refuse rather than wait on a busy writer. Expiry gates new enrollment,
   never durable bindings; an account or key change fences the controller.
