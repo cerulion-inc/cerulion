@@ -138,6 +138,20 @@ Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Mult
 
 ## Quickstart: Run, record and verify
 
+> **Using a coding agent?** Paste this prompt into Claude Code, Codex or another agent that runs commands in its own terminal:
+>
+> ```text
+> Install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+> Run cerulion login in the background, show me the URL and code it prints, and wait for it to finish while I approve the sign-in in my browser.
+> Then run the quickstart at https://github.com/cerulion-inc/cerulion#quickstart-run-record-and-verify in your own terminal:
+> cerulion workspace create safety_demo --starter obstacle_avoidance, then cd safety_demo.
+> Build both nodes (cerulion node build laser_scanner --release, then cerulion node build safety_controller --release; the first build takes a few minutes).
+> Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle_avoidance --release --record for at least five seconds, and stop it with Ctrl+C.
+> Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
+> In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
+> Report what changed between the two verifications.
+> ```
+
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
 
 Choose the acquisition route for your installed CLI. The 2.0.0 CLI includes `--starter`, so it takes the second route; the first is for a 1.0.0 install.
