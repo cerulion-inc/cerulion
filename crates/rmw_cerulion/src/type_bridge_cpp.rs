@@ -19,7 +19,10 @@
 //!   container walking; no layout assumptions in Rust. `std::vector<T>`
 //!   element-0 pointers are contiguous by the C++ standard (T ≠ bool);
 //!   `std::vector<bool>` is bit-packed and goes element-by-element via
-//!   `fetch`/`assign`.
+//!   `fetch`/`assign`, or, where the typesupport gives a `bool` sequence no
+//!   accessor at all (Foxy and Galactic), through the compiled shim's
+//!   `std::vector<bool>` operations
+//!   (`ffi::introspection_cpp::is_accessorless_bool_sequence`).
 //! - **`std::string`**: via the COMPILED shim (`shim/cppstring_shim.cpp`)
 //!   — the platform's real string ABI by construction.
 //! - **Fixed (primitive/nested-fixed) spans**: direct memcpy at the
@@ -42,9 +45,11 @@ use cerulion_core::wire::WireHeader;
 
 use crate::ffi;
 use crate::ffi::introspection_cpp::{
-    assign_u8_vector, cppstring_bytes, debug_assert_vector_u8_layout, is_unbounded_u8_vector,
-    member_assign, member_fetch, rmw_cerulion_cppstring_assign, vector_triplet_layout_verified,
-    CppMessageMember, CppMessageMembers, VecTriplet,
+    assign_u8_vector, cppstring_bytes, debug_assert_vector_u8_layout,
+    is_accessorless_bool_sequence, is_unbounded_u8_vector, member_assign, member_fetch,
+    rmw_cerulion_cppstring_assign, vector_bool_assign, vector_bool_len, vector_bool_read,
+    vector_triplet_layout_verified, CppAssignFn, CppFetchFn, CppMessageMember, CppMessageMembers,
+    VecTriplet,
 };
 use crate::type_bridge::{
     add_var_size, adopted_offset, align_up, check_out_cap, check_seq_bound, cursor_align_var,
@@ -56,11 +61,14 @@ use crate::type_bridge::{
 };
 
 /// Why a `bool` sequence is unreachable when its member carries no `fetch`
-/// accessor: before Humble the C++ typesupport generator emits no `fetch`
-/// or `assign` function for `std::vector<bool>` and leaves its `get` and
-/// `get_const` null, so no element of it can be read or written. One
-/// literal, rendered by [`bool_seq_no_fetch_detail`] where the member can
-/// be named and by [`BOOL_SEQ_NO_FETCH_NESTED`] where it cannot.
+/// accessor and is not the accessorless shape the shim serves
+/// ([`is_accessorless_bool_sequence`]: Foxy's and Galactic's generator leave
+/// every accessor of a `bool` sequence null, and the shim reads and fills
+/// that `std::vector<bool>` directly). A member with some accessors but no
+/// `fetch` or `assign` is no generator's output, and no element of it can be
+/// read or written. One literal, rendered by [`bool_seq_no_fetch_detail`]
+/// where the member can be named and by [`BOOL_SEQ_NO_FETCH_NESTED`] where it
+/// cannot.
 macro_rules! bool_seq_no_fetch_reason {
     () => {
         "this build's C++ typesupport has no fetch accessor for \
@@ -165,11 +173,11 @@ pub struct CppBridgedMessage {
     forge_count: usize,
     /// The FIRST `bool[]` member this build cannot write, as
     /// `(var_idx, member path)`, or `None` when every one of them has its
-    /// `assign` accessor. A property of the TYPE, decided once here rather
-    /// than per frame: before Humble the C++ typesupport generator emits no
-    /// `assign` for `std::vector<bool>`, so every frame carrying such a
-    /// member is undeliverable and the take refuses it BEFORE writing
-    /// anything. Reported through the decode latch with
+    /// `assign` accessor or is the accessorless shape the shim fills
+    /// ([`is_accessorless_bool_sequence`], Foxy and Galactic). A property of
+    /// the TYPE, decided once here rather than per frame: a member with
+    /// neither has no way in, so every frame carrying it is undeliverable
+    /// and the take refuses it BEFORE writing anything. Reported through the decode latch with
     /// [`bool_seq_no_assign_detail`], never as a generic malformed-entry
     /// warning blaming the wire.
     ///
@@ -350,8 +358,8 @@ impl CppBridgedMessage {
         }
 
         // The one type-level decode blocker (see the field's doc): a
-        // `bool[]` member whose `assign` accessor this build's C++
-        // `MessageMember` does not carry, at the top level or anywhere
+        // `bool[]` member with neither an `assign` accessor nor the
+        // accessorless shape the shim fills, at the top level or anywhere
         // below it.
         let unwritable_bool_seq = unwritable_bool_seq_census(&ops, member_slice);
 
@@ -1102,29 +1110,19 @@ impl CppBridgedMessage {
                     let count = seq_size(member, field).map_err(|d| self.encode_err(d))?;
                     check_seq_bound(count, *elem_size).map_err(|d| self.encode_err(d))?;
                     if *is_bool {
-                        // vector<bool>: bit-packed, fetch element-wise —
+                        // vector<bool>: bit-packed, read element-wise,
                         // straight into the cursor's zeroed span (no
-                        // intermediate buffer).
-                        let fetch = member_fetch(member)
+                        // intermediate buffer). The way in is settled
+                        // before the entry is written, so a refusal writes
+                        // no entry for this member.
+                        let source = bool_seq_source(member)
                             .ok_or_else(|| self.encode_err(&bool_seq_no_fetch_detail(member)))?;
                         let offset =
                             cursor_align_var(&mut cur, 1).map_err(|d| self.encode_err(d))?;
                         cursor_write_var_entry(&mut cur, table_base, *var_idx, offset, count)
                             .map_err(|d| self.encode_err(d))?;
                         let dst = cur.append_zeroed(count).map_err(|d| self.encode_err(d))?;
-                        for (i, b) in dst.iter_mut().enumerate() {
-                            let mut v: bool = false;
-                            if ffi::introspection_cpp::rmw_cerulion_member_fetch(
-                                fetch,
-                                field,
-                                i,
-                                &mut v as *mut bool as *mut c_void,
-                            ) != 0
-                            {
-                                return Err(self.encode_err("sequence accessor threw"));
-                            }
-                            *b = v as u8;
-                        }
+                        read_bool_seq_cpp(source, field, dst).map_err(|d| self.encode_err(d))?;
                     } else if count == 0 {
                         cursor_append_var(&mut cur, table_base, *var_idx, &[], *elem_size)
                             .map_err(|d| self.encode_err(d))?;
@@ -1830,11 +1828,12 @@ unsafe fn unwritable_bool_seq_below_cpp(
     None
 }
 
-/// Is this member a bool SEQUENCE whose `assign` accessor this build's C++
-/// `MessageMember` does not carry? Unbounded and bounded sequences both
-/// qualify (both are written element by element through `assign`); a fixed
-/// `bool[N]` does not, because it is copied as plain bytes and needs no
-/// accessor.
+/// Is this member a bool SEQUENCE that nothing can write: no `assign`
+/// accessor, and not the accessorless shape the shim fills
+/// ([`is_accessorless_bool_sequence`], every `bool` sequence of a Foxy or
+/// Galactic typesupport)? Unbounded and bounded sequences both qualify (both
+/// are written element by element); a fixed `bool[N]` does not, because it
+/// is copied as plain bytes and needs no accessor.
 ///
 /// # Safety
 /// `member` must come from live, process-lifetime introspection data.
@@ -1842,7 +1841,7 @@ unsafe fn unwritable_bool_seq_member_cpp(member: &CppMessageMember) -> bool {
     member.type_id_ == ros_type::BOOLEAN
         && member.is_array_
         && (member.array_size_ == 0 || member.is_upper_bound_)
-        && member_assign(member).is_none()
+        && bool_seq_sink(member).is_none()
 }
 
 /// A member's own name, or `<field>` where the typesupport carries none.
@@ -1919,9 +1918,98 @@ unsafe fn buffer_bytes_of_size(
 // Sequence access through introspection function pointers
 // =====================================================================
 
+/// How a `bool` sequence's elements are read: through the typesupport's
+/// `fetch` accessor (Humble on), or through the shim's `std::vector<bool>`
+/// operations for the accessorless shape Foxy and Galactic emit. Both give
+/// the same wire form, one byte per element, 1 or 0.
+#[derive(Clone, Copy)]
+enum BoolSeqSource {
+    Fetch(CppFetchFn),
+    Shim,
+}
+
+/// The way into a `bool` sequence member, or `None` when there is none
+/// (some accessors present, but no `fetch`): the caller refuses the frame
+/// before it writes this member's entry, naming the member at the top level
+/// and in the borrow seal.
+fn bool_seq_source(member: &CppMessageMember) -> Option<BoolSeqSource> {
+    if let Some(fetch) = member_fetch(member) {
+        return Some(BoolSeqSource::Fetch(fetch));
+    }
+    is_accessorless_bool_sequence(member).then_some(BoolSeqSource::Shim)
+}
+
+/// How a `bool` sequence's elements are written, the write twin of
+/// [`BoolSeqSource`]: through the typesupport's `assign` accessor (Humble on,
+/// after its `resize`), or through the shim's `std::vector<bool>` operations
+/// for the accessorless shape Foxy and Galactic emit.
+#[derive(Clone, Copy)]
+enum BoolSeqSink {
+    Assign(CppAssignFn),
+    Shim,
+}
+
+/// The way to write a `bool` sequence member, or `None` when there is none:
+/// the registration census records the type ([`unwritable_bool_seq_census`])
+/// and the decode leaf refuses the frame, both before any write.
+fn bool_seq_sink(member: &CppMessageMember) -> Option<BoolSeqSink> {
+    if let Some(assign) = member_assign(member) {
+        return Some(BoolSeqSink::Assign(assign));
+    }
+    is_accessorless_bool_sequence(member).then_some(BoolSeqSink::Shim)
+}
+
+/// Read `dst.len()` elements of the `bool` sequence at `field` into `dst`,
+/// one byte per element, 1 for true and 0 for false: the `Fetch` arm reads
+/// the first `dst.len()`, the `Shim` arm refuses unless the vector holds
+/// exactly that many. The ONE element walk of every encode path (top-level
+/// flatten, nested body and borrow seal).
+///
+/// # Safety
+/// `field` is the field, inside a live C++ message, of the member `source`
+/// came from, and that sequence holds at least `dst.len()` elements (the
+/// caller read the count from it just before).
+unsafe fn read_bool_seq_cpp(
+    source: BoolSeqSource,
+    field: *const c_void,
+    dst: &mut [u8],
+) -> Result<(), &'static str> {
+    match source {
+        BoolSeqSource::Fetch(fetch) => {
+            for (i, b) in dst.iter_mut().enumerate() {
+                let mut v: bool = false;
+                // Through the noexcept wrapper: a throw across the accessor
+                // pointer would be a foreign unwind.
+                if ffi::introspection_cpp::rmw_cerulion_member_fetch(
+                    fetch,
+                    field,
+                    i,
+                    &mut v as *mut bool as *mut c_void,
+                ) != 0
+                {
+                    return Err("sequence accessor threw");
+                }
+                *b = v as u8;
+            }
+            Ok(())
+        }
+        // SAFETY: `Shim` comes only from
+        // `is_accessorless_bool_sequence` holding for this member, so `field`
+        // is a live std::vector<bool>; the wrapper checks the length itself.
+        BoolSeqSource::Shim => vector_bool_read(field, dst),
+    }
+}
+
 unsafe fn seq_size(member: &CppMessageMember, field: *const c_void) -> Result<usize, &'static str> {
     if member.array_size_ > 0 && !member.is_upper_bound_ {
         return Ok(member.array_size_);
+    }
+    // Foxy and Galactic leave a `bool` sequence's `size_function` null; the
+    // member is a `std::vector<bool>`, measured through the shim.
+    if is_accessorless_bool_sequence(member) {
+        // SAFETY: the predicate holds, and `field` is this member's field in
+        // the live message the caller passed, so it is a std::vector<bool>.
+        return Ok(vector_bool_len(field));
     }
     // A Buffer's generated `size_function` is the backend's virtual
     // `size()`, which may throw: read it through the shim's catcher.
@@ -1936,17 +2024,19 @@ unsafe fn seq_size(member: &CppMessageMember, field: *const c_void) -> Result<us
 
 /// Write a primitive sequence into the C++ container. An unbounded
 /// `std::vector<uint8_t>` (the uint8[] payload class) takes the assign()
-/// fast path -- one alloc+copy, NO value-init memset; every
-/// other case resizes through the typesupport then bulk-copies (or
+/// fast path -- one alloc+copy, NO value-init memset; an accessorless
+/// `bool` sequence (Foxy and Galactic, [`is_accessorless_bool_sequence`])
+/// is resized and set through the shim's `std::vector<bool>` operations;
+/// every other case resizes through the typesupport then bulk-copies (or
 /// assigns per element for vector<bool>). Returns false on missing
 /// accessors or fixed-array length mismatch.
 ///
 /// The missing-`assign` refusal for a bool sequence is taken FIRST, before
 /// the resize: a `std::vector<bool>` is written element by element through
-/// `assign`, so a member without that accessor can never be filled whatever
-/// the frame says, and deciding it after the resize would leave the
-/// container emptied or grown on a decode that then fails. Registration
-/// already refuses every such TYPE
+/// `assign` or through the shim, so a member with neither can never be
+/// filled whatever the frame says, and deciding it after the resize would
+/// leave the container emptied or grown on a decode that then fails.
+/// Registration already refuses every such TYPE
 /// ([`unwritable_bool_seq_census`]), so this leaf is the second line: it
 /// holds even for a member a future census gap lets through, and it makes
 /// the zero-length case agree with the type-level verdict instead of
@@ -1958,9 +2048,30 @@ unsafe fn write_prim_seq_cpp(
     count: usize,
     is_bool: bool,
 ) -> bool {
-    if is_bool && member_assign(member).is_none() {
-        return false;
-    }
+    // The way into a bool sequence, settled before any resize (see above).
+    // `assign` is Some exactly when this is a bool sequence written element
+    // by element through the typesupport.
+    let assign = if is_bool {
+        match bool_seq_sink(member) {
+            Some(BoolSeqSink::Assign(assign)) => Some(assign),
+            // Foxy and Galactic: a `std::vector<bool>`, or a BoundedVector
+            // over one, filled through the shim, one byte per element. A
+            // sequence by the predicate, so only the bound applies, and it is
+            // checked here, before the shim's resize.
+            Some(BoolSeqSink::Shim) => {
+                if member.is_upper_bound_ && count > member.array_size_ {
+                    return false;
+                }
+                // SAFETY: the Shim sink comes only from
+                // `is_accessorless_bool_sequence` holding for this member, and
+                // `field` is its field in the caller's live message.
+                return count == bytes.len() && vector_bool_assign(field, bytes);
+            }
+            None => return false,
+        }
+    } else {
+        None
+    };
     // A `rosidl::Buffer<uint8_t>` (Lyrical and Rolling) is filled through
     // the shim, which leaves a CPU Buffer holding `bytes` whatever backend
     // the caller's message held before (its generated resize and get
@@ -2015,12 +2126,7 @@ unsafe fn write_prim_seq_cpp(
     if count == 0 {
         return true;
     }
-    if is_bool {
-        // Bound here, refused at the top of the function: this arm cannot be
-        // reached with `None` (no `else` branch can be covered by a test).
-        let Some(assign) = member_assign(member) else {
-            return false;
-        };
+    if let Some(assign) = assign {
         for (i, &b) in bytes.iter().enumerate() {
             let v: bool = b != 0;
             if ffi::introspection_cpp::rmw_cerulion_member_assign(
@@ -2226,21 +2332,9 @@ unsafe fn encode_message_payload_cpp(
             let elem = primitive_size(member.type_id_);
             check_seq_bound(count, elem)?;
             if member.type_id_ == ros_type::BOOLEAN {
-                let fetch = member_fetch(member).ok_or(BOOL_SEQ_NO_FETCH_NESTED)?;
+                let source = bool_seq_source(member).ok_or(BOOL_SEQ_NO_FETCH_NESTED)?;
                 buf.resize(count, 0);
-                for (i, b) in buf.iter_mut().enumerate() {
-                    let mut v: bool = false;
-                    if ffi::introspection_cpp::rmw_cerulion_member_fetch(
-                        fetch,
-                        field_ptr,
-                        i,
-                        &mut v as *mut bool as *mut c_void,
-                    ) != 0
-                    {
-                        return Err("sequence accessor threw");
-                    }
-                    *b = v as u8;
-                }
+                read_bool_seq_cpp(source, field_ptr, &mut buf)?;
             } else if count > 0 && member_is_buffer(member) {
                 if crate::rosidl_buffer::sizing() {
                     // Measured, not shipped: the Buffer's own length in zeros.
@@ -2578,10 +2672,10 @@ impl CppBridgedMessage {
                     check_seq_bound(count, if *is_bool { 1 } else { *elem_size })
                         .map_err(|d| SealRefusal::Encode(self.encode_err(d)))?;
                     if *is_bool {
-                        // Bit-packed: fetch into the reused owned arena (the
+                        // Bit-packed: read into the reused owned arena (the
                         // same element walk the flatten path runs). Never
                         // forgeable, never adopted.
-                        let fetch = member_fetch(member).ok_or_else(|| {
+                        let source = bool_seq_source(member).ok_or_else(|| {
                             SealRefusal::Encode(self.encode_err(&bool_seq_no_fetch_detail(member)))
                         })?;
                         if count == 0 {
@@ -2590,21 +2684,8 @@ impl CppBridgedMessage {
                         } else {
                             let start = owned.len();
                             owned.resize(start + count, 0);
-                            for (i, b) in owned[start..].iter_mut().enumerate() {
-                                let mut v: bool = false;
-                                if ffi::introspection_cpp::rmw_cerulion_member_fetch(
-                                    fetch,
-                                    field,
-                                    i,
-                                    &mut v as *mut bool as *mut c_void,
-                                ) != 0
-                                {
-                                    return Err(SealRefusal::Encode(
-                                        self.encode_err("sequence accessor threw"),
-                                    ));
-                                }
-                                *b = v as u8;
-                            }
+                            read_bool_seq_cpp(source, field, &mut owned[start..])
+                                .map_err(|d| SealRefusal::Encode(self.encode_err(d)))?;
                             items.push(SealItem::CopyOwned {
                                 start,
                                 len: count,
@@ -2901,19 +2982,20 @@ mod cpp_package_tests {
     }
 
     /// A bit-packed `std::vector<bool>` stand-in. The bridge reaches a
-    /// sequence only through the member's function pointers, so a Rust
-    /// struct with Rust `extern "C"` accessors is indistinguishable from the
-    /// real container, and the bit packing means no contiguous copy can
-    /// serve it.
+    /// sequence that has accessors only through them, so a Rust struct with
+    /// Rust `extern "C"` accessors is indistinguishable from the real
+    /// container, and the bit packing means no contiguous copy can serve it.
+    /// (A member with NO accessor is read as a real `std::vector<bool>`, so
+    /// these fixtures always install at least one.)
     #[repr(C)]
     struct FakeVecBool {
         bits: *mut u8,
         len: usize,
     }
 
-    /// The pre-Humble `bool[]` member: a container that can be resized and
-    /// whose elements cannot be written, because the C++ generator emits no
-    /// `assign` for `std::vector<bool>`.
+    /// An unwritable `bool[]` member: a container that can be resized and
+    /// whose elements cannot be written, because it has no `assign` accessor
+    /// and, with a resize present, is not the all-null shape the shim fills.
     fn bool_sequence_member(
         resize: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize)>,
     ) -> super::CppMessageMember {
