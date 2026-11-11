@@ -129,6 +129,10 @@ fn serving_transition_restores_canonical_and_observer_pins_on_the_same_subscribe
 #[test]
 #[ignore = "subprocess fixture for the real installed sibling layout"]
 fn actual_child_fixture() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("cerulion_netd=debug,cerulion_remoted=debug")
+        .with_test_writer()
+        .try_init();
     let robot = OwnerRobot::start_with_robot_id("transition", ROBOT, None, None);
     let login = Login::new();
     let _home = EnvGuard::set("CERULION_HOME", login.directory.path());

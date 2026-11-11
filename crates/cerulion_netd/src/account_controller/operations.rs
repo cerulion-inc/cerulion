@@ -203,6 +203,8 @@ impl AccountWanController {
                 Err(error) => Err(error.clone()),
             };
             if let Err(error) = restored {
+                tracing::debug!(robot = %key.robot, topic = %key.topic, observer = key.observer,
+                    serving = state.serving_gateway, error = %error, "outbound reader pin restoration failed");
                 if let Some(plane) = state
                     .plane
                     .as_ref()

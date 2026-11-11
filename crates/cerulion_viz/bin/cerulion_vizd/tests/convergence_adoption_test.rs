@@ -767,7 +767,7 @@ fn vizd_never_calls_netds_looping_query_verbs() {
 /// The LOCK-SCOPE pin: the netd client mutex is taken in exactly ONE place.
 ///
 /// `with_client` takes the guard, runs one round trip, and drops it. Every
-/// `DemandPlane` method must reach the client through it — a method that locked the
+/// query method must reach the demand-free client through it; a method that locked the
 /// client itself could hold it across anything.
 #[test]
 fn the_netd_client_mutex_is_taken_only_inside_with_client() {

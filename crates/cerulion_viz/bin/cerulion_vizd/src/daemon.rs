@@ -1314,7 +1314,7 @@ struct Ctx {
     /// shared mirror from the one-per-computer `cerulion-netd` daemon (instead of
     /// opening vizd's own ingress on the zenoh session), and `detach` releases it.
     /// A DI seam ([`DemandPlane`]): production is [`NetdDemandPlane`] (one persistent
-    /// UDS connection for the daemon's lifetime); tests inject a counting spy.
+    /// holding connection per source); tests inject a counting spy.
     demand_plane: Arc<dyn DemandPlane>,
     /// The schema-resolution walker, SWAPPABLE (remote arm): a schema-less
     /// remote attach grows it with a robot-served type's closure. Reads take a
@@ -5726,6 +5726,7 @@ pub trait DemandPlane: Send + Sync {
 }
 
 struct RemoteChannel {
+    client: Option<NetdClient>,
     local_topic: String,
     schema_hash: u64,
     misses: u8,
@@ -5734,14 +5735,10 @@ struct RemoteChannel {
     failures: FailureRegimeLatch,
 }
 
-/// The production demand plane — ONE persistent [`NetdClient`]
-/// connection to `cerulion-netd` for the daemon's lifetime (spawning netd detached
-/// on the first demand if it is not running). Every vizd demand rides this ONE
-/// connection, so netd sees vizd as ONE consumer; dropping the plane (at daemon
-/// shutdown) closes the connection, releasing every remaining demand (the crash-safe
-/// refcount). The client is behind a `Mutex` (its `demand`/`release` take `&mut
-/// self`, and controller threads share it) and opened LAZILY on the first demand, so
-/// a viz daemon that only ever serves LOCAL attaches never connects to netd.
+/// The production demand plane. Each source owns its holding connection, so a
+/// failed recovery closes only that source's demands. Catalog, schema and runs
+/// queries use a separate demand-free client. All connections are lazy; a daemon
+/// serving only local attaches opens none.
 pub struct NetdDemandPlane {
     channels: Mutex<BTreeMap<(String, String), RemoteChannel>>,
     probe_failures: Mutex<FailureRegimeLatch>,
@@ -5782,6 +5779,15 @@ impl NetdDemandPlane {
         f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
     ) -> Result<R, String> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        self.run_client(&mut guard, f)
+    }
+
+    /// One source's holding client or the separate demand-free query client.
+    fn run_client<R>(
+        &self,
+        guard: &mut Option<NetdClient>,
+        f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
+    ) -> Result<R, String> {
         if guard.is_none() {
             let client = match &self.socket {
                 Some(sock) => NetdClient::connect_or_spawn_at(sock.clone()),
@@ -5791,19 +5797,14 @@ impl NetdDemandPlane {
         }
         let client = guard.as_mut().expect("just connected");
         match f(client) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                // A CONNECTION-level error (broken pipe / a protocol desync — e.g.
-                // netd exited or was killed) leaves the client unusable, so DROP it:
-                // the NEXT demand reconnects (re-spawning netd if needed), instead of
-                // this long-lived daemon's demand plane staying permanently wedged on
-                // a dead socket (the crash-recovery model — netd is
-                // recovery-stateless). A `Netd(response)` error is a VALID refusal
-                // (schema conflict, …) — the connection is fine, so keep it.
-                if should_drop_client_on_error(&e) {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                // A framing failure closes only this source (or a demand-free
+                // query). A correlated refusal keeps its prior holding client.
+                if should_drop_client_on_error(&error) {
                     *guard = None;
                 }
-                Err(e.to_string())
+                Err(error.to_string())
             }
         }
     }
@@ -5833,49 +5834,13 @@ impl DemandPlane for NetdDemandPlane {
         if held.is_empty() {
             return Ok(());
         }
-        let (losses, status) = {
-            let Ok(mut holding) = self.client.try_lock() else {
-                return Ok(());
-            };
-            match holding.as_mut() {
-                Some(client) => match client.poll_pushed_losses() {
-                    Ok(()) => (
-                        client.take_mirror_losses(),
-                        Some(
-                            client.probe_status_until(Instant::now() + Duration::from_millis(200)),
-                        ),
-                    ),
-                    Err(_) => {
-                        *holding = None;
-                        (
-                            held.iter()
-                                .map(
-                                    |((robot, topic), _, _)| cerulion_netd::protocol::MirrorLost {
-                                        event: "mirror_lost".into(),
-                                        robot: robot.clone(),
-                                        topic: topic.clone(),
-                                    },
-                                )
-                                .collect(),
-                            None,
-                        )
-                    }
-                },
-                None => (
-                    held.iter()
-                        .map(
-                            |((robot, topic), _, _)| cerulion_netd::protocol::MirrorLost {
-                                event: "mirror_lost".into(),
-                                robot: robot.clone(),
-                                topic: topic.clone(),
-                            },
-                        )
-                        .collect(),
-                    None,
-                ),
-            }
-        };
-        if let Some(Err(error)) = &status {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let status = match &self.socket {
+            Some(socket) => NetdClient::connect_existing_at_until(socket.clone(), deadline),
+            None => NetdClient::connect_existing_until(deadline),
+        }
+        .and_then(|mut probe| probe.status_until(deadline));
+        if let Err(error) = &status {
             let mut latch = self
                 .probe_failures
                 .lock()
@@ -5897,6 +5862,14 @@ impl DemandPlane for NetdDemandPlane {
                 tracing::debug!(suppressed, "visualization status probe recovered");
             }
         }
+        let absent = matches!(&status, Err(ClientError::Connect { source, .. })
+            if matches!(source.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused));
+        if status.is_err() && !absent {
+            // Keep pushed losses queued on a busy pass. An absent listener is
+            // different: poll each held socket so dead sources can respawn netd.
+            return Ok(());
+        }
+        let status = status.ok();
         let mut errors = Vec::new();
         for (key, expected_channel, hash) in held {
             // All recovery intent lives in this map. Detach removes it under the
@@ -5908,38 +5881,41 @@ impl DemandPlane for NetdDemandPlane {
             if channel.local_topic != expected_channel || channel.schema_hash != hash {
                 continue;
             }
-            let lost = losses
-                .iter()
-                .any(|loss| loss.robot == key.0 && loss.topic == key.1);
+            let lost = match channel.client.as_mut() {
+                Some(client) => match client.poll_pushed_losses() {
+                    Ok(()) => client
+                        .take_mirror_losses()
+                        .iter()
+                        .any(|loss| loss.robot == key.0 && loss.topic == key.1),
+                    Err(_) => {
+                        channel.client = None;
+                        true
+                    }
+                },
+                None => true,
+            };
             if !lost {
-                match &status {
-                    Some(Ok(status)) => {
-                        let present = status.demands.iter().any(|row| {
-                            row.robot == key.0
-                                && row.topic == key.1
-                                && row.refcount > 0
-                                && row.local_topic.as_deref().unwrap_or(&row.topic)
-                                    == expected_channel
-                        });
-                        if present {
-                            channel.misses = 0;
-                            channel.delay = Duration::from_secs(1);
-                            channel.next_retry = Instant::now();
-                            if let Some(suppressed) = channel.failures.on_success() {
-                                tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
-                            }
-                            continue;
-                        }
-                        channel.misses = channel.misses.saturating_add(1);
-                        if channel.misses < 2 {
-                            continue;
-                        }
+                let Some(status) = &status else {
+                    continue;
+                };
+                let present = status.demands.iter().any(|row| {
+                    row.robot == key.0
+                        && row.topic == key.1
+                        && row.refcount > 0
+                        && row.local_topic.as_deref().unwrap_or(&row.topic) == expected_channel
+                });
+                if present {
+                    channel.misses = 0;
+                    channel.delay = Duration::from_secs(1);
+                    channel.next_retry = Instant::now();
+                    if let Some(suppressed) = channel.failures.on_success() {
+                        tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
                     }
-                    Some(Err(_)) => {
-                        channel.misses = 0;
-                        continue;
-                    }
-                    None => continue,
+                    continue;
+                }
+                channel.misses = channel.misses.saturating_add(1);
+                if channel.misses < 2 {
+                    continue;
                 }
             }
             if Instant::now() < channel.next_retry {
@@ -5948,7 +5924,9 @@ impl DemandPlane for NetdDemandPlane {
             channel.next_retry = Instant::now() + channel.delay;
             channel.delay = (channel.delay * 2).min(Duration::from_secs(30));
             let (robot, topic) = &key;
-            match self.with_client(|client| client.observe(robot, topic, hash)) {
+            match self.run_client(&mut channel.client, |client| {
+                client.observe(robot, topic, hash)
+            }) {
                 Ok(reply) if reply.local_topic == expected_channel => {
                     channel.misses = 0;
                     channel.delay = Duration::from_secs(1);
@@ -5958,8 +5936,9 @@ impl DemandPlane for NetdDemandPlane {
                     }
                 }
                 Ok(_) => {
-                    channels.remove(&key);
-                    let cleanup = self.with_client(|client| client.unobserve(robot, topic));
+                    let mut channel = channels.remove(&key).expect("channel is held");
+                    let cleanup = self
+                        .run_client(&mut channel.client, |client| client.unobserve(robot, topic));
                     errors.push(match cleanup {
                         Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
                         Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
@@ -5989,10 +5968,30 @@ impl DemandPlane for NetdDemandPlane {
 
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
         let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-        let reply = self.with_client(|client| client.observe(robot, topic, schema_hash))?;
+        let key = (robot.into(), topic.into());
+        if let Some(channel) = channels.get_mut(&key) {
+            let reply = self.run_client(&mut channel.client, |client| {
+                client.observe(robot, topic, schema_hash)
+            })?;
+            if channel.local_topic != reply.local_topic || channel.schema_hash != schema_hash {
+                let mut channel = channels.remove(&key).expect("channel is held");
+                let cleanup =
+                    self.run_client(&mut channel.client, |client| client.unobserve(robot, topic));
+                return Err(match cleanup {
+                    Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                    Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+                });
+            }
+            return Ok(());
+        }
+        let mut client = None;
+        let reply = self.run_client(&mut client, |client| {
+            client.observe(robot, topic, schema_hash)
+        })?;
         channels.insert(
-            (robot.into(), topic.into()),
+            key,
             RemoteChannel {
+                client,
                 local_topic: reply.local_topic,
                 schema_hash,
                 misses: 0,
@@ -6004,14 +6003,25 @@ impl DemandPlane for NetdDemandPlane {
         Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
-        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-        channels.remove(&(robot.into(), topic.into()));
-        self.with_client(|c| c.unobserve(robot, topic).map(|_| ()))
-            .map_err(|error| {
-                format!(
-                    "cannot release remote observer for robot '{robot}' topic '{topic}': {error}"
-                )
-            })
+        // Remove recovery intent before the release I/O, including failed release.
+        let channel = self
+            .channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(robot.into(), topic.into()));
+        let Some(mut channel) = channel else {
+            return Ok(());
+        };
+        let result = match channel.client.as_mut() {
+            Some(client) => client
+                .unobserve(robot, topic)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => Err("source holding connection is unavailable".into()),
+        };
+        result.map_err(|error| {
+            format!("cannot release remote observer for robot '{robot}' topic '{topic}': {error}")
+        })
     }
     fn local_channel(&self, robot: &str, topic: &str) -> Result<String, String> {
         self.channels
@@ -6022,9 +6032,8 @@ impl DemandPlane for NetdDemandPlane {
             .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
-        // Route the catalog GET through the ONE persistent netd connection (netd runs
-        // it over the machine's ONE zenoh session). A connection-level error drops the
-        // client so the next call reconnects (`with_client`); the caller falls back.
+        // Query on the demand-free client. A failure cannot release source holds;
+        // netd still routes through the machine's single network session.
         self.with_client(|c| c.query_catalog(Some(robot)))
     }
 
@@ -6039,10 +6048,8 @@ impl DemandPlane for NetdDemandPlane {
         self.with_client(|c| c.query_catalog_with_discovery(Some(robot)))
     }
     fn query_catalog_all(&self) -> Result<Vec<CatalogReply>, String> {
-        // The LAN-wide gather — `query_catalog(None)` harvests every
-        // announcing robot over the SAME one persistent netd connection. A
-        // connection-level error drops the client (`with_client`) so the next call
-        // reconnects; `discover` degrades to local-only on the returned `Err`.
+        // The LAN-wide gather uses the demand-free query connection. A transport
+        // failure reconnects this query client and preserves every held source.
         self.with_client(|c| c.query_catalog(None))
     }
 
@@ -6056,7 +6063,7 @@ impl DemandPlane for NetdDemandPlane {
         self.with_client(|c| c.query_schema(Some(robot), requested))
     }
 
-    /// The REAL runs gather, over the ONE persistent netd connection.
+    /// The REAL runs gather, over the demand-free query connection.
     ///
     /// `query_runs_with_discovery` is netd's NON-looping verb — one round trip, and
     /// the client mutex is taken and DROPPED inside `with_client`. There is

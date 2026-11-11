@@ -52,41 +52,25 @@ fn loss_during_fresh_observe_preserves_both_committed_demands() {
     let root = Directory::new();
     let socket = root.0.join("control.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut methods = Vec::new();
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 {
-                return methods;
-            }
-            let request: Value = serde_json::from_str(&line).unwrap();
-            let method = request["method"].as_str().unwrap();
-            let topic = request["topic"].as_str().unwrap();
-            methods.push((method.to_owned(), topic.to_owned()));
-            let id = request["id"].as_u64().unwrap();
-            let reply = match method {
-                "observe" => {
-                    if topic == "/extra" {
-                        writeln!(
-                            stream,
-                            "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}"
-                        )
-                        .unwrap();
-                    }
-                    json!({"id":id,"robot":"arm","topic":topic,"refcount":1,
-                        "mirror_created":true,"local_topic":topic})
+    let (server, methods) = spy(listener, move |request, stream| {
+        let method = request["method"].as_str().unwrap();
+        let topic = request["topic"].as_str().unwrap();
+        let id = request["id"].as_u64().unwrap();
+        match method {
+            "observe" => {
+                if topic == "/extra" {
+                    writeln!(
+                        stream,
+                        "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}"
+                    )
+                    .unwrap();
                 }
-                "unobserve" => json!({"id":id,"robot":"arm","topic":topic,
-                    "refcount":0,"last_release":true}),
-                other => panic!("unexpected control method {other}"),
-            };
-            writeln!(stream, "{reply}").unwrap();
+                json!({"id":id,"robot":"arm","topic":topic,"refcount":1,
+                    "mirror_created":true,"local_topic":topic})
+            }
+            "unobserve" => json!({"id":id,"robot":"arm","topic":topic,
+                "refcount":0,"last_release":true}),
+            other => panic!("unexpected control method {other}"),
         }
     });
     let plane = NetdDemandPlane::with_socket(socket);
@@ -96,7 +80,10 @@ fn loss_during_fresh_observe_preserves_both_committed_demands() {
     plane.release("arm", "/vector").unwrap();
     drop(plane);
     assert_eq!(
-        server.join().unwrap(),
+        {
+            server.finish();
+            methods.lock().unwrap().clone()
+        },
         [
             ("observe".into(), "/vector".into()),
             ("observe".into(), "/extra".into()),
@@ -112,53 +99,42 @@ fn cancellation_keeps_no_recovery_intent(changed_channel: bool) {
             let root = Directory::new();
             let socket = root.0.join("control.sock");
             let listener = UnixListener::bind(&socket).unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut methods = Vec::new();
-                let mut observes = 0;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap() == 0 {
-                        return methods;
-                    }
-                    let request: Value = serde_json::from_str(&line).unwrap();
-                    let method = request["method"].as_str().unwrap();
-                    methods.push(method.to_owned());
-                    let id = request["id"].as_u64().unwrap();
-                    let reply = match method {
-                        "observe" => {
-                            observes += 1;
-                            if changed_channel && observes == 1 {
-                                writeln!(stream, "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}").unwrap();
-                            }
-                            assert_eq!(request["robot"], "arm");
-                            assert_eq!(request["topic"], "/vector");
-                            assert_eq!(request["schema_hash"], 7);
-                            let channel = if changed_channel && observes > 1 {
-                                "/__cerulion/observers/e756c0190570ccb5/70c0eb8e1f85cdd5"
-                            } else {
-                                "/vector"
-                            };
-                            json!({"id":id,"robot":"arm","topic":"/vector",
-                                "refcount":1,"mirror_created":true,"local_topic":channel})
-                        }
-                        "unobserve" if lost => {
+            let observes = std::sync::atomic::AtomicUsize::new(0);
+            let (server, methods) = spy(listener, move |request, stream| {
+                let method = request["method"].as_str().unwrap();
+                let id = request["id"].as_u64().unwrap();
+                match method {
+                    "observe" => {
+                        let observes =
+                            observes.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                        if changed_channel && observes == 1 {
                             writeln!(stream, "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}").unwrap();
-                            json!({"id":id,"robot":"arm","topic":"/vector","refcount":0,"last_release":true})
                         }
-                        "unobserve" => json!({"id":id,"error":"release unavailable",
+                        assert_eq!(request["robot"], "arm");
+                        assert_eq!(request["topic"], "/vector");
+                        assert_eq!(request["schema_hash"], 7);
+                        let channel = if changed_channel && observes > 1 {
+                            "/__cerulion/observers/e756c0190570ccb5/70c0eb8e1f85cdd5"
+                        } else {
+                            "/vector"
+                        };
+                        json!({"id":id,"robot":"arm","topic":"/vector",
+                                "refcount":1,"mirror_created":true,"local_topic":channel})
+                    }
+                    "unobserve" if lost => {
+                        writeln!(
+                            stream,
+                            "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}}"
+                        )
+                        .unwrap();
+                        json!({"id":id,"robot":"arm","topic":"/vector","refcount":0,"last_release":true})
+                    }
+                    "unobserve" => json!({"id":id,"error":"release unavailable",
                             "robot":"arm","topic":"/vector"}),
-                        "status" => {
-                            json!({"id":id,"demands":[],"active_connections":1,"idle":false})
-                        }
-                        other => panic!("unexpected control method {other}"),
-                    };
-                    writeln!(stream, "{reply}").unwrap();
+                    "status" => {
+                        json!({"id":id,"demands":[],"active_connections":1,"idle":false})
+                    }
+                    other => panic!("unexpected control method {other}"),
                 }
             });
             let plane = NetdDemandPlane::with_socket(socket);
@@ -184,7 +160,99 @@ fn cancellation_keeps_no_recovery_intent(changed_channel: bool) {
             } else {
                 vec!["observe", "unobserve"]
             };
-            assert_eq!(server.join().unwrap(), expected);
+            server.finish();
+            let actual: Vec<_> = methods
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(method, _)| method.clone())
+                .collect();
+            assert_eq!(actual, expected);
         }
     }
+}
+
+struct Spy {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Spy {
+    fn finish(mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+impl Drop for Spy {
+    fn drop(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+type Methods = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+fn spy(
+    listener: UnixListener,
+    reply: impl Fn(&Value, &mut std::os::unix::net::UnixStream) -> Value + Send + Sync + 'static,
+) -> (Spy, Methods) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    listener.set_nonblocking(true).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let thread_running = running.clone();
+    let thread_methods = methods.clone();
+    let reply = Arc::new(reply);
+    let thread = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        while thread_running.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("spy accept failed: {error}"),
+            };
+            let methods = thread_methods.clone();
+            let reply = reply.clone();
+            workers.push(std::thread::spawn(move || {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    if method != "status" {
+                        methods
+                            .lock()
+                            .unwrap()
+                            .push((method.into(), request["topic"].as_str().unwrap().into()));
+                    }
+                    let response = reply(&request, &mut stream);
+                    writeln!(stream, "{response}").unwrap();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    (
+        Spy {
+            running,
+            thread: Some(thread),
+        },
+        methods,
+    )
 }
