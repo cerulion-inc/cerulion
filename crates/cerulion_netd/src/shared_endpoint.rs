@@ -317,9 +317,15 @@ impl Configuration {
         self.owner
             .as_deref()
             .map(|bytes| {
-                OwnerCertificatePresentationWire::from_postcard(bytes)
-                    .map(Arc::new)
-                    .map_err(|error| error.to_string())
+                let proof = OwnerCertificatePresentationWire::from_postcard(bytes)
+                    .map_err(|error| error.to_string())?;
+                let device = &proof.device_cert.cert;
+                if device.device_key.0 != self.key || Some(device.account.0) != self.account {
+                    return Err(
+                        "owner certificate does not match the current desk key and account".into(),
+                    );
+                }
+                Ok(Arc::new(proof))
             })
             .transpose()
     }
@@ -868,13 +874,26 @@ impl Drop for OutboundServer {
 }
 
 fn serve_connection(
-    mut stream: UnixStream,
+    stream: UnixStream,
     endpoint: Endpoint,
     runtime: tokio::runtime::Handle,
     seed: [u8; 32],
     manager: Arc<TransportManager>,
     holds: Option<ServingHolds>,
 ) {
+    serve_connection_with_plane_hook(stream, endpoint, runtime, seed, manager, holds, |_| {});
+}
+
+fn serve_connection_with_plane_hook(
+    mut stream: UnixStream,
+    endpoint: Endpoint,
+    runtime: tokio::runtime::Handle,
+    seed: [u8; 32],
+    manager: Arc<TransportManager>,
+    holds: Option<ServingHolds>,
+    on_plane: impl FnOnce(&IrohMirrorPlane),
+) {
+    let mut on_plane = Some(on_plane);
     let mut reader_hold: Option<ServingHold> = None;
     let mut plane: Option<IrohMirrorPlane> = None;
     let mut readers = std::collections::BTreeSet::new();
@@ -903,8 +922,12 @@ fn serve_connection(
             let robots = configuration.robots()?;
             let owner = configuration.owner_certificate()?;
             let retired = if let Some(existing) = &plane {
-                let retired = existing.update_membership(robots)?;
+                // Validation is complete. A failed mutation can leave retired
+                // readers or unusable registry state and must fence the client.
+                fenced = true;
                 existing.registry_owner(owner)?;
+                let retired = existing.update_membership(robots)?;
+                fenced = false;
                 retired
             } else {
                 let registry = Arc::new(
@@ -923,6 +946,9 @@ fn serve_connection(
                 Vec::new()
             };
             let mirror = plane.as_ref().ok_or("outbound plane was not constructed")?;
+            if let Some(on_plane) = on_plane.take() {
+                on_plane(mirror);
+            }
             for key in &retired {
                 readers.remove(key);
             }
@@ -1038,8 +1064,8 @@ fn serve_connection(
             }
         })()
         .map_err(|message| Refusal { message, fenced });
-        // Refused operations keep the admitted connection and every other
-        // reader alive. Only validation or framing failures retire its plane.
+        // Validation and operation refusals preserve readers. Identity fences,
+        // failed membership/owner mutation and framing failures retire the plane.
         if write_message(&mut stream, &answer).is_err() || fenced {
             break;
         }
@@ -1052,6 +1078,66 @@ fn serve_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_membership_cleanup_fences_the_reply_and_closes_control() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let seed = [0x43; 32];
+        let endpoint = runtime
+            .block_on(cerulion_link::build_endpoint(
+                cerulion_link::EndpointConfig::new(seed).with_relay(RelayConfig::Disabled),
+            ))
+            .unwrap();
+        let manager = TransportManager::init_for_test(
+            Default::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let configuration = serde_json::to_value(Configuration {
+            key: *endpoint.id().as_bytes(),
+            account: None,
+            epoch_dir: None,
+            owner: None,
+            namespace: serde_json::to_string(&manager.iox_config()).unwrap(),
+            peers: Vec::new(),
+        })
+        .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let serving_endpoint = endpoint.clone();
+        let handle = runtime.handle().clone();
+        let worker = std::thread::spawn(move || {
+            serve_connection_with_plane_hook(
+                server,
+                serving_endpoint,
+                handle,
+                seed,
+                manager,
+                None,
+                IrohMirrorPlane::poison_membership_cleanup_for_test,
+            );
+        });
+        for operation in 0..2 {
+            write_message(
+                &mut client,
+                &serde_json::json!({"configuration":&configuration,"operation":{"op":"sync"}}),
+            )
+            .unwrap();
+            let reply = read_message::<Result<Answer, Refusal>>(&mut client, false).unwrap();
+            if operation == 0 {
+                assert!(matches!(reply, Ok(Answer::Retired(keys)) if keys.is_empty()));
+            } else {
+                assert!(matches!(reply, Err(Refusal { message, fenced: true })
+                    if message == "could not clear retired WAN epoch diagnostics"));
+            }
+        }
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        worker.join().unwrap();
+        runtime.block_on(endpoint.close());
+    }
 
     #[test]
     fn address_candidates_are_unique_bounded_and_keep_the_tls_seen_address_first() {

@@ -128,6 +128,7 @@ fn remote_lease(
 }
 
 fn servable(topic: &str) -> CerudResult<()> {
+    let requested_topic = topic;
     let canonical;
     let topic = if topic.starts_with('/') {
         topic
@@ -137,8 +138,17 @@ fn servable(topic: &str) -> CerudResult<()> {
     };
     let manager = cerulion_core::TransportManager::get_or_init()
         .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
-    crate::wire::wire_servable(&manager, topic)
-        .map_err(|message| verb_error(VerbError::Unavailable(message)))
+    crate::wire::wire_servable(&manager, topic).map_err(|refusal| {
+        let message = refusal.message(requested_topic);
+        match refusal {
+            crate::wire::SourceRefusal::Reserved => verb_error(VerbError::Usage(message)),
+            crate::wire::SourceRefusal::Mirror
+            | crate::wire::SourceRefusal::MarkerUnavailable(_)
+            | crate::wire::SourceRefusal::Excluded(_) => {
+                verb_error(VerbError::Unavailable(message))
+            }
+        }
+    })
 }
 
 fn schemas_dir() -> Option<PathBuf> {
@@ -700,7 +710,12 @@ mod tests {
             let err = TopicPublishVerb::new(lease())
                 .execute(&json!({"topic": topic, "type": "std_msgs/String"}))
                 .unwrap_err();
-            assert_eq!(class_of(err), "unavailable", "{topic}");
+            assert!(
+                matches!(err, CerudError::Verb(ref message) if message == &format!(
+                    "usage: '{topic}' is in Cerulion's reserved control-plane namespace"
+                )),
+                "{topic}: {err}"
+            );
         }
     }
 

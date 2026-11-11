@@ -214,9 +214,9 @@ impl TapManager {
         // Attach the listener-less tap (opens ONLY the data service; NEVER
         // creates it). A missing topic / exhausted introspection slot surfaces
         // here with an actionable message naming the topic.
-        crate::wire::wire_servable(manager, topic).map_err(|reason| WireError::DemandFailed {
+        crate::wire::wire_servable(manager, topic).map_err(|refusal| WireError::DemandFailed {
             topic: topic.to_owned(),
-            reason,
+            reason: refusal.message(topic),
         })?;
         let tap = manager
             .create_remote_data_only_subscriber(topic)

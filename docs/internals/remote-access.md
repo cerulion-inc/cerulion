@@ -372,8 +372,10 @@ writes the robot's topics and services over the ops plane instead (§5.1):
 `topic-publish` publishes a message on a robot topic and `service-call` calls a
 robot service, in the robot's own shared memory, for an account with
 `CAP_TELEOP` and role ≥ OPERATOR. Neither consults the LAN posture; both are
-refused while the robot's e-stop latch is engaged, and `topic-publish` refuses a
-topic under `/__cerulion`. Under `Paired` a desk writes a message it supplies
+refused while the robot's e-stop latch is engaged. Every act verb refuses a
+network mirror and topics under `/__cerulion`; a live mirror names its source
+robot, other reserved names are usage errors, and producer exclusions preserve
+the topic's remote-access policy context. Under `Paired` a desk writes a message it supplies
 into the robot's shared memory only through `topic-publish` and `service-call`.
 Oracle tests:
 `demand_authorizer.rs` unit tests,
@@ -1077,7 +1079,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 |---|---|
 | `crates/cerulion_remoted/tests/act_verbs_daemon_test.rs` | Every act verb is registered in the production `serve_endpoint` daemon: each answers `{}` with its own usage error over a real ops session |
 | `crates/cerulion_remoted/tests/act_verbs_cloud_test.rs` | The act verbs under the allow-from-cloud switch: a cloud device is refused publish and snapshot only while the switch is off |
-| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, the unavailable class |
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions and local oracle delivery |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |

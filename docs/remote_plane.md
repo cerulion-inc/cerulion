@@ -106,11 +106,15 @@ act verbs, work on the robot's own shared memory; with `--robot`,
   `service-call` calls a robot service once. Both are refused while the
   robot's e-stop is engaged, and one already running stops when it engages.
   They check the e-stop, not the control lease, so the deadman does not cover
-  them. `topic-publish` refuses a topic under the reserved `/__cerulion`
-  namespace.
+  them.
 - With observe access, `topic-snapshot` reads the newest frame of a camera
   topic as a JPEG and `topic-echo-once` reads the newest message of a topic,
   decoded.
+
+Every act verb refuses a network mirror and topics under the reserved
+`/__cerulion` namespace. A live mirror is read on its source robot; other
+reserved topics produce a usage error. Producer exclusions name the refused
+topic and preserve its remote-access policy context.
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
@@ -129,7 +133,8 @@ and e-stop checks.
 Each robot exports its own local producers. Imported graph topics and private
 observer channels keep their source robot's access policy: read them on that
 source robot. A refused outbound demand or an unavailable robot during metadata
-discovery preserves the machine's other active readers. Ops snapshot, one-shot
+discovery preserves the machine's other active readers. Failed membership
+cleanup fences the outbound connection and reports transport loss. Ops snapshot, one-shot
 echo, publish and service calls enforce the same source restriction. Outbound
 readers retain the owned server against idle shutdown; new admission returns a retryable
 refusal while shutdown is already committed. Account ownership proofs survive
