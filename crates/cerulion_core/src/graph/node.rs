@@ -2937,6 +2937,12 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
     }
 }
 
+/// The node-side filter when the graph's environment snapshot carries no
+/// `RUST_LOG`: the node's own code at `info`, the framework inside the cdylib
+/// at `warn`. Its `error!`/`warn!` diagnostics (the `OutputProxy` discard
+/// error among them) stay visible.
+const CDYLIB_DEFAULT_FILTER: &str = "info,cerulion_core=warn";
+
 /// STOPGAP: install a cdylib-local stderr `fmt` tracing subscriber so
 /// node-side `tracing` events become host-visible.
 ///
@@ -2968,11 +2974,13 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
 /// - `rust_log_spec` comes from the node's [`NodeContext`] env snapshot
 ///   (`ctx.env_str("RUST_LOG", "")`), NEVER live `std::env` — the snapshot is
 ///   frozen at graph build for replay determinism (see [`NodeContext`]'s
-///   `env_lookup` docs). An empty/absent spec defaults to `info` (keeps
-///   error/warn/info visible — loud by design); a non-empty spec is applied via
-///   `tracing_subscriber::EnvFilter`. A spec that fails to parse emits a loud
-///   one-line `eprintln!` (tracing is not up yet, so `eprintln!` is the correct
-///   channel) and falls back to `info`.
+///   `env_lookup` docs). An empty/absent spec defaults to
+///   `info,cerulion_core=warn`: `info` for the node's own code (its
+///   `tracing::info!` lines stay visible) and `warn` for the `cerulion_core`
+///   linked into the cdylib, whose `info` lines are teardown bookkeeping. A
+///   non-empty spec is applied via `tracing_subscriber::EnvFilter`. A spec that
+///   fails to parse emits a loud one-line `eprintln!` (tracing is not up yet,
+///   so `eprintln!` is the correct channel) and falls back to `info`.
 /// - The `fmt` output disables ANSI escapes (`with_ansi(false)`): production
 ///   dylib-graph stderr is routinely piped/redirected, and escape codes would
 ///   corrupt log files.
@@ -2984,7 +2992,7 @@ fn cdylib_rust_log_is_absent(spec: Option<&str>) -> bool {
 ///   A spec that parses is applied as written, and it is the same `RUST_LOG`
 ///   the host's own logging reads, so naming it once per cdylib on every run
 ///   only repeated it; under the DEFAULT (absent or empty `RUST_LOG`) the
-///   filter is the documented `info`. Neither prints.
+///   filter is the documented default. Neither prints.
 /// - If a global default already exists in this linked copy (e.g. installed by
 ///   a link-time constructor before any node code ran),
 ///   `tracing::subscriber::set_global_default` returns `Err`; we do nothing and
@@ -3005,7 +3013,7 @@ pub fn install_cdylib_stderr_tracing(rust_log_spec: Option<&str>) {
         let (filter, fallback): (tracing_subscriber::EnvFilter, Option<&str>) =
             if cdylib_rust_log_is_absent(rust_log_spec) {
                 (
-                    tracing_subscriber::EnvFilter::new("info"),
+                    tracing_subscriber::EnvFilter::new(CDYLIB_DEFAULT_FILTER),
                     None,
                 )
             } else {

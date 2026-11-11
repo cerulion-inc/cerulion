@@ -822,22 +822,17 @@ the graph does not start.
 
 **Expected output:** the supervisor spawns one worker process
 per group, waits for each worker's READY, starts the recorder, then releases them
-together. Representative lines (timestamps, pids and paths vary; long lines are
-cut at `...`):
+together, and says so in one line. Representative lines (the ranges vary):
 
 ```
-INFO graph validation complete graph=obstacle_avoidance
-INFO spawned worker process group=grp_lidar_sensor pid=... nodes=1
-INFO worker READY observed group=grp_lidar_sensor ready=...
-INFO spawned worker process group=grp_safety_controller pid=... nodes=1
-INFO worker READY observed group=grp_safety_controller ready=...
-INFO spawned worker process group=grp_drive_base pid=... nodes=1
-INFO worker READY observed group=grp_drive_base ready=...
-INFO spawned bagd recorder graph=obstacle_avoidance pid=... bag=recordings/obstacle_avoidance_<timestamp>.mcap
-INFO all workers spawned + READY ...
+graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es); press Ctrl+C to stop
 INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2
 ```
+
+Each step of the bring-up (worker spawned, worker READY, recorder started) is
+logged at `info`, which `graph run` does not print by default; run it with
+`RUST_LOG=info` to see them.
 
 The graph is now running as three free-running worker processes. The `lidar_sensor`
 publishes at 10 Hz, the `safety_controller` reacts to each reading (the
@@ -857,8 +852,8 @@ one group contained to its own process.
 >   serves the LAN it still sends a live local topic to a LAN peer that names it.
 >   To refuse every LAN peer, set `CERULION_LAN_ACCESS=paired` for every Cerulion
 >   command and daemon and restart a running `cerulion-netd`. The first networked
->   run also starts the shared `cerulion-netd` daemon and says so; it exits by
->   itself when idle.
+>   run also starts the shared `cerulion-netd` daemon, which exits by itself when
+>   idle.
 
 Leave it running and open a second terminal.
 
@@ -1035,17 +1030,21 @@ and press **Ctrl+C**. The workers drain, the recorder finalizes the bag, and the
 run prints where it went:
 
 ```
-INFO live loop delivery telemetry node_id=lidar_sensor fires=387
-INFO live loop delivery telemetry node_id=safety_controller input=scan fires=387 drop_oldest=0
-INFO live loop delivery telemetry node_id=drive_base input=cmd_vel fires=387 drop_oldest=0
-...
 recording written to recordings/obstacle_avoidance_<timestamp>.mcap
 ```
 
-The telemetry lines are the run's own delivery account: how often each node
-fired, and how many queued frames its inputs lost. `drop_oldest=0` on both
-inputs means no frame was evicted from a full queue. To check what actually
-crossed, read the recorded frames of the topic itself.
+With `RUST_LOG=info` set, the run also prints its own delivery account before
+that line:
+
+```
+INFO live loop delivery telemetry node_id=lidar_sensor fires=387
+INFO live loop delivery telemetry node_id=safety_controller input=scan fires=387 drop_oldest=0
+INFO live loop delivery telemetry node_id=drive_base input=cmd_vel fires=387 drop_oldest=0
+```
+
+They say how often each node fired, and how many queued frames its inputs lost.
+`drop_oldest=0` on both inputs means no frame was evicted from a full queue. To
+check what actually crossed, read the recorded frames of the topic itself.
 
 The bag is a standard MCAP file that holds the frames, the graph, the environment
 and the scheduler's trace. `cerulion bag info` summarizes it:

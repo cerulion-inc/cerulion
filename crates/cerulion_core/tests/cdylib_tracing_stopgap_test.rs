@@ -41,8 +41,10 @@
 //!    The positive anchor is the child's own completion line; a sibling arm under
 //!    `off,<fixture>=warn` anchors on the subscriber itself (the user warn
 //!    passes, everything else stays off).
-//! 3. Absent `RUST_LOG` defaults to EXACTLY info-level visibility: discard
-//!    error + user warn + info probe present, debug probe ABSENT.
+//! 3. Absent `RUST_LOG` defaults to EXACTLY info-level visibility for the
+//!    node's own code (`info,cerulion_core=warn`): discard error + user warn +
+//!    info probe present, debug probe ABSENT, and the framework's own teardown
+//!    `info!` line ABSENT (present under pin 1's explicit `info`).
 //! 4. `CER_DISCARD_MODE=healthy` (all fields written): NO discard error, user
 //!    warn still present — the error is tied to the unwritten-field condition.
 //! 5. TWO instances of one cdylib init twice without panic + exactly ONE
@@ -140,6 +142,10 @@ const PARSE_FAILED: &str = "cerulion cdylib tracing: RUST_LOG spec";
 /// The child's own last stderr line, written after it stepped the probe graph:
 /// the positive anchor for an arm whose filter silences every node-side line.
 const CHILD_DONE: &str = "discard probe child stepped the graph";
+/// The framework's own teardown `info!` line, logged from the `cerulion_core`
+/// linked INTO the cdylib when the node's context drops: visible under an
+/// explicit `RUST_LOG=info`, below the default's `cerulion_core=warn`.
+const FRAMEWORK_INFO: &str = "producer reconciliation (per topic)";
 /// libtest / std panic prefix — its ABSENCE proves the two-instance init is clean.
 const PANIC_MARKER: &str = "panicked at";
 
@@ -415,6 +421,13 @@ fn discard_error_is_host_visible_on_stderr_with_rust_log_info() {
         "RUST_LOG=info must surface the node's own tick warn on stderr. stderr:\n{}",
         out.stderr
     );
+    // The positive control for the default arm's absence below: an explicit
+    // `info` reaches the framework's own target inside the cdylib.
+    assert!(
+        out.stderr.contains(FRAMEWORK_INFO),
+        "RUST_LOG=info must surface the framework's teardown info line. stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// Flood-latch, both levels: under `RUST_LOG=debug` the discard error
@@ -542,10 +555,12 @@ fn rust_log_off_with_one_target_at_warn_shows_only_that_targets_warn() {
     );
 }
 
-/// With RUST_LOG absent the cdylib subscriber defaults to EXACTLY "info": the
-/// discard error, user warn, and info probe are visible; the debug probe is NOT.
-/// A default mutated to "warn"/"error" loses the info probe; one mutated to
-/// "debug"/"trace" shows the debug probe.
+/// With RUST_LOG absent the cdylib subscriber defaults to EXACTLY "info" for the
+/// node's own code (`info,cerulion_core=warn`): the discard error, user warn,
+/// and info probe are visible; the debug probe and the framework's own `info`
+/// line are NOT. A default mutated to "warn"/"error" loses the info probe; one
+/// mutated to "debug"/"trace" shows the debug probe; one that drops
+/// `cerulion_core=warn` shows the framework line.
 ///
 /// The debug-probe-ABSENT arm relies on the debug test profile: under release,
 /// `tracing`'s `release_max_level_info` would compile the debug probe out
@@ -577,6 +592,15 @@ fn rust_log_unset_defaults_to_info_and_shows_error() {
         !out.stderr.contains(DEBUG_PROBE),
         "absent RUST_LOG (default \"info\") must NOT surface the debug probe — a \
          default mutated to \"debug\"/\"trace\" fails here. stderr:\n{}",
+        out.stderr
+    );
+    // ...while the framework linked into the cdylib defaults to `warn`, so its
+    // teardown bookkeeping stays off a default run's stderr (the explicit-info
+    // arm above is the positive control).
+    assert!(
+        !out.stderr.contains(FRAMEWORK_INFO),
+        "absent RUST_LOG must keep the framework's info lines quiet \
+         (`info,cerulion_core=warn`). stderr:\n{}",
         out.stderr
     );
 }
@@ -713,10 +737,9 @@ fn rust_log_unset_prints_no_breadcrumb() {
 
 /// A `RUST_LOG` that PARSES prints no breadcrumb: the effective filter is the
 /// spec the user wrote, which the host's own logging reads too, so announcing
-/// it once per node library on every run only repeated it. `warn` is the value
-/// the README quickstart recording ran under; `info` is the documented default
-/// spelled out. Positive anchor: the fixture's user warn reaches stderr, so the
-/// subscriber installed and applied the spec.
+/// it once per node library on every run only repeated it. `info` and `warn`
+/// are the two levels a user most often sets. Positive anchor: the fixture's
+/// user warn reaches stderr, so the subscriber installed and applied the spec.
 #[test]
 #[serial]
 fn rust_log_parseable_prints_no_breadcrumb() {

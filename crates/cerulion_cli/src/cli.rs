@@ -651,26 +651,33 @@ pub enum Commands {
 ///   `workspace *`, `trace inspect`, `clean`). These default QUIET
 ///   (`cerulion=warn`) so their command output isn't interleaved with
 ///   lifecycle breadcrumbs.
-/// - `LongRunning` — verbs that run a runtime loop / daemon (`graph run`,
-///   `graph profile`, `node run`, `bag play`, `ros2 attach`, `viz`, `connect`,
-///   and the hidden multi-process `run-worker`/`run-gateway` workers). These
-///   keep the legacy `cerulion=info` default.
+/// - `QuietRuntime`: the runtime verbs whose terminal output IS their result,
+///   `graph run` (with its hidden `run-worker` processes) and `bag play`. These
+///   default QUIET (`cerulion=warn`) too, so a run prints that it is running,
+///   its recording path and any warning, and a verification prints its
+///   verdict, with no lifecycle bookkeeping around them.
+/// - `LongRunning`: verbs whose lifecycle lines are the operator's window into
+///   a loop or daemon (`graph profile`, `node run`, `bag record`, `ros2 attach`,
+///   `viz`, `connect`, and the hidden `run-gateway`). These keep the
+///   `cerulion=info` default.
 ///
-/// `-v/--verbose` raises EITHER class to `cerulion=debug`; an explicit
-/// `RUST_LOG` always wins over the default (see `cerulion_core::init_logging`).
+/// `-v/--verbose` raises ANY class to `cerulion=debug`; an explicit `RUST_LOG`
+/// always wins over the default (see `cerulion_core::init_logging`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerbLogClass {
-    /// Run-and-exit verb — quiet (`warn`) default.
+    /// Run-and-exit verb: quiet (`warn`) default.
     OneShot,
-    /// Runtime / daemon verb — `info` default.
+    /// Runtime verb whose terminal output is its result: quiet (`warn`) default.
+    QuietRuntime,
+    /// Runtime / daemon verb: `info` default.
     LongRunning,
 }
 
 impl VerbLogClass {
-    /// True when this class defaults to the quiet `warn` filter — the
+    /// True when this class defaults to the quiet `warn` filter, the
     /// `quiet_default` argument threaded into `cerulion_core::init_logging`.
     pub fn is_quiet_default(self) -> bool {
-        matches!(self, VerbLogClass::OneShot)
+        matches!(self, VerbLogClass::OneShot | VerbLogClass::QuietRuntime)
     }
 }
 
@@ -685,20 +692,21 @@ impl Commands {
     /// for the TUI and dispatches `bagd` to its own logging init before
     /// `init_logging` runs), but they are classified here for exhaustiveness.
     pub fn log_verb_class(&self) -> VerbLogClass {
-        use VerbLogClass::{LongRunning, OneShot};
+        use VerbLogClass::{LongRunning, OneShot, QuietRuntime};
         match self {
             #[cfg(unix)]
             Commands::BootstrapRobot { .. } => OneShot,
             #[cfg(unix)]
             Commands::RobotSyncEpoch { .. } => OneShot,
-            // ── Long-running / runtime verbs: keep the `info` default ──
+            // ── Runtime verbs: quiet when the output is the result, else `info` ──
             Commands::Graph { action } => match action {
-                // Runtime loops: the live run, the live profiler, and the
-                // hidden multi-process worker / network-gateway processes.
-                GraphAction::Run { .. }
-                | GraphAction::Profile { .. }
-                | GraphAction::RunWorker { .. }
-                | GraphAction::RunGateway { .. } => LongRunning,
+                // The live run and its hidden workers: the run's own output
+                // (running, the recording path, the warnings) is its result,
+                // and the workers write to the run's stderr, so they take its
+                // class.
+                GraphAction::Run { .. } | GraphAction::RunWorker { .. } => QuietRuntime,
+                // The live profiler and the hidden network-gateway process.
+                GraphAction::Profile { .. } | GraphAction::RunGateway { .. } => LongRunning,
                 // create / validate / list / levels / partition all run-and-exit.
                 GraphAction::Create { .. }
                 | GraphAction::Validate { .. }
@@ -748,19 +756,16 @@ impl Commands {
             // error before `init_logging` matters. Classified for
             // exhaustiveness only.
             Commands::Ros { .. } => OneShot,
-            // `bag play` and `bag record` run a loop until the bag
-            // ends / the duration elapses / Ctrl-C, and their lifecycle
-            // breadcrumbs (topics refused, taps attached, schemas learned) are
-            // the operator's only window into a run — `info` default. `bag
-            // info` is a pure run-and-exit render, so it stays quiet.
-            // `bag play --resim` RE-EXECUTES nodes, which is the same
-            // runtime-verb argument the removed `cerulion replay` made, and it
-            // arrives through this same arm.
-            // `bag migrate` is a run-and-exit rewrite whose product
-            // is the preview it prints and the file it writes — `info` default,
-            // like `bag info`.
+            // `bag record` runs a loop until the duration elapses or Ctrl-C,
+            // and its lifecycle breadcrumbs (topics refused, taps attached,
+            // schemas learned) are the operator's only window into a run:
+            // `info` default. `bag play` prints its own result (a playback,
+            // or `--resim`'s verdict or summary), so it defaults quiet like
+            // `graph run`. `bag info` and `bag migrate` are run-and-exit
+            // renders whose product is what they print.
             Commands::Bag { action } => match action {
-                BagAction::Play { .. } | BagAction::Record { .. } => LongRunning,
+                BagAction::Play { .. } => QuietRuntime,
+                BagAction::Record { .. } => LongRunning,
                 BagAction::Info { .. } | BagAction::Migrate { .. } => OneShot,
             },
             // ── One-shot verbs: QUIET (`warn`) default ──
@@ -4861,17 +4866,35 @@ mod verb_log_class_tests {
         }
     }
 
+    /// `graph run` and `bag play` print their own result, so they default
+    /// QUIET (`QuietRuntime`) while staying distinct from the run-and-exit
+    /// verbs.
+    #[test]
+    fn result_printing_runtime_verbs_default_quiet() {
+        let quiet_runtime: &[&[&str]] = &[
+            &["cerulion", "graph", "run", "g"],
+            &["cerulion", "graph", "run", "g", "--record"],
+            &["cerulion", "bag", "play", "bag.mcap"],
+            &[
+                "cerulion", "bag", "play", "bag.mcap", "--resim", "all", "--verify",
+            ],
+        ];
+        for argv in quiet_runtime {
+            assert_eq!(class_of(argv), VerbLogClass::QuietRuntime, "{argv:?}");
+            assert!(
+                class_of(argv).is_quiet_default(),
+                "{argv:?} defaults to the quiet `warn` filter"
+            );
+        }
+    }
+
     /// Runtime / daemon verbs keep the `info` default (`LongRunning`).
     #[test]
     fn long_running_verbs_keep_info() {
         let long_running: &[&[&str]] = &[
-            &["cerulion", "graph", "run", "g"],
             &["cerulion", "graph", "profile", "g"],
             &["cerulion", "node", "run", "camera"],
-            // `bag play --resim` is where the removed `cerulion
-            // replay`'s re-execution went, so it inherits its log class — as
-            // does plain playback, which was already `LongRunning`.
-            &["cerulion", "bag", "play", "bag.mcap", "--resim", "all"],
+            &["cerulion", "bag", "record", "/camera"],
             &["cerulion", "ros2", "attach", "--iface", "10.0.0.7"],
             &["cerulion", "viz"],
             &["cerulion", "connect", "robot1"],
@@ -4894,14 +4917,15 @@ mod verb_log_class_tests {
         }
     }
 
-    /// The hidden multi-process worker / gateway verbs run a runtime loop, so
-    /// they keep `info` (they are spawned by `graph run`, never typed).
+    /// The hidden worker verb takes its parent `graph run`'s quiet class (the
+    /// supervisor's stderr is the worker's), while the hidden gateway keeps
+    /// `info`. Both are spawned, never typed.
     #[test]
-    fn hidden_worker_verbs_keep_info() {
+    fn hidden_worker_verbs_follow_their_parent() {
         assert_eq!(
             class_of(&["cerulion", "graph", "run-worker", "--plan", "/tmp/p.json"]),
-            VerbLogClass::LongRunning,
-            "run-worker is a runtime process"
+            VerbLogClass::QuietRuntime,
+            "run-worker prints on its graph run's stderr"
         );
         assert_eq!(
             class_of(&[
@@ -4928,6 +4952,11 @@ mod verb_log_class_tests {
         );
         assert_eq!(
             class_of(&["cerulion", "-v", "graph", "run", "g"]),
+            VerbLogClass::QuietRuntime,
+            "-v does not reclassify a quiet runtime verb"
+        );
+        assert_eq!(
+            class_of(&["cerulion", "-v", "graph", "profile", "g"]),
             VerbLogClass::LongRunning,
             "-v does not reclassify a long-running verb"
         );

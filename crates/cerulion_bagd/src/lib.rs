@@ -2597,6 +2597,13 @@ fn bagd_cli_run(args: BagdArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// The recorder's own logging default. `try_init` — a NO-OP if the host binary
 /// (`cerulion`) already installed a subscriber, so the fold never double-inits.
+///
+/// Only the `cerulion bagd` PROCESS reaches this (`bag record` runs the
+/// recorder in-process under the CLI's own filter), and that process is the
+/// recorder `graph run` spawns, so its default is `graph run`'s quiet `warn`:
+/// the run's stderr carries the recorder's warnings and none of its lifecycle
+/// lines. `RUST_LOG` (for example `cerulion=info,cerulion_bagd=info`) restores
+/// them.
 // P12 exception, per the comment inside: this is the tracing BOOTSTRAP — it
 // reports a set-but-invalid RUST_LOG before any subscriber exists, so a
 // `tracing::` call would go nowhere. Function-scoped because a `#[allow]` on a
@@ -2604,7 +2611,7 @@ fn bagd_cli_run(args: BagdArgs) -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::print_stderr)]
 fn init_bagd_logging() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    const DEFAULT_FILTER: &str = "cerulion=info,cerulion_bagd=info";
+    const DEFAULT_FILTER: &str = "cerulion=warn";
     let filter = match EnvFilter::try_from_default_env() {
         Ok(f) => f,
         Err(e) => {
