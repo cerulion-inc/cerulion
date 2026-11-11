@@ -615,15 +615,11 @@ impl HostContext {
         total_size: u32,
     ) -> Result<(), HostServiceError> {
         let index = self.port_index(context, port, LeaseDirection::Write)?;
-        let next_count = self
-            .counters
-            .committed
-            .checked_add(1)
-            .ok_or(LeaseError::GenerationExhausted)?;
         // Validate through the loan owner's slice, never a plugin-provided
         // address. A normal finish consumes the lease even when malformed;
         // its writer has already returned before this terminal callback.
         let layout = self.ports[index].spec.layout;
+        let suppressed = self.output_publisher(index)?.replay_suppress_active();
         let NativeLease::Write {
             loan,
             spill_attempted: false,
@@ -632,7 +628,7 @@ impl HostContext {
         else {
             return Err(HostServiceError::InvalidDescriptor);
         };
-        if !layout.accepts(loan.bytes_mut(), total_size) {
+        if !suppressed && !layout.accepts(loan.bytes_mut(), total_size) {
             self.discard_output(context, port, token, HostDiscardReason::Invariant)?;
             return Err(HostServiceError::InvalidDescriptor);
         }
@@ -644,10 +640,15 @@ impl HostContext {
         self.ports[index].busy = false;
         // The protected original header is host-authoritative, including the
         // loan timestamp, provisional sequence and current native step stamp.
-        let publisher = self.output_publisher(index)?;
-        if publisher.replay_suppress_active() {
+        if suppressed {
             return Ok(());
         }
+        let next_count = self
+            .counters
+            .committed
+            .checked_add(1)
+            .ok_or(LeaseError::GenerationExhausted)?;
+        let publisher = self.output_publisher(index)?;
         publisher.commit_plugin_frame(loan, header, total_size)?;
         self.counters.committed = next_count;
         Ok(())
@@ -678,6 +679,9 @@ impl HostContext {
         }
         *spill_attempted = true;
         let header = *header;
+        if self.output_publisher(index)?.replay_suppress_active() {
+            return Ok(());
+        }
         let next_count = self
             .counters
             .committed
@@ -698,9 +702,6 @@ impl HostContext {
         }
         // Retain the old mapping while the node's writer still borrows it.
         let publisher = self.output_publisher(index)?;
-        if publisher.replay_suppress_active() {
-            return Ok(());
-        }
         publisher.commit_plugin_spill(header, payload)?;
         self.counters.committed = next_count;
         self.counters.spills = next_spills;
@@ -719,7 +720,7 @@ impl HostContext {
         let storage_only = matches!(
             reason,
             HostDiscardReason::SpillRelease | HostDiscardReason::ReplaySuppressed
-        );
+        ) || self.output_publisher(index)?.replay_suppress_active();
         let next_count = if storage_only {
             self.counters.discarded
         } else {
@@ -2024,6 +2025,126 @@ mod tests {
         });
         remove_context(first).unwrap();
         remove_context(second).unwrap();
+    }
+
+    #[test]
+    fn replay_suppression_returns_storage_without_live_discard_or_sequence_effects() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let transport = crate::testing::TestTransport::new();
+        let mut publisher =
+            transport.publisher("abi/replay", crate::wire::MaxSliceLen::const_new(64), 0);
+        let mut subscriber = transport.subscriber("abi/replay");
+        let suppressed = Arc::new(AtomicBool::new(true));
+        let discard_signal = Arc::new(AtomicU32::new(0));
+        publisher.set_replay_suppress(Arc::clone(&suppressed));
+        publisher.set_discard_signal(Arc::clone(&discard_signal));
+        let layout = PluginWireLayout {
+            schema_hash: 0x1122_3344_5566_7788,
+            fixed_size: 24,
+            variable_fields: 0,
+            alignment: crate::shm_runtime::FRAME_ALIGN as u32,
+        };
+        let env = Arc::new(HashMap::new());
+        let native = NodeContext::with_runtime_env(
+            IndexMap::from([("out".to_string(), AnyPublisher::Ipc(publisher))]),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::clone(&env),
+        );
+        let host = HostContext::new(
+            native,
+            vec![HostPortSpec {
+                name: "out".into(),
+                direction: LeaseDirection::Write,
+                layout,
+                read_mode: 0,
+                accumulate_cap: None,
+            }],
+            env,
+            1,
+        )
+        .unwrap();
+        let handle = register_context(host).unwrap();
+        let port = with_context(handle, |host| {
+            host.bind_port(handle, 0, layout.schema_hash, LeaseDirection::Write)
+        })
+        .unwrap();
+        for reason in [
+            HostDiscardReason::TickFailed,
+            HostDiscardReason::Incomplete,
+            HostDiscardReason::Invariant,
+            HostDiscardReason::Teardown,
+            HostDiscardReason::ReplaySuppressed,
+        ] {
+            let loan = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+            with_context(handle, |host| {
+                host.discard_output(handle, port, loan.lease, reason)
+            })
+            .unwrap();
+        }
+        let loan = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        // The native proxy suppresses before checking a writer or its size.
+        with_context(handle, |host| {
+            host.commit_output(handle, port, loan.lease, 0)
+        })
+        .unwrap();
+        let loan = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.submit_spill(handle, port, loan.lease, &[], 0)
+        })
+        .unwrap();
+        assert_eq!(
+            with_context(handle, |host| Ok(host.outstanding_leases())),
+            Ok(1)
+        );
+        with_context(handle, |host| {
+            host.discard_output(handle, port, loan.lease, HostDiscardReason::SpillRelease)
+        })
+        .unwrap();
+        assert_eq!(discard_signal.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            with_context(handle, |host| Ok(host.counters())),
+            Ok(HostLeaseCounters::default())
+        );
+        with_context(handle, |host| {
+            host.with_native(|native| {
+                let Some(AnyPublisher::Ipc(publisher)) = native.publisher("out") else {
+                    panic!("output remains bound");
+                };
+                assert_eq!(
+                    (
+                        publisher.committed_frames(),
+                        publisher.output_discard_count(),
+                        publisher.frames_dropped_invariant_violation()
+                    ),
+                    (0, 0, 0)
+                );
+            })
+        })
+        .unwrap();
+        assert!(subscriber.view_raw().unwrap().is_none());
+        suppressed.store(false, Ordering::Relaxed);
+        let loan = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.commit_output(handle, port, loan.lease, 64)
+        })
+        .unwrap();
+        let delivered = subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                delivered.header().sequence,
+                delivered.header().timestamp_ns,
+                delivered.header().total_size
+            ),
+            (1, 0, 64)
+        );
+        assert_eq!(&delivered[40..], &[0; 24]);
+        drop(delivered);
+        remove_context(handle).unwrap();
     }
 
     #[test]

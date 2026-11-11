@@ -19,7 +19,9 @@ place. Adaptive variable outputs may explicitly submit a node-owned spill payloa
 for a synchronous host copy. Submission retains the original loan on every result
 until the writer is destroyed and `SPILL_RELEASE` returns its storage. A normal
 finish consumes its lease; malformed frames never publish or consume a sequence.
-Read leases exclude snapshot, head mutation and restore of their port.
+Read leases exclude snapshot, head mutation and restore of their port. Native
+replay suppression returns output storage before writer validation or discard
+accounting, preserving the existing sequence and replay-discard signal behavior.
 
 Raw accumulation uses `AccumulatorSet`'s existing gather, order, loss, event and
 state machinery. A fire offers one repeatable batch; indexed immutable frame
