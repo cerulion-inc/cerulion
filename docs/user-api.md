@@ -2302,6 +2302,8 @@ A machine that serves and imports shares its existing remote endpoint. The graph
 process itself stays network-free and reads or publishes local shared memory.
 Imported topics retain the source robot's access policy and are read remotely
 on that source robot, including when the consuming machine also serves graphs.
+Account ownership proofs remain valid when serving begins; a bounded restoration
+reports any unresolved ingress so it can reconnect.
 
 The zenoh LAN plane refuses topic reads, catalog/schema requests and inbound
 frames while paired. `CERULION_LAN_ACCESS=open` explicitly enables unauthenticated

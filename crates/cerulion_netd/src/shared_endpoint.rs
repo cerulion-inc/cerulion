@@ -7,7 +7,7 @@ use std::net::{Shutdown, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use cerulion_core::TransportManager;
 use cerulion_link::{Endpoint, EndpointId, RelayConfig};
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::verify::OwnerCertificatePresentationWire;
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use serde::{Deserialize, Serialize};
 
 use crate::iroh_plane::{IrohMirrorPlane, RobotProbeOutcome};
@@ -27,7 +28,70 @@ use crate::wan::{WanRegistry, WanRobot};
 const MAX_MESSAGE: usize = 256 * 1024;
 pub(crate) const MAX_CLIENTS: usize = 32;
 const MAX_ROBOTS: usize = 256;
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "outbound shared operation deadline expired".to_owned())
+}
+
+fn wait_for_io(stream: &UnixStream, interest: PollFlags, deadline: Instant) -> Result<(), String> {
+    loop {
+        let timeout = Timespec::try_from(remaining(deadline)?)
+            .map_err(|_| "outbound shared operation deadline is too distant")?;
+        let mut descriptors = [PollFd::new(stream, interest)];
+        match poll(&mut descriptors, Some(&timeout)) {
+            Ok(0) => {
+                remaining(deadline)?;
+            }
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return Err("outbound control readiness failed".into()),
+        }
+    }
+}
+
+fn read_exact_until(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    while !bytes.is_empty() {
+        remaining(deadline)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err("outbound control connection ended".into()),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_io(stream, PollFlags::IN, deadline)?
+            }
+            Err(_) => return Err("outbound control connection read failed".into()),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_until(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    while !bytes.is_empty() {
+        remaining(deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => return Err("outbound control connection write failed".into()),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_io(stream, PollFlags::OUT, deadline)?
+            }
+            Err(_) => return Err("outbound control connection write failed".into()),
+        }
+    }
+    Ok(())
+}
 
 /// The owned server and consumer resolve this path from the same state root.
 pub fn socket_path(root: &Path) -> PathBuf {
@@ -48,7 +112,7 @@ struct Configuration {
     key: [u8; 32],
     account: Option<[u8; 32]>,
     epoch_dir: Option<PathBuf>,
-    owner: Option<OwnerCertificatePresentationWire>,
+    owner: Option<Vec<u8>>,
     namespace: String,
     peers: Vec<Peer>,
 }
@@ -215,6 +279,17 @@ fn configure_stream(stream: &UnixStream) -> Result<(), String> {
 }
 
 impl Configuration {
+    fn owner_certificate(&self) -> Result<Option<Arc<OwnerCertificatePresentationWire>>, String> {
+        // Preserve the certificate's byte-string signature encoding on this JSON seam.
+        self.owner
+            .as_deref()
+            .map(|bytes| {
+                OwnerCertificatePresentationWire::from_postcard(bytes)
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
     fn robots(&self) -> Result<HashMap<String, WanRobot>, String> {
         if self.peers.len() > MAX_ROBOTS {
             return Err("outbound robot membership exceeds its limit".into());
@@ -294,7 +369,8 @@ impl SharedMirrorPlane {
             owner: self
                 .registry
                 .owner_certificate()?
-                .map(|proof| (*proof).clone()),
+                .map(|proof| proof.to_postcard().map_err(|error| error.to_string()))
+                .transpose()?,
             namespace: serde_json::to_string(&self.manager.iox_config())
                 .map_err(|_| "outbound namespace encoding failed")?,
             peers,
@@ -317,7 +393,82 @@ impl SharedMirrorPlane {
             .map_err(RequestError::Refused)
     }
 
-    fn call(&self, mut operation: Operation) -> Result<Answer, String> {
+    fn request_until(
+        stream: &mut UnixStream,
+        configuration: Configuration,
+        operation: Operation,
+        deadline: Instant,
+    ) -> Result<Answer, RequestError> {
+        let bytes = encode_message(&Request {
+            configuration,
+            operation,
+        })
+        .map_err(RequestError::Refused)?;
+        remaining(deadline).map_err(RequestError::Refused)?;
+        stream.set_nonblocking(true).map_err(|_| {
+            RequestError::Transport("outbound control nonblocking setup failed".into())
+        })?;
+        let result = (|| {
+            write_all_until(stream, &(bytes.len() as u32).to_le_bytes(), deadline)
+                .map_err(RequestError::Transport)?;
+            write_all_until(stream, &bytes, deadline).map_err(RequestError::Transport)?;
+            let mut header = [0; 4];
+            read_exact_until(stream, &mut header, deadline).map_err(RequestError::Transport)?;
+            let size = u32::from_le_bytes(header) as usize;
+            if size == 0 || size > MAX_MESSAGE {
+                return Err(RequestError::Transport(
+                    "outbound control message exceeds its byte limit".into(),
+                ));
+            }
+            let mut reply = vec![0; size];
+            read_exact_until(stream, &mut reply, deadline).map_err(RequestError::Transport)?;
+            remaining(deadline).map_err(RequestError::Transport)?;
+            serde_json::from_slice::<Result<Answer, String>>(&reply)
+                .map_err(|_| RequestError::Transport("outbound control message is invalid".into()))?
+                .map_err(RequestError::Refused)
+        })();
+        if stream.set_nonblocking(false).is_err() {
+            return Err(RequestError::Transport(
+                "outbound control socket restoration failed".into(),
+            ));
+        }
+        result
+    }
+
+    fn lock_connection(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<MutexGuard<'_, Option<UnixStream>>, String> {
+        let Some(deadline) = deadline else {
+            return self
+                .connection
+                .lock()
+                .map_err(|_| "outbound control state is poisoned".into());
+        };
+        // Wait for the same mutation lock, without turning contention into a busy refusal.
+        loop {
+            let budget = remaining(deadline)?;
+            match self.connection.try_lock() {
+                Ok(connection) => return Ok(connection),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err("outbound control state is poisoned".into())
+                }
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(budget.min(Duration::from_millis(1)))
+                }
+            }
+        }
+    }
+
+    fn call(&self, operation: Operation) -> Result<Answer, String> {
+        self.call_until(operation, None)
+    }
+
+    fn call_until(
+        &self,
+        mut operation: Operation,
+        deadline: Option<Instant>,
+    ) -> Result<Answer, String> {
         let started = Instant::now();
         let budget = match &operation {
             Operation::Probe { budget_ms, .. }
@@ -360,34 +511,47 @@ impl SharedMirrorPlane {
             let _closed = stream.shutdown(Shutdown::Both);
             return result;
         }
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| "outbound control state is poisoned")?;
+        let mut connection = self.lock_connection(deadline)?;
         if self.invalidated.load(Ordering::Acquire) {
             return Err("outbound account changed; recreate the mirror plane".into());
         }
         let configuration = self.configuration()?;
         if connection.is_none() {
-            let stream = UnixStream::connect(&self.socket)
-                .map_err(|_| "owned remote endpoint is not ready for outbound access")?;
+            let stream = if let Some(deadline) = deadline {
+                let address = socket2::SockAddr::unix(&self.socket)
+                    .map_err(|_| "outbound control socket address is invalid")?;
+                let socket =
+                    socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                        .map_err(|_| "outbound control socket setup failed")?;
+                socket
+                    .connect_timeout(&address, remaining(deadline)?)
+                    .and_then(|()| socket.peer_addr().map(|_| ()))
+                    .map_err(|_| "owned remote endpoint is not ready for outbound access")?;
+                socket.into()
+            } else {
+                UnixStream::connect(&self.socket)
+                    .map_err(|_| "owned remote endpoint is not ready for outbound access")?
+            };
             configure_stream(&stream)?;
             *connection = Some(stream);
         }
         let stream = connection
             .as_mut()
             .ok_or("outbound connection was not constructed")?;
-        let deadline_setup = stream
-            .set_read_timeout(Some(CONTROL_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(CONTROL_TIMEOUT)));
-        if deadline_setup.is_err() {
-            // macOS can reject timeout setup on a disconnected socket before
-            // the first write. Retire that socket just like any framing error.
-            connection.take();
-            self.transport_lost.store(true, Ordering::Release);
-            return Err("outbound control deadline setup failed".into());
-        }
-        let result = Self::request(stream, configuration, operation);
+        let result = if let Some(deadline) = deadline {
+            Self::request_until(stream, configuration, operation, deadline)
+        } else {
+            let deadline_setup = stream
+                .set_read_timeout(Some(CONTROL_TIMEOUT))
+                .and_then(|()| stream.set_write_timeout(Some(CONTROL_TIMEOUT)));
+            if deadline_setup.is_err() {
+                // macOS can reject timeout setup on a disconnected socket before writing.
+                connection.take();
+                self.transport_lost.store(true, Ordering::Release);
+                return Err("outbound control deadline setup failed".into());
+            }
+            Self::request(stream, configuration, operation)
+        };
         if matches!(result, Err(RequestError::Transport(_))) {
             // A framing failure fences the whole connection; never retry an operation
             // whose result may have been committed on the old endpoint.
@@ -422,8 +586,8 @@ impl SharedMirrorPlane {
         }
         retired
     }
-    pub(crate) fn sync(&self) -> Result<Vec<TopicKey>, String> {
-        match self.call(Operation::Sync)? {
+    pub(crate) fn sync_until(&self, deadline: Instant) -> Result<Vec<TopicKey>, String> {
+        match self.call_until(Operation::Sync, Some(deadline))? {
             Answer::Retired(keys) => Ok(keys
                 .into_iter()
                 .map(|(robot, topic, observer)| topic_key(robot, topic, observer))
@@ -447,13 +611,21 @@ impl SharedMirrorPlane {
             _ => Err("outbound reader reply is invalid".into()),
         }
     }
-    pub(crate) fn ensure(&self, key: &TopicKey, schema_hash: u64) -> Result<(), String> {
-        self.call(Operation::Ensure {
-            robot: key.robot.clone(),
-            topic: key.topic.clone(),
-            observer: key.observer,
-            schema_hash,
-        })
+    pub(crate) fn ensure_until(
+        &self,
+        key: &TopicKey,
+        schema_hash: u64,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.call_until(
+            Operation::Ensure {
+                robot: key.robot.clone(),
+                topic: key.topic.clone(),
+                observer: key.observer,
+                schema_hash,
+            },
+            Some(deadline),
+        )
         .map(|_| ())
     }
     pub(crate) fn release(&self, key: &TopicKey) -> MirrorRelease {
@@ -690,13 +862,14 @@ fn serve_connection(
                 );
             }
             let robots = configuration.robots()?;
+            let owner = configuration.owner_certificate()?;
             let configured_identity = (configuration.account, configuration.epoch_dir.clone());
             let retired = if let Some(existing) = &plane {
                 if identity.as_ref() != Some(&configured_identity) {
                     return Err("outbound account changed; release the previous connection".into());
                 }
                 let retired = existing.update_membership(robots)?;
-                existing.registry_owner(configuration.owner.map(Arc::new))?;
+                existing.registry_owner(owner)?;
                 retired
             } else {
                 let registry = Arc::new(
@@ -704,7 +877,7 @@ fn serve_connection(
                         .with_account(configuration.account)
                         .with_epoch_dir(configuration.epoch_dir),
                 );
-                registry.replace_owner_certificate(configuration.owner.map(Arc::new))?;
+                registry.replace_owner_certificate(owner)?;
                 plane = Some(IrohMirrorPlane::on_owned_endpoint(
                     manager.clone(),
                     registry,
@@ -844,6 +1017,138 @@ fn serve_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_shared_ensure_returns_at_the_callers_absolute_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("deadline.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_message::<Request>(&mut stream, false).unwrap();
+            assert!(matches!(request.operation, Operation::Ensure { .. }));
+            std::thread::sleep(Duration::from_millis(350));
+        });
+        let manager = TransportManager::init_for_test(
+            Default::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let control = SharedMirrorPlane::new(
+            socket,
+            manager,
+            Arc::new(WanRegistry::new(
+                HashMap::new(),
+                [17; 32],
+                RelayConfig::Disabled,
+            )),
+        );
+        let started = Instant::now();
+        let result = control.ensure_until(
+            &TopicKey::new("robot", "/stalled"),
+            11,
+            started + Duration::from_millis(70),
+        );
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "stalled Ensure took {elapsed:?}"
+        );
+        assert!(control.take_transport_loss());
+    }
+
+    #[test]
+    fn fragmented_sync_reply_cannot_renew_the_absolute_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("fragmented.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_message::<Request>(&mut stream, false).unwrap();
+            assert!(matches!(request.operation, Operation::Sync));
+            let body = b"{\"Ok\":{\"Retired\":[]}}";
+            assert_eq!(body.len(), 21);
+            for byte in 21u32.to_le_bytes().into_iter().chain(body.iter().copied()) {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let manager = TransportManager::init_for_test(
+            Default::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let control = SharedMirrorPlane::new(
+            socket,
+            manager,
+            Arc::new(WanRegistry::new(
+                HashMap::new(),
+                [18; 32],
+                RelayConfig::Disabled,
+            )),
+        );
+        let started = Instant::now();
+        assert!(control
+            .sync_until(started + Duration::from_millis(70))
+            .is_err());
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "fragmented Sync took {elapsed:?}"
+        );
+        assert!(control.take_transport_loss());
+    }
+
+    #[test]
+    fn an_expired_deadline_opens_no_connection_and_fences_no_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("expired.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let manager = TransportManager::init_for_test(
+            Default::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let control = SharedMirrorPlane::new(
+            socket,
+            manager,
+            Arc::new(WanRegistry::new(
+                HashMap::new(),
+                [19; 32],
+                RelayConfig::Disabled,
+            )),
+        );
+        assert!(control
+            .ensure_until(&TopicKey::new("robot", "/expired"), 11, Instant::now())
+            .unwrap_err()
+            .contains("deadline expired"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!control.take_transport_loss());
+    }
+
+    #[test]
+    fn malformed_owner_postcard_is_refused_before_operation_admission() {
+        for owner in [vec![0], vec![1], vec![255, 1]] {
+            let configuration = Configuration {
+                key: [1; 32],
+                account: Some([2; 32]),
+                epoch_dir: None,
+                owner: Some(owner),
+                namespace: String::new(),
+                peers: Vec::new(),
+            };
+            assert!(configuration.owner_certificate().is_err());
+        }
+    }
 
     #[test]
     fn malformed_and_duplicate_membership_is_refused() {

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Declared graph ingress precreates canonical single-writer services at the complete consumer capacity. Authenticated wire forwarding honors a declared reliable queue policy and reports refused frames. Embedded Android starts refuse ingress without a supported path.
 - Declared authenticated imports require native single-writer provisioning; a multi-publisher service with one live writer remains readable by observers.
+- Authenticated shared-endpoint control preserves signed account ownership proofs and bounds each reader restoration by one total deadline.
 - Shared outbound readers survive refused operations and metadata discovery failures, retain the server against idle shutdown, and keep imported topics bound to their source robot's access policy.
 
 - LAN topic access defaults to paired on every platform. Unpaired LAN peers
