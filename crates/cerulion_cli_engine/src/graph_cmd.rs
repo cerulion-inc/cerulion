@@ -2346,21 +2346,12 @@ pub fn graph_validate_with_inspector(
         graph_name,
         &config,
         &cdylib_cache,
-        true,
+        ReportFor::ValidateVerb,
         &inspector,
         &launch_arg_sources,
     ))
 }
 
-/// Inner validation that borrows a pre-resolved cdylib cache instead
-/// of building its own. `graph_validate` builds the cache and
-/// delegates here; `graph_run` builds the cache once and reuses it
-/// for both validation and node loading.
-///
-/// `check_network_ingress` enables the ingress schema gate at the
-/// end, which must LOAD the node cdylibs to see input schema hashes. `true` for
-/// the user-facing `graph validate` verb; `false` for `graph run`'s pre-run
-/// pass, which is about to load them for real.
 /// The report label for `cerulion_core`'s `validate_graph`. Named once because
 /// the refusal above keys its remedy on it: this is one of the checks
 /// `--no-validate` cannot skip, since `graph_run` itself re-runs
@@ -2859,12 +2850,37 @@ fn cfg_decided_schema_warning(node_type: &str, port: &str, declared: &str) -> St
     )
 }
 
+/// Which run of the validation report this is. Two checks judge what
+/// `graph run` judges again on its own path, once it knows how it deploys the
+/// graph, so only the `graph validate` verb makes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportFor {
+    /// `cerulion graph validate`: every check, including the `network
+    /// ingress` gate and the refusal of a `block_timeout_ms` on an edge split
+    /// across the `process_groups:` the graph declares.
+    ValidateVerb,
+    /// `graph run`'s pre-run report. The run computes the same gateway plan
+    /// later, through the same resolver, and refuses a `block_timeout_ms` on
+    /// an edge split across the process groups it deploys before any worker
+    /// starts. A `--single-process` run splits no edge, so this report must
+    /// not refuse one.
+    RunPreflight,
+}
+
+/// Inner validation that borrows a pre-resolved cdylib cache instead
+/// of building its own. `graph_validate` builds the cache and
+/// delegates here; `graph_run` builds the cache once and reuses it
+/// for both validation and node loading.
+///
+/// `report_for` decides the checks [`ReportFor::ValidateVerb`] alone makes:
+/// the ingress schema gate over the infos the queue check reads, and the
+/// split-edge `block_timeout_ms` refusal over the declared process groups.
 fn graph_validate_with_cache(
     workspace_root: &Path,
     graph_name: &str,
     config: &GraphConfig,
     cdylib_cache: &ResolvedCdylibCache,
-    check_network_ingress: bool,
+    report_for: ReportFor,
     inspector: &dyn crate::node_inspector::NodeInspector,
     launch_arg_sources: &cerulion_core::graph::ArgProvenance,
 ) -> ValidationReport {
@@ -3481,7 +3497,7 @@ fn graph_validate_with_cache(
     // reported twice.
     if topology_valid {
         if let Ok(entry_infos) = &loaded_infos {
-            checks.extend(input_backpressure_check(config, entry_infos));
+            checks.extend(input_backpressure_check(config, entry_infos, report_for));
         }
     }
 
@@ -3499,10 +3515,10 @@ fn graph_validate_with_cache(
     // input's schema hash, which the graph's input keys do not change.
     //
     // Only the explicit `cerulion graph validate` verb runs it. `graph run`'s
-    // pre-run validation passes `false`: the run computes the same gateway
-    // plan seconds later, through the same resolver, and refuses with the
-    // same words.
-    if check_network_ingress
+    // pre-run validation passes `ReportFor::RunPreflight`: the run computes the
+    // same gateway plan seconds later, through the same resolver, and refuses
+    // with the same words.
+    if report_for == ReportFor::ValidateVerb
         && config
             .network
             .as_ref()
@@ -3624,14 +3640,22 @@ fn collect_entry_infos_from_cache(
 /// `block_timeout_ms` keys. A refusal fails the line in the build's own words:
 /// a depth outside 1 to 64, `block` with no in-graph producer or on a
 /// `network.ingress` topic, a `block_timeout_ms` the build refuses, a ring of
-/// `block` edges, or a key on an `#[input(accumulate)]` input or on a port the
+/// `block` edges, `backpressure: block` or `depth:` on an
+/// `#[input(accumulate)]` input, or `backpressure:` or `depth:` on a port the
 /// node declares no metadata for.
+///
+/// For [`ReportFor::ValidateVerb`], on a graph that declares `process_groups:`,
+/// a `block_timeout_ms` on a creditable `block` edge those groups split then
+/// fails the line with the refusal `graph run` gives before any worker starts
+/// ([`split_edge_timeout_refusal_in_groups`](crate::multiprocess::split_edge_timeout_refusal_in_groups)),
+/// the check `graph levels` runs over the same groups.
 ///
 /// `None` when every queue passes and no input sets one of the three keys, so a
 /// graph that sets none gets no line.
 fn input_backpressure_check(
     config: &GraphConfig,
     entry_infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+    report_for: ReportFor,
 ) -> Option<ValidationCheck> {
     let mut infos = entry_infos.clone();
     let verdict = cerulion_core::graph::topology::apply_input_backpressure_overrides(
@@ -3640,11 +3664,30 @@ fn input_backpressure_check(
         cerulion_core::graph::topology::MissingInputMeta::Refuse,
     )
     .and_then(|()| cerulion_core::graph::GraphTopology::build(config, &infos))
-    .and_then(|topology| topology.validate());
-    if let Err(e) = verdict {
+    .and_then(|topology| topology.validate().map(|()| topology))
+    .map_err(|e| e.to_string())
+    .and_then(|topology| {
+        if report_for != ReportFor::ValidateVerb || !config.has_process_groups() {
+            return Ok(());
+        }
+        let trigger_edges = cerulion_core::graph::build_trigger_edges(config, &infos);
+        match cerulion_core::graph::creditable_split_block_edges(
+            &config.process_groups,
+            config,
+            &infos,
+            &trigger_edges,
+        )
+        .iter()
+        .find_map(|edge| crate::multiprocess::split_edge_timeout_refusal_in_groups(&topology, edge))
+        {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
+    });
+    if let Err(refusal) = verdict {
         return Some(ValidationCheck::fail(
             INPUT_BACKPRESSURE_CHECK_LABEL,
-            e.to_string(),
+            refusal,
         ));
     }
     let keyed = config
@@ -5661,10 +5704,11 @@ fn refuse_ambiguous_output_schemas(workspace_root: &Path, config: &GraphConfig) 
 /// When `skip_validate` is false, runs the pre-flight validation report
 /// before starting the graph. A FAILING check REFUSES the run
 /// (warnings stay advisory). `skip_validate` skips only that report — the
-/// graph topology, the macro trigger wiring and the node libraries are
-/// re-checked unconditionally below and by `GraphRuntime::build`, so the
-/// flag's real reach is the `schema:` family of checks, which nothing else
-/// in the system performs. See `failing_check_blocks_the_run`.
+/// graph topology, the input queues, the node params, the macro trigger
+/// wiring and the node libraries are re-checked unconditionally below and by
+/// `GraphRuntime::build`, so the flag's real reach is the `schema:` family of
+/// checks, which nothing else in the system performs. See
+/// `failing_check_blocks_the_run`.
 ///
 /// `prefer_release` selects the cdylib lookup mode for node loading:
 /// when false (default), the *freshest* built
@@ -5943,7 +5987,7 @@ pub fn graph_run(
             graph_name,
             report_config,
             &cdylib_cache,
-            false,
+            ReportFor::RunPreflight,
             &params_inspector,
             &launch_arg_sources,
         );
@@ -5967,8 +6011,9 @@ pub fn graph_run(
                 .any(|c| !c.passed && failing_check_blocks_the_run(&c.label, &cdylib_cache))
             {
                 "fix the failing check(s) — `--no-validate` skips this report, but not \
-                 the checks the runtime repeats on every start (graph topology, the \
-                 macro trigger wiring, and the node libraries it loads)"
+                 the checks the runtime repeats on every start (graph topology, the input \
+                 queues, the node params, the macro trigger wiring, and the node libraries \
+                 it loads)"
             } else {
                 "fix the failing check(s), or re-run with `--no-validate` to run anyway"
             };
@@ -35232,6 +35277,13 @@ nodes:
     const INGRESS_EXT_CMD: &str = "network:\n  mode: peer\n  listen:\n    - tcp/127.0.0.1:0\n  \
                                    ingress:\n    - /ext/cmd\n";
 
+    /// `process_groups:` that put `planner` and `follower` of [`chain_graph`]
+    /// in two groups, so the `cmd` edge crosses between them.
+    const SPLIT_GROUPS: &str = "process_groups:\n  front: [planner]\n  back: [follower]\n";
+
+    /// `process_groups:` that put both nodes of [`chain_graph`] in one group.
+    const ONE_GROUP: &str = "process_groups:\n  all: [planner, follower]\n";
+
     /// A workspace with node types `planner` and `follower` (an empty
     /// `src/lib.rs` each, and a placeholder library `find_cdylib` resolves)
     /// and `yaml` as graph `bp`.
@@ -35268,8 +35320,12 @@ nodes:
 
     /// Every queue the graph build refuses, `graph validate` refuses on one
     /// failing `input backpressure` line in the build's own words, with the
-    /// graph's keys applied over the node's declaration. A failing line also
-    /// blocks the run under `--no-validate`, since the build refuses again.
+    /// graph's keys applied over the node's declaration, and a
+    /// `block_timeout_ms` on an edge split across the process groups the graph
+    /// declares in the words `graph run` refuses it with before any worker
+    /// starts. The label blocks the run under `--no-validate`: the build
+    /// refuses each queue again, and a multi-process run refuses the split
+    /// edge.
     #[test]
     fn graph_validate_refuses_every_queue_the_graph_build_refuses() {
         use cerulion_core::graph::node::BackpressurePolicy::{Block, DropOldest};
@@ -35377,6 +35433,19 @@ nodes:
                 "Graph validation error: input 'follower.cmd' sets `backpressure:` or `depth:` \
                  in the graph, but node 'follower' declares no input metadata for 'cmd'",
             ),
+            (
+                "block_timeout_ms on a block edge split across declared process groups",
+                chain_graph(
+                    SPLIT_GROUPS,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+                drop_oldest_4(),
+                "input 'follower.cmd' on topic '/p/planner/cmd' sets `block_timeout_ms`, but the \
+                 input runs in process group 'back' and its producer 'planner' in process group \
+                 'front', so the two fire on different threads and count the edge on one shared \
+                 credit word.",
+            ),
         ];
         for (case, yaml, inspector, head) in rows {
             let report = validate_queues(&yaml, &inspector);
@@ -35405,6 +35474,7 @@ nodes:
         let _env = unset_target_dir_for_test();
         let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
         let block_4 = || chain_infos(Some(declared_input("cmd", Block, 4, false)));
+        let accumulate = || chain_infos(Some(declared_input("cmd", DropOldest, 4, true)));
         let one = "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's \
                    queue is one the graph build accepts";
         let rows: Vec<(&str, String, DeclaredInfos, &str)> = vec![
@@ -35446,6 +35516,28 @@ nodes:
                 "drop_oldest on one edge of a ring the attributes make",
                 ring_graph("        backpressure: drop_oldest\n", ""),
                 ring_infos(Block),
+                one,
+            ),
+            (
+                "drop_oldest on an accumulate input",
+                chain_graph("", "planner/cmd", "        backpressure: drop_oldest\n"),
+                accumulate(),
+                one,
+            ),
+            (
+                "block with no block_timeout_ms on an edge split across declared process groups",
+                chain_graph(SPLIT_GROUPS, "planner/cmd", "        backpressure: block\n"),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "block_timeout_ms on a block edge inside one declared process group",
+                chain_graph(
+                    ONE_GROUP,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+                drop_oldest_4(),
                 one,
             ),
             (
@@ -35585,9 +35677,54 @@ nodes:
         assert_eq!(first, second);
     }
 
-    /// A graph with no `network:` block gets no ingress check at all.
-    /// The single-host shape — the one that has always worked — validates exactly
-    /// as cheaply as before, loading no libraries.
+    /// The split-edge `block_timeout_ms` refusal is judged by the `graph
+    /// validate` verb only. `graph run`'s pre-run report of the same graph
+    /// passes the queue line: a `--single-process` run splits no edge, and a
+    /// multi-process run refuses the edge itself before any worker starts.
+    #[test]
+    fn graph_runs_report_leaves_the_split_edge_timeout_to_the_run() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = queue_workspace(&chain_graph(
+            SPLIT_GROUPS,
+            "planner/cmd",
+            "        backpressure: block\n        block_timeout_ms: 40\n",
+        ));
+        let inspector = chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let config = graph_read(&ws_root.join("graphs"), "bp").unwrap();
+        let cache = resolve_cdylib_cache(&ws_root, &config, false);
+        let line = |report_for| {
+            let report = graph_validate_with_cache(
+                &ws_root,
+                "bp",
+                &config,
+                &cache,
+                report_for,
+                &inspector,
+                &cerulion_core::graph::ArgProvenance::default(),
+            );
+            let line = queue_line(&report)
+                .unwrap_or_else(|| panic!("no input backpressure line in\n{report}"));
+            (line.passed, line.detail.clone())
+        };
+        let (verb_passed, verb_detail) = line(ReportFor::ValidateVerb);
+        assert!(!verb_passed, "{verb_detail}");
+        assert!(
+            verb_detail.starts_with(
+                "input 'follower.cmd' on topic '/p/planner/cmd' sets `block_timeout_ms`"
+            ),
+            "{verb_detail}"
+        );
+        let (run_passed, run_detail) = line(ReportFor::RunPreflight);
+        assert!(run_passed, "{run_detail}");
+        assert_eq!(
+            run_detail,
+            "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's queue \
+             is one the graph build accepts"
+        );
+    }
+
+    /// A graph with no `network:` block gets no `network ingress` line.
     #[test]
     fn graph_validate_skips_the_ingress_gate_without_a_network_block() {
         let _env = unset_target_dir_for_test();
@@ -35597,7 +35734,7 @@ nodes:
         let report = graph_validate(&ws_root, "test", false).unwrap();
         assert!(
             ingress_check(&report).is_none(),
-            "a graph with no network block must not run the ingress gate (and must not dlopen)"
+            "a graph with no network block must not run the ingress gate"
         );
     }
 
