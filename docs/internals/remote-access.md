@@ -844,7 +844,16 @@ retries on the backoff above.
 **On the desk, there is no pairing step.** `topic list` and `viz --robot` read
 the account's robots from the issuer's owner-only list endpoint and mark each
 one with a bounded presence probe. The directory fetch inside `topic list` has
-its own 2 s deadline (`LISTING_FETCH_BUDGET`, session refresh included); past it,
+its own 2 s deadline (`LISTING_FETCH_BUDGET`); stale-session refresh has a separate
+2 s caller-thread budget. A legacy sign-in with a valid session and no coupled
+device certificate gets one background enrollment attempt per process, with a
+2 s caller budget. It signs the account service's device-registration challenge
+using the existing machine key, sends the session only to that service without
+redirects, and verifies account, key, issuer and validity before publication.
+Publication holds the bounded auth-store lock, rechecks the unchanged session
+and key, stages consumer certificates, and commits the coupled chain last.
+Failure keeps the re-login remedy; local reads keep its diagnostics at debug.
+Enrollment is skipped under local scope and the network kill switch. Past a directory deadline,
 or on any error, the listing prints its LAN half and one
 `account robots not listed: <reason>` line. Selection is by exact, case-sensitive display
 name, or by the reserved `account:<robot id>` route; a display name shared with a

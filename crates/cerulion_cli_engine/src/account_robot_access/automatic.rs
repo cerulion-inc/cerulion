@@ -82,7 +82,9 @@ impl RemoteCatalogs {
     /// Keep cache-backed failures available to listings without warning on each read.
     pub fn log_diagnostics(&self) {
         for diagnostic in &self.diagnostics {
-            if self.serves_cached_directory() {
+            if self.serves_cached_directory()
+                || diagnostic == crate::login_cmd::DEVICE_ENROLLMENT_REQUIRED
+            {
                 tracing::debug!(error = %diagnostic, "remote robot directory could not be fully checked");
             } else {
                 tracing::warn!(error = %diagnostic, "remote robot directory could not be fully checked");
@@ -123,7 +125,18 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
         // directory worker starts. A failed refresh falls back to the saved directory.
         let fetched =
             crate::login_cmd::refresh_session_if_stale_within(account_robots::LISTING_FETCH_BUDGET)
-                .and_then(|_| account_robots::fetch_within(account_robots::LISTING_FETCH_BUDGET));
+                .and_then(|_| {
+                    if crate::login_cmd::enroll_device_once_within(
+                        account_robots::LISTING_FETCH_BUDGET,
+                    )
+                    .is_err()
+                    {
+                        result
+                            .diagnostics
+                            .push(crate::login_cmd::DEVICE_ENROLLMENT_REQUIRED.into());
+                    }
+                    account_robots::fetch_within(account_robots::LISTING_FETCH_BUDGET)
+                });
         match fetched {
             Ok(directory) => {
                 if let Err(error) = directory.cache_for_offline() {
@@ -264,7 +277,7 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
     Ok(result)
 }
 
-const MISSING_DEVICE_CERTIFICATE: &str = "this machine's sign-in has no device certificate, so the robot cannot verify it; run `cerulion login` again to enroll this machine";
+const MISSING_DEVICE_CERTIFICATE: &str = crate::login_cmd::DEVICE_ENROLLMENT_REQUIRED;
 const UNPAIRED_DEVICE_KEY: &str = "the robot refused this machine's device key as unpaired for its account; run `cerulion login` again to enroll this machine";
 
 /// A refused identity is not evidence that a robot is offline. Durable guest

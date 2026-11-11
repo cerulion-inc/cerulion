@@ -173,7 +173,11 @@ a skipped search does not claim absence on the LAN. A failed discovery pass repo
 that it has not converged and names the robot catalogs that were not checked.
 
 A sign-in without a device certificate cannot authenticate this machine to an
-account robot. If access is refused because this machine's key is unpaired, run
+account robot. With a still-valid session, the CLI enrolls its existing device key
+automatically in the background, without a browser step. It waits at most two
+seconds and attempts enrollment only once per process. A successful enrollment
+prints `this machine was enrolled as a device on your account`. An expired
+session or refused enrollment names the remedy. If access is refused because this machine's key is unpaired, run
 `cerulion login` again to enroll it. An authentication refusal does not mean the
 robot is offline. A producing run reports automatic robot registration failures
 at warn on stderr, with the cause, while netd retries. A robot state directory

@@ -218,6 +218,91 @@ fn register_robot_binds_the_logged_in_account_and_returns_an_owner_grant() {
 #[cfg(unix)]
 #[test]
 #[serial]
+fn a_legacy_desk_enrolls_without_login_and_the_real_robot_admits_its_key() {
+    use cerulion_cli_engine::{auth, owner_certificate, robot_bootstrap};
+    use cerulion_pairing::verify::{PairingSource, TrustStore};
+    use std::process::Command;
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let robot_home = tempfile::tempdir().unwrap();
+    let home = robot_home.path().canonicalize().unwrap();
+    let _robot_home = EnvGuard::set("CERULION_HOME", home.to_str().unwrap());
+    let robot_login = login(port, &email);
+    let root = home.join("robot-state");
+    let prepared = robot_bootstrap::prepare(&root).unwrap();
+    let writer = bounded_output(
+        Command::new(built_binary("cerulion-remoted"))
+            .arg("--state-root")
+            .arg(&root)
+            .arg("--provision-bundle")
+            .arg(&prepared.registration_bundle),
+    );
+    assert!(
+        writer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    let remoted = root.join("remoted");
+    let mac = std::fs::read(remoted.join("trust_store.mac_key")).unwrap();
+    let mut robot = TrustStore::load(remoted.join("trust_store"), &mac).unwrap();
+    let owner = robot.owner().unwrap();
+    let desk_home = tempfile::tempdir().unwrap();
+    let _desk_home = EnvGuard::set("CERULION_HOME", desk_home.path().to_str().unwrap());
+    let desk_login = login(port, &email);
+    assert_eq!(desk_login.account_id, robot_login.account_id);
+    let key = *auth::identity_layout()
+        .unwrap()
+        .load_machine_key()
+        .unwrap()
+        .unwrap()
+        .seed();
+    let peer = cerulion_pairing::format::PublicKey(
+        ed25519_dalek::SigningKey::from_bytes(&key)
+            .verifying_key()
+            .to_bytes(),
+    );
+    assert!(robot
+        .access_rows()
+        .iter()
+        .all(|row| row.device != Some(peer)));
+    std::fs::remove_file(desk_home.path().join("device.cert")).unwrap();
+    std::fs::remove_file(desk_home.path().join("device-chain.json")).unwrap();
+    let auth_before = std::fs::read(desk_home.path().join("auth.json")).unwrap();
+    assert!(login_cmd::enroll_device_once_within(Duration::from_secs(2)).unwrap());
+    assert_eq!(
+        std::fs::read(desk_home.path().join("auth.json")).unwrap(),
+        auth_before
+    );
+    assert_eq!(
+        *auth::identity_layout()
+            .unwrap()
+            .load_machine_key()
+            .unwrap()
+            .unwrap()
+            .seed(),
+        key
+    );
+    let presentation = owner_certificate::load().unwrap();
+    let now = auth::now_unix_ns();
+    assert_eq!(
+        robot
+            .verify_owner_certificate(&presentation, &peer, now)
+            .unwrap(),
+        owner
+    );
+    let admitted = robot.is_allowed(&owner, &peer, now).unwrap();
+    assert_eq!(admitted.device, Some(peer));
+    assert_eq!(admitted.source, PairingSource::CertificatePresentation);
+    assert_eq!(admitted.scope, cerulion_pairing::format::Scope::OWNER_FULL);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
 fn real_registration_worker_names_the_permission_fix_for_a_0755_directory() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;

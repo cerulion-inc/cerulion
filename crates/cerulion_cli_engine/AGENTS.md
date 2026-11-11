@@ -1,20 +1,20 @@
 # cerulion_cli_engine - agent notes
 
-CLI logic; `cerulion_cli` parses args.
+`cerulion_cli` parses args.
 Writers (`node create/delete/modify/stage`, graph create/partition/run
-partition persistence, ros2 attach/migrate --write, schema create/delete) hold
+partition saves, ros2 attach/migrate --write, schema create/delete) hold
 `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` across writes:
 UNIX flock: shared with wsd, thread reentrant, waiters warn once;
-elsewhere a no-op. Reads use `acquire_read`: create nothing, refuse re-entry.
-Reject symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits existing
+elsewhere a no-op. Reads: `acquire_read`: create nothing, refuse re-entry.
+No symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits existing
 tracked `.gitignore` when creating `.cerulion/`. Migration uses polling
 `acquire_interruptibly(root, interrupted)` -> `AcquireError` (no From).
 Locks are per root; --workspace is COLCON root. Stage declared ports via
 `graph_cmd::stage_declared_node`. Paired skips implicit LAN catalogs; Open,
 locators and scan retain them. Bad pairings are diagnostics. Observer channels
 are private per source; ambiguity needs selectors; caches bind account/key.
-Caller refresh: 2 s; cache logs debug; unread catalogs cannot prove absence.
-Refused identity: re-login, never offline; run watches warn on registration failures.
+Refresh/enroll: 2 s; enroll once/process, existing key, no browser; cache debug.
+Unread catalogs cannot prove absence; keys need re-login, never offline; run warns if registration fails.
 
 ## Invariants
 - Engine enforces invariants; CLI checks are UX.

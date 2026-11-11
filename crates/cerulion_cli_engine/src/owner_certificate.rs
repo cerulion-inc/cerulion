@@ -100,12 +100,23 @@ fn load_locked(dir: &Path, auth_path: &Path) -> CliResult<OwnerCertificatePresen
             "the device certificate chain does not match the current certificate",
         ));
     }
-    let cert: SignedDeviceCert = decode(&cached.device_cert)
-        .map_err(|_| invalid("the cached device certificate could not be decoded"))?;
-    let intermediate: SignedIntermediateCert = decode(&cached.intermediate)
-        .map_err(|_| invalid("the cached intermediate certificate could not be decoded"))?;
     let account = crate::account_identity::pairing_account_id(&state.account_id)
         .map_err(|_| invalid("the device certificate names a different login account"))?;
+    verify_issued(&cached.device_cert, &cached.intermediate, account, key)
+}
+
+/// Verify a coupled issuance before staging it, using the same identity checks
+/// as the cached owner presentation. Robots verify its signature chain.
+pub(crate) fn verify_issued(
+    leaf: &str,
+    issuer: &str,
+    account: AccountId,
+    key: PublicKey,
+) -> CliResult<OwnerCertificatePresentationWire> {
+    let cert: SignedDeviceCert =
+        decode(leaf).map_err(|_| invalid("the cached device certificate could not be decoded"))?;
+    let intermediate: SignedIntermediateCert = decode(issuer)
+        .map_err(|_| invalid("the cached intermediate certificate could not be decoded"))?;
     validate_leaf(&cert, account, key)?;
     if intermediate.cert.version != FORMAT_VERSION
         || intermediate.cert.validity.not_before_ns >= intermediate.cert.validity.not_after_ns
