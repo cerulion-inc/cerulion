@@ -4579,7 +4579,8 @@ nodes:
                         lease_ms: 5000,
                     }),
                 })
-                .expect("the hosted run.json fits the served cap"),
+                .expect("the hosted run.json fits the served cap")
+                .bytes,
             )
             .unwrap();
             let entry = RunEntry::new(RUN_ID, "wire", 0, RunState::Live, GRAPH, run_json)
