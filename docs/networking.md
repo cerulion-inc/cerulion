@@ -1,14 +1,16 @@
-# Cross-Machine Networking: Permissive by Default, the Gateway, and the `network:` Block
+# Cross-Machine Networking: Paired by Default, the Gateway, and the `network:` Block
 
-A "how it works and why" reference. A Cerulion robot is
-**network-viewable by default**: every real-clock live run registers its
-produced topics with a network GATEWAY, which opens the machine's single
-zenoh session, announces those topics, and forwards a topic to the mesh the
-moment a remote subscriber asks for it. On Unix a permissive run registers
-with the machine's shared `cerulion-netd` gateway; a `network:` block and the
-fallback routes use a per-run gateway process instead. You restrict this by
-adding a `network:` block (the block is a TIGHTENING, not the on-switch), or
-turn it off for a run with `--local` (also spelled `--network off`).
+A Cerulion robot defaults to **paired access on every platform**. Its zenoh
+LAN gateway refuses topic demands, catalog and schema queries, and inbound
+frames from LAN peers. Paired desks use the authenticated remote plane.
+Every real-clock live run registers its produced topics with a network
+gateway. A run without a `network:` block makes every produced topic eligible
+for export; an enabled block restricts that scope to its `egress:` list.
+On Unix a blockless run registers with the shared `cerulion-netd` gateway;
+a `network:` block and fallback routes use a per-run gateway process.
+Turn networking off for a run with `--local` (also spelled `--network off`).
+The zenoh transport details below describe the explicit open-LAN compatibility
+path. Open access requires `CERULION_LAN_ACCESS=open` on the serving machine.
 
 Related: `docs/user-api.md` "Cross-machine networking" (the YAML reference +
 validation table), `docs/multi_process.md` (networked multi-process: the
@@ -18,7 +20,7 @@ default + gateway, the discovery ladder, and pairing.
 
 ## TL;DR
 
-- **Open by default on non-Android.** A real-clock `graph run` (monolith OR multi-process),
+- **Paired by default everywhere.** A real-clock `graph run` (monolith OR multi-process),
   `node run`, or `ros2 attach` with NO `network:` block runs PERMISSIVE: one
   zenoh session announces produced topics when LAN access is open, and peers
   find each other
@@ -26,9 +28,9 @@ default + gateway, the discovery ladder, and pairing.
   default Unix path, `CERULION_NETD_LISTEN` set; see
   [Making a robot discoverable](#making-a-robot-discoverable)). Zenoh multicast scouting is OFF by default
   (gossip stays on); `CERULION_MULTICAST_SCOUTING=on` turns it back on. One
-  loud breadcrumb prints at start:
+  warning prints only when open LAN access is explicitly selected:
 
-  > ``network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.``
+  > `LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.`
 
 - **The `network:` block TIGHTENS.** With an explicit enabled block the
   gateway runs STRICT: it announces + egresses exactly the declared `egress`
@@ -86,12 +88,11 @@ default + gateway, the discovery ladder, and pairing.
   plane lifetime. Never a mere candidate. mDNS finds robots; zenoh connects and
   does everything after. (There is no per-candidate verify probe: presence
   IS the verification.)
-- **Open access is unauthenticated.** On non-Android platforms, a robot with
-  no `network:` block is viewable by any peer on the LAN; restrict it with a
-  `network:` block or `--network off`, or refuse every LAN peer with
-  `CERULION_LAN_ACCESS=paired`, which also stops LAN peers publishing into
-  the robot's ingress topics.
-- **Android is paired by default.** On an Android device the gateway and
+- **Open access is unauthenticated.** Selecting `CERULION_LAN_ACCESS=open`
+  lets any LAN peer demand exported topics and publish into declared ingress.
+  A `network:` block restricts topic scope; it does not authenticate peers.
+  Unset the variable to restore paired access.
+- **The paired gate protects every platform.** The gateway and
   `cerulion-netd` refuse every LAN request (demand, catalog, schema) and
   re-inject no frame a LAN peer publishes, so the LAN can neither read nor
   write topics, unless `CERULION_LAN_ACCESS=open` is set. While the app is
@@ -144,7 +145,7 @@ resolves to exactly one of these, in evaluation order:
 | `--time-source virtual` **or** `external` | Network INERT (replay-class: a zenoh session is a live side effect that would break replay byte-identity). Silent, no gateway. |
 | Enabled `network:` block + `--record` + declared `ingress:` | **Refused**, naming the topics + both workarounds. |
 | Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict** gateway: verbatim locators, egress allow-list, declared ingress. |
-| No / disabled block (incl. `--record`) | **Permissive**: gossip on, multicast scouting off unless `CERULION_MULTICAST_SCOUTING=on`, announce every produced topic. Egress rides the machine's shared `cerulion-netd` session on Unix (see below); the synthesized 7683 listen + bind ladder appear only on the permissive FALLBACK child (netd unreachable, or non-Unix). |
+| No / disabled block (incl. `--record`) | **Permissive export scope, paired access**: gossip on, multicast scouting off unless `CERULION_MULTICAST_SCOUTING=on`; every produced topic is eligible for export, but LAN announcements and access require explicit open access. Egress rides the machine's shared `cerulion-netd` session on Unix (see below); the synthesized 7683 listen + bind ladder appear only on the permissive FALLBACK child (netd unreachable, or non-Unix). |
 
 `graph profile` is the one deliberate exception: a bounded MEASUREMENT run,
 not a deployment, so it stays LOCAL-ONLY by design (its transport is built

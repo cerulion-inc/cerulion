@@ -191,7 +191,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
-By default a run is open to every machine on your LAN, so the CLI on another computer can find and read it: LAN peers are not authenticated and the default `tcp/` carrier is not encrypted. The log says so when the run starts. `--network off` turns off only this run's own gateway; while `cerulion-netd` serves the LAN, a LAN peer that names a live topic of any local run is still sent it. To refuse every LAN peer on this machine, set `CERULION_LAN_ACCESS=paired` in the environment of every Cerulion command and daemon, and restart a `cerulion-netd` that is already running.
+Runs use paired access by default on every platform. Unpaired LAN peers cannot read topics or publish into graph ingress through the zenoh plane; paired desks use the authenticated remote plane. `CERULION_LAN_ACCESS=open` explicitly enables unauthenticated LAN access and prints a warning. Restart daemons from an older release when upgrading so they use the paired default too.
 
 In a second terminal, watch the controller react:
 
