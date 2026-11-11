@@ -86,10 +86,11 @@ ENVIRONMENT:
     CERULION_NETD_IDLE_GRACE_MS  Idle grace before self-exit, in ms (default 30000).
     CERULION_NETD_HARD_EXIT_MS   Deadline for graceful shutdown before the daemon
                                  HARD-exits (nonzero) to avoid a zombie, in ms
-                                 (default 5000). A WAN daemon also budgets
-                                 CERULION_REMOTED_HARD_EXIT_MS (default 30000),
-                                 a 500 ms margin, and
-                                 CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S.
+                                 (default 5000). A network-enabled daemon in a
+                                 WAN build, whether or not it is serving, adds
+                                 CERULION_REMOTED_HARD_EXIT_MS (default 30000)
+                                 plus 500 ms and
+                                 CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S (default 35).
     CERULION_NETD_CONNECT        Zenoh locators to CONNECT to for remote robots
                                  the boot-time mDNS browse and the peer cache
                                  can't reach (comma/space separated).
@@ -510,8 +511,9 @@ fn lifecycle_status_line(standing_gateway: bool) -> &'static str {
 }
 
 /// The watchdog deadline for a shutdown: the robot supervisor's stop grace
-/// (zero without WAN serving), during which its stop may wait for a running
-/// revocation fetch, plus the hard-exit deadline for the rest of teardown.
+/// (zero with networking off or in a build without WAN), during which its stop
+/// may wait for a running revocation fetch, plus the hard-exit deadline for the
+/// rest of teardown.
 fn shutdown_deadline(hard_exit: Duration, supervisor_grace: Duration) -> Duration {
     hard_exit + supervisor_grace
 }

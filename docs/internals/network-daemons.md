@@ -160,6 +160,10 @@ remove them before committing.
   by forced reap if necessary and revocation-fetch grace. Endpoint transfer calls
   `MirrorPlane::begin_serving` before spawn and `end_serving` after both reap,
   retiring outgoing assignments under the account controller's state lock.
+  Incoming TLS handshakes run in bounded concurrent workers with deadlines;
+  completed handshakes dispatch before new arrivals, so a stalled peer cannot
+  serialize e-stop admission. Safety refresh waits never cancel a handshake.
+  Shutdown aborts and joins pending handshakes before endpoint cleanup.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway
