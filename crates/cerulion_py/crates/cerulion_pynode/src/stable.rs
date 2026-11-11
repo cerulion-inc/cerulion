@@ -78,6 +78,9 @@ impl<D: Definition> PluginNode for PythonNode<D> {
             _definition: PhantomData,
         })
     }
+    fn flush_deferred(&self) -> TransportResult<()> {
+        self.client.flush_deferred()
+    }
     fn tick(&mut self) -> TransportResult<()> {
         let result = self.host.tick().map_err(node_error);
         self.client.take_failure().map_or(result, Err)

@@ -57,4 +57,4 @@ Core runtime; test maps and transport ownership: core-testing.md/core-transport.
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
 
-Stable diagnostics keep exact text; the loader adds phase labels (core-dynamic.md).
+Stable diagnostics retain exact text/phase labels (core-dynamic.md); deferred terminal releases flush before user code (`node_plugin_raw_test`, serial).

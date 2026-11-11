@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::deferred::{Deferred, Terminal};
 use crate::error::{NodeErrorKind, TransportError, TransportResult};
 use crate::message::ShmMessage;
 use crate::node_abi::*;
@@ -12,6 +13,7 @@ struct ClientInner {
     api: HostApiV1,
     context: ContextHandle,
     failure: Mutex<Option<TransportError>>,
+    deferred: Mutex<Deferred>,
 }
 
 /// Node-owned cache of checked C function pointers and a host-minted handle.
@@ -70,6 +72,7 @@ impl HostClient {
             api,
             context,
             failure: Mutex::new(None),
+            deferred: Mutex::new(Deferred::default()),
         })))
     }
 
@@ -225,16 +228,68 @@ impl HostClient {
     }
 
     pub(super) fn finish_output(&self, lease: LeaseHandle, size: u32) {
-        let status = host_call!(self, finish_output, lease, size);
-        if let Err(error) = self.check(status) {
+        self.terminal(Terminal::Finish(lease, size));
+    }
+    pub(super) fn discard_output(&self, lease: LeaseHandle, reason: u32) {
+        self.terminal(Terminal::Discard(lease, reason));
+    }
+    fn invoke_terminal(&self, operation: Terminal) -> Status {
+        match operation {
+            Terminal::Finish(lease, size) => host_call!(self, finish_output, lease, size),
+            Terminal::Discard(lease, reason) => host_call!(self, discard_output, lease, reason),
+            Terminal::Release(lease) => host_call!(self, release_input, lease),
+        }
+    }
+    fn terminal(&self, operation: Terminal) {
+        let status = self.invoke_terminal(operation);
+        if status.code == status_code::INVALID_STATE {
+            // Admission has no lease effect. Keep one bounded scalar operation
+            // until this node next enters an admitted host invocation.
+            let result = self
+                .0
+                .deferred
+                .lock()
+                .map_err(|_| super::argument_error("deferred release gate is poisoned"))
+                .and_then(|mut pending| pending.push(operation));
+            if let Err(error) = result {
+                self.record_failure(error);
+            }
+        } else if let Err(error) = self.check(status) {
             self.record_failure(error);
         }
     }
-
-    pub(super) fn discard_output(&self, lease: LeaseHandle, reason: u32) {
-        let status = host_call!(self, discard_output, lease, reason);
-        if let Err(error) = self.check(status) {
-            self.record_failure(error);
+    pub(super) fn extend_deferred_budget(&self, additional: usize) -> TransportResult<()> {
+        self.0
+            .deferred
+            .lock()
+            .map_err(|_| super::argument_error("deferred release gate is poisoned"))?
+            .extend_capacity(additional)
+    }
+    /// Count locally deferred releases independently of diagnostics.
+    pub fn deferred_release_count(&self) -> usize {
+        self.0.deferred.lock().map_or(0, |pending| pending.len())
+    }
+    /// Retry out-of-admission releases before user code in an admitted call.
+    /// Every admitted terminal result retires its queue entry exactly once.
+    pub fn flush_deferred(&self) -> TransportResult<()> {
+        loop {
+            let mut pending = self
+                .0
+                .deferred
+                .lock()
+                .map_err(|_| super::argument_error("deferred release gate is poisoned"))?;
+            let Some(operation) = pending.front() else {
+                return Ok(());
+            };
+            // Host terminal services cannot re-enter node code. Keep the row
+            // reserved during the synchronous call so a concurrent finalizer
+            // cannot occupy it before an admission refusal is returned.
+            let status = self.invoke_terminal(operation);
+            if status.code != status_code::INVALID_STATE {
+                pending.pop();
+            }
+            drop(pending);
+            self.check(status)?;
         }
     }
 
@@ -335,10 +390,7 @@ impl HostClient {
     }
 
     pub(super) fn release_read(&self, lease: LeaseHandle) {
-        let status = host_call!(self, release_input, lease);
-        if let Err(error) = self.check(status) {
-            self.record_failure(error);
-        }
+        self.terminal(Terminal::Release(lease));
     }
 
     fn clock(&self, source: u32) -> Option<u64> {
