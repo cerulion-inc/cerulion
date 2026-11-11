@@ -643,3 +643,66 @@ fn native_and_stable_output_discard_logs_match_exactly_and_recover_after_deliver
     with_context(context.value, |host| host.end_node_call()).unwrap();
     remove_context(context.value).unwrap();
 }
+
+#[test]
+fn unwired_rust_outputs_are_absent_and_the_loaded_graph_can_tick() {
+    use cerulion_core::graph::node::NodeEntry;
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(777);
+    let env = Arc::new(HashMap::new());
+    let native = NodeContext::with_runtime_env(
+        IndexMap::new(),
+        IndexMap::new(),
+        clock.clone(),
+        ShutdownSignal::new(),
+        env.clone(),
+    );
+    assert!(native.publisher("out").is_none());
+    let specs = vec![HostPortSpec {
+        name: "out".into(),
+        direction: LeaseDirection::Write,
+        layout: PluginWireLayout {
+            schema_hash: Vector3::SCHEMA_HASH,
+            fixed_size: 24,
+            variable_fields: 0,
+            alignment: 8,
+        },
+        read_mode: 0,
+        accumulate_cap: None,
+    }];
+    let context = ContextHandle {
+        value: register_context(HostContext::new(native, specs, env.clone(), 4).unwrap()).unwrap(),
+    };
+    with_context(context.value, |host| host.begin_node_call()).unwrap();
+    // SAFETY: actual checked immutable host table and registered context are
+    // retained until the node-local context and its clients have been dropped.
+    let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+    let info = DylibNodeEntry::parse_info_json_labeled(&format!(r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":{}}}],"policy":{{"period_ms":1}}}}"#, Vector3::SCHEMA_HASH), "unwired Rust").unwrap();
+    let plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+    assert!(plugin.publisher("out").is_none());
+    assert!(!client.has_failure());
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+        0
+    );
+    drop(plugin);
+    drop(client);
+    with_context(context.value, |host| host.end_node_call()).unwrap();
+    remove_context(context.value).unwrap();
+    let path = cerulion_core::testing::find_fixture_cdylib("test_node_macro_cdylib");
+    let mut node = DylibNodeEntry::load(&path).unwrap();
+    node.init(NodeContext::with_runtime_env(
+        IndexMap::new(),
+        IndexMap::new(),
+        clock,
+        ShutdownSignal::new(),
+        env,
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        node.tick().unwrap();
+    }
+    node.shutdown().unwrap();
+}

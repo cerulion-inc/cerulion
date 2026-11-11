@@ -77,7 +77,7 @@ pub(crate) fn generate(
 
         impl #root::graph::node_plugin_abi::PluginNode for __CerPluginEntry {
             fn create(client: #root::graph::node_plugin_abi::HostClient, params: &[u8]) -> #root::error::TransportResult<Self> {
-                use #root::graph::node::NodeEntry;
+                use #root::graph::node::NodeEntry as _;
                 #root::graph::node::cdylib_platform_check().map_err(|reason|
                     #root::error::TransportError::NodeError { node_id: stringify!(#node).into(), reason })?;
                 let mut entry = #entry::new();

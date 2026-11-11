@@ -640,3 +640,43 @@ def test_python_node_error_reason_crosses_the_stable_slot_exactly():
     assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
         "tick=0 code=1 err=output loan 'out' retained a buffer export at tick end out_frames=0"
     ]
+
+
+def test_baked_node_directory_finds_workspace_schemas_without_the_variable():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env.pop("CERULION_WORKSPACE", None)
+    env["CERULION_PYNODE_CASE"] = "workspace_fallback"
+    for _ in range(2):
+        result = subprocess.run([FIXTURE, "host-pynode", path, "2"],
+                                capture_output=True, text=True, env=env, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+            "tick=0 code=0 out=00000000", "tick=1 code=0 out=01000000"
+        ]
+        assert "panicked" not in result.stderr
+
+
+def test_stale_metadata_uses_the_init_diagnostic_without_a_bootstrap_panic():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_wrongmeta" + DYLIB)
+    result = subprocess.run([FIXTURE, "host-pynode", path, "1"],
+                            capture_output=True, text=True, env=_node_env("wrongmeta"), timeout=60)
+    assert result.returncode != 0
+    assert ("node metadata is stale for output 'out': INFO schema_hash "
+            "5093796653891464802, declaration 5093796653891464803; run `cerulion node build`"
+            in result.stderr)
+    assert "panicked" not in result.stderr
+
+
+def test_unwired_python_outputs_allow_init_and_two_graph_ticks():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "unwired_output"
+    result = subprocess.run([FIXTURE, "host-pynode", path, "2", "--unwired-outputs"],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "unwired publisher_none=1" in result.stdout
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=", "tick=1 code=0 out="
+    ]
+    assert "shutdown code=0" in result.stdout

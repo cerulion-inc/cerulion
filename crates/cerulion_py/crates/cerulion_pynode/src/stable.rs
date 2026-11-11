@@ -68,7 +68,6 @@ impl<D: Definition> PluginNode for PythonNode<D> {
             D::paths(),
             D::info(),
             *count == 0,
-            Some(params),
         )
         .map_err(node_error)?;
         *count = next_count;
@@ -144,16 +143,18 @@ pub(crate) fn loan_request(layout: &WireLayout, hash: u64) -> Result<LoanRequest
 /// Cold wire facts are resolved by the same canonical layout hash as init.
 #[doc(hidden)]
 pub fn metadata<D: Definition>() -> Result<std::ffi::CString, String> {
-    let workspace = std::env::var_os("CERULION_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .or_else(|| D::paths().first().map(std::path::PathBuf::from))
-        .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
-    let schemas = crate::node_schemas(&workspace)?;
+    let explicit = std::env::var_os("CERULION_WORKSPACE").map(std::path::PathBuf::from);
+    let schemas = crate::resolve_node_workspace(explicit.as_deref(), D::paths())
+        .and_then(|workspace| crate::node_schemas(&workspace))
+        .ok();
     let bytes = D::info().strip_suffix(&[0]).unwrap_or(D::info());
     let mut info: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     info.as_object_mut()
         .ok_or("metadata is not an object")?
         .insert("retain_process".into(), true.into());
+    info.as_object_mut()
+        .ok_or("metadata is not an object")?
+        .insert("inline_safe".into(), false.into());
     for section in ["inputs", "outputs"] {
         let ports = info
             .get_mut(section)
@@ -164,10 +165,20 @@ pub fn metadata<D: Definition>() -> Result<std::ffi::CString, String> {
                 .get("schema_hash")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or("metadata port has no schema hash")?;
-            let layout = schemas
-                .layout_for_hash(hash)
-                .ok_or_else(|| format!("metadata schema hash {hash} is unavailable"))?;
-            let facts = loan_request(layout, hash)?;
+            // A stale hash must reach Python's declaration validation at
+            // create, which owns the shipped stale-metadata diagnostic. These
+            // inert facts provision no lease before that validation succeeds.
+            let facts = schemas
+                .as_ref()
+                .and_then(|schemas| schemas.layout_for_hash(hash))
+                .and_then(|layout| loan_request(layout, hash).ok())
+                .unwrap_or(LoanRequestV1 {
+                    schema_hash: hash,
+                    minimum_capacity: 40,
+                    wire_fixed_size: 0,
+                    variable_count: 0,
+                    alignment: cerulion_core::shm_runtime::FRAME_ALIGN as u32,
+                });
             let port = port
                 .as_object_mut()
                 .ok_or("metadata port is not an object")?;
@@ -215,14 +226,20 @@ macro_rules! export_stable_node {
         }
         fn __cer_python_api() -> *const $crate::cerulion_core::node_abi::NodeApiV1 {
             static API: ::std::sync::OnceLock<&'static $crate::cerulion_core::node_abi::NodeApiV1> = ::std::sync::OnceLock::new();
-            static METADATA: ::std::sync::OnceLock<::std::ffi::CString> = ::std::sync::OnceLock::new();
+            static METADATA: ::std::sync::OnceLock<::std::result::Result<::std::ffi::CString, ::std::string::String>> = ::std::sync::OnceLock::new();
             match ::std::panic::catch_unwind(|| {
                 *API.get_or_init(|| {
-                    let metadata = METADATA.get_or_init(|| $crate::stable::metadata::<__CerPythonDefinition>().expect("Python metadata schemas must be available"));
+                    let metadata = METADATA.get_or_init($crate::stable::metadata::<__CerPythonDefinition>);
+                    let bytes = match metadata {
+                        Ok(metadata) => metadata.as_bytes(),
+                        // Invalid original metadata remains an ordinary load
+                        // diagnostic. No schema lookup may panic bootstrap.
+                        Err(_) => $info.strip_suffix(&[0]).unwrap_or($info),
+                    };
                     // hot-path-alloc-ok: one immutable table per loaded Python library.
                     ::std::boxed::Box::leak(::std::boxed::Box::new($crate::cerulion_core::node_abi::NodeApiV1 {
                         header: $crate::cerulion_core::node_abi::TableHeaderV1::for_type::<$crate::cerulion_core::node_abi::NodeApiV1>(),
-                        metadata: $crate::cerulion_core::node_abi::Bytes { ptr: metadata.as_bytes().as_ptr(), len: metadata.as_bytes().len() as u64 },
+                        metadata: $crate::cerulion_core::node_abi::Bytes { ptr: bytes.as_ptr(), len: bytes.len() as u64 },
                         required_host_capabilities: 0, capabilities: 0,
                         create: __cer_python_create, tick: __cer_python_tick, shutdown: __cer_python_shutdown, destroy: __cer_python_destroy,
                         copy_error: __cer_python_error, query_extension: __cer_python_extension, state: ::std::ptr::null(), external: ::std::ptr::null(),
@@ -236,6 +253,37 @@ macro_rules! export_stable_node {
 
 #[cfg(test)]
 mod diagnostic_tests {
+    #[test]
+    fn unavailable_schema_has_inert_facts_and_no_bootstrap_panic() {
+        struct Stale;
+        impl super::Definition for Stale {
+            fn module() -> &'static str {
+                "stale"
+            }
+            fn paths() -> &'static [&'static str] {
+                &[]
+            }
+            fn info() -> &'static [u8] {
+                br#"{"inputs":[],"outputs":[{"name":"out","schema_hash":18446744073709551615}]}"#
+            }
+            fn instances() -> &'static std::sync::Mutex<usize> {
+                static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+                &COUNT
+            }
+        }
+        let metadata = super::metadata::<Stale>().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(metadata.as_bytes()).unwrap();
+        assert_eq!(value["outputs"][0]["schema_hash"], u64::MAX);
+        assert_eq!(value["outputs"][0]["wire_fixed_size"], 0);
+        assert_eq!(value["outputs"][0]["variable_count"], 0);
+        assert_eq!(
+            value["outputs"][0]["alignment"],
+            cerulion_core::shm_runtime::FRAME_ALIGN
+        );
+        assert_eq!(value["retain_process"], true);
+        assert_eq!(value["inline_safe"], false);
+    }
+
     #[test]
     fn python_node_error_retains_its_exact_traceback_text() {
         let expected = "Traceback (most recent call last):\nRuntimeError: probe\n";

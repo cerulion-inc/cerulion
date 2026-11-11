@@ -65,7 +65,7 @@ impl Clock for HostClock {
 
 /// Context built locally from checked host callbacks and integer port handles.
 /// Used only by the generated plugin init/tick adapters.
-pub struct NodeContext {
+pub struct PluginNodeContext {
     pub(super) client: HostClient,
     publishers: IndexMap<String, AnyPublisher>,
     subscribers: IndexMap<String, AnySubscriber>,
@@ -73,7 +73,10 @@ pub struct NodeContext {
     shutdown_signal: ShutdownSignal,
 }
 
-impl NodeContext {
+/// Compatibility name used by the generated adapters.
+pub type NodeContext = PluginNodeContext;
+
+impl PluginNodeContext {
     /// Bind declaration-order ports before calling the user's init.
     // hot-path-alloc-ok-fn: create copies names/configuration into node-owned maps once.
     pub fn new(client: HostClient, info: &NodeInfo) -> TransportResult<Self> {
@@ -119,6 +122,11 @@ impl NodeContext {
                     .map_err(|_| super::argument_error("output index exceeds u32"))?,
                 direction::OUTPUT,
             )?;
+            if binding.configured_capacity == 0 {
+                // The host honestly marks an unwired declaration. It has no
+                // publisher, matching the native context's missing entry.
+                continue;
+            }
             let topic = topic_from_binding(&binding)?;
             let maximum = MaxSliceLen::try_new(binding.configured_capacity)
                 .ok_or_else(|| super::argument_error("host output capacity is invalid"))?;

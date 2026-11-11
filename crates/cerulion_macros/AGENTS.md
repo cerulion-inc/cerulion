@@ -25,8 +25,8 @@ Codegen/rewriter changes run core and cerulion tests with root serial discipline
   from one parsed list, so the in-process and cdylib paths cannot disagree (internals doc).
 - Keep internal modules `mod`, never `pub mod` - a `proc-macro = true` crate may export
   only its macros; `pub mod` is a hard compile error.
-- Stable adapters share rewritten bodies (`plugin_impl.rs`/`plugin_codegen.rs`).
-  Writers drop before lease release, including SPILL_RELEASE after copied spill.
+- Stable context helpers belong in the annotated impl; data-only helpers are unchanged.
+  Writers drop before release, including SPILL_RELEASE after copied spill.
 - Macro error paths re-emit the original struct alongside the `compile_error!` - keep
   that, or one real diagnostic cascades into pages of "cannot find type" noise.
 
@@ -56,5 +56,5 @@ Codegen/rewriter changes run core and cerulion tests with root serial discipline
   preserves `100_000`/`0xff`/type suffixes, which `str::parse::<u64>()` rejects, and a
   swallowed parse error silently drops the user's policy.
 
-Stable maintenance only; link cdylibs before pushing.
+Stable maintenance; link cdylibs before pushing.
 Deep reference: docs/internals/macros.md (grammar, rewriter, root, FFI, trybuild).

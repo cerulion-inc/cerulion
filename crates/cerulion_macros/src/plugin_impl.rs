@@ -21,7 +21,7 @@ pub(crate) fn generate(common: &ItemImpl, port_helpers: &BTreeSet<String>) -> To
     for item in &common.items {
         if let ImplItem::Fn(method) = item {
             let mut context = ContextType(false);
-            context.visit_signature(&method.sig);
+            context.visit_impl_item_fn(method);
             if context.0 {
                 names.insert(method.sig.ident.to_string());
             }
@@ -67,7 +67,14 @@ pub(crate) fn generate(common: &ItemImpl, port_helpers: &BTreeSet<String>) -> To
             });
         }
     }
-    let mut adapter = Adapter { names: &names };
+    let self_name = match &*common.self_ty {
+        syn::Type::Path(path) => path.path.segments.last().map(|part| part.ident.to_string()),
+        _ => None,
+    };
+    let mut adapter = Adapter {
+        names: &names,
+        self_name,
+    };
     adapter.visit_item_impl_mut(&mut plugin);
     quote! {
         #[allow(unexpected_cfgs)]
@@ -95,16 +102,18 @@ impl<'ast> Visit<'ast> for NativeTransport {
 
 struct Adapter<'a> {
     names: &'a BTreeSet<String>,
+    self_name: Option<String>,
 }
 
 struct ContextType(bool);
 impl<'ast> syn::visit::Visit<'ast> for ContextType {
     fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-        self.0 |= path
-            .path
-            .segments
-            .last()
-            .is_some_and(|part| part.ident == "NodeContext");
+        self.0 |= path.path.segments.last().is_some_and(|part| {
+            matches!(
+                part.ident.to_string().as_str(),
+                "NodeContext" | "AnyPublisher" | "AnySubscriber"
+            )
+        });
         syn::visit::visit_type_path(self, path);
     }
 }
@@ -119,28 +128,6 @@ fn plugin_name(name: &syn::Ident) -> syn::Ident {
 
 impl VisitMut for Adapter<'_> {
     fn visit_impl_item_fn_mut(&mut self, method: &mut syn::ImplItemFn) {
-        if self.names.contains(&method.sig.ident.to_string()) {
-            for input in &mut method.sig.inputs {
-                let syn::FnArg::Typed(input) = input else {
-                    continue;
-                };
-                let syn::Type::Reference(reference) = &mut *input.ty else {
-                    continue;
-                };
-                let syn::Type::Path(context) = &mut *reference.elem else {
-                    continue;
-                };
-                if context
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|p| p.ident == "NodeContext")
-                {
-                    let root = crate_root::root();
-                    context.path = syn::parse_quote!(#root::graph::node_plugin_abi::NodeContext);
-                }
-            }
-        }
         if self.names.contains(&method.sig.ident.to_string()) {
             method.sig.ident = plugin_name(&method.sig.ident);
         }
@@ -157,12 +144,15 @@ impl VisitMut for Adapter<'_> {
     }
 
     fn visit_expr_path_mut(&mut self, expression: &mut syn::ExprPath) {
+        let self_type = expression.path.segments.iter().rev().nth(1);
         if expression.qself.is_none()
-            && expression
-                .path
-                .segments
-                .first()
-                .is_some_and(|part| part.ident == "Self")
+            && self_type.is_some_and(|part| {
+                part.ident == "Self"
+                    || self
+                        .self_name
+                        .as_deref()
+                        .is_some_and(|name| part.ident == name)
+            })
         {
             if let Some(last) = expression.path.segments.last_mut() {
                 if self.names.contains(&last.ident.to_string()) {
@@ -186,17 +176,25 @@ impl VisitMut for Adapter<'_> {
         ] {
             let ident = format_ident!("{name}");
             let native: Path = syn::parse_quote!(#root::#module::#ident);
-            let count = native.segments.len();
-            if path.leading_colon != native.leading_colon
-                || path.segments.len() < count
-                || !path
-                    .segments
-                    .iter()
-                    .zip(&native.segments)
-                    .all(|(a, b)| a.ident == b.ident)
-            {
-                continue;
-            }
+            let count = if matches!(name, "NodeContext" | "AnyPublisher" | "AnySubscriber") {
+                let Some(index) = path.segments.iter().position(|part| part.ident == ident) else {
+                    continue;
+                };
+                index + 1
+            } else {
+                let count = native.segments.len();
+                if path.leading_colon != native.leading_colon
+                    || path.segments.len() < count
+                    || !path
+                        .segments
+                        .iter()
+                        .zip(&native.segments)
+                        .all(|(a, b)| a.ident == b.ident)
+                {
+                    continue;
+                }
+                count
+            };
             // Include associated constructors as well as type positions.
             // Preserve generic arguments on the type and the untouched tail.
             let args = path.segments[count - 1].arguments.clone();
@@ -224,6 +222,33 @@ mod tests {
 
     fn compact(tokens: TokenStream) -> String {
         tokens.to_string().split_whitespace().collect()
+    }
+
+    #[test]
+    fn every_context_port_path_and_qualified_self_call_is_retyped() {
+        let common: ItemImpl = syn::parse_quote! {
+            impl Node {
+                fn __cer_user_init(&mut self, ctx: &mut NodeContext) {
+                    let _: &mut NodeContext = ctx;
+                    Node::configure(ctx);
+                    crate::module::Node::configure(ctx);
+                }
+                fn configure(ctx: &mut graph::node::NodeContext) -> Option<&AnyPublisher> {
+                    let _: Option<&graph::node::AnySubscriber> = ctx.subscriber("inp");
+                    ctx.publisher("out")
+                }
+                fn __cer_zero_copy_tick(&mut self, ctx: &mut ::cerulion_core::graph::node::NodeContext) {}
+            }
+        };
+        let emitted = compact(generate(&common, &BTreeSet::new()));
+        assert!(emitted.contains("Node::__cer_plugin_configure(ctx)"));
+        assert!(emitted.contains("crate::module::Node::__cer_plugin_configure(ctx)"));
+        assert!(
+            emitted.contains("let_:&mut::cerulion_core::graph::node_plugin_abi::NodeContext=ctx")
+        );
+        assert!(emitted.contains("Option<&::cerulion_core::graph::node_plugin_abi::AnyPublisher>"));
+        assert!(emitted.contains("Option<&::cerulion_core::graph::node_plugin_abi::AnySubscriber>"));
+        assert!(!emitted.contains("graph::node::"));
     }
 
     #[test]
