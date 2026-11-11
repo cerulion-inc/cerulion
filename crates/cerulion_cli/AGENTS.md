@@ -9,7 +9,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
 - Never gate `Completions`, `Clean` or the `doctor` family behind `command_needs_identity` -
   a shell rc file and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
-- Serving, including ROS 2 attach, uses netd require_serving_authority.
+- Serving uses netd require_serving_authority, including ROS 2 attach; graph gates producers only.
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.

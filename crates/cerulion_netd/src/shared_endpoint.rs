@@ -28,7 +28,23 @@ use crate::wan::{WanRegistry, WanRobot};
 const MAX_MESSAGE: usize = 256 * 1024;
 pub(crate) const MAX_CLIENTS: usize = 32;
 const MAX_ROBOTS: usize = 256;
+const MAX_ADDRESSES: usize = 16;
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub(crate) fn bounded_direct_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut bounded = Vec::new();
+    for address in addresses {
+        if !bounded.contains(&address) {
+            bounded.push(address);
+            if bounded.len() == MAX_ADDRESSES {
+                break;
+            }
+        }
+    }
+    bounded
+}
 
 fn remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
@@ -178,6 +194,23 @@ enum Answer {
     Retired(Vec<(String, String, bool)>),
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Refusal {
+    message: String,
+    fenced: bool,
+}
+
+impl Refusal {
+    fn into_request_error(self) -> RequestError {
+        if self.fenced {
+            RequestError::Transport(self.message)
+        } else {
+            RequestError::Refused(self.message)
+        }
+    }
+}
+
 enum RequestError {
     Transport(String),
     Refused(String),
@@ -299,7 +332,7 @@ impl Configuration {
             if peer.name.is_empty()
                 || peer.name.trim() != peer.name
                 || peer.name.len() > 256
-                || peer.addresses.len() > 16
+                || peer.addresses.len() > MAX_ADDRESSES
             {
                 return Err("outbound robot membership is invalid".into());
             }
@@ -356,7 +389,7 @@ impl SharedMirrorPlane {
             .map(|(name, peer)| Peer {
                 name,
                 key: *peer.eid.as_bytes(),
-                addresses: peer.direct_addrs,
+                addresses: bounded_direct_addresses(peer.direct_addrs),
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -388,9 +421,9 @@ impl SharedMirrorPlane {
         })
         .map_err(RequestError::Refused)?;
         write_encoded(stream, &bytes).map_err(RequestError::Transport)?;
-        read_message::<Result<Answer, String>>(stream, false)
+        read_message::<Result<Answer, Refusal>>(stream, false)
             .map_err(RequestError::Transport)?
-            .map_err(RequestError::Refused)
+            .map_err(Refusal::into_request_error)
     }
 
     fn request_until(
@@ -423,9 +456,9 @@ impl SharedMirrorPlane {
             let mut reply = vec![0; size];
             read_exact_until(stream, &mut reply, deadline).map_err(RequestError::Transport)?;
             remaining(deadline).map_err(RequestError::Transport)?;
-            serde_json::from_slice::<Result<Answer, String>>(&reply)
+            serde_json::from_slice::<Result<Answer, Refusal>>(&reply)
                 .map_err(|_| RequestError::Transport("outbound control message is invalid".into()))?
-                .map_err(RequestError::Refused)
+                .map_err(Refusal::into_request_error)
         })();
         if stream.set_nonblocking(false).is_err() {
             return Err(RequestError::Transport(
@@ -848,7 +881,7 @@ fn serve_connection(
     let mut identity = None;
     while let Ok(request) = read_message::<Request>(&mut stream, true) {
         let configuration = request.configuration;
-        let mut operation_started = false;
+        let mut fenced = true;
         let answer = (|| {
             if configuration.key != *endpoint.id().as_bytes() || endpoint.is_closed() {
                 return Err("shared endpoint does not match the current device key".into());
@@ -861,13 +894,15 @@ fn serve_connection(
                     "outbound mirror namespace does not match the serving namespace".into(),
                 );
             }
+            let configured_identity = (configuration.account, configuration.epoch_dir.clone());
+            if plane.is_some() && identity.as_ref() != Some(&configured_identity) {
+                return Err("outbound account changed; release the previous connection".into());
+            }
+            // Membership and owner refresh refusals preserve this admitted plane.
+            fenced = false;
             let robots = configuration.robots()?;
             let owner = configuration.owner_certificate()?;
-            let configured_identity = (configuration.account, configuration.epoch_dir.clone());
             let retired = if let Some(existing) = &plane {
-                if identity.as_ref() != Some(&configured_identity) {
-                    return Err("outbound account changed; release the previous connection".into());
-                }
                 let retired = existing.update_membership(robots)?;
                 existing.registry_owner(owner)?;
                 retired
@@ -894,7 +929,6 @@ fn serve_connection(
             if readers.is_empty() {
                 reader_hold.take();
             }
-            operation_started = true;
             match request.operation {
                 Operation::Ensure {
                     robot,
@@ -1002,10 +1036,11 @@ fn serve_connection(
                     Ok(Answer::Done)
                 }
             }
-        })();
+        })()
+        .map_err(|message| Refusal { message, fenced });
         // Refused operations keep the admitted connection and every other
         // reader alive. Only validation or framing failures retire its plane.
-        if write_message(&mut stream, &answer).is_err() || !operation_started {
+        if write_message(&mut stream, &answer).is_err() || fenced {
             break;
         }
     }
@@ -1017,6 +1052,56 @@ fn serve_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_candidates_are_unique_bounded_and_keep_the_tls_seen_address_first() {
+        let seen: SocketAddr = "127.0.0.1:1777".parse().unwrap();
+        let hints = (1..=17).map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let addresses = bounded_direct_addresses([seen, seen].into_iter().chain(hints));
+        assert_eq!(addresses.len(), 16);
+        assert_eq!(addresses[0], seen);
+        assert_eq!(addresses[15], SocketAddr::from(([127, 0, 0, 1], 15)));
+    }
+
+    #[test]
+    fn fenced_refusal_takes_the_connection_and_marks_transport_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("fenced.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_message::<Request>(&mut stream, false).unwrap();
+            write_message(
+                &mut stream,
+                &Err::<Answer, _>(Refusal {
+                    message: "identity changed".into(),
+                    fenced: true,
+                }),
+            )
+            .unwrap();
+        });
+        let manager = TransportManager::init_for_test(
+            Default::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let control = SharedMirrorPlane::new(
+            socket,
+            manager,
+            Arc::new(WanRegistry::new(
+                HashMap::new(),
+                [19; 32],
+                RelayConfig::Disabled,
+            )),
+        );
+        assert!(control
+            .has_reader(&TopicKey::new("robot", "/fenced"))
+            .unwrap_err()
+            .contains("identity changed"));
+        assert!(control.connection.lock().unwrap().is_none());
+        assert!(control.take_transport_loss());
+        worker.join().unwrap();
+    }
 
     #[test]
     fn stalled_shared_ensure_returns_at_the_callers_absolute_deadline() {

@@ -2452,3 +2452,6 @@ mod authenticated_supervisor;
 
 #[path = "wan_plane_iroh_test/shared_endpoint_regressions.rs"]
 mod shared_endpoint_regressions;
+
+#[path = "wan_plane_iroh_test/shared_endpoint_membership.rs"]
+mod shared_endpoint_membership;
