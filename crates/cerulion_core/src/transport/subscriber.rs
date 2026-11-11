@@ -2531,7 +2531,7 @@ impl CerulionSubscriber {
                 // decoration on a split edge: freeing credit is precisely the event
                 // a credit-blocked producer in another process parks for, and a
                 // decrement that did not ring would leave it asleep until its next
-                // slice — the wedge the wake word exists to prevent. On a LOCAL
+                // slice: the wedge the wake word exists to prevent. On a LOCAL
                 // word nobody can be parked, so the ring is a `wake_seq` bump plus
                 // a `parked`-mask read and no syscall.
                 counter.record_drained(removed)

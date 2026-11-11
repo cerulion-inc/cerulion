@@ -391,7 +391,7 @@ pub struct CerulionPublisher {
     /// `block`-policy consumer of this publisher's topic, each in a
     /// [`BlockCountSlot`] beside the take-back of the frame being sent. Each
     /// word is the deterministic mirror of that consumer's iceoryx2 queue
-    /// depth — incremented here before every send makes a frame visible (and
+    /// depth, incremented here before every send makes a frame visible (and
     /// taken back when the send fails, see [`Self::send_counted`]),
     /// decremented on the consumer's [`CerulionSubscriber`] drain. The
     /// producer's scheduler pre-fire check reads these to defer the moment any
