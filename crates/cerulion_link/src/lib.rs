@@ -93,7 +93,7 @@ pub use relay::{RelayConfig, RelayParseError, CERULION_RELAY_URL_ENV};
 /// Why a [`Connection`] closed ([`Connection::close_reason`]).
 pub use iroh::endpoint::ConnectionError;
 pub use iroh::endpoint::{Connection, RecvStream, SendStream};
-pub use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+pub use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 
 /// Hex-encode a 32-byte key for error/log display (no external dep).
 pub(crate) fn hex32(bytes: &[u8]) -> String {

@@ -41,10 +41,16 @@ impl AccountWanController {
         action: &AccountAccessRequest,
     ) -> Result<AccountAccessReply, String> {
         action.validate()?;
+        if let AccountAccessRequest::Discover { budget_ms } = action {
+            return self
+                .discover(Duration::from_millis(*budget_ms))
+                .map(|robots| AccountAccessReply::Discovery { robots });
+        }
         let (robot_id, budget) = match action {
-            AccountAccessRequest::Install { .. } => {
+            AccountAccessRequest::Install { .. } | AccountAccessRequest::InstallPaired { .. } => {
                 return Err("account installation requires daemon registry coordination".into())
             }
+            AccountAccessRequest::Discover { .. } => unreachable!("discovery returned above"),
             AccountAccessRequest::Probe {
                 robot_id,
                 budget_ms,
@@ -92,7 +98,9 @@ impl AccountWanController {
             AccountAccessRequest::Schema { topic, .. } => plane
                 .query_schema(&route, topic, remaining(deadline)?)
                 .map(|schema| AccountAccessReply::Schema { robot_id, schema }),
-            AccountAccessRequest::Install { .. } => {
+            AccountAccessRequest::Install { .. }
+            | AccountAccessRequest::InstallPaired { .. }
+            | AccountAccessRequest::Discover { .. } => {
                 unreachable!("install was refused before identity and I/O")
             }
         };
@@ -195,8 +203,38 @@ impl MirrorPlane for AccountWanController {
         self.named_schema(robot_id, requested)
     }
 
+    fn install_paired_robots(
+        &self,
+        robots: &[crate::account_access::PairedRobot],
+        registry: &mut DemandRegistry,
+    ) -> Result<(), String> {
+        self.install_paired(robots, registry)
+    }
+
+    fn paired_catalog(&self, robot: &str) -> Option<Result<CatalogReply, String>> {
+        self.paired_metadata(robot, None)
+            .map(|result| result.map(|(catalog, _)| catalog))
+    }
+
+    fn paired_schema(&self, robot: &str, requested: &str) -> Option<Result<SchemaReply, String>> {
+        self.paired_metadata(robot, Some(requested)).map(|result| {
+            result.and_then(|(_, schema)| {
+                schema.ok_or_else(|| "paired schema response was absent".into())
+            })
+        })
+    }
+
     fn refresh_identity(&self, registry: &mut DemandRegistry) -> Result<(), String> {
         self.refresh(registry)
+    }
+
+    /// Observer channel on WAN; legacy LAN mirrors keep their canonical channel.
+    fn local_channel(&self, key: &TopicKey) -> String {
+        if matches!(self.route(key), Ok(Route::Wan)) {
+            key.local_topic()
+        } else {
+            key.topic.clone()
+        }
     }
 
     /// The route this controller PINNED when it ensured the mirror, never the route

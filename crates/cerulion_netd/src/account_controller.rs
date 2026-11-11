@@ -24,6 +24,7 @@ use crate::mirror::{GatewayMirrorPlane, MirrorPlane};
 use crate::registry::{DemandRegistry, TopicKey};
 use crate::wan::{WanRegistry, WanRobot};
 
+mod discovery;
 mod operations;
 
 use crate::account_access::{CONTROLLER_BUSY as BUSY, IDENTITY_BUSY};
@@ -80,6 +81,7 @@ pub struct AccountWanController {
     authorizer: Arc<dyn DemandAuthorizer>,
     config: AccountControllerConfig,
     manual: HashMap<String, WanRobot>,
+    paired: Mutex<HashMap<String, WanRobot>>,
     pins: Mutex<BTreeMap<TopicKey, Route>>,
     state: Mutex<State>,
 }
@@ -111,6 +113,7 @@ impl AccountWanController {
             authorizer,
             config,
             manual: robots,
+            paired: Mutex::new(HashMap::new()),
             pins: Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
                 registry: Arc::new(manual),
@@ -146,11 +149,20 @@ impl AccountWanController {
         if let Some(route) = self.pins()?.get(key) {
             return Ok(*route);
         }
-        Ok(if account || self.manual.contains_key(&key.robot) {
-            Route::Wan
-        } else {
-            Route::Lan
-        })
+        Ok(
+            if account
+                || self.manual.contains_key(&key.robot)
+                || self
+                    .paired
+                    .lock()
+                    .map_err(|_| "paired robot state is poisoned")?
+                    .contains_key(&key.robot)
+            {
+                Route::Wan
+            } else {
+                Route::Lan
+            },
+        )
     }
 
     fn network_allowed(&self) -> Result<(), String> {
@@ -281,6 +293,12 @@ impl AccountWanController {
 
     fn membership(&self, snapshot: &AccountSnapshot) -> Result<HashMap<String, WanRobot>, String> {
         let mut robots = self.manual.clone();
+        robots.extend(
+            self.paired
+                .lock()
+                .map_err(|_| "paired robot state is poisoned")?
+                .clone(),
+        );
         for robot in &snapshot.robots {
             if let Some(key) = robot.endpoint_key {
                 let eid = EndpointId::from_bytes(&key)
@@ -341,7 +359,7 @@ impl AccountWanController {
             let old = state.registry.membership_snapshot()?;
             let changed: BTreeSet<_> = old
                 .iter()
-                .filter(|(name, peer)| robots.get(*name) != Some(*peer))
+                .filter(|(name, peer)| robots.get(*name).is_none_or(|next| next.eid != peer.eid))
                 .map(|(name, _)| name.clone())
                 .collect();
             let keys: BTreeSet<_> = self
