@@ -473,3 +473,8 @@ shared-memory singleton pattern that forces `--test-threads=1` elsewhere in the
 workspace. `cargo check -p cerulion_netd --no-default-features` and
 `cargo check -p cerulion_dds --no-default-features` are the lean-build gates the
 consumers rely on; keep both green.
+
+Automatic robot startup failures are forwarded by the supervised egress plane
+into netd status. Both paired and open graph watches report them once per failure
+regime and report recovery when the status clears. A living remoted child clears
+the stale startup failure before a beacon refresh, even if that refresh fails.

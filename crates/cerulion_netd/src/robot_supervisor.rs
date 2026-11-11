@@ -98,10 +98,12 @@ impl RobotSupervisor {
                     attempt += 1;
                     let started = Instant::now();
                     let result = run(&worker_running, &ownership, |eid| {
+                        // This callback runs after the child passes try_wait.
+                        // Serving recovered even if refreshing the beacon fails.
+                        gateway.set_robot_startup_error(None);
                         let refreshed = gateway
                             .refresh_robot_beacon(eid)
                             .map_err(|error| error.to_string())?;
-                        gateway.set_robot_startup_error(None);
                         Ok(refreshed)
                     });
                     let Err(error) = result else { return };
