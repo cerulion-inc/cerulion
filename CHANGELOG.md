@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
+=======
+- Native Android account requests use verified system certificate roots without a Java context; client setup failures keep local topic reads available.
+
+- A successful session refresh has a separate bounded settlement window to save its replacement tokens, or revoke them after a concurrent sign-out, when the account store is briefly busy.
+
+- Topic discovery lists account-owned and explicitly paired robots anywhere, with direct or relayed reachability and visible offline status. Topic reads and remote visualization demand authenticated wire/2 streams automatically, keep identical local and remote names separate, and release streams when their observers exit. `topic echo`, `hz`, and `info` accept `--robot NAME` and refuse ambiguous names with exit 2.
+
+>>>>>>> 4123422f3bbe8615f66b3aa6d58a5bf2acdea6dd
 ## [2.0.0] - 2026-11-11
 
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. This release changes the command line in ways existing scripts notice, including paired LAN access by default on every platform, the output of `cerulion topic echo` and how `cerulion graph run` runs a graph by default (see Changed), so it is a major version. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 31 (see Changed).

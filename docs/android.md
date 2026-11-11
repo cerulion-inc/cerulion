@@ -167,6 +167,11 @@ pairing without a new sign-in. The legacy `CERULION_NETD_LISTEN` configuration
 retains its prior-login gate. Authenticated serving begins with a live export,
 without requiring a zenoh listen setting.
 
+The standalone CLI uses Android system certificate roots for account HTTPS,
+with certificate and hostname verification. It needs no Java context. If the
+roots cannot be read, account requests fail with a warning; local topic reads
+still work on an expired session.
+
 On Android, netd and a `graph run` gateway refuse every LAN peer unless
 `CERULION_LAN_ACCESS=open` is set, the same posture as the app's
 `lan_access`; they raise the same mDNS beacon. Set it in the shell that

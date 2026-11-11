@@ -881,7 +881,10 @@ gate remains closed; an unavailable issuer never enables unauthenticated access.
 the account's robots from the issuer's owner-only list endpoint and mark each
 one with a bounded presence probe. The directory fetch inside `topic list` has
 its own 2 s deadline (`LISTING_FETCH_BUDGET`); stale-session refresh has a separate
-2 s caller-thread budget. A legacy sign-in with a valid session and no coupled
+2 s caller-thread request budget. A successful token rotation has an additional
+1 s settlement budget for store publication or revocation after a concurrent
+sign-out or sign-in. HTTP never holds the store lock, and publication still
+checks the exact refresh-token identity before writing. A legacy sign-in with a valid session and no coupled
 device certificate gets one background enrollment attempt per process, with a
 2 s caller budget. It signs the account service's device-registration challenge
 using the existing machine key, sends the session only to that service without
