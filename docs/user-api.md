@@ -2306,6 +2306,11 @@ budget, netd names its robot and topic. CLI observers re-demand their pinned
 source and schema, or exit with a named error if recovery fails. Graph imports revalidate their pinned producer before
 reconnecting; visualization re-demands its pinned source and schema. Status checks use separate connections, so a busy daemon does not release healthy readers. Visualization retries each lost source with backoff independently.
 
+Remote schema reads use current producer registrations, including a registration
+that arrives after the reader connects. A schema lookup without topic data
+opens no data reader and does not prevent a local producer from starting.
+Authorization and producer privacy are checked again before returning metadata.
+
 An enabled `network:` block restricts exported topics and declares imported
 topics. Under paired access each import selects a unique authenticated producer;
 schema, QoS, single-writer and recording-plus-ingress checks remain enforced.

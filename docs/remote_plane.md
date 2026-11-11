@@ -132,8 +132,10 @@ and e-stop checks.
 
 Each robot exports its own local producers. Imported graph topics and private
 observer channels keep their source robot's access policy: read them on that
-source robot. A refused outbound demand or an unavailable robot during metadata
-discovery preserves the machine's other active readers. Failed membership
+source robot. Schema reads without topic data use current producer metadata
+without opening a data reader; privacy and authorization are checked again
+after the metadata source returns. A refused outbound demand or an unavailable
+robot during metadata discovery preserves the machine's other active readers. Failed membership
 cleanup fences the outbound connection and reports transport loss. Ops snapshot, one-shot
 echo, publish and service calls enforce the same source restriction. Outbound
 readers retain the owned server against idle shutdown; new admission returns a retryable

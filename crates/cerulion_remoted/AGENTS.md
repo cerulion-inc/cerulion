@@ -35,8 +35,8 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
-- Metadata reads namespace-checked netd snapshots (no startup) or in-process
-  `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
+- Metadata: namespace-checked netd snapshots or `SchemaSource`; no startup.
+  Recheck CAP_OBSERVE/privacy after awaits; schema-only reads hold no leases.
 - Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
 - Same-user outbound shares endpoint/runtime/node; pre-dial key/namespace gate. Metadata per-call; validation refusals keep readers/idle fence; cleanup errors fence control. Retire only outbound.
 
@@ -48,4 +48,4 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   e2e: loopback iroh only, relay off, direct dial, bounded awaits.
 - remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
-Read docs/internals/remote-access.md before verb, trust, wire, pairing or epoch changes.
+Read docs/internals/remote-access.md before verb, trust, wire, pairing and epoch edits.

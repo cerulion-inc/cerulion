@@ -519,6 +519,12 @@ VERBATIM; per-topic QUIC flow control means a slow topic never stalls a fast
 one, and the demand lifecycle IS the stream lifecycle). End-to-end over real
 iroh + real iceoryx2: `wire_plane_test.rs` (byte-for-byte against hand oracles).
 
+Schema metadata reads create no policy services when no data service exists.
+Their temporary listener leases would otherwise destroy an empty marker while
+a later policy reader opens it. Actual header taps acquire source and egress
+leases, retaining them through the data port's lifetime. Schema responses check
+producer privacy and account authorization after the provider returns.
+
 - **Framing is NOT cancel-safe** (`cerulion_link::framing`): `read_frame`/
   `write_frame` are two sequential awaits, so a dropped future desyncs the
   stream permanently. Never `select!` on them; one dedicated task per stream
