@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -96,8 +97,15 @@ def test_host_pynode_loans_builtin_output_without_workspace_schemas():
         text=True,
         env=_node_env("builtin"),
     )
-    assert result.stdout.splitlines() == [
-        "node_info={\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":15293913555552287199,\"max_slice_len_default\":64,\"promise_within_ms\":null,\"wire_fixed_size\":24}],\"policy\":{\"period_ms\":1}}",
+    lines = result.stdout.splitlines()
+    assert json.loads(lines[0].removeprefix("node_info=")) == {
+        "inputs": [],
+        "outputs": [{"name": "out", "schema_hash": 15293913555552287199,
+                     "max_slice_len_default": 64, "promise_within_ms": None,
+                     "wire_fixed_size": 24, "variable_count": 0, "alignment": 8}],
+        "policy": {"period_ms": 1}, "retain_process": True,
+    }
+    assert lines[1:] == [
         "tick=0 code=0 out=000000000000f83f00000000000000c0000000000000d03f",
         "shutdown code=0",
     ]
@@ -289,6 +297,69 @@ def test_extra_thread_warning_is_latched():
     result = _run("errors", "spawn_thread", ticks=3)
     assert result.returncode == 0
     assert result.stderr.count("additional threads") == 1
+
+
+def test_stable_python_adapter_delivers_oracle_frames_and_host_sequences():
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    expected = [
+        "tick=0 code=0 out=0100000000000000 seq=41",
+        "tick=1 code=0 out=0300000000000000 seq=42",
+        "tick=2 code=0 out=0500000000000000 seq=43",
+    ]
+    for _ in range(2):
+        result = subprocess.run([FIXTURE, "host-pynode", counter, "3", "--seed", "41"],
+                                capture_output=True, text=True, check=True, env=_node_env("counter"))
+        metadata = json.loads(result.stdout.splitlines()[0].removeprefix("node_info="))
+        assert metadata["retain_process"] is True
+        assert metadata["inputs"][0]["schema_hash"] == 15583965953746584896
+        assert metadata["inputs"][0]["wire_fixed_size"] == 8
+        assert metadata["inputs"][0]["variable_count"] == 0
+        assert metadata["inputs"][0]["alignment"] == 8
+        assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == expected
+
+
+class _Status(ctypes.Structure):
+    _fields_ = [("error", ctypes.c_uint64), ("code", ctypes.c_uint32), ("kind", ctypes.c_uint32)]
+
+
+class _TableHeader(ctypes.Structure):
+    _fields_ = [("layout_id", ctypes.c_uint64), ("size_bytes", ctypes.c_uint32), ("major", ctypes.c_uint32)]
+
+
+class _Bytes(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_uint64)]
+
+
+class _NodeApi(ctypes.Structure):
+    _fields_ = [("header", _TableHeader), ("metadata", _Bytes),
+                ("required", ctypes.c_uint64), ("capabilities", ctypes.c_uint64)] + [
+                    (name, ctypes.c_void_p) for name in
+                    ("create", "tick", "shutdown", "destroy", "copy_error", "query_extension", "state", "external")]
+
+
+def test_stable_python_bootstrap_refuses_null_host_and_stale_handles():
+    library = _counter_library()
+    library.cerulion_node_api_v1_stabbied_v3_report.restype = ctypes.c_void_p
+    assert library.cerulion_node_api_v1_stabbied_v3_report()
+    assert library.cerulion_node_api_v1_stabbied_v3
+    library.cerulion_node_api_v1.restype = ctypes.POINTER(_NodeApi)
+    pointer = library.cerulion_node_api_v1()
+    assert pointer
+    api = pointer.contents
+    assert api.header.major == 1
+    assert api.header.size_bytes == ctypes.sizeof(_NodeApi)
+    assert api.header.layout_id != 0
+    assert api.capabilities == api.required == 0
+    assert api.state is None and api.external is None
+    assert b"\0" not in ctypes.string_at(api.metadata.ptr, api.metadata.len)
+    create = ctypes.CFUNCTYPE(_Status, ctypes.c_void_p, ctypes.c_uint64, _Bytes,
+                              ctypes.POINTER(ctypes.c_uint64))(api.create)
+    handle = ctypes.c_uint64(999)
+    assert create(None, 1, _Bytes(None, 0), ctypes.byref(handle)).code == 5
+    assert handle.value == 0
+    for name in ("tick", "shutdown", "destroy"):
+        operation = ctypes.CFUNCTYPE(_Status, ctypes.c_uint64)(getattr(api, name))
+        assert operation(0).code == operation(999).code == 4
 
 
 def _counter_library():

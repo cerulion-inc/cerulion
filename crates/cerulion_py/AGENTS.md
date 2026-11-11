@@ -57,3 +57,17 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 `src/` (native module: session, publisher, subscriber, frame, typed, bag, errors), `python/cerulion/`
 (facade), `fixtures/` (Rust interop binary), `tests/` (pytest), `scripts/` (e2e). User doc:
 `../../docs/python.md` - its code blocks are executed by `tests/test_docs.py`.
+
+## Stable embedded node boundary
+
+Python `export_node!` emits the same checked stable node table as Rust nodes.
+Python objects, context wrappers, schema layouts and buffer guards stay node-local;
+stable reads/writes retain scalar host-owned leases. The shared tick body keeps
+preflight validation and publishes after successful Python completion.
+Dynamic variable outputs keep the explicit adaptive spill service.
+Stable host services own clock/sequence stamps. Python metadata sets
+`retain_process: true`: CPython caches pyclass code and retained views may
+pin leases after shutdown, so the loader retains code and context until exit.
+Python nodes advertise neither state nor external-source capability.
+Stable create/error-copy forwarding adds two checked C-call unsafe sites;
+their U06/U12 lifetime and descriptor validation live in the shared export adapter.
