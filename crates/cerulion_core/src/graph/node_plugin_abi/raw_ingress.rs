@@ -198,7 +198,8 @@ impl RawPublisher {
                         "raw ingress loan descriptor is invalid",
                     ));
                 }
-                // SAFETY (U09): validated exclusive lease pins the initialized
+                // SAFETY (U09): host derives the pointer from its exclusive mutable
+                // loan mapping; the validated lease pins that initialized
                 // writable slot through copy; the borrow ends before terminal
                 // publish or discard, including every validation failure.
                 let output = unsafe {
