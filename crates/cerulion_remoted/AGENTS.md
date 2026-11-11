@@ -1,17 +1,13 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-The robot-side remote plane (daemon or `RemotePlane`): ONE iroh endpoint per
-robot (the device key's PUBLIC half IS the `EndpointId`, its 32-byte secret also
-seeds the pairing identity) multiplexing `cerulion/wire/2` and `cerulion/ops/1`. It
-also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
-`cerulion_wireclient`, `cerulion_connectd`, `cerud`, `cerulion_accountd` and
-`cerulion-wire`.
+Robot plane: ONE iroh endpoint, device public key = `EndpointId`, same secret
+for pairing; multiplexes wire/2 and ops/1. This guide also covers pairing, link,
+wireclient, connectd, cerud, accountd and cerulion-wire.
 
 ## Invariants
 - Deny-by-default: every accept is classified by `PairingAuthorizer`, and the verb
   to capability table in `authorizer.rs` is the sacred security surface. An
-  unclassified verb is DENIED; a new one must be classified there
-  (`authorizer_matrix_test.rs` pins it cell by cell).
+  unclassified verb is DENIED (`authorizer_matrix_test.rs` pins every cell).
 - Bootstrap verbs self-gate on their own proof (chassis secret, cert chain, owner
   grant, CPace witness). The pairing subject is ALWAYS the TLS-authenticated device
   key, never a client arg, and validity, TTL and rollback checks use the robot's
@@ -46,17 +42,16 @@ also carries the family-wide rules for `cerulion_pairing`, `cerulion_link`,
 - Metadata reads the EXISTING netd snapshot (namespace checked; never starts netd)
   or a host's in-process `SchemaSource`. Catalog and Schema reauthorize
   CAP_OBSERVE after async provider work (`local_schema_provider_test`).
-- The daemon hosts same-user outbound mirror control on its existing endpoint
-  and transport node. Reject key or namespace mismatches before dialing;
-  retirement closes only outbound sessions, never the shared endpoint.
+- Same-user outbound control reuses the endpoint, runtime and transport node.
+  Refuse key/namespace mismatch before dialing; retire outbound sessions only.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft
   limit a parallel run hits iceoryx service/port errors.
 - The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
   e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
-- remoted and link cold-compile the ~390-crate iroh tree. remoted, connectd,
-  wireclient, link and accountd are OUT of `default-members`: build them with `-p`.
+- remoted, connectd, wireclient, link and accountd are OUT of default members;
+  use `-p`. remoted/link cold-compile the iroh tree.
 
 Deep reference: docs/internals/remote-access.md, before touching the verb table,
 trust persistence, the wire plane, pairing formats or epoch delivery.

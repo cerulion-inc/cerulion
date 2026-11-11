@@ -594,10 +594,12 @@ fn serve_connection(
                         .with_epoch_dir(configuration.epoch_dir),
                 );
                 registry.replace_owner_certificate(configuration.owner.map(Arc::new))?;
-                plane = Some(
-                    IrohMirrorPlane::new(manager.clone(), registry)?
-                        .with_endpoint(endpoint.clone(), runtime.clone())?,
-                );
+                plane = Some(IrohMirrorPlane::on_owned_endpoint(
+                    manager.clone(),
+                    registry,
+                    endpoint.clone(),
+                    runtime.clone(),
+                )?);
                 identity = Some(configured_identity);
                 Vec::new()
             };

@@ -284,6 +284,18 @@ impl IrohMirrorPlane {
             .thread_name("netd-iroh")
             .build()
             .map_err(|e| format!("failed to build the cerulion-netd iroh runtime: {e}"))?;
+        Ok(Self::from_runtime(
+            manager,
+            registry,
+            PlaneRuntime::Owned(rt),
+        ))
+    }
+
+    fn from_runtime(
+        manager: Arc<TransportManager>,
+        registry: Arc<WanRegistry>,
+        rt: PlaneRuntime,
+    ) -> Self {
         // Derive netd's OWN desk device key (the demander identity) from the
         // WAN registry's desk seed — the SAME ed25519 public half the endpoint's iroh
         // id would carry, computed here without binding the (lazy) endpoint so the
@@ -291,10 +303,10 @@ impl IrohMirrorPlane {
         let desk_key = DeviceIdentity::from_seed(&registry.desk_seed())
             .public_key()
             .0;
-        Ok(Self {
+        Self {
             manager,
             registry,
-            rt: PlaneRuntime::Owned(rt),
+            rt,
             inner: Arc::new(AsyncMutex::new(IrohState {
                 endpoint: None,
                 robots: HashMap::new(),
@@ -307,7 +319,29 @@ impl IrohMirrorPlane {
             epoch_pushes: Arc::new(AsyncMutex::new(HashMap::new())),
             missing_cache_noted: Arc::new(std::sync::Mutex::new(HashSet::new())),
             shared_control: None,
-        })
+        }
+    }
+
+    /// Build directly on the owner's runtime without starting per-client
+    /// runtime threads. The endpoint must match the current device identity.
+    pub(crate) fn on_owned_endpoint(
+        manager: Arc<TransportManager>,
+        registry: Arc<WanRegistry>,
+        endpoint: Endpoint,
+        runtime: Handle,
+    ) -> Result<Self, String> {
+        let plane = Self::from_runtime(manager, registry, PlaneRuntime::Shared(runtime));
+        if endpoint.id().as_bytes() != &plane.desk_key || endpoint.is_closed() {
+            return Err("shared endpoint does not match the current live device key".into());
+        }
+        let mut state = plane
+            .inner
+            .try_lock()
+            .map_err(|_| "new shared plane is busy")?;
+        state.endpoint = Some(endpoint);
+        state.shared_endpoint = true;
+        drop(state);
+        Ok(plane)
     }
 
     /// Consume through the serving host's endpoint without binding another one.
