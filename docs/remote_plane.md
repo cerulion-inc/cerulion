@@ -237,14 +237,19 @@ most 24 pending slots: a validated IP holds at most four of them, relay
 arrivals from keys this robot has not paired share eight per relay URL, and
 custom transports share four. The last eight slots are a reserve for device
 keys this robot has paired and still allows that arrive by relay, and each
-such key holds at most four pending slots. Unpaired peers can still fill the
-24 shared slots, never the reserve: sixteen unanswered dials plus eight
-stranger relay handshakes, or plus four from each of two validated addresses,
-are enough, and one host can claim several addresses. A dial over a direct
-path uses the shared slots. A desk whose key this robot has not yet recorded
-as paired, such as an account desk on its first relay dial, also shares its
-relay URL's eight unpaired slots, which one unpaired key can hold on its own.
-Established sessions are not globally capped.
+such key holds at most four pending slots. A paired relay key answers one
+QUIC Retry, which travels over the relay to the key's holder, before it takes
+its slots or the reserve, so a peer that forges the key's relay address cannot
+take them. Unpaired peers can still fill the 24 shared slots, never the
+reserve: sixteen unanswered dials plus eight stranger relay handshakes, or
+plus four from each of two validated addresses, are enough, and one host can
+claim several addresses. A dial over a direct path uses the shared slots, and
+a dial that also carries a direct address (`--addr`) is classified by the copy
+that arrives first, so it gets the reserve only when the relay copy is first.
+A desk whose key this robot has not yet recorded as paired, such as an account
+desk on its first relay dial, also shares its relay URL's eight unpaired
+slots, which one unpaired key can hold on its own. Established sessions are
+not globally capped.
 
 ## A dropped connection does not drop the lease
 

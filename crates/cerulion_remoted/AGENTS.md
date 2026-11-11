@@ -18,8 +18,8 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   key and refuses any other value; a cloud account needs the roots-verified chain
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
-  concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
-  TLS: 32 (last 8 for paired relay keys); retry 16; 4/IP or paired key; 8/unpaired URL.
+  concurrently so no session starves it (`estop_starvation_test.rs`).
+  TLS: docs/remote_plane.md; paired keys Retry first.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.

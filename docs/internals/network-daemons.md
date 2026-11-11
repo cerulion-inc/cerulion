@@ -170,7 +170,10 @@ remove them before committing.
   retry at half capacity, validated IPs hold at most four, unpaired relay arrivals
   share eight per relay URL and custom transports four. The last eight are kept for
   relay keys the trust snapshot reads as allowed on a claimed robot, at most four per
-  key, so stalled unpaired peers cannot refuse a paired desk's relayed e-stop dial.
+  key. iroh reads a relay key from the source address, which an IP datagram can
+  forge, so a paired relay key answers one Retry over the relay before it takes its
+  bucket or the reserve. Stalled unpaired peers therefore cannot refuse a paired
+  desk's relayed e-stop dial.
   A direct dial uses the 24; a relay key the snapshot does not read as allowed (such
   as a desk not yet in the trust index) also shares its URL's eight. Each cap has
   its own refusal latch. Completed handshakes dispatch before new arrivals, and safety
