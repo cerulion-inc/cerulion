@@ -55,9 +55,19 @@ default + gateway, the discovery ladder, and pairing.
   the robot stays visible while recording. The ONE exception: `--record`
   plus an explicit block that declares `ingress:` is refused (because
   recorded ingress re-injection is not replay-faithful).
-- **`topic list` discovers local and LAN topics.** `cerulion topic list` lists
-  LOCAL topics instantly, then discovers REMOTE topics over the LAN by default
-  (the discovery ladder below). The remote half is the discovery ladder (~1.5 s ceiling), a
+- **`topic list` discovers local topics and your robots anywhere.** `cerulion topic list` lists
+  LOCAL topics instantly, then lists account-owned and explicitly paired robots
+  through the authenticated iroh remote plane. Robot rows include offline and
+  unknown reachability; online rows show the selected direct or relay path.
+  Each topic row names its robot. Account lookup has a two-second deadline and
+  robot catalogs share one four-second budget. Saved directory and authenticated
+  direct-address hints let explicitly paired robots remain usable offline.
+  `find` matches those catalogs. `echo`, `hz`, `info`, `snapshot`, and `viz --robot`
+  demand remote topics automatically; the last observer releases its private
+  shared-memory channel.
+  Duplicate topic names require `--robot NAME` for reads, or `--local` for a local
+  producer. Explicit `--connect` and `--listen` remain available for LAN use.
+  The LAN half is the discovery ladder (~1.5 s ceiling), a
   connect phase hard-bounded at 1 s, and the demand/announce reply gathers
   (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
   LOCAL list has already printed by then. `--local` (also spelled
@@ -934,14 +944,17 @@ than folded in, and if the open still fails (a tarpit that accepts TCP but
 never speaks zenoh) it is retried ONCE with the reachable-explicit locators only,
 so a discovered false positive never sinks the gather. With nothing discovered
 the `ROBOTS` section is omitted and the `REMOTE TOPICS` section collapses to one
-line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect
-tcp/<host>:7683)`; a peer that is reachable (a given locator, a discovered
+line, `remote: none discovered in 500 ms (sign in or pair a robot; account and
+paired robots are reached automatically)`; a peer that is reachable (a given locator, a discovered
 robot) but advertised no topic in time gets `retry` instead.
 
 **Mirror provenance: one data source = one topic.** When a desk
 process re-injects a remote robot's topic into local SHM (vizd's remote viz,
 `topic echo`'s auto-ingress, `cerulion connect`'s iroh re-inject), the mirror
-lands as a plain `{topic}/data` service, which `topic list`'s local
+lands as a canonical `{topic}/data` service for graph ingress and manual connect,
+or a source-qualified `/__cerulion/observers/.../data` service for CLI and viewer
+observers. Private observer channels are hidden unless `--all` is given, which
+marks them internal and names their origin robot. `topic list`'s local
 enumeration would otherwise surface as a phantom SECOND LOCAL topic. Each
 re-injector records the mirror's origin in an out-of-band provenance registry
 (`/__cerulion/mirrors`, a reserved SHM control service with NO `/data` suffix so
@@ -963,8 +976,9 @@ streaming. Crucially, the streaming rows are LOCAL SHM knowledge (read from the
 provenance registry, not the network), so they render even under `--no-network`
 and even when the remote query fails: a mirror is REMOTE by IDENTITY (it is a
 copy of a remote robot's data), independent of any live network query. The wire
-name is untouched (a consumer still subscribes to the exact mirrored name:
-"remote = local"); only the `topic list` presentation folds it into REMOTE. The
+name is untouched. Canonical graph consumers subscribe to the mirrored name;
+observers open the private channel netd returns, keeping identically named local
+and remote sources separate. The `topic list` presentation folds mirrors into REMOTE. The
 Studio sidebar parses the same rows: the topic path stays the row's first
 whitespace token, with the `● streaming` marker + robot in the trailing columns.
 
@@ -1161,7 +1175,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":9,"wire_header":2}
+{"hello":"cerulion-netd","protocol":10,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
 ```
 
