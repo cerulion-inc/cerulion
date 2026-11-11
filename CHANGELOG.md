@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `cerulion-vizd` answers `list` and `status` from the last gathered mirror attribution instead of reading the mirror registry first whenever that attribution had expired, so a slow registry no longer holds their reply past the control client's deadline. A mirror attached by the local path shows the `robot` the last `discover` or local `attach` read; those two still refresh it.
 - After a `detach`, `cerulion-vizd`'s `attach`, `list`, `status` and `discover` replies no longer name the retired mirror's robot for a topic a desk producer took over. A mirror-provenance read that started before a `detach` or a remote `attach` and finished after it was stored over the newer state; it is now refused.
 
 ## [2.0.0] - 2026-11-11

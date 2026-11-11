@@ -5570,9 +5570,9 @@ fn an_attached_mirror_is_attributed_to_its_robot_on_list_and_status_e2e() {
     // THE ORACLE IS EXACT — `Some("ubuntu")` on the mirror and NO robot
     // on the desk producer, both read from ONE response. A mirror that is never
     // attributed still fails, with a bound rather than on the first sample.
-    // (The `status` half below polls too — but see the note there: gating on `hz`
-    // ALONE does not cover the attribution its own assertion reads, so that half is
-    // exposed to this same transient.)
+    // (The `status` half below reads the same held snapshot this loop converged on,
+    // and nothing refreshes it in between, so its robot condition holds on the
+    // first read and its loop waits only for a rate.)
     let mut list = client.request(r#"{"id":2,"method":"list"}"#);
     // The refreshing `discover` goes through the shipped client, so its read is bounded.
     let mut refresher = VizdConn::connect(&socket).expect("the shipped client connects");
@@ -5609,8 +5609,8 @@ fn an_attached_mirror_is_attributed_to_its_robot_on_list_and_status_e2e() {
     // the assertions need (the waits-for-A-asserts-B family), and
     // re-requesting afterwards means no predicate can cover them anyway:
     // the attribution the assertion reads would be a DIFFERENT response's.
-    let status_line = r#"{"id":3,"method":"status"}"#;
-    let mut status = client.request(status_line);
+    let status_request = r#"{"id":3,"method":"status"}"#;
+    let mut status = client.request(status_request);
     let status_deadline = Instant::now() + Duration::from_secs(6);
     while Instant::now() < status_deadline
         && !entry_for(&status["topics"], "topic", "/attr/scan").is_some_and(|e| {
@@ -5618,7 +5618,7 @@ fn an_attached_mirror_is_attributed_to_its_robot_on_list_and_status_e2e() {
         })
     {
         std::thread::sleep(Duration::from_millis(100));
-        status = client.request(status_line);
+        status = client.request(status_request);
     }
     let scan_status = entry_for(&status["topics"], "topic", "/attr/scan").expect("mirror status");
     assert_eq!(
@@ -5736,8 +5736,9 @@ fn a_torn_down_mirror_keeps_its_attached_row_on_its_robot_e2e() {
         );
     }
 
-    // While the mirror is LIVE, the live snapshot attributes it. Polled because the
-    // daemon's provenance cache may still hold the pre-registration snapshot.
+    // While the mirror is LIVE, the row names ubuntu. `list` serves the HELD snapshot
+    // and never gathers, so right after the remote attach that answer is the tap's
+    // own demanded robot, its authoritative record. Polled to a bound all the same.
     wait_until(Duration::from_secs(6), || {
         entry_for(
             &client.request(r#"{"id":2,"method":"list"}"#)["attached"],
@@ -5751,7 +5752,7 @@ fn a_torn_down_mirror_keeps_its_attached_row_on_its_robot_e2e() {
     assert_eq!(
         entry_for(&list["attached"], "topic", "/attr/tomb").expect("attached")["robot"].as_str(),
         Some("ubuntu"),
-        "the live mirror is attributed from the provenance registry: {list}"
+        "the remote-attached mirror's row names the robot it was demanded from: {list}"
     );
 
     // The live evidence goes away under a still-held tap: BOTH provenance records are
@@ -5764,21 +5765,20 @@ fn a_torn_down_mirror_keeps_its_attached_row_on_its_robot_e2e() {
         );
     }
 
-    // ANTI-VACUITY GATE. The daemon caches the provenance snapshot for ~3 s, so an
-    // immediate assertion would be answered from the CACHED (still-attributing)
-    // snapshot and would pass with or without the fallback. `/attr/probe` is the
-    // discriminator: it is NOT attached, so no tap record can cover it — the
-    // instant it shows up as a LOCAL topic, the daemon has provably re-gathered and the
-    // FRESH snapshot attributes neither topic.
-    // The SAME cache governs this (inverse) direction — here we wait for a
-    // re-gather to DROP the torn-down attribution — so it takes the same derived
-    // bound rather than its own hand-written multiple of the TTL.
+    // ANTI-VACUITY GATE. `list` and `status` serve the HELD snapshot, and the remote
+    // attach invalidated this topic, so no registry answer gathered before the teardown
+    // can carry its attribution into the assertions below. `/attr/probe` is the
+    // discriminator: it is NOT attached, so no tap record can cover it. Once a
+    // `discover` shows it as a LOCAL topic, a gather after the teardown attributes
+    // neither topic, and any robot the attached row still shows comes from its tap
+    // record. The wait takes the same derived bound as the forward direction rather
+    // than its own hand-written multiple of the TTL.
     let regathered = discover_until(&mut client, ATTRIBUTION_CONVERGENCE_BOUND, |d| {
         entry_for(&d["topics"], "topic", "/attr/probe").is_some()
     });
     assert!(
         entry_for(&regathered["topics"], "topic", "/attr/probe").is_some(),
-        "the daemon must re-gather within the cache TTL, or this test proves nothing about \
+        "a `discover` must gather after the teardown, or this test proves nothing about \
          the post-teardown snapshot: {regathered}"
     );
 
@@ -5944,10 +5944,10 @@ fn a_desk_producer_reusing_a_detached_remote_topic_name_is_never_attributed_e2e(
 #[test]
 fn discover_provenance_snapshot_is_cached_within_ttl_e2e() {
     // `discover` serves mirror provenance from a short-TTL cache
-    // so a live mirror does not cost a 150-600 ms `/__cerulion/mirrors` gather on EVERY
-    // ~2 s sidebar poll (the cerulion_core registry fast path only short-circuits a
-    // registry-LESS desk — precisely NOT the live-mirror scenario). This is the ANTI-TAUTOLOGY
-    // pin for the cache: it proves the cache is ACTIVE (not a no-op that re-gathers
+    // so back-to-back `discover` calls with a live mirror cost at most one
+    // `/__cerulion/mirrors` gather per TTL (the cerulion_core registry fast path only
+    // short-circuits a registry-LESS desk, precisely NOT the live-mirror scenario).
+    // This is the ANTI-TAUTOLOGY pin for the cache: it proves the cache is ACTIVE (not a no-op that re-gathers
     // every call), by observing the ACCEPTED staleness — a mirror registered AFTER the
     // first (caching) discover is NOT yet folded on an immediate second discover (it
     // shows LOCAL for one cycle), whereas a per-call re-gather would fold it instantly.
@@ -13291,8 +13291,8 @@ fn a_compose_attached_mirror_is_monitored_under_its_robot_e2e() {
 /// MEASURED with that answer simply RECORDED onto the
 /// tap at attach time: the row reads `robot: "ubuntu"` for a topic this desk is
 /// publishing itself, and 12 s of `discover` + `list` polling past the 3 s TTL does
-/// not clear it — because once the record exists the HELD half of
-/// `attribution_snapshot` re-asserts it to `list`/`status`/`discover` forever.
+/// not clear it, because once the record exists the authoritative per-tap half
+/// of `attribution_snapshot` re-asserts it to `list`/`status`/`discover` forever.
 /// Affirmatively WRONG (worse than absent), permanent, and on every surface at
 /// once. Both seams share the exposure: `attach` reproduces it identically.
 ///
@@ -13499,8 +13499,8 @@ fn a_snapshot_past_its_ttl_is_not_adopted_and_a_real_gather_withdraws_the_hint_e
         "precondition: the held row is attributed to ubuntu"
     );
 
-    // The retirement + the name reuse, then let the snapshot AGE OUT. Only the four
-    // attribution-asking verbs gather and `monitors` is not one of them, so polling
+    // The retirement + the name reuse, then let the snapshot AGE OUT. Only
+    // `discover` and a local `attach` gather, and `monitors` is neither, so polling
     // it cannot refresh the cache: the staleness here is deterministic.
     mgr.unregister_mirror_provenance(reused)
         .expect("unregister the retired mirror's provenance");
@@ -13574,8 +13574,8 @@ fn a_snapshot_past_its_ttl_is_not_adopted_and_a_real_gather_withdraws_the_hint_e
 /// and fail this arm.
 ///
 /// COLD IS DETERMINISTIC on this daemon, and the assertion rests on that: only the
-/// four control handlers that ask for attribution — `discover`, `list`, `status`,
-/// `attach_local` — populate `mirror_provenance`, and nothing on the poll thread
+/// two control handlers that refresh attribution, `discover` and `attach_local`,
+/// populate `mirror_provenance`, and nothing on the poll thread
 /// does. So a compose issued as the FIRST request of a fresh daemon reads an empty
 /// cache by construction. (If a boot-time gather is ever added, this arm flips and
 /// says so, which is the correct outcome — the cost contract would have changed.)

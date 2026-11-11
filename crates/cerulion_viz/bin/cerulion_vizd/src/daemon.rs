@@ -885,7 +885,7 @@ struct DaemonState {
     /// A short-TTL CACHE of the mirror-provenance snapshot (topic to origin
     /// robot), with its gather stamp and invalidation generation (see
     /// [`ProvenanceCache`]). While nothing invalidates it, the TTL bounds
-    /// back-to-back refreshes to one 150-600 ms `/__cerulion/mirrors` gather per TTL
+    /// back-to-back refreshes to one `/__cerulion/mirrors` gather per TTL
     /// while a mirror is live (the cerulion_core registry fast path only
     /// short-circuits a desk with no registry writer); a refresher polled slower
     /// than the TTL gathers on every poll. `discover` and the local `attach` reply
@@ -1002,8 +1002,9 @@ impl DaemonState {
     /// and compose or attach it before [`PROVENANCE_CACHE_TTL`] expires. MEASURED on
     /// that shape — the row read `robot: "ubuntu"` for a topic this desk was
     /// publishing itself, and it never healed, because once the record exists the
-    /// HELD half of `attribution_snapshot` re-asserts it to `list`/`status`/`discover`
-    /// forever. Worse than `None`, and on every surface at once.
+    /// authoritative per-tap half of `attribution_snapshot` re-asserts it to
+    /// `list`/`status`/`discover` forever. Worse than `None`, and on every surface
+    /// at once.
     ///
     /// There is no cheap way to CORROBORATE the map at stamp time: the registry's
     /// entire read surface is `gather_mirror_provenance{,_checked}`, both of which
@@ -1015,13 +1016,14 @@ impl DaemonState {
     ///
     /// # The bound, stated exactly
     ///
-    /// A wrong hint survives until the cached snapshot is REPLACED, which needs a
-    /// verb that gathers (`discover` / `list` / `status` / `attach_local`) to run past
-    /// the TTL — then at most one sampling interval more. On a live Studio, which
-    /// polls the sidebar every ~2 s, that is a few seconds. With NOTHING polling those
-    /// verbs it does not converge at all; the accurate reading is that the attribution
-    /// is only as fresh as the last question anyone asked, which is the same contract
-    /// `list` and `status` already serve under.
+    /// A wrong hint survives until the cached snapshot is REPLACED by a fresh
+    /// gather, which only a refreshing verb (`discover`, or the local `attach`
+    /// reply) makes, once the snapshot is past the TTL or invalidated; then at most
+    /// one sampling interval more. On a live Studio, which polls `discover` on its
+    /// own, that is a few seconds. With NOTHING calling those verbs it does not
+    /// converge at all: the attribution is only as fresh as the last refreshing
+    /// question anyone asked, which is the same contract `list` and `status` serve
+    /// under, since they read the stored snapshot and never gather.
     ///
     /// A STALE snapshot is HELD, never treated as an absence: expiry means "nobody has
     /// asked recently", not "the mirror is gone", and clearing on it would flap every
@@ -1069,21 +1071,26 @@ fn hint_refresh_target(
     Some(live.map(str::to_string))
 }
 
-/// How long a cached mirror-provenance snapshot stays fresh before
-/// `discover` re-gathers it. 3 s comfortably spans the ~2 s sidebar poll (so alternate
-/// polls are O(1)) while bounding staleness to one poll cycle: a topic that just became
-/// a mirror (or a torn-down one) is correctly grouped within one refresh. External
-/// mirror mutations (another desk consumer, `topic echo`) converge within the TTL; the
-/// user's OWN attach/detach are reflected immediately via cache invalidation.
+/// How long a cached mirror-provenance snapshot stays fresh before `discover` or
+/// a local `attach` gathers it again; `list` and `status` serve it at any age and
+/// never gather. While nothing invalidates, 3 s bounds back-to-back refreshes to
+/// one gather per TTL, and a refresher polled slower than the TTL gathers on every
+/// poll; either way a topic that just became a mirror (or a torn-down one) is
+/// correctly grouped within one gather. External mirror mutations (another desk
+/// consumer, `topic echo`) converge on the first refreshing verb after the TTL;
+/// the user's OWN remote attach and detach drop their topic at once through
+/// invalidation.
 ///
 /// `pub` because the e2e suite must
 /// DERIVE its attribution-convergence bound from this number rather than
 /// re-spell it. A gather that misses the record is cached exactly like a real
 /// snapshot (see `Ctx::gather_mirror_provenance` — deliberate, so a transient
-/// registry error cannot re-storm the gather), so a mirror can legitimately read
-/// as a LOCAL topic for up to one whole TTL. Two tests hard-coded budgets that
-/// did not account for that — one polled for 4 s against this 3 s, the other did
-/// not poll at all — and a contended macOS runner outran both. A test bound
+/// registry error cannot re-storm the gather), so on the refreshing verbs a mirror
+/// can legitimately read as a LOCAL topic for up to one whole TTL, and on `list`
+/// and `status` until a refreshing verb gathers after the TTL. Two tests
+/// hard-coded budgets that did not account for that (one polled for 4 s against
+/// this 3 s, the other did not poll at all), and a contended macOS runner outran
+/// both. A test bound
 /// written as a multiple of this constant cannot silently fall under it again if
 /// the TTL is ever raised.
 pub const PROVENANCE_CACHE_TTL: Duration = Duration::from_secs(3);
@@ -4907,9 +4914,10 @@ impl Ctx {
     }
 
     /// The CURRENT mirror-provenance snapshot as a `topic → origin robot`
-    /// map, served from a short-TTL CACHE ([`DaemonState::mirror_provenance`]) so a live
-    /// mirror does not cost `discover` a 150-600 ms gather on every poll. On a cache
-    /// MISS (never filled, invalidated, or older than [`PROVENANCE_CACHE_TTL`]) it
+    /// map, served from a short-TTL CACHE ([`DaemonState::mirror_provenance`]) so
+    /// back-to-back refreshing reads with a live mirror pay at most one gather per
+    /// TTL. On a cache MISS (never filled, invalidated, or older than
+    /// [`PROVENANCE_CACHE_TTL`]) it
     /// re-gathers from the desk's
     /// `/__cerulion/mirrors` registry over THIS daemon's transport node (the parity of
     /// the CLI's `topic_cmd::gather_mirror_provenance`) and stores the fresh snapshot,
@@ -4974,11 +4982,11 @@ impl Ctx {
     /// The attribution map EVERY sidebar surface reads — `discover`'s
     /// enumeration fold and the `list`/`status` attach-state rows.
     ///
-    /// It is the live `/__cerulion/mirrors` snapshot merged with the ORIGIN ROBOT
-    /// each currently-held tap recorded for ITSELF at attach ([`TopicStat`]'s
+    /// It is the stored or refreshed `/__cerulion/mirrors` snapshot merged with the
+    /// ORIGIN ROBOT each currently-held tap recorded for ITSELF at attach ([`TopicStat`]'s
     /// `origin_robot`). One map for all three surfaces is what makes "one data
     /// source = one topic" structural: they cannot place one topic in two sections,
-    /// because they are reading the same answer. Live provenance wins (see
+    /// because they are reading the same answer. The mirror snapshot wins (see
     /// [`cerulion_core::transport::mirror_registry::merge_attribution`]).
     ///
     /// The per-tap half matters because the live gather is BEST-EFFORT and cached:
