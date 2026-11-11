@@ -97,6 +97,10 @@ pub struct StreamPreamble {
 
 /// A control-stream request (desk → robot), length-prefixed JSON. The `verb` tag
 /// dispatches; each verb is answered with a [`WireResponse`].
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum WireRequest {
@@ -106,6 +110,9 @@ pub enum WireRequest {
     Demand {
         /// The canonical absolute topic to stream.
         topic: String,
+        /// Canonical graph import; absent/false preserves observer queue semantics.
+        #[serde(default, skip_serializing_if = "is_false")]
+        graph_ingress: bool,
     },
     /// Drop the tap for `topic` (its uni stream ends). An un-demanded topic costs
     /// nothing.
@@ -782,7 +789,10 @@ async fn handle_request(
                 },
             }
         }
-        WireRequest::Demand { topic } => {
+        WireRequest::Demand {
+            topic,
+            graph_ingress,
+        } => {
             // Per-topic demand authorization. The accept gate already admitted
             // this connection (paired CAP_OBSERVE); the demand authorizer adds per-topic
             // granularity — a topic the DEMANDER (the connection's authenticated remote
@@ -813,7 +823,7 @@ async fn handle_request(
                     }
                 }
             };
-            let schemas = match &plane.local_schemas {
+            let schemas = match plane.local_schemas.as_ref().filter(|_| graph_ingress) {
                 Some(source) => match source.load(manager.iox_shm_identity()).await {
                     Ok(schemas) => Some(schemas),
                     Err(error) => {
@@ -832,7 +842,7 @@ async fn handle_request(
                 .as_ref()
                 .and_then(|schemas| schemas.egress_qos(&topic));
             match taps
-                .demand_with_qos(&manager, connection, &topic, qos)
+                .demand_with_qos(&manager, connection, &topic, qos, graph_ingress)
                 .await
             {
                 Ok(()) => WireResponse::DemandAccepted { topic },
@@ -1062,6 +1072,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&WireRequest::Demand {
+                graph_ingress: false,
                 topic: "/imu".to_string()
             })
             .unwrap(),
@@ -1080,6 +1091,7 @@ mod tests {
         for req in [
             WireRequest::Catalog,
             WireRequest::Demand {
+                graph_ingress: false,
                 topic: "/a".to_string(),
             },
             WireRequest::Undemand {

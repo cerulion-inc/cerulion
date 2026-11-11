@@ -655,6 +655,7 @@ async fn demand_topic(
         send,
         recv,
         &WireRequest::Demand {
+            graph_ingress: false,
             topic: topic.to_string(),
         },
         timeout,

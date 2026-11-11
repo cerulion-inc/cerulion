@@ -36,7 +36,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
-- Wire graphs honor Reliable/send_queue; unknown stays unknown, best-effort refuses. Separate refusal counter; checked producer counts.
+- Graph imports require Reliable/send_queue and one writer. Observers keep best-effort/all writers; proxies preserve the import flag.
 - Same-user outbound reuses endpoint/runtime/node; refuse key/namespace mismatch before dialing, retire only outbound sessions.
 
 ## Testing

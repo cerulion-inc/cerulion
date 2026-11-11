@@ -256,3 +256,7 @@ frames in order, and exposes `wan_refused` separately from `wan_dropped`.
 A source without policy metadata is unverified for graph ingress.
 Best-effort datagram graph ingress is refused on this wire path.
 Changing a retained topic's queue policy requires restarting `cerulion-netd`.
+
+Observer reads use their existing bounded best-effort queue, including exports
+with BestEffort policy and multiple publishers. The reliable-policy and
+single-writer refusals apply to canonical graph imports.
