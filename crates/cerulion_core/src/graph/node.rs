@@ -2286,27 +2286,30 @@ impl NodeContext {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Install the HOST's process [`TransportManager`] (see the
-    /// `transport` field doc — the context-carried transport contract).
-    /// Called by the runtime BEFORE `init()` moves the context (mirrors
-    /// `Self::set_qos_event_store`); the `Arc` travels with the `Box`
-    /// across the cdylib `init()` FFI. `pub` (not `pub(crate)`) because
-    /// host EMBEDDINGS that hand-roll contexts via
-    /// [`Self::with_runtime_env`] must be able to carry their manager the
-    /// same way (and tests exercise the cdylib contract through it).
+    /// Install the host process transport before native initialization.
+    /// The manager remains host-owned when an opaque stable context is created.
     pub fn set_transport(&mut self, transport: Arc<TransportManager>) {
         self.transport = Some(transport);
     }
 
-    /// The HOST's process [`TransportManager`], carried in this
-    /// context so cdylib nodes never resolve cross-linkage-unit statics (the
-    /// cdylib's own `TransportManager::get()` can NEVER see the host's
-    /// singleton — and `get_or_init()` there would mint a second manager on
-    /// the wrong SHM namespace). `None` only for hand-rolled/test contexts
-    /// that never called [`Self::set_transport`]; every runtime-built
-    /// context carries `Some`.
+    /// Native process transport; stable plugins use opaque raw ingress instead.
     pub fn transport(&self) -> Option<&Arc<TransportManager>> {
         self.transport.as_ref()
+    }
+
+    /// Raw-ingress factory backed by this context's existing process transport.
+    /// Stable plugin contexts expose the same local API over host-owned handles.
+    // hot-path-alloc-ok-fn: missing native factory allocates a diagnostic only on refusal.
+    pub fn raw_ingress(&self) -> TransportResult<crate::graph::node_plugin_abi::RawIngress> {
+        self.transport
+            .as_ref()
+            .map(|transport| {
+                crate::graph::node_plugin_abi::RawIngress::native(Arc::clone(transport))
+            })
+            .ok_or_else(|| TransportError::NodeError {
+                node_id: "raw ingress".into(),
+                reason: "node context carries no process transport for raw ingress".into(),
+            })
     }
 
     /// Take the edge-triggered [`ExpectWithinEvent`]

@@ -1861,7 +1861,6 @@ fn gen_cdylib(
                         r#"{{"name":"{}","schema_hash":{}{}}}"#,
                         #input_field_names,
                         <#input_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
-
                         #input_key_suffixes,
                     ));
                 )*

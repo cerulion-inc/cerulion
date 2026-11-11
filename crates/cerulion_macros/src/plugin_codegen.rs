@@ -16,11 +16,13 @@ pub(crate) fn generate(
 ) -> TokenStream {
     let root = crate_root::root();
     let input_types = inputs.iter().map(|input| &input.field_type);
-    let output_types = outputs.iter().map(|output| &output.field_type);
-    let accumulate_caps = inputs.iter().map(|input| match input.accumulate {
-        Some(cap) => quote!(Some(#cap)),
+    let input_caps = inputs.iter().map(|input| match input.accumulate {
+        Some(cap) => {
+            quote!(Some(#cap))
+        }
         None => quote!(None),
     });
+    let output_types = outputs.iter().map(|output| &output.field_type);
     let register = crate::input_accumulate::register_calls_for(inputs, &quote! { instance });
     let required = if inputs.iter().any(|input| input.accumulate.is_some()) {
         quote!(#root::node_abi::capability::ACCUMULATE)
@@ -220,7 +222,7 @@ pub(crate) fn generate(
                         INFO_JSON.get_or_init(__cer_build_info_json).as_c_str(),
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#input_types>()),*],
                         &[#(#root::graph::node_plugin_abi::HostClient::request::<#output_types>()),*],
-                        &[#(#accumulate_caps),*],
+                        &[#(#input_caps),*],
                     ).expect("generated wire facts match the common metadata")
                 }).as_bytes();
                 // hot-path-alloc-ok: bootstrap owns one immutable table for the library lifetime.
