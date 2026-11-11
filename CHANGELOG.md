@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A `cerulion graph run --record` shorter than one checkpoint interval (15 s by default) no longer ends with the warning `bagd checkpoint coverage INCOMPLETE ... some node ended the run with NO anchor`. The recorder opened each worker's node-state ring at its current write position when it found the ring, so the step-0 checkpoint each worker writes just before that was never in the bag. A recorder that is running when the graph starts now reads each ring from its start, as it already did for a ring named on its command line, so the bag keeps every node's step-0 checkpoint. A `cerulion bag record --run` that attaches to a graph already running still starts at the current position and still warns when a node has no checkpoint in its bag.
+- `cerulion bag play --resim` of a multi-process recording no longer warns `absolute source is inside this graph's own prefix namespace but matches no declared output` about a correct edge between two processes, such as the obstacle avoidance starter's `safety_controller` input fed by `laser_scanner`. The replay re-executes each recorded process against its own part of the graph and now tells it which topics the other processes produce, as `graph run` already tells each worker. A source no process produces still warns.
 
 ## [2.0.0] - 2026-11-11
 

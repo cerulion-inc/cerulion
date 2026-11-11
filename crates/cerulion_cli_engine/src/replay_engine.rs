@@ -4454,7 +4454,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 &transport,
                 &clock,
                 schema_hashes.as_ref(),
-                pass_wiring(&burst_floors, &verification.depth_floors),
+                pass_wiring(
+                    &burst_floors,
+                    &verification.depth_floors,
+                    plan.sibling_produced(),
+                ),
                 &wiring,
             ) {
                 Ok(runtime) => runtime,
@@ -8079,12 +8083,19 @@ fn build_replay_context(
 /// per `(node, input)` the depth a bag-fed input's subscriber is built at when
 /// its steered schedule holds more frames than it declares
 /// (`PassVerification::depth_floors`). An empty map adds nothing.
+///
+/// `sibling_topics` is the rank's [`RankPlan::sibling_produced`]: the topics
+/// another rank produces for this one, handed to the pass's validation exactly
+/// as a live worker hands its plan's set, so a correct cross-rank edge is not
+/// reported as a possible typo. It changes no wiring.
 fn pass_wiring<'a>(
     burst_floors: &'a BTreeMap<String, cerulion_core::transport::TopicRequirements>,
     depth_floors: &'a BTreeMap<(String, String), usize>,
+    sibling_topics: &'a cerulion_core::graph::SiblingProducedTopics,
 ) -> cerulion_core::graph::CrossProcessWiring<'a> {
     let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
-    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning);
+    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning)
+        .with_sibling_topics(sibling_topics);
     if depth_floors.is_empty() {
         wiring
     } else {

@@ -29084,6 +29084,72 @@ fn a_two_rank_free_run_bag_with_per_edge_rims_still_verifies() {
     assert_clean_verdict(&outcome, "free-run bag stating per-edge rims");
 }
 
+/// A two-rank FREE-RUN resim does not call the consuming rank's correct
+/// cross-rank sources possible typos.
+///
+/// `fusion` (rank 1) reads `prod_a/out` and `prod_b/out` (rank 0), written
+/// relative, the starter graph's shape. The per-rank split absolutizes both and
+/// drops their producers from rank 1's view, so the pass build re-validated a
+/// graph whose two in-prefix sources had no producer and warned "matches no
+/// declared output" once per source on every verify of a multi-process
+/// recording. The live worker hands the same view its sibling set; the pass now
+/// does too.
+///
+/// The positive half proves the rank-1 pass was BUILT and ran (its two edges were
+/// compared), so the absence below cannot pass on a pass that never validated.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_two_rank_free_run_resim_does_not_call_a_correct_cross_rank_source_a_typo() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("free_run_cross_rank_sources.mcap");
+    let staging = |rank: u32| -> Option<serde_json::Value> {
+        (rank == 1)
+            .then(|| serde_json::json!({ "capacities": { "fusion": [[0, 0, 64], [1, 0, 64]] } }))
+    };
+    write_sy_bag_overridden(
+        rec,
+        &bag,
+        |_| {},
+        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        None,
+        Some(&staging),
+    );
+
+    let outcome = replay(&bag, sy_bounded_factories, None, None).expect("replay runs");
+    assert_eq!(
+        outcome.coordination.mode,
+        replay_engine::CoordinationMode::FreeRun
+    );
+    assert_clean_verdict(&outcome, "two-rank free-run bag");
+    match outcome.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(
+                edges_compared, 2,
+                "rank 1's two edges: {:?}",
+                outcome.read_log
+            );
+        }
+        other => panic!("the rank-1 pass must have run and compared its edges: {other:?}"),
+    }
+
+    logs_assert(|lines: &[&str]| {
+        let typo_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("matches no declared output"))
+            .collect();
+        if typo_lines.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "a correct cross-rank source was reported as a possible typo: {typo_lines:?}"
+            ))
+        }
+    });
+}
+
 /// **The PRODUCTION shape whose decline must be
 /// reported under its own cause.**
 ///
