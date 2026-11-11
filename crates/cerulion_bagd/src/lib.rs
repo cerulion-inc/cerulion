@@ -12756,6 +12756,7 @@ impl Recorder {
             return;
         };
         let held = std::mem::take(&mut self.state_ring_names);
+        let attached_mid_run = self.cfg.attached_mid_run;
         // The probe is a NAME EXISTENCE question, answered by the open itself:
         // the sweep needs to know which ranks answered, and a rank whose ring is
         // present but unopenable (a truncated or wrong-policy segment) is a rank
@@ -12780,10 +12781,21 @@ impl Recorder {
             if !cerulion_core::shm_ring::shm_object_exists(&name) {
                 return false;
             }
-            // A ring created by a live rank is being written RIGHT NOW, so the
-            // live cursor is the only sound attach: its head anchor is partial by
+            // The SAME open policy as a declared ring (`run_bagd`'s setup): a
+            // recorder that is present from the run's start reads every ring from
+            // record 0, so an anchor a rank published before this sweep found its
+            // ring (the step-0 anchor, taken a few hundred ms before the first
+            // sweep) is in the bag. Record 0 starts an anchor: the producer checks
+            // `free_records` before every anchor, so a backpressure ring is never
+            // lapped before its first consumer. Only a MID-RUN attach takes the
+            // live cursor, the one sound attach: its head anchor is partial by
             // construction and `StateAnchorLedger::for_open` discards it.
-            match StateRingConsumer::open_at_live(&name) {
+            let opened_ring = if attached_mid_run {
+                StateRingConsumer::open_at_live(&name)
+            } else {
+                StateRingConsumer::open(&name)
+            };
+            match opened_ring {
                 Ok(c) => opened.push((rank, name, c)),
                 Err(e) => refused.push((name, e.to_string())),
             }
@@ -12858,6 +12870,7 @@ impl Recorder {
                 rank,
                 generation = consumer.generation(),
                 nodes = consumer.node_ids().len(),
+                opened_at = if attached_mid_run { "live" } else { "start" },
                 "bagd discovered a node-state ring by its (arm tag, rank) name"
             );
             // Declared BEFORE the ring is handed anywhere —
@@ -12868,11 +12881,11 @@ impl Recorder {
             }
             let ring = SendStateRing {
                 ring: consumer,
-                ledger: StateAnchorLedger::for_open(true),
-                // A DISCOVERED ring is always opened at the live cursor, so its
-                // harvester is armed on exactly the same evidence its ledger is —
-                // one `attached_mid_run` fact, two readers, never two guesses.
-                anchors: self.anchor_harvester(true),
+                ledger: StateAnchorLedger::for_open(attached_mid_run),
+                // Paired with the ring's OPEN policy above, exactly as the ledger
+                // is: one `attached_mid_run` fact, three readers, never two
+                // guesses.
+                anchors: self.anchor_harvester(attached_mid_run),
                 declared_name: name,
                 discovered: true,
             };

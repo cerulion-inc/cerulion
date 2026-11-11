@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A `cerulion graph run --record` shorter than one checkpoint interval (15 s by default) no longer ends with the warning `bagd checkpoint coverage INCOMPLETE ... some node ended the run with NO anchor`. The recorder opened each worker's node-state ring at its current write position when it found the ring, so the step-0 checkpoint each worker writes just before that was never in the bag. A recorder that is running when the graph starts now reads each ring from its start, as it already did for a ring named on its command line, so the bag keeps every node's step-0 checkpoint. A `cerulion bag record --run` that attaches to a graph already running still starts at the current position and still warns when a node has no checkpoint in its bag.
+
 ## [2.0.0] - 2026-11-11
 
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. This release changes the command line in ways a script written for 1.x notices, among them the output of `cerulion topic echo` and how `cerulion graph run` runs a graph by default (see Changed), so it is a major version. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 31 (see Changed).
