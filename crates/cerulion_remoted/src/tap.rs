@@ -221,7 +221,11 @@ impl TapManager {
                 reason: e.to_string(),
             })?;
 
-        if graph_ingress && tap.publisher_count() != 1 {
+        // Principle #4: declared imports need a service that prevents a second
+        // writer joining after admission. Keep policy-unknown raw compatibility.
+        if graph_ingress
+            && (tap.publisher_count() != 1 || (qos.is_some() && tap.max_publishers() != 1))
+        {
             return Err(WireError::DemandFailed {
                 topic: topic.to_owned(),
                 reason: "authenticated graph ingress requires exactly one live producer".into(),

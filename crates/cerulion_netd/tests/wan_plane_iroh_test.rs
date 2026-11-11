@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The iroh WAN [`IrohMirrorPlane`] / [`DualMirrorPlane`] end-to-end
-//! over REAL loopback iroh endpoints + REAL iceoryx2 (DISTINCT per-test SHM roots for
-//! the robot and the desk — parallel-safe, no `#[serial]`).
+//! over real loopback iroh and iceoryx2 with distinct robot and desk SHM roots.
+//! CLI fixtures share the global manager; run with `-- --test-threads=1`.
 //!
 //! The headline: an in-process ROBOT (`cerulion_remoted::WirePlane` +
 //! `PairingAuthorizer` over SHM root A, a real producer publishing hand-oracle
@@ -19,7 +19,7 @@
 //! Whole file `#![cfg(feature = "wan")]`. `wan` is DEFAULT-ON, so `cargo test -p
 //! cerulion_netd` already compiles this file; `--no-default-features` compiles it to
 //! nothing. Run it explicitly with
-//! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test`.
+//! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- --test-threads=1`.
 #![cfg(feature = "wan")]
 
 use std::collections::HashMap;

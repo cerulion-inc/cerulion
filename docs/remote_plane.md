@@ -114,7 +114,9 @@ While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 A graph with declared `ingress:` can pull an exported topic from a unique
 same-account or explicitly paired producer over the authenticated remote plane.
 The receiving graph checks the declared topic, schema, QoS and single-writer
-rules. The producer serves its stream; the consumer does not send arbitrary data
+rules. Declared imports require a native service provisioned for one publisher;
+a multi-publisher service is refused even with only one live writer. The
+producer serves its stream; the consumer does not send arbitrary data
 frames to the producer. A machine can serve and consume through the same owned
 endpoint. This is distinct from the ops `topic-publish` verb and its capability
 and e-stop checks.

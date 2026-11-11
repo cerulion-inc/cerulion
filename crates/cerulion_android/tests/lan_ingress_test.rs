@@ -541,10 +541,27 @@ fn lan_run(
 ) {
     let paired = run == "paired";
     let config = if paired {
-        json!({
+        let declared = json!({
             "graph_yaml": graph_yaml("relay"),
             "listen": [format!("tcp/127.0.0.1:{port}")],
             "ingress": [ingress, other],
+        });
+        assert!(matches!(
+            runtime.start(&declared.to_string()),
+            Err(cerulion_android::error::EmbedError::InvalidArgument(message))
+                if message == "authenticated graph ingress is unavailable in this embedded host; use the explicit open LAN compatibility path"
+        ));
+        assert_eq!(demand_set_size(), 0, "a refused start retains no demand");
+        assert_eq!(
+            runtime.status_handle().lock().unwrap().state,
+            RuntimeState::Failed
+        );
+        assert!(!is_ingress_registered(ingress));
+        assert!(!is_ingress_registered(other));
+        // A paired run without imports still refuses unauthenticated LAN data.
+        json!({
+            "graph_yaml": graph_yaml("relay"),
+            "listen": [format!("tcp/127.0.0.1:{port}")],
         })
     } else {
         json!({

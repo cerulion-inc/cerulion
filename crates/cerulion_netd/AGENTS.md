@@ -41,7 +41,7 @@ One gateway/zenoh session per host; refcounted NDJSON demands. Injected spies pr
 - Release removes debug; operator outcomes use info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is reader-only: no peers.json writes.
 
 ## Testing
-- `cargo test -p cerulion_netd` is parallel-safe; keep `--no-default-features` green.
+- Tests: `-- --test-threads=1` (CLI shares SHM); `--no-default-features` green.
   Oracles are COUNTS, never wall clocks.
 - `wan_plane_iroh_test owner_pair::controller` wants `-- --test-threads=1`.
 - `wan_plane_iroh_test automatic_cli` needs `cargo build -p cerulion_cli` first;

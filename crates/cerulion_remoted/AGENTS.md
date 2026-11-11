@@ -27,7 +27,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
-- Bound/sanitize peer error/log text at entry (`sanitize_peer_text`).
+- Sanitize/bound peer text at entry (`sanitize_peer_text`).
 - Desk key files are exactly 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
@@ -36,7 +36,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
-- Graph imports require Reliable/send_queue and one writer. Observers keep best-effort/all writers; proxies preserve the import flag.
+- Declared imports require Reliable/send_queue, native capacity one and one live writer. Observers keep best-effort/all writers; proxies preserve the import flag.
 - Same-user outbound reuses endpoint/runtime/node; refuse key/namespace mismatch before dialing, retire only outbound sessions.
 
 ## Testing
@@ -44,7 +44,7 @@ One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing
   limit a parallel run hits iceoryx service/port errors.
 - The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
   e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
-- remoted/link cold-compile iroh. remoted/connectd/wireclient/link/accountd are OUT of default-members: build with `-p`.
+- remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p` (not default-members).
 
 Deep reference: docs/internals/remote-access.md, before touching the verb table,
 trust persistence, the wire plane, pairing formats or epoch delivery.

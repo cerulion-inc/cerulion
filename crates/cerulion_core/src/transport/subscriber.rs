@@ -1001,6 +1001,17 @@ impl DataOnlySubscriber {
         self.data_service.dynamic_config().number_of_publishers() as u32
     }
 
+    /// The native service's publisher capacity, fixed when the service is created.
+    ///
+    /// Principle #4: a declared graph import requires capacity one so a second
+    /// writer cannot join after admission. A live count of one does not establish
+    /// that invariant on a multi-publisher service. This static read allocates no
+    /// memory and opens no additional port.
+    pub fn max_publishers(&self) -> usize {
+        use iceoryx2::prelude::PortFactory as _;
+        self.data_service.static_config().max_publishers()
+    }
+
     /// Returns the topic name.
     pub fn topic(&self) -> &str {
         &self.topic
