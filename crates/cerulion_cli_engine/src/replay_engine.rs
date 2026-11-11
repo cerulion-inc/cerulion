@@ -131,7 +131,7 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
 
 /// The fixed head of every resim's PRIVATE iceoryx2 prefix
-/// (`{RESIM_NAMESPACE_MARKER}{pid:08x}_`, see [`resim_namespace_prefix`]).
+/// (`{RESIM_NAMESPACE_MARKER}{slot:08x}_`, see [`resim_namespace_prefix`]).
 ///
 /// A resim publishes the frames it re-executes and the recorded external
 /// inputs it re-injects under the recording's own topic names, and its
@@ -146,33 +146,34 @@ pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
 /// listing of one namespace never reaches another's files.
 pub const RESIM_NAMESPACE_MARKER: &str = "cer_resim_";
 
-/// The private iceoryx2 prefix of the resim running as process `pid`.
+/// How many resim namespaces a machine has. A resim runs on the slot it holds
+/// ([`claim_resim_slot`]), so at most this many resims run at once, and the
+/// files resims leave behind belong to at most this many namespaces.
+const RESIM_NAMESPACE_SLOTS: u32 = 256;
+
+/// The private iceoryx2 prefix of resim namespace slot `slot`.
 ///
-/// The pid is rendered as exactly eight lowercase hex digits (every `u32`
+/// The slot is rendered as exactly eight lowercase hex digits (every `u32`
 /// fits), so every resim prefix has the same length and none is a strict
 /// prefix of another: iceoryx2 lists a namespace's nodes by string-prefix
-/// match, and prefixes of different lengths would let one resim's listing reach
-/// another's node files. Two resims running at once have different pids, so
-/// each runs on its own namespace.
+/// match, and prefixes of different lengths would let one slot's listing reach
+/// another's files. One process at a time holds a slot, so two resims running
+/// at once never share a namespace.
 ///
 /// Nothing the run records or reports carries this prefix: it names files, and
 /// a topic's iceoryx2 service identity is derived from the topic alone.
 #[must_use]
-pub fn resim_namespace_prefix(pid: u32) -> String {
-    format!("{RESIM_NAMESPACE_MARKER}{pid:08x}_")
+pub fn resim_namespace_prefix(slot: u32) -> String {
+    format!("{RESIM_NAMESPACE_MARKER}{slot:08x}_")
 }
 
-/// The pid whose private resim namespace a node-monitor file belongs to.
+/// The resim namespace slot whose [`resim_namespace_prefix`] `file_name`
+/// begins with.
 ///
-/// `Some(pid)` for `{RESIM_NAMESPACE_MARKER}{pid:08x}_{node id}{monitor_suffix}`,
-/// the shape iceoryx2 gives a node's monitor file in a namespace minted by
-/// [`resim_namespace_prefix`]; `None` for any other name, including the
-/// monitor's `_context` and `_owner_lock` companions and every other
-/// namespace's files.
-fn resim_namespace_owner(file_name: &str, monitor_suffix: &str) -> Option<u32> {
-    if monitor_suffix.is_empty() || !file_name.ends_with(monitor_suffix) {
-        return None;
-    }
+/// `None` for every other name: other namespaces' files, and a slot's lock
+/// file (`cer_resim_{slot:08x}.lock`, no `_` after the digits).
+#[must_use]
+pub fn resim_namespace_slot(file_name: &str) -> Option<u32> {
     let rest = file_name.strip_prefix(RESIM_NAMESPACE_MARKER)?;
     let hex = rest.get(..8)?;
     if !rest.get(8..)?.starts_with('_')
@@ -183,16 +184,16 @@ fn resim_namespace_owner(file_name: &str, monitor_suffix: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// The iceoryx2 config of the resim running as `pid`: `base` with the private
+/// The iceoryx2 config of resim namespace slot `slot`: `base` with the private
 /// [`resim_namespace_prefix`]. A resim passes the host's RESOLVED config
 /// (`Config::global_config()`), so an operator's iceoryx2 config file, its root
 /// path included, applies exactly as it does to a live run.
 fn resim_ix_config(
     base: &iceoryx2::config::Config,
-    pid: u32,
+    slot: u32,
 ) -> Result<iceoryx2::config::Config, ReplayError> {
     use iceoryx2::prelude::{FileName, SemanticString};
-    let prefix = resim_namespace_prefix(pid);
+    let prefix = resim_namespace_prefix(slot);
     let file_name = FileName::new(prefix.as_bytes()).map_err(|e| ReplayError::Internal {
         reason: format!(
             "cannot build the resim's private iceoryx2 prefix '{prefix}': iceoryx2 rejects it \
@@ -204,16 +205,279 @@ fn resim_ix_config(
     Ok(ix_config)
 }
 
+/// The directory that holds this machine's shared-memory segment names:
+/// `/dev/shm` on Linux, and on macOS the directory of the state files iceoryx2
+/// keeps one per segment. Segment names do not depend on the iceoryx2 root, so
+/// every namespace with one prefix shares its segment names here, whatever root
+/// its config names. `None` where a resim does not walk segment names.
+#[cfg(target_os = "linux")]
+const SEGMENT_NAME_DIR: Option<&str> = Some("/dev/shm/");
+#[cfg(target_os = "macos")]
+const SEGMENT_NAME_DIR: Option<&str> = Some(crate::shm_state::SHM_STATE_DIRECTORY);
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEGMENT_NAME_DIR: Option<&str> = None;
+
+/// The directory a resim takes its slot lock in: [`SEGMENT_NAME_DIR`], or
+/// `base`'s iceoryx2 root where there is none.
+///
+/// The lock sits where a slot's segment names collide, so its exclusion covers
+/// every process that could share them: two resims whose iceoryx2 configs name
+/// different roots, and two containers that share `/dev/shm` but not `/tmp`,
+/// still take different slots, and a slot's reclaim never removes a segment a
+/// running resim uses.
+fn resim_slot_lock_dir(base: &iceoryx2::config::Config) -> PathBuf {
+    SEGMENT_NAME_DIR.map_or_else(
+        || PathBuf::from(String::from(base.global.root_path())),
+        PathBuf::from,
+    )
+}
+
+/// A resim namespace slot this process holds: its lock file stays open, and
+/// its exclusive `flock` held, until the value is dropped or the process
+/// ends, a crash included (the kernel releases the lock with the descriptor).
+#[derive(Debug)]
+struct ResimSlot {
+    slot: u32,
+    /// Kept only to hold the lock.
+    _lock: std::fs::File,
+}
+
+/// Claim the lowest slot below `slots` whose lock file in `lock_dir`
+/// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
+/// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
+/// the lock is held.
+///
+/// A slot whose lock another process holds, whose lock file cannot be opened
+/// (another user's, say) or that `ready` refuses is passed over, its lock
+/// released. With no slot left the claim is [`ReplayError::Internal`] (exit
+/// 5), naming the directory and the first failure to open or lock a file.
+fn claim_resim_slot(
+    lock_dir: &Path,
+    slots: u32,
+    mut ready: impl FnMut(u32) -> bool,
+) -> Result<ResimSlot, ReplayError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut first_failure: Option<String> = None;
+    for slot in 0..slots {
+        let path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+        let lock = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(lock) => lock,
+            Err(e) => {
+                first_failure.get_or_insert_with(|| format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => continue,
+            Err(e) => {
+                first_failure.get_or_insert_with(|| format!("{}: {e}", path.display()));
+                continue;
+            }
+        }
+        if ready(slot) {
+            return Ok(ResimSlot { slot, _lock: lock });
+        }
+    }
+    Err(ReplayError::Internal {
+        reason: format!(
+            "no resim namespace slot is free: none of the {slots} slot locks in '{}' could be \
+             taken by this process (each is held by a running resim, could not be opened or \
+             locked, or its namespace still holds a node){}",
+            lock_dir.display(),
+            first_failure
+                .map(|failure| format!("; the first that could not be opened or locked: {failure}"))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+/// What reclaiming one slot's namespace found and did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SlotReclaim {
+    /// The dead-node sweep's counts.
+    cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
+    /// Nodes still registered after the sweep; `None` when the registry could
+    /// not be listed.
+    nodes_left: Option<u64>,
+    /// Leftover segments removed.
+    segments_removed: u64,
+    /// Leftover segments that could not be removed.
+    segments_failed: u64,
+}
+
+impl SlotReclaim {
+    /// A resim may start on the slot: its namespace holds no node, and every
+    /// leftover segment the walk reached was removed.
+    fn is_clean(&self) -> bool {
+        self.nodes_left == Some(0) && self.segments_failed == 0
+    }
+}
+
+/// Reclaim the namespace of a slot this process holds, within `budget`,
+/// before a resim starts on it.
+///
+/// A resim's iceoryx2 node lives as long as its process, so every resim
+/// leaves its node registered, and a killed one also leaves the services it
+/// held. The dead-node sweep removes those: their process is gone, so iceoryx2
+/// reads them dead, and only dead nodes are removed. Once no node is left,
+/// every segment in `segment_dir` named with the slot's prefix is removed too:
+/// whatever the sweep did not reach, and the namespace's iceoryx2 management
+/// segment, which iceoryx2 itself never removes. The caller holds the slot's
+/// lock, so no running resim uses any of them. A namespace that still holds a
+/// node keeps its segments. A walk the budget cuts short leaves the rest for
+/// the next resim on the slot.
+fn reclaim_resim_slot(
+    ix_config: &iceoryx2::config::Config,
+    slot: u32,
+    segment_dir: Option<&Path>,
+    budget: Duration,
+) -> SlotReclaim {
+    // Startup hygiene only: the elapsed time bounds how long the reclaim may
+    // delay the resim and never reaches anything the run executes or reports.
+    let started = std::time::Instant::now();
+    let mut reclaim = SlotReclaim {
+        cleaned: cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(
+            ix_config, budget,
+        ),
+        ..SlotReclaim::default()
+    };
+    let mut nodes = 0u64;
+    let listed =
+        iceoryx2::node::Node::<iceoryx2::service::ipc_threadsafe::Service>::list(ix_config, |_| {
+            nodes += 1;
+            iceoryx2::prelude::CallbackProgression::Continue
+        });
+    reclaim.nodes_left = listed.is_ok().then_some(nodes);
+    if reclaim.nodes_left != Some(0) {
+        return reclaim;
+    }
+    let Some(entries) = segment_dir.and_then(|dir| std::fs::read_dir(dir).ok()) else {
+        return reclaim;
+    };
+    for entry in entries.flatten() {
+        if started.elapsed() >= budget {
+            break;
+        }
+        if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
+            continue;
+        }
+        match remove_leftover_segment(&entry.path()) {
+            SegmentRemoval::Removed => reclaim.segments_removed += 1,
+            SegmentRemoval::NotASegment => {}
+            SegmentRemoval::Failed => reclaim.segments_failed += 1,
+        }
+    }
+    reclaim
+}
+
+/// What [`remove_leftover_segment`] did with one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentRemoval {
+    Removed,
+    /// Not a segment (a directory or a link, or on macOS anything but a state
+    /// file), so it was left alone.
+    NotASegment,
+    Failed,
+}
+
+/// Remove one leftover segment of a reclaimed namespace: a regular file, which
+/// on macOS is a state file and goes with the object it names
+/// ([`crate::shm_state::remove_unused_state_file`]).
+fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
+    let is_file = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    #[cfg(target_os = "macos")]
+    let is_segment = is_file
+        && path
+            .to_str()
+            .is_some_and(|p| p.ends_with(crate::shm_state::SHM_STATE_SUFFIX));
+    #[cfg(not(target_os = "macos"))]
+    let is_segment = is_file;
+    if !is_segment {
+        return SegmentRemoval::NotASegment;
+    }
+    #[cfg(target_os = "macos")]
+    let removed =
+        crate::shm_state::remove_unused_state_file(path, &crate::shm_state::LibcProbe).is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let removed = std::fs::remove_file(path).is_ok();
+    if removed {
+        SegmentRemoval::Removed
+    } else {
+        SegmentRemoval::Failed
+    }
+}
+
+/// The slot this process's resims run on: claimed, and its namespace
+/// reclaimed, by the first resim the process starts, then held until the
+/// process ends. The process has one transport, so every resim it runs uses
+/// that one namespace, and a later resim never reclaims the namespace the
+/// transport is running on.
+static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
+
+/// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
+/// claims the lowest free slot whose namespace reclaims clean, within the
+/// startup sweep budget for all the slots it tries.
+fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayError> {
+    let mut held = RESIM_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(running) = held.as_ref() {
+        return Ok(running.slot);
+    }
+    let budget = cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET;
+    // Startup hygiene only, as in `reclaim_resim_slot`.
+    let started = std::time::Instant::now();
+    let lock_dir = resim_slot_lock_dir(base);
+    // The iceoryx2 root a fallback names may not exist before the first node;
+    // a directory that cannot be made fails the claim's first open, by name.
+    let _ = std::fs::create_dir_all(&lock_dir);
+    let mut reclaimed = SlotReclaim::default();
+    let claimed = claim_resim_slot(
+        &lock_dir,
+        RESIM_NAMESPACE_SLOTS,
+        |slot| match resim_ix_config(base, slot) {
+            Ok(ix_config) => {
+                reclaimed = reclaim_resim_slot(
+                    &ix_config,
+                    slot,
+                    SEGMENT_NAME_DIR.map(Path::new),
+                    budget.saturating_sub(started.elapsed()),
+                );
+                reclaimed.is_clean()
+            }
+            Err(_) => false,
+        },
+    )?;
+    tracing::debug!(
+        slot = claimed.slot,
+        cleanups = reclaimed.cleaned.cleanups,
+        deferred = reclaimed.cleaned.deferred,
+        segments = reclaimed.segments_removed,
+        total_failures = reclaimed.cleaned.failed_cleanups,
+        "replay: claimed and reclaimed a resim namespace slot"
+    );
+    let slot = claimed.slot;
+    *held = Some(claimed);
+    Ok(slot)
+}
+
 /// Start the process transport of a resim on the resim's private namespace.
 ///
-/// The cross-process transport is built with [`resim_ix_config`] for this
-/// process, after [`sweep_dead_resim_namespaces`] has reclaimed what earlier
-/// resims left. It is the process singleton (one iceoryx2 node per process), so
-/// every later [`TransportManager::get`] in the run lands on the same private
-/// namespace. The singleton keeps the config of its FIRST initialization, so
-/// the namespace is checked after the call: a transport some earlier code
-/// started on another namespace refuses the run (exit 5) instead of
-/// re-executing onto it.
+/// The cross-process transport is built with [`resim_ix_config`] for the slot
+/// [`process_resim_slot`] holds. It is the process singleton (one iceoryx2
+/// node per process), so every later [`TransportManager::get`] in the run
+/// lands on the same private namespace. The singleton keeps the config of its
+/// FIRST initialization, so the namespace is checked after the call: a
+/// transport some earlier code started on another namespace refuses the run
+/// (exit 5) instead of re-executing onto it.
 ///
 /// The `local-transport` build's transport is in-process only, so nothing
 /// outside the process can attach to it and it keeps the plain initializer.
@@ -226,25 +490,11 @@ fn init_resim_transport(
         }
         cerulion_core::transport::TransportKind::CrossProcess => {
             let base = iceoryx2::config::Config::global_config();
-            let swept = sweep_dead_resim_namespaces(
-                base,
-                cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET,
-            );
-            if swept.namespaces > 0 {
-                tracing::debug!(
-                    namespaces = swept.namespaces,
-                    unswept = swept.unswept,
-                    cleanups = swept.cleaned.cleanups,
-                    total_failures = swept.cleaned.failed_cleanups,
-                    deferred = swept.cleaned.deferred,
-                    "replay: swept the private namespaces earlier resims left"
-                );
-            }
-            let pid = std::process::id();
-            let ix_config = resim_ix_config(base, pid)?;
+            let slot = process_resim_slot(base)?;
+            let ix_config = resim_ix_config(base, slot)?;
             let transport = TransportManager::init_with_config(config, ix_config)
                 .map_err(replay_transport_init_error)?;
-            let expected = resim_namespace_prefix(pid);
+            let expected = resim_namespace_prefix(slot);
             let running = transport.iox_config().global.prefix.to_string();
             if running != expected {
                 return Err(ReplayError::Internal {
@@ -257,245 +507,6 @@ fn init_resim_transport(
             }
             Ok(transport)
         }
-    }
-}
-
-/// What one [`sweep_dead_resim_namespaces`] found and did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ResimNamespaceSweep {
-    /// Resim namespaces with at least one node-monitor file.
-    namespaces: usize,
-    /// Of those, the ones the budget left unswept.
-    unswept: usize,
-    /// The dead-node sweep's counts, summed over the swept namespaces.
-    cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
-}
-
-/// Reclaim what dead resims left in their private namespaces under `base`'s
-/// root, within `budget`.
-///
-/// The process transport lives as long as the process, so a finished resim's
-/// iceoryx2 node is never dropped, and a killed one also leaves every service
-/// it held. The shared-namespace sweeps (`graph run`'s, `cerulion clean`)
-/// list only that namespace's files, so each resim sweeps the resim
-/// namespaces too:
-/// every pid with a resim node-monitor file in `base`'s node directory, in
-/// ascending order, gets the dead-node sweep on its namespace. That sweep
-/// removes only nodes whose process is gone, so a resim still running is left
-/// alone. The budget covers all of them together; a namespace past it waits
-/// for the next resim. Advisory: nothing here fails the resim.
-fn sweep_dead_resim_namespaces(
-    base: &iceoryx2::config::Config,
-    budget: Duration,
-) -> ResimNamespaceSweep {
-    let node_dir = PathBuf::from(String::from(&base.global.node_dir()));
-    let monitor_suffix = base.global.node.monitor_suffix.to_string();
-    let Ok(entries) = std::fs::read_dir(&node_dir) else {
-        return ResimNamespaceSweep::default();
-    };
-    // Sorted and de-duplicated: a namespace holds one monitor file per node.
-    let owners: BTreeSet<u32> = entries
-        .flatten()
-        .filter_map(|entry| resim_namespace_owner(entry.file_name().to_str()?, &monitor_suffix))
-        .collect();
-    let mut sweep = ResimNamespaceSweep {
-        namespaces: owners.len(),
-        ..ResimNamespaceSweep::default()
-    };
-    // Startup hygiene only: the elapsed time bounds how long the sweep may
-    // delay the resim and never reaches anything the run executes or reports.
-    let started = std::time::Instant::now();
-    for pid in owners {
-        let remaining = budget.saturating_sub(started.elapsed());
-        let ix_config = match resim_ix_config(base, pid) {
-            Ok(ix_config) if !remaining.is_zero() => ix_config,
-            _ => {
-                sweep.unswept += 1;
-                continue;
-            }
-        };
-        let swept = cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(
-            &ix_config, remaining,
-        );
-        sweep.cleaned.cleanups += swept.cleanups;
-        sweep.cleaned.failed_cleanups += swept.failed_cleanups;
-        sweep.cleaned.deferred += swept.deferred;
-    }
-    sweep
-}
-
-#[cfg(test)]
-mod resim_namespace_tests {
-    use super::{
-        resim_ix_config, resim_namespace_owner, resim_namespace_prefix,
-        sweep_dead_resim_namespaces, ResimNamespaceSweep, RESIM_NAMESPACE_MARKER,
-    };
-    use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
-    use iceoryx2::node::{Node, NodeBuilder, NodeState};
-    use iceoryx2::prelude::CallbackProgression;
-    use iceoryx2::service::ipc_threadsafe::Service;
-    use std::time::Duration;
-
-    /// iceoryx2's default node-monitor suffix, as a hand-written literal.
-    const MONITOR: &str = ".node_monitor";
-
-    /// Hand oracles: the marker, the pid in exactly eight lowercase hex
-    /// digits, then `_`, at both ends of the `u32` range and at Linux's
-    /// largest `pid_max`.
-    #[test]
-    fn the_private_prefix_is_the_marker_then_the_pid_in_eight_hex_digits() {
-        assert_eq!(resim_namespace_prefix(0), "cer_resim_00000000_");
-        assert_eq!(resim_namespace_prefix(0x1234), "cer_resim_00001234_");
-        assert_eq!(resim_namespace_prefix(4_194_304), "cer_resim_00400000_");
-        assert_eq!(resim_namespace_prefix(u32::MAX), "cer_resim_ffffffff_");
-    }
-
-    /// No resim prefix string-prefixes another resim's, the default
-    /// namespace's, the planning namespace's or iceoryx2's test namespaces',
-    /// in either direction: the property that keeps one namespace's node
-    /// listing out of another's files.
-    #[test]
-    fn no_resim_prefix_lists_another_namespace() {
-        let pids = [
-            0u32,
-            1,
-            0x10,
-            0x123,
-            0x1234,
-            0x00ab_cdef,
-            0x0fff_ffff,
-            u32::MAX,
-        ];
-        let resim: Vec<String> = pids
-            .iter()
-            .map(|&pid| resim_namespace_prefix(pid))
-            .collect();
-        for a in &resim {
-            assert_eq!(a.len(), RESIM_NAMESPACE_MARKER.len() + 9, "{a}");
-            for b in &resim {
-                if a != b {
-                    assert!(!b.starts_with(a.as_str()), "{a} lists {b}'s files");
-                }
-            }
-            for other in ["iox2_", "cer_p_0123456789abcdef", "test_prefix_"] {
-                assert!(
-                    !other.starts_with(a.as_str()) && !a.starts_with(other),
-                    "{a} and {other} overlap"
-                );
-            }
-        }
-    }
-
-    /// iceoryx2 accepts every prefix, and the config keeps the base's root.
-    #[test]
-    fn the_private_config_is_the_base_with_the_private_prefix() {
-        let base = iceoryx2::config::Config::global_config();
-        for pid in [0, 0x1234, u32::MAX] {
-            let ix_config = resim_ix_config(base, pid).expect("a prefix iceoryx2 accepts");
-            assert_eq!(
-                ix_config.global.prefix.to_string(),
-                resim_namespace_prefix(pid)
-            );
-            assert_eq!(
-                String::from(ix_config.global.root_path()),
-                String::from(base.global.root_path())
-            );
-        }
-    }
-
-    /// A resim's monitor file names its pid; every other name, the monitor's
-    /// companions and other namespaces' files included, names none.
-    #[test]
-    fn only_a_resim_monitor_file_names_an_owner() {
-        assert_eq!(
-            resim_namespace_owner("cer_resim_0000abcd_1234567890.node_monitor", MONITOR),
-            Some(0xabcd)
-        );
-        assert_eq!(
-            resim_namespace_owner("cer_resim_ffffffff_1.node_monitor", MONITOR),
-            Some(u32::MAX)
-        );
-        for name in [
-            "cer_resim_0000abcd_1234567890.node_monitor_context",
-            "cer_resim_0000abcd_1234567890.node_monitor_owner_lock",
-            // Upper case: the prefix renders lower case only.
-            "cer_resim_0000ABCD_1234567890.node_monitor",
-            // Seven digits, then the separator.
-            "cer_resim_000abcd_1234567890.node_monitor",
-            // No separator after the eight digits.
-            "cer_resim_0000abcd1234567890.node_monitor",
-            // A sign `u32::from_str_radix` would accept.
-            "cer_resim_+000abcd_1.node_monitor",
-            "iox2_1234567890.node_monitor",
-            "cer_p_0123456789abcdef1234567890.node_monitor",
-            "1234567890",
-            "cer_resim_",
-        ] {
-            assert_eq!(resim_namespace_owner(name, MONITOR), None, "{name}");
-        }
-        assert_eq!(
-            resim_namespace_owner("cer_resim_0000abcd_1.node_monitor", ""),
-            None,
-            "an empty suffix matches nothing"
-        );
-    }
-
-    /// The owner parse inverts the prefix for every pid shape.
-    #[test]
-    fn a_monitor_file_names_the_pid_its_prefix_was_minted_from() {
-        for pid in [0, 1, 0x1234, 0x00ab_cdef, u32::MAX] {
-            let name = format!("{}98765{MONITOR}", resim_namespace_prefix(pid));
-            assert_eq!(resim_namespace_owner(&name, MONITOR), Some(pid), "{name}");
-        }
-    }
-
-    /// The sweep over a REAL node on a resim namespace in an isolated root:
-    /// it finds the namespace, a zero budget sweeps nothing, a live node is
-    /// never reaped, and a node dropped gracefully leaves nothing to find.
-    #[test]
-    fn the_sweep_finds_a_resim_namespace_and_never_reaps_a_live_node() {
-        let root = cerulion_core::testing::IsolatedRoot::mint("rsweep");
-        let base = root.config();
-        let ix_config = resim_ix_config(&base, std::process::id()).expect("the private config");
-        let node = NodeBuilder::new()
-            .config(&ix_config)
-            .create::<Service>()
-            .expect("a live node on the resim namespace");
-
-        assert_eq!(
-            sweep_dead_resim_namespaces(&base, Duration::ZERO),
-            ResimNamespaceSweep {
-                namespaces: 1,
-                unswept: 1,
-                cleaned: BoundedCleanup::default(),
-            },
-            "a zero budget finds the namespace and sweeps nothing"
-        );
-        assert_eq!(
-            sweep_dead_resim_namespaces(&base, Duration::from_secs(10)),
-            ResimNamespaceSweep {
-                namespaces: 1,
-                unswept: 0,
-                cleaned: BoundedCleanup::default(),
-            },
-            "a live node is not dead, so nothing is removed"
-        );
-        let mut alive = 0usize;
-        Node::<Service>::list(&ix_config, |state| {
-            if matches!(state, NodeState::Alive(_)) {
-                alive += 1;
-            }
-            CallbackProgression::Continue
-        })
-        .expect("list the resim namespace");
-        assert_eq!(alive, 1, "the swept node is still alive");
-
-        drop(node);
-        assert_eq!(
-            sweep_dead_resim_namespaces(&base, Duration::from_secs(10)),
-            ResimNamespaceSweep::default(),
-            "a gracefully dropped node leaves no monitor file"
-        );
     }
 }
 
@@ -8388,13 +8399,12 @@ fn build_replay_context(
             // The resume plan: after the load (so `NodeLoad` keeps precedence),
             // before the transport (so its seeds reach publisher creation).
             let resume = resolve_resume()?;
-            // Smart, dead-node-only cleanup (the `graph_run` precedent) — live
-            // sibling Cerulion processes are untouched.
-            let _ = crate::ipc_cleanup::cleanup_dead_iceoryx2_nodes();
             let clock = Arc::new(VirtualClock::new());
             // On the resim's PRIVATE namespace (`init_resim_transport`), so no
             // live graph, recorder or network daemon on this host receives
             // the frames it re-executes or the recorded inputs it re-injects.
+            // The resim opens nothing on the shared namespace, so it sweeps
+            // only its own slot's namespace (`reclaim_resim_slot`).
             let transport = init_resim_transport(cerulion_core::TransportConfig {
                 node_name: format!("{REPLAY_NODE_NAME_PREFIX}{}", config.identity()),
                 clock: clock.clone(),
@@ -33132,5 +33142,444 @@ mod unlisted_macro_output_tests {
     fn a_hand_written_node_output_the_embedded_graph_does_not_list_is_not_refused() {
         let info = NodeInfo::from_names(vec![], vec!["echo".to_string()]);
         assert!(refuse_unlisted_macro_output(&subgraph(), &entries(info)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod resim_namespace_tests {
+    use super::{
+        claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
+        resim_namespace_slot, ResimSlot, SlotReclaim, RESIM_NAMESPACE_MARKER,
+        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+    };
+    use cerulion_core::testing::IsolatedRoot;
+    use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
+    use iceoryx2::node::{Node, NodeBuilder, NodeState};
+    use iceoryx2::prelude::CallbackProgression;
+    use iceoryx2::service::ipc_threadsafe::Service;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// What the child below prints once it holds its node and publisher.
+    const CHILD_READY: &str = "resim slot child holds a publisher";
+
+    /// A slot no claim reaches (at or above [`RESIM_NAMESPACE_SLOTS`]), distinct
+    /// per test process and per `index`, so no resim on the machine and no
+    /// concurrent run of these tests shares its segment names.
+    fn unclaimable_slot(index: u32) -> u32 {
+        RESIM_NAMESPACE_SLOTS + std::process::id() * 4 + index
+    }
+
+    /// Every file under `dir`, `depth` levels down, named with `slot`'s prefix.
+    fn files_of_slot(dir: &Path, slot: u32, depth: usize) -> BTreeSet<PathBuf> {
+        let mut found = BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_str().and_then(resim_namespace_slot) == Some(slot) {
+                found.insert(path.clone());
+            }
+            if depth > 1 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                found.extend(files_of_slot(&path, slot, depth - 1));
+            }
+        }
+        found
+    }
+
+    /// Every file of `slot`'s namespace: under the isolated root (three levels
+    /// reach a node's `<prefix>node.details`) and among this machine's segment
+    /// names.
+    fn namespace_files(root: &IsolatedRoot, slot: u32) -> BTreeSet<PathBuf> {
+        let mut found = files_of_slot(Path::new(&root.root), slot, 3);
+        if let Some(dir) = SEGMENT_NAME_DIR {
+            found.extend(files_of_slot(Path::new(dir), slot, 1));
+        }
+        found
+    }
+
+    fn alive_nodes(ix_config: &iceoryx2::config::Config) -> usize {
+        let mut alive = 0usize;
+        Node::<Service>::list(ix_config, |state| {
+            if matches!(state, NodeState::Alive(_)) {
+                alive += 1;
+            }
+            CallbackProgression::Continue
+        })
+        .expect("list the resim namespace");
+        alive
+    }
+
+    /// The claim every caller below makes: any slot the lock admits is ready.
+    fn claim(dir: &Path, slots: u32) -> ResimSlot {
+        claim_resim_slot(dir, slots, |_| true).expect("a free slot")
+    }
+
+    /// Hand oracles: the marker, the slot in exactly eight lowercase hex
+    /// digits, then `_`, nineteen characters for every slot, and the name
+    /// parses back to its slot. The last slot a claim takes is `0xff`.
+    #[test]
+    fn the_private_prefix_is_the_marker_then_the_slot_in_eight_hex_digits() {
+        for (slot, prefix) in [
+            (0, "cer_resim_00000000_"),
+            (1, "cer_resim_00000001_"),
+            (RESIM_NAMESPACE_SLOTS - 1, "cer_resim_000000ff_"),
+            (0x1234, "cer_resim_00001234_"),
+            (u32::MAX, "cer_resim_ffffffff_"),
+        ] {
+            assert_eq!(resim_namespace_prefix(slot), prefix);
+            assert_eq!(prefix.len(), 19, "{prefix}");
+            assert_eq!(resim_namespace_slot(prefix), Some(slot), "{prefix}");
+        }
+    }
+
+    /// No resim prefix string-prefixes another resim's, the default
+    /// namespace's, the planning namespace's or iceoryx2's test namespaces',
+    /// in either direction: the property that keeps one namespace's node
+    /// listing out of another's files.
+    #[test]
+    fn no_resim_prefix_lists_another_namespace() {
+        let slots = [0u32, 1, 0x10, 0xff, 0x100, 0x1234, 0x0fff_ffff, u32::MAX];
+        let resim: Vec<String> = slots.iter().map(|&s| resim_namespace_prefix(s)).collect();
+        for a in &resim {
+            assert_eq!(a.len(), RESIM_NAMESPACE_MARKER.len() + 9, "{a}");
+            for b in &resim {
+                if a != b {
+                    assert!(!b.starts_with(a.as_str()), "{a} lists {b}'s files");
+                }
+            }
+            for other in ["iox2_", "cer_p_0123456789abcdef", "test_prefix_"] {
+                assert!(
+                    !other.starts_with(a.as_str()) && !a.starts_with(other),
+                    "{a} and {other} overlap"
+                );
+            }
+        }
+    }
+
+    /// iceoryx2 accepts every prefix, and the config keeps the base's root.
+    #[test]
+    fn the_private_config_is_the_base_with_the_private_prefix() {
+        let base = iceoryx2::config::Config::global_config();
+        for slot in [0, 0xff, u32::MAX] {
+            let ix_config = resim_ix_config(base, slot).expect("a prefix iceoryx2 accepts");
+            assert_eq!(
+                ix_config.global.prefix.to_string(),
+                resim_namespace_prefix(slot)
+            );
+            assert_eq!(
+                String::from(ix_config.global.root_path()),
+                String::from(base.global.root_path())
+            );
+        }
+    }
+
+    /// A file of a slot's namespace names the slot; every other name, a slot's
+    /// lock file and other namespaces' files included, names none.
+    #[test]
+    fn only_a_file_of_a_slots_namespace_names_the_slot() {
+        assert_eq!(
+            resim_namespace_slot("cer_resim_0000abcd_1234567890.node_monitor"),
+            Some(0xabcd)
+        );
+        assert_eq!(
+            resim_namespace_slot("cer_resim_00000000_x_node.0_10_0.global_mgmt"),
+            Some(0)
+        );
+        for name in [
+            // A slot's lock file: no `_` after the digits.
+            "cer_resim_00000000.lock",
+            // Upper case: the prefix renders lower case only.
+            "cer_resim_0000ABCD_1234567890.node_monitor",
+            // Seven digits, then the separator.
+            "cer_resim_000abcd_1234567890.node_monitor",
+            // No separator after the eight digits.
+            "cer_resim_0000abcd1234567890.node_monitor",
+            // A sign `u32::from_str_radix` would accept.
+            "cer_resim_+000abcd_1.node_monitor",
+            "iox2_1234567890.node_monitor",
+            "cer_p_0123456789abcdef1234567890.node_monitor",
+            "1234567890",
+            "cer_resim_",
+            "",
+        ] {
+            assert_eq!(resim_namespace_slot(name), None, "{name}");
+        }
+    }
+
+    /// Two claims held at once take different slots, the lowest free first,
+    /// each by its own lock file.
+    #[test]
+    fn two_concurrent_claims_take_different_slots() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        let second = claim(dir.path(), 4);
+        assert_eq!((first.slot, second.slot), (0, 1));
+        assert!(dir.path().join("cer_resim_00000000.lock").is_file());
+        assert!(dir.path().join("cer_resim_00000001.lock").is_file());
+    }
+
+    /// Dropping a holder closes its lock file, as the kernel does for every
+    /// descriptor of a process that ends: the next claim reuses that slot,
+    /// the lowest free one again, while the other holder keeps its own.
+    #[test]
+    fn a_claim_after_a_holder_lets_go_reuses_its_slot() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        let second = claim(dir.path(), 4);
+        drop(first);
+        let third = claim(dir.path(), 4);
+        assert_eq!((second.slot, third.slot), (1, 0));
+        drop(second);
+        drop(third);
+        assert_eq!(claim(dir.path(), 4).slot, 0);
+    }
+
+    /// A slot whose reclaim refuses it is passed over, and its lock released:
+    /// the next claim takes it.
+    #[test]
+    fn a_slot_its_reclaim_refuses_is_passed_over_and_released() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let mut tried = Vec::new();
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            tried.push(slot);
+            slot != 0
+        })
+        .expect("slot 1 is ready");
+        assert_eq!((claimed.slot, tried), (1, vec![0, 1]));
+        assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+    }
+
+    /// Every slot held: exit 5, naming the directory and the slot count, and
+    /// no open failure, since every lock file opened.
+    #[test]
+    fn a_claim_with_every_slot_held_is_refused_with_exit_5() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let _first = claim(dir.path(), 2);
+        let _second = claim(dir.path(), 2);
+        let err = claim_resim_slot(dir.path(), 2, |_| true).expect_err("no free slot");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(text.contains("none of the 2 slot locks"), "{text}");
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+        assert!(!text.contains("could not be opened or locked:"), "{text}");
+    }
+
+    /// A lock directory that does not exist: exit 5, naming the first lock
+    /// file that could not be opened.
+    #[test]
+    fn a_missing_lock_directory_is_refused_naming_the_first_open_failure() {
+        let dir = tempfile::tempdir().expect("a parent directory");
+        let missing = dir.path().join("absent");
+        let err = claim_resim_slot(&missing, 2, |_| true).expect_err("nothing opens");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        let first = missing.join("cer_resim_00000000.lock");
+        assert!(
+            text.contains(&format!(
+                "the first that could not be opened or locked: {}",
+                first.display()
+            )),
+            "{text}"
+        );
+    }
+
+    /// A namespace with no node: the reclaim removes the slot's segments in
+    /// the segment directory and nothing else (another slot's segment, the
+    /// slot's lock file, another namespace's segment, a directory). A zero
+    /// budget removes nothing and still reads clean.
+    #[test]
+    fn the_reclaim_of_an_empty_namespace_removes_its_slots_segments_only() {
+        let root = IsolatedRoot::mint("rslotseg");
+        let slot = unclaimable_slot(0);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let prefix = resim_namespace_prefix(slot);
+        let other = resim_namespace_prefix(slot + 1);
+        let kept: BTreeSet<String> = [
+            format!("{other}c.shm_state"),
+            format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"),
+            "iox2_d.shm_state".to_string(),
+            format!("{prefix}dir"),
+        ]
+        .into_iter()
+        .collect();
+        for name in [
+            format!("{prefix}a.shm_state"),
+            format!("{prefix}b.shm_state"),
+        ]
+        .iter()
+        .chain(kept.iter().filter(|name| !name.ends_with("dir")))
+        {
+            std::fs::write(segments.path().join(name), b"").expect("write a segment name");
+        }
+        std::fs::create_dir(segments.path().join(format!("{prefix}dir"))).expect("a directory");
+        let left = || -> BTreeSet<String> {
+            std::fs::read_dir(segments.path())
+                .expect("read the segment directory")
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        };
+
+        let untouched = reclaim_resim_slot(&ix_config, slot, Some(segments.path()), Duration::ZERO);
+        assert_eq!(
+            untouched,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Some(0),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert!(untouched.is_clean());
+        assert_eq!(
+            left().len(),
+            kept.len() + 2,
+            "a zero budget removes nothing"
+        );
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            reclaimed,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Some(0),
+                segments_removed: 2,
+                segments_failed: 0,
+            }
+        );
+        assert!(reclaimed.is_clean());
+        assert_eq!(left(), kept);
+    }
+
+    /// A namespace with a LIVE node is left as it is: the node is not reaped
+    /// and the slot's segment stays. Once the node is dropped, the reclaim of
+    /// the real segment names removes the namespace's iceoryx2 management
+    /// segment, the one segment a node leaves, and the namespace holds no file.
+    #[test]
+    fn the_reclaim_leaves_a_namespace_with_a_live_node_as_it_is() {
+        let root = IsolatedRoot::mint("rslotlive");
+        let slot = unclaimable_slot(1);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let node = NodeBuilder::new()
+            .config(&ix_config)
+            .create::<Service>()
+            .expect("a live node on the slot");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let segment = segments
+            .path()
+            .join(format!("{}a.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&segment, b"").expect("write a segment name");
+
+        let held = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            held,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Some(1),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert!(!held.is_clean());
+        assert!(
+            segment.exists(),
+            "a namespace with a node keeps its segments"
+        );
+        assert_eq!(alive_nodes(&ix_config), 1, "the live node was not reaped");
+
+        drop(node);
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            Duration::from_secs(10),
+        );
+        assert_eq!(reclaimed.nodes_left, Some(0));
+        assert!(reclaimed.is_clean());
+        if SEGMENT_NAME_DIR.is_some() {
+            assert_eq!(reclaimed.segments_removed, 1, "the management segment");
+        }
+        assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+
+    /// The child process the next test kills: a node and a publisher on the
+    /// slot namespace its parent names, held until it is killed.
+    #[test]
+    #[ignore = "a child process `the_reclaim_removes_every_file_a_killed_resim_left` spawns"]
+    fn child_holds_a_publisher_on_a_resim_slot() {
+        let Some(config) = cerulion_core::testing::child_iceoryx_config() else {
+            return;
+        };
+        let node = NodeBuilder::new()
+            .config(&config)
+            .create::<Service>()
+            .expect("a node on the slot");
+        let service = node
+            .service_builder(&"resim_slot_child".try_into().expect("a service name"))
+            .publish_subscribe::<u64>()
+            .open_or_create()
+            .expect("a service on the slot");
+        let _publisher = service.publisher_builder().create().expect("a publisher");
+        println!("{CHILD_READY}");
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// A resim killed while it held a service leaves its node, the service and
+    /// the namespace's management segment. The reclaim reaps the dead node,
+    /// which takes the service with it, then removes the management segment:
+    /// the namespace holds no file afterwards.
+    #[test]
+    fn the_reclaim_removes_every_file_a_killed_resim_left() {
+        let mut root = IsolatedRoot::mint("rslotdead");
+        let slot = unclaimable_slot(2);
+        root.prefix = resim_namespace_prefix(slot);
+        cerulion_core::testing::kill_child_holding_ports(
+            "replay_engine::resim_namespace_tests::child_holds_a_publisher_on_a_resim_slot",
+            &root,
+            CHILD_READY,
+            Duration::from_millis(200),
+        );
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let left = namespace_files(&root, slot);
+        assert!(
+            left.iter()
+                .any(|path| path.to_string_lossy().ends_with(".node_monitor")),
+            "the killed child left its node: {left:?}"
+        );
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            reclaimed.cleaned,
+            BoundedCleanup {
+                cleanups: 1,
+                failed_cleanups: 0,
+                deferred: 0,
+            },
+            "the dead node is reaped"
+        );
+        assert_eq!(reclaimed.nodes_left, Some(0));
+        assert!(reclaimed.is_clean());
+        assert_eq!(namespace_files(&root, slot), BTreeSet::new());
     }
 }

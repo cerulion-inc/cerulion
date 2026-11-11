@@ -2516,3 +2516,101 @@ fn two_resims_of_one_bag_write_byte_identical_reports() {
         "the report names no private namespace: {parsed}"
     );
 }
+
+/// Every resim namespace file on this machine, by slot: the shared-memory
+/// segments in `/dev/shm`, and the files under the iceoryx2 root (three levels
+/// down, which reaches a node's `<prefix>node.details`) whose name begins with
+/// a resim prefix.
+fn resim_namespace_files() -> std::collections::BTreeMap<u32, std::collections::BTreeSet<PathBuf>> {
+    use cerulion_cli_engine::replay_engine::resim_namespace_slot;
+    let root = PathBuf::from(String::from(
+        iceoryx2::config::Config::global_config().global.root_path(),
+    ));
+    let mut files = std::collections::BTreeMap::<u32, std::collections::BTreeSet<PathBuf>>::new();
+    let mut walk = vec![(PathBuf::from("/dev/shm"), 1usize), (root, 3usize)];
+    while let Some((dir, depth)) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(slot) = entry.file_name().to_str().and_then(resim_namespace_slot) {
+                files.entry(slot).or_default().insert(path.clone());
+            }
+            if depth > 1 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                walk.push((path, depth - 1));
+            }
+        }
+    }
+    files
+}
+
+/// Two resims run one after the other use ONE namespace. Each takes slot 0,
+/// the lowest free one, reclaims what was left there and leaves one iceoryx2
+/// management segment and one node, its own: the second's node replaces the
+/// first's, and the second leaves exactly as many files as the first. No other
+/// resim namespace gains or loses a file.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn two_resims_in_a_row_reuse_slot_0_and_leave_one_namespaces_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}seq", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let other_slots = |mut files: std::collections::BTreeMap<u32, _>| {
+        files.remove(&0);
+        files
+    };
+    let before = other_slots(resim_namespace_files());
+    let mut left = Vec::new();
+    for run in ["first", "second"] {
+        let out = run_replay_bin_in_workspace(root, &bag);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the {run} resim; stderr: {}",
+            stderr_of(&out)
+        );
+        let mut files = resim_namespace_files();
+        let slot_0 = files.remove(&0).unwrap_or_default();
+        assert_eq!(
+            files, before,
+            "the {run} resim touched a namespace other than slot 0's"
+        );
+        let names = |suffix: &str| -> Vec<PathBuf> {
+            slot_0
+                .iter()
+                .filter(|path| path.to_string_lossy().ends_with(suffix))
+                .cloned()
+                .collect()
+        };
+        let segments = names(".global_mgmt");
+        assert_eq!(
+            segments.len(),
+            1,
+            "the {run} resim leaves one management segment on slot 0: {slot_0:?}"
+        );
+        assert!(segments[0].starts_with("/dev/shm"), "{segments:?}");
+        let nodes = names(".node_monitor");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "the {run} resim leaves one node on slot 0: {slot_0:?}"
+        );
+        left.push((slot_0.len(), nodes[0].clone()));
+    }
+    assert_ne!(
+        left[0].1, left[1].1,
+        "the second resim reclaimed the first's node and left its own"
+    );
+    assert_eq!(
+        left[0].0, left[1].0,
+        "the second resim leaves exactly as many files on slot 0 as the first"
+    );
+}

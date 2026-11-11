@@ -36,6 +36,12 @@ unrecognized subcommand.
 | Needs the workspace? | No | Yes: it loads the cdylibs |
 | Who sees its frames | Anything attached to local shared memory | Nothing outside the resim: it runs on a private shared-memory namespace |
 
+The private namespace covers Cerulion topic frames only: a re-executed node
+that drives hardware or another network directly (for example a node that
+opens a robot's own command channel in `init`) still does so during a resim,
+so run a resim of such a node only where its devices are safe to drive or
+disconnected.
+
 Re-simulation re-injects only external-source topics and recomputes everything
 else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
 **no output**: its `dds_bridge` node still needs its external DDS inputs. Use
