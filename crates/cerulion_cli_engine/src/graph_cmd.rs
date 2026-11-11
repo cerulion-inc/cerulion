@@ -3636,8 +3636,12 @@ fn collect_entry_infos_from_cache(
 /// a depth outside 1 to 64, `block` with no in-graph producer or on a
 /// `network.ingress` topic, a `block_timeout_ms` the build refuses, a ring of
 /// `block` edges, `backpressure: block` or `depth:` on an
-/// `#[input(accumulate)]` input, or `backpressure:` or `depth:` on a port the
-/// node declares no metadata for.
+/// `#[input(accumulate)]` input, `backpressure:` or `depth:` on a port the
+/// node declares no metadata for, or a queue deeper than the shared buffer
+/// ceiling on a `multi_publisher_topics:` topic the graph publishes
+/// ([`refuse_a_queue_over_the_multi_publisher_ceiling`]). The subscriber slots
+/// such a topic's consumers take are counted only by the build: the count
+/// depends on drain capabilities a library exports beside its node info.
 ///
 /// `None` when every queue passes and no input sets one of the three keys, so a
 /// graph that sets none gets no line.
@@ -3652,7 +3656,10 @@ fn input_backpressure_check(
         cerulion_core::graph::topology::MissingInputMeta::Refuse,
     )
     .and_then(|()| cerulion_core::graph::GraphTopology::build(config, &infos))
-    .and_then(|topology| topology.validate());
+    .and_then(|topology| {
+        topology.validate()?;
+        refuse_a_queue_over_the_multi_publisher_ceiling(config, &topology)
+    });
     if let Err(e) = verdict {
         return Some(ValidationCheck::fail(
             INPUT_BACKPRESSURE_CHECK_LABEL,
@@ -3677,6 +3684,46 @@ fn input_backpressure_check(
             ),
         )
     })
+}
+
+/// `GraphRuntime::build`'s refusal of a queue deeper than
+/// [`MULTI_TOPIC_BUFFER_CEILING`](cerulion_core::transport::MULTI_TOPIC_BUFFER_CEILING)
+/// on a topic listed in `multi_publisher_topics:` that a node in the graph
+/// publishes, in the build's words. Every graph that opens such a topic
+/// provisions the same buffer ceiling, so the build refuses a consumer depth
+/// above it, an `#[input(accumulate, cap = N)]` input's cap included. A listed
+/// topic no node in the graph publishes is an external topic, and the build
+/// does not refuse a deep queue on it. Topics are walked in graph order, as
+/// the build walks them, and the first refused one is named.
+fn refuse_a_queue_over_the_multi_publisher_ceiling(
+    config: &GraphConfig,
+    topology: &cerulion_core::graph::GraphTopology,
+) -> cerulion_core::TransportResult<()> {
+    let ceiling = cerulion_core::transport::MULTI_TOPIC_BUFFER_CEILING;
+    for flow in topology.topics() {
+        if flow.producers.is_empty() || !config.is_multi_publisher(&flow.topic) {
+            continue;
+        }
+        let deepest = flow.consumers.iter().map(|c| c.depth).max().unwrap_or(0);
+        if deepest > ceiling {
+            // The build's sentence byte for byte, its one dash spelled by code
+            // point.
+            return Err(cerulion_core::TransportError::GraphError {
+                reason: format!(
+                    "multi-publisher topic '{}': a consumer declares depth {} \
+                     but the shared multi-publisher buffer ceiling is {} \
+                     (cross-graph topics provision a graph-independent \
+                     ceiling; every unit of it commits SHM on EVERY \
+                     publisher's pool) \u{2014} use a shallower depth or an \
+                     unlisted single-writer topic (an \
+                     `#[input(accumulate, cap = N)]` input's cap is its \
+                     depth, so its cap is held to the same ceiling)",
+                    flow.topic, deepest, ceiling
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The text of [`KILL_SWITCH_SCOPE`], for `concat!`.
@@ -35295,6 +35342,12 @@ nodes:
         let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
         let accumulate = || chain_infos(Some(declared_input("cmd", DropOldest, 4, true)));
         let multi = "multi_publisher_topics:\n  - /p/planner/cmd\n";
+        let over_the_shared_ceiling = "Graph validation error: multi-publisher topic \
+             '/p/planner/cmd': a consumer declares depth 17 but the shared multi-publisher \
+             buffer ceiling is 16 (cross-graph topics provision a graph-independent ceiling; \
+             every unit of it commits SHM on EVERY publisher's pool) \u{2014} use a shallower \
+             depth or an unlisted single-writer topic (an `#[input(accumulate, cap = N)]` \
+             input's cap is its depth, so its cap is held to the same ceiling)";
         let rows: Vec<(&str, String, DeclaredInfos, &str)> = vec![
             (
                 "depth 65 over a declared 4",
@@ -35354,6 +35407,18 @@ nodes:
                  `block_timeout_ms`, but the topic has 1 in-graph producer ('planner') and is \
                  listed in `multi_publisher_topics:`, which lets publishers outside the graph \
                  write it.",
+            ),
+            (
+                "depth 17 on a listed multi-publisher topic the graph publishes",
+                chain_graph(multi, "planner/cmd", "        depth: 17\n"),
+                drop_oldest_4(),
+                over_the_shared_ceiling,
+            ),
+            (
+                "an accumulate cap of 17 on a listed multi-publisher topic, with no key set",
+                chain_graph(multi, "planner/cmd", ""),
+                chain_infos(Some(declared_input("cmd", DropOldest, 17, true))),
+                over_the_shared_ceiling,
             ),
             (
                 "a ring the graph's keys make",
@@ -35446,6 +35511,27 @@ nodes:
             (
                 "depth 1, the minimum",
                 chain_graph("", "planner/cmd", "        depth: 1\n"),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 16 on a listed multi-publisher topic the graph publishes, the shared \
+                 ceiling",
+                chain_graph(
+                    "multi_publisher_topics:\n  - /p/planner/cmd\n",
+                    "planner/cmd",
+                    "        depth: 16\n",
+                ),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 32 on a listed topic no node in the graph publishes",
+                chain_graph(
+                    "multi_publisher_topics:\n  - /ext/cmd\n",
+                    "/ext/cmd",
+                    "        depth: 32\n",
+                ),
                 drop_oldest_4(),
                 one,
             ),
