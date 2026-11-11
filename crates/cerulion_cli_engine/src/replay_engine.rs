@@ -502,8 +502,8 @@ pub struct ReplayOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aborted: Option<ReplayAbort>,
     /// WHICH coordination contract this replay applied, and
-    /// whether the bag SAID so — the machine-readable twin of the verdict's
-    /// provenance line (the operator vocabulary). ALWAYS present, for the
+    /// whether the bag SAID so, in every state (the verdict prints a line for
+    /// the inferred one only, [`render_coordination_line`]). ALWAYS present, for the
     /// same reason [`Self::read_log`] is: the whole point is that a reader can
     /// tell "the bag was stamped lockstep" from "nothing said, so lockstep was
     /// assumed", and an absent key cannot carry that. Additive in the
@@ -556,33 +556,33 @@ pub struct ReplayOutcome {
     pub record_out_error: Option<String>,
 }
 
-/// The verdict's coordination PROVENANCE line, verbatim.
+/// The verdict's coordination line, or `None` when the contract applied needs
+/// no word on the terminal.
 ///
-/// The three states are the canonical operator vocabulary, copied rather than
-/// re-worded — the verdict and the `--report` JSON print ONE vocabulary, so the
-/// text lives in one function and the JSON block ([`CoordinationReport`]) is the
-/// same three states in machine-readable form.
+/// A stamped contract, `free_run` or `lockstep`, is the recording saying how it
+/// ran, and the replay applied exactly that: nothing a reader can act on, so the
+/// terminal stays quiet and the `--report` JSON's [`CoordinationReport`] block
+/// carries it (always, all three states). The INFERRED lockstep of a bag that
+/// carries no stamp is a caveat, an assumption the replay made for the bag, so
+/// it is the one state that prints.
 ///
-/// `pub` because `resim_cmd`'s NEUTRAL renderer prints the SAME
-/// line (the rule is that the provenance is always visible, and a neutral
-/// resim is a surface like any other), and that crate half is
-/// platform-independent while this module is Unix-only — so the LINE crosses as
-/// a rendered `String` on `ResimReport`, produced here. A second `match` over
-/// there would be the two-copies class on the one vocabulary this function
-/// exists to keep single.
-pub fn render_coordination_line(report: &CoordinationReport) -> String {
+/// `pub` because `resim_cmd`'s NEUTRAL renderer prints the SAME line, and that
+/// crate half is platform-independent while this module is Unix-only, so the
+/// LINE crosses as a rendered `Option<String>` on `ResimReport`, produced here.
+/// A second `match` over there would be the two-copies class on the one
+/// vocabulary this function exists to keep single.
+pub fn render_coordination_line(report: &CoordinationReport) -> Option<String> {
     match (report.mode, report.inferred) {
-        (CoordinationMode::FreeRun, _) => "coordination: free_run (per-rank boundary streams + \
-             read-log agreement; cross-rank lockstep equality not applicable)"
-            .to_string(),
-        (CoordinationMode::Lockstep, false) => "coordination: lockstep".to_string(),
+        (CoordinationMode::FreeRun, _) | (CoordinationMode::Lockstep, false) => None,
         (CoordinationMode::Lockstep, true) => {
-            "coordination: lockstep (inferred: no coordination stamp)".to_string()
+            Some("coordination: lockstep (inferred: no coordination stamp)".to_string())
         }
     }
 }
 
-/// How a replay fed its reads, the second provenance line of the verdict.
+/// How a replay fed its reads: the `--report` JSON's `read_identity` block,
+/// and a verdict line when reads were fed best effort
+/// ([`render_read_identity_line`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ReadIdentityReport {
@@ -602,24 +602,28 @@ pub enum ReadIdentityReport {
     },
 }
 
-/// The verdict line [`ReadIdentityReport`] renders as.
-pub fn render_read_identity_line(report: &ReadIdentityReport) -> String {
+/// The verdict line [`ReadIdentityReport`] renders as, or `None` for
+/// [`ReadIdentityReport::Fed`].
+///
+/// Fed by identity is the full-fidelity path every current recording takes, so
+/// it prints nothing and the `--report` JSON's `read_identity` block carries its
+/// counts. Best effort NARROWS what the verdict covers (a read reproduces only
+/// when the queue behaves as it did live), so it prints.
+pub fn render_read_identity_line(report: &ReadIdentityReport) -> Option<String> {
     match report {
-        ReadIdentityReport::Fed { reads, frames } => format!(
-            "reads: fed by recorded identity ({reads} reads, {frames} frames, each read through \
-             its own private feed)"
-        ),
+        ReadIdentityReport::Fed { .. } => None,
         ReadIdentityReport::BestEffort { reason } if reason.is_empty() => {
-            "reads: best effort, no read identity".to_string()
+            Some("reads: best effort, no read identity".to_string())
         }
         ReadIdentityReport::BestEffort { reason } => {
-            format!("reads: best effort, no read identity ({reason})")
+            Some(format!("reads: best effort, no read identity ({reason})"))
         }
     }
 }
 
-/// The `--report` JSON's coordination block — the three states
-/// the provenance line renders, in machine-readable form.
+/// The `--report` JSON's coordination block: the three states of the
+/// contract a replay applied, in machine-readable form (the terminal prints a
+/// line for the inferred one only, [`render_coordination_line`]).
 ///
 /// The two fields are independent by construction and only three of the four
 /// combinations are reachable, which is the point: `free_run` is only ever
@@ -3857,9 +3861,13 @@ pub enum ReplayNodes {
 /// Run the deterministic replay engine and return its [`ReplayOutcome`].
 ///
 /// Writes the JSON report to `inputs.report_path` when set. Emits a
-/// `tracing::warn!` per env divergence and per data violation for log
-/// pipelines; the human-readable verdict is [`render_verdict`] (printed by the
-/// CLI). A clean run yields `outcome.passed == true`; data divergences leave it
+/// `tracing::warn!` per env divergence and a `tracing::info!` per node failure
+/// (both terminal reports name each failed node). A data violation and a
+/// structural trace divergence are a `tracing::info!` under
+/// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
+/// printed by the CLI) states each in full, and a `tracing::warn!` under
+/// [`ReplayPurpose::Resim`], whose neutral summary only counts them. A clean
+/// run yields `outcome.passed == true`; data divergences leave it
 /// `false` (the CLI maps that to `EXIT_VIOLATION`). Bag-vs-graph mismatch and
 /// node-load failures short-circuit as typed [`ReplayError`]s (exit 2 / 3).
 pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutcome, ReplayError> {
@@ -4578,6 +4586,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             covered_range,
             coordination_report,
             ros2_entries_skipped,
+            purpose,
         },
         abort_marker,
     );
@@ -4734,6 +4743,10 @@ struct EpilogueInputs<'a> {
     covered_range: Option<CoveredRange>,
     coordination_report: CoordinationReport,
     ros2_entries_skipped: Vec<String>,
+    /// Which terminal report the CLI prints for this outcome: the `--verify`
+    /// verdict, which states every data violation and schedule divergence in
+    /// full, or the neutral `--resim` summary, which counts them.
+    purpose: ReplayPurpose,
 }
 
 /// The `?`-FREE epilogue of [`run_engine`] — fold the passes'
@@ -4789,6 +4802,7 @@ fn assemble_outcome(
         covered_range,
         coordination_report,
         ros2_entries_skipped,
+        purpose,
     } = ep;
 
     // 5. The read-log verdict, folded across the passes. Under lockstep there
@@ -5257,18 +5271,39 @@ fn assemble_outcome(
     for d in &env_divergence {
         tracing::warn!(var = %d.name, detail = %d.detail, "replay: environment divergence vs bag env.json");
     }
+    // `--verify`: INFO, because the verdict renders each violation and the
+    // schedule divergence as its own block on the same stderr, so these lines
+    // are for a log pipeline only. A bare `--resim`: WARN, because its neutral
+    // summary only counts the differing topics and says the schedule differs,
+    // so these lines are where the terminal names each topic, frame and
+    // position.
+    let verdict_states_detail = purpose == ReplayPurpose::Verify;
     for v in &violations {
-        tracing::warn!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        if verdict_states_detail {
+            tracing::info!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        } else {
+            tracing::warn!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        }
     }
     if let Some(td) = &trace_divergence {
-        tracing::warn!(
-            position = td.position,
-            detail = %td.detail,
-            "replay: structural trace divergence vs the recorded scheduler trace"
-        );
+        if verdict_states_detail {
+            tracing::info!(
+                position = td.position,
+                detail = %td.detail,
+                "replay: structural trace divergence vs the recorded scheduler trace"
+            );
+        } else {
+            tracing::warn!(
+                position = td.position,
+                detail = %td.detail,
+                "replay: structural trace divergence vs the recorded scheduler trace"
+            );
+        }
     }
+    // INFO under both purposes: the verdict and the neutral summary each name
+    // every failed node with its reason.
     for f in &node_failures {
-        tracing::warn!(
+        tracing::info!(
             node_id = %f.node_id,
             reason = %f.reason,
             "replay: node suffered a panic-class failure (exit-3 root cause)"
@@ -21609,10 +21644,11 @@ fn validate_step_boundaries(
     // above (per-rank consecutive steps + non-decreasing targets) is the part
     // that still holds per rank and SURVIVES VERBATIM for both modes.
     //
-    // The skip is never silent: the verdict's coordination provenance line
-    // (`render_coordination_line`) states which contract was applied and
-    // that cross-rank lockstep equality is "not applicable" — that line is
-    // where a mode-gated validation says so.
+    // The skip is stated where the contract is: the `--report` JSON's
+    // `coordination` block names the `free_run` contract this replay applied,
+    // under which cross-rank lockstep equality is not applicable. The terminal
+    // prints a coordination line only for an INFERRED contract
+    // (`render_coordination_line`).
     if coordination == CoordinationMode::FreeRun {
         return Ok(BoundaryWalk {
             summaries,
@@ -26132,6 +26168,87 @@ fn declined_counts(outcome: &ReplayOutcome) -> (usize, usize) {
     (declined, matched)
 }
 
+/// The verdict's read-log ENFORCEMENT line, newline-terminated, or `None` when
+/// the enforcement ran clean or had nothing to do.
+///
+/// Prints when the enforcement says something that narrows the verdict: stages
+/// that could not be gated or a rank whose edges were not enforced (their
+/// intra-step arrival is whatever their queue held), and an `Enforced` run with
+/// any anomaly count above zero (a planned step never reached, a refill empty by
+/// enforcement, a consult the plan held no position for, a stage not gateable).
+/// A clean `Enforced` run, `NotApplicable` and `Lockstep` print nothing; the
+/// `--report` JSON's `read_log_enforcement` block carries every state with its
+/// counts.
+pub fn render_enforcement_line(enforcement: &ReadLogEnforcement) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    match enforcement {
+        ReadLogEnforcement::NotApplicable | ReadLogEnforcement::Lockstep => return None,
+        ReadLogEnforcement::NotGateable { stages, reasons } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: {stages} graph-produced stage(s) could NOT be \
+                 gated, so their intra-step arrival is whatever their queue held:"
+            );
+            for r in reasons {
+                let _ = writeln!(s, "  - {r}");
+            }
+        }
+        ReadLogEnforcement::NotEnforced { topics, reason } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
+                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
+                 whatever its queue held."
+            );
+        }
+        ReadLogEnforcement::Enforced {
+            stages,
+            steps,
+            frames_admitted,
+            consults_refused,
+            unplanned_consults,
+            enforced_empty_refills,
+            steps_not_reached,
+            stages_not_gateable,
+        } => {
+            if *steps_not_reached == 0
+                && *enforced_empty_refills == 0
+                && *unplanned_consults == 0
+                && *stages_not_gateable == 0
+            {
+                return None;
+            }
+            let _ = write!(
+                s,
+                "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
+                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
+                 consult(s) refused"
+            );
+            if *steps_not_reached > 0 {
+                let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
+            }
+            if *enforced_empty_refills > 0 {
+                let _ = write!(
+                    s,
+                    ", {enforced_empty_refills} refill(s) empty by enforcement"
+                );
+            }
+            if *unplanned_consults > 0 {
+                let _ = write!(
+                    s,
+                    ", {unplanned_consults} consult(s) the installed plan held no position for"
+                );
+            }
+            if *stages_not_gateable > 0 {
+                let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");
+            }
+            let _ = writeln!(s, ").");
+        }
+    }
+    Some(s)
+}
+
 /// Render the human-readable stderr verdict for `outcome` (the CLI prints this).
 ///
 /// A clean run prints a one-line PASS with the counts. A structural divergence
@@ -26150,13 +26267,17 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
 
-    // The PROVENANCE line — which coordination contract
-    // this replay applied — FIRST, above everything else, on the pass path and
-    // the fail path alike. It is where a mode-gated validation says so: when a
-    // free-run bag skips the cross-rank lockstep equality check, this line is
-    // the statement that it was skipped, never a silent difference.
-    let _ = writeln!(s, "{}", render_coordination_line(&outcome.coordination));
-    let _ = writeln!(s, "{}", render_read_identity_line(&outcome.read_identity));
+    // The two PROVENANCE caveats FIRST, on the pass path and the fail path
+    // alike: a coordination contract the replay had to infer, and reads fed
+    // best effort. Each narrows what the verdict below covers. The clean states
+    // (a stamped contract, reads fed by identity) print nothing; the
+    // `--report` JSON carries every state.
+    if let Some(line) = render_coordination_line(&outcome.coordination) {
+        let _ = writeln!(s, "{line}");
+    }
+    if let Some(line) = render_read_identity_line(&outcome.read_identity) {
+        let _ = writeln!(s, "{line}");
+    }
 
     for d in &outcome.env_divergence {
         let _ = writeln!(s, "WARNING: env divergence: {}", d.detail);
@@ -26364,87 +26485,14 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
             let _ = writeln!(s, "  - edge {}.{}: {}", u.node_id, u.input, u.detail);
         }
     }
-    // The ENFORCEMENT's positive line, on EVERY path, for the reason the
-    // `read log:` status line below exists: a clean verdict must say what it
-    // enforced, and silence is what a reader cannot audit.
-    match &outcome.read_log_enforcement {
-        ReadLogEnforcement::NotApplicable => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: no graph-produced input edge runs inside one rank \
-                 on this recording, so none was gated."
-            );
-        }
-        ReadLogEnforcement::Lockstep => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: none (a lockstep replay's one gating clock orders \
-                 every publish against every step)."
-            );
-        }
-        ReadLogEnforcement::NotGateable { stages, reasons } => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: {stages} graph-produced stage(s) could NOT be \
-                 gated, so their intra-step arrival is whatever their queue held:"
-            );
-            for r in reasons {
-                let _ = writeln!(s, "  - {r}");
-            }
-        }
-        ReadLogEnforcement::NotEnforced { topics, reason } => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
-                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
-                 whatever its queue held."
-            );
-        }
-        ReadLogEnforcement::Enforced {
-            stages,
-            steps,
-            frames_admitted,
-            consults_refused,
-            unplanned_consults,
-            enforced_empty_refills,
-            steps_not_reached,
-            stages_not_gateable,
-        } => {
-            let _ = write!(
-                s,
-                "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
-                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
-                 consult(s) refused"
-            );
-            if *steps_not_reached > 0 {
-                let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
-            }
-            if *enforced_empty_refills > 0 {
-                let _ = write!(
-                    s,
-                    ", {enforced_empty_refills} refill(s) empty by enforcement"
-                );
-            }
-            if *unplanned_consults > 0 {
-                let _ = write!(
-                    s,
-                    ", {unplanned_consults} consult(s) the installed plan held no position for"
-                );
-            }
-            if *stages_not_gateable > 0 {
-                let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");
-            }
-            let _ = writeln!(s, ").");
-        }
+    // The enforcement's line, when it says something the verdict does not:
+    // see `render_enforcement_line`.
+    if let Some(line) = render_enforcement_line(&outcome.read_log_enforcement) {
+        let _ = write!(s, "{line}");
     }
 
-    // The read-log verifier's POSITIVE status — one
-    // line on EVERY path (pass and fail), so "verified clean" is a visible
-    // claim distinct from "never looked" (inert/disabled), which is what
-    // makes a clean read log auditable by a human too.
-    // What the verifier DECLINED to compare, rendered on EVERY
-    // path — a clean read-log line beside an unstated exclusion is the claim
-    // this block exists to scope.
+    // What the verifier DECLINED to compare, rendered on EVERY path: the
+    // `read log:` line below names the quarantine, and this block scopes it.
     if !outcome.read_log_quarantine.is_empty() {
         let _ = writeln!(
             s,
@@ -26473,7 +26521,17 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         }
     }
 
+    // A clean verification with nothing quarantined is what the `replay PASS`
+    // line already says, so it prints nothing; the `--report` JSON's `read_log`
+    // block carries its edge count. Every other state scopes the verdict (what
+    // the verifier did not compare, never looked at, or stopped looking at), so
+    // it prints.
     match &outcome.read_log {
+        ReadLogStatus::VerifiedClean {
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+            ..
+        } => {}
         ReadLogStatus::VerifiedClean {
             edges_compared,
             quarantined_nodes,
@@ -28326,25 +28384,127 @@ mod recorder_info_version_tests {
         }
     }
 
-    /// The provenance line's three states, HAND-WRITTEN
-    /// verbatim. This is the operator vocabulary — verdict and `--report` JSON
-    /// print one wording, so the strings are pinned rather than described.
+    /// Only the INFERRED contract prints a coordination line; a stamped
+    /// `free_run` or `lockstep` prints none (the `--report` block carries all
+    /// three states, pinned by the arm below).
     #[test]
-    fn provenance_line_renders_three_states() {
+    fn only_an_inferred_coordination_contract_renders_a_line() {
         let line =
             |mode, inferred| render_coordination_line(&CoordinationReport { mode, inferred });
+        assert_eq!(line(CoordinationMode::FreeRun, false), None);
+        assert_eq!(line(CoordinationMode::Lockstep, false), None);
         assert_eq!(
-            line(CoordinationMode::FreeRun, false),
-            "coordination: free_run (per-rank boundary streams + read-log agreement; \
-             cross-rank lockstep equality not applicable)"
+            line(CoordinationMode::Lockstep, true).as_deref(),
+            Some("coordination: lockstep (inferred: no coordination stamp)")
+        );
+    }
+
+    /// Reads fed by identity print nothing; best effort prints, with its reason
+    /// when it has one.
+    #[test]
+    fn only_best_effort_reads_render_a_line() {
+        assert_eq!(
+            render_read_identity_line(&ReadIdentityReport::Fed {
+                reads: 346,
+                frames: 346
+            }),
+            None
         );
         assert_eq!(
-            line(CoordinationMode::Lockstep, false),
-            "coordination: lockstep"
+            render_read_identity_line(&ReadIdentityReport::BestEffort {
+                reason: String::new()
+            })
+            .as_deref(),
+            Some("reads: best effort, no read identity")
         );
         assert_eq!(
-            line(CoordinationMode::Lockstep, true),
-            "coordination: lockstep (inferred: no coordination stamp)"
+            render_read_identity_line(&ReadIdentityReport::BestEffort {
+                reason: "recorded before read identity".into()
+            })
+            .as_deref(),
+            Some("reads: best effort, no read identity (recorded before read identity)")
+        );
+    }
+
+    fn enforced(
+        unplanned_consults: u64,
+        enforced_empty_refills: u64,
+        steps_not_reached: usize,
+        stages_not_gateable: usize,
+    ) -> ReadLogEnforcement {
+        ReadLogEnforcement::Enforced {
+            stages: 1,
+            steps: 292,
+            frames_admitted: 290,
+            consults_refused: 2,
+            unplanned_consults,
+            enforced_empty_refills,
+            steps_not_reached,
+            stages_not_gateable,
+        }
+    }
+
+    /// The enforcement line prints only when it narrows the verdict: a clean
+    /// `Enforced` run, `NotApplicable` and `Lockstep` print nothing, while every
+    /// anomaly count, an ungateable stage set and an unenforced rank print, each
+    /// against its hand-written line.
+    #[test]
+    fn the_enforcement_line_renders_only_what_narrows_the_verdict() {
+        assert_eq!(render_enforcement_line(&enforced(0, 0, 0, 0)), None);
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotApplicable),
+            None
+        );
+        assert_eq!(render_enforcement_line(&ReadLogEnforcement::Lockstep), None);
+
+        let head = "NOTE: read-log enforcement: 1 graph-produced stage(s) gated across 292 \
+                    step(s) (290 frame(s) admitted, 2 consult(s) refused";
+        for (e, tail) in [
+            (enforced(0, 0, 3, 0), ", 3 planned step(s) never reached"),
+            (enforced(0, 4, 0, 0), ", 4 refill(s) empty by enforcement"),
+            (
+                enforced(5, 0, 0, 0),
+                ", 5 consult(s) the installed plan held no position for",
+            ),
+            (enforced(0, 0, 0, 6), ", 6 stage(s) NOT gateable"),
+        ] {
+            assert_eq!(
+                render_enforcement_line(&e),
+                Some(format!("{head}{tail}).\n")),
+                "{e:?}"
+            );
+        }
+        assert_eq!(
+            render_enforcement_line(&enforced(5, 4, 3, 6)),
+            Some(format!(
+                "{head}, 3 planned step(s) never reached, 4 refill(s) empty by enforcement, \
+                 5 consult(s) the installed plan held no position for, 6 stage(s) NOT \
+                 gateable).\n"
+            ))
+        );
+
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotGateable {
+                stages: 2,
+                reasons: vec!["a".into(), "b".into()],
+            })
+            .as_deref(),
+            Some(
+                "NOTE: read-log enforcement: 2 graph-produced stage(s) could NOT be gated, so \
+                 their intra-step arrival is whatever their queue held:\n  - a\n  - b\n"
+            )
+        );
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotEnforced {
+                topics: 3,
+                reason: "no read log".into(),
+            })
+            .as_deref(),
+            Some(
+                "NOTE: read-log enforcement: NONE over 3 topic(s) this rank both produces and \
+                 consumes (no read log), so each such edge's intra-step arrival is whatever \
+                 its queue held.\n"
+            )
         );
     }
 

@@ -2899,6 +2899,109 @@ fn changed_relay_factory_diverges_on_relay_topic_only() {
     );
 }
 
+/// The source and relay bag replayed against a relay that adds 101 instead of
+/// 100, under `purpose`: the outcome, plus the bag path for the renderers.
+fn replay_changed_relay(
+    dir: &std::path::Path,
+    purpose: replay_engine::ReplayPurpose,
+) -> (ReplayOutcome, std::path::PathBuf) {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let bag = dir.join("changed_relay.mcap");
+    write_bag(&rec, &bag, None);
+    let candidate = || {
+        factories(vec![
+            ("source", Box::new(SourceNodeEntry::new())),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 101.0,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let (outcome, _) = ri_replay(&bag, candidate, purpose);
+    let outcome = outcome.expect("the changed relay replays to a verdict");
+    // Hand oracle: every relay frame carries the new addend, so the topic's
+    // ONE violation is a byte mismatch at its first frame, and the unchanged
+    // source matches.
+    match outcome.violations.as_slice() {
+        [v] if v.topic == "/sr/relay/out" => assert!(
+            matches!(v.class, ViolationClass::ByteMismatch { index: 0, .. }),
+            "{v:?}"
+        ),
+        other => panic!("expected exactly one violation, on /sr/relay/out: {other:?}"),
+    }
+    (outcome, bag)
+}
+
+/// A bare `--resim` warns each data violation, naming its topic: its neutral
+/// summary only COUNTS the differing topics (pinned below), so the warn is the
+/// one place its terminal names which topic changed and where.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_bare_resim_warns_each_data_violation_by_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_changed_relay(dir.path(), replay_engine::ReplayPurpose::Resim);
+
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+        &bag,
+    );
+    assert!(
+        summary.contains("1 of 2 topic(s) differ") && !summary.contains("/sr/relay/out"),
+        "the neutral summary counts the topic without naming it: {summary}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: data violation")
+            })
+            .collect();
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+        ) {
+            ([line], 0) if line.contains("/sr/relay/out") => Ok(()),
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming /sr/relay/out and no INFO twin, got {other:?} and \
+                 {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// `--verify` states each data violation in its verdict block, so the engine
+/// logs it at `info` rather than printing the same frame twice on the terminal.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_states_each_data_violation_in_its_verdict_and_logs_it_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_changed_relay(dir.path(), replay_engine::ReplayPurpose::Verify);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("FRAME-CONTENT DIVERGENCE") && verdict.contains("/sr/relay/out"),
+        "the verdict block names the topic: {verdict}"
+    );
+    // The absence guard is paired with a positive count over the same capture.
+    logs_assert(|lines: &[&str]| {
+        match (
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+            cerulion_core::testing::count_at(lines, "WARN", "replay: data violation"),
+        ) {
+            (1, 0) => Ok(()),
+            (infos, warns) => Err(format!(
+                "expected ONE INFO and no WARN, got {infos} INFO and {warns} WARN line(s)"
+            )),
+        }
+    });
+}
+
 // ===========================================================================
 // 5. Missing / extra MESSAGES (count mismatches, both directions)
 // ===========================================================================
@@ -19556,11 +19659,9 @@ fn assert_edge_read_verdict(outcome: &ReplayOutcome, label: &str) {
 }
 
 /// (a) CLEAN BAG → the verifier runs, WARNS nothing, and claims its clean
-/// verification POSITIVELY: no report field, no warn, verdict untouched —
-/// and the verdict prints the `read log: verified clean (N edge(s)
-/// compared)` line, which this arm asserts ("silent" here
-/// means no WARN-class output, not no output — the positive status line is
-/// deliberate, it is what makes a clean cycle auditable). The recording's
+/// verification POSITIVELY in the `--report` JSON (`read_log.status ==
+/// "verified_clean"` with its edge count), while the terminal verdict leaves a
+/// clean verification to its PASS line and prints no `read log:` line. The recording's
 /// kind-6 content is anchored to a HAND oracle first (anti-vacuity: a
 /// verifier that never saw a record would also warn nothing — the oracle
 /// proves the bag really carries the read log, and
@@ -19643,11 +19744,16 @@ fn read_log_clean_bag_verifies_clean_with_no_warns() {
     // The always-present status field, internally tagged snake_case.
     assert_eq!(parsed["read_log"]["status"], "verified_clean");
     assert_eq!(parsed["read_log"]["edges_compared"], 1);
-    // And the human verdict carries the one-line status on the PASS path.
+    // The human verdict leaves a clean verification to the PASS line: the
+    // report above carries the status and its edge count.
     let verdict = replay_engine::render_verdict(&outcome, &bag);
     assert!(
-        verdict.contains("read log: verified clean (1 edge(s) compared)"),
-        "verdict: {verdict}"
+        !verdict.contains("read log:"),
+        "a clean verification prints no `read log:` line: {verdict}"
+    );
+    assert!(
+        verdict.contains("replay PASS: "),
+        "the PASS line carries the verdict: {verdict}"
     );
 }
 
@@ -23536,10 +23642,10 @@ fn an_explicitly_lockstep_bag_replays_byte_identically_and_says_so() {
         }
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert_eq!(
-        verdict.lines().next(),
-        Some("coordination: lockstep"),
-        "an EXPLICIT stamp carries no inferred suffix: {verdict}"
+    assert!(
+        !verdict.contains("coordination:"),
+        "an EXPLICIT stamp is the contract the recording ran under, so the verdict \
+         prints no coordination line (the report below carries it): {verdict}"
     );
     assert_eq!(
         read_report(&report)["coordination"],
@@ -23667,13 +23773,10 @@ fn free_run_crafted_bag_replays_byte_exact_per_rank() {
         }
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert_eq!(
-        verdict.lines().next(),
-        Some(
-            "coordination: free_run (per-rank boundary streams + read-log agreement; \
-             cross-rank lockstep equality not applicable)"
-        ),
-        "the skip is stated on the provenance line: {verdict}"
+    assert!(
+        !verdict.contains("coordination:"),
+        "a stamped free_run contract prints no coordination line; the outcome above \
+         and the report's coordination block carry it: {verdict}"
     );
     // The replay RAN — phase 2 refuses BEFORE the first step, so a non-empty
     // tap is the discriminator against a refusal that merely changed shape.
@@ -41401,8 +41504,9 @@ fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
     assert!(
-        verdict.contains("reads: fed by recorded identity"),
-        "the verdict says how reads were fed: {verdict}"
+        !verdict.contains("reads:"),
+        "reads fed by identity print no line; `ri_assert_fed` read it off the outcome: \
+         {verdict}"
     );
 }
 
