@@ -22,8 +22,11 @@ fusion remains the fastest path.
 > **Deprecated:** the `CERULION_EXECUTION_MODE=lockstep` opt-out, and the
 > `CERULION_BARRIER_SPIN_US` and `CERULION_BARRIER_OS_SYNC` variables that tune
 > its barrier, are outside Semantic Versioning and may change or be removed in a
-> 2.x minor release. A multi-process run already free-runs by default. Replaying
-> a bag stamped `coordination: lockstep` is not deprecated. See
+> 2.x minor release. A multi-process run already free-runs by default. To order
+> a split edge between two nodes on the same level, mark the edge
+> `#[input(trigger)]` or co-locate both nodes in one `process_groups:` group; to
+> keep every node in one process, run `cerulion graph run --single-process`.
+> Replaying a bag stamped `coordination: lockstep` is not deprecated. See
 > [Multi-process execution](user-api.md#multi-process-execution).
 
 Related: `docs/multi_publisher_topics.md` (single-writer topics across
