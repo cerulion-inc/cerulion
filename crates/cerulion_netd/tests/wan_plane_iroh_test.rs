@@ -114,6 +114,34 @@ async fn disabled_endpoint(secret: [u8; 32]) -> Endpoint {
         .expect("endpoint should bind")
 }
 
+/// Bind actual loopback sockets for the CLI's exact authenticated-address oracle.
+async fn loopback_endpoint(secret: [u8; 32]) -> Endpoint {
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Empty)
+        .secret_key(secret.into())
+        .relay_mode(iroh::RelayMode::Disabled)
+        .alpns(
+            cerulion_link::alpn::ALL
+                .iter()
+                .map(|alpn| alpn.to_vec())
+                .collect(),
+        )
+        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .clear_ip_transports()
+        .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("IPv4 loopback binding")
+        .bind_addr(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+        .expect("IPv6 loopback binding")
+        .bind()
+        .await
+        .expect("loopback endpoint should bind");
+    assert!(!endpoint.bound_sockets().is_empty());
+    assert!(endpoint
+        .bound_sockets()
+        .iter()
+        .all(|socket| socket.ip().is_loopback()));
+    endpoint
+}
+
 /// Rewrite unspecified bound sockets to loopback so they are dialable.
 fn loopback_sockets(bound: &[SocketAddr]) -> Vec<SocketAddr> {
     bound
@@ -267,13 +295,14 @@ struct RobotFixture {
 
 impl RobotFixture {
     fn start(tag: &str, authz: Arc<PairingAuthorizer>) -> Self {
-        Self::start_with_schema(tag, authz, None)
+        Self::start_with_schema(tag, authz, None, false)
     }
 
     fn start_with_schema(
         tag: &str,
         authz: Arc<PairingAuthorizer>,
         schema: Option<(String, cerulion_core::SchemaDoc)>,
+        loopback_only: bool,
     ) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("robot runtime");
         let manager = test_manager(&format!("robot_{tag}"));
@@ -292,7 +321,11 @@ impl RobotFixture {
             plane = plane.with_in_process_schema_provider(Arc::new(move || serving.clone()));
         }
         let plane = Arc::new(plane);
-        let daemon = rt.block_on(disabled_endpoint(unique_secret()));
+        let daemon = if loopback_only {
+            rt.block_on(loopback_endpoint(unique_secret()))
+        } else {
+            rt.block_on(disabled_endpoint(unique_secret()))
+        };
         let eid = daemon.id();
         let addrs = loopback_sockets(&daemon.bound_sockets());
         let endpoint = daemon.clone();

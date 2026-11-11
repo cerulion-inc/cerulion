@@ -3,8 +3,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/idle_spy.rs"]
+mod idle_spy;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -92,16 +95,13 @@ fn offline_source_reobserve_preserves_healthy_source_refcount_and_oracle_deliver
                 let held = server_held.clone();
                 let busy = server_busy.clone();
                 let attempts = server_attempts.clone();
+                let worker_running = server_running.clone();
                 workers.push(std::thread::spawn(move || {
                     stream.set_nonblocking(false).unwrap();
-                    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
                     writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    loop {
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).unwrap() == 0 {
-                            break;
-                        }
+                    while let Some(line) = idle_spy::read_request(&mut reader, &worker_running) {
                         let request: Value = serde_json::from_str(&line).unwrap();
                         let request_id = request["id"].as_u64().unwrap();
                         let reply = match request["method"].as_str().unwrap() {

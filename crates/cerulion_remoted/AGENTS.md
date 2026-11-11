@@ -10,7 +10,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
   verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
-- `pair` takes exactly ONE proof (`owner_certificate_postcard` or
+- `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
   key, owner, chain, scope, clocks and revocation, preserve the owner row, persist
   before binding, and refuse a narrower cert: permissions are per-account.
@@ -26,8 +26,8 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
-  task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
-  builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
+  task per stream. connectd mirrors the robot protocol (no production remoted dep);
+  `protocol_parity_test.rs` gates parity: change both.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
 - Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.

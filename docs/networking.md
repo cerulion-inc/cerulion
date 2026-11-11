@@ -2,7 +2,7 @@
 
 A Cerulion robot defaults to **paired access on every platform**. A live run
 makes its exported topics available to authorized desks through the authenticated
-remote plane. Same-account robots and saved pairings are discovered automatically;
+remote plane. Robots on your account (and existing saved pairings) are discovered automatically;
 iroh takes a direct path when possible, including on one LAN, and uses a relay
 when direct connectivity is unavailable. No listen setting, IP address or
 `--connect` flag is needed for that path.
@@ -187,7 +187,7 @@ shutdown once active ops sessions, control leases and owed e-stop work settle.
 
 A signed-in producer registers itself and starts authenticated serving on its
 first live export. A signed-in desk finds robots on that account through the
-account directory. Saved pairings join the same discovery and read path, including
+account directory. Existing saved pairings join the same discovery and read path, including
 validated cached direct routes at offline sites. An authenticated reply establishes
 presence; a directory row alone does not prove that a robot is reachable.
 

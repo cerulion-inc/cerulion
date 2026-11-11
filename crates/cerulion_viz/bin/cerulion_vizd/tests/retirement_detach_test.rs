@@ -3,7 +3,10 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+#[path = "support/idle_spy.rs"]
+mod idle_spy;
+
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::time::Duration;
 
@@ -366,18 +369,15 @@ fn spy(
             };
             let methods = thread_methods.clone();
             let reply = reply.clone();
+            let worker_running = thread_running.clone();
             workers.push(std::thread::spawn(move || {
                 stream.set_nonblocking(false).unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout(Some(Duration::from_millis(200)))
                     .unwrap();
                 writeln!(stream, "{}", cerulion_netd::Hello::new().to_json_line()).unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap() == 0 {
-                        break;
-                    }
+                while let Some(line) = idle_spy::read_request(&mut reader, &worker_running) {
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let method = request["method"].as_str().unwrap();
                     if method != "status" {

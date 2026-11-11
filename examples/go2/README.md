@@ -203,7 +203,7 @@ cerulion viz --robot go2 /go2/utlidar/cloud /go2/camera/jpeg /tf /tf_static
 `--robot` takes the robot's announced name, which is the
 `CERULION_ROBOT_IDENTITY` exported in step 2, and needs at least one topic.
 `cerulion topic list` prints the announced name under ROBOTS if you are
-unsure. The same account or saved pairing works across networks without an
+unsure. The same account works across networks without an
 address or listen setting. iroh uses a direct path when possible and a relay
 otherwise. The desk can decode the raw H.264 route
 directly (`/go2/camera/h264`); the JPEG leg is the fallback for a desk that

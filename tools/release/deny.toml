@@ -318,7 +318,9 @@ name = "iroh"
 # `cerulion_remoted` is a DEV edge only: its tests need iroh's `VarInt`,
 # `SecretKey`, `RelayMode` and endpoint presets, and `iroh-relay`'s loopback
 # relay server and client, which `cerulion_link` does not re-export.
-wrappers = ["cerulion_link", "cerulion_remoted"]
+# `cerulion_netd` is also a DEV edge only: its automatic CLI fixture binds
+# actual loopback sockets through the endpoint presets; production uses the wrapper.
+wrappers = ["cerulion_link", "cerulion_remoted", "cerulion_netd"]
 
 [[bans.deny]]
 name = "rerun"

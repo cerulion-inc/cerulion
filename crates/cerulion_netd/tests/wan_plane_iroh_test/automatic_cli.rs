@@ -163,6 +163,7 @@ fn automatic_paired_cli_delivers_frames_and_selected_sources_never_collide() {
         "automatic",
         Arc::new(claimed_paired(public_of(&desk_seed))),
         Some((topic.clone(), doc)),
+        true,
     );
     let manager = TransportManager::get_or_init().unwrap();
     let home = tempfile::tempdir_in("/tmp").unwrap();
