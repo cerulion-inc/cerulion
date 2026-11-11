@@ -522,29 +522,26 @@ impl IrohMirrorPlane {
                     )
                     .await
                     .map_err(|failure| failure.reason)?;
-                let path = connection
-                    .connection
-                    .paths()
-                    .iter()
-                    .find(|path| path.is_selected())
-                    .map_or(crate::account_access::RobotPath::Unknown, |path| {
-                        if path.is_ip() {
+                // Reachability and the persisted direct route must describe the
+                // same authenticated path snapshot, even while iroh migrates.
+                let paths = connection.connection.paths();
+                let (path, direct) = paths.iter().find(|path| path.is_selected()).map_or(
+                    (crate::account_access::RobotPath::Unknown, None),
+                    |path| {
+                        let route = if path.is_ip() {
                             crate::account_access::RobotPath::Direct
                         } else if path.is_relay() {
                             crate::account_access::RobotPath::Relayed
                         } else {
                             crate::account_access::RobotPath::Unknown
-                        }
-                    });
-                let direct = connection
-                    .connection
-                    .paths()
-                    .iter()
-                    .find(|path| path.is_selected())
-                    .and_then(|path| match path.remote_addr() {
-                        cerulion_link::TransportAddr::Ip(address) => Some(*address),
-                        _ => None,
-                    });
+                        };
+                        let direct = match path.remote_addr() {
+                            cerulion_link::TransportAddr::Ip(address) => Some(*address),
+                            _ => None,
+                        };
+                        (route, direct)
+                    },
+                );
                 Ok((catalog, path, direct))
             })
             .await

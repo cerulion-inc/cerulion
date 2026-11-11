@@ -4,9 +4,9 @@
 no transport/rerun; `bin/cerulion_vizd`: desk daemon. Not default-members:
 builds stay rerun-free (`default_member_build_is_rerun_free`); use -p.
 
-- Remote taps read netd's returned channel, retaining canonical topic/schema/robot.
-  Source changes require detach. Attach/detach serialize outside poll state; wait
-  for demand readiness and release fresh refused demands.
+- Remote taps keep canonical topic/schema/robot on netd's returned channel.
+  Repoint after detach; share committed demands; release fresh refusals.
+  Attach/detach serialize outside poll state (<=3 s); rollback waits <=45 s.
 
 ## Invariants
 - Live viz is INSTANT-ONLY: reconnects get statics + blueprint, never replay (`re_grpc_server` fork in
