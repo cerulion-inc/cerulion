@@ -230,3 +230,16 @@ macro_rules! export_stable_node {
         $crate::cerulion_core::node_abi::export_node_api!(__cer_python_api);
     };
 }
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn python_node_error_retains_its_exact_traceback_text() {
+        let expected = "Traceback (most recent call last):\nRuntimeError: probe\n";
+        let error = super::node_error(expected.into());
+        assert_eq!(
+            cerulion_core::graph::node_plugin_abi::diagnostic_reason(&error),
+            expected
+        );
+    }
+}

@@ -632,3 +632,11 @@ def test_escaped_python_memoryview_survives_destroy_and_never_reuses_its_lease()
     assert result.returncode == 0, result.stdout + result.stderr
     assert "pinned after_destroy=1 outstanding=1 refused=9" in result.stdout
     assert "pinned after_unload=1 bytes=d4c3b2a1 outstanding=1" in result.stdout
+
+
+def test_python_node_error_reason_crosses_the_stable_slot_exactly():
+    result = _run("errors", "retain_loan", ticks=1)
+    assert result.returncode == 0, result.stderr
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=1 err=output loan 'out' retained a buffer export at tick end out_frames=0"
+    ]

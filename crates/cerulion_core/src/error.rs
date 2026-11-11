@@ -154,6 +154,11 @@ pub enum TransportError {
     /// YAML parse error.
     #[error("Failed to parse graph YAML: {reason}. Check YAML syntax (indentation, colons, dashes) and compare against the graph format in the documentation.")]
     GraphParseError { reason: String },
+    /// A host callback's already rendered diagnostic, kept verbatim locally.
+    /// The stable boundary transfers text without a native Rust error value.
+    #[doc(hidden)]
+    #[error("{reason}")]
+    HostServiceFailed { reason: String },
     /// Node init/tick/shutdown failure.
     #[error("Node '{node_id}' error: {reason}")]
     NodeError { node_id: String, reason: String },

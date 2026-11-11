@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Checked, cached calls to the host's immutable C table.
 
-use std::mem::{align_of, offset_of};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{NodeErrorKind, TransportError, TransportResult};
@@ -57,60 +56,14 @@ impl HostClient {
         context: ContextHandle,
         required: u64,
     ) -> Result<Self, Status> {
-        if api.is_null()
-            || !api.addr().is_multiple_of(align_of::<HostApiV1>())
-            || context.value == 0
-        {
+        if context.value == 0 {
             return Err(super::status(status_code::INVALID_ARGUMENT));
         }
-        // SAFETY (U05): the caller guarantees a live immutable fixed header;
-        // non-null/alignment are checked before reading it. No full table yet.
-        let header = unsafe { api.cast::<TableHeaderV1>().read() };
-        validate_header::<HostApiV1>(&header)
+        // SAFETY (U05): caller retains the immutable host allocation and code;
+        // the frozen interface validates alignment, complete header identity
+        // and all 28 callback representations before returning a typed table.
+        let api = unsafe { read_host_api(api) }
             .map_err(|_| super::status(status_code::INVALID_ARGUMENT))?;
-        // Read required function addresses as integers BEFORE forming a typed
-        // HostApi value: a null Rust function pointer is an invalid value.
-        let offsets = [
-            offset_of!(HostApiV1, bind_port),
-            offset_of!(HostApiV1, loan_output),
-            offset_of!(HostApiV1, finish_output),
-            offset_of!(HostApiV1, submit_spill),
-            offset_of!(HostApiV1, discard_output),
-            offset_of!(HostApiV1, receive_input),
-            offset_of!(HostApiV1, release_input),
-            offset_of!(HostApiV1, input_head),
-            offset_of!(HostApiV1, set_snapshot_inputs),
-            offset_of!(HostApiV1, snapshot_inputs),
-            offset_of!(HostApiV1, pump_history),
-            offset_of!(HostApiV1, clock),
-            offset_of!(HostApiV1, request_shutdown),
-            offset_of!(HostApiV1, environment),
-            offset_of!(HostApiV1, poll_event),
-            offset_of!(HostApiV1, publisher_counters),
-            offset_of!(HostApiV1, copy_error),
-            offset_of!(HostApiV1, diagnostic),
-            offset_of!(HostApiV1, accumulate_count),
-            offset_of!(HostApiV1, accumulate_frame),
-            offset_of!(HostApiV1, mark_served),
-            offset_of!(HostApiV1, capture_accumulate),
-            offset_of!(HostApiV1, query_extension),
-            offset_of!(HostApiV1, restore_accumulate),
-            offset_of!(HostApiV1, create_raw_publisher),
-            offset_of!(HostApiV1, finish_raw_output),
-            offset_of!(HostApiV1, register_raw_egress),
-            offset_of!(HostApiV1, destroy_raw_publisher),
-        ];
-        for offset in offsets {
-            // SAFETY (U05): complete byte size/identity were checked; fn fields
-            // have pointer-sized initialized representations on this target.
-            let address = unsafe { api.cast::<u8>().add(offset).cast::<usize>().read() };
-            if address == 0 {
-                return Err(super::status(status_code::INVALID_ARGUMENT));
-            }
-        }
-        // SAFETY (U05): complete shape and every fn representation checked;
-        // host backing remains immutable. Copy only the C records/callbacks.
-        let api = unsafe { api.read() };
         negotiate(required, api.capabilities)
             .map_err(|_| super::status(status_code::UNSUPPORTED))?;
         Ok(Self(Arc::new(ClientInner {
@@ -147,10 +100,7 @@ impl HostClient {
                 kind,
                 reason,
             },
-            None => TransportError::NodeError {
-                node_id: "host".into(),
-                reason,
-            },
+            None => TransportError::HostServiceFailed { reason },
         }
     }
 
@@ -172,6 +122,10 @@ impl HostClient {
         );
         if !matches!(status.code, status_code::OK | status_code::BUFFER_TOO_SMALL) {
             return None;
+        }
+        if status.code == status_code::OK && required == 0 {
+            // A complete empty copy has already consumed its token.
+            return Some(String::new());
         }
         let len = usize::try_from(required)
             .ok()
