@@ -45,6 +45,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
 use crate::tap::{peek_schema_hash, TapManager};
+
+/// Only a local source may be exported under this robot's authorization.
+pub(crate) fn wire_servable(manager: &TransportManager, topic: &str) -> Result<(), String> {
+    let prefix = cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX;
+    if topic == prefix
+        || topic
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || !matches!(manager.is_network_mirror(topic), Ok(false))
+    {
+        return Err(format!(
+            "'{topic}' is a network mirror of another robot; read it on its source robot"
+        ));
+    }
+    if !manager
+        .remote_topic_allowed(topic)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(
+            "the producing run excludes this topic from network egress; remote access is refused"
+                .into(),
+        );
+    }
+    Ok(())
+}
 use crate::trust::TrustError;
 use crate::{AcceptDecision, PairingAuthorizer, RemotedClock, SharedTrust};
 
@@ -528,6 +553,10 @@ impl WirePlane {
         topic: &str,
         taps: &mut TapManager,
     ) -> Result<SchemaReply, WireError> {
+        let _source = self
+            .manager()?
+            .acquire_local_topic_lease(topic)
+            .map_err(|error| WireError::SchemaSource(error.to_string()))?;
         let _scope = self
             .manager()?
             .acquire_remote_topic_lease(topic)
@@ -823,6 +852,12 @@ async fn handle_request(
                     }
                 }
             };
+            if let Err(message) = wire_servable(&manager, &topic) {
+                return WireResponse::Error {
+                    topic: Some(topic),
+                    message,
+                };
+            }
             let schemas = match plane.local_schemas.as_ref().filter(|_| graph_ingress) {
                 Some(source) => match source.load(manager.iox_shm_identity()).await {
                     Ok(schemas) => Some(schemas),
@@ -862,6 +897,16 @@ async fn handle_request(
         WireRequest::Schema { topic } => {
             if let Some(refusal) = metadata_refusal(authorizer, connection, Some(&topic)) {
                 return refusal;
+            }
+            let source = plane
+                .manager()
+                .map_err(|error| error.to_string())
+                .and_then(|manager| wire_servable(&manager, &topic));
+            if let Err(message) = source {
+                return WireResponse::Error {
+                    topic: Some(topic),
+                    message,
+                };
             }
             let schema = plane.current_schema(&topic, taps).await;
             // The local provider and any header peek await work. Admission must
@@ -971,7 +1016,7 @@ async fn build_catalog(
         let per_topic = crate::tap::catalog_peek_budget();
         let rows: Vec<(String, Option<u64>, Option<u32>)> = topics
             .into_iter()
-            .filter(|topic| manager.remote_topic_allowed(topic).unwrap_or(false))
+            .filter(|topic| wire_servable(&manager, topic).is_ok())
             .map(|topic| {
                 let hash = match known.get(&topic) {
                     Some(h) => Some(*h),
@@ -1060,6 +1105,24 @@ pub fn rebuild_frame(header: &WireHeader, body: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use cerulion_core::transport::cerulion_q::SchemaEncoding;
+
+    #[test]
+    fn wire_servable_refuses_reserved_prefix_with_exact_boundaries() {
+        let manager = TransportManager::init_for_test(
+            cerulion_core::TransportConfig::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        for topic in ["/__cerulion", "/__cerulion/observers/x/y"] {
+            assert_eq!(
+                wire_servable(&manager, topic),
+                Err(format!(
+                    "'{topic}' is a network mirror of another robot; read it on its source robot"
+                ))
+            );
+        }
+        assert_eq!(wire_servable(&manager, "/__cerulionx"), Ok(()));
+    }
 
     /// The control protocol round-trips through JSON with the documented `verb` /
     /// `reply` tags (hand oracle — the exact wire vocabulary).

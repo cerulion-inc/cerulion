@@ -1755,6 +1755,8 @@ impl PermissiveShmProbe {
     /// 5. SHM open-only probe → [`ProbeVerdict::Served`] (register + announce) or
     ///    [`ProbeVerdict::Missing`] (refused, nothing created).
     ///
+    /// Remote mirrors or unreadable source identity are refused before registration.
+    ///
     /// Idempotent: a second call for an already-served topic returns
     /// `AlreadyRegistered` (step 3) - one registration, one announce (and, if the
     /// first announce failed, the heal happens here on the retry).
@@ -1774,6 +1776,11 @@ impl PermissiveShmProbe {
         //    poisoned gate reads conservatively (do not probe).
         if !matches!(manager.bridge_manager().egress_is_allow_all(), Ok(true)) {
             return ProbeVerdict::NotPermissive;
+        }
+
+        if !matches!(manager.is_network_mirror(&canonical), Ok(false)) {
+            self.record_loop_refusal(&canonical, "network mirror belongs to its source robot");
+            return ProbeVerdict::LoopRefused;
         }
 
         // 3. Already registered (boot-plan, control channel, or an earlier

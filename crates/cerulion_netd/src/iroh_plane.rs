@@ -396,6 +396,24 @@ impl IrohMirrorPlane {
         self.registry.replace_owner_certificate(proof)
     }
 
+    /// Consume a persistent shared-control transport loss for registry retirement.
+    pub(crate) fn take_shared_transport_loss(&self) -> bool {
+        self.shared_control
+            .as_ref()
+            .is_some_and(|control| control.take_transport_loss())
+    }
+
+    pub(crate) fn shares_owned_endpoint(&self) -> bool {
+        self.shared_control.is_some()
+    }
+
+    pub(crate) fn synchronize_shared_endpoint(&self) -> Result<Vec<TopicKey>, String> {
+        self.shared_control
+            .as_ref()
+            .ok_or_else(|| "mirror plane does not share an owned endpoint".to_owned())?
+            .sync()
+    }
+
     /// Override the dial / await timeout (tests shorten it to catch a stalling /
     /// unreachable robot fast).
     pub fn with_dial_timeout(mut self, dial_timeout: Duration) -> Self {
@@ -487,9 +505,9 @@ impl IrohMirrorPlane {
         &self,
         robots: HashMap<String, WanRobot>,
     ) -> Result<Vec<TopicKey>, String> {
-        if let Some(control) = &self.shared_control {
+        if self.shares_owned_endpoint() {
             self.registry.replace_membership(robots)?;
-            return control.sync();
+            return self.synchronize_shared_endpoint();
         }
         if robots
             .keys()
@@ -1729,7 +1747,7 @@ impl Drop for IrohMirrorPlane {
     fn drop(&mut self) {
         // Owned runtime drop aborts its tasks. Shared handles do not: explicitly
         // retire readers so their injection slots cannot outlive this plane.
-        if self.shared_control.is_some() || matches!(&self.rt, PlaneRuntime::Shared(_)) {
+        if self.shares_owned_endpoint() || matches!(&self.rt, PlaneRuntime::Shared(_)) {
             if let Err(error) = self.invalidate_account() {
                 tracing::warn!(error = %error, "outbound mirror shutdown could not acknowledge retirement");
             }

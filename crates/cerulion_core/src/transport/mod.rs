@@ -4179,14 +4179,16 @@ impl TransportManager {
         egress_scope::REMOTE_ACCESS_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// A remote tap that holds producer policy for its entire lifetime.
+    /// An export tap that holds producer policy and local source identity through teardown.
     pub fn create_remote_data_only_subscriber(
         &self,
         topic: &str,
     ) -> TransportResult<DataOnlySubscriber> {
+        let local = self.acquire_local_topic_lease(topic)?;
         let lease = self.acquire_remote_topic_lease(topic)?;
         let mut tap = self.create_data_only_subscriber(topic)?;
         tap.hold_remote_lease(lease);
+        tap.hold_local_lease(local);
         Ok(tap)
     }
 

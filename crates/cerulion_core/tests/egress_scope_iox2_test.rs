@@ -70,6 +70,41 @@ fn a_retained_remote_tap_cannot_read_a_successor_local_only_producer() {
 }
 
 #[test]
+fn an_export_tap_pins_local_source_identity_until_after_its_data_port_drops() {
+    let (producer, remote) = managers();
+    let publisher = producer
+        .create_publisher_simple("/source_role", MaxSliceLen::const_new(128))
+        .unwrap();
+    let tap = remote
+        .create_remote_data_only_subscriber("/source_role")
+        .unwrap();
+    drop(publisher);
+    let refused =
+        producer.create_remote_ingress_injector("/source_role", 11, MaxSliceLen::const_new(128));
+    assert!(matches!(
+        refused,
+        Err(cerulion_core::TransportError::MirrorIdentity { .. })
+    ));
+    drop(tap);
+    let mirror = producer
+        .create_remote_ingress_injector("/source_role", 11, MaxSliceLen::const_new(128))
+        .unwrap();
+    assert!(remote.is_network_mirror("/source_role").unwrap());
+    assert!(matches!(
+        remote.create_remote_data_only_subscriber("/source_role"),
+        Err(cerulion_core::TransportError::LocalObservationLease { .. })
+    ));
+    drop(mirror);
+    let publisher = producer
+        .create_publisher_simple("/source_role", MaxSliceLen::const_new(128))
+        .unwrap();
+    assert!(remote
+        .create_remote_data_only_subscriber("/source_role")
+        .is_ok());
+    drop(publisher);
+}
+
+#[test]
 fn concurrent_opposite_admissions_never_both_succeed() {
     for _ in 0..16 {
         let (producer, remote) = managers();
