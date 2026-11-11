@@ -235,7 +235,14 @@ fn membership_preflight_and_retirement_preserve_tearing_generation_order() {
     let old_conn = registry.connect(Instant::now());
     registry.demand(old_conn, key.clone(), 1, Instant::now());
     registry.mark_mirror_present(&key);
-    controller.pins().unwrap().insert(key.clone(), Route::Wan);
+    controller.pins().unwrap().insert(
+        key.clone(),
+        Pin {
+            route: Route::Wan,
+            schema_hash: 1,
+            live: true,
+        },
+    );
     registry.release(old_conn, &key, Instant::now());
     assert!(registry.claim_tearing(&key));
     let smaller = login.snapshot(vec![robot(2, true)]);
@@ -291,7 +298,14 @@ fn changed_identity_retires_all_old_holds_before_reinstall() {
     let old = registry.connect(Instant::now());
     registry.demand(old, key.clone(), 1, Instant::now());
     registry.mark_mirror_present(&key);
-    controller.pins().unwrap().insert(key.clone(), Route::Wan);
+    controller.pins().unwrap().insert(
+        key.clone(),
+        Pin {
+            route: Route::Wan,
+            schema_hash: 1,
+            live: true,
+        },
+    );
     login.write([6; 32], [10; 32]);
     assert_eq!(
         controller.prepare_demand(&key, &mut registry).unwrap_err(),
@@ -394,4 +408,49 @@ fn poisoned_controller_refuses_wan_without_rerouting_it_to_lan() {
     assert!(controller
         .prepare_demand(&TopicKey::new("lan-robot", "/state"), &mut registry)
         .is_ok());
+}
+
+#[test]
+fn last_holder_release_during_controller_io_cannot_revive_a_migrating_pin() {
+    let login = Login::new();
+    let controller = login.controller(true, true);
+    let now = Instant::now();
+    let mut registry = DemandRegistry::new(now);
+    controller
+        .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
+        .unwrap();
+    let key = TopicKey::new(account_access::robot_route(&[1; 32]), "/released");
+    let conn = registry.connect(now);
+    registry.demand(conn, key.clone(), 7, now);
+    registry.mark_mirror_present(&key);
+    controller.pins().unwrap().insert(
+        key.clone(),
+        Pin {
+            route: Route::Wan,
+            schema_hash: 7,
+            live: true,
+        },
+    );
+    assert!(controller.holds_outbound_readers());
+    let state = controller.state.lock().unwrap();
+    registry.release(conn, &key, now);
+    assert_eq!(controller.release_mirror(&key), MirrorRelease::Lingering);
+    assert!(!controller.pins().unwrap()[&key].live);
+    assert!(
+        controller.holds_outbound_readers(),
+        "busy must remain conservative"
+    );
+    drop(state);
+    assert!(!controller.holds_outbound_readers());
+    controller.refresh_identity(&mut registry).unwrap();
+    assert!(controller.pins().unwrap().is_empty());
+    assert!(registry.snapshot().is_empty());
+    assert!(
+        registry.take_mirror_losses(conn).is_empty(),
+        "released holders receive no loss event"
+    );
+    assert!(
+        controller.state().unwrap().plane.is_none(),
+        "a released reader must not construct an endpoint"
+    );
 }
