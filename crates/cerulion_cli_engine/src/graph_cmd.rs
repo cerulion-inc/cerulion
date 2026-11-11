@@ -17666,10 +17666,22 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
             record_dir.display()
         ))
     })?;
+    // Resolve a relative directory once, before passing paths to the recorder.
+    // Explicit absolute paths retain their spelling in recorder status.
+    let record_dir = if record_dir.is_absolute() {
+        std::borrow::Cow::Borrowed(record_dir)
+    } else {
+        std::borrow::Cow::Owned(std::path::absolute(record_dir).map_err(|error| {
+            CliError::Validation(format!(
+                "recording: cannot resolve recording dir `{}`: {error}",
+                record_dir.display()
+            ))
+        })?)
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let paths = resolve_recording_paths(record_dir, graph_name, now);
+    let paths = resolve_recording_paths(&record_dir, graph_name, now);
     let scratch = ScratchGuard {
         paths: vec![
             paths.ready.clone(),
@@ -24980,6 +24992,20 @@ process_groups:
         let (guard, status_off) = prepare_bagd_status(&manager, &RunTopicScope::LocalOnly, "scope");
         assert!(guard.is_none());
         assert!(status_off);
+        for scope in [
+            RunTopicScope::Unrestricted,
+            RunTopicScope::Declared {
+                topics: vec![cerulion_bagd::STATUS_TOPIC.into()],
+                ingress: vec![],
+            },
+        ] {
+            let (guard, status_off) = prepare_bagd_status(&manager, &scope, "scope");
+            assert!(guard.is_none());
+            assert!(
+                !status_off,
+                "a public recording never excludes a leased status topic"
+            );
+        }
     }
 
     /// What `graph run --record` hands the recorder is what
@@ -28862,6 +28888,59 @@ process_groups:
             schema_hash,
             wire_fixed_size: 0,
             multi_publisher: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_recording_directory_hands_absolute_paths_to_bagd() {
+        for _ in 0..2 {
+            let workspace = tempfile::tempdir_in(".").unwrap();
+            assert!(workspace.path().is_relative());
+            let directory = workspace.path().join("recordings");
+            let expected_directory = std::env::current_dir().unwrap().join(&directory);
+            let inputs = prepare_recording_inputs(RecordingInputSpec {
+                embed_config: &recorded_topics_config(),
+                record_dir: &directory,
+                workspace_root: workspace.path(),
+                graphs_dir: &workspace.path().join("graphs"),
+                graph_name: "status",
+                recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
+                record_env: RecordEnvMode::None,
+                coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            })
+            .unwrap();
+            for path in [
+                &inputs.paths.out,
+                &inputs.paths.ready,
+                &inputs.paths.topics_json,
+                &inputs.paths.env_json,
+                &inputs.paths.recorder_json,
+                &inputs.paths.schema_catalog,
+                &inputs.paths.graph_yaml,
+            ] {
+                assert!(path.is_absolute());
+                assert_eq!(path.parent(), Some(expected_directory.as_path()));
+            }
+            let argv = bagd_argv(&BagdSpawnSpec {
+                graph_name: "status",
+                status_off: false,
+                out_path: &inputs.paths.out,
+                topics_json_path: &inputs.paths.topics_json,
+                ready_path: &inputs.paths.ready,
+                env_json_path: &inputs.paths.env_json,
+                recorder_json_path: &inputs.paths.recorder_json,
+                graph_yaml_path: &inputs.paths.graph_yaml,
+                ring_names: &[],
+                record_cpu: RecordCpu::None,
+                iox2_config_path: None,
+                schema_catalog_path: inputs.schema_catalog.as_deref(),
+                state_tag: None,
+                flashback_dir: None,
+            });
+            assert_eq!(argv[1], "--out");
+            assert_eq!(argv[2], inputs.paths.out.as_os_str());
+            assert!(!argv.iter().any(|arg| arg == "--status-period-ms"));
         }
     }
 

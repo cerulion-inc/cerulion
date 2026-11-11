@@ -13,7 +13,8 @@ TRACKED existing `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage nodes only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
-- Graph/node guards precede services/workers, including recording: off/inert excludes every topic, strict excludes outputs outside egress. Drop guards after all ports/workers.
+- Graph/node guards precede ports/workers: off/inert excludes all, strict non-egress. Drop after ports/workers.
+- Resolve relative recording paths before child handoff.
 - Engine enforces invariants; CLI checks are UX.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
   share 4 s (500 ms/robot); never pair or demand. LAN and account rows merge only on
