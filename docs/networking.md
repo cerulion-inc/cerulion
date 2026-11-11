@@ -497,8 +497,9 @@ serialized plan + the run's iceoryx2 namespace.
   and `lost`. `next` is the last sequence the reply accounts for, inclusive:
   the next GET passes it back unchanged. `lost` counts the sequences in that
   range the run no longer holds (overwritten or dropped), so rows plus `lost`
-  equal `next` minus `after`. A full page means more are waiting. A lost
-  sequence takes no row, so a shorter page reached the newest fire. The other
+  equal `next` minus `after`. A full page may have more waiting, so the desk
+  asks again; that ask can come back empty. A lost sequence takes no row, so
+  a shorter page reached the newest fire. The other
   outcomes are `unknown_run` (the robot hosts no such run: ask `runs` again),
   `not_served` (the run records no fires) and `refused` (the access gate that
   also guards `runs`; nothing is read and no lease is armed). The
