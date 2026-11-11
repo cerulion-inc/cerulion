@@ -56,4 +56,4 @@ Stable export details and per-site safety: `../../docs/internals/node-abi.md`.
 Python objects stay local; raw leases/spill retain native preflight and publish order.
 Metadata retains code/context for process lifetime (CPython caches code/escaped views).
 No state/external capabilities; diagnostics preserve exact text plus host classification.
-Escaped-view tests pin lifetime; deferred releases flush before Python runs.
+Escaped views pin lifetime; deferred releases flush before Python; host owns maintenance.

@@ -5,7 +5,6 @@ use cerulion_core::graph::node::{AnyPublisher, AnySubscriber, NodeContext as Nat
 use cerulion_core::graph::node_plugin_abi as plugin;
 use cerulion_core::node_abi::LoanRequestV1;
 use cerulion_core::transport::publisher::RawShmLoan;
-use cerulion_core::{SyncHeadOp, SyncOpAnswer};
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -51,36 +50,6 @@ impl Context {
                     Subscribers::Plugin(s, client),
                 )
             }
-        }
-    }
-    pub(crate) fn snapshot_inputs(&mut self, names: &[String]) {
-        match self {
-            Self::Native(c) => c.snapshot_inputs(names),
-            Self::Plugin(_, _) => unreachable!("stable input snapshots belong to the host"),
-        }
-    }
-    pub(crate) fn drain_trigger_input(&mut self, name: &str) -> (u64, Option<u64>) {
-        match self {
-            Self::Native(c) => c.drain_trigger_input(name),
-            Self::Plugin(_, _) => unreachable!("stable trigger drain belongs to the host"),
-        }
-    }
-    pub(crate) fn refill_trigger_input(&mut self, name: &str) -> (u64, Option<u64>) {
-        match self {
-            Self::Native(c) => c.refill_trigger_input(name),
-            Self::Plugin(_, _) => unreachable!("stable trigger refill belongs to the host"),
-        }
-    }
-    pub(crate) fn sync_head_op(&mut self, name: &str, op: SyncHeadOp) -> SyncOpAnswer {
-        match self {
-            Self::Native(c) => c.sync_head_op(name, op),
-            Self::Plugin(_, _) => unreachable!("stable sync operations belong to the host"),
-        }
-    }
-    pub(crate) fn pump_history(&mut self) {
-        match self {
-            Self::Native(c) => c.pump_history(),
-            Self::Plugin(_, _) => unreachable!("stable history pumping belongs to the host"),
         }
     }
 }

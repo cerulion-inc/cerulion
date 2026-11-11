@@ -21,7 +21,6 @@ use cerulion_core::dynamic::{FrameEncoder, SchemaSet};
 use cerulion_core::graph::node::NodeContext as NativeContext;
 use cerulion_core::transport::subscriber::RawInputView;
 use cerulion_core::wire::WireHeader;
-use cerulion_core::{SyncHeadOp, SyncOpAnswer};
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -40,7 +39,6 @@ use std::sync::{Once, OnceLock};
 
 pub use cerulion_core;
 
-pub mod abi;
 mod backend;
 pub mod stable;
 
@@ -560,10 +558,6 @@ pub struct Host {
     outputs: Rc<HashMap<String, LoanMeta>>,
     next_sequences: HashMap<String, u32>,
     held_copies: HashMap<String, Rc<[u8]>>,
-    /// The runtime-classified non-trigger inputs the scheduler freezes at each
-    /// step boundary, stored once by `cerulion_node_set_snapshot_inputs` so the
-    /// per-step `cerulion_node_snapshot_inputs` allocates nothing.
-    snapshot_input_names: Vec<String>,
     /// The frame objects of the tick in progress, in input declaration order
     /// (`None` for an input with no frame). Emptied at the end of every tick
     /// and reused, so the steady-state tick pushes without allocating.
@@ -1083,45 +1077,12 @@ impl Host {
                 outputs: Rc::new(metadata.outputs),
                 next_sequences: HashMap::new(),
                 held_copies: HashMap::new(),
-                snapshot_input_names: Vec::new(),
                 frame_scratch: Vec::new(),
                 warned_threads: false,
             };
             Self::warn_extra_threads(py, &mut host.warned_threads);
             Ok(host)
         })
-    }
-
-    /// Store the non-trigger input names the scheduler freezes at each step
-    /// boundary (`cerulion_node_set_snapshot_inputs`, once per node).
-    pub fn set_snapshot_inputs(&mut self, names: Vec<String>) {
-        self.snapshot_input_names = names;
-    }
-
-    /// Freeze the stored inputs for this step (`cerulion_node_snapshot_inputs`):
-    /// the same `NodeContext::snapshot_inputs` a `#[cerulion_node]` node runs,
-    /// so a periodic Python node reads its last input on a quiet tick instead
-    /// of `None`. Allocates nothing: the names were stored once.
-    pub fn snapshot_inputs(&mut self) {
-        self.ctx.snapshot_inputs(&self.snapshot_input_names);
-    }
-
-    /// Drain a data-trigger input at a step boundary
-    /// (`cerulion_node_drain_trigger_input`).
-    pub fn drain_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
-        self.ctx.drain_trigger_input(input_name)
-    }
-
-    /// Refill a data-trigger input between two fires of one step
-    /// (`cerulion_node_refill_trigger_input`).
-    pub fn refill_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
-        self.ctx.refill_trigger_input(input_name)
-    }
-
-    /// One Sync head operation on an input (`cerulion_node_sync_head_op`), so a
-    /// `sync_window_ms` Python node reads the aligned set the scheduler chose.
-    pub fn sync_head_op(&mut self, input_name: &str, op: SyncHeadOp) -> SyncOpAnswer {
-        self.ctx.sync_head_op(input_name, op)
     }
 
     /// Run one Python tick and commit its touched outputs.
@@ -1388,11 +1349,6 @@ impl Host {
         })
     }
 
-    pub fn pump_history(&mut self) -> Result<(), String> {
-        self.ctx.pump_history();
-        Ok(())
-    }
-
     pub fn shutdown(&mut self) -> Result<(), String> {
         let result = Python::attach(|py| {
             self.runtime
@@ -1510,17 +1466,6 @@ macro_rules! export_node {
             result.unwrap_or_else(|_| { __set_error("cerulion_node_tick: panic caught by catch_unwind".into()); 2 })
         }
         #[no_mangle]
-        pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                let mut nodes = match NODES.lock() { Ok(v) => v, Err(_) => { __set_error("mutex poisoned".into()); return 3; } };
-                match nodes.as_mut().and_then(|v| v.get_mut(&handle)) {
-                    Some(host) => match host.pump_history() { Ok(()) => 0, Err(error) => { __set_error(error); 1 } },
-                    None => { __set_error(format!("handle {handle} not found")); 4 }
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_pump_history: panic caught by catch_unwind".into()); 2 })
-        }
-        #[no_mangle]
         pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
             let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                 let mut nodes = match NODES.lock() { Ok(v) => v, Err(_) => { __set_error("mutex poisoned".into()); return 3; } };
@@ -1530,91 +1475,6 @@ macro_rules! export_node {
                 }
             }));
             result.unwrap_or_else(|_| { __set_error("cerulion_node_shutdown: panic caught by catch_unwind".into()); 2 })
-        }
-        // The OPTIONAL input-discipline exports a `#[cerulion_node]` cdylib
-        // also carries. The loader resolves each by presence: the snapshot pair
-        // freezes a periodic node's non-trigger inputs at every step boundary,
-        // the drain/refill pair serves a data-trigger input one frame per fire,
-        // and the head op lets a `sync_window_ms` node read the aligned set the
-        // scheduler chose. Bodies live in `cerulion_pynode::abi`; the wrappers
-        // here add only the catch_unwind the C ABI requires.
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_set_snapshot_inputs(
-            handle: u64,
-            names_ptr: *const u8,
-            names_len: usize,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live byte slice of exactly `names_len` bytes.
-                unsafe { $crate::abi::set_snapshot_inputs(&NODES, __set_error, handle, names_ptr, names_len) }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_set_snapshot_inputs: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_snapshot_inputs(handle: u64) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                $crate::abi::snapshot_inputs(&NODES, __set_error, handle)
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_snapshot_inputs: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_drain_trigger_input(
-            handle: u64,
-            name_ptr: *const u8,
-            name_len: usize,
-            out_popped: *mut u64,
-            out_latest_ts: *mut u64,
-            out_has_ts: *mut i32,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live name slice and its own writable out-slots.
-                unsafe {
-                    $crate::abi::trigger_drain(
-                        &NODES, __set_error, $crate::abi::TriggerDrain::Boundary,
-                        handle, name_ptr, name_len, out_popped, out_latest_ts, out_has_ts,
-                    )
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_drain_trigger_input: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_refill_trigger_input(
-            handle: u64,
-            name_ptr: *const u8,
-            name_len: usize,
-            out_popped: *mut u64,
-            out_latest_ts: *mut u64,
-            out_has_ts: *mut i32,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live name slice and its own writable out-slots.
-                unsafe {
-                    $crate::abi::trigger_drain(
-                        &NODES, __set_error, $crate::abi::TriggerDrain::Refill,
-                        handle, name_ptr, name_len, out_popped, out_latest_ts, out_has_ts,
-                    )
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_refill_trigger_input: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_sync_head_op(
-            handle: u64,
-            name_ptr: *const u8,
-            name_len: usize,
-            op: u32,
-            out_ts: *mut u64,
-            out_kind: *mut i32,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live name slice and its own writable out-slots.
-                unsafe {
-                    $crate::abi::sync_head_op(
-                        &NODES, __set_error, handle, name_ptr, name_len, op, out_ts, out_kind,
-                    )
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_sync_head_op: panic caught by catch_unwind".into()); -4 })
         }
     };
 }
