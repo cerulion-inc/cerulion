@@ -49,6 +49,7 @@ use super::run_registry;
 use super::team_auth::{NetworkAuth, TeamSession};
 use super::TransportManager;
 use crate::error::{TransportError, TransportResult};
+use crate::fire_tap::Cursor;
 use crate::wire::{WireHeader, WIRE_HEADER_VERSION};
 
 // Re-entrant READ acquire for `announce_gate`: the demand queryable and the
@@ -483,6 +484,13 @@ const CATALOG_QUERY_RESOURCE: &str = "<catalog: all topics>";
 /// per-resource policy must be able to tell them apart, and a refusal log must
 /// name which one was refused.
 const RUNS_QUERY_RESOURCE: &str = "<runs: live runs + graphs>";
+
+/// The synthetic RESOURCE label the `fires` verb passes to the
+/// [`DemandAuthorizer`] gate. Distinct from [`RUNS_QUERY_RESOURCE`], because a
+/// `fires` GET reads when and how each node of a run ticks and arms the run's
+/// recording, which a future per-resource policy must be able to refuse on its
+/// own, and a refusal log must name.
+const FIRES_QUERY_RESOURCE: &str = "<fires: node fire telemetry>";
 
 /// Canonical Cerulion topic names carry a leading `/`
 /// (`/{prefix}/{node}/{output}`). The NETWORK layer normalizes every name
@@ -1940,14 +1948,16 @@ impl PermissiveShmProbe {
 /// the zenoh query thread for every GET landing on `cerulion_q/{robot}/**`. Parses
 /// the verb ([`cerulion_q::parse_query_verb`]) and routes it: `demand{topic}` to
 /// the demand path (behavior preserved), `catalog` to the catalog
-/// path, `schema/{pkg}/{Type}` to the schema-serving path, and
-/// `runs` to the live-run path. An unrecognized/malformed key is a
+/// path, `schema/{pkg}/{Type}` to the schema-serving path,
+/// `runs` to the live-run path, and `fires/{run_id}/{after}` to the hosted
+/// run's fire tap. An unrecognized/malformed key is a
 /// `debug!` no-op (a future verb from a newer peer must not error).
 ///
 /// The `authorizer` gate covers the WHOLE query surface - `demand`
-/// (frame-serving), `catalog`, `schema` (the discovery plane) AND `runs`
-/// all consult it before serving, so an unauthorized party can neither
-/// pull frames nor ENUMERATE the robot's topic catalog / schemas / running graphs.
+/// (frame-serving), `catalog`, `schema` (the discovery plane), `runs` AND
+/// `fires` all consult it before serving, so an unauthorized party can neither
+/// pull frames nor ENUMERATE the robot's topic catalog / schemas / running graphs
+/// / node fires.
 /// The default [`AllowAllAuthorizer`]
 /// admits everything (deny-nothing plumbing, byte-identical); an account-grant authorizer
 /// installs the `is_allowed(account)` predicate once and the entire surface is gated.
@@ -1984,6 +1994,9 @@ fn handle_query(
             handle_schema_verb(query, robot, schema, &requested, authorizer)
         }
         Some(QueryVerb::Runs) => handle_runs_verb(query, robot, runs, authorizer),
+        Some(QueryVerb::Fires { run_id, after }) => {
+            handle_fires_verb(query, robot, runs, authorizer, run_id, after)
+        }
         None => {
             tracing::debug!(
                 key = %query.key_expr().as_str(),
@@ -2413,6 +2426,78 @@ fn assemble_runs_reply(
     cerulion_q::build_runs_reply(robot, entries, undescribable, completeness)
 }
 
+/// The `fires` verb: reply with the fires the hosted run `run_id` recorded
+/// after the GET's cursor (see [`fires_serve_decision`]), on the concrete
+/// [`cerulion_q::fires_selector`] key the GET asked on. A reply failure is a
+/// `debug!` no-op: the desk sees no answer and asks again on its next poll.
+///
+/// A desk polls this verb (a few GETs a second while it shows the run), so a
+/// served reply logs at `trace`.
+fn handle_fires_verb(
+    query: &zenoh::query::Query,
+    robot: &str,
+    runs: &RunSource,
+    authorizer: &dyn DemandAuthorizer,
+    run_id: u128,
+    after: Option<u64>,
+) {
+    let reply = fires_serve_decision(&runs.hosted, authorizer, robot, run_id, after);
+    let (outcome, rows) = match &reply.outcome {
+        cerulion_q::FiresOutcome::Served { fires, .. } => ("served", fires.len()),
+        cerulion_q::FiresOutcome::UnknownRun => ("unknown_run", 0),
+        cerulion_q::FiresOutcome::NotServed => ("not_served", 0),
+        cerulion_q::FiresOutcome::Refused { .. } => ("refused", 0),
+    };
+    let bytes = cerulion_q::encode_fires_reply(&reply);
+    let reply_key = cerulion_q::fires_selector(robot, &reply.run_id, after);
+    match query.reply(reply_key.as_str(), bytes).wait() {
+        Ok(()) => tracing::trace!(
+            robot = %robot, run_id = %reply.run_id, outcome, rows,
+            "fires reply served"
+        ),
+        Err(e) => tracing::debug!(
+            robot = %robot, run_id = %reply.run_id, error = %e,
+            "fires queryable: reply failed"
+        ),
+    }
+}
+
+/// The fires-serve DECISION: the demand-authorization gate FIRST (the access
+/// boundary every verb consults), then the hosted run's tap. Extracted so the
+/// sync test seam runs the EXACT decision the real callback runs, minus the
+/// reply.
+///
+/// - **Refused**: [`cerulion_q::FiresOutcome::Refused`] with the gate's
+///   reason. The hosted slot is never read, so a refused GET neither learns
+///   which runs are hosted nor arms any recording.
+/// - **Unknown run**: no run is hosted under `run_id` (it ended, or the desk
+///   holds a stale id).
+/// - **Not served**: the run is hosted without a fire tap.
+/// - **Served**: the rows after `after` (`None`: from now), and the tap's
+///   lease extended from this GET. A tap records only while a desk keeps
+///   asking.
+fn fires_serve_decision(
+    hosted: &HostedRuns,
+    authorizer: &dyn DemandAuthorizer,
+    robot: &str,
+    run_id: u128,
+    after: Option<u64>,
+) -> cerulion_q::FiresReply {
+    if let DemandDecision::Deny { reason } =
+        authorizer.authorize_demand(&DemandSubject::Lan { locator: None }, FIRES_QUERY_RESOURCE)
+    {
+        log_lan_refusal(authorizer, "fires GET", FIRES_QUERY_RESOURCE, &reason);
+        return cerulion_q::FiresReply::new(
+            robot,
+            run_id,
+            cerulion_q::FiresOutcome::Refused { reason },
+        );
+    }
+    note_lan_authorized(authorizer, "fires GET", FIRES_QUERY_RESOURCE);
+    let cursor = after.map_or(Cursor::Now, Cursor::After);
+    cerulion_q::FiresReply::new(robot, run_id, hosted.serve_fires(run_id, cursor))
+}
+
 /// The shared, thread-safe source the `catalog` verb reads to build a
 /// [`cerulion_q::CatalogReply`]. The GATEWAY owns the writers - it drains the
 /// runtime-registration control channel into `hashes`, and `boot_topics` is set
@@ -2568,7 +2653,8 @@ pub struct RunSource {
     /// registry record and no run directory). A gateway fills it with its
     /// [`NetworkManager::hosted_runs`], so the query surface serves what the
     /// host put there. Absence stays exact: a hosted run is listed only while
-    /// its [`HostedRunGuard`](super::hosted_runs::HostedRunGuard) lives.
+    /// its [`HostedRunGuard`](super::hosted_runs::HostedRunGuard) lives. The
+    /// `fires` verb reads the same set: it serves only a hosted run's tap.
     pub hosted: HostedRuns,
 }
 
@@ -2907,6 +2993,20 @@ pub(crate) fn runs_serve_decision_for_test(
     robot: &str,
 ) -> cerulion_q::RunsReply {
     runs_serve_decision(runs, authorizer, robot)
+}
+
+/// SYNC SEAM (fires verb): run the EXACT fires-serve DECISION
+/// ([`fires_serve_decision`], authorizer gate, then the hosted run's tap)
+/// inline and return the reply, with no zenoh timing in the way.
+#[cfg(test)]
+pub(crate) fn fires_serve_decision_for_test(
+    hosted: &HostedRuns,
+    authorizer: &dyn DemandAuthorizer,
+    robot: &str,
+    run_id: u128,
+    after: Option<u64>,
+) -> cerulion_q::FiresReply {
+    fires_serve_decision(hosted, authorizer, robot, run_id, after)
 }
 
 /// The producer EXPIRY sweep - disable GET-granted topics whose last GET
@@ -5584,9 +5684,11 @@ impl NetworkManager {
     /// `get_state` is shared with the reconciler thread's expiry sweep),
     /// `catalog` replies the robot's full topic catalog built from `catalog` + the
     /// live bridge manager, `schema/{pkg}/{Type}` replies
-    /// the requested type's `.msg`/YAML closure built from `schema`, and `runs`
+    /// the requested type's `.msg`/YAML closure built from `schema`, `runs`
     /// replies the machine's live runs, each carrying its effective
-    /// `graph.yaml` + `run.json`, gathered at serve time through `runs`.
+    /// `graph.yaml` + `run.json`, gathered at serve time through `runs`, and
+    /// `fires/{run_id}/{after}` replies the fires a run hosted in `runs.hosted`
+    /// recorded after the cursor.
     ///
     /// IDEMPOTENT - at most ONE queryable per gateway (a second call once one is
     /// retained is a no-op `Ok(())`). Opens the session lazily. The demand verb's
@@ -8132,6 +8234,7 @@ mod hosted_runs_serve_tests {
             HostedRun {
                 entry,
                 live: Arc::clone(&flag),
+                fires: None,
             },
         );
         (guard, flag)
@@ -8148,6 +8251,7 @@ mod hosted_runs_serve_tests {
                 run_json: RUN_JSON.to_string(),
             },
             live: Arc::new(AtomicBool::new(true)),
+            fires: None,
         }
     }
 
@@ -8666,6 +8770,7 @@ mod hosted_runs_serve_tests {
                 HostedRun {
                     entry: entry_named("hosted", started_at_ns),
                     live: Arc::new(AtomicBool::new(true)),
+                    fires: None,
                 },
             )
         };
@@ -8705,5 +8810,334 @@ mod hosted_runs_serve_tests {
             served_reply(vec![entry_named("hosted", 30)], RunsCompleteness::Settled),
             "the hosted twin started later, so it survives the gathered run"
         );
+    }
+}
+
+#[cfg(test)]
+mod fires_serve_tests {
+    use super::*;
+    use crate::clock::VirtualClock;
+    use crate::fire_tap::{FireBody, FireCause, FireFlags, FireRecord, FireTap, FireTapConfig};
+    use crate::transport::cerulion_q::{
+        decode_fires_reply, encode_fires_reply, format_run_id, FiresOutcome, FiresReply, RunEntry,
+    };
+    use crate::transport::hosted_runs::{HostedRun, HostedRunGuard};
+    use crate::transport::run_registry::RunState;
+
+    const ROBOT: &str = "temi";
+    const RUN: u128 = 0x5d1c_0000_0000_0000_0000_0000_0000_9e02;
+    const RUN_TEXT: &str = "0x5d1c0000000000000000000000009e02";
+    const CAPACITY: usize = 64;
+    const ANSWER_CEILING: Duration = Duration::from_secs(10);
+
+    struct DenyAll;
+    impl DemandAuthorizer for DenyAll {
+        fn authorize_demand(&self, _subject: &DemandSubject, resource: &str) -> DemandDecision {
+            DemandDecision::deny(format!("test: no access to {resource}"))
+        }
+    }
+
+    struct Tapped {
+        hosted: HostedRuns,
+        tap: Arc<FireTap>,
+        clock: Arc<VirtualClock>,
+        in_tick: Vec<Arc<AtomicU64>>,
+        _guard: HostedRunGuard,
+    }
+
+    fn host(hosted: &HostedRuns, fires: Option<Arc<FireTap>>) -> HostedRunGuard {
+        hosted.host(
+            RUN,
+            HostedRun {
+                entry: RunEntry::new(RUN, "temi", 1, RunState::Live, "name: temi\n", "{}\n")
+                    .expect("a well-formed entry"),
+                live: Arc::new(AtomicBool::new(true)),
+                fires,
+            },
+        )
+    }
+
+    fn tapped() -> Tapped {
+        let clock = Arc::new(VirtualClock::new());
+        clock.set(88_100_000_000);
+        let in_tick: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let tap = Arc::new(FireTap::new(
+            FireTapConfig {
+                capacity: CAPACITY,
+                lease: Duration::from_secs(5),
+            },
+            3,
+            in_tick.clone(),
+            clock.clone(),
+        ));
+        let hosted = HostedRuns::default();
+        let guard = host(&hosted, Some(Arc::clone(&tap)));
+        Tapped {
+            hosted,
+            tap,
+            clock,
+            in_tick,
+            _guard: guard,
+        }
+    }
+
+    fn body(at_ns: u64, node: u16, cause: FireCause, wrote: u64) -> FireBody {
+        FireBody {
+            at_ns,
+            dur_ns: 38_211,
+            node,
+            cause,
+            flags: FireFlags(0),
+            wrote,
+        }
+    }
+
+    fn decide(hosted: &HostedRuns, after: Option<u64>) -> FiresReply {
+        fires_serve_decision_for_test(hosted, &AllowAllAuthorizer, ROBOT, RUN, after)
+    }
+
+    #[test]
+    fn a_get_for_a_run_this_host_does_not_host_answers_unknown_run() {
+        let hosted = HostedRuns::default();
+        assert_eq!(
+            decide(&hosted, None),
+            FiresReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                run_id: RUN_TEXT.to_string(),
+                outcome: FiresOutcome::UnknownRun,
+            }
+        );
+        let other =
+            fires_serve_decision_for_test(&hosted, &AllowAllAuthorizer, ROBOT, 0x2a, Some(9));
+        assert_eq!(
+            other.run_id,
+            format_run_id(0x2a),
+            "the reply names the run the GET asked for"
+        );
+        assert_eq!(other.outcome, FiresOutcome::UnknownRun);
+    }
+
+    #[test]
+    fn a_run_hosted_without_a_tap_answers_not_served() {
+        let hosted = HostedRuns::default();
+        let _guard = host(&hosted, None);
+        assert_eq!(
+            decide(&hosted, Some(0)),
+            FiresReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                run_id: RUN_TEXT.to_string(),
+                outcome: FiresOutcome::NotServed,
+            }
+        );
+    }
+
+    /// A refused GET completes while the hosted slot is locked, so it never
+    /// read it, and the tap stays disarmed: a denied party cannot switch the
+    /// recording on.
+    #[test]
+    fn a_denied_get_is_refused_without_reading_the_slot_or_arming_the_tap() {
+        let run = tapped();
+        let held = run.hosted.hold_lock_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let serving = run.hosted.clone();
+        let server = std::thread::spawn(move || {
+            let _ = tx.send(fires_serve_decision_for_test(
+                &serving, &DenyAll, ROBOT, RUN, None,
+            ));
+        });
+        let answer = rx.recv_timeout(ANSWER_CEILING);
+        drop(held);
+        server.join().expect("the serve thread");
+
+        assert_eq!(
+            answer.expect("a denied fires GET completed while the hosted slot was locked"),
+            FiresReply {
+                version: 1,
+                robot: ROBOT.to_string(),
+                run_id: RUN_TEXT.to_string(),
+                outcome: FiresOutcome::Refused {
+                    reason: "test: no access to <fires: node fire telemetry>".to_string(),
+                },
+            }
+        );
+        assert!(!run.tap.stats().armed, "a refused GET arms nothing");
+        run.tap.push(body(1, 0, FireCause::Period, 1));
+        assert_eq!(run.tap.stats().recorded, 0);
+    }
+
+    #[test]
+    fn the_first_get_arms_the_tap_from_now_and_the_next_reads_the_rows_after_it() {
+        let run = tapped();
+        run.tap.push(body(1, 0, FireCause::Period, 1));
+        assert_eq!(
+            decide(&run.hosted, None).outcome,
+            FiresOutcome::Served {
+                now_ns: 88_100_000_000,
+                armed_since_ns: 88_100_000_000,
+                next: 0,
+                lost: 0,
+                in_tick: Vec::new(),
+                fires: Vec::new(),
+            },
+            "a fire before the first GET was not recorded"
+        );
+
+        run.tap
+            .push(body(88_111_000_000, 0, FireCause::Period, 0b1));
+        run.tap.push(body(88_112_000_000, 1, FireCause::Data, 0b10));
+        run.clock.set(88_123_456_789);
+        let reply = decide(&run.hosted, Some(0));
+        assert_eq!(
+            reply.outcome,
+            FiresOutcome::Served {
+                now_ns: 88_123_456_789,
+                armed_since_ns: 88_100_000_000,
+                next: 2,
+                lost: 0,
+                in_tick: Vec::new(),
+                fires: vec![
+                    FireRecord {
+                        seq: 1,
+                        at_ns: 88_111_000_000,
+                        dur_ns: 38_211,
+                        node: 0,
+                        cause: FireCause::Period,
+                        flags: FireFlags(0),
+                        wrote: 0b1,
+                    },
+                    FireRecord {
+                        seq: 2,
+                        at_ns: 88_112_000_000,
+                        dur_ns: 38_211,
+                        node: 1,
+                        cause: FireCause::Data,
+                        flags: FireFlags(0),
+                        wrote: 0b10,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            decode_fires_reply(&encode_fires_reply(&reply)),
+            Ok(reply),
+            "the bytes a GET carries decode to the reply the decision built"
+        );
+    }
+
+    /// `-` reads from now: rows recorded before a `-` GET belong to an earlier
+    /// lease or another desk, and a GET after 0 would return them.
+    #[test]
+    fn a_from_now_get_skips_the_rows_recorded_before_it() {
+        let run = tapped();
+        decide(&run.hosted, None);
+        run.tap.push(body(1, 0, FireCause::Period, 0));
+        run.tap.push(body(2, 1, FireCause::Data, 0));
+        let FiresOutcome::Served {
+            next, lost, fires, ..
+        } = decide(&run.hosted, None).outcome
+        else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!((next, lost, fires.len()), (2, 0, 0));
+    }
+
+    #[test]
+    fn records_the_ring_overwrote_before_the_read_are_counted_lost() {
+        let run = tapped();
+        decide(&run.hosted, None);
+        for at_ns in 1..=100 {
+            run.tap.push(body(at_ns, 2, FireCause::Data, 0));
+        }
+        let FiresOutcome::Served {
+            next, lost, fires, ..
+        } = decide(&run.hosted, Some(0)).outcome
+        else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!((next, lost, fires.len()), (100, 36, CAPACITY));
+        assert_eq!(
+            fires.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            (37..=100).collect::<Vec<_>>()
+        );
+        assert_eq!(fires[0].at_ns, 37);
+
+        let FiresOutcome::Served {
+            next, lost, fires, ..
+        } = decide(&run.hosted, Some(next)).outcome
+        else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!((next, lost, fires.len()), (100, 0, 0));
+    }
+
+    #[test]
+    fn a_page_holds_at_most_the_reply_cap_and_the_next_get_reads_on() {
+        let clock = Arc::new(VirtualClock::new());
+        let tap = Arc::new(FireTap::new(
+            FireTapConfig {
+                capacity: 1024,
+                lease: Duration::from_secs(5),
+            },
+            1,
+            vec![Arc::new(AtomicU64::new(0))],
+            clock,
+        ));
+        let hosted = HostedRuns::default();
+        let _guard = host(&hosted, Some(Arc::clone(&tap)));
+        decide(&hosted, None);
+        for at_ns in 1..=600 {
+            tap.push(body(at_ns, 0, FireCause::Data, 0));
+        }
+        let first = decide(&hosted, Some(0));
+        let FiresOutcome::Served { next, fires, .. } = &first.outcome else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!((*next, fires.len()), (512, cerulion_q::MAX_FIRES_PER_REPLY));
+        assert_eq!(
+            decode_fires_reply(&encode_fires_reply(&first)),
+            Ok(first.clone())
+        );
+
+        let FiresOutcome::Served { next, fires, .. } = decide(&hosted, Some(*next)).outcome else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!((next, fires.len()), (600, 88));
+        assert_eq!(fires[0].seq, 513);
+    }
+
+    #[test]
+    fn in_tick_names_each_node_inside_a_tick_with_its_start() {
+        let run = tapped();
+        run.in_tick[2].store(88_123_100_000, Ordering::Release);
+        let FiresOutcome::Served { in_tick, .. } = decide(&run.hosted, None).outcome else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!(in_tick, vec![(2, 88_123_100_000)]);
+
+        run.in_tick[2].store(0, Ordering::Release);
+        run.in_tick[0].store(5, Ordering::Release);
+        let FiresOutcome::Served { in_tick, .. } = decide(&run.hosted, Some(0)).outcome else {
+            panic!("a hosted tap is served");
+        };
+        assert_eq!(in_tick, vec![(0, 5)]);
+    }
+
+    #[test]
+    fn each_get_extends_the_lease_and_the_tap_disarms_once_gets_stop() {
+        let run = tapped();
+        decide(&run.hosted, None);
+        run.clock.set(92_100_000_000);
+        decide(&run.hosted, Some(0));
+        run.clock.set(93_100_000_000);
+        assert!(
+            run.tap.stats().armed,
+            "the second GET moved the lease to 5 s after it"
+        );
+        run.clock.set(97_099_999_999);
+        assert!(run.tap.stats().armed);
+        run.clock.set(97_100_000_000);
+        assert!(!run.tap.stats().armed, "no GET for 5 s disarms the tap");
     }
 }
