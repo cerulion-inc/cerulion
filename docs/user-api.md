@@ -2282,7 +2282,9 @@ A real-clock live run uses **paired access by default on every platform**.
 `graph run` (monolith or multiprocess), `node run` and `ros2 attach` register
 allowed exports with the shared daemon. The first live export starts authenticated
 serving automatically. A saved login (including an expired one) or valid durable
-claimed robot pairing permits serving; a query-only desk and a local-only run
+claimed robot pairing permits serving. The command-wide identity gate accepts
+that same validated robot state without creating a login record or enrolling
+again; incomplete or corrupt state does not bypass it. A query-only desk and a local-only run
 start no server. Last-export release reaps the server after active shell/exec
 work, owed e-stop delivery and its latch clear, using bounded graceful shutdown.
 Signed-in desks

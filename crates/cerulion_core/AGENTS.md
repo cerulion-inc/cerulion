@@ -1,9 +1,9 @@
-# cerulion_core - agent notes
+# cerulion_core
 
-Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rules.
+Core: wire/codegen/iceoryx2/scheduler/graph/gateway; serial rules per binary.
 
 ## Invariants
-- Excluded producers hold guards before data ports; remote taps, mirrors and announces retain opposite leases until withdrawal. Remote metadata uses `collect_remote_run_entries`: v2 private/v1 public, local accepts both; hide private ids and counts. No frame-path checks.
+- Producers exclude before ports; remote taps/mirrors/announces hold opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame-path checks.
 
 - ONE general read path: the iceoryx2 queue receive. No bypass/raw-handle read;
   a fused chain may serve a frame it just committed, in-process.
@@ -12,8 +12,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rule
   the loader also refuses a differing `RUSTC_FINGERPRINT`.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
-- No pointer-bearing raw SHM types (`String`, `Vec`, `HashMap`); strings/bytes use
-  variable-field offsets backed by the slot.
+- Raw SHM has no pointers (String/Vec/HashMap); strings/bytes use slot-backed offsets.
 - Wire `sequence` is consumed at COMMIT (`OutputProxy::Drop`), never at loan: a discarded
   loan burns no sequence, so streams stay gap-free.
 - A publisher drains its OWN event listener on every notifying path (iceoryx2 delivers
@@ -22,7 +21,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rule
   totals log as `total_failures=`, site keys as `topic=`/`service=`.
 - Sync fires ONCE PER COMPLETE ALIGNED SET, each trigger consumed by at most one set; verdicts
   from pure `sync_match.rs`; in-order consumption and arrived-set preservation inviolable.
-- Graph YAML denies unknown fields loudly; new fields need round-trip and rejection oracles.
+- Graph YAML denies unknown fields; new fields need round-trip/rejection oracles.
 - Replay = Live: `external_source()` is queried once at `run_live` entry, never under
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
@@ -47,7 +46,7 @@ Core: wire, codegen, iceoryx2, scheduler, graph, gateway; per-binary serial rule
   parallel-safe, no fence. Re-bless trybuild (`TRYBUILD=overwrite`, `macro_compile_fail_test`)
   on drift, from CI's output.
 
-## Gotchas
+## Traps
 
 - `#[traced_test]` needs tracing-test's `no-env-filter` feature (on the dev-dep) or
   production events silently vanish. `GraphRuntime` is `!Debug` - use `match`.

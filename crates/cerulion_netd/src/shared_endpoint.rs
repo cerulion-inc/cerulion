@@ -103,7 +103,11 @@ enum Answer {
     Done,
     Present(bool),
     Probe(Option<String>),
-    Catalog(CatalogReply, crate::account_access::RobotPath, Option<SocketAddr>),
+    Catalog(
+        CatalogReply,
+        crate::account_access::RobotPath,
+        Option<SocketAddr>,
+    ),
     Schema(SchemaReply),
     Released(bool),
     Retired(Vec<(String, String, bool)>),
@@ -422,7 +426,18 @@ impl SharedMirrorPlane {
             _ => Err("outbound probe reply is invalid".into()),
         }
     }
-    pub(crate) fn catalog(&self, robot: &str, timeout: Duration) -> Result<(CatalogReply, crate::account_access::RobotPath, Option<SocketAddr>), String> {
+    pub(crate) fn catalog(
+        &self,
+        robot: &str,
+        timeout: Duration,
+    ) -> Result<
+        (
+            CatalogReply,
+            crate::account_access::RobotPath,
+            Option<SocketAddr>,
+        ),
+        String,
+    > {
         match self.call(Operation::Catalog {
             robot: robot.into(),
             budget_ms: timeout.as_millis().min(15_000) as u64,
@@ -628,10 +643,19 @@ fn serve_connection(
                     .ensure_mirror(&topic_key(robot, topic, observer), schema_hash)
                     .map(|()| Answer::Done)
                     .map_err(|error| error.to_string()),
-                Operation::Release { robot, topic, observer } => Ok(Answer::Released(
-                    mirror.release_mirror(&topic_key(robot, topic, observer)) == MirrorRelease::Retired,
+                Operation::Release {
+                    robot,
+                    topic,
+                    observer,
+                } => Ok(Answer::Released(
+                    mirror.release_mirror(&topic_key(robot, topic, observer))
+                        == MirrorRelease::Retired,
                 )),
-                Operation::HasReader { robot, topic, observer } => mirror
+                Operation::HasReader {
+                    robot,
+                    topic,
+                    observer,
+                } => mirror
                     .has_reader(&topic_key(robot, topic, observer))
                     .map(Answer::Present),
                 Operation::Retire { robot } => mirror.retire_robot(&robot).map(|()| Answer::Done),

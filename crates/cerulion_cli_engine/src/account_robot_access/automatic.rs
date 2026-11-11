@@ -518,6 +518,7 @@ mod tests {
         cerulion_core::transport::cerulion_q::build_catalog_reply(
             robot,
             [CatalogEntry {
+                egress_qos: None,
                 topic: topic.into(),
                 schema_name: Some("std_msgs/String".into()),
                 schema_hash: Some(1),

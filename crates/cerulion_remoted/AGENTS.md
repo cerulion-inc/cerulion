@@ -1,8 +1,6 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-ONE robot endpoint: device-key public half is `EndpointId`; its 32-byte secret
-seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules cover
-`cerulion_{pairing,link,wireclient,connectd,accountd}`, `cerud` and `cerulion-wire`.
+One robot endpoint: device public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
 - Catalog/schema/demand/acts obey producer scope before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops are independent.
@@ -11,10 +9,7 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
   verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
-- Bootstrap verbs self-gate on their own proof (chassis secret, cert chain, owner
-  grant, CPace witness). The pairing subject is ALWAYS the TLS-authenticated device
-  key, never a client arg, and validity, TTL and rollback checks use the robot's
-  `RemotedClock`.
+- Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes exactly ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
   key, owner, chain, scope, clocks and revocation, preserve the owner row, persist
@@ -32,7 +27,7 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
   task per stream. connectd MIRRORS the robot protocol (no remoted dep in production
   builds), and `protocol_parity_test.rs` is the no-divergence gate: change both.
-- Peer text is sanitized and bounded where it ENTERS an error or log (`sanitize_peer_text`).
+- Bound/sanitize peer error/log text at entry (`sanitize_peer_text`).
 - Desk key files are exactly 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
@@ -41,10 +36,8 @@ seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules c
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata reads namespace-checked netd snapshots (no startup) or in-process
   `SchemaSource`; reauthorize CAP_OBSERVE after provider awaits.
-- Wire graph demands honor declared Reliable/send_queue; unknown policy stays
-  unknown, best-effort refuses. Count refusals separately; checked producer counts.
-- Same-user outbound control reuses the endpoint, runtime and transport node.
-  Refuse key/namespace mismatch before dialing; retire outbound sessions only.
+- Wire graphs honor Reliable/send_queue; unknown stays unknown, best-effort refuses. Separate refusal counter; checked producer counts.
+- Same-user outbound reuses endpoint/runtime/node; refuse key/namespace mismatch before dialing, retire only outbound sessions.
 
 ## Testing
 - Run `wire_plane_test` with `-- --test-threads=1`: under the macOS 256-file soft

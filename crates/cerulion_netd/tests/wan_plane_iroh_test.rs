@@ -282,6 +282,7 @@ impl RobotFixture {
         let mut plane = WirePlane::with_manager(format!("robot-{tag}"), manager.clone());
         if let Some((topic, doc)) = schema {
             let serving = cerulion_core::SchemaServing {
+                egress_qos: Vec::new(),
                 topic_schemas: vec![cerulion_core::TopicSchema {
                     topic: topic.clone(),
                     schema_name: doc.qualified.clone(),
@@ -666,12 +667,42 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
     observer
         .ensure_mirror(&served_key, ORACLE_SCHEMA_HASH)
         .unwrap();
+    let observed_key = TopicKey::observed("producer", &topic);
+    let (_, path, direct) = plane
+        .query_catalog_with_path("producer", Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(path, cerulion_netd::account_access::RobotPath::Direct);
+    assert!(remote
+        .addrs
+        .contains(&direct.expect("selected loopback path")));
     for _ in 0..2 {
         plane.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
+        plane
+            .ensure_mirror(&observed_key, ORACLE_SCHEMA_HASH)
+            .unwrap();
+        assert_ne!(plane.local_channel(&observed_key), topic);
         assert_oracle_and_gap_free(&collect_frames(&manager, &topic, 3));
+        assert_oracle_and_gap_free(&collect_frames(&manager, &observed_key.local_topic(), 3));
+        assert_eq!(plane.release_mirror(&observed_key), MirrorRelease::Retired);
+        assert!(plane.has_reader(&key).unwrap());
+        assert!(!plane.has_reader(&observed_key).unwrap());
         assert_eq!(plane.release_mirror(&key), MirrorRelease::Retired);
         assert_oracle_and_gap_free(&collect_frames(&observer_manager, &served_topic, 3));
     }
+    plane
+        .ensure_mirror(&observed_key, ORACLE_SCHEMA_HASH)
+        .unwrap();
+    let retired = plane.update_membership(HashMap::new()).unwrap();
+    assert_eq!(retired, vec![observed_key.clone()]);
+    plane
+        .update_membership(HashMap::from([(
+            "producer".into(),
+            WanRobot {
+                eid: remote.eid,
+                direct_addrs: remote.addrs.clone(),
+            },
+        )]))
+        .unwrap();
     drop(service);
     let service = cerulion_netd::shared_endpoint::OutboundServer::start(
         directory.path().join("outbound.sock"),
