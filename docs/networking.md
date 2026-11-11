@@ -270,8 +270,9 @@ serialized plan + the run's iceoryx2 namespace.
 - **Port.** A per-run gateway CHILD listens on the well-known port **7683**
   (IANA-unassigned) and bind-probes UPWARD (up to 8 tries)
   on an address-in-use conflict, so two robots on one host coexist. This does
-  NOT apply to the default netd-hosted plane, which takes its listen endpoints
-  only from `CERULION_NETD_LISTEN` and synthesizes nothing. Override
+  NOT apply to netd's optional open zenoh listener, which takes its endpoints
+  only from `CERULION_NETD_LISTEN`. Authenticated serving starts automatically
+  and needs no zenoh listen endpoint. Override
   the base with `CERULION_GATEWAY_PORT=<n>` (parsed strictly; a non-integer
   is a loud error). A Strict gateway uses the block's `listen` locators
   VERBATIM: no ladder (your config is truth); a stolen port fails the boot
@@ -662,12 +663,14 @@ network:
   `CERULION_NETD_LISTEN`. It applies rules 7 to 9 below to those variables
   when it starts, reads each file then, and refuses to start, naming the
   variable, on a setting that cannot work.
-- **Discovery** still speaks TCP: the mDNS beacon advertises a `tcp/` listen
+- **Open zenoh LAN discovery** speaks TCP: the mDNS beacon advertises a `tcp/` listen
   port (plus `udp_rel=<port>` under `CERULION_UNENCRYPTED_QUIC=on`, below; a
   graph listening on `quic/` alone is not advertised), and
   `topic list --connect` takes `<carrier>/<host>:<port>` with no `?` metadata
   and probes it over TCP before it uses it, so it cannot reach a QUIC-only
-  robot. Reach one through `CERULION_NETD_CONNECT` or a graph's `connect:`.
+  zenoh listener. Explicit `CERULION_NETD_CONNECT` or a graph's `connect:`
+  can select that carrier. Authenticated account and paired access uses iroh
+  regardless of the optional zenoh listener's carrier.
 
 ### The egress/ingress model
 
@@ -1040,13 +1043,12 @@ wifi) blocks ALL station-to-station traffic and defeats every LAN rung;
 only a rendezvous point both sides dial out to survives it. The authenticated
 iroh path can use its relay; the open LAN ladder has no rendezvous tier.
 
-### `cerulion-netd` browses mDNS and folds the cache at boot
+### Optional zenoh LAN dial list at daemon boot
 
-The ladder above is what `topic list` runs. `cerulion-netd`, the daemon
-every OTHER surface rides (`topic hz`/`echo`/`info`, `schema info`, vizd/Studio
-attaches), runs its own boot-time version of it before it builds its one
-session, because with multicast scouting off a session dials only its connect
-endpoints. In order:
+Default account and paired discovery uses the authenticated remote plane and
+refreshes independently of zenoh's dial list. For open LAN compatibility,
+`cerulion-netd` builds its zenoh connect endpoints at boot. With multicast
+scouting off, that session dials only those endpoints, in this order:
 
 1. explicit `CERULION_NETD_CONNECT` locators, verbatim;
 2. one `_cerulion._tcp` mDNS browse (800 ms: one PTR query per interface and
@@ -1057,10 +1059,9 @@ endpoints. In order:
 
 Rows 2 and 3 are deduped by address and TCP-probed together; survivors are
 folded into the connect endpoints. The browse's mDNS daemon is shut down when
-the browse ends, so netd sends no further mDNS queries. A desk with no
-environment variable set therefore reaches every listening robot on its LAN
-on the first `topic echo`, `topic hz`, Studio attach or `cerulion viz`. A
-desk that finds nothing gets a plain "not found".
+the browse ends, so netd sends no further mDNS queries. This dial list reaches
+listening open LAN peers; it grants no access to a paired run. Account robots
+and saved pairings need no environment variable or entry in this list.
 
 Two details worth knowing:
 
@@ -1076,13 +1077,13 @@ Two details worth knowing:
   where one hanging endpoint sinks every other robot.)
 - **The fold happens once, at daemon start.** netd's session config is immutable
   after init, and netd self-exits on idle, so a restart is the refresh. A netd
-  held alive for hours by a running Studio keeps its boot-time dial list, and a
-  desk netd does not listen or advertise unless `CERULION_NETD_LISTEN` is set.
-  So a robot that boots after a running desk is found when the desk's netd next
-  starts (it exits 30 s after its last user), or right away if the robot was
-  listed in `CERULION_NETD_CONNECT` when that netd started: an explicit locator
-  is retried in the background until the robot answers. `CERULION_MULTICAST_SCOUTING=on` on both
-  machines also covers it, at the cost of periodic scout packets.
+  held alive for hours by a running Studio keeps its boot-time dial list. Its
+  optional zenoh listener and beacon require `CERULION_NETD_LISTEN`.
+  An open LAN peer that boots later enters that dial list on the next restart,
+  or is reached by background retries of an explicit `CERULION_NETD_CONNECT`
+  locator. `CERULION_MULTICAST_SCOUTING=on` on both machines also discovers
+  listening zenoh peers, at the cost of periodic scout packets. These refresh
+  rules do not limit automatic authenticated discovery or serving.
 
 To see what a running daemon is CONFIGURED to dial:
 
