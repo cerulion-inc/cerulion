@@ -2023,9 +2023,28 @@ jobs:
       # This does NOT weaken the job's no-GStreamer stance: nothing GStreamer
       # is installed, and camera_jpeg still builds capture-less by design.
       - name: Install libudev (joystick_teleop -> gilrs -> libudev-sys)
+        # When the runner cannot reach the Ubuntu archive, the step installs the
+        # libudev-dev that matches the image's own libudev1 from the kernel.org
+        # Ubuntu mirror instead, and only a copy whose sha256 is listed below
+        # (taken from the archive's Packages index for that version). An
+        # unlisted libudev1 version fails the step.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          if sudo apt-get update && sudo apt-get install -y libudev-dev; then
+            exit 0
+          fi
+          ver="$(dpkg-query -W -f='${Version}' libudev1:amd64)"
+          case "$ver" in
+            259.5-0ubuntu3) sha=038871598c9993d47d363dd42090c657b9ff09ccba353d10367849a437482707 ;;
+            259.5-0ubuntu3.4) sha=d7368a8fc7e9381a56ef8a4ad7057396a88cbc085eb2ae7900a1ff2a9772f741 ;;
+            259.9-0ubuntu0.1) sha=e9e142b9b0f287a58dc0cef550bc8200cddad495fdf9ba6245c76be615d24048 ;;
+            *) echo "::error::apt could not install libudev-dev and no pinned copy matches libudev1 $ver"; exit 1 ;;
+          esac
+          deb="libudev-dev_${ver}_amd64.deb"
+          curl --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 120 --retry 5 --retry-all-errors --retry-delay 5 --fail --silent --show-error --location \
+            -o "$deb" "https://mirrors.edge.kernel.org/ubuntu/pool/main/s/systemd/$deb"
+          echo "$sha  $deb" | sha256sum -c -
+          sudo dpkg -i "$deb"
+          echo "::warning::apt could not install libudev-dev; installed the pinned $deb from the kernel.org Ubuntu mirror"
 
       - name: Cache cargo (restore)
         id: cache-restore-1

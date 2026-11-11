@@ -25,6 +25,7 @@ Every prebuilt node cdylib must be rebuilt for node ABI 32 (see Changed).
 
 ### Fixed
 - When a `block` consumer's process dies, the supervisor releases that consumer's slot and the producer resumes; the topic's other `block` consumers keep their slots. The "lost its CONSUMER" warning now says the slot was released and names the producer node. A consumer node that stops (a fatal error, a tick panic, or a node library panic code) releases its own slots the same way, whichever process its producer runs in. A released slot counts nothing, so a drain of it logs no `block credit drain removed frames its word never counted` warning. Before, the producer stayed deferred for the rest of the run.
+- An ops `engage-estop` delivery in `cerulion-remoted` can end, on a panic or a dropped runtime, while it deletes the MCP session of an attempt rcpd answered that its latch closed. When an `engage-estop` came after that attempt began, the delivery now logs at error that the `estop` it still owed that `engage-estop` was not sent; the next `engage-estop` sends it. Before, it logged nothing.
 
 ## [2.0.0] - 2026-11-11
 
