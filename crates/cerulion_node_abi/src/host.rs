@@ -14,9 +14,12 @@ use crate::*;
 /// concurrent use returns counted INVALID_STATE without changing any lease.
 /// BUSY means destroy must wait for
 /// outstanding leases: release them and retry. No NodeApi/StateApi/ExternalApi
-/// entries run concurrently for one NodeHandle. Every call-scoped ordinary lease
-/// ends before return; after destroy the host reclaims leaks as INVARIANT, without
-/// publication. Retained helper/Python leases instead live until process exit.
+/// entries run concurrently for one NodeHandle. Retained ordinary leases keep
+/// their row, mapping and busy port across ticks until their own release; a fire
+/// can run so the owner can release them. Loan budgets still bound retention.
+/// An out-of-admission finalizer queues its release for the next admitted call.
+/// After node destroy the host reclaims abandoned ordinary leases as INVARIANT;
+/// retained helper/Python mappings instead survive until release or process exit.
 #[stabby::stabby]
 #[repr(C)]
 #[derive(Clone, Copy)]

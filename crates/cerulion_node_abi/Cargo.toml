@@ -8,7 +8,7 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "Compiler-independent C interface for Cerulion node plugins"
 readme = "README.md"
-include = ["src/", "tests/", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
 
 [lints]
 workspace = true

@@ -345,3 +345,97 @@ fn short_error_buffers_retain_real_diagnostics_until_a_complete_copy() {
         );
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn inline_metadata_is_checked_before_create_and_absence_is_conservative() {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            std::env::remove_var("CER_INLINE_SAFE_METADATA");
+        }
+    }
+    let _guard = Guard;
+    let path = cerulion_core::testing::find_fixture_cdylib("test_node_cdylib");
+    for (value, expected) in [("absent", false), ("false", false), ("true", true)] {
+        std::env::set_var("CER_INLINE_SAFE_METADATA", value);
+        let mut entry = DylibNodeEntry::load(&path).expect("valid metadata bool");
+        assert_eq!(
+            entry.inline_safe(),
+            expected,
+            "type declaration before create"
+        );
+        entry
+            .init(NodeContext::for_tests(IndexMap::new(), IndexMap::new()))
+            .expect("valid context");
+        assert!(
+            !entry.inline_safe(),
+            "after init the fixture's missing state table is unchanged"
+        );
+        entry.shutdown().expect("teardown");
+    }
+    std::env::set_var("CER_INLINE_SAFE_METADATA", "invalid");
+    let error = match DylibNodeEntry::load(&path) {
+        Ok(_) => panic!("string metadata must refuse before create"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("inline_safe metadata must be a bool"));
+}
+
+#[test]
+fn linked_stable_fixtures_export_the_bootstrap_and_no_legacy_maintenance_entries() {
+    const LEGACY: &[&str] = &[
+        "cerulion_node_pump_history",
+        "cerulion_node_pump_history_at",
+        "cerulion_node_set_snapshot_inputs",
+        "cerulion_node_snapshot_inputs",
+        "cerulion_node_drain_trigger_input",
+        "cerulion_node_refill_trigger_input",
+        "cerulion_node_sync_head_op",
+        "cerulion_node_probes_trigger_input",
+    ];
+    for name in [
+        "test_node_raw_ffi_template_cdylib",
+        "test_node_snapshot_fail_cdylib",
+        "test_node_drain_fail_cdylib",
+        "test_node_sync_op_fail_cdylib",
+    ] {
+        let library = cerulion_core::testing::find_fixture_cdylib(name);
+        let mut command = std::process::Command::new("nm");
+        if cfg!(target_os = "macos") {
+            command.arg("-gU");
+        } else {
+            command.args(["-D", "--defined-only"]);
+        }
+        let output = command.arg(&library).output().expect("list linked exports");
+        assert!(
+            output.status.success(),
+            "nm failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let symbols = String::from_utf8(output.stdout).expect("UTF-8 symbol listing");
+        let exports: Vec<&str> = symbols
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .map(|name| {
+                if cfg!(target_os = "macos") {
+                    name.strip_prefix('_').unwrap_or(name)
+                } else {
+                    name
+                }
+            })
+            .collect();
+        assert!(
+            exports.contains(&"cerulion_node_api_v1"),
+            "the maintained bootstrap must actually be linked: {name}"
+        );
+        for forbidden in LEGACY {
+            assert!(
+                !exports.contains(forbidden),
+                "stable fixture {name} still exports obsolete {forbidden}"
+            );
+        }
+    }
+}

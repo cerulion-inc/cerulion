@@ -7,7 +7,7 @@ node_toolchain=${CERULION_ABI_NODE_TOOLCHAIN:-1.95.0}
 host_toolchain=${CERULION_ABI_HOST_TOOLCHAIN:-stable}
 abi_target_root=${CERULION_ABI_TARGET_ROOT:?set a dedicated target root for the compiler-skew check}
 node_target="$abi_target_root/node"
-host_target="$abi_target_root/host"
+host_target=${CERULION_ABI_HOST_TARGET:-"$abi_target_root/host"}
 node_compiler=$(rustup run "$node_toolchain" rustc -vV)
 host_compiler=$(rustup run "$host_toolchain" rustc -vV)
 printf '%s\n' "$node_compiler" "$host_compiler"
@@ -81,7 +81,7 @@ if [ ! -f "$node_library" ]; then
 fi
 "${build_env[@]}" CARGO_TARGET_DIR="$host_target" cargo "+$host_toolchain" build --locked -p cerulion_core --test stable_node_abi_cross_compiler_test
 # Local runtime evidence uses the shared desk lock; hosted runners own their VM.
-if [ "${CI:-}" = true ]; then
+if [ "${CI:-}" = true ] || [ "${CERULION_ABI_DESK_LOCK_HELD:-}" = 1 ]; then
     "${build_env[@]}" CARGO_TARGET_DIR="$host_target" CERULION_TEST_NODE_ABI_DYLIB="$node_library" cargo "+$host_toolchain" test --locked -p cerulion_core --test stable_node_abi_cross_compiler_test different_compiler_delivers_oracle_frames_in_two_identical_runs -- --ignored --exact --test-threads=1
 else
     case "$host_toolchain" in

@@ -278,8 +278,8 @@
 16 examples/go2/nodes/dds_bridge/src/generic.rs
 1 examples/go2/nodes/dds_bridge/src/generic/raw.rs
 2 examples/go2/nodes/dds_bridge/src/latch.rs
-4 examples/go2/nodes/dds_bridge/src/lib.rs
-22 examples/go2/nodes/dds_bridge/src/pump.rs
+3 examples/go2/nodes/dds_bridge/src/lib.rs
+21 examples/go2/nodes/dds_bridge/src/pump.rs
 5 examples/go2/nodes/joystick_teleop/src/pump.rs
 2 examples/go2/nodes/keyboard_teleop/src/pump.rs
 2 examples/go2/nodes/teleop_mux/src/arbitrate.rs

@@ -49,7 +49,7 @@ pub(crate) fn log_tick_failed(topic: &str, schema_hash: u64) {
     tracing::debug!(
         topic = topic,
         schema_hash = schema_hash,
-        "OutputProxy: tick did not complete — output discarded, loan released without publish"
+        "OutputProxy: tick did not complete — output discarded, loan released without publish" // dash-ok: native OutputProxy log text kept byte-identical
     );
 }
 
@@ -74,8 +74,10 @@ pub(crate) fn log_nested_failure(
                 schema_hash = schema_hash,
                 error = error.map(tracing::field::display),
                 suppressed_count = suppressed,
-                "OutputProxy discard suppressed: staged nested-field flush recurred as \
-                         a failure; skipping publish — first occurrence logged loudly at error"
+                concat!(
+                    "OutputProxy discard suppressed: staged nested-field flush recurred as ",
+                    "a failure; skipping publish — first occurrence logged loudly at error" // dash-ok: native OutputProxy log text kept byte-identical
+                )
             );
         }
     }
@@ -95,9 +97,11 @@ pub(crate) fn log_missing_variable(topic: &str, schema_hash: u64, level: Discard
                 topic = topic,
                 schema_hash = schema_hash,
                 suppressed_count = suppressed,
-                "OutputProxy discard suppressed: incomplete output (missing declared \
-                         variable field) recurred; skipping publish — first occurrence logged \
-                         loudly at error"
+                concat!(
+                    "OutputProxy discard suppressed: incomplete output (missing declared ",
+                    "variable field) recurred; skipping publish — first occurrence logged ", // dash-ok: native OutputProxy log text kept byte-identical
+                    "loudly at error"
+                )
             );
         }
     }
@@ -108,9 +112,11 @@ pub(crate) fn log_spill_output_recovered(topic: &str, schema_hash: u64, suppress
         topic = %topic,
         schema_hash = schema_hash,
         suppressed_count = suppressed,
-        "OutputProxy: output recovered — complete publish after a \
-         discard regime (further discards on this port will log \
-         loudly again)"
+        concat!(
+            "OutputProxy: output recovered — complete publish after a ", // dash-ok: native OutputProxy log text kept byte-identical
+            "discard regime (further discards on this port will log ",
+            "loudly again)"
+        )
     );
 }
 
@@ -119,8 +125,10 @@ pub(crate) fn log_output_recovered(topic: &str, schema_hash: u64, suppressed: u6
         topic = topic,
         schema_hash = schema_hash,
         suppressed_count = suppressed,
-        "OutputProxy: output recovered — complete publish after a discard \
-                         regime (further discards on this port will log loudly again)"
+        concat!(
+            "OutputProxy: output recovered — complete publish after a discard ", // dash-ok: native OutputProxy log text kept byte-identical
+            "regime (further discards on this port will log loudly again)"
+        )
     );
 }
 

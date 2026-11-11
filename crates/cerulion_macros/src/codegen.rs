@@ -2012,13 +2012,8 @@ fn gen_cdylib(
                 #__cer_root::transport::TRANSPORT_KIND.cdylib_abi_version()
             }
 
-            // ABI v22: reports the rustc that compiled THIS cdylib, so the
-            // host can refuse a load where the two sides' compilers disagree
-            // on how a `repr(Rust)` type crossing the FFI (for example
-            // `Option<FrozenSlot>`) is laid out, a class the ABI version above
-            // cannot see, since two different rustc releases can agree on
-            // every struct size and offset and still encode `None`
-            // differently. See `cerulion_core::rustc_fingerprint`.
+            // Compiler provenance only. Stable loading checks the complete
+            // frozen table and boundary major; it ignores this legacy symbol.
             #[no_mangle]
             pub extern "C" fn cerulion_rustc_fingerprint() -> *const ::std::ffi::c_char {
                 #__cer_root::rustc_fingerprint_cstr()
@@ -2099,10 +2094,8 @@ fn gen_cdylib(
             //
             // Init returns u64 handle (0 = failure; LAST_ERROR also set).
 
-            // `cerulion_node_platform_check`: the loader calls this at load,
-            // before init, so the probe runs against THIS cdylib's iceoryx2
-            // copy rather than the host's. Required on Android. 0 = supported;
-            // nonzero sets LAST_ERROR.
+            // Legacy diagnostic export only. Stable nodes use host-owned
+            // transport; Android support is checked on the host before loading.
             #[no_mangle]
             pub extern "C" fn cerulion_node_platform_check() -> i32 {
                 let result = ::std::panic::catch_unwind(|| {

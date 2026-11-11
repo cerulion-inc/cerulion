@@ -2731,14 +2731,14 @@ fn stage_nested_error(h: &Harness, error: &str) {
 }
 fn native_log_oracle(topic: &str) -> Vec<String> {
     let schema = LogImage::SCHEMA_HASH;
-    let nested = "Nested field 'header' published with an unwritten variable child field 'header.frame_id' — every variable-length field of a nested schema must be written each tick (e.g. `self.<port>.header.frame_id = …`), or write the whole field as bytes. Frame discarded.";
+    let nested = "Nested field 'header' published with an unwritten variable child field 'header.frame_id' — every variable-length field of a nested schema must be written each tick (e.g. `self.<port>.header.frame_id = …`), or write the whole field as bytes. Frame discarded."; // dash-ok: native OutputProxy log text kept byte-identical
     let missing = format!("ERROR OutputProxy dropped without writing all declared variable fields; skipping publish topic=\"{topic}\" schema_hash={schema}");
-    let missing_repeat = format!("DEBUG OutputProxy discard suppressed: incomplete output (missing declared variable field) recurred; skipping publish — first occurrence logged loudly at error topic=\"{topic}\" schema_hash={schema} suppressed_count=1");
+    let missing_repeat = format!("DEBUG OutputProxy discard suppressed: incomplete output (missing declared variable field) recurred; skipping publish — first occurrence logged loudly at error topic=\"{topic}\" schema_hash={schema} suppressed_count=1"); // dash-ok: native OutputProxy log text kept byte-identical
     let nested_first = format!("ERROR OutputProxy: staged nested-field flush failed; skipping publish topic=\"{topic}\" schema_hash={schema} error={nested}");
-    let nested_repeat = format!("DEBUG OutputProxy discard suppressed: staged nested-field flush recurred as a failure; skipping publish — first occurrence logged loudly at error topic=\"{topic}\" schema_hash={schema} error={nested} suppressed_count=1");
-    let recovery = format!("INFO OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again) topic=\"{topic}\" schema_hash={schema} suppressed_count=1");
-    let spill_recovery = format!("INFO OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again) topic={topic} schema_hash={schema} suppressed_count=1");
-    let tick = format!("DEBUG OutputProxy: tick did not complete — output discarded, loan released without publish topic=\"{topic}\" schema_hash={schema}");
+    let nested_repeat = format!("DEBUG OutputProxy discard suppressed: staged nested-field flush recurred as a failure; skipping publish — first occurrence logged loudly at error topic=\"{topic}\" schema_hash={schema} error={nested} suppressed_count=1"); // dash-ok: native OutputProxy log text kept byte-identical
+    let recovery = format!("INFO OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again) topic=\"{topic}\" schema_hash={schema} suppressed_count=1"); // dash-ok: native OutputProxy log text kept byte-identical
+    let spill_recovery = format!("INFO OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again) topic={topic} schema_hash={schema} suppressed_count=1"); // dash-ok: native OutputProxy log text kept byte-identical
+    let tick = format!("DEBUG OutputProxy: tick did not complete — output discarded, loan released without publish topic=\"{topic}\" schema_hash={schema}"); // dash-ok: native OutputProxy log text kept byte-identical
     vec![
         missing.clone(),
         missing_repeat,

@@ -1233,7 +1233,7 @@ pub fn node_build_with_progress(
 /// This is what `cerulion-wsd`'s `node.build` streams to Studio. Everything
 /// before cargo runs is the same function as the CLI's build: the unknown-node
 /// and malformed-metadata refusals, the optional-system-dependency probe and
-/// notice, the PATH compiler advisory. `on_cargo_start` is called exactly
+/// notice, and Cargo toolchain selection. `on_cargo_start` is called exactly
 /// once, as soon as cargo has been spawned (a spawn that fails never calls
 /// it), so a caller can tell a build
 /// that was refused up front (an `Err` before the call) from one that ran and

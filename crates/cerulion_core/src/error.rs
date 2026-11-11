@@ -166,8 +166,7 @@ pub enum TransportError {
     /// with its [`NodeErrorKind`] kept as a typed value.
     ///
     /// This is what the node macros produce at the boundary and what the
-    /// cdylib loader rebuilds from the optional `cerulion_take_last_error_kind`
-    /// export, so the runtime acts on the KIND (a [`NodeErrorKind::Fatal`]
+    /// cdylib loader rebuilds from the stable Status kind, so the runtime acts on the KIND (a [`NodeErrorKind::Fatal`]
     /// stops the node) without reading message text. It renders exactly like
     /// [`TransportError::NodeError`]. A cdylib that does not export the symbol
     /// still reports the untyped [`TransportError::NodeError`].
@@ -759,8 +758,7 @@ pub type NodeResult<T> = Result<T, NodeError>;
 /// The kind of a [`NodeError`], as a typed value that crosses the node macro
 /// and the cdylib boundary.
 ///
-/// A cdylib node reports it through the optional
-/// `cerulion_take_last_error_kind` export as [`code`](Self::code); the host
+/// A cdylib node reports it through stable Status as [`code`](Self::code); the host
 /// rebuilds it with [`from_code`](Self::from_code). The codes are an FFI
 /// contract: never renumber one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

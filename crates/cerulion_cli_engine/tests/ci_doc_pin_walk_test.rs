@@ -1319,7 +1319,7 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 85;
+const WORKSPACE_MEMBER_COUNT: usize = 86;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.

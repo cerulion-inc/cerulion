@@ -30,6 +30,28 @@ struct PortFacts {
     outputs: Vec<PortFact>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Init,
+    Tick,
+    Shutdown,
+    Destroy,
+    Shape,
+    External,
+}
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Tick => "tick",
+            Self::Shutdown => "shutdown",
+            Self::Destroy => "destroy",
+            Self::Shape => "state shape",
+            Self::External => "external source",
+        }
+    }
+}
+
 /// Production native node, discovered through the compiler-independent table.
 pub struct DylibNodeEntry {
     library: Option<abi::CheckedNodeLibrary>,
@@ -44,6 +66,8 @@ pub struct DylibNodeEntry {
     snapshot_failed: bool,
     retain_process: bool,
     doorbell: bool,
+    shape: Option<u64>,
+    inline_type: bool,
     maintenance: FailureRegimeLatch,
     snapshot_errors: FailureRegimeLatch,
     head_errors: FailureRegimeLatch,
@@ -70,9 +94,10 @@ impl DylibNodeEntry {
         // the SDK checks every header/callback before any instance is created.
         let library = unsafe { abi::CheckedNodeLibrary::load(path, HOST_API.capabilities) }
             .map_err(|e| {
-                error(format!(
-                    "{e}; rebuild the node (`cerulion node build <type>`)"
-                ))
+                error(match e {
+                    abi::AbiError::Platform | abi::AbiError::Library { .. } => e.to_string(),
+                    _ => format!("{e}; rebuild the node (`cerulion node build <type>`)"),
+                })
             })?;
         let span = library.api().metadata;
         // SAFETY: descriptor validation bounded this nonempty span; the trusted
@@ -89,16 +114,16 @@ impl DylibNodeEntry {
                     prefix: metadata.chars().take(80).collect(), reason: parse.to_string(),
                 }
             })?;
-        let retain_process = match author_metadata.get("retain_process") {
-            None => false,
-            Some(value) => value
-                .as_bool()
-                .ok_or_else(|| error("retain_process metadata must be a bool".to_owned()))?,
-        };
+        let retain_process = metadata_bool(&author_metadata, "retain_process").map_err(error)?;
+        let inline_type = metadata_bool(&author_metadata, "inline_safe").map_err(error)?;
         author_metadata
             .as_object_mut()
             .ok_or_else(|| error("node metadata must be an object".to_owned()))?
             .remove("retain_process");
+        author_metadata
+            .as_object_mut()
+            .expect("metadata object validated")
+            .remove("inline_safe");
         for (direction, keys) in [
             (
                 "inputs",
@@ -165,7 +190,7 @@ impl DylibNodeEntry {
             }
             ports.push(port_spec(fact, LeaseDirection::Write, abi::read_mode::ONE).map_err(error)?);
         }
-        Ok(Self {
+        let mut entry = Self {
             library: Some(library),
             instance: None,
             context: None,
@@ -178,11 +203,15 @@ impl DylibNodeEntry {
             snapshot_failed: false,
             retain_process,
             doorbell: false,
+            shape: None,
+            inline_type,
             maintenance: FailureRegimeLatch::new(),
             snapshot_errors: FailureRegimeLatch::new(),
             head_errors: FailureRegimeLatch::new(),
             external_errors: FailureRegimeLatch::new(),
-        })
+        };
+        entry.shape = entry.query_state_shape();
+        Ok(entry)
     }
     fn api(&self) -> &abi::NodeApiV1 {
         self.library
@@ -193,7 +222,7 @@ impl DylibNodeEntry {
     // hot-path-alloc-ok-fn: invalid lifecycle admission allocates only on refusal
     fn handle(&self) -> TransportResult<abi::NodeHandle> {
         self.instance
-            .ok_or_else(|| self.error("node not initialized".to_owned()))
+            .ok_or_else(|| self.error("node has not been initialized".to_owned()))
     }
     // hot-path-alloc-ok-fn: returned diagnostics copy the label only after failure
     fn error(&self, reason: String) -> TransportError {
@@ -203,53 +232,22 @@ impl DylibNodeEntry {
         }
     }
     // hot-path-alloc-ok-fn: diagnostic copies occur only after a boundary failure
-    fn result(&self, status: abi::Status, operation: &str) -> TransportResult<()> {
+    fn result(&self, status: abi::Status, phase: Phase) -> TransportResult<()> {
         if status.code == abi::status_code::OK {
             return Ok(());
         }
-        let mut reason = format!("node {operation} failed with status {}", status.code);
-        if status.error != 0 {
-            let mut required = 0u64;
-            // SAFETY: library retains callback, caller owns output scalar. Null
-            // zero-length buffer is the frozen non-consuming size query.
-            let queried = self.invoke(|| unsafe {
-                (self.api().copy_error)(
-                    status.error,
-                    abi::MutableBytes {
-                        ptr: std::ptr::null_mut(),
-                        len: 0,
-                    },
-                    &mut required,
-                )
-            })?;
-            if matches!(
-                queried.code,
-                abi::status_code::OK | abi::status_code::BUFFER_TOO_SMALL
-            ) && required > 0
-                && required <= 1024 * 1024
-            {
-                let mut bytes = vec![0u8; required as usize];
-                // SAFETY: exclusive host buffer is initialized and remains live
-                // through synchronous copy; node never retains or frees it.
-                let copied = self.invoke(|| unsafe {
-                    (self.api().copy_error)(
-                        status.error,
-                        abi::MutableBytes {
-                            ptr: bytes.as_mut_ptr(),
-                            len: bytes.len() as u64,
-                        },
-                        &mut required,
-                    )
-                })?;
-                if copied.code == abi::status_code::OK && required as usize <= bytes.len() {
-                    reason = String::from_utf8_lossy(&bytes[..required as usize]).into_owned();
-                }
-            }
+        let mut reason = self.diagnostic(status, phase.name());
+        if phase == Phase::Init {
+            reason = format!("init failed: {reason}");
         }
         if status.code == abi::status_code::PANICKED {
-            return Err(TransportError::NodeTickPanicked {
-                node_id: self.label.clone(),
-                reason,
+            return Err(if phase == Phase::Tick {
+                TransportError::NodeTickPanicked {
+                    node_id: self.label.clone(),
+                    reason,
+                }
+            } else {
+                self.error(reason)
             });
         }
         if let Some(kind) = NodeErrorKind::from_code(status.kind)
@@ -263,6 +261,72 @@ impl DylibNodeEntry {
         }
         Err(self.error(reason))
     }
+    // hot-path-alloc-ok-fn: diagnostic text copies only after failure.
+    fn diagnostic(&self, status: abi::Status, operation: &str) -> String {
+        if status.error == 0 {
+            return format!("node {operation} failed with status {}", status.code);
+        }
+        self.copy_node_diagnostic(status.error)
+            .unwrap_or_else(|failure| format!("node {operation} diagnostic copy failed: {failure}"))
+    }
+    // hot-path-alloc-ok-fn: complete node diagnostics copy only on a failure, using host-owned storage.
+    fn copy_node_diagnostic(&self, token: u64) -> Result<String, String> {
+        let mut required = 0u64;
+        // SAFETY: checked live callback borrows an exclusive length scalar;
+        // a null zero-length buffer is the frozen size query and empty-copy case.
+        let queried = self
+            .invoke(|| unsafe {
+                (self.api().copy_error)(
+                    token,
+                    abi::MutableBytes {
+                        ptr: std::ptr::null_mut(),
+                        len: 0,
+                    },
+                    &mut required,
+                )
+            })
+            .map_err(|error| error.to_string())?;
+        if queried.code == abi::status_code::OK && required == 0 {
+            return Ok(String::new());
+        }
+        if queried.code != abi::status_code::BUFFER_TOO_SMALL || required == 0 {
+            return Err(format!(
+                "size query returned status {} and length {required}",
+                queried.code
+            ));
+        }
+        let length = usize::try_from(required)
+            .ok()
+            .filter(|length| *length <= isize::MAX as usize)
+            .ok_or_else(|| format!("length {required} exceeds addressable host storage"))?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|error| {
+            format!("cannot allocate complete {length}-byte diagnostic: {error}")
+        })?;
+        bytes.resize(length, 0);
+        // SAFETY: the host owns exclusive initialized storage of exactly the
+        // requested length. The node copies its bytes without retaining/freeing it.
+        let copied = self
+            .invoke(|| unsafe {
+                (self.api().copy_error)(
+                    token,
+                    abi::MutableBytes {
+                        ptr: bytes.as_mut_ptr(),
+                        len: length as u64,
+                    },
+                    &mut required,
+                )
+            })
+            .map_err(|error| error.to_string())?;
+        if copied.code != abi::status_code::OK || required != length as u64 {
+            return Err(format!(
+                "complete copy returned status {} and length {required}; expected {length}",
+                copied.code
+            ));
+        }
+        String::from_utf8(bytes).map_err(|error| format!("diagnostic is not UTF-8: {error}"))
+    }
+
     // hot-path-alloc-ok-fn: admission diagnostics allocate only on contract refusal.
     fn invoke<R>(&self, call: impl FnOnce() -> R) -> TransportResult<R> {
         let Some(context) = self.context else {
@@ -279,13 +343,22 @@ impl DylibNodeEntry {
         Ok(result)
     }
 
-    fn native<R>(
-        &self,
-        op: impl FnOnce(&mut NodeContext) -> R,
-    ) -> Result<R, host::HostCallFailure> {
-        host::with_context(self.context.unwrap_or(0), |ctx| {
-            Ok(op(ctx.native_mut_for_runtime()?))
-        })
+    fn query_state_shape(&self) -> Option<u64> {
+        let ptr = self.api().state;
+        if ptr.is_null() {
+            return None;
+        }
+        let mut shape = 0;
+        // SAFETY: SDK validated complete immutable state table retained by library;
+        // exclusive stack output is live through synchronous, handle-free query.
+        let status = self.invoke(|| unsafe { ((*ptr).shape)(&mut shape) }).ok()?;
+        match self.result(status, Phase::Shape) {
+            Ok(()) => Some(shape),
+            Err(error) => {
+                tracing::warn!(node_id = %self.label, error = %error, "cerulion_node_state_shape failed; node state is unavailable");
+                None
+            }
+        }
     }
     /// Borrow the already validated metadata JSON.
     // hot-path-alloc-ok-fn: metadata inspection is cold CLI graph discovery
@@ -303,6 +376,16 @@ impl DylibNodeEntry {
     #[doc(hidden)]
     pub fn leaks_library_on_drop(&self) -> bool {
         self.retain_process
+    }
+}
+
+// hot-path-alloc-ok-fn: metadata validation only runs during cold library loading.
+fn metadata_bool(metadata: &serde_json::Value, key: &str) -> Result<bool, String> {
+    match metadata.get(key) {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{key} metadata must be a bool")),
     }
 }
 
@@ -328,6 +411,17 @@ fn port_spec(
         read_mode,
         accumulate_cap: fact.accumulate_cap,
     })
+}
+// Native state diagnostic codes remain stable even though transport statuses use
+// their own frozen namespace. They describe the same encoder/decoder failures.
+fn state_failure_code(status: abi::Status) -> i32 {
+    match status.code {
+        abi::status_code::BUFFER_TOO_SMALL => -6,
+        abi::status_code::PANICKED => -7,
+        abi::status_code::INVALID_HANDLE => -2,
+        abi::status_code::INVALID_ARGUMENT => -3,
+        _ => -5,
+    }
 }
 fn observe(label: &str, site: &str, latch: &mut FailureRegimeLatch, failed: bool) {
     if failed {
@@ -419,17 +513,27 @@ impl NodeEntry for DylibNodeEntry {
                 return Err(error);
             }
         };
-        if let Err(error) = self.result(status, "init") {
+        if let Err(error) = self.result(status, Phase::Init) {
             if !self.retain_process {
-                let _ = host::remove_context(handle);
-                self.context = None;
+                match host::remove_context(handle) {
+                    Ok(()) => self.context = None,
+                    Err(error) => {
+                        self.retain_process = true;
+                        tracing::warn!(node_id = %self.label, error = ?error, "failed node creation retained its library and host context");
+                    }
+                }
             }
             return Err(error);
         }
         if instance.value == 0 {
             if !self.retain_process {
-                let _ = host::remove_context(handle);
-                self.context = None;
+                match host::remove_context(handle) {
+                    Ok(()) => self.context = None,
+                    Err(error) => {
+                        self.retain_process = true;
+                        tracing::warn!(node_id = %self.label, error = ?error, "failed node creation retained its library and host context");
+                    }
+                }
             }
             return Err(self.error("node init returned an invalid zero handle".to_owned()));
         }
@@ -439,12 +543,14 @@ impl NodeEntry for DylibNodeEntry {
     // hot-path-alloc-ok-fn: fire admission diagnostics allocate only after rejection
     fn tick(&mut self) -> TransportResult<()> {
         let instance = self.handle()?;
-        host::with_context(self.context.unwrap_or(0), HostContext::begin_fire)
-            .map_err(|e| self.error(format!("node fire admission failed: {e:?}")))?;
-        // SAFETY: graph holds exclusive NodeEntry access; node instance and host
-        // context are live, all previous loans returned, checked library retained.
-        let result = self.invoke(|| unsafe { (self.api().tick)(instance) })?;
-        self.result(result, "tick")
+        let result = self.invoke(|| {
+            host::with_context(self.context.unwrap_or(0), HostContext::begin_fire)
+                .map_err(|error| self.error(format!("node fire admission failed: {error:?}")))?;
+            // SAFETY: exclusive admitted entry, retained instance/code/context;
+            // each outstanding lease keeps its mapping until its own release.
+            Ok::<abi::Status, TransportError>(unsafe { (self.api().tick)(instance) })
+        })??;
+        self.result(result, Phase::Tick)
     }
     // hot-path-alloc-ok-fn: node teardown diagnostics are outside publish and receive
     fn shutdown(&mut self) -> TransportResult<()> {
@@ -455,7 +561,7 @@ impl NodeEntry for DylibNodeEntry {
         // live; shutdown runs before node allocator destroys its own state.
         let result = self
             .invoke(|| unsafe { (self.api().shutdown)(instance) })
-            .and_then(|status| self.result(status, "shutdown"));
+            .and_then(|status| self.result(status, Phase::Shutdown));
         // SAFETY: all synchronous node calls have returned; node frees only its
         // own instance allocation, never the host context or sample owners.
         let destroyed = match self.invoke(|| unsafe { (self.api().destroy)(instance) }) {
@@ -467,12 +573,19 @@ impl NodeEntry for DylibNodeEntry {
         };
         if destroyed.code != abi::status_code::OK {
             self.retain_process = true;
-            return self.result(destroyed, "destroy");
+            return self.result(destroyed, Phase::Destroy);
         }
         if !self.retain_process {
-            if let Some(context) = self.context.take() {
-                host::remove_context(context)
-                    .map_err(|e| self.error(format!("host context teardown failed: {e:?}")))?;
+            if let Some(context) = self.context {
+                match host::remove_context(context) {
+                    Ok(()) => self.context = None,
+                    Err(error) => {
+                        // An outstanding owner may still call its finalizer. Keep
+                        // code, callbacks and mappings live rather than unloading.
+                        self.retain_process = true;
+                        return Err(self.error(format!("host context teardown failed: {error:?}")));
+                    }
+                }
             }
         }
         result
@@ -481,14 +594,19 @@ impl NodeEntry for DylibNodeEntry {
         if self.context.is_none() {
             return;
         }
-        let failed = self.native(NodeContext::pump_history).is_err();
+        let failed =
+            host::with_context(self.context.unwrap_or(0), HostContext::runtime_pump_history)
+                .is_err();
         observe(&self.label, "history", &mut self.maintenance, failed);
     }
     fn pump_history_at(&mut self, now: std::time::Instant) {
         if self.context.is_none() {
             return;
         }
-        let failed = self.native(|ctx| ctx.pump_history_at(now)).is_err();
+        let failed = host::with_context(self.context.unwrap_or(0), |ctx| {
+            ctx.runtime_pump_history_at(now)
+        })
+        .is_err();
         observe(&self.label, "history", &mut self.maintenance, failed);
     }
     fn collect_publisher_recon_stats(&self, out: &mut Vec<PublisherReconStat>) {
@@ -533,12 +651,16 @@ impl NodeEntry for DylibNodeEntry {
         true
     }
     fn drain_trigger_input(&mut self, name: &str) -> (u64, Option<u64>) {
-        let result = self.native(|ctx| ctx.drain_trigger_input(name));
+        let result = host::with_context(self.context.unwrap_or(0), |ctx| {
+            ctx.runtime_drain_trigger_input(name)
+        });
         observe(&self.label, "drain", &mut self.head_errors, result.is_err());
         result.unwrap_or((0, None))
     }
     fn refill_trigger_input(&mut self, name: &str) -> (u64, Option<u64>) {
-        let result = self.native(|ctx| ctx.refill_trigger_input(name));
+        let result = host::with_context(self.context.unwrap_or(0), |ctx| {
+            ctx.runtime_refill_trigger_input(name)
+        });
         observe(
             &self.label,
             "refill",
@@ -548,9 +670,10 @@ impl NodeEntry for DylibNodeEntry {
         result.unwrap_or((0, None))
     }
     fn sync_head_op(&mut self, name: &str, op: SyncHeadOp) -> SyncOpAnswer {
-        let answer = self
-            .native(|ctx| ctx.sync_head_op(name, op))
-            .unwrap_or(SyncOpAnswer::Failed);
+        let answer = host::with_context(self.context.unwrap_or(0), |ctx| {
+            ctx.runtime_sync_head_op(name, op)
+        })
+        .unwrap_or(SyncOpAnswer::Failed);
         observe(
             &self.label,
             "sync head",
@@ -581,36 +704,28 @@ impl NodeEntry for DylibNodeEntry {
         slot: SyncFrameSlot,
         location: HeaderStampLocation,
     ) -> Option<Result<u64, StampDecodeError>> {
-        self.native(|ctx| ctx.sync_capture_stamp(name, slot, location))
-            .ok()
-            .flatten()
+        host::with_context(self.context.unwrap_or(0), |ctx| {
+            Ok(ctx
+                .native_for_runtime()
+                .sync_capture_stamp(name, slot, location))
+        })
+        .ok()
+        .flatten()
     }
     fn state_shape(&self) -> Option<u64> {
-        let ptr = self.api().state;
-        if ptr.is_null() {
-            return None;
-        }
-        let mut shape = 0;
-        // SAFETY: SDK validated complete immutable state table retained by library;
-        // exclusive stack output is live through synchronous, handle-free query.
-        let status = self.invoke(|| unsafe { ((*ptr).shape)(&mut shape) }).ok()?;
-        match self.result(status, "state shape") {
-            Ok(()) => Some(shape),
-            Err(error) => {
-                tracing::warn!(node_id = %self.label, error = %error, "cerulion_node_state_shape failed; node state is unavailable");
-                None
-            }
-        }
+        self.shape
     }
     // hot-path-alloc-ok-fn: anchor restoration and its diagnostics are cold
     fn restore_state(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let ptr = self.api().state;
         if ptr.is_null() {
-            return Err(self.error("node declares no restorable state".to_owned()));
+            return Err(TransportError::GraphError { reason: format!("node '{}' declares no restorable state; implement the stable state table, or use #[cerulion_node] to generate cerulion_node_restore_state behavior; refusing to resume from its constructor's defaults", self.label) });
         }
         // SAFETY: checked state table/code and instance retained, exclusive entry;
         // payload is host-owned and borrowed only through this synchronous call.
-        let instance = self.handle()?;
+        let instance = self.instance.ok_or_else(|| TransportError::GraphError {
+            reason: format!("node '{}' has not been initialized", self.label),
+        })?;
         let status = self.invoke(|| unsafe {
             ((*ptr).restore)(
                 instance,
@@ -620,13 +735,22 @@ impl NodeEntry for DylibNodeEntry {
                 },
             )
         })?;
-        self.result(status, "restore state")
+        if status.code == abi::status_code::OK {
+            return Ok(());
+        }
+        Err(super::node::state_restore_failure(
+            &self.label,
+            state_failure_code(status),
+            &self.diagnostic(status, "restore state"),
+        ))
     }
     // hot-path-alloc-ok-fn: state capture diagnostics allocate only on refusal
     fn capture_state(&self, sink: &mut dyn crate::state::StateSink) -> TransportResult<()> {
         let ptr = self.api().state;
         if ptr.is_null() {
-            return Err(self.error("node declares no capturable state".to_owned()));
+            return Err(TransportError::GraphError {
+                reason: format!("node '{}' declares no capturable state", self.label),
+            });
         }
         let capacity = sink.remaining_hint().map_or(u64::MAX, |n| n as u64);
         let mut bridge = SinkBridge {
@@ -640,21 +764,39 @@ impl NodeEntry for DylibNodeEntry {
         };
         // SAFETY: checked callback/instance remain live; bridge and record are
         // exclusive borrowed stack objects, never retained past synchronous call.
-        let instance = self.handle()?;
+        let instance = self.instance.ok_or_else(|| TransportError::GraphError {
+            reason: format!("node '{}' has not been initialized", self.label),
+        })?;
         let status = self.invoke(|| unsafe { ((*ptr).capture)(instance, &output, capacity) })?;
-        if bridge.panicked {
-            return Err(self.error("host state sink panicked".to_owned()));
+        if status.code == abi::status_code::OK && !bridge.full && !bridge.panicked {
+            return Ok(());
         }
-        if bridge.full || status.code == abi::status_code::BUFFER_TOO_SMALL {
+        if bridge.full || (status.code == abi::status_code::BUFFER_TOO_SMALL && !bridge.panicked) {
             bridge.sink.refuse();
-            return Err(self.error("host state sink refused capture".to_owned()));
         }
-        self.result(status, "capture state")
+        if status.code == abi::status_code::OK {
+            return Err(TransportError::GraphError { reason: format!(
+                "node '{}' state capture REFUSED: the host's sink {}; yet its exporter returned 0 (success). This exporter is BROKEN: it must stop at the first refusal and report BUFFER_TOO_SMALL (8). Only a PREFIX of this node's state reached the sink", self.label,
+                if bridge.panicked { "PANICKED" } else { "REFUSED a chunk" }) });
+        }
+        let cause = if bridge.panicked {
+            "the host sink panicked while accepting a chunk"
+        } else if bridge.full || status.code == abi::status_code::BUFFER_TOO_SMALL {
+            "the host sink refused the bytes (its buffer is too small for this node's state)"
+        } else {
+            "the cdylib could not encode this node's state"
+        };
+        Err(super::node::state_capture_failure(
+            &self.label,
+            state_failure_code(status),
+            cause,
+            &self.diagnostic(status, "capture state"),
+        ))
     }
     fn inline_safe(&self) -> bool {
         let ptr = self.api().state;
         let Some(instance) = self.instance else {
-            return false;
+            return self.inline_type;
         };
         if ptr.is_null() {
             return false;
@@ -670,12 +812,13 @@ impl NodeEntry for DylibNodeEntry {
     }
     fn cer_probe(&self) -> bool {
         let ptr = self.api().state;
+        // A node declaring no state graph cannot veto another node's anchor.
+        if ptr.is_null() {
+            return true;
+        }
         let Some(instance) = self.instance else {
             return false;
         };
-        if ptr.is_null() {
-            return false;
-        }
         // SAFETY: checked state table and instance live; graph serializes the
         // synchronous probe with all other calls and retains library until return.
         self.invoke(|| unsafe { ((*ptr).probe)(instance) })
@@ -714,7 +857,7 @@ impl NodeEntry for DylibNodeEntry {
             };
         if !valid {
             let error = self
-                .result(status, "external source")
+                .result(status, Phase::External)
                 .err()
                 .unwrap_or_else(|| self.error("external source descriptor is invalid".to_owned()));
             match self.external_errors.on_failure() {
@@ -801,6 +944,45 @@ unsafe extern "C" fn sink_write(context: *mut u8, bytes: abi::Bytes) -> abi::Sta
         Err(_) => {
             bridge.panicked = true;
             failure(abi::status_code::PANICKED)
+        }
+    }
+}
+
+#[cfg(all(test, not(feature = "local-transport")))]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_tick_panics_have_the_structural_tick_panic_class() {
+        let entry = DylibNodeEntry::load(&crate::testing::find_fixture_cdylib("test_node_cdylib"))
+            .expect("build test_node_cdylib first");
+        for phase in [
+            Phase::Init,
+            Phase::Tick,
+            Phase::Shutdown,
+            Phase::Destroy,
+            Phase::Shape,
+            Phase::External,
+        ] {
+            let error = entry
+                .result(
+                    abi::Status {
+                        code: abi::status_code::PANICKED,
+                        kind: 0,
+                        error: 0,
+                    },
+                    phase,
+                )
+                .expect_err("a panic cannot succeed");
+            assert_eq!(
+                matches!(error, TransportError::NodeTickPanicked { .. }),
+                phase == Phase::Tick
+            );
+            if phase != Phase::Tick {
+                assert!(matches!(error, TransportError::NodeError { .. }));
+            }
+            if phase == Phase::Init {
+                assert!(error.to_string().contains("init failed: "));
+            }
         }
     }
 }

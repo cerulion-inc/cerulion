@@ -59,7 +59,7 @@ pub enum AbiError {
         /// Required callback field.
         callback: &'static str,
     },
-    /// Native plugins are supported only on the existing POSIX targets.
+    /// Native plugins are supported on Linux, macOS and Android.
     #[error("native node plugins are unsupported on this platform")]
     Platform,
 }

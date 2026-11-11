@@ -182,9 +182,8 @@ pub mod posix_shm;
 pub mod prelude;
 pub mod read_outcome;
 pub mod replay_feed;
-// The rustc that compiled THIS copy of `cerulion_core`, compared across the
-// cdylib FFI boundary by `DylibNodeEntry::load` to catch a toolchain-skew
-// niche-encoding mismatch the ABI version cannot see. See the module doc.
+// Compiler provenance supports diagnostics and reproducible workspace defaults.
+// The stable node boundary is independent of this compiler fingerprint.
 pub mod rustc_fingerprint;
 #[allow(missing_docs)]
 pub mod scheduler;
@@ -320,10 +319,11 @@ pub mod wedge_page;
 #[allow(missing_docs)]
 pub mod wire;
 
-/// ABI version for cdylib node compatibility checking.
+/// ABI history version for node compatibility and diagnostics.
 ///
-/// Incremented when the cdylib entry point ABI changes. Dynamic libraries
-/// must export `cerulion_abi_version() -> u32` returning this exact value.
+/// Version 32 introduces stable boundary major 1. Native loading checks its
+/// complete frozen table identity, boundary major and capabilities; the compiler
+/// provenance and legacy version symbol do not govern stable compatibility.
 ///
 /// History:
 /// - v1: original handle-less ABI.

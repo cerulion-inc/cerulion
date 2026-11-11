@@ -4949,6 +4949,24 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
     ]
 }
 
+// Native state errors share this formatter with the stable loader. The Unicode
+// escape preserves the existing diagnostic bytes without changing its punctuation.
+pub(super) fn state_capture_failure(
+    label: &str,
+    code: i32,
+    cause: &str,
+    detail: &str,
+) -> TransportError {
+    TransportError::GraphError {
+        reason: format!(
+            "node '{label}' state capture failed (code {code}): {cause} \u{2014} {detail}"
+        ),
+    }
+}
+pub(super) fn state_restore_failure(label: &str, code: i32, detail: &str) -> TransportError {
+    TransportError::GraphError { reason: format!("node '{label}' state restore failed (code {code}): {detail}. The node may be PARTIALLY restored \u{2014} the run must fail rather than continue (§2.8)") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

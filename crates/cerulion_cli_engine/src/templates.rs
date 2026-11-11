@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Node source and Cargo.toml template generation.
 //!
-//! Generates cdylib node source for the handle-based FFI convention. The
-//! emitted `cerulion_abi_version()` tracks the transport-tagged ABI value of
-//! the `cerulion_core` it is compiled against, and the emitted
-//! `cerulion_rustc_fingerprint()` (ABI v22) tracks
-//! `cerulion_core::rustc_fingerprint_cstr()`. Neither is pinned to a specific
-//! value here, so a host rebuild propagates to every future generated node
-//! crate with no template regeneration.
-//! Uses programmatic `String` building (matching `codegen/generator/` pattern).
+//! Generates node source using checked stable boundary major 1. Native transport
+//! ownership stays in the host, and no compiler fingerprint governs loading.
+//! Uses programmatic String building for metadata and source emission.
 
 use crate::node_metadata::NodeMetadata;
 use crate::utils::to_pascal_case;
@@ -1492,6 +1487,23 @@ mod tests {
         assert!(toml.contains(r#"default = ["cdylib"]"#));
     }
 
+    #[test]
+    fn raw_fixture_dependencies_are_a_subset_of_the_scaffold() {
+        let generated: toml::Value = generate_cargo_toml("raw").parse().unwrap();
+        let fixture: toml::Value =
+            include_str!("../../test_fixtures/test_node_raw_ffi_template_cdylib/Cargo.toml")
+                .parse()
+                .unwrap();
+        let allowed = generated["dependencies"].as_table().unwrap();
+        for name in fixture["dependencies"].as_table().unwrap().keys() {
+            assert!(
+                allowed.contains_key(name),
+                "fixture dependency {name} must be shipped by the scaffold"
+            );
+        }
+        assert!(generate_lib_rs(&raw_metadata_for_test()).contains("cerulion_core::tracing::warn!"));
+    }
+
     fn raw_metadata_for_test() -> NodeMetadata {
         NodeMetadata {
             throttle_ms: None,
@@ -2782,12 +2794,13 @@ struct CameraNode {
         // struct, FFI fns, no `#[cerulion_node]` anywhere on the
         // struct.
         let source = r#"
-use cerulion_core::prelude::*;
-
+use cerulion_core::graph::node_plugin_abi::{HostClient, PluginNode};
 struct CameraState { tick_count: u64 }
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_init(_ctx: *mut u8) -> u64 { 1 }
+impl PluginNode for CameraState {
+    fn create(_client: HostClient, _params: &[u8]) -> cerulion_core::TransportResult<Self> {
+        Ok(Self { tick_count: 0 })
+    }
+}
 "#;
         assert!(
             !is_macro_based(source),

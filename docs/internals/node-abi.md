@@ -8,10 +8,12 @@ Unknown optional extensions are ignored without casting. Required unavailable ca
 
 Host context, port and sample leases use owner-local integer handles, never encoded pointers. The host owns transport, queues, clocks, snapshots, counters
 and native sample drop glue. Node state and overflow allocations remain owned by the node. Borrowed byte spans retain their owner until the synchronous call
-returns. Ordinary receive, accumulate and output leases obtained during a node
-call reach their terminal host operation before it returns. Raw helper leases
-are excepted. After destroy the host reclaims outstanding ordinary leases as
-INVARIANT without publication; all corresponding pointers are then invalid.
+returns. An escaped ordinary lease retains its row, mapping and busy port
+across ticks until its own release; begin_fire keeps running so the owner can
+release it. Existing per-port and context budgets bound new loans. A release
+outside admission keeps its mapping and queues once; the next admitted call
+flushes that queue before user code. After node destroy the host reclaims
+abandoned ordinary leases as INVARIANT without publication.
 Python and non-cancellable helper retention instead keeps library, context and
 escaped leases alive until process exit.
 
@@ -101,3 +103,9 @@ frozen by committed literal oracles. Stabby remains exactly pinned: a checker
 update must preserve those IDs. Bootstrap discovery must validate the complete
 signature before invoking the constructor, which runs before its returned
 header can be checked.
+
+Optional metadata booleans `retain_process` and `inline_safe` are validated
+before create; absence means false and a non-boolean refuses the library.
+The inline safety declaration supplies the native type constant before init;
+after init, the existing instance state-table callback supplies the answer.
+Neither key changes a frozen record or the capability namespace.

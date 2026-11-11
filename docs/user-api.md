@@ -78,28 +78,23 @@ follow the same checkout-or-exact-registry selection as an empty workspace.
 fingerprint. The generated README shows both the included graph and explicit
 create/stage/wire commands. The name must be a single directory name.
 
-For a CLI built with a stable Rust release, both commands write
-`rust-toolchain.toml` naming that release and the minimal profile, but only when
-a rustup toolchain is already installed whose release and full commit hash match
-the CLI's own. The check is offline and never installs a toolchain. A missing,
-mismatching or hash-less compiler produces a warning instead, and the workspace
-keeps whatever compiler your environment selects. A file that is written makes
-rustup use that compiler for node builds inside this workspace without changing
-the machine's default. An existing `rust-toolchain` or `rust-toolchain.toml`,
-symlinks included, is preserved with a warning. An explicit `RUSTUP_TOOLCHAIN`
-and a rustup directory override set at the workspace both take precedence over
-the file, while an override set on a more distant ancestor does not; whatever
-wins must still select a compatible compiler. A nightly or beta build warns
-rather than inferring a toolchain from an undated release string. Existing
-workspaces are not migrated.
+For a CLI built with a stable Rust release, both commands optionally write
+`rust-toolchain.toml` naming that release and the minimal profile when an exact
+matching rustup toolchain is already installed. The offline check installs
+nothing and changes no rustup default. An existing toolchain file is preserved.
+If no verified stable toolchain is available, the workspace uses the compiler
+selected by its environment. Explicit `RUSTUP_TOOLCHAIN` and rustup overrides
+retain their normal precedence. This pin is a reproducible build default; any
+supported compiler at or above the MSRV can build loadable nodes.
 
 Native node libraries use boundary major 1 and load when built by any supported
 Rust compiler at or above the workspace MSRV. The compiler need not match the
 CLI. CLI updates preserve compatibility while that boundary major remains
 supported. A legacy Rust-boundary node must be rebuilt once with
 `cerulion node build <TYPE>`; a different boundary major is refused with the same
-rebuild instruction. Macro attributes and node-author method signatures stay
-unchanged.
+rebuild instruction. Macro attributes stay unchanged. Move helper functions
+that take the node context into the node's `#[cerulion_node_impl]` block; helpers
+that take only data are unchanged.
 
 Workspace scaffolding chooses dependencies based on where the `cerulion`
 binary itself lives, not on the directory you run it from. A CLI installed
@@ -630,13 +625,10 @@ macOS). If `cargo` is missing the build fails with a message naming rustup and
 the linker, rather than a raw "No such file or directory" that reads like a lost
 build artifact.
 
-The node must also be built by the **same compiler that built your `cerulion`
-binary**: the loader compares the two fingerprints and refuses a skewed node
-(see the `cdylib` feature row under [Cargo features](#cargo-features)). The
-pre-build PATH `rustc` probe only warns when its release differs from the
-CLI's compiler, because Cargo may select another compiler through `RUSTC`, its
-configuration, or a wrapper. The build continues; loading the resulting node
-requires its full compiler fingerprint to match the host.
+Native nodes use stable boundary major 1. Any supported Rust compiler at or
+above the MSRV builds loadable nodes; the compiler need not match the CLI.
+Rebuild existing libraries once with `cerulion node build <TYPE>`. A library
+using an unsupported boundary major is refused with a rebuild instruction.
 
 Some nodes need a **system** library: GStreamer, librealsense, CUDA. Making
 that a hard dependency punishes everyone: `cargo build` then fails for every
@@ -1757,11 +1749,10 @@ impl Lidar {
 }
 ```
 
-The kind crosses into the runtime only from a node that reports it. A `#[cerulion_node]` node built with this Cerulion does. These do not, so a `Fatal` from them is logged like any other error and the node keeps firing:
-
-- A node built with an older Cerulion. It still loads; rebuild it with `cerulion node build` to get the stop.
-- A `--raw-ffi` node. The template does not export it; add `#[no_mangle] pub extern "C" fn cerulion_take_last_error_kind() -> u32` yourself to get the stop. The host calls it right after `cerulion_take_last_error`; return the last error's kind code (`3` for fatal, `0` for none) and reset it to `0`.
-- A Python node. Its errors are reported without a kind, so it cannot stop itself with `Fatal`.
+The stable boundary carries the node error kind with its diagnostic. Rust macro
+nodes and the `--raw-ffi` template preserve it, including `Fatal`; Python errors
+are reported without a kind. Existing libraries from the earlier Rust boundary
+are refused at load and must be rebuilt with `cerulion node build <TYPE>`.
 
 ---
 
@@ -3871,7 +3862,7 @@ For the `cerulion-rcpd` MCP server. See `docs/rcp.md`.
 ### Android CLI and node workspaces
 
 The CLI, `cerulion-netd` and `cerulion-wsd` build for Android. Node cdylibs
-must be cross-built on a host with the same Rust compiler as the CLI. On
+must be cross-built on a host with Rust 1.95 or newer. On
 Android, graph and node runs search
 `<target-directory>/<target-triple>/<profile>` when that node's cdylib is
 present there, otherwise using `<target-directory>/<profile>` when its library
@@ -3930,7 +3921,7 @@ You generally don't set these; the CLI generates the right feature wiring per no
 
 | Feature | On `cerulion_core` | When |
 |---|---|---|
-| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; switches the macro to emit cdylib FFI exports for `cerulion node run` / `cerulion graph run` to load. Each cdylib's ABI value includes the framework version and its transport kind (the cross-process value remains `CERULION_ABI_VERSION`), plus the rustc fingerprint that built it; a node built against an incompatible `cerulion_core`, OR by a different rustc release or full compiler commit than the `cerulion` host, is rejected loudly at load, even when both meet the crate's MSRV. To select the official stable compiler that built the host: `rustup toolchain install <host's rustc>`, then rebuild with `RUSTUP_TOOLCHAIN=<host's rustc> cerulion node build <type>` (plain `cerulion node build` needs no override when Cargo's effective compiler already matches). For distribution, custom, nightly, or beta hosts, a matching release string alone may not reproduce the fingerprint: use the identical compiler installation for both sides or rebuild the CLI and nodes together with the selected compiler. Also rebuild after upgrading the framework or the toolchain. |
+| `cdylib` | n/a | Set on a node crate's `Cargo.toml`; emits stable boundary major 1 for `cerulion node run` and `cerulion graph run`. Linux, macOS and Android hosts accept nodes built by any supported Rust compiler at or above the MSRV. CLI updates retain compatibility while that boundary major remains supported. Existing Rust-boundary node libraries must be rebuilt once with `cerulion node build <TYPE>`; a different boundary major is refused loudly. |
 | `debug-logging` | yes | Enables `tracing`'s `max_level_trace`. It does NOT put `debug`/`trace` back into a release build: `cerulion_core` sets `release_max_level_info` on its `tracing` dependency, `tracing` consults every `release_max_level_*` feature before any `max_level_*` one in a build without debug assertions, and Cargo unifies features across the binary, so a release binary stays capped at `info` with or without this feature, no matter what `RUST_LOG` says. To get `debug`/`trace` lines, build without cargo's `--release` (a dev-profile build has no ceiling). |
 | `local-transport` | yes, opt-in | Selects an in-process transport for apps whose local publishers, subscribers, and gateway all run in one process. It preserves the zero-copy path within that process. Explicit cross-process configurations, detached pre-creation for other processes, and cdylibs with a different transport kind are refused. Do not enable it for the CLI or daemons. A `local-transport` host refuses every native cdylib node at load: each library carries its own process-local registry, so its frames cannot reach the host. Enable it only for apps whose publishers and subscribers all live in that one process; for cdylib graphs or cross-process setups, build a workspace and run it with `cerulion graph run` on the default transport. |
 | `test-helpers` | yes | Exposes test-only constructors and seams (`ClosureNodeEntry`, the `new_for_test` constructors). Used by integration tests; users shouldn't need it. |

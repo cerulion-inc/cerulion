@@ -52,21 +52,12 @@ Three nodes forming a reactive pipeline:
   usually too old). `cerulion node build` compiles your nodes with your
   own `cargo`.
 
-  Build the nodes below with the same compiler that built the `cerulion` binary you
-  installed above: a node cdylib built by a different rustc release is refused at
-  load, loudly. A downloaded release binary is pinned to the exact rustc that built
-  it, named in the archive's `rustc-version.txt` (Rust 1.95.0 for the 2.0.0
-  binaries), and the README's [Install](../../README.md#install) section gives the
-  `RUSTUP_TOOLCHAIN=` step for that case. On Homebrew and apt, run
-  `cerulion-install-rust` once to install that compiler, then put
-  `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. Building this workspace from
-  source needs Rust 1.95 or newer. The workspace you create in step 1 also
-  records that compiler in its own `rust-toolchain.toml` when a matching rustup
-  toolchain is already installed, so the builds below select it with no environment
-  variable; when the CLI cannot verify a match it warns, leaves your environment's
-  compiler in charge, and never changes your rustup default. A CLI you built
-  yourself already matches, as long as you do not switch your default toolchain
-  part way through.
+  Build the nodes below with Rust 1.95 or newer. Native libraries use a stable
+  boundary, so their compiler need not match the CLI. On Homebrew and apt,
+  `cerulion-install-rust` installs the tested compiler; put
+  `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. Workspace creation may record
+  that compiler as a reproducible default when it is already installed, and
+  otherwise keeps the compiler your environment selects.
 
 Every step below is a `cerulion` verb. You never run `cargo` yourself and you never
 write a `main`: a node is a library the runtime loads, and the graph file is the

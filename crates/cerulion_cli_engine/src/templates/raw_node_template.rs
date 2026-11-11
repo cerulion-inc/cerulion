@@ -23,7 +23,7 @@ impl PluginNode for __NODE_STATE__ {
         let context = NodeContext::new(client.clone(), &info)?;
         let rust_log = context.env_opt("RUST_LOG");
         cerulion_core::graph::node::install_cdylib_stderr_tracing(rust_log.as_deref());
-        tracing::warn!(
+        cerulion_core::tracing::warn!(
             "raw node template contains no application logic; implement tick before running"
         );
         if let Some(error) = client.take_failure() {

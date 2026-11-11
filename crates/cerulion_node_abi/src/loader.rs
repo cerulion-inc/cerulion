@@ -31,7 +31,7 @@ impl CheckedNodeLibrary {
     /// Refuses missing stable symbols, incompatible layouts/major/capabilities,
     /// null required callbacks, invalid spans and unsupported native platforms.
     pub unsafe fn load(path: &Path, host_capabilities: u64) -> Result<Self, AbiError> {
-        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        if !native_platform_supported(std::env::consts::OS) {
             return Err(AbiError::Platform);
         }
         // SAFETY: caller authorizes native initialization and guarantees the
@@ -81,11 +81,27 @@ impl CheckedNodeLibrary {
     }
 }
 
+/// Native libraries use the supported POSIX loaders, including Android bionic.
+fn native_platform_supported(os: &str) -> bool {
+    matches!(os, "linux" | "macos" | "android")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn supported_native_platforms_are_frozen() {
+        for os in ["linux", "macos", "android"] {
+            assert!(native_platform_supported(os));
+        }
+        for os in ["windows", "ios", "freebsd", "unknown"] {
+            assert!(!native_platform_supported(os));
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     fn non_library_file_reports_native_open_failure() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         // SAFETY: the crate's actual text manifest is not native code. The OS
@@ -97,10 +113,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
     fn existing_system_library_without_stable_exports_requires_rebuild() {
         #[cfg(target_os = "linux")]
         let path = Path::new("libc.so.6");
+        #[cfg(target_os = "android")]
+        let path = Path::new("libc.so");
         #[cfg(target_os = "macos")]
         let path = Path::new("/usr/lib/libSystem.B.dylib");
         // SAFETY: this is the process's trusted C runtime, whose constructors

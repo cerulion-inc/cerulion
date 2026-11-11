@@ -9313,6 +9313,8 @@ name = "test_node_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+ "serde_json",
 ]
 
 [[package]]
@@ -9335,6 +9337,7 @@ name = "test_node_drain_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9613,7 +9616,6 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
- "tracing",
 ]
 
 [[package]]
@@ -9621,6 +9623,7 @@ name = "test_node_snapshot_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9653,6 +9656,13 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_unknown_schema_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
 ]
 
 [[package]]

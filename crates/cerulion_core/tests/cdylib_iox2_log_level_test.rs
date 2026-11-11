@@ -674,15 +674,10 @@ fn every_hand_written_cdylib_init_applies_the_iox2_log_level() {
     // signature spelling, a `continue` that swallows everything) would
     // otherwise pass silently — the same "nothing enumerates them" hole.
     //
-    // This list held two entries until `cerulion_viz/nodes/rerun_sink` was
-    // deleted (visualization is desk-side, so the node lost its last
-    // caller). The scaffolding template is the survivor and is
-    // the RIGHT anchor: it is the seed `cerulion node create --raw-ffi` emits,
-    // so every user-authored raw-FFI node inherits the call by construction.
-    // If a production hand-written init is ever added back, list it here too.
-    // (Kept as a named array, not inlined, so re-adding an entry is a one-line
-    // edit — and so `clippy::single_element_loop` does not fire at length 1.)
-    const EXPECTED_HAND_WRITTEN_INITS: [&str; 1] = ["crates/cerulion_cli_engine/src/templates.rs"];
+    // The Python native adapter remains a hand-written initializer. Stable
+    // raw nodes use host-owned transport and need no node-side iceoryx2 static.
+    const EXPECTED_HAND_WRITTEN_INITS: [&str; 1] =
+        ["crates/cerulion_py/crates/cerulion_pynode/src/lib.rs"];
     for expected in EXPECTED_HAND_WRITTEN_INITS {
         assert!(
             scanned.iter().any(|s| s == expected),

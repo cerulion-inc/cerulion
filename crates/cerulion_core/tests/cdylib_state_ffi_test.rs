@@ -933,18 +933,12 @@ fn a_capture_the_host_sink_refused_is_refused_even_though_the_cdylib_reported_su
         "blames the exporter, not the buffer: {text}"
     );
     assert!(
-        text.contains("-6"),
+        text.contains("BUFFER_TOO_SMALL (8)"),
         "names the code the exporter owed us: {text}"
     );
-    // (c2) And whatever the cdylib left in its FFI error slot is SURFACED, not
-    //      thrown away: it is the only thing the exporter had to say about a
-    //      capture it got wrong. (Draining it is also what stops it resurfacing
-    //      against a later, unrelated failure — the slot is process-global for
-    //      the life of the loaded library.)
-    assert!(
-        text.contains("ignored 2 sink rejection(s) and reported success"),
-        "surfaces the cdylib's own message: {text}"
-    );
+    // Stable success has no diagnostic token. The host's independent sink
+    // observation supplies the complete refusal even when the node lies.
+    assert!(!text.contains("ignored 2 sink rejection(s)"));
 
     // (d) And the host's own sink is latched, so nothing downstream can read
     //     its prefix back as accepted bytes.
@@ -1366,7 +1360,7 @@ fn a_refused_shape_export_leaves_nothing_behind_to_explain_the_next_failure() {
         "the tick failure must NOT be explained by the load-time shape refusal: {text}"
     );
     assert!(
-        text.contains("cerulion_node_tick returned 9") && text.contains("no detail provided"),
+        text.contains("node tick failed with status 2"),
         "it reports its own condition and admits it has no detail: {text}"
     );
 }
@@ -1404,7 +1398,7 @@ fn a_healthy_shape_export_logs_no_refusal_and_leaves_the_error_slot_alone() {
         .expect_err("the tick was told to fail")
         .to_string();
     assert!(
-        text.contains("cerulion_node_tick returned 9"),
+        text.contains("node tick failed with status 2"),
         "reports its own condition: {text}"
     );
 }
@@ -1428,13 +1422,34 @@ fn panic_cdylib() -> std::path::PathBuf {
 fn two_panic_nodes() -> (DylibNodeEntry, DylibNodeEntry) {
     let mut a = DylibNodeEntry::load(&panic_cdylib()).expect("the panic cdylib loads");
     let mut b = DylibNodeEntry::load(&panic_cdylib()).expect("the panic cdylib loads twice");
-    for entry in [&mut a, &mut b] {
-        entry
-            .init(cerulion_core::graph::node::NodeContext::for_tests(
-                IndexMap::new(),
-                IndexMap::new(),
-            ))
-            .expect("the panic fixture inits");
+    let clock = Arc::new(VirtualClock::new());
+    let manager = cerulion_core::transport::TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: "state_panic_context".into(),
+            clock,
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("isolated transport");
+    for (index, entry) in [&mut a, &mut b].into_iter().enumerate() {
+        let mut outputs = IndexMap::new();
+        outputs.insert(
+            "out".into(),
+            cerulion_core::AnyPublisher::Ipc(
+                manager
+                    .create_publisher(
+                        &format!("/state_panic/{index}"),
+                        cerulion_core::wire::MaxSliceLen::const_new(4096),
+                        0,
+                    )
+                    .expect("declared publisher"),
+            ),
+        );
+        let mut context = NodeContext::for_tests(outputs, IndexMap::new());
+        context.set_transport(manager.clone());
+        entry.init(context).expect("the panic fixture inits");
     }
     (a, b)
 }
@@ -1460,6 +1475,10 @@ fn a_panicking_state_encoder_fails_its_own_capture_without_poisoning_the_cdylibs
         assert!(
             sink.is_empty(),
             "and nothing was captured — a partial encoding is not an anchor"
+        );
+        assert!(
+            !matches!(err, cerulion_core::TransportError::NodeTickPanicked { .. }),
+            "state capture did not execute a tick"
         );
         err.to_string()
     };
@@ -1504,9 +1523,17 @@ fn a_panicking_state_decoder_fails_its_own_restore_without_poisoning_the_cdylibs
 
     let refusal = {
         let _panic = EnvGuard::set("STATE_PANIC_MODE", "restore");
-        a.restore_state(&payload)
-            .expect_err("a panicking decoder cannot report success")
-            .to_string()
+        let error = a
+            .restore_state(&payload)
+            .expect_err("a panicking decoder cannot report success");
+        assert!(
+            !matches!(
+                error,
+                cerulion_core::TransportError::NodeTickPanicked { .. }
+            ),
+            "state restore did not execute a tick"
+        );
+        error.to_string()
     };
 
     // The same no-poison pin on the restore half, and again BEFORE the wording: the
@@ -1710,4 +1737,37 @@ fn a_symbol_less_cdylib_forks_and_is_believed_quiescent() {
         "the raw-FFI fixture declares no state either — if it did, this is the \
          wrong library"
     );
+}
+
+#[test]
+#[serial]
+fn complete_and_empty_diagnostics_survive_the_loader_without_truncation_or_replacement() {
+    use cerulion_core::TransportError;
+    let mut entry = init_liar();
+    for (mode, expected) in [
+        (
+            "fail_long",
+            format!("full reason:{}:end", "x".repeat(1024 * 1024 + 17)),
+        ),
+        ("fail_empty", String::new()),
+    ] {
+        let _mode = EnvGuard::set("STATE_TICK_MODE", mode);
+        let TransportError::NodeError { reason, .. } = entry
+            .tick()
+            .expect_err("fixture supplies an exact failure reason")
+        else {
+            panic!("untyped error kind must remain untyped");
+        };
+        assert_eq!(
+            reason, expected,
+            "complete and empty node-owned reasons must be copied exactly"
+        );
+    }
+    let _mode = EnvGuard::set("STATE_TICK_MODE", "fail_silent");
+    let text = entry
+        .tick()
+        .expect_err("new failure has no diagnostic")
+        .to_string();
+    assert!(text.contains("node tick failed with status 2"));
+    assert!(!text.contains("full reason:"));
 }

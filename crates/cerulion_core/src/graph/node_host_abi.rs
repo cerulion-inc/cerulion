@@ -273,20 +273,6 @@ impl HostContext {
         &self.native
     }
 
-    /// Unscoped native maintenance protects all borrowed input ports. Retained
-    /// output samples are independently owned and do not block input maintenance.
-    /// Named input operations use the narrower runtime helpers below.
-    pub(crate) fn native_mut_for_runtime(&mut self) -> Result<&mut NodeContext, HostServiceError> {
-        self.admit()?;
-        if self.ports.iter().any(|port| {
-            port.spec.direction == LeaseDirection::Read
-                && (port.busy || port.accumulated_borrows != 0)
-        }) {
-            return Err(HostServiceError::InvalidState);
-        }
-        Ok(&mut self.native)
-    }
-
     fn runtime_input_index(&self, name: &str) -> Result<usize, HostServiceError> {
         self.admit()?;
         let index = self

@@ -23,8 +23,8 @@
 //! --ignored --nocapture`) as a child, pipes the CHILD's stderr, drives a
 //! 1-node (or 2-node) graph over real iceoryx2 (`build_for_test`) that loads the
 //! `test_node_discard_probe_cdylib` fixture, and asserts on the captured stderr.
-//! The child installs NO host subscriber and uses NO `#[traced_test]` — the pin
-//! is that the CDYLIB's own subscriber writes to the child process stderr.
+//! The child installs the host subscriber for host-owned output diagnostics.
+//! The cdylib subscriber routes the author's events to the same stderr channel.
 //!
 //! Oracle: the literal error/warn strings (NOT a self-compare). Test 1 FAILS
 //! without the subscriber (the black hole — nothing reaches stderr). Portable: runs on
@@ -236,6 +236,13 @@ fn subprocess_child_discard_probe() {
     if std::env::var(ENV_CHILD).as_deref() != Ok("1") {
         return;
     }
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     let instances = std::env::var(ENV_INSTANCES)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
