@@ -94,7 +94,24 @@ struct CallRequest {
 }
 
 /// The newest frame per state resource name.
-type NewestState = Arc<Mutex<BTreeMap<String, Option<String>>>>;
+type NewestState = Arc<Mutex<BTreeMap<String, Option<StateFrame>>>>;
+
+#[derive(Clone)]
+struct StateFrame {
+    text: String,
+    remotely_visible: bool,
+}
+
+fn captured_state_visible(
+    producer_allowed: bool,
+    origin: u128,
+    publishers: &[cerulion_core::transport::TopicPublisherNode],
+) -> bool {
+    producer_allowed
+        && publishers
+            .iter()
+            .any(|publisher| publisher.publisher == origin)
+}
 
 /// The handle async code uses to reach the journal thread.
 #[derive(Clone)]
@@ -290,6 +307,19 @@ impl Journal {
             .get(name)
             .cloned()
             .flatten()
+            .map(|frame| frame.text)
+    }
+
+    /// Serve only state captured from an admitted live producer, even after it exits.
+    pub fn remote_state(&self, name: &str) -> Result<Option<String>, String> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.get(name).and_then(Option::as_ref) {
+            Some(frame) if !frame.remotely_visible => {
+                self.manager.record_remote_access_refusal();
+                Err("cached state belongs to an excluded or unavailable producer".into())
+            }
+            frame => Ok(frame.map(|frame| frame.text.clone())),
+        }
     }
 }
 
@@ -301,11 +331,12 @@ struct Pending {
 }
 
 struct Ports {
+    manager: Arc<TransportManager>,
     calls_topic: String,
     results_topic: String,
     calls: CerulionPublisher,
     results: CerulionSubscriber,
-    state: Vec<(String, CerulionSubscriber)>,
+    state: Vec<(String, String, CerulionSubscriber)>,
     newest: NewestState,
     latch: Arc<AtomicBool>,
     pending: BTreeMap<u64, Pending>,
@@ -418,7 +449,7 @@ pub(crate) fn drain_stamped_strings(
 
 impl Ports {
     fn open(
-        manager: &TransportManager,
+        manager: &Arc<TransportManager>,
         config: &JournalConfig,
         state: &[StateResource],
         latch: Arc<AtomicBool>,
@@ -429,9 +460,14 @@ impl Ports {
         let results = manager.create_subscriber(&config.results_topic)?;
         let mut state_ports = Vec::new();
         for entry in state {
-            state_ports.push((entry.name.clone(), manager.create_subscriber(&entry.topic)?));
+            state_ports.push((
+                entry.name.clone(),
+                entry.topic.clone(),
+                manager.create_subscriber(&entry.topic)?,
+            ));
         }
         let ports = Self {
+            manager: Arc::clone(manager),
             calls_topic: config.calls_topic.clone(),
             results_topic: config.results_topic.clone(),
             calls,
@@ -569,12 +605,32 @@ impl Ports {
     }
 
     fn refresh_state(&mut self) {
-        for (name, subscriber) in &self.state {
-            if let Some(text) = drain_strings(subscriber, name).pop() {
+        for (name, topic, subscriber) in &self.state {
+            if let Some(frame) = drain_stamped_strings(subscriber, topic).pop() {
+                // Private frames and queued frames from a retired publisher must
+                // never become public when the producer's exclusion disappears.
+                let local_scope = self.manager.retain_local_topic_scope(topic);
+                let remotely_visible =
+                    self.manager
+                        .topic_publisher_nodes(topic)
+                        .is_ok_and(|publishers| {
+                            captured_state_visible(
+                                matches!(&local_scope, Ok(None)),
+                                frame.origin,
+                                &publishers,
+                            )
+                        });
+                drop(local_scope);
                 self.newest
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(name.clone(), Some(text));
+                    .insert(
+                        name.clone(),
+                        Some(StateFrame {
+                            text: frame.text,
+                            remotely_visible,
+                        }),
+                    );
             }
         }
     }
@@ -585,6 +641,20 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::{decode_string, gate, Gate};
+
+    #[test]
+    fn cached_state_visibility_never_promotes_a_private_or_retired_origin() {
+        let publishers = [cerulion_core::transport::TopicPublisherNode {
+            publisher: 17,
+            node_name: None,
+        }];
+        for _ in 0..2 {
+            assert!(super::captured_state_visible(true, 17, &publishers));
+            assert!(!super::captured_state_visible(false, 17, &publishers));
+            assert!(!super::captured_state_visible(true, 19, &publishers));
+            assert!(!super::captured_state_visible(true, 17, &[]));
+        }
+    }
 
     #[test]
     fn a_cancelled_gated_call_is_dropped_and_an_estop_or_read_is_not() {

@@ -4179,6 +4179,11 @@ impl TransportManager {
         egress_scope::REMOTE_ACCESS_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Count an application cache refusal whose producer admission has already expired.
+    pub fn record_remote_access_refusal(&self) {
+        egress_scope::REMOTE_ACCESS_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// A remote tap that holds producer policy for its entire lifetime.
     pub fn create_remote_data_only_subscriber(
         &self,

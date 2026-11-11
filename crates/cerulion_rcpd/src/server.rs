@@ -229,7 +229,14 @@ impl ServerHandler for RcpServer {
             } else {
                 None
             };
-            let Some(text) = host.journal().state(name) else {
+            let text = if remote {
+                host.journal()
+                    .remote_state(name)
+                    .map_err(|error| ErrorData::invalid_params(error, None))?
+            } else {
+                host.journal().state(name)
+            };
+            let Some(text) = text else {
                 return Err(ErrorData::resource_not_found(
                     "no frame seen on this state topic yet",
                     Some(serde_json::json!({ "uri": request.uri })),
