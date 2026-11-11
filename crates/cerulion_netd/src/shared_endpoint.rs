@@ -316,10 +316,15 @@ impl SharedMirrorPlane {
         if timeout.is_zero() {
             return Err("outbound metadata operation exceeded its time budget".into());
         }
-        stream
+        let deadline_setup = stream
             .set_read_timeout(Some(timeout))
-            .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|_| "outbound control deadline setup failed")?;
+            .and_then(|()| stream.set_write_timeout(Some(timeout)));
+        if deadline_setup.is_err() {
+            // macOS can reject timeout setup on a disconnected socket before
+            // the first write. Retire that socket just like any framing error.
+            connection.take();
+            return Err("outbound control deadline setup failed".into());
+        }
         let result = Self::request(stream, configuration, operation);
         if result.is_err() {
             // A framing failure fences the whole connection; never retry an operation
