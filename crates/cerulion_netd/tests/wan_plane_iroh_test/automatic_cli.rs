@@ -135,6 +135,10 @@ fn successful(output: Output) -> String {
 
 #[test]
 fn automatic_paired_cli_delivers_frames_and_selected_sources_never_collide() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("cerulion_netd=debug,cerulion_remoted=debug,iroh=warn")
+        .with_test_writer()
+        .try_init();
     let topic = format!("/automatic/{}", unique_id());
     let desk_seed = unique_secret();
     let doc = cerulion_core::SchemaDoc {

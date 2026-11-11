@@ -143,6 +143,23 @@ impl Fixture {
     }
 }
 
+#[test]
+#[serial]
+fn a_stale_directory_refuses_before_starting_a_network_daemon() {
+    let fixture = Fixture::new();
+    let directory = cerulion_cli_engine::account_robots::fetch().unwrap();
+    let path = fixture.home.path().join("auth.json");
+    let mut state = auth::load_from(&path).state().unwrap().clone();
+    state.session_token = "changed-session-after-fetch".into();
+    auth::write_to(&path, &state).unwrap();
+    let error = account_robot_access::install_directory(&directory).unwrap_err();
+    assert!(error.to_string().contains("login changed"), "{error}");
+    assert!(
+        !fixture.socket().exists(),
+        "stale membership must not start a daemon"
+    );
+}
+
 #[derive(Default)]
 struct AccessSpy(std::sync::Mutex<Vec<cerulion_netd::account_access::AccountAccessRequest>>);
 impl cerulion_netd::MirrorPlane for AccessSpy {

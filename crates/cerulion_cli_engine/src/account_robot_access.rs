@@ -145,6 +145,7 @@ fn classify_install_outcome(
 /// re-validated before every attempt, so a login that changes DURING the wait
 /// aborts instead of installing a snapshot that no longer describes this machine.
 pub fn install_directory(directory: &AccountRobotDirectory) -> CliResult<NetdClient> {
+    directory.validate_current_login()?;
     let mut client = NetdClient::connect_or_spawn().map_err(access_error)?;
     install_directory_until(
         directory,

@@ -474,9 +474,31 @@ fn ensure_topic_available_with_selection(
             .flatten();
         if let Some(selected) = selected_robot {
             if selected.catalog.is_none() {
+                let state = match &selected.presence {
+                    cerulion_netd::account_access::RobotPresence::NotReached { reason } => {
+                        format!("is offline (not reached: {})", sanitize_display(reason))
+                    }
+                    cerulion_netd::account_access::RobotPresence::Unknown { reason } => {
+                        format!("has unknown reachability ({})", sanitize_display(reason))
+                    }
+                    cerulion_netd::account_access::RobotPresence::Online => {
+                        "is online but its topics are unavailable".into()
+                    }
+                };
                 return Err(CliError::Validation(format!(
-                    "robot '{}' is offline or its topics could not be read within the deadline",
+                    "robot '{}' {state}",
                     sanitize_display(&selected.name)
+                )));
+            }
+            if let Some(error) = selected
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.error.as_ref())
+            {
+                return Err(CliError::Validation(format!(
+                    "robot '{}' topics are unavailable: {}",
+                    sanitize_display(&selected.name),
+                    sanitize_display(error)
                 )));
             }
         }

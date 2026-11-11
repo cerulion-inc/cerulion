@@ -424,10 +424,11 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
 
 /// The process exit status for an error a verb returned, built-in or family:
 /// `EXIT_NODE_FATAL` (3) for a run that stopped a node on a fatal error, in
-/// process or in a worker group, and 1 for every other error.
+/// process or in a worker group, 2 for an ambiguous topic, and 1 otherwise.
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
+        CliError::AmbiguousTopic(_) => 2,
         CliError::NodeFatal { .. }
         | CliError::WorkerNodeFatal { .. }
         | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
@@ -5358,9 +5359,9 @@ mod cli_error_exit_code_tests {
     use cerulion_cli_engine::error::CliError;
 
     /// A run that stopped a node on a fatal error exits 3, in process or in
-    /// a worker group; every other error exits 1.
+    /// a worker group; ambiguous topics exit 2 and other errors exit 1.
     #[test]
-    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+    fn fatal_nodes_exit_3_ambiguous_topics_exit_2_and_other_errors_exit_1() {
         let in_process = CliError::NodeFatal {
             nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
         };
@@ -5370,6 +5371,10 @@ mod cli_error_exit_code_tests {
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
         assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::AmbiguousTopic("candidates".into())),
+            2
+        );
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1

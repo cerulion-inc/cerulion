@@ -177,6 +177,9 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
         return Ok(result);
     }
     let attempt = (|| {
+        if let Some(directory) = &directory {
+            directory.validate_current_login()?;
+        }
         let mut client = NetdClient::connect_or_spawn().map_err(super::access_error)?;
         // Installations and every robot share one deadline after bounded daemon startup.
         let deadline = Instant::now() + Duration::from_secs(4);
