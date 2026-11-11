@@ -2295,8 +2295,9 @@ pub fn graph_validate(
 /// [`graph_validate`] with the node-library reader chosen by the caller: a
 /// one-shot CLI loads libraries in-process, a standing daemon MUST NOT (a
 /// library that aborts on load would take it down — see
-/// [`crate::node_inspector`]). Only the network-ingress gate reads libraries;
-/// every other check is source- and path-based.
+/// [`crate::node_inspector`]). The input backpressure check, the network-ingress
+/// gate and the params check read libraries; the other checks are source- and
+/// path-based.
 pub fn graph_validate_with_inspector(
     workspace_root: &Path,
     graph_name: &str,
@@ -2335,9 +2336,10 @@ pub fn graph_validate_with_inspector(
     // the same cache and threads it back in so a validated run walks
     // each `src/` tree exactly once total.
     let cdylib_cache = resolve_cdylib_cache(workspace_root, &config, prefer_release);
-    // Both checks that read a node library (the ingress gate and the params
-    // check) go through ONE memo, so each library's static initialization
-    // and teardown run once per validation, not once per check and node.
+    // Every check that reads a node library (the input backpressure check, the
+    // ingress gate and the params check) goes through ONE memo, so each
+    // library's static initialization and teardown run once per validation,
+    // not once per check and node.
     let inspector = crate::graph_params_check::OncePerLibrary::new(inspector);
     Ok(graph_validate_with_cache(
         workspace_root,
@@ -2367,6 +2369,11 @@ pub fn graph_validate_with_inspector(
 /// `failing_check_blocks_the_run` is the full list.)
 const TOPOLOGY_CHECK_LABEL: &str = "graph topology";
 
+/// The report label for the input queue check ([`input_backpressure_check`]):
+/// the graph's per-input keys applied to the loaded node metadata, then the
+/// topology built and validated, as `GraphRuntime::build` does on every start.
+const INPUT_BACKPRESSURE_CHECK_LABEL: &str = "input backpressure";
+
 /// Label prefix for the per-node-type crate check.
 const NODE_CRATE_CHECK_PREFIX: &str = "node crate '";
 /// Label prefix for the per-node-type cdylib check.
@@ -2384,6 +2391,8 @@ const SYNC_TRIGGER_CHECK_PREFIX: &str = "sync trigger binding '";
 ///
 /// * `graph topology` IS `cerulion_core`'s `validate_graph`, which
 ///   `GraphRuntime::build` calls. Always blocking.
+/// * `input backpressure` applies the graph's input keys and validates the
+///   topology, which `GraphRuntime::build` does again. Always blocking.
 /// * `cdylib '<type>'` is re-asked by `load_node_factories_from_cache`, off
 ///   the SAME cache the report used. Always blocking — and this is the common
 ///   case: a staged-but-never-BUILT node was told to re-run with
@@ -2405,6 +2414,7 @@ const SYNC_TRIGGER_CHECK_PREFIX: &str = "sync trigger binding '";
 /// not "is this check re-run?" but "does the library it would load resolve?".
 fn failing_check_blocks_the_run(label: &str, cdylib_cache: &ResolvedCdylibCache) -> bool {
     if label == TOPOLOGY_CHECK_LABEL
+        || label == INPUT_BACKPRESSURE_CHECK_LABEL
         || label.starts_with(CDYLIB_CHECK_PREFIX)
         // The graph BUILD re-runs the macro trigger-wiring resolution itself,
         // so an unwired `#[input(trigger)]` refuses again under the flag —
@@ -2862,20 +2872,22 @@ fn graph_validate_with_cache(
     let mut checks = Vec::new();
 
     // Run core graph validation (topology, references, policy bounds)
-    match validate_graph(config) {
+    let topology_valid = match validate_graph(config) {
         Ok(()) => {
             checks.push(ValidationCheck::pass(
                 TOPOLOGY_CHECK_LABEL,
                 "all references and policies valid",
             ));
+            true
         }
         Err(e) => {
             checks.push(ValidationCheck::fail(
                 TOPOLOGY_CHECK_LABEL,
                 format!("{}", e),
             ));
+            false
         }
-    }
+    };
 
     // Build a map of resolved output TOPIC -> schema.
     // Keyed by the RESOLVED topic (override-aware), and
@@ -3454,25 +3466,42 @@ fn graph_validate_with_cache(
         }
     }
 
+    // Every native node's library info, read through the caller's inspector.
+    // Both callers hand in one `OncePerLibrary` memo, so the params check below
+    // reads no library a second time. `Err` when a library does not resolve or
+    // does not read; the node crate, cdylib or params check then fails the
+    // report for that node.
+    let loaded_infos = collect_entry_infos_from_cache(config, cdylib_cache, inspector);
+
+    // The input queues, judged as the graph build judges them. Only with every
+    // node's metadata: without one node's, its declared `block` would read as
+    // the default `drop_oldest` and the check could refuse a graph the build
+    // accepts. Not after a `validate_graph` failure: the build judges the
+    // topology only of a graph that passes it, and a fault both see would be
+    // reported twice.
+    if topology_valid {
+        if let Ok(entry_infos) = &loaded_infos {
+            checks.extend(input_backpressure_check(config, entry_infos));
+        }
+    }
+
     // The network `ingress:` gate, run HERE instead of only inside
-    // `graph run`. Every check above reads YAML or syn-parses `src/lib.rs`;
-    // none of them can see an input's schema hash, because that value only
-    // exists on the far side of the cdylib FFI boundary. Without this gate both halves of a
+    // `graph run`. None of the checks above judges an input's schema hash, a
+    // value that only exists on the far side of the cdylib FFI boundary.
+    // Without this gate both halves of a
     // two-host graph can pass validate with every check green and then die at
     // `graph run` with "no consumer with a declared schema" — the preflight an
     // operator trusts before a run could not fail on the
     // cross-machine legs the run depends on.
     //
-    // Gated on an enabled block with a non-empty ingress list, so ONLY graphs
-    // that actually import a topic pay the `dlopen` — a single-host graph
-    // validates exactly as cheaply as before.
+    // Gated on an enabled block with a non-empty ingress list. It judges the
+    // infos read above as the libraries declare them: it reads each consuming
+    // input's schema hash, which the graph's input keys do not change.
     //
     // Only the explicit `cerulion graph validate` verb runs it. `graph run`'s
-    // pre-run validation passes `false`: it is about to load these libraries for
-    // real, and loading + dropping them first would run each node's static
-    // init/teardown an extra time before the run's own load. No coverage is
-    // lost — the run computes the same gateway plan seconds later, through the
-    // same resolver, and refuses with the same words.
+    // pre-run validation passes `false`: the run computes the same gateway
+    // plan seconds later, through the same resolver, and refuses with the
+    // same words.
     if check_network_ingress
         && config
             .network
@@ -3480,9 +3509,9 @@ fn graph_validate_with_cache(
             .is_some_and(|n| n.is_enabled() && !n.ingress.is_empty())
     {
         let ingress_count = config.network.as_ref().map_or(0, |n| n.ingress.len());
-        match collect_entry_infos_from_cache(config, cdylib_cache, inspector) {
+        match &loaded_infos {
             Ok(entry_infos) => {
-                match cerulion_core::graph::validate_network_ingress(config, &entry_infos) {
+                match cerulion_core::graph::validate_network_ingress(config, entry_infos) {
                     Ok(()) => checks.push(ValidationCheck::pass(
                         "network ingress",
                         format!(
@@ -3539,7 +3568,9 @@ fn graph_validate_with_cache(
 
 /// Load every node's cdylib from the already-resolved cache and
 /// collect its `NodeInfo` — the same map `graph run` derives from its loaded
-/// factories, which is the only place an input's schema hash exists.
+/// factories, which is the only place an input's schema hash exists. The
+/// infos are as the libraries declare them: [`input_backpressure_check`]
+/// applies the graph's input keys to a copy of its own.
 ///
 /// Deliberately NOT [`load_node_factories_from_cache`]: that function owns the
 /// stale-build log line, and calling it here would make a `graph run`
@@ -3550,9 +3581,9 @@ fn graph_validate_with_cache(
 /// treats a node missing from the map as "declares no schema", so handing it a
 /// partial map would manufacture a false failure on a graph that runs fine.
 /// Any load error therefore aborts with an `Err` rather than yielding a partial
-/// map — and the caller renders that `Err` as a FAILING check, never an
+/// map. The ingress gate renders that `Err` as a FAILING check, never an
 /// advisory: every way it is reached means `graph run` cannot run this graph.
-/// See the call site's `Err` arm, pinned by
+/// See the gate's `Err` arm, pinned by
 /// `graph_validate_fails_when_the_ingress_gate_cannot_load_the_libraries`.
 fn collect_entry_infos_from_cache(
     config: &GraphConfig,
@@ -3582,12 +3613,58 @@ fn collect_entry_infos_from_cache(
             inspector.inspect(&lib.path, node_type)?,
         );
     }
-    cerulion_core::graph::topology::apply_input_backpressure_overrides(
-        config,
-        &mut entry_infos,
-        cerulion_core::graph::topology::MissingInputMeta::Refuse,
-    )?;
     Ok(entry_infos)
+}
+
+/// The `input backpressure` line: every input's queue judged as
+/// `GraphRuntime::build` judges it. The graph's per-input `backpressure:` and
+/// `depth:` keys are written into a copy of the loaded metadata with
+/// [`MissingInputMeta::Refuse`](cerulion_core::graph::topology::MissingInputMeta::Refuse),
+/// as the build writes them, then the topology is built and validated with its
+/// `block_timeout_ms` keys. A refusal fails the line in the build's own words:
+/// a depth outside 1 to 64, `block` with no in-graph producer or on a
+/// `network.ingress` topic, a `block_timeout_ms` the build refuses, a ring of
+/// `block` edges, or a key on an `#[input(accumulate)]` input or on a port the
+/// node declares no metadata for.
+///
+/// `None` when every queue passes and no input sets one of the three keys, so a
+/// graph that sets none gets no line.
+fn input_backpressure_check(
+    config: &GraphConfig,
+    entry_infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+) -> Option<ValidationCheck> {
+    let mut infos = entry_infos.clone();
+    let verdict = cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut infos,
+        cerulion_core::graph::topology::MissingInputMeta::Refuse,
+    )
+    .and_then(|()| cerulion_core::graph::GraphTopology::build(config, &infos))
+    .and_then(|topology| topology.validate());
+    if let Err(e) = verdict {
+        return Some(ValidationCheck::fail(
+            INPUT_BACKPRESSURE_CHECK_LABEL,
+            e.to_string(),
+        ));
+    }
+    let keyed = config
+        .native_nodes()
+        .flat_map(|node| &node.inputs)
+        .filter(|input| {
+            input.backpressure.is_some()
+                || input.depth.is_some()
+                || input.block_timeout_ms.is_some()
+        })
+        .count();
+    (keyed > 0).then(|| {
+        ValidationCheck::pass(
+            INPUT_BACKPRESSURE_CHECK_LABEL,
+            format!(
+                "{keyed} input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every \
+                 input's queue is one the graph build accepts"
+            ),
+        )
+    })
 }
 
 /// The text of [`KILL_SWITCH_SCOPE`], for `concat!`.
@@ -35030,6 +35107,482 @@ network:
              (the staged raw-FFI fixture's input parses to the 0 sentinel); got: {}",
             gate.detail
         );
+    }
+
+    // ─── `input backpressure`: the graph build's queue refusals, at validate ─
+
+    /// Answers each node TYPE with the info a hand-written table declares for
+    /// it, as a loaded library answers `cerulion_node_info()`. A type missing
+    /// from the table reads as a library that will not load.
+    struct DeclaredInfos(Vec<(&'static str, cerulion_core::NodeInfo)>);
+
+    impl crate::node_inspector::NodeInspector for DeclaredInfos {
+        fn inspect(&self, _cdylib: &Path, label: &str) -> CliResult<cerulion_core::NodeInfo> {
+            self.0
+                .iter()
+                .find(|(node_type, _)| *node_type == label)
+                .map(|(_, info)| info.clone())
+                .ok_or_else(|| CliError::Validation(format!("'{label}' will not load")))
+        }
+    }
+
+    /// Each listed node type declares exactly the given `#[input]` ports.
+    fn declaring(
+        types: &[(&'static str, Vec<cerulion_core::graph::node::InputMeta>)],
+    ) -> DeclaredInfos {
+        DeclaredInfos(
+            types
+                .iter()
+                .map(|(node_type, inputs)| {
+                    (
+                        *node_type,
+                        cerulion_core::NodeInfo::with_meta(inputs.clone(), Vec::new()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// One declared `#[input]` port with the attribute's `backpressure`,
+    /// `depth` and `accumulate`, and a non-zero schema hash so the ingress
+    /// gate finds a declared schema on it.
+    fn declared_input(
+        name: &str,
+        backpressure: cerulion_core::graph::node::BackpressurePolicy,
+        depth: usize,
+        accumulate: bool,
+    ) -> cerulion_core::graph::node::InputMeta {
+        cerulion_core::graph::node::InputMeta {
+            name: name.to_string(),
+            schema_hash: 0x5eed,
+            trigger: false,
+            depth,
+            backpressure,
+            expect_within_ms: None,
+            accumulate,
+            consume: Default::default(),
+        }
+    }
+
+    /// `planner` publishes `cmd` and declares no input; `follower` declares
+    /// `cmd` as `follower_cmd` says (no port at all for `None`).
+    fn chain_infos(follower_cmd: Option<cerulion_core::graph::node::InputMeta>) -> DeclaredInfos {
+        declaring(&[
+            ("planner", Vec::new()),
+            ("follower", follower_cmd.into_iter().collect()),
+        ])
+    }
+
+    /// `planner` declares `state` and `follower` declares `cmd`, both with
+    /// `policy` at depth 4: the two inputs of [`ring_graph`].
+    fn ring_infos(policy: cerulion_core::graph::node::BackpressurePolicy) -> DeclaredInfos {
+        declaring(&[
+            ("planner", vec![declared_input("state", policy, 4, false)]),
+            ("follower", vec![declared_input("cmd", policy, 4, false)]),
+        ])
+    }
+
+    /// `planner` publishes `cmd`; `follower` reads `source` with `keys` (YAML
+    /// lines at the input's key indent) on that input. `top` adds top-level
+    /// keys.
+    fn chain_graph(top: &str, source: &str, keys: &str) -> String {
+        format!(
+            r#"prefix: p
+{top}nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+  - id: follower
+    type: follower
+    inputs:
+      - name: cmd
+        source: {source}
+{keys}"#
+        )
+    }
+
+    /// `planner` reads `follower/state` and `follower` reads `planner/cmd`,
+    /// with `planner_keys` and `follower_keys` on those inputs.
+    fn ring_graph(planner_keys: &str, follower_keys: &str) -> String {
+        format!(
+            r#"prefix: p
+nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+    inputs:
+      - name: state
+        source: follower/state
+{planner_keys}  - id: follower
+    type: follower
+    outputs:
+      - name: state
+        schema: geometry_msgs/Vector3
+    inputs:
+      - name: cmd
+        source: planner/cmd
+{follower_keys}"#
+        )
+    }
+
+    const INGRESS_EXT_CMD: &str = "network:\n  mode: peer\n  listen:\n    - tcp/127.0.0.1:0\n  \
+                                   ingress:\n    - /ext/cmd\n";
+
+    /// A workspace with node types `planner` and `follower` (an empty
+    /// `src/lib.rs` each, and a placeholder library `find_cdylib` resolves)
+    /// and `yaml` as graph `bp`.
+    fn queue_workspace(yaml: &str) -> (tempfile::TempDir, PathBuf) {
+        let (tmp, graphs_dir) = setup_workspace();
+        let ws_root = graphs_dir.parent().unwrap().to_path_buf();
+        for node_type in ["planner", "follower"] {
+            let src = ws_root.join("nodes").join(node_type).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), "").unwrap();
+            touch_cdylib(&ws_root, node_type, "debug");
+        }
+        std::fs::write(graphs_dir.join("bp.yaml"), yaml).unwrap();
+        (tmp, ws_root)
+    }
+
+    /// `graph validate` of `yaml` (graph `bp` in a [`queue_workspace`]), with
+    /// node libraries read through `inspector`.
+    fn validate_queues(yaml: &str, inspector: &DeclaredInfos) -> ValidationReport {
+        let (_tmp, ws_root) = queue_workspace(yaml);
+        graph_validate_with_inspector(&ws_root, "bp", false, inspector).unwrap()
+    }
+
+    /// The report's `input backpressure` line; a report carries at most one.
+    fn queue_line(report: &ValidationReport) -> Option<&ValidationCheck> {
+        let lines: Vec<&ValidationCheck> = report
+            .checks
+            .iter()
+            .filter(|c| c.label == "input backpressure")
+            .collect();
+        assert!(lines.len() <= 1, "more than one queue line:\n{report}");
+        lines.first().copied()
+    }
+
+    /// Every queue the graph build refuses, `graph validate` refuses on one
+    /// failing `input backpressure` line in the build's own words, with the
+    /// graph's keys applied over the node's declaration. A failing line also
+    /// blocks the run under `--no-validate`, since the build refuses again.
+    #[test]
+    fn graph_validate_refuses_every_queue_the_graph_build_refuses() {
+        use cerulion_core::graph::node::BackpressurePolicy::{Block, DropOldest};
+        let _env = unset_target_dir_for_test();
+        let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let accumulate = || chain_infos(Some(declared_input("cmd", DropOldest, 4, true)));
+        let multi = "multi_publisher_topics:\n  - /p/planner/cmd\n";
+        let rows: Vec<(&str, String, DeclaredInfos, &str)> = vec![
+            (
+                "depth 65 over a declared 4",
+                chain_graph("", "planner/cmd", "        depth: 65\n"),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' \
+                 declares depth = 65; the maximum queue depth is 64 ",
+            ),
+            (
+                "depth 0",
+                chain_graph("", "planner/cmd", "        depth: 0\n"),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' \
+                 declares depth = 0; queue depth must be >= 1",
+            ),
+            (
+                "block on a source no node publishes",
+                chain_graph("", "/ext/cmd", "        backpressure: block\n"),
+                drop_oldest_4(),
+                "Graph validation error: block input 'follower.cmd' reads topic '/ext/cmd', \
+                 which has no in-graph producer;",
+            ),
+            (
+                "block on a network.ingress topic",
+                chain_graph(INGRESS_EXT_CMD, "/ext/cmd", "        backpressure: block\n"),
+                drop_oldest_4(),
+                "Graph validation error: `block` input 'follower.cmd' reads topic '/ext/cmd', \
+                 which `network.ingress` brings in from another host.",
+            ),
+            (
+                "block_timeout_ms on an input the graph leaves drop_oldest",
+                chain_graph("", "planner/cmd", "        block_timeout_ms: 40\n"),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' sets \
+                 `block_timeout_ms` but its backpressure is DropOldest, not `block`",
+            ),
+            (
+                "block_timeout_ms: 0",
+                chain_graph(
+                    "",
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 0\n",
+                ),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' sets \
+                 `block_timeout_ms: 0`, which would release the slot on every full reading",
+            ),
+            (
+                "block_timeout_ms on a listed multi-publisher topic",
+                chain_graph(
+                    multi,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' sets \
+                 `block_timeout_ms`, but the topic has 1 in-graph producer ('planner') and is \
+                 listed in `multi_publisher_topics:`, which lets publishers outside the graph \
+                 write it.",
+            ),
+            (
+                "a ring the graph's keys make",
+                ring_graph(
+                    "        backpressure: block\n",
+                    "        backpressure: block\n",
+                ),
+                ring_infos(DropOldest),
+                "Graph validation error: a ring of `block` edges: planner -> follower.cmd \
+                 (topic '/p/planner/cmd'), follower -> planner.state (topic \
+                 '/p/follower/state').",
+            ),
+            (
+                "a ring the attributes make, with no key set",
+                ring_graph("", ""),
+                ring_infos(Block),
+                "Graph validation error: a ring of `block` edges: planner -> follower.cmd \
+                 (topic '/p/planner/cmd'), follower -> planner.state (topic \
+                 '/p/follower/state').",
+            ),
+            (
+                "block on an accumulate input",
+                chain_graph("", "planner/cmd", "        backpressure: block\n"),
+                accumulate(),
+                "Graph validation error: input 'follower.cmd' sets `backpressure: block` in the \
+                 graph, but the node declares it `#[input(accumulate)]`.",
+            ),
+            (
+                "depth on an accumulate input",
+                chain_graph("", "planner/cmd", "        depth: 8\n"),
+                accumulate(),
+                "Graph validation error: input 'follower.cmd' sets `depth:` in the graph, but \
+                 the node declares it `#[input(accumulate)]`.",
+            ),
+            (
+                "a key on a port the node does not declare",
+                chain_graph("", "planner/cmd", "        depth: 8\n"),
+                chain_infos(None),
+                "Graph validation error: input 'follower.cmd' sets `backpressure:` or `depth:` \
+                 in the graph, but node 'follower' declares no input metadata for 'cmd'",
+            ),
+        ];
+        for (case, yaml, inspector, head) in rows {
+            let report = validate_queues(&yaml, &inspector);
+            let line = queue_line(&report)
+                .unwrap_or_else(|| panic!("{case}: no input backpressure line in\n{report}"));
+            assert!(!line.passed, "{case}: {}", line.detail);
+            assert!(
+                line.detail.starts_with(head),
+                "{case}: expected the build's refusal\n  {head}\ngot\n  {}",
+                line.detail
+            );
+            assert!(!report.all_passed(), "{case}");
+            assert!(
+                failing_check_blocks_the_run(&line.label, &ResolvedCdylibCache::new()),
+                "{case}: the build refuses this again under --no-validate"
+            );
+        }
+    }
+
+    /// The graph's keys win over the node's declaration in the verdict: a key
+    /// that makes a declared queue valid passes, and the passing line counts
+    /// the inputs that set a key.
+    #[test]
+    fn graph_validate_accepts_the_queues_the_graph_keys_make_valid() {
+        use cerulion_core::graph::node::BackpressurePolicy::{Block, DropOldest};
+        let _env = unset_target_dir_for_test();
+        let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let block_4 = || chain_infos(Some(declared_input("cmd", Block, 4, false)));
+        let one = "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's \
+                   queue is one the graph build accepts";
+        let rows: Vec<(&str, String, DeclaredInfos, &str)> = vec![
+            (
+                "block at depth 8 over a declared drop_oldest at 4",
+                chain_graph(
+                    "",
+                    "planner/cmd",
+                    "        backpressure: block\n        depth: 8\n",
+                ),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 64, the maximum",
+                chain_graph("", "planner/cmd", "        depth: 64\n"),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 1, the minimum",
+                chain_graph("", "planner/cmd", "        depth: 1\n"),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "drop_oldest over a declared block on a source no node publishes",
+                chain_graph("", "/ext/cmd", "        backpressure: drop_oldest\n"),
+                block_4(),
+                one,
+            ),
+            (
+                "block_timeout_ms on a declared block with one producer",
+                chain_graph("", "planner/cmd", "        block_timeout_ms: 40\n"),
+                block_4(),
+                one,
+            ),
+            (
+                "drop_oldest on one edge of a ring the attributes make",
+                ring_graph("        backpressure: drop_oldest\n", ""),
+                ring_infos(Block),
+                one,
+            ),
+            (
+                "keys on both inputs of a ring that stays broken",
+                ring_graph(
+                    "        backpressure: drop_oldest\n",
+                    "        backpressure: block\n        depth: 2\n",
+                ),
+                ring_infos(DropOldest),
+                "2 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every \
+                 input's queue is one the graph build accepts",
+            ),
+        ];
+        for (case, yaml, inspector, detail) in rows {
+            let report = validate_queues(&yaml, &inspector);
+            let line = queue_line(&report)
+                .unwrap_or_else(|| panic!("{case}: no input backpressure line in\n{report}"));
+            assert!(line.passed, "{case}: {}", line.detail);
+            assert_eq!(line.detail, detail, "{case}");
+            assert!(report.all_passed(), "{case}:\n{report}");
+        }
+    }
+
+    /// A graph that sets no key and whose declared queues the build accepts
+    /// gets no `input backpressure` line, as a node with no `params:` gets no
+    /// params line.
+    #[test]
+    fn graph_validate_writes_no_queue_line_when_no_input_sets_a_key() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        for (case, inspector) in [
+            (
+                "a declared port",
+                chain_infos(Some(declared_input("cmd", DropOldest, 4, false))),
+            ),
+            ("no declared port", chain_infos(None)),
+        ] {
+            let report = validate_queues(&chain_graph("", "planner/cmd", ""), &inspector);
+            assert!(queue_line(&report).is_none(), "{case}:\n{report}");
+            assert!(report.all_passed(), "{case}:\n{report}");
+        }
+    }
+
+    /// With a node library that does not read, the queue check writes no line:
+    /// the params check already fails the report for that library, and queues
+    /// judged without that node's declaration could refuse a graph the build
+    /// accepts.
+    #[test]
+    fn graph_validate_writes_no_queue_line_when_a_library_does_not_read() {
+        let _env = unset_target_dir_for_test();
+        let inspector = declaring(&[("planner", Vec::new())]);
+        let report = validate_queues(
+            &chain_graph("", "planner/cmd", "        depth: 65\n"),
+            &inspector,
+        );
+        assert!(queue_line(&report).is_none(), "{report}");
+        let unread: Vec<&ValidationCheck> = report
+            .checks
+            .iter()
+            .filter(|c| c.label == "params 'follower'")
+            .collect();
+        assert_eq!(unread.len(), 1, "{report}");
+        assert!(!unread[0].passed, "{report}");
+        assert_eq!(
+            unread[0].detail,
+            "not checked: the node library could not be read: 'follower' will not load"
+        );
+    }
+
+    /// A fault `validate_graph` reports on the `graph topology` line is not
+    /// reported a second time on the queue line.
+    #[test]
+    fn graph_validate_reports_a_topology_fault_only_on_the_topology_line() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let report = validate_queues(
+            &chain_graph("", "nobody/cmd", "        depth: 0\n"),
+            &chain_infos(Some(declared_input("cmd", DropOldest, 4, false))),
+        );
+        let topology = report
+            .checks
+            .iter()
+            .find(|c| c.label == "graph topology")
+            .expect("a graph topology line");
+        assert!(!topology.passed, "{report}");
+        assert!(queue_line(&report).is_none(), "{report}");
+    }
+
+    /// A key the graph build refuses on an ingress graph is reported on the
+    /// queue line, and the `network ingress` line still judges the loaded
+    /// libraries' schemas instead of reporting libraries that will not load.
+    #[test]
+    fn graph_validate_keeps_a_refused_key_off_the_ingress_line() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let report = validate_queues(
+            &chain_graph(INGRESS_EXT_CMD, "/ext/cmd", "        depth: 8\n"),
+            &chain_infos(Some(declared_input("cmd", DropOldest, 4, true))),
+        );
+        let ingress = ingress_check(&report).expect("the ingress check runs");
+        assert!(ingress.passed, "{}", ingress.detail);
+        assert_eq!(
+            ingress.detail,
+            "1 topic(s) resolve to a consuming input with a declared schema"
+        );
+        let line = queue_line(&report).expect("a queue line");
+        assert!(
+            line.detail.starts_with(
+                "Graph validation error: input 'follower.cmd' sets `depth:` in the graph, but \
+                 the node declares it `#[input(accumulate)]`."
+            ),
+            "{}",
+            line.detail
+        );
+    }
+
+    /// Two validations of one workspace write the same report, byte for byte.
+    #[test]
+    fn graph_validate_writes_the_same_queue_verdict_on_every_run() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = queue_workspace(&ring_graph(
+            "        backpressure: block\n",
+            "        backpressure: block\n",
+        ));
+        let inspector = ring_infos(DropOldest);
+        let first = graph_validate_with_inspector(&ws_root, "bp", false, &inspector)
+            .unwrap()
+            .to_string();
+        let second = graph_validate_with_inspector(&ws_root, "bp", false, &inspector)
+            .unwrap()
+            .to_string();
+        assert!(
+            first.contains("input backpressure: Graph validation error: a ring"),
+            "{first}"
+        );
+        assert_eq!(first, second);
     }
 
     /// A graph with no `network:` block gets no ingress check at all.
