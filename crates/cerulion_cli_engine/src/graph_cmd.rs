@@ -24897,7 +24897,10 @@ process_groups:
             for _ in 0..2 {
                 let manager = TransportManager::init_for_test(
                     TransportConfig {
-                        network: Some(NetworkConfig::default()),
+                        network: Some(NetworkConfig {
+                            robot_identity: Some("scope".into()),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     },
                     cerulion_core::testing::iceoryx_test_config(),
@@ -24958,6 +24961,7 @@ process_groups:
                     assert_eq!(frames.len(), 1);
                     assert_eq!(frames[0].payload(), frame.as_slice());
                 }
+                drop(local_frames);
                 drop(publisher);
                 drop(local);
                 drop(remote);

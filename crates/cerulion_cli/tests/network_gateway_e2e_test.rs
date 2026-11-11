@@ -728,17 +728,20 @@ fn record_keeps_network_gateway_up_and_bag_finalizes() {
     assert!(
         wait_until(
             || {
+                status_frames.clear();
                 status_subscriber
-                    .drain_owned(8, &mut status_frames)
+                    .drain_owned(1, &mut status_frames)
                     .unwrap();
-                status_frames.iter().any(|sample| {
+                let matches_recording = status_frames.iter().any(|sample| {
                     serde_json::from_slice::<serde_json::Value>(
                         &sample.payload()[cerulion_core::wire::WireHeader::SIZE..],
                     )
                     .is_ok_and(|value| {
                         value["bag_path"].as_str() == Some(bag.to_string_lossy().as_ref())
                     })
-                })
+                });
+                status_frames.clear();
+                matches_recording
             },
             Duration::from_secs(10)
         ),
