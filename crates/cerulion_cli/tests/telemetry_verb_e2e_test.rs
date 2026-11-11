@@ -1161,7 +1161,7 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
         (Some("off"), &["graph", "list"]),
         (Some(" OFF "), &["graph", "list"]),
         (Some("typo"), &["graph", "list"]),
-        (Some("off"), &["pair", "robot", "--eid", "ab"]),
+        (Some("off"), &["viz", "/camera", "--robot", "bench-arm"]),
         (None, &["graph", "run", "demo", "--network", "off"]),
         (None, &["graph", "run", "demo", "--local"]),
         (None, &["connect", "bench-arm", "--network", "on"]),

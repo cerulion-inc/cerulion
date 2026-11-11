@@ -205,8 +205,10 @@ which is correct: the operator is gone.
 
 ## It never bricks offline
 
-A desk joins a robot's access list by signing in with `cerulion login` to the
-account that owns the robot. Code pairing is not available in this release.
+Robots on your account are reached by signing in with `cerulion login` on the
+desk: the robot adds the desk to its access list the first time the desk's
+network daemon reads one of its topics. Code pairing is not available in this
+release.
 
 On the LAN, an established pairing reaches the robot with no cloud anywhere in
 the connect path: a direct iroh dial to the robot address you give

@@ -276,6 +276,53 @@ fn viz_robot_completes_the_paired_robot_from_the_isolated_home() {
     assert_eq!(values(&["cerulion", "viz", "--robot", ""]), ["spot_lab"]);
 }
 
+/// Every candidate the engine returns for the last of `words`, hidden ones
+/// included, as `(value, description)`: the shells print exactly these, so
+/// unlike [`complete`] nothing is filtered. The top level reads no local
+/// source, so no fixture is needed.
+fn raw_top_level(words: &[&str]) -> Vec<(String, String)> {
+    let mut cmd = cli_command();
+    let args: Vec<OsString> = words.iter().map(OsString::from).collect();
+    let index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, index, None)
+        .expect("completion engine")
+        .into_iter()
+        .map(|c| {
+            (
+                c.get_value().to_string_lossy().into_owned(),
+                c.get_help().map(ToString::to_string).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// The hidden `pair` stub is not among the verbs `cerulion <TAB>` offers. For
+/// a word no visible verb starts with, clap_complete offers the hidden verbs
+/// that match, so `cerulion p<TAB>` offers `pair` alone, described by the
+/// stub's refusal rather than by a pairing ceremony.
+#[test]
+fn the_hidden_pair_stub_completes_only_for_its_own_prefix() {
+    let top = raw_top_level(&["cerulion", ""]);
+    assert!(
+        top.iter().any(|(value, _)| value == "connect"),
+        "the verb list is not empty: {top:?}"
+    );
+    assert!(
+        !top.iter().any(|(value, _)| value == "pair"),
+        "`cerulion <TAB>` offers `pair`: {top:?}"
+    );
+    for word in ["p", "pa"] {
+        assert_eq!(
+            raw_top_level(&["cerulion", word]),
+            [(
+                "pair".to_string(),
+                "Code pairing is not available in this release".to_string()
+            )],
+            "`cerulion {word}<TAB>`"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The create arms complete NOTHING
 // ---------------------------------------------------------------------------

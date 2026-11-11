@@ -390,9 +390,9 @@ pub enum Commands {
         /// The desk device key file (32 raw bytes: an ed25519 seed). When
         /// omitted, this machine's key `~/.cerulion/identity/device.key` (also
         /// named `~/.cerulion/desk.key`) is used if it exists (written by
-        /// `cerulion login`), else an EPHEMERAL key, which a robot REFUSES
-        /// unless that key is on its access list, so sign in first with
-        /// `cerulion login`.
+        /// `cerulion login`), else an EPHEMERAL key, which no robot's access
+        /// list holds, so a robot REFUSES it; `cerulion login` creates this
+        /// machine's key.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         key_file: Option<PathBuf>,
         /// Materialize fetched `.msg`/YAML schemas into this dir so `topic echo` /
@@ -420,11 +420,15 @@ pub enum Commands {
     // ceremony cannot complete against a real robot. The verb stays parseable
     // so a script that calls it gets `main`'s refusal (`PAIR_UNAVAILABLE_MSG`,
     // exit 2, above the login gate) instead of clap's "unrecognized
-    // subcommand". Hidden from help and completions; no alias.
+    // subcommand". No alias. Hidden from `--help` and from the completion of
+    // `cerulion <TAB>`; clap_complete offers a hidden verb only for a word no
+    // visible verb starts with (`p`, `pa`), and then with the first line
+    // above as its description.
     //
     // `disable_help_flag` and the swallowing positional work as on the `Ros`
     // stub above: every spelling, `--help` and the old flags included,
     // reaches the refusal rather than a help page or a clap parse error.
+    // (`cerulion help pair` still renders the doc comment above.)
     #[command(hide = true, disable_help_flag = true)]
     Pair {
         /// Swallows whatever followed (`go2 --code ...`, `--help` included) so
@@ -2444,8 +2448,8 @@ mod pair_dispatch_tests {
         }
     }
 
-    /// `pair` is hidden: `cerulion --help` lists no `pair` row, and the
-    /// shells, which skip hidden verbs, never offer it.
+    /// `pair` is hidden: `cerulion --help` lists no `pair` row. Completion is
+    /// pinned in `completion_wiring_tests`.
     #[test]
     fn pair_is_hidden_from_the_root_help() {
         let mut cmd = Cli::command();

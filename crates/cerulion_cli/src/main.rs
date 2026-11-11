@@ -57,8 +57,9 @@ const ROS_VERB_MOVED_MSG: &str = "`cerulion ros attach` has moved: the verb is n
 
 /// The refusal of the hidden `cerulion pair` stub: no robot-side verb arms a
 /// pairing code, so the desk side of the code ceremony cannot complete.
-/// Printed by the `main` intercept ABOVE the kill switch and the login gate,
-/// for every spelling, and pinned byte-for-byte by
+/// Printed by the `dispatch` intercept ABOVE the kill switch and the login
+/// gate, for every spelling (`cerulion help pair` renders the stub's doc
+/// comment instead), and pinned byte-for-byte by
 /// `tests/local_scope_e2e_test.rs`.
 const PAIR_UNAVAILABLE_MSG: &str = "code pairing is not available in this release; robots on your account are reached by signing in with `cerulion login`";
 

@@ -52,7 +52,7 @@ use cerulion_link::{RelayConfig, RelayUrl};
 #[command(
     name = "cerulion-connectd",
     version,
-    about = "The helper that `cerulion connect`, `cerulion pair` and `cerulion rcp` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
+    about = "The helper that `cerulion connect`, `cerulion rcp` and the `--robot` verbs run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
     long_about = None
 )]
 struct Cli {
@@ -70,6 +70,10 @@ enum ConnectdCommand {
     /// Runs the code-pairing ceremony, so the robot adds this desk's device key
     /// to its access list. Afterwards `cerulion connect <robot>` is admitted
     /// with no flags.
+    //
+    // Hidden from `--help`: no robot-side verb arms a pairing code, and the
+    // `cerulion pair` verb that ran this is a hidden stub that refuses.
+    #[command(hide = true)]
     Pair(PairCli),
     /// Call one of the robot's act verbs (`topic-publish`, `service-call`,
     /// `topic-snapshot`, `topic-echo-once`) and print its JSON result.
@@ -165,8 +169,8 @@ struct RcpCli {
 #[derive(Parser, Debug)]
 struct ConnectCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
-    /// 32-byte device key). Obtain it from `cerulion pair`, the robot's mDNS
-    /// TXT `eid=` record, or the robot operator.
+    /// 32-byte device key). Obtain it from the robot's mDNS TXT `eid=`
+    /// record or the robot operator.
     #[arg(long, value_name = "HEX")]
     eid: String,
 
@@ -196,8 +200,9 @@ struct ConnectCli {
 
     /// The desk device key file (32 raw bytes: an ed25519 seed whose public
     /// half is the desk identity the robot pairs with). When omitted, an
-    /// EPHEMERAL key is used, which an unpaired robot REFUSES: pair the desk
-    /// first with `cerulion pair`.
+    /// EPHEMERAL key is used, which no robot's access list holds, so a robot
+    /// refuses it; `cerulion connect` passes this machine's key, which
+    /// `cerulion login` creates.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -720,8 +725,8 @@ async fn run_connect_command(cli: ConnectCli) -> ExitCode {
             match &e {
                 ConnectError::Refused(reason) => tracing::error!(
                     reason = %sanitize_peer_text(reason),
-                    "cerulion connect: the robot refused the wire plane — pair the desk with the \
-                     robot first (`cerulion pair <robot>`)"
+                    "cerulion connect: the robot refused the wire plane: this desk's key is not on \
+                     its access list"
                 ),
                 other => tracing::error!(
                     error = %sanitize_peer_text(&other.to_string()),

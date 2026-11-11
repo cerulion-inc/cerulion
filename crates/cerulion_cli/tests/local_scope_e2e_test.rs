@@ -371,12 +371,23 @@ fn hidden_pair_refuses_every_spelling_before_discovery_the_switch_and_the_gate()
             assert!(output.stdout.is_empty(), "{args:?} {network:?}");
         }
         // A machine that never signed in, with no terminal: the login gate
-        // would refuse with exit 7 here, so exit 2 proves the stub answers
-        // above it.
+        // refuses a gated verb with exit 7 there (the control), so exit 2
+        // proves the stub answers above it.
         let root = tempfile::tempdir().unwrap();
         let fresh = root.path().join("never-signed-in");
         std::fs::create_dir_all(&fresh).unwrap();
         let fresh = fresh.to_str().unwrap();
+        let control = run_with(
+            root.path(),
+            &["graph", "list"],
+            &[quiet_iceoryx2, ("CERULION_HOME", fresh)],
+        );
+        assert_eq!(
+            control.status.code(),
+            Some(7),
+            "the gate refuses a gated verb on this home: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
         let output = run_with(
             root.path(),
             args,
