@@ -629,6 +629,23 @@ pub(crate) mod tests {
         assert_eq!(future.next, u64::MAX);
     }
 
+    /// A full page may have nothing after it: exactly a page of records
+    /// returns them all with `next` at the head, and the next read is empty.
+    #[test]
+    fn an_exactly_full_page_ends_at_the_head() {
+        let (tap, _) = tap(1024);
+        tap.serve(Cursor::Now, 0);
+        for id in 0..FIRE_SERVE_MAX as u64 {
+            tap.push(body(id));
+        }
+        let page = tap.serve(Cursor::After(0), FIRE_SERVE_MAX);
+        assert_eq!(page.records.len(), FIRE_SERVE_MAX);
+        assert_eq!((page.next, page.lost), (FIRE_SERVE_MAX as u64, 0));
+        let after = tap.serve(Cursor::After(page.next), FIRE_SERVE_MAX);
+        assert!(after.records.is_empty());
+        assert_eq!((after.next, after.lost), (page.next, 0));
+    }
+
     /// A reader reads on only after a full page, so a lost sequence must not
     /// take a row: a short page reached the newest assigned sequence.
     #[test]
