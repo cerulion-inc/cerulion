@@ -795,7 +795,11 @@ impl Ctx {
         // config matches netd's shared session before tapping.
         ix_config_json: Option<String>,
     ) -> Response {
-        if plan.announce.is_empty() {
+        if plan
+            .announce
+            .iter()
+            .all(|topic| crate::registry::canonical_topic(topic).is_empty())
+        {
             return Response::error(
                 Some(id),
                 "register_egress requires a non-empty announce set (the produced topics to \
@@ -1222,13 +1226,22 @@ pub fn start_with_planes_and_events(
         let shutdown = Arc::clone(&shutdown);
         let self_exit = Arc::clone(&self_exit);
         let guard = Arc::clone(&guard);
+        let egress_plane = Arc::clone(&ctx.egress_plane);
         let idle_grace = config.idle_grace;
         let poll = config.idle_watch_poll;
         Some(
             std::thread::Builder::new()
                 .name("netd-idle".to_string())
                 .spawn(move || {
-                    idle_watch(registry, shutdown, self_exit, guard, idle_grace, poll)
+                    idle_watch(
+                        registry,
+                        shutdown,
+                        self_exit,
+                        guard,
+                        egress_plane,
+                        idle_grace,
+                        poll,
+                    )
                 })?,
         )
     } else {
@@ -1352,6 +1365,7 @@ fn idle_watch(
     shutdown: Arc<AtomicBool>,
     self_exit: Arc<AtomicBool>,
     guard: Arc<Mutex<Option<SocketGuard>>>,
+    egress_plane: Arc<dyn EgressPlane>,
     idle_grace: Duration,
     poll: Duration,
 ) {
@@ -1374,7 +1388,9 @@ fn idle_watch(
         // just stops the threads.
         let committed = {
             let reg = lock_registry(&registry);
-            if reg.should_self_exit(Instant::now(), idle_grace) {
+            if reg.should_self_exit(Instant::now(), idle_grace)
+                && !egress_plane.holds_serving_endpoint()
+            {
                 self_exit.store(true, Ordering::Release);
                 // Drop the guard AT the commit (close to new clients now, not ~200ms
                 // later when main notices self_exit) to close the race window.

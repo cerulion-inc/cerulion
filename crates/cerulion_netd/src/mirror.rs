@@ -178,6 +178,16 @@ pub enum MirrorRelease {
 /// on the LAST release. `Send + Sync`: shared across the daemon's per-connection +
 /// idle-watch threads.
 pub trait MirrorPlane: Send + Sync {
+    /// Transfer this machine's endpoint to its owned remote server. Called off
+    /// the daemon registry lock, before spawning the server. A WAN controller
+    /// must close its outgoing endpoint and fence new construction before return.
+    fn begin_serving(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Return endpoint ownership after the remote server has been killed/reaped.
+    fn end_serving(&self) {}
+
     /// Cold control operations through the same controller that owns WAN mirrors.
     /// Lean/LAN-only planes explicitly refuse this capability.
     fn account_access(

@@ -28,13 +28,14 @@ lib + bin: injected in-process daemon tests prove wiring, not live delivery.
 - A nonzero non-loopback TCP `CERULION_NETD_LISTEN` port is the ONLY gate for the mDNS
   beacon and standing mode (gateway boots at start, idle self-exit off). None means a
   reported refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
-- LISTEN startup needs a persisted prior login: expired records still serve LAN
-  offline, never-logged-in refuses with `serving_login::REFUSAL`. Network-off, desk
-  and injected daemons are exempt. `register_egress` rechecks before mutating.
-- A WAN LISTEN machine owns ONE remoted child via `robot_supervisor`: registration
-  is deadline-bound, retried with capped backoff; shutdown reaps before releasing
-  the singleton, and the machine REFUSES outgoing WAN demands rather than building a second
-  endpoint or falling back to LAN. Beacon facts share `discovery::robot_state`.
+- Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
+  LISTEN needs login; off/injected exempt. First nonempty WAN egress starts one
+  remoted without LISTEN; query/off starts none; standing persists until shutdown.
+- Idle reap waits for work/latch/owed delivery, retains singleton and exclusive
+  `serving.hold`; guards/sources share it, never unlink. Own process group, direct
+  TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
+- Controller lock fences outgoing at `begin_serving`; `end_serving` follows reap;
+  facts use `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata, and pins survive tearing. EVERY

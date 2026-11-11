@@ -1,14 +1,16 @@
 # cerulion_remoted - agent notes (the remote-access family's scoped file)
 
-Robot daemon/`RemotePlane`: ONE iroh endpoint, device public key = `EndpointId`,
-32-byte secret seeds pairing; multiplexes `cerulion/wire/2` and `cerulion/ops/1`.
-Also governs `cerulion_{pairing,link,wireclient,connectd,accountd}`, `cerud`,
-and `cerulion-wire`.
+ONE robot endpoint: device-key public half is `EndpointId`; its 32-byte secret
+seeds pairing. Daemon/`RemotePlane` multiplexes wire/2 and ops/1. Family rules cover
+`cerulion_{pairing,link,wireclient,connectd,accountd}`, `cerud` and `cerulion-wire`.
 
 ## Invariants
-- Catalog/schema/demand/topic acts obey producer scope before ports open; taps/mirrors retain leases after data drops. Capabilities never override privacy; safety ops are independent.
-- Every accept uses `PairingAuthorizer`; `authorizer.rs` maps verbs to capabilities.
-  Unclassified verbs are DENIED; classify new ones there (`authorizer_matrix_test.rs`).
+- Catalog/schema/demand/acts obey producer scope before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops are independent.
+- Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
+  final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
+  fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
+- `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
+  verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
 - Bootstrap verbs self-gate on their own proof (chassis secret, cert chain, owner
   grant, CPace witness). The pairing subject is ALWAYS the TLS-authenticated device
   key, never a client arg, and validity, TTL and rollback checks use the robot's
@@ -24,10 +26,7 @@ and `cerulion-wire`.
   concurrently so a hostile session cannot starve it (`estop_starvation_test.rs`).
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
-- `cerulion_pairing`'s canonical signing bytes are pinned by INDEPENDENT
-  hand-serializer vectors (`format_vectors_test.rs`): a format change updates encoder
-  AND oracle. A store-format bump migrates or refuses old files loudly (v3 -> v4
-  migrates); epoch apply is monotonic wholesale-replace.
+- Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
 - `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
@@ -49,8 +48,7 @@ and `cerulion-wire`.
   limit a parallel run hits iceoryx service/port errors.
 - The family is parallel-safe (`cargo test -p <crate>`, no `#[serial]`/`#[ignore]`);
   e2e suites are LOOPBACK iroh only (relay off, direct dial, bounded awaits).
-- remoted and link cold-compile the ~390-crate iroh tree. remoted, connectd,
-  wireclient, link and accountd are OUT of `default-members`: build them with `-p`.
+- remoted/link cold-compile iroh. remoted/connectd/wireclient/link/accountd are OUT of default-members: build with `-p`.
 
 Deep reference: docs/internals/remote-access.md, before touching the verb table,
 trust persistence, the wire plane, pairing formats or epoch delivery.
