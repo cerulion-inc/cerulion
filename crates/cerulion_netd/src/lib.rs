@@ -11,10 +11,13 @@
 //!
 //! # Who uses it
 //!
-//! Users install it with `cargo install --locked cerulion_cli cerulion_netd` and
+//! Users install it with `cargo install --locked cerulion_cli cerulion_netd cerulion_remoted` and
 //! normally never start it by hand: the first command that needs a remote topic
-//! spawns it detached through [`NetdClient`]. A robot that should be discoverable
-//! runs it as a standing service with `CERULION_NETD_LISTEN` set;
+//! spawns it detached through [`NetdClient`]. The first egress registration also
+//! starts the owned authenticated remote server, without a LISTEN locator. Its
+//! last release reaps that server after active ops work, an owed e-stop and its
+//! latch have cleared. An explicit `CERULION_NETD_LISTEN` keeps a
+//! standing service available until shutdown;
 //! `cerulion-netd --help` lists every environment variable. Library consumers (the
 //! CLI engine, the visualization daemon, the recorder) use [`NetdClient`] to
 //! connect, demand a topic and query the catalog.
@@ -90,7 +93,9 @@ pub mod quic_first;
 pub mod quic_probe;
 pub mod registry;
 pub mod robot_supervisor;
+pub mod serving_hold;
 pub mod serving_login;
+pub mod supervised_egress;
 
 // The iroh WAN plane, gated behind the `wan` feature, now DEFAULT-ON (the
 // decision ships the WAN plane by default; `--no-default-features` is the lean

@@ -62,6 +62,7 @@ enum Route {
 }
 
 struct State {
+    serving_gateway: bool,
     registry: Arc<WanRegistry>,
     plane: Option<IrohMirrorPlane>,
     account_mode: bool,
@@ -105,6 +106,7 @@ impl AccountWanController {
         }) {
             return Err("manual WAN robot names cannot use the reserved account: prefix".into());
         }
+        let serving = config.serving_gateway;
         Ok(Self {
             lan: GatewayMirrorPlane::new(Arc::clone(&manager)),
             manager,
@@ -113,6 +115,7 @@ impl AccountWanController {
             manual: robots,
             pins: Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
+                serving_gateway: serving,
                 registry: Arc::new(manual),
                 plane: None,
                 account_mode: false,
@@ -174,6 +177,9 @@ impl AccountWanController {
 
     fn ensure_plane<'a>(&self, state: &'a mut State) -> Result<&'a IrohMirrorPlane, String> {
         self.network_allowed()?;
+        if state.serving_gateway {
+            return Err(crate::wan::SERVING_MACHINE_WAN_REFUSAL.into());
+        }
         if state.pending_all || !state.pending_robots.is_empty() {
             return Err("previous WAN mirrors are awaiting registry retirement".into());
         }
