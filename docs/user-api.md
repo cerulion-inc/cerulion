@@ -164,7 +164,8 @@ two-second budget to refresh and save its tokens. The robot metadata sweep has o
 four-second budget regardless of the number of robots. A saved directory and
 authenticated direct-address hints preserve paired access when the account service
 is unavailable. Cache-backed reads keep service diagnostics at debug; `topic list`
-reports them on one stderr line.
+reports them on one stderr line. Topic resolution that reads no robot catalog reports
+that it has not converged; it does not claim a topic is absent.
 
 `topic echo`, `hz`, `info`, `find`, `snapshot`, and `viz --robot` use the existing
 authenticated remote plane automatically for those robots. Reads demand the topic
