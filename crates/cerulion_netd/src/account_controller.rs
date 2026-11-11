@@ -69,6 +69,14 @@ struct Pin {
     live: bool,
 }
 
+const RESTORATION_BUDGET: Duration = Duration::from_secs(5);
+
+fn restoration_time_left(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|left| !left.is_zero())
+}
+
 struct State {
     serving_gateway: bool,
     registry: Arc<WanRegistry>,
@@ -271,12 +279,20 @@ impl AccountWanController {
         if keys.iter().any(|key| registry.is_tearing(key)) {
             return Err("previous WAN mirrors are still being retired; retry the operation".into());
         }
-        // Full transport loss and failed-robot cleanup already closed readers.
-        // A dead controller must still notify holders even if Release cannot dial.
+        // Failed restorations own no reader. Full transport loss already closed
+        // readers; neither case needs a Release ack before notifying holders.
         if !state.pending_all {
             if let Some(plane) = &state.plane {
                 for key in &keys {
-                    if state.pending_robots.contains(&key.robot) {
+                    if state.pending_robots.contains(&key.robot)
+                        || state.pending_restores.contains(key)
+                        || state
+                            .handover
+                            .as_ref()
+                            .is_some_and(|readers| readers.iter().any(|(reader, _)| reader == key))
+                    {
+                        // Failed or unattempted restorations have no admitted reader.
+                        // A transport failure instead fences the complete connection.
                         continue;
                     }
                     if plane.release_mirror(key) == crate::mirror::MirrorRelease::Lingering {
@@ -300,6 +316,14 @@ impl AccountWanController {
         let mut pins = self.pins()?;
         for key in keys {
             pins.remove(&key);
+        }
+        if state.handover.as_ref().is_some_and(|readers| {
+            readers
+                .iter()
+                .all(|(key, _)| !pins.get(key).is_some_and(|pin| pin.live))
+        }) {
+            // A canceled transition must not leave future re-demands busy forever.
+            state.handover = None;
         }
         state.pending_all = false;
         state.pending_robots.clear();

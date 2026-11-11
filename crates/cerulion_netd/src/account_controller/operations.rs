@@ -164,17 +164,18 @@ impl AccountWanController {
         Ok(schema)
     }
 
-    fn restore_readers(&self, state: &mut State) -> Result<(), String> {
+    fn restore_readers(&self, state: &mut State, deadline: Instant) -> Result<(), String> {
         let Some(readers) = state.handover.take() else {
             return Ok(());
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
         let ready = match self.sync_identity(state) {
             Err(error) => Err(error),
             Ok(()) if state.serving_gateway => loop {
-                let result = self
-                    .ensure_plane(state)
-                    .and_then(|plane| plane.synchronize_shared_endpoint().map(|_| ()));
+                let result = self.ensure_plane(state).and_then(|plane| {
+                    plane
+                        .synchronize_shared_endpoint_until(deadline)
+                        .map(|_| ())
+                });
                 match result {
                     Ok(()) => break Ok(()),
                     Err(error) if Instant::now() >= deadline => break Err(error),
@@ -185,6 +186,7 @@ impl AccountWanController {
         };
         let mut first_error = None;
         let mut failed = BTreeSet::new();
+        let mut restored_keys: BTreeSet<TopicKey> = BTreeSet::new();
         for (key, hash) in readers {
             if !self
                 .pins()?
@@ -194,17 +196,30 @@ impl AccountWanController {
                 continue;
             }
             let restored = match &ready {
-                Ok(()) => self
+                Ok(()) if restoration_time_left(deadline, Instant::now()).is_some() => self
                     .ensure_plane(state)
-                    .map_err(|error| error.to_string())
-                    .and_then(|plane| {
-                        plane
-                            .ensure_mirror(&key, hash)
-                            .map_err(|error| error.to_string())
-                    }),
+                    .and_then(|plane| plane.ensure_mirror_until(&key, hash, deadline)),
+                Ok(()) => Err("outbound reader restoration exceeded its time budget".into()),
                 Err(error) => Err(error.clone()),
             };
             if let Err(error) = restored {
+                if let Some(plane) = state
+                    .plane
+                    .as_ref()
+                    .filter(|plane| !plane.shares_owned_endpoint())
+                {
+                    // Native cancellation closes the affected robot/mode wire
+                    // connection, so earlier successes on it may also be lost.
+                    // This is an in-memory check, not another restoration attempt.
+                    for previous in &restored_keys {
+                        if previous.robot == key.robot
+                            && previous.observer == key.observer
+                            && !plane.has_reader(previous).unwrap_or(false)
+                        {
+                            failed.insert(previous.clone());
+                        }
+                    }
+                }
                 failed.insert(key.clone());
                 first_error.get_or_insert_with(|| {
                     format!(
@@ -212,7 +227,21 @@ impl AccountWanController {
                         key.robot, key.topic
                     )
                 });
+            } else {
+                restored_keys.insert(key);
             }
+        }
+        if state
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.take_shared_transport_loss())
+        {
+            // A partially framed persistent exchange fences every shared reader,
+            // including pins restored before the failing exchange.
+            state.pending_all = true;
+            first_error.get_or_insert_with(|| {
+                "outbound readers lost their shared control transport during restoration".into()
+            });
         }
         state.pending_restores.extend(failed);
         first_error.map_or(Ok(()), Err)
@@ -262,11 +291,30 @@ impl MirrorPlane for AccountWanController {
     }
 
     fn serving_ready(&self) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "account robot controller state is poisoned")?;
-        self.restore_readers(&mut state)
+        let deadline = Instant::now() + RESTORATION_BUDGET;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("account robot controller state is poisoned".into());
+            }
+            Err(TryLockError::WouldBlock) => {
+                // begin_serving already retired the previous endpoint. Do not
+                // wait for unrelated metadata I/O before supervising the child.
+                // Registry retirement observes these canceled pins independently.
+                let mut first = None;
+                for (key, pin) in self.pins()?.iter_mut() {
+                    if pin.route == Route::Wan && pin.live {
+                        pin.live = false;
+                        first.get_or_insert_with(|| format!(
+                            "remote mirror lost for robot '{}' topic '{}': controller busy during restoration",
+                            key.robot, key.topic
+                        ));
+                    }
+                }
+                return Err(first.unwrap_or_else(|| "controller busy during restoration".into()));
+            }
+        };
+        self.restore_readers(&mut state, deadline)
     }
 
     fn holds_outbound_readers(&self) -> bool {
@@ -307,7 +355,7 @@ impl MirrorPlane for AccountWanController {
             let _restored = state.registry.replace_owner_certificate(proof);
         }
         state.serving_gateway = false;
-        if let Err(error) = self.restore_readers(&mut state) {
+        if let Err(error) = self.restore_readers(&mut state, Instant::now() + RESTORATION_BUDGET) {
             tracing::warn!(error = %error, "outbound reader restoration failed after serving stopped");
         }
     }

@@ -1,8 +1,8 @@
 # cerulion_netd
 
-One gateway/zenoh session per host, refcounted NDJSON demands; spies prove wiring, not delivery.
+One gateway/zenoh session/host; refcounted NDJSON demands. Spies prove wiring, not delivery.
 
-- Protocol11: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical. MirrorLost names losses; re-demand or stop.
+- Protocol11: paired catalogs; WAN observers use private `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases its source/mode mirror; wire/2 stays canonical. MirrorLost queues all losses without replacing replies; demand-free probes treat busy as unknown.
 
 ## Rules
 - LAN defaults to Paired everywhere; explicit Open warns. Delivery fixtures select Open.
@@ -28,23 +28,23 @@ One gateway/zenoh session per host, refcounted NDJSON demands; spies prove wirin
   `serving.hold`; guards/sources share it, never unlink. Own process group, direct
   TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
 - Lifecycle I/O runs off verbs and unlocked; outbound readers fence idle reap.
-  begin/ready/end preserve WAN pins; facts use `discovery::robot_state`.
+  begin/ready/end restore pins in 5 s or name losses; `discovery::robot_state`.
 - ONE `account_controller::AccountWanController` serves manual and account routes:
   install creates no endpoint, controller state is `try_lock` under registry
   bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY
   demand calls `prepare_demand`: stale identity or dead reader cannot acknowledge
   a phantom mirror. Validate `account:` before `TopicKey` trims ordinary names.
-- Bounded same-user `outbound.sock` shares owned endpoint/runtime; key/namespace
-  gate before dial. Metadata per-call; refusals keep readers, which hold idle fence.
+- Bounded same-user `outbound.sock` shares endpoint/runtime; key/namespace
+  gate before dial. Metadata per-call; refusals keep readers and idle fence.
   Transport loss retires keys; account fences retain postcard owner; never bind key twice.
-- Public identity bytes are auth-locked across reads; busy writers refuse. Expiry gates enrollment, never durable bindings; account/key changes fence controller.
-- Release removes debug; operator outcomes use info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is reader-only: no peers.json writes.
+- Public identity bytes are auth-locked across reads; busy writers refuse. Expiry gates enrollment, not durable bindings; account/key changes fence it.
+- Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery is read-only: no peers.json writes.
 
-## Testing
-- Tests run `-- --test-threads=1` (CLI shares SHM); keep `--no-default-features` green. Count oracles, never wall clocks.
-- Build `cerulion_cli` first; `wan_plane_iroh_test` includes the real CLI/default
-  SHM namespace and owner controller; CI runs serial too.
+## Tests
+- Run `-- --test-threads=1` (CLI shares SHM); `--no-default-features` stays green. Count oracles, not clocks.
+- Build `cerulion_cli`/`cerulion_remoted` first; WAN fixtures use the real CLI/default
+  SHM namespace and owner controller; CI runs serial.
 - `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
   it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
 
-Reference: docs/internals/network-daemons.md, docs/internals/remote-access.md.
+See: docs/internals/network-daemons.md, docs/internals/remote-access.md.

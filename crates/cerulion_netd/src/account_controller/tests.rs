@@ -1,5 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+
+#[test]
+fn restoration_deadline_bounds_attempts_and_refuses_the_deadline_boundary() {
+    let start = Instant::now();
+    let deadline = start + RESTORATION_BUDGET;
+    let attempted: Vec<_> = [0, 2, 5, 7, 20]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(pin, elapsed)| {
+            restoration_time_left(deadline, start + Duration::from_secs(elapsed)).map(|_| pin)
+        })
+        .collect();
+    assert_eq!(attempted, [0, 1]);
+    assert_eq!(
+        restoration_time_left(deadline, start),
+        Some(Duration::from_secs(5))
+    );
+    assert_eq!(
+        restoration_time_left(deadline, start + Duration::from_secs(2)),
+        Some(Duration::from_secs(3))
+    );
+    assert_eq!(restoration_time_left(deadline, deadline), None);
+    assert_eq!(
+        restoration_time_left(deadline, deadline + Duration::from_nanos(1)),
+        None
+    );
+}
 use crate::account_access::{
     AccountAccessReply, AccountAccessRequest, AccountRobot, RobotPresence,
 };
@@ -12,6 +39,54 @@ use cerulion_pairing::client::DeviceIdentity;
 
 const ACCOUNT: [u8; 32] = [5; 32];
 const SEED: [u8; 32] = [9; 32];
+
+#[test]
+fn serving_ready_cancels_each_wan_pin_without_waiting_for_a_busy_controller() {
+    let login = Login::new();
+    let controller = login.controller(true, false);
+    let wan = TopicKey::observed("arm", "/vector");
+    let lan = TopicKey::new("lan", "/local");
+    {
+        let mut pins = controller.pins().unwrap();
+        for (key, route) in [(wan.clone(), Route::Wan), (lan.clone(), Route::Lan)] {
+            pins.insert(
+                key,
+                Pin {
+                    route,
+                    schema_hash: 7,
+                    live: true,
+                },
+            );
+        }
+    }
+    let mut state = controller.state.lock().unwrap();
+    state.serving_gateway = true;
+    state.handover = Some(vec![(wan.clone(), 7)]);
+    let started = Instant::now();
+    let error = controller.serving_ready().unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        error.contains("arm") && error.contains("/vector"),
+        "{error}"
+    );
+    assert_eq!(
+        controller.pending_keys(&state).unwrap(),
+        BTreeSet::from([wan.clone()])
+    );
+    let pins = controller.pins().unwrap();
+    assert!(!pins[&wan].live);
+    assert!(pins[&lan].live);
+    drop(pins);
+    let mut registry = DemandRegistry::new(Instant::now());
+    controller
+        .retire_pending(&mut state, &mut registry)
+        .unwrap();
+    assert!(
+        state.handover.is_none(),
+        "cancellation must permit later re-demands"
+    );
+    assert!(controller.pins().unwrap().contains_key(&lan));
+}
 
 struct Login {
     home: tempfile::TempDir,
@@ -453,4 +528,54 @@ fn last_holder_release_during_controller_io_cannot_revive_a_migrating_pin() {
         controller.state().unwrap().plane.is_none(),
         "a released reader must not construct an endpoint"
     );
+}
+
+#[test]
+fn a_non_live_pin_without_an_owned_reader_is_retired_on_identity_refresh() {
+    for _ in 0..2 {
+        let login = Login::new();
+        let controller = login.controller(true, false);
+        let key = TopicKey::observed("arm", "/absent");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let endpoint = runtime
+            .block_on(cerulion_link::build_endpoint(
+                cerulion_link::EndpointConfig::new(SEED).with_relay(RelayConfig::Disabled),
+            ))
+            .unwrap();
+        let plane = IrohMirrorPlane::on_owned_endpoint(
+            controller.manager.clone(),
+            Arc::new(WanRegistry::new(
+                HashMap::new(),
+                SEED,
+                RelayConfig::Disabled,
+            )),
+            endpoint.clone(),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut registry = DemandRegistry::new(now);
+        let conn = registry.connect(now);
+        registry.demand(conn, key.clone(), 7, now);
+        registry.mark_mirror_present(&key);
+        {
+            let mut state = controller.state().unwrap();
+            controller.sync_identity(&mut state).unwrap();
+            state.plane = Some(plane);
+        }
+        controller.pins().unwrap().insert(
+            key.clone(),
+            Pin {
+                route: Route::Wan,
+                schema_hash: 7,
+                live: false,
+            },
+        );
+        controller.refresh_identity(&mut registry).unwrap();
+        assert!(controller.pins().unwrap().is_empty());
+        assert_eq!(registry.active_demand_count(), 0);
+        assert_eq!(registry.take_mirror_losses(conn), BTreeSet::from([key]));
+        drop(controller);
+        runtime.block_on(endpoint.close());
+    }
 }

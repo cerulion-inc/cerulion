@@ -364,8 +364,8 @@ fn serve(
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
     if let Err(error) = ownership.mirror.serving_ready() {
-        // A failed outbound migration must notify its affected holders. It must
-        // not stop an otherwise live ops plane and erase an engaged e-stop.
+        // The mirror controller queues retirement for affected holders after a
+        // bounded migration failure. Keep the live ops plane and its e-stop latch.
         tracing::warn!(error = %error, "remote outbound reader migration failed; robot ops plane remains available");
     }
     let period = epoch_sync_period_from_env();
