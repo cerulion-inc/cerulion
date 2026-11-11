@@ -2,7 +2,7 @@
 
 Crates: lib/cerulion_viz (rerun render/sink), lib/go2_tf (pure TFMessage codec, no transport/rerun), bin/cerulion_vizd (desk daemon). Outside default-members; plain builds stay rerun-free (`default_member_build_is_rerun_free`); use `-p`.
 
-- Remote attach taps netd local_channel; viewer keeps canonical topic/schema/robot and owns its claimed channel. Demand readiness is serialized; rejected fresh claims release only their demand. Source changes require detach.
+- Remote attach uses netd local_channel; viewer owns that channel and keeps canonical topic/schema/robot. Serialize attach/detach outside poll state (3 s); fresh refusals release only their demand, rollback waits 45 s. Source changes require detach.
 
 ## Invariants
 - Live viz is INSTANT-ONLY: reconnects get statics + blueprint, never replay (`re_grpc_server` fork in

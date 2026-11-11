@@ -1,6 +1,6 @@
 # cerulion_core
 
-Core: wire/codegen/iceoryx2/scheduler/graph/gateway; serial rules per binary.
+Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
 
 ## Invariants
 - Producers exclude before ports; remote taps/mirrors/announces hold opposite leases until withdrawal. `collect_remote_run_entries` hides private v2 ids/counts, public v1; local reads both. No frame-path checks.

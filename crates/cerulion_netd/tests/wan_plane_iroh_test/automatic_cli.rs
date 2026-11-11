@@ -209,6 +209,16 @@ fn automatic_paired_cli_delivers_frames_and_selected_sources_never_collide() {
         &socket,
         &["topic", "info", &topic],
     )));
+    let early_cache: std::collections::BTreeMap<String, SocketAddr> =
+        serde_json::from_slice(&std::fs::read(home.path().join("robot-direct.json")).unwrap())
+            .unwrap();
+    assert!(
+        early_cache
+            .get(&robot.eid.to_string())
+            .is_some_and(|address| robot.addrs.contains(address)),
+        "first authenticated catalog cached {early_cache:?}; robot sockets {:?}",
+        robot.addrs
+    );
     assert!(
         info.contains("remote_msgs/Reading") && info.contains("17") && info.contains("123456789"),
         "{info}"
@@ -335,8 +345,12 @@ fn automatic_paired_cli_delivers_frames_and_selected_sources_never_collide() {
     let cache: std::collections::BTreeMap<String, SocketAddr> =
         serde_json::from_slice(&std::fs::read(home.path().join("robot-direct.json")).unwrap())
             .unwrap();
-    assert!(cache
-        .get(&robot.eid.to_string())
-        .is_some_and(|address| robot.addrs.contains(address)));
+    assert!(
+        cache
+            .get(&robot.eid.to_string())
+            .is_some_and(|address| robot.addrs.contains(address)),
+        "authenticated direct cache {cache:?} must name the robot's bound sockets {:?}",
+        robot.addrs
+    );
     daemon.shutdown();
 }

@@ -2887,10 +2887,15 @@ impl Ctx {
             return (0, Vec::new());
         }
         let gate = remote_attach_gate(&self.state);
-        let _operation = match wait_remote_operation(&gate) {
-            Ok(operation) => operation,
-            Err(error) => return (0, vec![error]),
-        };
+        // Rollback must outwait an in-flight attach, not use a controller's
+        // three-second retry bound. The operation deadline covers a two-attempt
+        // netd constructor (20 s), catalog/schema/demand round trips (5 s each)
+        // and mirror visibility, while the poll-state mutex remains free.
+        let _operation =
+            match wait_remote_operation_until(&gate, Instant::now() + Duration::from_secs(45)) {
+                Ok(operation) => operation,
+                Err(error) => return (0, vec![error]),
+            };
         let mut removed_topics = Vec::new();
         let mut retained = Vec::new();
         {
@@ -6714,7 +6719,13 @@ fn perform_remote_release(
 }
 
 fn wait_remote_operation(gate: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, String> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    wait_remote_operation_until(gate, Instant::now() + Duration::from_secs(3))
+}
+
+fn wait_remote_operation_until(
+    gate: &Mutex<()>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'_, ()>, String> {
     loop {
         match gate.try_lock() {
             Ok(operation) => return Ok(operation),
@@ -10395,10 +10406,49 @@ mod tests {
                 panic!("{response:?}")
             };
             assert!(detached.detached);
-            assert_eq!(
-                ctx.rollback_compose_attaches(&["/rollback".into()]),
-                (1, vec![])
-            );
+            if with_model {
+                assert_eq!(
+                    ctx.rollback_compose_attaches(&["/rollback".into()]),
+                    (1, vec![])
+                );
+            } else {
+                // A real schema-less attach holds the gate while its catalog
+                // request is pending. Cleanup must survive the controller's
+                // three-second retry bound, then remove the tap and its demand.
+                let (entered, entering) = std::sync::mpsc::channel();
+                let (finish, finishing) = std::sync::mpsc::channel();
+                *spy.catalog_wait.lock().unwrap() = Some((entered, finishing));
+                let metadata = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        ctx.attach_remote(5, "/metadata".into(), None, "other".into(), None)
+                    })
+                };
+                entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (completed, completing) = std::sync::mpsc::channel();
+                let cleanup = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = ctx.rollback_compose_attaches(&["/rollback".into()]);
+                        completed.send(result).unwrap();
+                    })
+                };
+                assert!(matches!(
+                    completing.recv_timeout(Duration::from_millis(3_200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert!(spy
+                    .release_keys()
+                    .iter()
+                    .all(|(_, topic)| topic != "/rollback"));
+                finish.send(()).unwrap();
+                assert_eq!(
+                    completing.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    (1, vec![])
+                );
+                cleanup.join().unwrap();
+                assert!(matches!(metadata.join().unwrap(), Response::Error(_)));
+            }
             assert_eq!(
                 spy.release_keys(),
                 vec![
@@ -10575,6 +10625,7 @@ mod tests {
         /// When set, the query methods return `Err` (netd-unreachable) so
         /// the caller's transient-session fallback path is exercised.
         fail_query: std::sync::atomic::AtomicBool,
+        catalog_wait: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
     impl SpyDemandPlane {
         fn set_fail_demand(&self, fail: bool) {
@@ -10615,6 +10666,13 @@ mod tests {
             Ok(())
         }
         fn query_catalog(&self, _robot: &str) -> Result<Vec<CatalogReply>, String> {
+            let wait = self.catalog_wait.lock().unwrap().take();
+            if let Some((entered, finish)) = wait {
+                entered.send(()).unwrap();
+                finish
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+            }
             if self.fail_query.load(Ordering::SeqCst) {
                 return Err("spy: netd unreachable".to_string());
             }
