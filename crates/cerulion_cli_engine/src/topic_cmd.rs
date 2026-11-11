@@ -3160,11 +3160,13 @@ pub fn normalize_remote_topics(mut topics: Vec<String>) -> Vec<String> {
 /// seam. mDNS TXT robot names, announce-key robot chunks, and
 /// liveliness-key topic names are ALL attacker-controllable by any LAN peer;
 /// interpolated verbatim they could inject ANSI/CSI escapes (`ESC[2J`
-/// screen-clear, CR overwrite, BEL) into the operator's terminal. Every C0 control
-/// (U+0000..=U+001F), DEL (U+007F), and C1 control (U+0080..=U+009F) is
-/// replaced with the Unicode replacement char (U+FFFD); every other code
-/// point — including non-ASCII robot names like "go2-α" — passes through
-/// unchanged. Pure — oracle-tested below.
+/// screen-clear, CR overwrite, BEL) into the operator's terminal, forge a line
+/// with a Unicode line separator, reorder the text around them with a bidi
+/// control, or hide text with an invisible format character. Every
+/// [`is_terminal_hostile`] character is replaced with the
+/// Unicode replacement char (U+FFFD); every other code point, including
+/// non-ASCII robot names like "go2-α", passes through unchanged. Pure,
+/// oracle-tested below.
 ///
 /// It is `pub(crate)` because `bag_cmd`'s coverage renderer now
 /// prints a `remote_mirror`'s origin ROBOT and an `attach_failed`'s transport
@@ -3173,40 +3175,65 @@ pub fn normalize_remote_topics(mut topics: Vec<String>) -> Vec<String> {
 /// drift.
 pub(crate) fn sanitize_display(s: &str) -> String {
     s.chars()
-        .map(|c| match c {
-            '\u{0000}'..='\u{001F}' | '\u{007F}' | '\u{0080}'..='\u{009F}' => '\u{FFFD}',
-            other => other,
+        .map(|c| {
+            if is_terminal_hostile(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
         })
         .collect()
 }
 
-/// A remote authorizer's refusal reason is untrusted remote text: control
-/// characters (ESC, CR, LF, ...) and the Unicode line and paragraph
-/// separators become `?` so the error cannot inject terminal sequences or
-/// extra lines, and the text truncates at 200 chars
-/// with a `…` marker.
+/// The characters no remote text may put on an operator's terminal: C0 and C1
+/// controls and DEL (escape sequences, CR, LF, BEL), the Unicode line and
+/// paragraph separators (a forged line), and every format character (general
+/// category Cf, Unicode 15.1): the bidi controls that reorder the text around
+/// them, and the invisible ones that hide text in a name or make one name
+/// look like another (`te\u{200B}mi` beside `temi`). The one class both
+/// [`sanitize_display`] and [`sanitize_refusal_reason`] neutralize.
+pub(crate) fn is_terminal_hostile(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0000}'..='\u{001F}'
+            | '\u{007F}'..='\u{009F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// A remote authorizer's refusal reason is untrusted remote text: every
+/// [`is_terminal_hostile`] character becomes `?` so the error cannot inject
+/// terminal sequences, extra lines or reordered text, and the text truncates
+/// at 200 chars with a `…` marker.
 pub(crate) fn sanitize_refusal_reason(s: &str) -> String {
     const LIMIT: usize = 200;
     let mut out = String::with_capacity(s.len().min(LIMIT));
     let mut chars = s.chars();
     for _ in 0..LIMIT {
         match chars.next() {
-            // C0/C1 controls, the Unicode line and paragraph separators,
-            // and the bidi/format controls that reorder or hide text in a
-            // terminal all become `?`: a hostile LAN peer cannot smuggle
-            // terminal sequences, line breaks, or right-to-left overrides
-            // into a logged or printed refusal.
-            Some(
-                '\u{0000}'..='\u{001F}'
-                | '\u{007F}'..='\u{009F}'
-                | '\u{061C}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}',
-            ) => out.push('?'),
+            Some(c) if is_terminal_hostile(c) => out.push('?'),
             Some(other) => out.push(other),
             None => return out,
         }
@@ -5805,9 +5832,10 @@ mod tests {
     }
 
     /// `sanitize_display` neutralizes terminal
-    /// control characters — ESC/CSI, CR, LF, BEL, DEL, and C1 controls all
-    /// become U+FFFD; ordinary UTF-8 (incl. non-ASCII robot names) is
-    /// untouched. Hand oracles.
+    /// control characters, ESC/CSI, CR, LF, BEL, NUL, DEL, C1 controls, the
+    /// line and paragraph separators, the bidi controls and every other format
+    /// character all become U+FFFD; ordinary UTF-8 (incl. non-ASCII robot
+    /// names) is untouched. Hand oracles.
     #[test]
     fn sanitize_display_neuters_control_chars_and_preserves_utf8() {
         // ESC-based CSI screen-clear: only the ESC (a C0 control) is replaced.
@@ -5819,6 +5847,73 @@ mod tests {
         // DEL (U+007F) and a C1 control (U+0085 NEL).
         assert_eq!(sanitize_display("a\u{7f}b"), "a\u{fffd}b");
         assert_eq!(sanitize_display("a\u{85}b"), "a\u{fffd}b");
+        // The line and paragraph separators cannot forge a line, and the
+        // bidi and format controls cannot reorder or hide the text around them.
+        assert_eq!(
+            sanitize_display("a\u{2028}b\u{2029}c"),
+            "a\u{fffd}b\u{fffd}c"
+        );
+        for control in [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert_eq!(sanitize_display(&format!("a{control}b")), "a\u{fffd}b");
+        }
+        // Both ends of the C0 and C1 ranges: NUL, and the C1 controls that
+        // open or close a terminal sequence (CSI U+009B, ST U+009C, OSC
+        // U+009D).
+        for control in [
+            '\u{0000}', '\u{001F}', '\u{0080}', '\u{0090}', '\u{009B}', '\u{009C}', '\u{009D}',
+            '\u{009F}',
+        ] {
+            assert_eq!(sanitize_display(&format!("a{control}b")), "a\u{fffd}b");
+        }
+        // Every invisible format character (general category Cf) can make
+        // one name look like another or hide text in it.
+        for format in [
+            '\u{00AD}',
+            '\u{0600}',
+            '\u{06DD}',
+            '\u{070F}',
+            '\u{0890}',
+            '\u{08E2}',
+            '\u{180E}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{FEFF}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{110BD}',
+            '\u{110CD}',
+            '\u{13430}',
+            '\u{1343F}',
+            '\u{1BCA0}',
+            '\u{1BCA3}',
+            '\u{1D173}',
+            '\u{1D17A}',
+            '\u{E0001}',
+            '\u{E0020}',
+            '\u{E0041}',
+            '\u{E007F}',
+        ] {
+            assert_eq!(
+                sanitize_display(&format!("te{format}mi")),
+                "te\u{fffd}mi",
+                "U+{:04X}",
+                u32::from(format)
+            );
+            assert_eq!(sanitize_refusal_reason(&format!("a{format}b")), "a?b");
+        }
+        // Their printable neighbours are ordinary text.
+        assert_eq!(
+            sanitize_display("\u{061B}\u{2027}\u{202F}\u{00AE}\u{FFFC}"),
+            "\u{061B}\u{2027}\u{202F}\u{00AE}\u{FFFC}"
+        );
         // Ordinary UTF-8 passes through unchanged, non-ASCII included.
         assert_eq!(sanitize_display("go2-α"), "go2-α");
         assert_eq!(sanitize_display("robot"), "robot");
