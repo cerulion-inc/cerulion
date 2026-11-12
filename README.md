@@ -68,10 +68,10 @@ Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-c
 - **Execution you can test.** Periodic, data-triggered, synchronized and external nodes; explicit backpressure and deadlines; recorded execution traces and a virtual clock for deterministic re-execution.
 - **Recordings you can check code against.** Standard MCAP, byte-exact output comparisons, per-field tolerances and machine-readable verdicts for CI. Test your changed code against the inputs that actually reached the robot.
 - **Flashback when you forgot to record.** Save the moments before and after a failure from a rolling in-memory history, then inspect the incident or replay its recorded topics.
-- **Your robots, wherever they are.** Automatic account-based pairing connects owned and shared robots, with access grants controlling authenticated pub/sub. Discover nearby robots with mDNS; reach remote ones through Iroh hole punching or a relay.
+- **Your robots, wherever they are.** Sign in to the same account on the robot and on your computer, and your computer finds the robot and reads its topics with no addresses or flags to set, over a direct connection when it can and a relay when it cannot. By default, a machine on your LAN that is neither on your account nor paired with the robot cannot read them.
 - **A path from ROS 2.** Run an existing stack through `rmw_cerulion`, attach to one already running, or combine ROS 2 processes and native nodes in the same graph.
 - **Tools your coding agent can use.** Cerulion MCP gives an agent tools for analyzing MCAP recordings, and Hindsight investigates recordings with evidence tied to topics and timestamps.
-- **One workflow across machines.** Native single- and multi-process execution on Linux and macOS, with LAN topic delivery and remote data mirrored locally for your tools.
+- **One workflow across machines.** Native single- and multi-process execution on Linux and macOS, with your robots' topics, on your LAN or across the internet, mirrored locally for your tools.
 
 ## Install
 
@@ -131,7 +131,7 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 </picture>
 
 - **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
-- **Across machines:** account ownership (and any existing saved pairing) discovers authorized robots automatically. Iroh uses direct connections when possible, including on one LAN, and a relay when needed. The network daemon mirrors subscribed topics locally for your tools. Unpaired LAN access requires explicit open access.
+- **Across machines:** robots on your account, and robots this computer is already paired with, are discovered automatically. Iroh connects directly when it can, including on one LAN, and through a relay when it cannot. The network daemon mirrors subscribed topics locally for your tools. An unpaired machine reads a robot's topics over the LAN only when the robot runs with `CERULION_LAN_ACCESS=open`.
 - **At your desk:** the CLI inspects, records and verifies the robot's data, and Cerulion MCP gives your coding agent tools for analyzing its recordings. A captured failure is a recording to inspect. Before re-running it, check `anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` attachment.
 
 Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-multi-process) · [Networking and remote robots](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots) · [Remote access](docs/remote_plane.md)
@@ -206,7 +206,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
-Runs use paired access by default on every platform. Unpaired LAN peers cannot read topics or publish into graph ingress through the zenoh plane; paired desks use the authenticated remote plane. `CERULION_LAN_ACCESS=open` explicitly enables unauthenticated LAN access and prints a warning. Restart daemons from an older release when upgrading so they use the paired default too.
+By default the run is readable from any computer signed in to your account, on this LAN or another network, with no addresses or flags: `cerulion topic list` on that computer finds it. A machine that is neither on your account nor paired with this one cannot read its topics or publish into it. Add `--network off` to keep a run on this machine. Setting `CERULION_LAN_ACCESS=open` here lets any computer on the LAN read the run's topics without signing in, and the run warns when it starts. After upgrading from 1.x, restart any `cerulion-netd` that is still running so it uses this default.
 
 In a second terminal, watch the controller react:
 
