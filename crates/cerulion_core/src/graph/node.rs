@@ -4171,6 +4171,8 @@ impl DylibNodeEntry {
                 #[serde(default)]
                 schema_hash: u64,
                 /// The `#[input(accumulate)]` mark; absent = not accumulate.
+                /// A loaded node library's key is written by the loader from
+                /// the input's stable `accumulate_cap`.
                 #[serde(default)]
                 accumulate: bool,
                 /// The declared `consume`; absent = `fifo`. Accepted on a
@@ -5357,9 +5359,8 @@ mod tests {
         assert!(info.output_names.is_empty());
     }
 
-    /// The `accumulate` input key: absent reads as not-accumulate (the shape
-    /// every node library built before the key existed emits), present as
-    /// accumulate. Neither warns as an unknown key.
+    /// The `accumulate` input key: absent reads as not-accumulate, present
+    /// as accumulate. Neither warns as an unknown key.
     #[test]
     #[tracing_test::traced_test]
     fn test_parse_info_json_accumulate_key_absent_reads_false() {

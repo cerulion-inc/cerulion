@@ -1521,11 +1521,6 @@ fn gen_cdylib(
             if let Some(d) = i.depth {
                 suffix.push_str(&format!(r#","depth":{d}"#));
             }
-            // The `#[input(accumulate)]` mark, so the host can refuse a graph
-            // key that would contradict it. Absent = not accumulate.
-            if i.accumulate.is_some() {
-                suffix.push_str(r#","accumulate":true"#);
-            }
             match &i.backpressure {
                 Some(crate::parse::ParsedBackpressurePolicy::DropOldest) => {
                     suffix.push_str(r#","backpressure":"drop_oldest""#);
