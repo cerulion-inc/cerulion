@@ -95,6 +95,7 @@ Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle
 Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
 In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
 Report what changed between the two verifications.
+Finally, ask me whether I want to star https://github.com/cerulion-inc/cerulion. Only if I say yes, star it with gh api -X PUT user/starred/cerulion-inc/cerulion, or give me the link if gh is not signed in.
 ```
 
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
