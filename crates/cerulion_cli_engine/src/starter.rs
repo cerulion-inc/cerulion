@@ -231,13 +231,17 @@ mod tests {
     #[test]
     fn released_documentation_routes_do_not_invoke_unavailable_starter_commands() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for (relative, path) in [
-            ("README.md", crate_dir.join("../../README.md")),
-            (
-                "docs/tutorials/01-getting-started.md",
-                crate_dir.join("../../docs/tutorials/01-getting-started.md"),
-            ),
-        ] {
+        // The README documents only the current CLI: its quickstart creates
+        // the starter directly and names no 1.0.0 route.
+        let readme = std::fs::read_to_string(crate_dir.join("../../README.md")).unwrap();
+        assert!(
+            readme.contains("cerulion workspace create safety_demo --starter obstacle_avoidance")
+        );
+        assert!(!readme.contains("--branch v1.0.0"));
+        for (relative, path) in [(
+            "docs/tutorials/01-getting-started.md",
+            crate_dir.join("../../docs/tutorials/01-getting-started.md"),
+        )] {
             let document = std::fs::read_to_string(path).unwrap();
             let (_, routes) = document.split_once("### Released CLI 1.0.0").unwrap();
             let (released, starter) = routes.split_once("### CLI builds with --starter").unwrap();
