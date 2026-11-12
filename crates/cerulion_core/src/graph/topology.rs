@@ -2504,7 +2504,7 @@ pub fn split_edge_timeout_refusal(
          one and let a frame published after the release be evicted. Put both nodes in ONE \
          `process_groups:` group, or run `--single-process`, to keep the timeout; or remove \
          `block_timeout_ms`, and the slot is still released when the consumer stops for good \
-         (a fatal error, a tick panic, or its process dying)"
+         (a fatal error or its process dying)"
     )
 }
 
@@ -2550,8 +2550,8 @@ fn shared_topic_timeout_refusal(flow: &TopicFlow, c: &ConsumerEdge, listed: bool
          connection is its own queue, so on this topic a release can leave the slot's count \
          high and release a consumer that keeps up again and again. Keep one producer on the \
          topic and take it out of `multi_publisher_topics:`; or remove `block_timeout_ms`, and \
-         the slot is still released when the consumer stops for good (a fatal error, a tick \
-         panic, or its process dying)",
+         the slot is still released when the consumer stops for good (a fatal error or \
+         its process dying)",
         c.node_id,
         c.input,
         flow.topic,
@@ -2913,7 +2913,7 @@ mod tests {
              the slot's count high and release a consumer that keeps up again and again. Keep \
              one producer on the topic and take it out of `multi_publisher_topics:`; or remove \
              `block_timeout_ms`, and the slot is still released when the consumer stops for good \
-             (a fatal error, a tick panic, or its process dying)";
+             (a fatal error or its process dying)";
         let listing = "is listed in `multi_publisher_topics:`, which lets publishers outside \
              the graph write it";
         let err = shared(&["a", "b"], true, Some(50)).expect_err("two producers");

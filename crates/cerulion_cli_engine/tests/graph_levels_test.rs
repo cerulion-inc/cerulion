@@ -578,7 +578,7 @@ fn a_split_block_edge_with_a_timeout_reads_invalid_with_the_run_refusal() {
                    after the release be evicted. Put both nodes in ONE `process_groups:` group, \
                    or run `--single-process`, to keep the timeout; or remove `block_timeout_ms`, \
                    and the slot is still released when the consumer stops for good (a fatal \
-                   error, a tick panic, or its process dying)";
+                   error or its process dying)";
 
     let tmp = tempfile::tempdir().unwrap();
     let ws = setup_workspace(tmp.path());

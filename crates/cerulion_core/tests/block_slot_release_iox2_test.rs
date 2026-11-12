@@ -44,6 +44,9 @@
 //!   the whole graph; without the key such a
 //!   consumer that stops for good still has its slot released;
 //! - a consumer node that stops with a fatal error has its slot released;
+//! - a node library `block` consumer whose tick panics keeps its slot: on one
+//!   frame, every other frame reaches downstream in order and the producer
+//!   stays paced; on every frame, the producer is paced, never held;
 //! - the live loop's wait sizing holds a deferred producer until its slot's
 //!   `block_timeout_ms` deadline, or until the drain that frees it, instead of
 //!   re-evaluating it at the 1 ms floor;
@@ -64,6 +67,10 @@
 //! `block_empty_resync_off`, `block_shared_timeout_refusal_off`,
 //! `block_split_timeout_refusal_off`, `block_forgiven_hold_counted` and
 //! `block_replaced_head_unpaid` each make a row here fail.
+//!
+//! The two node library rows load a fixture: run
+//! `cargo build -p test_node_macro_block_panic_cdylib` first. They hold the
+//! cdylib registry, so they are `#[serial]`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -74,7 +81,9 @@ use cerulion_core::credit::{credit_edge_id, CreditShared, CreditWord, MappedCred
 use cerulion_core::graph::config::{
     GraphConfig, InputBackpressure, InputDef, NetworkBlock, NetworkMode, NodeDef, OutputDef,
 };
-use cerulion_core::graph::node::{ClosureNodeEntry, InputMeta, MacroPolicy, NodeEntry, NodeInfo};
+use cerulion_core::graph::node::{
+    ClosureNodeEntry, DylibNodeEntry, InputMeta, MacroPolicy, NodeEntry, NodeInfo,
+};
 use cerulion_core::graph::{BuildPurpose, CrossProcessWiring, GraphRuntime};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
@@ -84,6 +93,7 @@ use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
+use serial_test::serial;
 use tracing_test::traced_test;
 
 const STEPS: u64 = 100;
@@ -1798,7 +1808,7 @@ fn split_timeout_refusal(topic: &str, producer: &str) -> String {
          and hold the producer with nothing queued, or miss one and let a frame published \
          after the release be evicted. Put both nodes in ONE `process_groups:` group, or run \
          `--single-process`, to keep the timeout; or remove `block_timeout_ms`, and the slot \
-         is still released when the consumer stops for good (a fatal error, a tick panic, or \
+         is still released when the consumer stops for good (a fatal error or \
          its process dying)"
     )
 }
@@ -2076,7 +2086,7 @@ fn shared_timeout_refusal(topic: &str, producers: &str) -> String {
          slot's count high and release a consumer that keeps up again and again. Keep one \
          producer on the topic and take it out of `multi_publisher_topics:`; or remove \
          `block_timeout_ms`, and the slot is still released when the consumer stops for good \
-         (a fatal error, a tick panic, or its process dying)"
+         (a fatal error or its process dying)"
     )
 }
 
@@ -2194,6 +2204,143 @@ fn a_consumer_that_stops_with_a_fatal_error_releases_its_slot() {
     assert!(
         produced >= 85,
         "the producer resumes after the consumer stops (fires {produced}; held it would stay near 4)"
+    );
+}
+
+/// `period_ms = 10`, publishes `x = 1000 + n`: every frame is one the panic
+/// fixture panics on.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct HighProducer {
+    #[output]
+    out: Vector3,
+    n: u32,
+}
+
+#[cerulion_node_impl]
+impl HighProducer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.n += 1;
+        self.out.x = 1000.0 + f64::from(self.n);
+        Ok(())
+    }
+}
+
+/// Records every frame it receives, in arrival order.
+#[cerulion_node]
+#[derive(Default)]
+struct Recorder {
+    #[input(trigger)]
+    inp: Vector3,
+    seen: Arc<Mutex<Vec<f64>>>,
+}
+
+#[cerulion_node_impl]
+impl Recorder {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let x = self.inp.x;
+        self.seen.lock().expect("seen lock").push(x);
+        Ok(())
+    }
+}
+
+/// Run `producer` (the `Producer` or `HighProducer` type) into the
+/// `test_node_macro_block_panic_cdylib` node library over a `block` edge at
+/// depth 2, and the library's output into a recorder, for `STEPS` steps.
+/// Returns the runtime and every frame the recorder received.
+fn run_panicking_library(prefix: &str, producer: &str) -> (GraphRuntime, Vec<f64>) {
+    let cfg = config(
+        prefix,
+        vec![
+            node("producer", producer, vec![], vec![output("out")]),
+            node(
+                "cons",
+                "block_panic",
+                vec![input("producer/out")],
+                vec![output("out")],
+            ),
+            node("rec", "recorder", vec![input("cons/out")], vec![]),
+        ],
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    let producer_entry: Box<dyn NodeEntry> = match producer {
+        "producer" => Box::new(ProducerEntry::new()),
+        "high_producer" => Box::new(HighProducerEntry::new()),
+        other => panic!("no producer {other}"),
+    };
+    factories.insert("producer".to_string(), producer_entry);
+    let path = cerulion_core::testing::find_fixture_cdylib("test_node_macro_block_panic_cdylib");
+    factories.insert(
+        "cons".to_string(),
+        Box::new(DylibNodeEntry::load(&path).expect("load the block panic node library")),
+    );
+    factories.insert(
+        "rec".to_string(),
+        Box::new(RecorderEntry::with_state(Recorder {
+            seen: Arc::clone(&seen),
+            ..Default::default()
+        })),
+    );
+    let mut rt = GraphRuntime::build_for_test(cfg, factories, Arc::new(VirtualClock::new()), 64)
+        .unwrap_or_else(|e| panic!("build: {e}"));
+    for _ in 0..STEPS {
+        rt.step(Duration::from_millis(10));
+    }
+    let frames = seen.lock().expect("seen lock").clone();
+    (rt, frames)
+}
+
+/// A node library catches a tick panic and keeps running, so a `block`
+/// consumer whose tick panics on one frame keeps its slot: no release is
+/// counted, the producer stays paced to the consumer's 20 ms throttle, and
+/// every frame but the one whose tick panicked reaches the recorder, in
+/// order.
+#[test]
+#[serial]
+fn a_node_library_that_panics_on_one_frame_keeps_its_block_slot() {
+    let (rt, frames) = run_panicking_library("bsr_panic_once", "producer");
+    assert_eq!(releases(&rt, "cons"), 0, "a caught panic releases nothing");
+    let last = frames.last().copied().unwrap_or(0.0);
+    assert!(
+        last >= 20.0,
+        "count floor: the recorder reached frame {last}"
+    );
+    // The hand oracle: frames 1, 2, then 4 through the last one received.
+    // Frame 3's tick panicked, so it published nothing; a released slot
+    // would let the producer outrun the throttled consumer and evict frames.
+    let mut want = vec![1.0, 2.0];
+    let mut x = 4.0;
+    while x <= last {
+        want.push(x);
+        x += 1.0;
+    }
+    assert_eq!(frames, want, "every frame but the panicked one, in order");
+    let produced = fires(&rt, "producer");
+    assert!(
+        produced <= STEPS * 3 / 4,
+        "the producer stays paced to the throttled consumer (fires {produced} of {STEPS} steps)"
+    );
+}
+
+/// A node library whose tick panics on every frame still drains each frame
+/// it fires on, so its producer is paced, not held: it keeps publishing at
+/// the consumer's throttled rate, no release is counted, and nothing reaches
+/// the recorder.
+#[test]
+#[serial]
+fn a_node_library_that_panics_on_every_frame_still_paces_its_producer() {
+    let (rt, frames) = run_panicking_library("bsr_panic_always", "high_producer");
+    assert_eq!(releases(&rt, "cons"), 0, "a caught panic releases nothing");
+    assert_eq!(
+        frames,
+        Vec::<f64>::new(),
+        "every tick panicked, so nothing is published"
+    );
+    let produced = fires(&rt, "producer");
+    assert!(
+        (STEPS / 4..=STEPS * 3 / 4).contains(&produced),
+        "the producer is paced, neither held nor free (fires {produced} of {STEPS} steps)"
     );
 }
 

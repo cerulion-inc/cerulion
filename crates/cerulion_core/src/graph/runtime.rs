@@ -1723,10 +1723,11 @@ struct HeldBlockSlot {
 }
 
 /// Release every `block` slot `consumer` holds: called by its tick callback
-/// when the node stops for good (a fatal error, a host-side panic that
-/// poisons the entry, or a cdylib panic code). Sticky, idempotent per slot,
-/// and one loud event per slot released. A slot held across processes is
-/// the shared word, so the producer in the other process stops waiting too.
+/// when the node stops for good (a fatal error, or a host-side panic that
+/// poisons the entry). A tick panic a node library catches is not a stop:
+/// the node keeps draining, so its slots stay armed. Sticky, idempotent per
+/// slot, and one loud event per slot released. A slot held across processes
+/// is the shared word, so the producer in the other process stops waiting too.
 fn release_held_block_slots(consumer: &str, slots: &[HeldBlockSlot]) {
     for slot in slots {
         if slot.word.release_slot() {
@@ -9238,41 +9239,33 @@ impl GraphRuntime {
                         }
                         Ok(Err(err)) => {
                             // STRUCTURAL panic-class classification:
-                            // only the dedicated variant counts — it is minted
-                            // exclusively by `DylibNodeEntry::tick` for the
-                            // cdylib FFI panic/poisoned codes (2/3). A
-                            // deterministic tick `Err` is NORMAL execution
-                            // (legal live behavior — Replay = Live) and is
-                            // never recorded as a panic, no matter what its
-                            // message says.
+                            // only the dedicated variant counts. It is minted
+                            // for a tick a node library reports as panicked
+                            // (`DylibNodeEntry::tick`). A deterministic tick
+                            // `Err` is NORMAL execution (legal live behavior,
+                            // Replay = Live) and is never recorded as a panic,
+                            // no matter what its message says.
                             if let TransportError::NodeTickPanicked { reason, .. } = &err {
                                 record_first_reason(&panic_record, reason);
-                                // The SHIPPING node shape, and
-                                // until now it was recorded by NEITHER mint site.
-                                // A cdylib catches its own panic behind the FFI
-                                // and returns it as an `Err` (codes 2/3), so
+                                // A node library catches a tick panic in its own
+                                // instance gate and returns it as an `Err`, so
                                 // nothing unwinds through the host's entry guard:
-                                // the poison arm never runs, and the callback
-                                // returns cleanly so `fire_node_into` resets
-                                // `consecutive_panics` and the circuit breaker
-                                // never opens either. Every node built by
-                                // `cerulion node build` is a cdylib, so producer
-                                // 2 was inert on real robots.
-                                //
-                                // TERMINAL by the same argument as the host-side
-                                // poison: code 2 leaves the cdylib's own `NODES`
-                                // mutex poisoned, after which every later tick
-                                // returns code 3 forever. The STRUCTURAL variant
-                                // is what gates this — a plain `NodeError` is
-                                // ordinary tick failure and must never be read as
-                                // a death (Replay = Live).
+                                // the poison arm above never runs, and the
+                                // callback returns cleanly, so `fire_node_into`
+                                // resets `consecutive_panics` and the circuit
+                                // breaker never opens. The gate recovers and the
+                                // node keeps firing and draining, so its `block`
+                                // slots stay armed: a release is sticky
+                                // (`CreditShared::release_slot`) and would leave
+                                // a live consumer's edge lossy for the rest of
+                                // the run. The death ledger records the panic
+                                // once.
                                 latch_node_death(
                                     &mut node_death_reported,
                                     &node_death_for_callback,
                                     &node_id_for_log,
                                     crate::scheduler::NodeDeathCause::CdylibPanicked,
                                 );
-                                release_held_block_slots(&node_id_for_log, &held_slots);
                             }
                             // `NodeError::Fatal`: stop the node. One error line
                             // names the node, the kind and the message; the

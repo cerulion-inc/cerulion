@@ -74,6 +74,10 @@ members = [
     # which the live path refuses, so neither can be staged into a
     # graph a real `cerulion graph run` executes.
     "crates/test_fixtures/test_node_macro_trigger_block_cdylib",
+    # A `block` trigger consumer whose tick panics on one frame (and on every
+    # frame from a threshold on): a node library catches the panic and keeps
+    # running, so its slot must stay armed.
+    "crates/test_fixtures/test_node_macro_block_panic_cdylib",
     # Serve-many — DataTrigger + plain non-trigger context over the FFI
     # (the motivating shape for the cross-step hold; no other fixture combines the two).
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",

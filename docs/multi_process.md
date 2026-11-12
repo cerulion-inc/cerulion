@@ -568,19 +568,22 @@ an edge that is not there.
 ### Reading a credit-death warn
 
 Under `--peer-loss continue` the survivors keep running when a worker dies. If the dead rank
-was a credited edge's CONSUMER, the producer is now gating on a mirror nobody will drain, so
-the supervisor says so. The head is a `warn!` (emitted by `CreditDeathWatch` in `graph_cmd.rs`) with these fields:
+was a credited edge's CONSUMER, the supervisor releases that consumer's slot (its word only;
+every other consumer of the topic keeps its own) and the producer resumes. The head is a
+`warn!` (emitted by `CreditDeathWatch` in `graph_cmd.rs`) with these fields:
 
 ```
-group  node_id  topic  consumer_input  dead_rank
+group  node_id  topic  consumer_input  producer  reason  slot_released  dead_rank
 deferred_producer_ranks  deferred_producer_groups  total_failures
 ```
 
 Read it as: **`topic` + `consumer_input`** identify the edge; **`dead_rank` / `group`** say who
-died; **`deferred_producer_groups`** names the groups whose producers are now stuck on it (real
-group names, one per producer rank, not the batch; a rank whose group cannot be resolved
-renders `<rank N>` rather than being dropped);
-**`total_failures`** is a running, unconditional count that recovery never resets.
+died; **`producer`** names the edge's producer nodes; **`reason`** is `consumer_died`;
+**`slot_released`** is `true` when this report released the slot; **`deferred_producer_groups`**
+names the groups of the producers the dead consumer had been holding (real group names, one
+per producer rank, not the batch; a rank whose group cannot be resolved renders `<rank N>`
+rather than being dropped); **`total_failures`** is a running, unconditional count that
+recovery never resets.
 
 It is flood-latched on the shared `FailureRegimeLatch`: one loud head, `debug!` repeats,
 and a `warn!` re-announcement at each decade of the running total. If a
