@@ -126,7 +126,7 @@ pub mod wire;
 
 pub use authorizer::{AcceptDecision, PairingAuthorizer};
 pub use beacon_facts::BeaconFacts;
-pub use clock::RemotedClock;
+pub use clock::{MonotonicClock, RemotedClock};
 pub use config::{
     classify_network, network_disabled, resolve_network_disabled, resolve_network_disabled_loud,
     NetworkSetting, RemotedConfig,

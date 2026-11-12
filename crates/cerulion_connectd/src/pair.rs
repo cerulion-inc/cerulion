@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(
             classify_verb_error(
                 "verb_error",
-                "no code pairing is armed on this robot; an owner must arm a guest code first (begin code pairing)"
+                "no code pairing is armed on this robot; a pairing code is made on the robot itself: get one from the robot and run `cerulion pair` again"
             ),
             VerbErrorClass::Refused
         );

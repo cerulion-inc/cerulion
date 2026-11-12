@@ -46,7 +46,7 @@ use cerulion_pairing::verify::{PairingSource, TrustStore};
 use ed25519_dalek::SigningKey;
 
 use cerulion_remoted::pairing_verbs::{PresentationWire, SharedCodePairSessions};
-use cerulion_remoted::{OpsServing, PairingAuthorizer, RemotedClock, SharedTrust};
+use cerulion_remoted::{MonotonicClock, OpsServing, PairingAuthorizer, RemotedClock, SharedTrust};
 
 // ── constants + tiny helpers ────────────────────────────────────────────────
 
@@ -110,6 +110,9 @@ struct Robot {
     lease: Arc<Mutex<ControlLease>>,
     sessions: SharedCodePairSessions,
     clock: RemotedClock,
+    /// The code-pairing store's clock, which its window and rate interval
+    /// run on.
+    mono: MonotonicClock,
     classify: Arc<PairingAuthorizer>,
     ops: Arc<OpsServing>,
     store_path: std::path::PathBuf,
@@ -162,7 +165,8 @@ fn build_robot(
 
     let shared = SharedTrust::new(store, index, MAC_KEY.to_vec());
     let lease = Arc::new(Mutex::new(ControlLease::with_default_window()));
-    let sessions = SharedCodePairSessions::new();
+    let mono = MonotonicClock::fixed(T_NOW);
+    let sessions = SharedCodePairSessions::with_clock(mono.clone());
     let clock = RemotedClock::fixed(T_NOW);
     let classify = Arc::new(PairingAuthorizer::from_shared(shared.clone()));
     let ops = Arc::new(
@@ -182,6 +186,7 @@ fn build_robot(
         lease,
         sessions,
         clock,
+        mono,
         classify,
         ops,
         store_path,
@@ -533,7 +538,7 @@ async fn code_pair_start_finish_establishes_a_row_via_a_cpace_witness() {
     let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
     let r = build_robot(dir.path(), robot_key, /*claim_owner=*/ true, &[]);
 
-    // The owner arms a guest code (3 attempts, default TTL).
+    // A code is armed in the store (3 tries, the default window).
     const CODE: &str = "SWAN-42";
     r.sessions.arm(CODE, CeremonyConfig::default());
 
@@ -573,18 +578,23 @@ async fn code_pair_wrong_code_denies_and_burns_bounded_attempts() {
     let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
     let r = build_robot(dir.path(), robot_key, /*claim_owner=*/ true, &[]);
 
-    // Arm 2 attempts; the guest presents the WRONG code repeatedly.
+    // Arm 2 tries; the guest presents the WRONG code repeatedly, each try
+    // one rate interval after the last.
     r.sessions.arm(
         "RIGHT-CODE",
         CeremonyConfig::new(2, 60_000_000_000).unwrap(),
     );
     let guest = AccountId(client_key);
+    let mono = r.mono.clone();
+    let rate = cerulion_pairing::pair_code::PAIR_CODE_RATE_INTERVAL.as_nanos() as u64;
 
     let (a1, a2, a3) = with_serving(&r, &robot, async {
         run_client(&client, robot_addr, move |c| {
             let a1 = run_cpace(c, "WRONG-CODE", robot_key, client_key, guest, "g");
+            mono.set(T_NOW + rate);
             let a2 = run_cpace(c, "WRONG-CODE", robot_key, client_key, guest, "g");
-            // The third `code-pair-start` finds the responder BURNED (2 attempts used).
+            mono.set(T_NOW + 2 * rate);
+            // The third `code-pair-start` finds both tries used: the code is burned.
             let a3 = run_cpace(c, "WRONG-CODE", robot_key, client_key, guest, "g");
             (a1, a2, a3)
         })
@@ -621,7 +631,7 @@ async fn code_pair_wrong_code_denies_and_burns_bounded_attempts() {
                 "burned code names burn, got {message}"
             );
             assert!(
-                message.contains("2 attempts exhausted"),
+                message.contains(&cerulion_remoted::pairing_verbs::code_exhausted(2)),
                 "the burn must name the exact max (2), got {message}"
             );
         }
@@ -646,12 +656,12 @@ async fn code_pair_expired_ttl_denies() {
     let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
     let r = build_robot(dir.path(), robot_key, /*claim_owner=*/ true, &[]);
 
-    // A short TTL; the trusted clock is advanced PAST it between start and finish.
+    // A short TTL; the store's clock is advanced PAST it between start and finish.
     let ttl = 10_000_000; // 10 ms
     r.sessions
         .arm("TTL-CODE", CeremonyConfig::new(3, ttl).unwrap());
     let guest = AccountId(client_key);
-    let clock = r.clock.clone();
+    let clock = r.mono.clone();
 
     let finish = with_serving(&r, &robot, async {
         run_client(&client, robot_addr, move |c| {
@@ -673,7 +683,7 @@ async fn code_pair_expired_ttl_denies() {
             let (_keys, initiator_confirm) = attempt
                 .finish(&msg2, &responder_confirm)
                 .expect("cpace initiator finish");
-            // The trusted clock jumps PAST the TTL before the finish reaches the robot.
+            // The store's clock passes the TTL before the finish reaches the robot.
             clock.set(T_NOW + ttl + 1);
             c.call(
                 "code-pair-finish",
