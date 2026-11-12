@@ -4498,12 +4498,9 @@ mod tests {
     }
 
     /// Raw-FFI arm: bare `Vector3` resolves on BOTH raw-FFI paths.
-    /// The INFO JSON carries port NAMES only (schema strings never
-    /// appear in it — see `generate_info_fn` /
-    /// `try_parse_raw_ffi_node`, which round-trips every port with
-    /// `schema: None`), so the observable schema string on this path
-    /// is the import `node modify` splices — it must be the QUALIFIED
-    /// one. Resolution also gates the raw-FFI create path: an
+    /// The INFO JSON carries port names, while the adjacent PORT_SCHEMAS
+    /// anchor retains qualified schema names for subsequent modifications.
+    /// Resolution also gates the raw-FFI create path: an
     /// ambiguous bare name fails with no directory created.
     #[test]
     fn test_raw_ffi_bare_schema_resolves_qualified_import() {
@@ -4525,6 +4522,10 @@ mod tests {
         // pinned below). The INFO JSON carries the port name.
         let metadata = parse_node_metadata(&nodes_dir.join("raw_vec")).unwrap();
         assert_eq!(metadata.outputs[0].name, "vec_out");
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
 
         // Modify: the spliced import is the QUALIFIED schema string —
         // the raw-FFI path's observable resolution product.
@@ -4548,6 +4549,14 @@ mod tests {
         );
         let metadata = parse_node_metadata(&nodes_dir.join("raw_vec")).unwrap();
         assert_eq!(metadata.inputs[0].name, "vec_in");
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
 
         // The resolution gate applies to raw-FFI create too:
         // ambiguous bare name → Err, no node directory created.
@@ -4572,6 +4581,178 @@ mod tests {
             !nodes_dir.join("raw_ambig").exists(),
             "a failed raw-FFI create must not leave a node directory behind"
         );
+    }
+
+    #[test]
+    fn raw_modify_preserves_typed_facts_and_matches_the_linked_delivery_fixture() {
+        for _ in 0..2 {
+            let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+            node_create_with_options(
+                &nodes_dir,
+                &cargo_toml,
+                "raw_ffi_template",
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 1 }),
+                &NodeCreateOptions {
+                    raw_ffi: true,
+                    outputs: vec![("geometry_msgs/Vector3".into(), "original".into())],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let node = nodes_dir.join("raw_ffi_template");
+            let created = parse_node_metadata(&node).unwrap();
+            assert_eq!(created.outputs.len(), 1);
+            assert_eq!(created.outputs[0].name, "original");
+            assert_eq!(
+                created.outputs[0].schema.as_deref(),
+                Some("geometry_msgs/Vector3")
+            );
+            for name in ["first", "second"] {
+                node_modify_add_port(
+                    &nodes_dir,
+                    "raw_ffi_template",
+                    name,
+                    Some("geometry_msgs/Vector3"),
+                    true,
+                    false,
+                )
+                .unwrap();
+                let parsed = parse_node_metadata(&node).unwrap();
+                assert!(parsed
+                    .outputs
+                    .iter()
+                    .all(|port| port.schema.as_deref() == Some("geometry_msgs/Vector3")));
+            }
+            let parsed = parse_node_metadata(&node).unwrap();
+            assert_eq!(
+                parsed
+                    .outputs
+                    .iter()
+                    .map(|port| port.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["original", "first", "second"]
+            );
+            let source = std::fs::read_to_string(node.join("src/lib.rs")).unwrap();
+            let fixture = include_str!("../../test_fixtures/test_node_raw_ffi_template_cdylib/tests/fixtures/modified_raw.rs");
+            let block = |text: &str| {
+                text.split_once("// CERULION:INFO_START")
+                    .unwrap()
+                    .1
+                    .split_once("// CERULION:INFO_END")
+                    .unwrap()
+                    .0
+                    .to_owned()
+            };
+            // Compare parsed bytes and request types so formatting punctuation
+            // cannot obscure a changed schema, layout constructor or port order.
+            let contract = |text: &str| {
+                let file = syn::parse_file(text).unwrap();
+                let bytes = file
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        syn::Item::Static(item) if item.ident == "INFO_BYTES" => {
+                            let syn::Expr::Lit(value) = &*item.expr else {
+                                panic!("metadata literal")
+                            };
+                            let syn::Lit::ByteStr(value) = &value.lit else {
+                                panic!("metadata bytes")
+                            };
+                            Some(value.value())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let method = file
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        syn::Item::Fn(item) if item.sig.ident == "__cer_raw_wire_metadata" => {
+                            Some(item)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let syn::Stmt::Expr(syn::Expr::MethodCall(end), _) =
+                    method.block.stmts.last().unwrap()
+                else {
+                    panic!("raw metadata result")
+                };
+                let syn::Expr::Call(call) = &*end.receiver else {
+                    panic!("raw metadata call")
+                };
+                let facts = [1, 2].map(|index| {
+                    let syn::Expr::Reference(arg) = &call.args[index] else {
+                        panic!("facts borrow")
+                    };
+                    let syn::Expr::Array(array) = &*arg.expr else {
+                        panic!("facts array")
+                    };
+                    array
+                        .elems
+                        .iter()
+                        .map(|fact| {
+                            let syn::Expr::Call(request) = fact else {
+                                panic!("typed facts required")
+                            };
+                            let syn::Expr::Path(path) = &*request.func else {
+                                panic!("request path")
+                            };
+                            let last = path.path.segments.last().unwrap();
+                            assert_eq!(last.ident, "request");
+                            let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                                panic!("typed request")
+                            };
+                            let syn::GenericArgument::Type(syn::Type::Path(ty)) = &args.args[0]
+                            else {
+                                panic!("schema type")
+                            };
+                            ty.path
+                                .segments
+                                .iter()
+                                .map(|part| part.ident.to_string())
+                                .collect::<Vec<_>>()
+                                .join("::")
+                        })
+                        .collect::<Vec<_>>()
+                });
+                (bytes, facts)
+            };
+            let actual = contract(&block(&source));
+            assert_eq!(
+                actual.1,
+                [
+                    vec![],
+                    vec!["native_ros2_messages::geometry_msgs::Vector3".to_owned(); 3]
+                ]
+            );
+            assert_eq!(
+                actual,
+                contract(&block(fixture)),
+                "the compiled delivery fixture must contain the actual modified metadata"
+            );
+            let schemas = |text: &str| {
+                text.lines()
+                    .find(|line| line.starts_with(PORT_SCHEMAS_MARKER))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(schemas(&source), schemas(fixture));
+            let before = source.clone();
+            assert!(node_modify_add_port(
+                &nodes_dir,
+                "raw_ffi_template",
+                "first",
+                Some("geometry_msgs/Vector3"),
+                true,
+                false
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read_to_string(node.join("src/lib.rs")).unwrap(),
+                before
+            );
+        }
     }
 
     // ── The unsatisfied-dep WARN must match the printed notice ──

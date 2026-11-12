@@ -31,6 +31,7 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
   never warn-and-accept. A duplicated identity refuses iff ANY bearer is un-carryable.
 - Rewrite `node modify` sources with `syn` spans, never `str::replace`.
+- Raw-node INFO blocks retain PORT_SCHEMAS names; modifications preserve every existing typed wire fact.
 - iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
 - Blocking waits check `running` after interrupted ERRORS and retry only within

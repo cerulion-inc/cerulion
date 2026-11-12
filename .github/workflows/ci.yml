@@ -2527,6 +2527,9 @@ jobs:
       - name: Build test cdylibs
         run: cargo build --locked --workspace
 
+      - name: Build modified raw-node delivery fixture
+        run: cargo build --locked -p test_node_raw_ffi_template_cdylib --example modified_raw
+
       # The whole-workspace build is the job's single biggest disk
       # consumer and was the one point between the reclaim and the wan step with
       # no `df` at all — every post-mortem had a reading from before the build
@@ -3590,6 +3593,9 @@ jobs:
       # spirit as the default-cover test model below.
       - name: Build test cdylibs
         run: cargo build --workspace
+
+      - name: Build modified raw-node delivery fixture
+        run: cargo build --locked -p test_node_raw_ffi_template_cdylib --example modified_raw
 
       # The pinned tool tarballs the `tool-tarballs` job verified and saved.
       # On a miss the install below downloads, as it does with no cache.
