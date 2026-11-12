@@ -42,6 +42,7 @@
 //! per-consumer mirror (which would re-introduce the exact collision + double-
 //! network-crossing the shared daemon dissolves).
 
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -172,6 +173,39 @@ const SPAWN_POST_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// `query::tests::the_shipped_cold_start_budget_fits_inside_the_client_round_trip_timeout`,
 /// which is why this is `pub(crate)` rather than private.
 pub(crate) const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(5);
+
+const MIRROR_BUSY_BUDGET: Duration = Duration::from_secs(2);
+// Uneven deterministic delays avoid a fixed retry cadence without randomness.
+const MIRROR_BUSY_DELAYS: [Duration; 7] = [
+    Duration::from_millis(23),
+    Duration::from_millis(47),
+    Duration::from_millis(83),
+    Duration::from_millis(139),
+    Duration::from_millis(211),
+    Duration::from_millis(307),
+    Duration::from_millis(389),
+];
+
+fn mirror_busy_delay(retries: usize, remaining: Duration) -> Option<Duration> {
+    MIRROR_BUSY_DELAYS
+        .get(retries)
+        .copied()
+        .filter(|delay| *delay < remaining)
+}
+
+fn is_transient_mirror_refusal(message: &str, key: &crate::registry::TopicKey) -> bool {
+    if crate::account_access::is_transient_busy(message) {
+        return true;
+    }
+    [crate::account_access::CONTROLLER_BUSY, crate::account_access::IDENTITY_BUSY]
+        .iter()
+        .any(|busy| {
+            message == format!(
+                "mirror registration failed: failed to establish the iroh WAN mirror for robot='{}' topic='{}': {busy}",
+                key.robot, key.topic
+            )
+        })
+}
 
 /// The longest the first-contact wait sleeps without re-checking the
 /// caller's cancellation flag.
@@ -472,6 +506,8 @@ pub enum ClientError {
     /// A protocol violation: a bad/mismatched [`Hello`] banner, an unexpected
     /// response shape, or an unparseable line.
     Protocol(String),
+    /// A previously acknowledged mirror was retired; re-demand or stop.
+    MirrorLost(crate::protocol::MirrorLost),
     /// A wire I/O error (broken pipe, timeout) exchanging a request/response.
     Io(io::Error),
 }
@@ -544,6 +580,9 @@ impl std::fmt::Display for ClientError {
                 }
                 _ => write!(f, "cerulion-netd error: {error}"),
             },
+            ClientError::MirrorLost(event) => write!(f,
+                "remote mirror lost for robot '{}' topic '{}'; re-demand the topic or restart the observer",
+                event.robot, event.topic),
             ClientError::Protocol(msg) => write!(f, "cerulion-netd protocol error: {msg}"),
             ClientError::Io(e) => write!(f, "cerulion-netd I/O error: {e}"),
         }
@@ -582,6 +621,9 @@ pub struct NetdClient {
     daemon_protocol: u32,
     /// A partial or invalid bounded exchange may leave a reply in flight.
     poisoned: bool,
+    pending_losses: Vec<crate::protocol::MirrorLost>,
+    push_fragment: Vec<u8>,
+    mirror_busy_failures: FailureRegimeLatch,
 }
 
 impl NetdClient {
@@ -878,6 +920,9 @@ impl NetdClient {
             socket_path: socket,
             daemon_protocol: 0,
             poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
         };
         let line = client.read_line()?;
         client.daemon_protocol = validate_hello(&line)?;
@@ -915,6 +960,66 @@ impl NetdClient {
         }
     }
 
+    /// Hold a source-qualified observer mirror until this connection closes.
+    /// Exact transient controller/identity refusals retry on this same connection
+    /// at most seven times within two seconds after the first Busy reply.
+    pub fn observe(
+        &mut self,
+        robot: &str,
+        topic: &str,
+        schema_hash: u64,
+    ) -> Result<crate::protocol::ObserveResponse, ClientError> {
+        let (id, response) = self.mirror_request(robot, topic, |id| Request::Observe {
+            id,
+            robot: robot.into(),
+            topic: topic.into(),
+            schema_hash,
+        })?;
+        match response {
+            Response::Observed(reply) => {
+                let key = crate::registry::TopicKey::observed(robot, topic);
+                if reply.demand.id != id
+                    || reply.demand.robot != key.robot
+                    || reply.demand.topic != key.topic
+                    || (reply.local_topic != key.local_topic() && reply.local_topic != key.topic)
+                {
+                    return Err(ClientError::Protocol(
+                        "observer reply does not match its requested source".into(),
+                    ));
+                }
+                Ok(reply)
+            }
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "unexpected observer reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// Release this connection's observer refcount before connection close.
+    pub fn unobserve(&mut self, robot: &str, topic: &str) -> Result<ReleaseResponse, ClientError> {
+        let id = self.next_request_id();
+        match self.round_trip(&Request::Unobserve {
+            id,
+            robot: robot.into(),
+            topic: topic.into(),
+        })? {
+            Response::Release(reply) => Ok(reply),
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "unexpected observer release reply: {other:?}"
+            ))),
+        }
+    }
+
     /// One bounded account operation. Never respawns or retries implicitly.
     /// The running daemon must support protocol v9; upgrade and restart it otherwise.
     pub fn account_access_once(
@@ -932,14 +1037,13 @@ impl NetdClient {
         topic: &str,
         schema_hash: u64,
     ) -> Result<DemandResponse, ClientError> {
-        let id = self.next_request_id();
-        let req = Request::Demand {
+        let (_, response) = self.mirror_request(robot, topic, |id| Request::Demand {
             id,
             robot: robot.to_string(),
             topic: topic.to_string(),
             schema_hash,
-        };
-        match self.round_trip(&req)? {
+        })?;
+        match response {
             Response::Demand(d) => Ok(d),
             Response::Error(e) => Err(ClientError::Netd {
                 error: e.error,
@@ -952,22 +1056,69 @@ impl NetdClient {
         }
     }
 
+    // hot-path-alloc-ok-fn: cold mirror acquisition over the control socket
+    fn mirror_request(
+        &mut self,
+        robot: &str,
+        topic: &str,
+        request: impl Fn(u64) -> Request,
+    ) -> Result<(u64, Response), ClientError> {
+        let key = crate::registry::TopicKey::new(robot, topic);
+        let mut retry_deadline = None;
+        let mut retries = 0;
+        loop {
+            let id = self.next_request_id();
+            // Keep the existing normal round-trip budget. Only a completed Busy
+            // reply starts the smaller absolute budget for all retry I/O/backoff.
+            let deadline = retry_deadline.unwrap_or_else(|| Instant::now() + ROUNDTRIP_TIMEOUT);
+            let response = self.bounded_round_trip(&request(id), deadline)?;
+            if let Response::Error(error) = &response {
+                if error.id == Some(id) && is_transient_mirror_refusal(&error.error, &key) {
+                    let end =
+                        *retry_deadline.get_or_insert_with(|| Instant::now() + MIRROR_BUSY_BUDGET);
+                    if let Some(delay) =
+                        mirror_busy_delay(retries, end.saturating_duration_since(Instant::now()))
+                    {
+                        tracing::debug!(robot = %key.robot, topic = %key.topic, attempt = retries + 1, delay_ms = delay.as_millis(), "remote mirror controller busy; retrying");
+                        std::thread::sleep(delay);
+                        if Instant::now() < end {
+                            retries += 1;
+                            continue;
+                        }
+                    }
+                    match self.mirror_busy_failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                            tracing::warn!(robot = %key.robot, topic = %key.topic, attempts = retries + 1, error = %error.error, total_failures = self.mirror_busy_failures.total_failures(), "remote mirror controller busy retry budget exhausted");
+                        }
+                        RegimeDecision::Suppressed { suppressed } => {
+                            tracing::debug!(robot = %key.robot, topic = %key.topic, suppressed, "remote mirror controller still busy after retry budget");
+                        }
+                    }
+                    return Ok((id, response));
+                }
+            }
+            if let Some(suppressed) = self.mirror_busy_failures.on_success() {
+                tracing::debug!(robot = %key.robot, topic = %key.topic, suppressed, "remote mirror controller recovered");
+            }
+            return Ok((id, response));
+        }
+    }
+
     /// Rebuild this client's connection in place (the demand-retry path) —
     /// re-run [`Self::connect_or_spawn_at`] against the same socket (which itself
     /// re-classifies: a gone socket respawns a fresh daemon, a live one reconnects)
     /// and adopt its fresh stream/reader + reset `next_id`. The socket path is
     /// unchanged.
     fn reconnect(&mut self) -> Result<(), ClientError> {
-        self.ensure_usable()?;
+        // Safe retry callers discard the failed framing and its held demands.
+        // Only a complete fresh handshake restores usability; never reuse the
+        // poisoned stream or carry its poison into the new connection.
         let fresh = Self::connect_or_spawn_at(self.socket_path.clone())?;
-        self.stream = fresh.stream;
-        self.reader = fresh.reader;
-        self.next_id = fresh.next_id;
         // Adopt the fresh daemon's protocol version
         // too — a reconnect can land on a DIFFERENT daemon (a v2 daemon idle-exited
         // and a v1 daemon respawned, or vice versa), so the per-verb compat gate must
         // re-gate against whoever we are now talking to, not the pre-reconnect version.
-        self.daemon_protocol = fresh.daemon_protocol;
+        *self = fresh;
         Ok(())
     }
 
@@ -1583,7 +1734,26 @@ impl NetdClient {
     /// connection during its idle exit is reported as the error
     /// [`closed_while_exiting`] recognises.
     pub fn status(&mut self) -> Result<crate::protocol::StatusResponse, ClientError> {
-        self.status_once()
+        let response = self.status_once()?;
+        if !self.pending_losses.is_empty() {
+            return Err(ClientError::MirrorLost(self.pending_losses.remove(0)));
+        }
+        Ok(response)
+    }
+
+    /// Drain every queued mirror retirement without replacing committed replies.
+    pub fn take_mirror_losses(&mut self) -> Vec<crate::protocol::MirrorLost> {
+        std::mem::take(&mut self.pending_losses)
+    }
+
+    /// Probe status on a demand-free connection within the caller's deadline.
+    /// A timeout closes only the probe and preserves every demand held by `self`.
+    pub fn probe_status_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::protocol::StatusResponse, ClientError> {
+        let mut probe = Self::connect_existing_at_until(self.socket_path.clone(), deadline)?;
+        probe.status_until(deadline)
     }
 
     /// One `status` round-trip.
@@ -1666,14 +1836,7 @@ impl NetdClient {
     /// a v1 daemon that would fail to parse it; it surfaces a precise, actionable
     /// version error instead.
     fn round_trip(&mut self, req: &Request) -> Result<Response, ClientError> {
-        self.ensure_usable()?;
-        if let Some(msg) = verb_compat_error(self.daemon_protocol, req) {
-            return Err(ClientError::Protocol(msg));
-        }
-        self.write_line(&req.to_json_line())?;
-        let line = self.read_line()?;
-        serde_json::from_str::<Response>(line.trim())
-            .map_err(|e| ClientError::Protocol(format!("unparseable response: {e}")))
+        self.bounded_round_trip(req, Instant::now() + ROUNDTRIP_TIMEOUT)
     }
 
     /// Write one NDJSON line + newline.
@@ -1738,6 +1901,7 @@ impl NetdClient {
             let line = self.read_line()?;
             match classify_control_line(&line) {
                 ControlLine::Event(event) => queued.push(event),
+                ControlLine::MirrorLost(event) => return Err(ClientError::MirrorLost(event)),
                 ControlLine::Response(text) => {
                     match serde_json::from_str::<Response>(&text) {
                         Ok(Response::SubscribeCatalog(r)) if r.id == id => break r,
@@ -1843,6 +2007,7 @@ impl NetdEventClient {
             ))),
             Ok(_) => match classify_control_line(&line) {
                 ControlLine::Event(event) => Ok(NextEvent::Changed(Box::new(event))),
+                ControlLine::MirrorLost(event) => Err(ClientError::MirrorLost(event)),
                 // A subscribed connection sends no further requests, so a RESPONSE
                 // here is netd talking about something we did not ask for. Skipping it
                 // keeps the stream in sync (the alternative — treating it as an event —
@@ -2987,6 +3152,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mirror_loss_consumes_the_matching_response_and_preserves_re_demand_connection() {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            for id in [1, 2, 3] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["id"], id);
+                let reply = if id == 1 {
+                    assert_eq!(request["method"], "observe");
+                    assert_eq!(request["topic"], "/extra");
+                    for topic in ["/vector", "/pose"] {
+                        writeln!(
+                            server,
+                            "{{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"{topic}\"}}"
+                        )
+                        .unwrap();
+                    }
+                    serde_json::json!({"id":id,"robot":"arm","topic":"/extra","refcount":1,
+                        "mirror_created":true,"local_topic":"/extra"})
+                } else {
+                    serde_json::json!({"id":id,"demands":[],"active_connections":1,"idle":false})
+                };
+                writeln!(server, "{reply}").unwrap();
+            }
+        });
+        let mut client = NetdClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            next_id: 1,
+            socket_path: PathBuf::new(),
+            daemon_protocol: PROTOCOL_VERSION,
+            poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
+        };
+        assert_eq!(
+            client.observe("arm", "/extra", 7).unwrap().local_topic,
+            "/extra"
+        );
+        assert!(
+            matches!(client.status(), Err(ClientError::MirrorLost(event))
+            if event.robot == "arm" && event.topic == "/vector")
+        );
+        let remaining = client.take_mirror_losses();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].topic, "/pose");
+        assert!(!client.poisoned);
+        assert_eq!(client.status().unwrap().id, 3);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn pushed_loss_poll_preserves_fragments_and_an_empty_socket_is_not_poisoned() {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        let mut client = NetdClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            next_id: 1,
+            socket_path: PathBuf::new(),
+            daemon_protocol: PROTOCOL_VERSION,
+            poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
+        };
+        client.poll_pushed_losses().unwrap();
+        assert!(!client.poisoned);
+        server
+            .write_all(b"{\"event\":\"mirror_lost\",\"robot\":\"arm\",")
+            .unwrap();
+        client.poll_pushed_losses().unwrap();
+        assert!(client.take_mirror_losses().is_empty());
+        server.write_all(b"\"topic\":\"/vector\"}\n").unwrap();
+        client.poll_pushed_losses().unwrap();
+        let losses = client.take_mirror_losses();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].robot, "arm");
+        assert_eq!(losses[0].topic, "/vector");
+        assert!(!client.poisoned);
+    }
+
+    #[test]
+    fn mirror_loss_records_validate_shape_and_observer_version_floor() {
+        let line = "{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\"}";
+        let oracle = crate::protocol::MirrorLost {
+            event: "mirror_lost".into(),
+            robot: "arm".into(),
+            topic: "/vector".into(),
+        };
+        assert_eq!(
+            classify_control_line(line),
+            ControlLine::MirrorLost(oracle.clone())
+        );
+        assert_eq!(
+            classify_control_line(&oracle.to_json_line()),
+            ControlLine::MirrorLost(oracle)
+        );
+        for bad in [
+            "{\"event\":\"mirror_lost\"}",
+            "{\"event\":\"mirror_lost\",\"robot\":1,\"topic\":\"/vector\"}",
+            "{\"event\":\"mirror_lost\",\"robot\":\"arm\",\"topic\":\"/vector\",\"id\":99}",
+        ] {
+            assert!(matches!(
+                classify_control_line(bad),
+                ControlLine::Unknown(_)
+            ));
+        }
+        let observe = Request::Observe {
+            id: 1,
+            robot: "arm".into(),
+            topic: "/vector".into(),
+            schema_hash: 7,
+        };
+        assert_eq!(
+            observe.min_daemon_version(),
+            crate::protocol::MIRROR_LOSS_MIN_DAEMON_VERSION
+        );
+        assert!(verb_compat_error(10, &observe).is_some());
+        assert!(verb_compat_error(PROTOCOL_VERSION, &observe).is_none());
+    }
+
     /// The CLASSIFIER that keeps a subscribed connection in sync, against a
     /// hand-written table. A push carries `event` and no `id`; a response carries `id`
     /// and no `event`. Getting this wrong in either direction IS the desync the opt-in
@@ -3043,10 +3335,10 @@ mod tests {
                 "must not be guessed at: {bad}"
             );
         }
-        // An unrecognized event NAME is not ours — it falls through to the id check.
+        // A mixed discriminator cannot be mistaken for a response.
         assert!(matches!(
             classify_control_line("{\"event\":\"something_else\",\"id\":4}"),
-            ControlLine::Response(_)
+            ControlLine::Unknown(_)
         ));
     }
 

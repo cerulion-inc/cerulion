@@ -33,6 +33,7 @@ const BUILTIN_HASH: u64 = 0x1112_1314_1516_1718;
 
 fn serving() -> SchemaServing {
     SchemaServing {
+        egress_qos: Vec::new(),
         served_topics: vec![TOPIC.into(), RAW_TOPIC.into()],
         topic_schemas: vec![TopicSchema {
             topic: TOPIC.into(),
@@ -279,6 +280,184 @@ fn assert_closed(reader: &mut BufReader<std::os::unix::net::UnixStream>) {
                 std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected
             ) => {}
         other => panic!("failed provider query must close its socket: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_metadata_only_schema_read_does_not_create_temporary_policy_services() {
+    use iceoryx2::prelude::CallbackProgression;
+    use iceoryx2::service::Service;
+
+    let netd = LocalNetd::start();
+    let snapshot = netd.plane.serving_schema_snapshot().unwrap();
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let path = directory.path().join("netd.sock");
+    let listener = scripted_listener(&path);
+    let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let mut reader = receive_snapshot_request(listener);
+        requested_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let reply = serde_json::json!({"id":1,"serving_schema":snapshot});
+        writeln!(reader.get_mut(), "{reply}").unwrap();
+        assert_closed(&mut reader);
+    });
+    let endpoint = disabled_endpoint([89; 32]).await;
+    let robot = Robot::start(
+        netd.manager.clone(),
+        path,
+        &[PublicKey(*endpoint.id().as_bytes())],
+    )
+    .await;
+    let mut desk = Desk::connect(&endpoint, &robot).await;
+    desk.send(&schema_request(TOPIC)).await;
+    bounded("provider request observed", requested_rx)
+        .await
+        .unwrap();
+    // Inspect while the real provider request is pending, before any lease
+    // could drop. A metadata lookup must not create a disposable event service
+    // that a concurrent policy reader can open during its final destruction.
+    let markers = [
+        cerulion_core::transport::egress_scope::marker_service_name(TOPIC),
+        cerulion_core::transport::mirror_origin::marker_service_name(TOPIC),
+    ];
+    let mut observed = Vec::new();
+    iceoryx2::service::ipc_threadsafe::Service::list(&netd.manager.iox_config(), |service| {
+        let name = service.static_details.name().as_str();
+        if markers.iter().any(|marker| marker == name) {
+            observed.push(name.to_owned());
+        }
+        CallbackProgression::Continue
+    })
+    .unwrap();
+    release_tx.send(()).unwrap();
+    let WireResponse::Schema(reply) = desk.receive().await else {
+        panic!("expected missing schema before registration")
+    };
+    assert!(reply.error.is_some());
+    assert!(reply.docs.is_empty());
+    bounded(
+        "scripted peer exit",
+        tokio::task::spawn_blocking(move || peer.join().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert!(netd.manager.data_service_missing(TOPIC));
+    let mut after = Vec::new();
+    iceoryx2::service::ipc_threadsafe::Service::list(&netd.manager.iox_config(), |service| {
+        let name = service.static_details.name().as_str();
+        if markers.iter().any(|marker| marker == name) {
+            after.push(name.to_owned());
+        }
+        CallbackProgression::Continue
+    })
+    .unwrap();
+    desk.close();
+    robot.shutdown().await;
+    bounded("desk close", endpoint.close()).await;
+    netd.shutdown();
+    assert!(
+        observed.is_empty(),
+        "metadata created policy services: {observed:?}"
+    );
+    assert!(
+        after.is_empty(),
+        "missing data created policy services: {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_changed_while_the_local_provider_is_awaited_refuses_the_pending_schema() {
+    for mirror in [false, true] {
+        let netd = LocalNetd::start();
+        let mut registration = netd.client();
+        registration
+            .register_egress(
+                &GatewayPlan {
+                    egress_policy: GatewayEgressPolicy::AllowAll,
+                    announce: vec![TOPIC.into()],
+                    ingress: vec![],
+                },
+                &serving(),
+                None,
+            )
+            .unwrap();
+        let snapshot = netd.plane.serving_schema_snapshot().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let path = directory.path().join("netd.sock");
+        let listener = scripted_listener(&path);
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let mut reader = receive_snapshot_request(listener);
+            requested_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let reply = serde_json::json!({"id":1,"serving_schema":snapshot});
+            writeln!(reader.get_mut(), "{reply}").unwrap();
+            assert_closed(&mut reader);
+        });
+        let endpoint = disabled_endpoint([90 + u8::from(mirror); 32]).await;
+        let robot = Robot::start(
+            netd.manager.clone(),
+            path,
+            &[PublicKey(*endpoint.id().as_bytes())],
+        )
+        .await;
+        let mut desk = Desk::connect(&endpoint, &robot).await;
+        desk.send(&schema_request(TOPIC)).await;
+        bounded("provider request observed", requested_rx)
+            .await
+            .unwrap();
+        // A different producer in the same namespace can change the topic's
+        // role while this server waits for its registered schema metadata.
+        let replacement = cerulion_core::TransportManager::init_for_test(
+            cerulion_core::TransportConfig::default(),
+            netd.manager.iox_config(),
+        )
+        .unwrap();
+        let exclusion = if mirror {
+            None
+        } else {
+            Some(replacement.exclude_remote_topic(TOPIC).unwrap())
+        };
+        let injector = if mirror {
+            Some(
+                replacement
+                    .create_remote_ingress_injector(TOPIC, CUSTOM_HASH, MaxSliceLen::const_new(256))
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        release_tx.send(()).unwrap();
+        let WireResponse::Error { topic, message } = desk.receive().await else {
+            panic!("privacy change must refuse the schema")
+        };
+        assert_eq!(topic.as_deref(), Some(TOPIC));
+        assert_eq!(
+            message,
+            if mirror {
+                format!(
+                    "'{TOPIC}' is a network mirror of another robot; read it on its source robot"
+                )
+            } else {
+                format!("Remote access policy for topic '{TOPIC}' refused: the producing run excludes this topic from network egress; remote access is refused")
+            }
+        );
+        bounded(
+            "scripted peer exit",
+            tokio::task::spawn_blocking(move || peer.join().unwrap()),
+        )
+        .await
+        .unwrap();
+        drop(injector);
+        drop(exclusion);
+        drop(registration);
+        desk.close();
+        robot.shutdown().await;
+        bounded("desk close", endpoint.close()).await;
+        netd.shutdown();
     }
 }
 

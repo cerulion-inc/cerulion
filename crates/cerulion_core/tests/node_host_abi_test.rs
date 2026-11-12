@@ -1477,6 +1477,57 @@ fn raw_ingress_preserves_original_wire_bytes_and_recipient_count_in_two_runs() {
 }
 
 #[test]
+fn private_raw_publisher_keeps_scope_until_outstanding_loans_and_port_are_retired() {
+    for revoke in [false, true] {
+        let h = RawHarness::new(1);
+        let topic = "abi/raw/private/retirement";
+        let scope = h.manager.exclude_remote_topic(topic).unwrap();
+        let binding = h.create(topic);
+        let slot = h.loan(binding.port, 64);
+        drop(scope);
+        assert!(h.manager.acquire_remote_topic_lease(topic).is_err());
+        assert_eq!(
+            abi_call!((HOST_API.register_raw_egress)(h.context, binding.port)).code,
+            0
+        );
+        assert_eq!(h.manager.dynamic_egress_record_hash_for_test(topic), None);
+        assert_eq!(
+            abi_call!((HOST_API.destroy_raw_publisher)(h.context, binding.port)).code,
+            abi::status_code::BUSY
+        );
+        assert!(h.manager.acquire_remote_topic_lease(topic).is_err());
+        if revoke {
+            // The caller has stopped accessing its loan before context retirement.
+            with_context(h.context.value, |host| {
+                host.revoke();
+                Ok(())
+            })
+            .unwrap();
+        } else {
+            assert_eq!(
+                abi_call!((HOST_API.discard_output)(
+                    h.context,
+                    slot.lease,
+                    abi::discard_reason::INVARIANT
+                ))
+                .code,
+                0
+            );
+            assert!(h.manager.acquire_remote_topic_lease(topic).is_err());
+            assert_eq!(
+                abi_call!((HOST_API.destroy_raw_publisher)(h.context, binding.port)).code,
+                0
+            );
+        }
+        assert!(h.manager.remote_topic_allowed(topic).unwrap());
+        assert_eq!(
+            with_context(h.context.value, |host| Ok(host.outstanding_leases())),
+            Ok(0)
+        );
+    }
+}
+
+#[test]
 fn raw_creation_refuses_reserved_tags_and_budget_reuse_before_native_creation() {
     let h = RawHarness::new(1);
     let mut out = MaybeUninit::uninit();

@@ -385,22 +385,22 @@ fn msg_store_names_in(schemas_dir: &Path) -> Vec<Candidate> {
     out
 }
 
-/// Robot names, from the three instant local records of a robot this desk has
+/// Robot names, from the two instant local records of a robot this desk has
 /// actually met.
 ///
 /// - `peers_path` — `~/.cerulion/peers.json`, the warm-peer cache.
 ///   Read through [`crate::peer_cache::load_peers`], so the 7-day TTL applies
 ///   and a robot that has been gone a week stops being offered.
-/// - `robots_toml_path` — `~/.cerulion/robots.toml`, the `name → eid` pins
-///   `cerulion pair` writes. A paired robot completes even if it has never
-///   been seen on THIS LAN, which is the point of pairing.
+/// - `robots_toml_path`: `~/.cerulion/robots.toml`, the `name → eid` pins.
+///   A pinned robot completes even if it has never been seen on THIS LAN,
+///   which is the point of a pin.
 ///
-/// A fourth source was measured and REJECTED: the origin robots of the mirrors
+/// A third source was measured and REJECTED: the origin robots of the mirrors
 /// live in local SHM. Reading them means
 /// `mirror_registry::gather_current_provenance`, which opens an iceoryx2 node —
 /// MEASURED at 620 ms on an idle desk with zero topics, four times the whole
 /// budget. It would also have added little: a robot only ends up mirrored here
-/// after this desk has already met it (a `pair`, or a `topic list` gather that
+/// after this desk has already met it (a pin, or a `topic list` gather that
 /// wrote it back to the peer cache), so a robot streaming right now is
 /// overwhelmingly a robot already in one of the two files above.
 ///

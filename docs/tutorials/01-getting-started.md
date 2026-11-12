@@ -822,7 +822,6 @@ per group, waits for each worker's READY, starts the recorder, then releases the
 together, and says so in one line. Representative lines (the ranges vary):
 
 ```
-WARN network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only. graph=obstacle_avoidance
 graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es); press Ctrl+C to stop
 INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2
@@ -839,15 +838,12 @@ simulated obstacle comes within half a meter), and the `drive_base` receives
 velocity commands, all through **zero-copy shared memory**, with a crash in any
 one group contained to its own process.
 
-> **A warning you will see on this first run, and what it means.**
-> `WARN network egress OPEN BY DEFAULT`: with no `network:` block, the topics
-> are open to every machine on your LAN, with no peer authentication.
-> `--network off` turns off only this run's own gateway; while `cerulion-netd`
-> serves the LAN it still sends a live local topic to a LAN peer that names it.
-> To refuse every LAN peer, set `CERULION_LAN_ACCESS=paired` for every Cerulion
-> command and daemon and restart a running `cerulion-netd`. The first networked
-> run also starts the shared `cerulion-netd` daemon, which exits by itself when
-> idle.
+> **Networking on this first run.**
+> Networking uses paired access by default, with no open-access warning.
+> Unpaired LAN peers cannot read topics or publish into graph ingress through
+> the zenoh plane. The first networked run starts the shared `cerulion-netd`
+> daemon. Explicit `CERULION_LAN_ACCESS=open` permits unpaired
+> LAN access and prints a warning; unset it to restore paired access.
 
 Leave it running and open a second terminal.
 
@@ -871,7 +867,7 @@ TOPIC
 /demo/lidar_sensor/scan
 /demo/safety_controller/cmd_vel
 1 internal topic hidden (--all shows it)
-remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)
+remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)
 ```
 
 The hidden topic is `/bagd/status`, the recorder's own status channel (it is
@@ -883,7 +879,7 @@ TOPIC
 /bagd/status  internal
 /demo/lidar_sensor/scan
 /demo/safety_controller/cmd_vel
-remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)
+remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)
 ```
 
 The `remote:` line is the LAN discovery half of the verb; with no other

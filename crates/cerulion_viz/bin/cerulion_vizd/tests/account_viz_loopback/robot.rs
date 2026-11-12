@@ -99,6 +99,7 @@ impl Robot {
                     ingress: vec![],
                 },
                 &SchemaServing {
+                    egress_qos: Vec::new(),
                     served_topics: vec![TOPIC.into()],
                     topic_schemas: vec![TopicSchema {
                         topic: TOPIC.into(),

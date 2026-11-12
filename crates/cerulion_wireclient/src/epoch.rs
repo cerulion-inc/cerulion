@@ -131,9 +131,9 @@ pub enum EpochPushOutcome {
     /// This desk has no VERIFIED name for the robot it dialed, so it cannot select a
     /// cache file at all.
     ///
-    /// The cache is keyed by the name the DESK knows a robot by (`cerulion pair` pins
-    /// name→eid in `~/.cerulion/robots.toml`). A raw `--eid` dial of an unpinned robot —
-    /// or an ambiguous reverse lookup — leaves the desk with no such name, and the one
+    /// The cache is keyed by the name the DESK knows a robot by (its name→eid pin in
+    /// `~/.cerulion/robots.toml`). A raw `--eid` dial of an unpinned robot,
+    /// or an ambiguous reverse lookup, leaves the desk with no such name, and the one
     /// name available then is the robot's OWN reported identity, which would let the
     /// dialed peer choose which cached artifact it receives. Refusing to push is the
     /// safe outcome; the fix is to pin/pair the robot.
