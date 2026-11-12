@@ -1342,6 +1342,53 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-cross-aarch64-${{ hashFiles('Cargo.lock') }}
+  stable-node-compiler-skew:
+    name: Stable node compiler compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CERULION_ABI_TARGET_ROOT: ${{ github.workspace }}/target/stable-node-compiler-skew
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install node compiler
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.95.0
+      - name: Install host compiler
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Install native build dependencies
+        run: |
+          missing=()
+          for package in libssl-dev pkg-config; do
+            dpkg -s "$package" >/dev/null 2>&1 || missing+=("$package")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${missing[@]}"
+          fi
+          libclang=
+          for candidate in /usr/lib/llvm-*/lib/libclang.so* /usr/lib/llvm-*/lib/libclang-[0-9]*.so*; do
+            if [ -f "$candidate" ]; then
+              libclang=$candidate
+              break
+            fi
+          done
+          if [ -z "$libclang" ]; then
+            echo 'The runner has no preinstalled libclang for bindgen' >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
+      # This binary checks actual compiler provenance and downstream
+      # delivery and literal full-frame oracles in two identical graph runs.
+      - name: Load a node built by another compiler and verify downstream frames
+        run: tools/scripts/check_stable_node_compiler_skew.sh
+
   msrv:
     name: MSRV (1.95)
     runs-on: ubuntu-latest
@@ -2119,6 +2166,11 @@ jobs:
       #     stay visible in the log rather than disappearing from a hand list.
       #
       # Everything else runs: ~16 s locally for the full set.
+      # stable_plugin_delivery_test loads the bridge cdylib; test builds produce an rlib.
+      - name: Build bridge library for stable plugin delivery
+        working-directory: examples/go2
+        run: cargo build -p dds_bridge
+
       - name: cargo test (everything but camera_jpeg)
         run: cd examples/go2 && cargo test --workspace --exclude camera_jpeg -- --test-threads=1
 
@@ -2474,6 +2526,9 @@ jobs:
       # `Cargo.lock` fails here instead of being repaired silently in the job.
       - name: Build test cdylibs
         run: cargo build --locked --workspace
+
+      - name: Build modified raw-node delivery fixture
+        run: cargo build --locked -p test_node_raw_ffi_template_cdylib --example modified_raw
 
       # The whole-workspace build is the job's single biggest disk
       # consumer and was the one point between the reclaim and the wan step with
@@ -2926,6 +2981,16 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
+
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test -p test_node_macro_cdylib --lib
+      - name: selection marker, test_node_macro_cdylib
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
@@ -3529,6 +3594,9 @@ jobs:
       - name: Build test cdylibs
         run: cargo build --workspace
 
+      - name: Build modified raw-node delivery fixture
+        run: cargo build --locked -p test_node_raw_ffi_template_cdylib --example modified_raw
+
       # The pinned tool tarballs the `tool-tarballs` job verified and saved.
       # On a miss the install below downloads, as it does with no cache.
       - name: Tool tarball cache key
@@ -3910,6 +3978,16 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
+
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test -p test_node_macro_cdylib --lib
+      - name: selection marker, test_node_macro_cdylib
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
@@ -4566,6 +4644,8 @@ jobs:
       # doc-pin: cerulion_hygiene::dependency_rules_test reads examples
       # doc-pin: cerulion_hygiene::shipped_surface_structure_test reads .github, benches, docs, tools
       # doc-pin: cerulion_hygiene::user_api_doc_test reads docs
+      - name: Stable node interface tests
+        run: cargo test -p cerulion_node_abi --all-features
       - name: cerulion_hygiene tests
         run: cargo test -p cerulion_hygiene
       # Both feature states: the default build is the no-op that source builds
@@ -4759,7 +4839,7 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
         run: |
           set -eu
-          for manifest in fixtures/pynodes/*/Cargo.toml; do
+          for manifest in fixtures/pynodes/*/Cargo.toml fixtures/pynodes/shared/nodes/*/Cargo.toml; do
             CARGO_TARGET_DIR="$PWD/target/pynodes" cargo build --release --manifest-path "$manifest"
           done
           cd ../..

@@ -8,9 +8,11 @@
 # rmw_cerulion in this distro's container (both directions, the three #[ignore]'d tests in
 # rclpy_xproc_test.rs run with --ignored against the freshly staged .so), with a wrong-payload
 # self-test that must red and a staged-vs-built digest check, so a green lane proves a real rclpy
-# peer talks to native Cerulion on this distro. The emulated aarch64 leg sets
+# peer talks to native Cerulion on this distro. On the rows in RCLCPP_PAIR_DISTROS (harvest.sh) it then runs the
+# stock demo_nodes_cpp and demo_nodes_py talker and listener over rmw_cerulion in three pairs
+# (rclcpp to rclcpp, rclcpp to rclpy, rclpy to rclcpp). The emulated aarch64 leg sets
 # RMW_GATE_SKIP_SERIAL_SUITE=1 to defer the in-process serial suite (the x86_64 lanes always run
-# it); the build, symbol audit, staged digest and the exchange still run there. `refuse`
+# it); the build, symbol audit, staged digest, the exchange and the pairs still run there. `refuse`
 # means the build is expected to stop at a KNOWN place, and
 # the gate requires that exact marker in the build log: any other failure is a lane failure, and a
 # distro that silently starts building fails the lane too, so the table can never lag the truth.
@@ -328,6 +330,85 @@ case "$expect" in
         grep -q -F "$GATE_WRONG_SENTINEL" "$splain" || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): the injected literal ($GATE_WRONG_SENTINEL) never appears in the exchange's failure output; the RED is not a proven payload mismatch"; echo "-- output tail:"; tail -n 40 "$splain"; exit 1; }
         echo "GATE SELF-TEST PASS (2a): $distro wrong payload ($GATE_WRONG_SENTINEL) crossed the exchange and the oracle REJECTED it ($s_fail failed; the literal is in the collected values)"
         rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+        # ===================================================================
+        # RCLCPP TALKER AND LISTENER: the stock demo_nodes_cpp and demo_nodes_py
+        # nodes over rmw_cerulion, three pairs: rclcpp to rclcpp, rclcpp to rclpy
+        # and rclpy to rclcpp, each in fresh processes on a topic of its own, each
+        # node under its own `timeout --preserve-status -s INT` deadline. Judged
+        # by rclcpp_pair_judge (harvest.sh, self-tested in gate_selftest.sh):
+        # both nodes ran to their deadline and stopped cleanly; no abort,
+        # traceback, rmw_cerulion or cerulion_core ERROR line or dropped
+        # malformed frame; no message heard twice; at least
+        # RCLCPP_PAIR_MIN_HEARD heard, at most two lost from the first heard on,
+        # every one of them published. ros-base ships neither demo package, so
+        # both are installed here.
+        # -------------------------------------------------------------------
+        if rclcpp_pairs_run "$distro"; then
+            for pkg in demo-nodes-cpp demo-nodes-py; do
+                if [ ! -d "/opt/ros/$distro/lib/${pkg//-/_}" ]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "ros-$distro-$pkg" >/dev/null 2>&1 \
+                        || { echo "GATE FAIL: $distro rclcpp pair - could not install ros-$distro-$pkg"; exit 1; }
+                fi
+            done
+            PAIR_SECS="${RCLCPP_PAIR_SECS:-15}"
+            PAIR_MIN_HEARD="${RCLCPP_PAIR_MIN_HEARD:-3}"
+            PAIRS_EXPECTED=3
+            pairs_ok=0
+            for pair in cpp:cpp cpp:py py:cpp; do
+                tside="${pair%%:*}"; lside="${pair#*:}"
+                pdir="/tmp/rmw_rclcpp_pair_${distro}_${tside}_${lside}"
+                topic="/rmw_gate_pair_${tside}_to_${lside}"
+                rm -rf "$pdir" /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+                mkdir -p "$pdir"
+                echo "== rmw rclcpp pair on $distro: demo_nodes_$tside talker -> demo_nodes_$lside listener on $topic (${PAIR_SECS}s) =="
+                # The listener starts 3s before the talker and its deadline is 6s
+                # later, so it outlives the talker by 3s. `--preserve-status`
+                # hands back each node's OWN exit status after the SIGINT (0 for a
+                # clean shutdown), and the time each ran is read off the monotonic
+                # clock (mono_ms), so node_status tells a clean stop at the
+                # deadline from an early exit or a crash on the way down.
+                ldeadline=$((PAIR_SECS + 6))
+                # The listener's status and end time are recorded inside its own
+                # background job, so a talker slow to stop cannot stretch them.
+                (
+                    l0=$(mono_ms)
+                    env RMW_IMPLEMENTATION=rmw_cerulion PYTHONUNBUFFERED=1 \
+                        AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                        LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                        timeout --preserve-status -s INT --kill-after=10 "$ldeadline" \
+                        "/opt/ros/$distro/lib/demo_nodes_$lside/listener" --ros-args -r "chatter:=$topic" \
+                        > "$pdir/listener.log" 2>&1 < /dev/null
+                    echo "$? $(($(mono_ms) - l0))" > "$pdir/listener.end"
+                ) &
+                lpid=$!
+                sleep 3
+                t0=$(mono_ms)
+                env RMW_IMPLEMENTATION=rmw_cerulion PYTHONUNBUFFERED=1 \
+                    AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                    LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                    timeout --preserve-status -s INT --kill-after=10 "$PAIR_SECS" \
+                    "/opt/ros/$distro/lib/demo_nodes_$tside/talker" --ros-args -r "chatter:=$topic" \
+                    > "$pdir/talker.log" 2>&1 < /dev/null
+                trc=$?
+                tms=$(($(mono_ms) - t0))
+                wait "$lpid"
+                read -r lrc lms < "$pdir/listener.end" || { echo "GATE FAIL: $distro rclcpp pair - the listener job left no status"; exit 1; }
+                tstatus="$(node_status "$trc" "$tms" "$PAIR_SECS")"
+                lstatus="$(node_status "$lrc" "$lms" "$ldeadline")"
+                label="$distro rclcpp pair demo_nodes_$tside talker -> demo_nodes_$lside listener"
+                if ! rclcpp_pair_judge "$pdir/talker.log" "$pdir/listener.log" "$tstatus" "$lstatus" "$PAIR_MIN_HEARD" "$label"; then
+                    echo "-- talker log tail:"; tail -n 20 "$pdir/talker.log"
+                    echo "-- listener log tail:"; tail -n 20 "$pdir/listener.log"
+                    exit 1
+                fi
+                pairs_ok=$((pairs_ok + 1))
+            done
+            rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+            [ "$pairs_ok" -eq "$PAIRS_EXPECTED" ] || { echo "GATE FAIL: $distro ran $pairs_ok/$PAIRS_EXPECTED rclcpp pairs"; exit 1; }
+            echo "GATE PASS (rclcpp pair): $distro ran $pairs_ok/$PAIRS_EXPECTED demo_nodes talker/listener pairs over rmw_cerulion (rclcpp to rclcpp, rclcpp to rclpy, rclpy to rclcpp)"
+        else
+            echo "== rclcpp talker/listener pairs SKIPPED on $distro: they run on [$RCLCPP_PAIR_DISTROS] =="
+        fi
         # ===================================================================
         # EXACT REPLAY (rmw_replay_*_test.rs): one ROS 2 process recorded with
         # the delivery log and replayed alone, judged by its own callback log and

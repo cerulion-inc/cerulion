@@ -183,12 +183,12 @@ fn find_symbolless_cdylib() -> std::path::PathBuf {
 /// the `names_len == 0` join path (that lives on the symbol-having Active side).
 #[test]
 #[serial]
-fn symbolless_cdylib_does_not_hold_and_snapshot_is_safe_noop() {
+fn checked_raw_cdylib_uses_host_snapshot_and_empty_configuration_is_safe() {
     let mut entry =
         DylibNodeEntry::load(&find_symbolless_cdylib()).expect("pre-hold-fix cdylib still loads");
     // No symbols → does not hold → host keeps the default borrow-2 provisioning.
     assert!(
-        !entry.holds_input_snapshot(),
+        entry.holds_input_snapshot(),
         "a symbol-less cdylib must NOT report holding (back-compat: reads live)"
     );
     // Safe no-op even pre-init (handle is None) AND for any input names — the

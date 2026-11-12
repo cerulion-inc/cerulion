@@ -54,7 +54,7 @@ pub struct NodeMetadata {
 /// from an external message crate (`sensor_msgs/Image`), the BARE entry
 /// name for a workspace schema reached through the node's own module
 /// (`DetectionArray`), and `None` when the source gives no `use` to derive
-/// it from (a raw-FFI node, or a type declared inline).
+/// it from (an untyped raw port, or a type declared inline).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortDef {
     pub name: String,

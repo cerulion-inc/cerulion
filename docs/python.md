@@ -72,11 +72,7 @@ inside `init`, `tick` or `shutdown`, resolves in that node's directory, and two
 node types in one process each keep their own, even when other code imported a
 module of the same name first. Two instances of one node type share its
 modules; a rebuilt node loads them afresh.
-Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
-`node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
-node whose compiler fingerprint does not match. When the default `rustc`
-differs from the one that built `cerulion`, prefix `cerulion node build` with
-`RUSTUP_TOOLCHAIN=<that toolchain>` for that command only.
+Python node libraries use the same stable boundary as Rust nodes. Build them with Rust 1.95 or newer; their compiler need not match the CLI. Existing node libraries must be rebuilt once with `cerulion node build <node>`.
 
 A Python node must declare exactly one scheduling policy: `period_ms`, one
 `trigger=True` input, or `sync_window_ms` for multiple trigger inputs. The

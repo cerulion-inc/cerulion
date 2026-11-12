@@ -1,68 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Unified trigger drain for CDYLIB nodes — the production
-//! surface of the one-receive-per-hop win.
-//!
-//! A macro-generated cdylib now exports the OPTIONAL
-//! `cerulion_node_drain_trigger_input` FFI symbol (additive, NO ABI bump —
-//! same precedent as the snapshot pair). Symbol PRESENCE is the
-//! capability (`DylibNodeEntry::unifies_trigger_drain`): present ⇒ the
-//! runtime elides the separate trigger-drain subscriber and wires the
-//! binding `DrainSource::Unified`, with `drain_trigger_input` forwarded
-//! across the FFI at the level boundary; absent (raw-FFI / older
-//! cdylib) ⇒ today's dual-subscriber path, byte-identical. Because only
-//! macro-generated cdylibs export the symbol — and their reads are generated
-//! `try_view`, the one path the unified drain's frozen slot serves — the
-//! gate also structurally enforces the trait's READ-PATH CONTRACT for the
-//! production surface.
-//!
-//! What this file pins (real iceoryx2 via `build_for_test`, per-test SHM
-//! root; hand oracles, downstream-DELIVERY based — never fire-count, which
-//! records even on tick Err):
-//!
-//! - **(a) Unified + delivers:** the `test_node_macro_data_trigger_cdylib`
-//!   consumer (forwards `trigger_in.x` → `cmd.x`) reports the capability
-//!   DIRECTLY (`unifies_trigger_drain() == true`), builds with EXACTLY one
-//!   Unified binding (the closure sink is `from_names` ⇒ Separate by the
-//!   stage-1a fail-safe, so the count isolates the cdylib), and the sink
-//!   observes the full hand-oracle sequence THROUGH the cdylib — the
-//!   delivery oracle proves the FFI drain feeds both the fire signal and the
-//!   tick's `try_view`.
-//! - **(b) back-compat:** the raw-FFI `test_node_cdylib` fixture (no symbol)
-//!   still loads and reports `unifies_trigger_drain() == false` — the
-//!   no-silent-breakage pin. (No raw-FFI fixture carries a data-trigger
-//!   input, so the behavioral Separate-delivery arm for a symbol-less cdylib
-//!   is covered by (c)'s forced-Separate leg instead — same wiring, same
-//!   drain path.)
-//! - **(c) the drain-discipline seam extends to cdylibs:** `CERULION_DRAIN_DISCIPLINE=
-//!   separate` forces the SAME cdylib graph back to 0 Unified bindings with
-//!   BYTE-IDENTICAL delivery (the changes-HOW-not-WHAT invariant on
-//!   the FFI surface) — which also behaviorally exercises the Separate path
-//!   for a cdylib data-trigger input.
-//!
-//! - **(d) the FFI-FAILURE arm:** the `test_node_drain_fail_cdylib`
-//!   raw-FFI fixture EXPORTS the drain symbol (capability TRUE → Unified) but
-//!   FAILS it (-1) under `CER_FAIL_MODE=drain_fail`. TEST A (fault): the host
-//!   maps every failure to the safe `(0, None)` — the consumer NEVER fires
-//!   (no fabricated fire signal; fire_count 0 IS the right assert here, since
-//!   fires record even on tick Err — 0 means no fire SIGNAL existed), the
-//!   flood latch logs exactly ONE `error!` across N failing steps
-//!   (`logs_assert` count pins the latch), and the RUNTIME SURVIVES (the
-//!   producer keeps publishing all N steps — no wedge). TEST B (control, no
-//!   fail mode): the drain returns 0 with `popped = 0` → still no fires.
-//!   Anti-tautology: the fixture's process-global drain-call counter (read
-//!   via the test's OWN `libloading` handle — a second `dlopen` shares the
-//!   data segment) proves the FFI was invoked in BOTH arms.
-//!
-//! # Required fixture builds
-//!
-//! ```bash
-//! cargo build -p test_node_macro_data_trigger_cdylib -p test_node_cdylib \
-//!             -p test_node_drain_fail_cdylib
-//! cargo test -p cerulion_core --test cdylib_unified_drain_test -- --test-threads=1
-//! ```
-//!
-//! All `#[serial]`: the cdylib `NODES` registry is process-global, the env
-//! knob is process-global, and iceoryx2's SHM singleton wants serial runs.
+//! Host-owned unified drain delivers through checked DLL nodes.
+//! The ordinary and forced-separate chains compare against the same hand oracle;
+//! legacy foreign maintenance traps cannot change delivered frames.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -77,7 +16,6 @@ use cerulion_core::MacroPolicy;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
-use tracing_test::traced_test;
 
 /// The drain-discipline measurement seam knob (process-global).
 const KNOB: &str = "CERULION_DRAIN_DISCIPLINE";
@@ -294,14 +232,12 @@ fn macro_cdylib_data_trigger_builds_unified_and_delivers() {
 // ===========================================================================
 #[test]
 #[serial]
-fn raw_ffi_cdylib_without_symbol_reports_capability_false() {
+fn checked_raw_ffi_cdylib_uses_host_owned_unified_drain() {
     let path = find_cdylib("test_node_cdylib");
     let entry = DylibNodeEntry::load(&path).expect("raw-FFI cdylib must still load (no ABI bump)");
     assert!(
-        !entry.unifies_trigger_drain(),
-        "a symbol-less (raw-FFI / pre-unified-drain) cdylib must report the drain \
-         capability FALSE — its data-trigger inputs stay DrainSource::Separate \
-         (today's behavior, byte-identical)"
+        entry.unifies_trigger_drain(),
+        "checked nodes use the host's native body subscriber"
     );
     // The info surface is untouched by the optional symbol probe.
     entry
@@ -385,22 +321,6 @@ fn load_drain_fail_accessor() -> libloading::Library {
         .expect("accessor dlopen of test_node_drain_fail_cdylib")
 }
 
-fn reset_drain_calls(lib: &libloading::Library) {
-    let f: libloading::Symbol<unsafe extern "C" fn()> = unsafe {
-        lib.get(b"cerulion_test_reset_drain_calls\0")
-            .expect("reset symbol")
-    };
-    unsafe { f() };
-}
-
-fn get_drain_calls(lib: &libloading::Library) -> u64 {
-    let f: libloading::Symbol<unsafe extern "C" fn(u64) -> u64> = unsafe {
-        lib.get(b"cerulion_test_get_drain_calls\0")
-            .expect("get symbol")
-    };
-    unsafe { f(0) }
-}
-
 /// Build + drive the drain-fail graph: macro producer → drain-fail cdylib
 /// consumer (`inp` ← producer/out, data-trigger). Returns
 /// `(capability, unified_count, consumer_fires, producer_fires)`.
@@ -474,92 +394,42 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
     (capability, unified, consumer_fires, producer_fires)
 }
 
-// TEST A (fault): the failing drain never fabricates a fire signal, logs
-// exactly one flood-latched error!, and the runtime survives.
+fn observed_drain_input(lib: &libloading::Library) -> u64 {
+    // SAFETY: exact scalar fixture export, library retained during invocation.
+    unsafe {
+        lib.get::<unsafe extern "C" fn() -> u64>(b"cerulion_test_observed_input\0")
+            .expect("observation")()
+    }
+}
 #[test]
 #[serial]
-#[traced_test]
-fn failing_drain_never_fabricates_a_fire_and_runtime_survives() {
+fn legacy_drain_failure_hook_cannot_block_host_owned_delivery() {
     std::env::remove_var(KNOB);
     let accessor = load_drain_fail_accessor();
-    reset_drain_calls(&accessor);
-
     let _fail = FailModeGuard::set("drain_fail");
     let (capability, unified, consumer_fires, producer_fires) = run_drain_fail_graph("cud_fail");
-
-    assert!(
-        capability,
-        "the drain-fail fixture exports the symbol — capability must be TRUE"
-    );
-    assert_eq!(unified, 1, "the failing consumer must be wired Unified");
+    assert!(capability);
+    assert_eq!(unified, 1);
+    assert!(consumer_fires > 0);
+    assert_eq!(producer_fires, u64::from(FAIL_STEPS));
     assert_eq!(
-        consumer_fires, 0,
-        "a FAILING drain maps to (0, None) — the consumer must NEVER fire \
-         (a nonzero fire_count means a fire signal was fabricated)"
-    );
-    assert_eq!(
-        producer_fires,
+        observed_drain_input(&accessor),
         u64::from(FAIL_STEPS),
-        "the runtime must SURVIVE the failing drain — the producer keeps \
-         publishing on every step (no wedge)"
+        "last source frame reaches the node through the host's native drain"
     );
-    let calls = get_drain_calls(&accessor);
-    assert!(
-        calls >= 1,
-        "the drain FFI must actually have been invoked (got {calls} calls) — \
-         otherwise this test is vacuous"
-    );
-    // The flood latch: N failing steps ⇒ EXACTLY ONE error! (the rest are
-    // suppressed to debug until recovery).
-    assert!(
-        logs_contain("cdylib drain_trigger_input FFI call failed"),
-        "the first drain failure must log loudly"
-    );
-    logs_assert(|lines: &[&str]| {
-        let errors = lines
-            .iter()
-            .filter(|l| l.contains("cdylib drain_trigger_input FFI call failed"))
-            .count();
-        if errors == 1 {
-            Ok(())
-        } else {
-            Err(format!(
-                "expected exactly 1 flood-latched error across {FAIL_STEPS} \
-                 failing steps, got {errors}"
-            ))
-        }
-    });
 }
-
-// TEST B (control): no fail mode — the drain succeeds with popped = 0, so
-// still no fires; the counter proves the FFI ran in this arm too.
 #[test]
 #[serial]
-fn control_drain_returns_zero_popped_and_counter_proves_invocation() {
+fn host_drain_delivery_matches_the_same_hand_oracle_on_two_runs() {
     std::env::remove_var(KNOB);
     std::env::remove_var("CER_FAIL_MODE");
     let accessor = load_drain_fail_accessor();
-    reset_drain_calls(&accessor);
-
-    let (capability, unified, consumer_fires, producer_fires) = run_drain_fail_graph("cud_ctrl");
-
-    assert!(capability, "control arm capability must be TRUE");
-    assert_eq!(unified, 1, "control arm must be wired Unified");
-    assert_eq!(
-        consumer_fires, 0,
-        "a successful drain reporting popped = 0 must produce no fires \
-         (nothing arrived, per the fixture)"
-    );
-    assert_eq!(
-        producer_fires,
-        u64::from(FAIL_STEPS),
-        "the producer publishes on every step in the control arm"
-    );
-    let calls = get_drain_calls(&accessor);
-    assert!(
-        calls >= 1,
-        "anti-tautology: the drain FFI must have been invoked in the CONTROL \
-         arm too (got {calls} calls) — the fault arm's 0-fires is meaningful \
-         only if the FFI actually runs in both"
-    );
+    for prefix in ["cud_ctrl_a", "cud_ctrl_b"] {
+        let (capability, unified, consumer_fires, producer_fires) = run_drain_fail_graph(prefix);
+        assert!(capability);
+        assert_eq!(unified, 1);
+        assert!(consumer_fires > 0);
+        assert_eq!(producer_fires, u64::from(FAIL_STEPS));
+        assert_eq!(observed_drain_input(&accessor), u64::from(FAIL_STEPS));
+    }
 }

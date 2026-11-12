@@ -1017,7 +1017,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
-| `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
+| `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib); a resim on its private namespace delivers nothing to a live input or an egress tap on the shared one, two resims, the second on slot 1 while the test holds slot 0's lock, write byte-identical reports, and two resims in a row reuse slot 0, remove a leftover segment name planted on it and leave one namespace's files | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
 | `tests/node_fatal_e2e_test.rs` | A node returning `NodeError::Fatal` on a temp workspace, `--single-process`: exact delivered frames, ONE fatal log line, `graph run` exit 3 (record and plain arms), `bag play --resim all --verify` exit 0 on the recording; a recorded `Logic` error keeps the node firing (a second failure is logged), exit 0 and the same two frames | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/node_fatal_mp_e2e_test.rs` | The same workspace on the multi-process default (Linux only, iceoryx2 2034 waiver on macOS): two workers, ONE fatal line, the worker's and the supervisor's `Error:` lines, exit 3, not degraded, no orphan; a `Logic` error keeps the node firing (a second failure is logged) and exits 0 | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, one rank per executor unit with its manifest, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
@@ -1142,9 +1142,10 @@ it with a no-replace hard link. Failed writes leave no partial final manifest;
 concurrent choices win. Clean up the staging file and propagate filesystem errors,
 including filesystems without hard-link support; never fall back to overwriting.
 
-`node build` probes PATH `rustc` only for an advisory warning. Cargo owns compiler
-selection, including environment and project configuration overrides. The built
-cdylib must match the host's full compiler fingerprint, checked at load before init.
+`node build` uses Cargo compiler selection through toolchain files and compiler
+overrides. Cargo enforces the workspace MSRV. Native loading checks the frozen
+boundary major, complete layout identity and capabilities; compiler provenance
+is diagnostic metadata and never a load refusal.
 
 ### Bundled starters
 

@@ -1,7 +1,6 @@
 # cerulion_cli_engine - agent notes
 
-All `cerulion` CLI command logic; `cerulion_cli` is its thin clap binary;
-the engine is testable without spawning processes.
+Clap delegates here; tests must not spawn processes.
 Every workspace-file writer (`node create/delete/modify`, `node stage`,
 `graph create/partition`, `graph run`'s auto-partition persist,
 `ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
@@ -15,13 +14,14 @@ TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
 `AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
 Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 ## Invariants
-- Enforce invariants at the engine boundary; CLI checks are UX.
+- Enforce invariants at engine boundary; CLI checks are UX.
 - Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
   share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
   robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
   registration, leaf and key before writing, and commits `device-chain.json` LAST.
-- `node build`'s rustc probe is advisory; only the cdylib fingerprint, checked at load, counts.
+- `node build` uses Cargo compiler selection/MSRV; load checks the frozen boundary,
+  never compiler provenance.
 - Android: cdylib lookup prefers `<target>/<triple>/<profile>`, then `<target>/<profile>`;
   `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
 - `node_metadata::parse_node_metadata` is the sole port/trigger source; only `INFO_END`
@@ -31,7 +31,8 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
   never warn-and-accept. A duplicated identity refuses iff ANY bearer is un-carryable.
 - Rewrite `node modify` sources with `syn` spans, never `str::replace`.
-- iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
+- Raw INFO retains PORT_SCHEMAS names; modifications preserve all typed wire facts.
+- Use prefix-free iceoryx2 prefixes: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
 - Blocking waits check `running` after interrupted ERRORS and retry only within
   `MAX_CONSECUTIVE_WAIT_ERRORS`; never sleep-retry an ERROR. FOREIGN children Cerulion SIGINTs go via `child_signals`
@@ -39,8 +40,8 @@ Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
 - After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
 ## Workspace dependency contract
-Workspace dependencies follow the binary, never cwd: checkout paths or exact registry
-pins. See `docs/internals/cli.md` §11 for the full contract and compiler checks.
+Dependencies follow the binary, never cwd: checkout paths or exact registry pins.
+See `docs/internals/cli.md` §11 for the contract and compiler checks.
 ## Testing
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc

@@ -65,6 +65,7 @@ ignored = [
 ]
 
 [dependencies]
+cerulion_node_abi = { workspace = true, features = ["loader"] }
 thiserror = "2"
 tracing = { version = "0.1.44", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

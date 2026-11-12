@@ -3055,8 +3055,8 @@ unsafe fn take_impl_live(
             });
         }
         // A member this build's C++ typesupport gives no way to WRITE
-        // (a `bool[]` before Humble: the generator emits no `assign` for
-        // `std::vector<bool>`), at the top level or inside a nested message,
+        // (a `bool[]` with neither `assign` nor the shim's accessorless
+        // path), at the top level or inside a nested message,
         // makes every frame of this type undeliverable.
         // Decided at registration, so this is one `Option` read per frame,
         // and taken BEFORE `unflatten` so the caller's message is untouched.

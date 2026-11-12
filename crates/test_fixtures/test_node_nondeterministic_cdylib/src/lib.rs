@@ -53,10 +53,44 @@ use native_ros2_messages::geometry_msgs::Vector3;
 struct NondetNode {
     #[output]
     cmd: Vector3,
+    #[cerulion(reconstruct)]
+    helper: Option<std::thread::JoinHandle<()>>,
+    #[cerulion(reconstruct)]
+    helper_events: Option<std::path::PathBuf>,
 }
 
 #[cerulion_node_impl]
 impl NondetNode {
+    fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
+        self.helper_events = ctx.env_opt("CER_STABLE_HELPER_EVENTS").map(Into::into);
+        if let Some(events) = self.helper_events.clone() {
+            let shutdown = ctx.shutdown_signal().clone();
+            self.helper = Some(std::thread::spawn(move || {
+                std::fs::write(&events, [1]).expect("helper entered");
+                while !shutdown.is_requested() {
+                    std::thread::yield_now();
+                }
+                std::fs::write(events, [1, 2]).expect("helper exited");
+            }));
+            if ctx.env_opt("CER_STABLE_HELPER_CONTEXT_STOP").as_deref() == Some("1") {
+                ctx.request_shutdown();
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), NodeError> {
+        if let Some(helper) = self.helper.take() {
+            helper.join().expect("helper observed shutdown");
+            std::fs::write(
+                self.helper_events.as_ref().expect("helper events"),
+                [1, 2, 3],
+            )
+            .expect("helper joined");
+        }
+        Ok(())
+    }
+
     fn tick(&mut self) -> Result<(), NodeError> {
         // Fold two independent non-replayable sources into one 64-bit value:
         // the advancing wall clock AND the process-random RandomState seed.
