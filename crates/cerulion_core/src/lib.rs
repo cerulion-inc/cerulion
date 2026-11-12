@@ -84,6 +84,9 @@
 #[cfg(test)]
 mod abi_layout;
 
+/// Compiler-independent node plugin interface.
+pub use cerulion_node_abi as node_abi;
+
 // Lock-free, SHM-mappable counting barrier — the rendezvous
 // state machine for the cross-process DAG-level barrier. SHM page mapping,
 // doorbell wake, and scheduler integration are not wired yet; `pub`
