@@ -359,13 +359,13 @@ pub fn test_surface() -> TestSurface {
 /// `is_key_` arrived at Jazzy, `is_rosidl_buffer_` at Lyrical), so the bridge
 /// classifier cannot receive them swapped. The hand-mirrored C++ bridge is
 /// shaped by the SAME cfgs, so every era is admitted; the pre-Galactic
-/// shape (96-byte member, no fetch/assign) costs only its
-/// `std::vector<bool>` members, refused per message.
+/// shape (96-byte member, no fetch/assign) leaves `std::vector<bool>`
+/// without accessors, read and filled through the compiled shim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CIntrospectionEra {
     /// Before `fetch_function` (Foxy, Galactic): 96-byte members, and no
     /// accessor for a `std::vector<bool>` member, which the C++ bridge
-    /// refuses per message.
+    /// reaches through the compiled shim.
     PreGalactic,
     /// `fetch_function` without `is_key_` (Humble, Iron): 112-byte members,
     /// 56-byte `MessageMembers`, 32-byte `ServiceMembers`.
@@ -590,9 +590,9 @@ pub const CPP_BRIDGE_VENDORED_UNNAMED_RUNTIME_REFUSAL: &str = concat!(
 /// UNBOUNDED NOW, because every era has a mirror.
 /// `ffi/introspection_cpp.rs` takes its shape from the same capability
 /// cfgs that select the era: `fetch_function` / `assign_function` arrived
-/// at Humble (before them the C++ `MessageMember` is 96 bytes and
-/// `std::vector<bool>` members are unreachable, which the bridge refuses
-/// per MESSAGE rather than per build), `is_key_` /
+/// at Humble (before them the C++ `MessageMember` is 96 bytes and a
+/// `std::vector<bool>` member has no accessor at all, which the bridge
+/// serves through the compiled shim rather than refusing the build), `is_key_` /
 /// `has_any_key_member_` at Jazzy and `is_rosidl_buffer_` at Lyrical,
 /// each widening the mirror under its own cfg. Every one of those fields
 /// was added to the C AND C++ introspection structs by the same rosidl
@@ -1473,8 +1473,8 @@ mod tests {
         // Foxy/Galactic: the mirror drops `fetch_function` and
         // `assign_function` under the same cfg that classifies this era and
         // closes at 96 bytes, so the build is admitted; the one member kind
-        // it cannot reach, a `std::vector<bool>`, is refused per MESSAGE by
-        // the bridge, not per build by this gate.
+        // with no accessor there, a `std::vector<bool>`, is read and filled
+        // by the bridge through the compiled shim, not refused per build.
         assert_eq!(
             classify_cpp_bridge(CppBypassMode::Off, CIntrospectionEra::PreGalactic),
             CppBridgeGate::Supported,

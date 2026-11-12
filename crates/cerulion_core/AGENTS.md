@@ -8,10 +8,9 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
 - ONE read path: iceoryx2 queue receive, no bypass/raw-handle read;
   fused chains may serve their just-committed frame in-process.
 - LAN defaults to Paired; fixtures select Open. Locators/login never open it.
-- FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs;
-  the loader also refuses a differing `RUSTC_FINGERPRINT`.
-- Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
-  sides see different layouts); fields stay, only setters gated.
+- FFI signature/error-meaning changes bump `CERULION_ABI_VERSION` or misload cdylibs.
+- Native plugins: check boundary major/full stable layout, ignore compiler provenance.
+- Never `#[cfg(feature)]`-gate a FIELD crossing the cdylib boundary: layouts differ. Fields stay; only setters gated.
 - Raw SHM has no pointers (String/Vec/HashMap); strings/bytes use slot-backed offsets.
 - Wire `sequence` is consumed at COMMIT (`OutputProxy::Drop`), never at loan: a discarded
   loan burns no sequence, so streams stay gap-free.
@@ -26,8 +25,7 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
   polled `step()`; parks/spins/wakes are record-only (change WHEN, never WHAT).
 - Wake loops: drain BEFORE waiting, never block on an empty slice; pace `last_wait_blocked()`;
   never drop a `SeqCst` fence in the doorbell ring/park pair (its lost wake is untestable).
-- Same-PROCESS REST producers of a `multi_publisher_topics` topic publish in declaration
-  order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
+- Same-process REST `multi_publisher_topics` producers publish in declaration order (`RestWalk::InsertionOrder`); never rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
 - Shipped surface: in-code graphs are tests only; no tracker ids or typographic
@@ -39,9 +37,7 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
   nextest-fenced in CI); per-test SHM roots isolate data, but global counters serialize.
 - CI shards 4 ways: `./tools/scripts/ci_test_shard.sh cerulion_core <n> 4` runs one leg
   (`cargo nextest run`, NOT `--test-threads=1`); fence `.config/nextest.toml`, `serial_discipline_test`.
-- cdylib tests dlopen prebuilt fixtures (`cargo build -p test_node_*` first); after ANY core
-  change rebuild ALL, or a stale one SIGABRTs like a regression. Executor/step/drain changes:
-  run EVERY `GraphRuntime`/`step()` binary (subsets missed twice).
+- Rebuild ALL cdylib fixtures after any core change (`cargo build -p test_node_*`); stale ones SIGABRT. Executor/step/drain changes run EVERY `GraphRuntime`/`step()` binary.
 - Cross-process credit: `credit_test`, `credit_block_iox2_test`, `free_run_ctor_iox2_test`:
   parallel-safe, no fence. Re-bless trybuild (`TRYBUILD=overwrite`, `macro_compile_fail_test`)
   on drift, from CI's output.
@@ -57,3 +53,5 @@ Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
 - Declared ingress precreates SingleWriter at full consumer capacity; imports
   require native capacity one. Ordinary producerless absolute sources remain External.
+
+Stable diagnostics keep text/phase; deferred releases flush before user code (`node_plugin_raw_test`, serial).

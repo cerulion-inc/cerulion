@@ -45,21 +45,9 @@ case it points at that checkout.
 The first node build in a workspace also compiles the Cerulion runtime, so it
 takes a few minutes on a laptop; later builds take seconds.
 
-## The compiler has to match the CLI
+## Build with Rust 1.95 or newer
 
-A node is a shared library loaded into the CLI's own process, so the loader
-refuses a node built by a different rustc and names both compilers. These
-example directories carry no `rust-toolchain.toml`, so a build uses the
-compiler your environment selects. When your rustup default is a different
-compiler from the one that built `cerulion`, name it on the command line:
-
-```bash
-RUSTUP_TOOLCHAIN=<release> cerulion node build <node>
-```
-
-`cerulion node build` warns, and continues, when the `rustc` on your `PATH`
-reports a different release. See
-[Build nodes with the compiler that built the CLI](../docs/install.md#build-nodes-with-the-compiler-that-built-the-cli).
+These example workspaces use the compiler your environment selects. Native nodes load through stable boundary major 1, so their compiler need not match the CLI. Rebuild existing libraries once with `cerulion node build <node>`. See [Build nodes with a supported Rust compiler](../docs/install.md#build-nodes-with-a-supported-rust-compiler).
 
 ## The process layout on the first run
 

@@ -55,6 +55,8 @@ pub mod network;
 pub mod notify_delivery_latch;
 pub mod output_discard_latch;
 pub mod output_proxy;
+#[doc(hidden)]
+pub mod plugin_lease;
 pub mod publisher;
 pub mod reg_channel;
 pub mod run_artifacts;

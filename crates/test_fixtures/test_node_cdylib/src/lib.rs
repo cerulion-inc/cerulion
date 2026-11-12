@@ -1,255 +1,415 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Test cdylib node for integration testing of DylibNodeEntry.
-//!
-//! Implements the Cerulion raw-FFI node entry point convention. The
-//! `cerulion_abi_version()` export tracks `cerulion_core::CERULION_ABI_VERSION`
-//! directly, so this fixture stays loadable across ABI bumps:
-//! - `cerulion_abi_version()` → ABI version (the host's current `CERULION_ABI_VERSION`)
-//! - `cerulion_rustc_fingerprint()` → rustc that compiled this cdylib (ABI v22);
-//!   honors `CER_RUSTC_FAULT` the same way `cerulion_abi_version` honors `CER_ABI_FAULT`
-//! - `cerulion_node_info()` → JSON metadata (static, no allocation)
-//!   * v4 outputs shape: array of `{name, schema_hash, max_slice_len_default}`
-//!     objects. This fixture has zero outputs so the array is empty;
-//!     post-A2 hosts also accept the legacy `["name1"]` strings shape
-//!     via `serde(untagged)` for backward compat.
-//! - `cerulion_node_init(*mut u8) -> u64` → handle-based init
-//! - `cerulion_node_tick(u64) -> i32` → tick by handle
-//! - `cerulion_node_pump_history(u64) -> i32` → service quiescent late joiners by handle (ABI v7,; no-op here — fixture has no publishers)
-//! - `cerulion_node_shutdown(u64) -> i32` → shutdown by handle
-//! - `cerulion_take_last_error -> *mut c_char` → most recent error message
-//! - `cerulion_free_error(*mut c_char)` → free a string returned by take_last_error
-//!
-//! Also exports `cerulion_test_get_tick_count(u64)` for test verification.
-//!
-//! `cerulion_node_init` also applies `IOX2_LOG_LEVEL` from the node's
-//! frozen env snapshot to THIS cdylib's own `iceoryx2-log` static (a
-//! hand-written raw-FFI node must do what the macro generates), and — behind
-//! the env-gated `CER_CDYLIB_IOX2_PROBE` switch, inert for every other test that
-//! loads this fixture — prints that level as `RAWFFI_IOX2_LEVEL=<n>` for
-//! `cdylib_iox2_log_level_test.rs` to read off stderr.
-
-// Principle #12 (logging): library code never prints — it logs through
-// `tracing`. Scoped `not(test)` so unit tests keep printing diagnostics, and
-// applied at the crate root rather than in `[workspace.lints]` because that
-// table cannot distinguish a lib target from a test binary. Pinned by
-// `cerulion_cli_engine/tests/library_print_ban_test.rs`.
+//! Zero-port stable fixture for lifecycle, rejection and logging tests.
+// A node is a library loaded by the runtime. Use tracing for diagnostics.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use cerulion_core::graph::node_plugin_abi::{HostClient, NodeContext, NodeExports, PluginNode};
+use cerulion_core::node_abi as abi;
 
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
-static NODES: Mutex<Option<HashMap<u64, NodeState>>> = Mutex::new(None);
-
-/// One handle's state: its tick count, and whether its ticks fail (read
-/// ONCE from `CER_TICK_FAIL` at init, so the tick path does no env lookup).
-struct NodeState {
-    ticks: u64,
+struct TestNodeState {
+    context: Option<NodeContext>,
+    tick_count: u64,
     tick_fail: bool,
+    retained: Option<RetainedOutput>,
 }
 
-/// Null-terminated JSON info string in .rodata — no allocation, no leak.
-///
-/// The info JSON carries no `node_type`; the loader resolves type
-/// from the cdylib's folder name. The
-/// `outputs` shape is per-output objects; an empty array is valid in
-/// that shape, so this zero-port fixture's JSON needs no entries.
-static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";
-
-/// ABI version — tracks `cerulion_core::CERULION_ABI_VERSION` directly so a
-/// host ABI bump needs no edit here (this fixture must stay loadable).
-/// A hardcoded literal
-/// silently breaks `node_test` on every ABI bump; referencing the const
-/// makes the host the single source of truth.
-#[no_mangle]
-pub extern "C" fn cerulion_abi_version() -> u32 {
-    // Test-only fault toggle (env-gated): when `CER_ABI_FAULT` is set, report a
-    // deliberately-wrong ABI so the host's version-mismatch rejection path
-    // (`DylibNodeEntry::load`) is exercisable end-to-end. WITHOUT the env var,
-    // tracks `cerulion_core::CERULION_ABI_VERSION` so this fixture stays loadable
-    // across ABI bumps. (This fixture is hand-written, not a drift-checked
-    // mirror, so the env branch is safe here.)
-    if std::env::var("CER_ABI_FAULT").is_ok() {
-        9999 // test-only: a deliberately-wrong ABI to exercise the host's version-mismatch rejection
-    } else {
-        cerulion_core::CERULION_ABI_VERSION
+impl PluginNode for TestNodeState {
+    fn create(client: HostClient, _params: &[u8]) -> cerulion_core::TransportResult<Self> {
+        let cold = COLD_HOST.with(std::cell::Cell::take);
+        let info = cerulion_core::graph::node::DylibNodeEntry::parse_info_json_labeled(
+            std::str::from_utf8(if retain_output_mode() {
+                RETAIN_METADATA.get_or_init(retain_metadata).as_bytes()
+            } else {
+                &INFO_BYTES[..INFO_BYTES.len() - 1]
+            })
+            .map_err(|error| cerulion_core::TransportError::GraphError {
+                reason: error.to_string(),
+            })?,
+            "raw node",
+        )
+        .map_err(|reason| cerulion_core::TransportError::GraphError { reason })?;
+        let context = NodeContext::new(client.clone(), &info)?;
+        let rust_log = context.env_opt("RUST_LOG");
+        cerulion_core::graph::node::install_cdylib_stderr_tracing(rust_log.as_deref());
+        let iox_log = context.env_str("IOX2_LOG_LEVEL", "");
+        cerulion_core::iceoryx_logger::init_iceoryx_log_level(if iox_log.is_empty() {
+            None
+        } else {
+            Some(&iox_log)
+        });
+        // Machine-readable probe reports this library's actual linked log level.
+        #[allow(clippy::print_stderr)]
+        if std::env::var_os("CER_CDYLIB_IOX2_PROBE").is_some() {
+            eprintln!(
+                "RAWFFI_IOX2_LEVEL={}",
+                cerulion_core::iceoryx_logger::current_iox2_log_level()
+            );
+        }
+        if let Some(error) = client.take_failure() {
+            return Err(error);
+        }
+        Ok(Self {
+            context: Some(context),
+            tick_count: 0,
+            tick_fail: std::env::var_os("CER_TICK_FAIL").is_some(),
+            retained: if retain_output_mode() {
+                Some(RetainedOutput::new(cold.expect("checked create context"))?)
+            } else {
+                None
+            },
+        })
+    }
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        if self.tick_fail {
+            return Err(cerulion_core::TransportError::NodeError {
+                node_id: "raw fixture".into(),
+                reason: "untyped fixture tick failure".into(),
+            });
+        }
+        if let Some(retained) = &mut self.retained {
+            retained.tick()?;
+        }
+        self.tick_count = self.tick_count.wrapping_add(1);
+        Ok(())
+    }
+    fn shutdown(&mut self) -> cerulion_core::TransportResult<()> {
+        if let Some(retained) = &mut self.retained {
+            retained.release()?;
+        }
+        self.context = None;
+        Ok(())
+    }
+    fn state_shape() -> u64 {
+        0
+    }
+    fn capture(
+        &self,
+        _: &mut dyn cerulion_core::state::StateSink,
+    ) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+    fn restore(&mut self, _: &[u8]) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+    fn inline_safe(&self) -> bool {
+        false
+    }
+    fn probe(&self) -> bool {
+        false
+    }
+    fn external_source(&mut self) -> cerulion_core::TransportResult<abi::ExternalSourceV1> {
+        Ok(abi::ExternalSourceV1 {
+            fd: -1,
+            kind: abi::external::HOST_DRIVEN,
+            flags: 0,
+        })
     }
 }
 
-/// ABI v22 rustc fingerprint: tracks `cerulion_core::rustc_fingerprint_cstr()`
-/// directly, same reasoning as `cerulion_abi_version` above, EXCEPT for two
-/// test-only fault toggles read from the same `CER_RUSTC_FAULT` env var:
-/// - unset: report the real fingerprint (the control path).
-/// - any other value (conventionally `"1"`): report a deliberately-FAKE
-///   fingerprint, so the host's rustc-MISMATCH rejection path
-///   (`DylibNodeEntry::load`) is exercisable end-to-end without needing a
-///   second rustc toolchain installed
-///   (`cerulion_core/tests/rustc_fingerprint_mismatch_test.rs`). The fake
-///   value is a static C string, not a fresh allocation per call, which
-///   matches `rustc_fingerprint_cstr()`'s own "no allocation after the first
-///   call" contract.
-/// - exactly `"null"`: return a NULL pointer, so the host's null-pointer arm
-///   (a defensive check for a symbol that resolves but returns nothing
-///   readable, distinct from a missing symbol, which `libloading::Symbol`
-///   itself already refuses) is exercisable the same way, rather than only by
-///   code inspection.
+static NODES: std::sync::OnceLock<NodeExports<TestNodeState>> = std::sync::OnceLock::new();
+fn nodes() -> &'static NodeExports<TestNodeState> {
+    NODES.get_or_init(Default::default)
+}
+
+unsafe extern "C" fn create(
+    host: *const abi::HostApiV1,
+    context: abi::ContextHandle,
+    params: abi::Bytes,
+    output: *mut abi::NodeHandle,
+) -> abi::Status {
+    // SAFETY: host retains immutable descriptor/code/context for the instance;
+    // the maintained checker validates its complete identity before caching it.
+    let api = match unsafe { abi::read_host_api(host) } {
+        Ok(api) => api,
+        Err(_) => {
+            return abi::Status {
+                code: abi::status_code::INVALID_ARGUMENT,
+                ..Default::default()
+            }
+        }
+    };
+    let previous = COLD_HOST.with(|slot| slot.replace(Some((api, context))));
+    // SAFETY: caller's initialized parameter span and exclusive result stay live
+    // through the maintained registry's checked, panic-contained create.
+    let result = unsafe { nodes().create(host, context, params, output, 0) };
+    COLD_HOST.with(|slot| slot.set(previous));
+    result
+}
+unsafe extern "C" fn tick(handle: abi::NodeHandle) -> abi::Status {
+    nodes().tick(handle)
+}
+unsafe extern "C" fn shutdown(handle: abi::NodeHandle) -> abi::Status {
+    nodes().shutdown(handle)
+}
+unsafe extern "C" fn destroy(handle: abi::NodeHandle) -> abi::Status {
+    nodes().destroy(handle)
+}
+unsafe extern "C" fn copy_error(
+    token: u64,
+    target: abi::MutableBytes,
+    required: *mut u64,
+) -> abi::Status {
+    // SAFETY: caller owns bounded writable storage and the output scalar for this
+    // synchronous call. NodeExports checks bounds and copies node-owned text.
+    unsafe { nodes().copy_error(token, target, required) }
+}
+unsafe extern "C" fn query_extension(
+    _id: u64,
+    _version: u32,
+    _output: *mut abi::ExtensionDescriptorV1,
+) -> abi::Status {
+    abi::Status {
+        code: abi::status_code::UNSUPPORTED,
+        ..Default::default()
+    }
+}
+static API: [std::sync::OnceLock<&'static abi::NodeApiV1>; 6] =
+    [const { std::sync::OnceLock::new() }; 6];
+static METADATA: [std::sync::OnceLock<std::ffi::CString>; 4] =
+    [const { std::sync::OnceLock::new() }; 4];
+fn node_api() -> *const abi::NodeApiV1 {
+    let fault = std::env::var_os("CER_ABI_FAULT").is_some();
+    let variant = if retain_output_mode() {
+        4
+    } else {
+        match std::env::var("CER_INLINE_SAFE_METADATA").as_deref() {
+            Ok("true") => 1,
+            Ok("false") => 2,
+            Ok("invalid") => 3,
+            _ => 0,
+        }
+    };
+    *API[if fault { 5 } else { variant }].get_or_init(|| {
+        let metadata = if variant == 4 {
+            RETAIN_METADATA.get_or_init(retain_metadata).as_bytes()
+        } else {
+            METADATA[variant]
+                .get_or_init(|| {
+                    let base = __cer_raw_wire_metadata();
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(base.to_bytes()).expect("generated metadata");
+                    let fields = value.as_object_mut().expect("metadata object");
+                    match variant {
+                        0 => {
+                            fields.remove("inline_safe");
+                        }
+                        1 => {
+                            fields.insert("inline_safe".into(), true.into());
+                        }
+                        2 => {
+                            fields.insert("inline_safe".into(), false.into());
+                        }
+                        _ => {
+                            fields.insert("inline_safe".into(), "true".into());
+                        }
+                    }
+                    std::ffi::CString::new(serde_json::to_vec(&value).expect("metadata bytes"))
+                        .expect("no embedded NUL")
+                })
+                .as_bytes()
+        };
+        Box::leak(Box::new(abi::NodeApiV1 {
+            header: {
+                let mut header = abi::TableHeaderV1::for_type::<abi::NodeApiV1>();
+                if fault {
+                    header.boundary_major = 9999;
+                }
+                header
+            },
+            metadata: abi::Bytes {
+                ptr: metadata.as_ptr(),
+                len: metadata.len() as u64,
+            },
+            required_host_capabilities: 0,
+            capabilities: 0,
+            create,
+            tick,
+            shutdown,
+            destroy,
+            copy_error,
+            query_extension,
+            state: std::ptr::null(),
+            external: std::ptr::null(),
+        }))
+    }) as *const _
+}
+cerulion_core::node_abi::export_node_api!(node_api);
+
+/// Diagnostic provenance is optional and is never a stable-load requirement.
 #[no_mangle]
 pub extern "C" fn cerulion_rustc_fingerprint() -> *const std::ffi::c_char {
-    match std::env::var("CER_RUSTC_FAULT") {
-        Ok(v) if v == "null" => std::ptr::null(),
-        Ok(_) => {
-            // test-only: a deliberately-fake fingerprint, kept in lockstep with
-            // `rustc_fingerprint_mismatch_test.rs::FAKE_FINGERPRINT`.
-            static FAKE: &[u8] = b"9.9.9 (deadbeefdead)\0";
-            FAKE.as_ptr() as *const std::ffi::c_char
-        }
-        Err(_) => cerulion_core::rustc_fingerprint_cstr(),
+    match std::env::var("CER_RUSTC_FAULT").as_deref() {
+        Ok("null") => std::ptr::null(),
+        Ok("1") => c"diagnostic-fault".as_ptr(),
+        _ => cerulion_core::rustc_fingerprint_cstr(),
     }
 }
-
-// This manual fixture mirrors the
-// macro-generated FFI surface. It never produces an error so the take
-// function always returns null, but it must export the symbols so the
-// loader's symbol-presence check passes at v3.
-#[no_mangle]
-pub extern "C" fn cerulion_take_last_error() -> *mut std::ffi::c_char {
-    std::ptr::null_mut()
-}
-
-/// # Safety
-///
-/// Pointer must be one previously returned by `cerulion_take_last_error`
-/// from this same cdylib (allocator pairing requirement); null is also
-/// allowed (no-op).
-#[no_mangle]
-pub unsafe extern "C" fn cerulion_free_error(ptr: *mut std::ffi::c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: per the function-level contract above; this fixture's
-    // take never returns non-null, but defining the free for symmetry
-    // keeps the contract complete.
-    let _ = std::ffi::CString::from_raw(ptr);
-}
+// CERULION:INFO_START
+static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";
 
 #[no_mangle]
 pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
+    // SAFETY: INFO_BYTES is a static &[u8] with a trailing null byte.
+    // Casting *const u8 to *const c_char is safe: identical layout, valid and 'static.
     INFO_BYTES.as_ptr() as *const std::ffi::c_char
 }
 
-/// Initialize a new node instance.
-///
-/// Receives `*mut NodeContext` (typed as `*mut u8` at the raw-FFI boundary —
-/// the host owns the concrete `NodeContext` type).
-/// Reclaim the host's `Box::into_raw(NodeContext)` via `Box::from_raw` so
-/// each init call doesn't leak one NodeContext. Ignoring the pointer
-/// (`let _ = ctx_ptr;`) would leak it; the leak is negligible for a test
-/// that passes an empty context, but the same pattern in the
-/// user-facing `generate_lib_rs` template would be a correctness defect,
-/// and reclaiming the context here keeps the
-/// test fixture faithful to the FFI ownership contract.
-///
-/// Returns a u64 handle (0 = error).
-#[no_mangle]
-pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
-    // SAFETY: `ctx_ptr` was produced by `Box::into_raw(Box::new(NodeContext))`
-    // in the host's `DylibNodeEntry::init` (cerulion_core/src/graph/node.rs).
-    // Reclaim via `Box::from_raw`; the Box drops at end of this scope.
-    let ctx = unsafe { Box::from_raw(ctx_ptr as *mut cerulion_core::graph::node::NodeContext) };
-
-    // A cdylib statically links its OWN `cerulion_core -> iceoryx2 ->
-    // iceoryx2-log`, so it has its OWN `LOG_LEVEL` static that the host's
-    // `set_log_level` cannot touch. The macro-generated `cerulion_node_init`
-    // applies `IOX2_LOG_LEVEL` from the node's FROZEN env snapshot; a
-    // HAND-WRITTEN raw-FFI node (this fixture, and anything grown from the
-    // `cerulion node create --raw-ffi` template) must do it itself. Reproduced here so
-    // `cdylib_iox2_log_level_test.rs` can pin the raw-FFI half of the contract
-    // behaviorally, over a real dlopen.
-    {
-        let iox2_log = ctx.env_str("IOX2_LOG_LEVEL", "");
-        cerulion_core::iceoryx_logger::init_iceoryx_log_level(if iox2_log.is_empty() {
-            None
-        } else {
-            Some(iox2_log.as_str())
-        });
-    }
-    // Env-gated probe (INERT for every other test that loads this fixture):
-    // report the level of THIS cdylib's own linked copy. Consumed by
-    // `cerulion_core/tests/cdylib_iox2_log_level_test.rs`.
-    // P12 exception: this line is a MACHINE-READ MARKER, not a log. The parent
-    // test process reads it off this cdylib's stderr; routing it through
-    // `tracing` would make it depend on a subscriber this fixture does not
-    // install and on RUST_LOG, which is exactly what the test is measuring.
-    #[allow(clippy::print_stderr)]
-    if std::env::var_os("CER_CDYLIB_IOX2_PROBE").is_some() {
-        eprintln!(
-            "RAWFFI_IOX2_LEVEL={}",
-            cerulion_core::iceoryx_logger::current_iox2_log_level()
-        );
-    }
-    drop(ctx);
-
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let mut guard = NODES.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(
-        handle,
-        NodeState {
-            ticks: 0,
-            tick_fail: std::env::var_os("CER_TICK_FAIL").is_some(),
-        },
-    );
-    handle
+fn __cer_raw_wire_metadata() -> std::ffi::CString {
+    let base = std::ffi::CStr::from_bytes_with_nul(INFO_BYTES)
+        .expect("static metadata has one trailing NUL");
+    cerulion_core::graph::node_plugin_abi::raw_metadata(base, &[], &[])
+        .expect("raw schema facts match declared ports")
 }
+// CERULION:INFO_END
 
-#[no_mangle]
-pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
-    let mut guard = NODES.lock().unwrap();
-    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-        // `CER_TICK_FAIL` at init (INERT for every other test that loads this
-        // fixture): fail the tick with code 1 and no message, the shape of an
-        // older cdylib that exports no `cerulion_take_last_error_kind`.
-        // Consumed by `cerulion_core/tests/node_error_kind_cdylib_test.rs`.
-        Some(state) if state.tick_fail => 1,
-        Some(state) => {
-            state.ticks += 1;
-            0
+fn retain_output_mode() -> bool {
+    std::env::var_os("CER_RETAIN_OUTPUT").is_some()
+}
+static RETAIN_METADATA: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+fn retain_metadata() -> std::ffi::CString {
+    use cerulion_core::message::ShmMessage;
+    let hash = native_ros2_messages::geometry_msgs::Vector3::SCHEMA_HASH;
+    std::ffi::CString::new(format!(r#"{{"inputs":[{{"name":"inp","trigger":true,"schema_hash":{hash},"wire_fixed_size":24,"variable_count":0,"alignment":8}}],"outputs":[{{"name":"out","schema_hash":{hash},"wire_fixed_size":24,"variable_count":0,"alignment":8}}],"policy":{{"data_trigger":{{"input_name":"inp"}}}}}}"#)).expect("valid metadata")
+}
+thread_local! {
+    static COLD_HOST: std::cell::Cell<Option<(abi::HostApiV1, abi::ContextHandle)>> = const { std::cell::Cell::new(None) };
+}
+struct RetainedOutput {
+    api: abi::HostApiV1,
+    context: abi::ContextHandle,
+    input: abi::PortHandle,
+    output: abi::PortHandle,
+    pending: Option<abi::LeaseHandle>,
+    ticks: u64,
+}
+fn accepted(result: abi::Status) -> cerulion_core::TransportResult<()> {
+    if result.code == abi::status_code::OK {
+        Ok(())
+    } else {
+        Err(cerulion_core::TransportError::NodeError {
+            node_id: "retained output fixture".into(),
+            reason: format!("host callback refused with status {}", result.code),
+        })
+    }
+}
+impl RetainedOutput {
+    fn new(
+        (api, context): (abi::HostApiV1, abi::ContextHandle),
+    ) -> cerulion_core::TransportResult<Self> {
+        let mut ports = [abi::PortHandle::default(); 2];
+        for (index, direction) in [abi::direction::INPUT, abi::direction::OUTPUT]
+            .into_iter()
+            .enumerate()
+        {
+            let mut binding = abi::PortBindingV1 {
+                port: abi::PortHandle::default(),
+                topic: abi::Bytes {
+                    ptr: std::ptr::null(),
+                    len: 0,
+                },
+                configured_capacity: 0,
+                read_mode: 0,
+            };
+            // SAFETY: checked cached table/code/context remain host-owned and live;
+            // admitted create lends exclusive initialized output for this call.
+            accepted(unsafe { (api.bind_port)(context, 0, direction, &mut binding) })?;
+            ports[index] = binding.port;
         }
-        None => 4, // handle not found
+        Ok(Self {
+            api,
+            context,
+            input: ports[0],
+            output: ports[1],
+            pending: None,
+            ticks: 0,
+        })
     }
-}
-
-// ABI v7: required symbol so the loader's
-// symbol-presence check passes at v7. This fixture's node has no
-// publishers, so servicing late joiners is a no-op — return 0 on a
-// known handle, mirroring tick's handle-lookup + code-4 not-found path.
-#[no_mangle]
-pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
-    let guard = NODES.lock().unwrap();
-    match guard.as_ref().and_then(|m| m.get(&handle)) {
-        Some(_state) => 0, // nothing to pump (no publishers)
-        None => 4,         // handle not found
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        use cerulion_core::message::ShmMessage;
+        if let Some(lease) = self.pending.take() {
+            // SAFETY: scalar lease belongs to this context, retained from the
+            // previous admitted tick; host owns its unchanged slot until finish.
+            accepted(unsafe { (self.api.finish_output)(self.context, lease, 64) })?;
+        }
+        let mut read = abi::ReadSlotV1 {
+            data: std::ptr::null(),
+            lease: abi::LeaseHandle::default(),
+            schema_hash: 0,
+            size: 0,
+            alignment: 0,
+        };
+        // SAFETY: admitted tick, checked input handle and exclusive initialized
+        // output; host retains the mapped frame until our terminal release below.
+        accepted(unsafe {
+            (self.api.receive_input)(self.context, self.input, abi::read_mode::ONE, &mut read)
+        })?;
+        let mut write = abi::WriteSlotV1 {
+            data: std::ptr::null_mut(),
+            lease: abi::LeaseHandle::default(),
+            schema_hash: 0,
+            capacity: 0,
+            configured_capacity: 0,
+            alignment: 0,
+            prefix_size: 0,
+        };
+        let request = abi::LoanRequestV1 {
+            schema_hash: native_ros2_messages::geometry_msgs::Vector3::SCHEMA_HASH,
+            minimum_capacity: 64,
+            wire_fixed_size: 24,
+            variable_count: 0,
+            alignment: 8,
+        };
+        // SAFETY: checked output handle/descriptor, admitted exclusive tick; the
+        // initialized result is borrowed until its scalar lease is consumed.
+        let loan =
+            unsafe { (self.api.loan_output)(self.context, self.output, request, &mut write) };
+        if loan.code == abi::status_code::OK
+            && !read.data.is_null()
+            && !write.data.is_null()
+            && read.size >= 64
+            && write.capacity >= 64
+        {
+            // SAFETY: distinct producer/read and node/output segments, validated
+            // fixed prefixes and live leases; 24 payload bytes stay within both.
+            unsafe {
+                std::slice::from_raw_parts_mut(write.data.add(40), 24)
+                    .copy_from_slice(std::slice::from_raw_parts(read.data.add(40), 24));
+            }
+            self.pending = Some(write.lease);
+        }
+        // SAFETY: admitted terminal release of exactly the live read lease; no
+        // reference to its mapping survives the synchronous payload transform.
+        accepted(unsafe { (self.api.release_input)(self.context, read.lease) })?;
+        accepted(loan)?;
+        if self.pending.is_none() {
+            // SAFETY: an admitted successful loan minted this scalar lease;
+            // malformed bounds refuse the frame and return it to its host owner.
+            accepted(unsafe {
+                (self.api.discard_output)(self.context, write.lease, abi::discard_reason::INVARIANT)
+            })?;
+            return Err(cerulion_core::TransportError::NodeError {
+                node_id: "retained output fixture".into(),
+                reason: "host returned a malformed fixed slot".into(),
+            });
+        }
+        self.ticks += 1;
+        if self.ticks > 1 {
+            if let Some(lease) = self.pending.take() {
+                // SAFETY: just-loaned host-owned slot initialized above, admitted
+                // terminal commit; sequence is assigned once by the host.
+                accepted(unsafe { (self.api.finish_output)(self.context, lease, 64) })?;
+            }
+        }
+        Ok(())
     }
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
-    // Parity with macro-generated FFI:
-    // a missing handle returns code 4, never a silent 0.
-    let mut guard = NODES.lock().unwrap();
-    match guard.as_mut().and_then(|m| m.remove(&handle)) {
-        Some(_) => 0,
-        None => 4, // handle not found
+    fn release(&mut self) -> cerulion_core::TransportResult<()> {
+        if let Some(lease) = self.pending.take() {
+            // SAFETY: admitted shutdown releases its retained slot once through
+            // its host owner; no node allocation or mapping is freed across C.
+            accepted(unsafe {
+                (self.api.discard_output)(self.context, lease, abi::discard_reason::TICK_FAILED)
+            })?;
+        }
+        Ok(())
     }
-}
-
-/// Helper for tests to read tick count for a given handle.
-#[no_mangle]
-pub extern "C" fn cerulion_test_get_tick_count(handle: u64) -> u64 {
-    let guard = NODES.lock().unwrap();
-    guard
-        .as_ref()
-        .and_then(|m| m.get(&handle))
-        .map_or(0, |state| state.ticks)
 }

@@ -27,9 +27,8 @@
 #   4. The heap hook: `cerulion ros2 run --adopt-take ...` is refused (exit
 #      69) with a direct-launch recipe naming the SHIPPED hook path; a talker
 #      run with CERULION_HEAPHOOK_DEBUG=1 prints the hook's own load
-#      breadcrumb twice, once from the python launcher (won_malloc=0, it
-#      loses to python's allocator) and once from the C++ node (won_malloc=1,
-#      proof the CLI auto-injected it and it won malloc there), and the node
+#      breadcrumb twice with won_malloc=1, once from the Python launcher and
+#      once from the C++ node, with no allocator-loss diagnostic. The node
 #      maps it; the same run with the hook file moved
 #      aside prints no breadcrumb and maps nothing, so the evidence is the
 #      file, not the environment. The adopt-take refusal itself names the
@@ -162,9 +161,11 @@ wait_for_line() {
     wait_file=$1
     wait_pattern=$2
     wait_deadline=$3
+    wait_min_count=${4:-1}
     wait_elapsed=0
     while [ "$wait_elapsed" -lt "$wait_deadline" ]; do
-        if grep -q -- "$wait_pattern" "$wait_file" 2>/dev/null; then
+        wait_count=$(grep -c -- "$wait_pattern" "$wait_file" 2>/dev/null || true)
+        if [ "${wait_count:-0}" -ge "$wait_min_count" ]; then
             return 0
         fi
         sleep 1
@@ -312,31 +313,34 @@ grep -q "LD_PRELOAD=$hook" "$out/adopt-take.log" || {
 printf 'adopt-take is refused with a recipe naming %s\n' "$hook"
 
 # 4b. Auto-injection: a talker with the hook's debug breadcrumb on. The
-# breadcrumb is written by the hook itself from inside the node, so it proves
-# the CLI prepended the hook AND that the hook won malloc resolution there.
+# breadcrumbs are written by the hook in the Python launcher and the node,
+# proving the CLI prepended the hook and it won malloc in both processes.
 stage="4b hook preloaded into a node"
 export CERULION_HEAPHOOK_DEBUG=1
 start_ros2 "$out/hook-talker.log" demo_nodes_cpp talker
 talker_pid=$started_pid
-# TWO breadcrumbs are expected, in this order, because `cerulion ros2 run`
-# puts the hook in the LD_PRELOAD of the python `ros2` launcher, which then
-# execs the C++ node, so the hook loads in BOTH processes: in the python
-# interpreter it loses malloc to python's own allocator (`won_malloc=0`,
-# expected and harmless), in the node it wins (`won_malloc=1`, the thing
-# the package ships it for). The seventh box attempt matched the launcher's
-# line first and read the node's before it was written; so the wait is for
-# the node's line specifically, and the launcher's is asserted afterwards.
-wait_for_line "$out/hook-talker.log" 'cerulion heap hook loaded: abi v[0-9]* won_malloc=1' "$listener_deadline" || {
+# Wait for BOTH processes to report a win. Python 3.12 in the Jazzy image
+# can expose an undefined canonical PLT import, but calls still bind to the
+# hook. Its executable import stub must not count as another allocator.
+# Waiting for two lines prevents checking the node before its constructor
+# has written the second breadcrumb.
+hook_won_pattern='^cerulion heap hook loaded: abi v[0-9][0-9]* won_malloc=1$'
+wait_for_line "$out/hook-talker.log" "$hook_won_pattern" "$listener_deadline" 2 || {
     cat "$out/hook-talker.log" >&2
     if grep -q 'cerulion heap hook loaded' "$out/hook-talker.log"; then
-        die "the heap hook loaded but no process reported winning malloc within ${listener_deadline}s (a node line with won_malloc=1 is expected after the launcher's won_malloc=0)"
+        die "the heap hook loaded but both processes did not report winning malloc within ${listener_deadline}s (the Python launcher and node must each report won_malloc=1)"
     fi
     die "the talker printed no heap hook breadcrumb; the hook was not preloaded"
 }
-grep -q 'cerulion heap hook loaded: abi v[0-9]* won_malloc=0' "$out/hook-talker.log" || {
+hook_won_count=$(grep -c -- "$hook_won_pattern" "$out/hook-talker.log" || true)
+[ "$hook_won_count" -eq 2 ] || {
     cat "$out/hook-talker.log" >&2
-    die "the python launcher's own breadcrumb (won_malloc=0) is missing; the hook was not in the launcher's LD_PRELOAD, so it reached the node some other way"
+    die "expected exactly two won_malloc=1 breadcrumbs, one from the Python launcher and one from the node"
 }
+if grep -q 'another allocator won malloc' "$out/hook-talker.log"; then
+    cat "$out/hook-talker.log" >&2
+    die "the hook reported an allocator loss; the Python launcher and node must both win malloc with the shipped hook alone"
+fi
 wait_for_line "$out/hook-talker.log" 'Publishing:' "$listener_deadline" ||
     die "the talker did not publish with the hook preloaded"
 node_pid=$(pgrep -n -f 'demo_nodes_cpp/talker' || true)
