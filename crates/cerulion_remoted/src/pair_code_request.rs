@@ -47,6 +47,16 @@
 //!    written, the code is disarmed again, which leaves no code armed (the
 //!    arm replaced an earlier one).
 //!
+//! A request equal to the one that armed the code this step tracks, its nonce
+//! and its code alike, while that code's end is not written, arms nothing
+//! ([`ArmOutcome::Repeated`], logged at info as [`REPEATED_LINE`]): a writer
+//! leaves its request again when it cannot tell whether the daemon claimed
+//! it, and may have removed the result first, so the next
+//! [`PairCodeArm::report`] writes the code's state again, its window still
+//! counted from the first arm and its failed tries kept. A request with the
+//! same nonce and another code, or one claimed after the code's end was
+//! written, is armed as any other.
+//!
 //! A claimed request that arms no code is refused
 //! ([`PairCodeRefusal`]): `unreadable` when the owner-only read or the removal
 //! of its claimed file fails, `malformed` when it does not parse, and
@@ -181,6 +191,11 @@ pub const STOP_FAILED_LINE: &str = "cerulion_remoted: the pair-code stop did not
 pub const LAST_WRITE_FAILED_LINE: &str = "cerulion_remoted: could not write the last pair-code \
                                           result for a code that is replaced or withdrawn; the \
                                           result file is removed and not written again";
+/// The line logged at info, with `ttl_s` and `tries`, when a claimed request
+/// names the code already armed from it ([`ArmOutcome::Repeated`]).
+pub const REPEATED_LINE: &str = "cerulion_remoted: the pair-code request names the code already \
+                                 armed from it; its state is written again and nothing new is \
+                                 armed";
 /// The work the serving-hold admission names for a pair-code request.
 const PAIR_CODE_WORK: &str = "a pair-code request, which waits for the next poll when refused";
 /// The refusal of a claimed request whose file could not be removed.
@@ -195,6 +210,10 @@ pub enum ArmOutcome {
     Nothing,
     /// The request's code is armed and the result is written.
     Armed,
+    /// The request equals the one that armed the code, whose end is not
+    /// written yet: nothing new is armed, and the next
+    /// [`PairCodeArm::report`] writes the code's state again.
+    Repeated,
     /// The claimed request was refused as `refusal`: no code is armed for it,
     /// the code an earlier request armed is disarmed, and the result says
     /// `refused` (a write that fails is retried by [`PairCodeArm::report`]).
@@ -316,12 +335,13 @@ fn claimed_bytes(read: Result<Option<Vec<u8>>, String>, removed: bool) -> Result
     }
 }
 
-/// The code this step armed last: its request's nonce, its arm in the store,
-/// and the generation and failed count its result last stated.
+/// The code this step armed last: the request that armed it, its arm in the
+/// store, and the generation and failed count its result last stated; `None`
+/// for the generation when the state is to be written again.
 struct Tracked {
-    nonce: PairCodeNonce,
+    request: PairCodeRequest,
     arm: u64,
-    written: u64,
+    written: Option<u64>,
     failed: u8,
 }
 
@@ -474,13 +494,45 @@ impl PairCodeArm {
         let removed = remove(&claimed);
         let (refusal, reason) = match claimed_bytes(read, removed) {
             Ok(bytes) => match PairCodeRequest::parse(&bytes) {
-                Ok(request) => return self.arm(&request),
+                Ok(request) => {
+                    if self.rewrite_if_repeat(&request) {
+                        return ArmOutcome::Repeated;
+                    }
+                    return self.arm(&request);
+                }
                 Err(e) => (PairCodeRefusal::Malformed, e.to_string()),
             },
             Err(reason) => (PairCodeRefusal::Unreadable, reason),
         };
         self.refuse(None, refusal, &reason);
         ArmOutcome::Refused { refusal, reason }
+    }
+
+    /// When `request` equals the one that armed the code this step tracks,
+    /// that code still armed in the store with its end not written, mark its
+    /// state to be written again by the next report and log the repeat;
+    /// whether it did.
+    fn rewrite_if_repeat(&self, request: &PairCodeRequest) -> bool {
+        let mut answer = self.answer();
+        let Some(Answer::Armed(t)) = answer.as_mut() else {
+            return false;
+        };
+        if t.request != *request
+            || self
+                .sessions
+                .snapshot()
+                .is_none_or(|snapshot| snapshot.arm != t.arm)
+        {
+            return false;
+        }
+        t.written = None;
+        drop(answer);
+        tracing::info!(
+            ttl_s = self.policy.ttl_ns / 1_000_000_000,
+            tries = self.policy.max_attempts,
+            "{REPEATED_LINE}"
+        );
+        true
     }
 
     /// The serving hold a request is armed under; `None` without holds.
@@ -559,9 +611,9 @@ impl PairCodeArm {
         match self.write_result(&result.render()) {
             Ok(()) => {
                 *self.answer() = Some(Answer::Armed(Tracked {
-                    nonce: request.nonce(),
+                    request: request.clone(),
                     arm: armed.armed.arm,
-                    written: armed.armed.generation,
+                    written: Some(armed.armed.generation),
                     failed: 0,
                 }));
                 tracing::info!(
@@ -649,7 +701,7 @@ impl PairCodeArm {
         };
         log_written(&last, t.failed);
         self.write_last(PairCodeResult::new(
-            t.nonce,
+            t.request.nonce(),
             self.endpoint_id,
             last.ttl_s,
             last.tries,
@@ -739,11 +791,11 @@ impl PairCodeArm {
             *answer = None;
             return ReportOutcome::Nothing;
         };
-        if snapshot.generation == t.written {
+        if t.written == Some(snapshot.generation) {
             return ReportOutcome::Nothing;
         }
         let result = PairCodeResult::new(
-            t.nonce,
+            t.request.nonce(),
             self.endpoint_id,
             snapshot.ttl_s,
             snapshot.tries,
@@ -761,7 +813,7 @@ impl PairCodeArm {
         self.report_worked();
         log_written(&snapshot, t.failed);
         let status = snapshot.state.status();
-        t.written = snapshot.generation;
+        t.written = Some(snapshot.generation);
         t.failed = snapshot.failed;
         if status.is_terminal() {
             let arm = t.arm;
@@ -912,7 +964,7 @@ impl PairCodeArm {
                     PairCodeState::Refused(PairCodeRefusal::Stopping)
                 };
                 PairCodeResult::new(
-                    t.nonce,
+                    t.request.nonce(),
                     self.endpoint_id,
                     last.ttl_s,
                     last.tries,
@@ -1110,7 +1162,7 @@ mod tests {
     use cerulion_pairing::pake::{CpaceConfirmed, CpaceInitiator, PakeIdentities};
 
     use crate::clock::MonotonicClock;
-    use crate::pairing_verbs::{code_exhausted, code_expired};
+    use crate::pairing_verbs::{code_exhausted, code_expired, CODE_USED};
 
     const T_ARM: u64 = 1_000_000_000_000;
     const SECOND: u64 = 1_000_000_000;
@@ -1387,11 +1439,11 @@ mod tests {
         f.clock.set(T_ARM + TTL_NS + 1);
         assert_refused(pair(&f.sessions, [4; 32], CODE), &code_expired());
 
-        // A code armed later counts from its own arm: the last instant of its
-        // window still pairs.
+        // A code armed later, by a request of its own, counts from its own
+        // arm: the last instant of its window still pairs.
         let later = T_ARM + 10 * TTL_NS;
         f.clock.set(later);
-        leave(&f.dir, &request_line(CODE), 0o600);
+        leave(&f.dir, &request_for(LATER_NONCE, CODE), 0o600);
         assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
         f.clock.set(later + TTL_NS);
         pair(&f.sessions, [4; 32], CODE).expect("in-window desk pairs");
@@ -3221,5 +3273,282 @@ mod tests {
         assert_eq!(f.arm.apply_request(), ArmOutcome::Nothing);
         assert_eq!(f.arm.claim_failures(), 0);
         assert_eq!(names(&f.dir), Vec::<String>::new());
+    }
+
+    /// Remove the result, as a writer does before it leaves its request
+    /// again, and leave `bytes` once more.
+    fn leave_again(f: &Fixture, bytes: &[u8]) {
+        std::fs::remove_file(f.dir.join(RESULT_FILE)).unwrap();
+        leave(&f.dir, bytes, 0o600);
+    }
+
+    /// The arm of the code armed in `sessions`.
+    fn armed_arm(sessions: &SharedCodePairSessions) -> u64 {
+        sessions.snapshot().expect("a code is armed").arm
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_request_left_again_for_the_armed_code_arms_nothing_and_has_its_state_written_again() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        leave_again(&f, &request_line(CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+        // The request is claimed and removed, and the same look's report
+        // writes the code's state again.
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Armed)
+        );
+        assert_eq!(names(&f.dir), vec![RESULT_FILE.to_string()]);
+        assert_eq!(f.result(), line(NONCE_HEX, "armed", 0, "- -"));
+        assert_eq!(f.arm.report(), ReportOutcome::Nothing, "written once");
+        // Nothing new was armed, withdrawn or refused.
+        assert_eq!(armed_arm(&f.sessions), 1);
+        assert_eq!(f.sessions.codes_withdrawn(), 0);
+        assert_eq!(f.sessions.requests_refused(), 0);
+        assert!(logs_contain(REPEATED_LINE));
+        assert!(logs_contain("ttl_s=600"));
+        assert!(logs_contain("tries=3"));
+        // DELIVERY: the code still pairs a desk, and the result says so.
+        pair(&f.sessions, [4; 32], CODE).expect("the repeated code pairs");
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Paired)
+        );
+        assert_eq!(
+            f.result(),
+            line(
+                NONCE_HEX,
+                "paired",
+                0,
+                &format!("{} lab-desk", "04".repeat(32))
+            )
+        );
+    }
+
+    #[test]
+    fn a_repeat_keeps_the_failed_tries_and_the_window_of_the_first_arm() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        wrong_try(&f.sessions, [1; 32]);
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Armed)
+        );
+        f.clock.set(T_ARM + 100 * SECOND);
+        leave_again(&f, &request_line(CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Armed)
+        );
+        assert_eq!(f.result(), line(NONCE_HEX, "armed", 1, "- -"));
+        // The window ends 600 s after the first arm, not after the repeat.
+        f.clock.set(T_ARM + TTL_NS);
+        assert_eq!(f.arm.report(), ReportOutcome::Nothing);
+        f.clock.set(T_ARM + TTL_NS + 1);
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Expired)
+        );
+        assert_eq!(f.result(), line(NONCE_HEX, "expired", 1, "- -"));
+    }
+
+    #[test]
+    fn only_the_same_request_while_its_end_is_not_written_is_a_repeat() {
+        // The same nonce with another code is armed, and the code it replaces
+        // is counted withdrawn.
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        leave_again(&f, &request_line(LATER_CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        assert_eq!(armed_arm(&f.sessions), 2);
+        assert_eq!(f.sessions.codes_withdrawn(), 1);
+        f.clock.set(T_ARM + RATE);
+        assert!(
+            pair(&f.sessions, [4; 32], CODE).is_err(),
+            "the replaced code no longer pairs"
+        );
+        f.clock.set(T_ARM + 2 * RATE);
+        pair(&f.sessions, [5; 32], LATER_CODE).expect("the later code pairs");
+
+        // A request claimed after its code's end was written is armed anew.
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        pair(&f.sessions, [4; 32], CODE).expect("the code pairs");
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Paired)
+        );
+        leave_again(&f, &request_line(CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        assert_eq!(armed_arm(&f.sessions), 2);
+        assert_eq!(f.result(), line(NONCE_HEX, "armed", 0, "- -"));
+
+        // Two repeats in a row arm nothing.
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        for _ in 0..2 {
+            leave_again(&f, &request_line(CODE));
+            assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+            assert_eq!(
+                f.arm.report(),
+                ReportOutcome::Written(PairCodeStatus::Armed)
+            );
+        }
+        assert_eq!(armed_arm(&f.sessions), 1);
+        assert_eq!(f.sessions.codes_withdrawn(), 0);
+        assert_eq!(f.result(), line(NONCE_HEX, "armed", 0, "- -"));
+    }
+
+    #[test]
+    fn a_request_left_again_after_a_pairing_not_yet_written_is_a_repeat_and_the_code_stays_used() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        // A desk pairs, and the writer's copy is claimed before the pairing
+        // is written.
+        pair(&f.sessions, [4; 32], CODE).expect("the code pairs");
+        leave_again(&f, &request_line(CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+        assert_eq!(armed_arm(&f.sessions), 1, "nothing new was armed");
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Paired)
+        );
+        assert_eq!(names(&f.dir), vec![RESULT_FILE.to_string()]);
+        assert_eq!(
+            f.result(),
+            line(
+                NONCE_HEX,
+                "paired",
+                0,
+                &format!("{} lab-desk", "04".repeat(32))
+            )
+        );
+        // DELIVERY of single use: a second desk with the same code is refused.
+        f.clock.set(T_ARM + RATE);
+        assert_refused(pair(&f.sessions, [5; 32], CODE), CODE_USED);
+        assert_eq!(f.sessions.codes_withdrawn(), 0);
+        assert_eq!(f.sessions.requests_refused(), 0);
+    }
+
+    #[test]
+    fn a_request_left_again_after_a_window_passed_unwritten_is_a_repeat_and_arms_no_new_window() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        // The window passes, and the writer's copy is claimed before the
+        // expiry is written.
+        f.clock.set(T_ARM + TTL_NS + 1);
+        leave_again(&f, &request_line(CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+        assert_eq!(armed_arm(&f.sessions), 1, "nothing new was armed");
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Expired)
+        );
+        assert_eq!(names(&f.dir), vec![RESULT_FILE.to_string()]);
+        assert_eq!(f.result(), line(NONCE_HEX, "expired", 0, "- -"));
+        // DELIVERY: the code gets no fresh window; a desk is refused expired.
+        assert_refused(pair(&f.sessions, [4; 32], CODE), &code_expired());
+        assert_eq!(f.sessions.codes_withdrawn(), 0);
+        assert_eq!(f.sessions.requests_refused(), 0);
+    }
+
+    #[test]
+    fn a_request_left_again_after_the_tries_were_used_up_unwritten_is_a_repeat_and_keeps_them() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        // Every shared try fails, and the writer's copy is claimed before the
+        // used-up code is written.
+        wrong_try(&f.sessions, [1; 32]);
+        f.clock.set(T_ARM + RATE);
+        wrong_try(&f.sessions, [2; 32]);
+        f.clock.set(T_ARM + 2 * RATE);
+        wrong_try(&f.sessions, [3; 32]);
+        leave_again(&f, &request_line(CODE));
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+        assert_eq!(armed_arm(&f.sessions), 1, "nothing new was armed");
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Exhausted)
+        );
+        assert_eq!(names(&f.dir), vec![RESULT_FILE.to_string()]);
+        assert_eq!(f.result(), line(NONCE_HEX, "exhausted", 3, "- -"));
+        // DELIVERY of the shared budget: the right code is still refused as
+        // used up, so the repeat gave no try back.
+        f.clock.set(T_ARM + 3 * RATE);
+        assert_refused(pair(&f.sessions, [4; 32], CODE), &code_exhausted(3));
+        assert_eq!(f.sessions.codes_withdrawn(), 0);
+        assert_eq!(f.sessions.requests_refused(), 0);
+    }
+
+    #[test]
+    fn a_repeat_writes_identically_on_two_runs() {
+        fn run() -> (Vec<String>, u64, u64, u64) {
+            let f = fixture();
+            let mut results = Vec::new();
+            leave(&f.dir, &request_line(CODE), 0o600);
+            assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+            results.push(f.result());
+            wrong_try(&f.sessions, [1; 32]);
+            f.arm.report();
+            results.push(f.result());
+            leave_again(&f, &request_line(CODE));
+            assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+            f.arm.report();
+            results.push(f.result());
+            (
+                results,
+                armed_arm(&f.sessions),
+                f.sessions.codes_withdrawn(),
+                f.sessions.requests_refused(),
+            )
+        }
+        let first = run();
+        assert_eq!(first, run());
+        assert_eq!(
+            first,
+            (
+                vec![
+                    line(NONCE_HEX, "armed", 0, "- -"),
+                    line(NONCE_HEX, "armed", 1, "- -"),
+                    line(NONCE_HEX, "armed", 1, "- -"),
+                ],
+                1,
+                0,
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn a_repeats_state_that_cannot_be_written_is_counted_and_written_by_the_next_look() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        leave_again(&f, &request_line(CODE));
+        // A non-empty directory at the staging name refuses each write.
+        std::fs::create_dir(f.dir.join(RESULT_STAGING_FILE)).unwrap();
+        std::fs::write(f.dir.join(RESULT_STAGING_FILE).join("x"), b"").unwrap();
+        assert_eq!(f.arm.apply_request(), ArmOutcome::Repeated);
+        assert!(matches!(f.arm.report(), ReportOutcome::Failed { .. }));
+        assert_eq!(f.arm.report_failures(), 1);
+        assert!(!f.dir.join(RESULT_FILE).exists());
+        std::fs::remove_dir_all(f.dir.join(RESULT_STAGING_FILE)).unwrap();
+        assert_eq!(
+            f.arm.report(),
+            ReportOutcome::Written(PairCodeStatus::Armed)
+        );
+        assert_eq!(f.result(), line(NONCE_HEX, "armed", 0, "- -"));
+        assert_eq!(f.arm.report_failures(), 1);
     }
 }

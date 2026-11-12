@@ -99,6 +99,9 @@ pub mod node_params_info;
 // iroh-free; the CPace ceremony lives in the spawned sibling). No `cerulion`
 // verb calls it while `cerulion pair` is a hidden stub.
 pub mod pair_cmd;
+// The robot side of code pairing: the decisions of one pairing code's run
+// over the robot-local file handoff, and the texts it shows.
+pub mod pair_start_cmd;
 /// `--robot NAME` on `topic pub`, `topic snapshot` and `service call`.
 pub mod robot_act;
 // Login-gated ownership at install: `register_robot` (`POST
