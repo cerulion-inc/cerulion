@@ -130,6 +130,13 @@ frames to the producer. A machine can serve and consume through the same owned
 endpoint. This is distinct from the ops `topic-publish` verb and its capability
 and e-stop checks.
 
+Account graph imports retain usable saved trust when a revocation refresh fails,
+including during an account-service outage or after session expiry. The failure
+is reported with the source robot and cause, and repeated failures are counted.
+Every reconnect still validates the pinned source identity and producer policy.
+The shared endpoint sends only the selected peer and peers with held readers;
+unrelated registered robots do not consume a request's framing budget.
+
 Each robot exports its own local producers. Imported graph topics and private
 observer channels keep their source robot's access policy: read them on that
 source robot. Schema reads without topic data use current producer metadata

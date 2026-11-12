@@ -2345,6 +2345,11 @@ Imported topics retain the source robot's access policy and are read remotely
 on that source robot, including when the consuming machine also serves graphs.
 Account ownership proofs remain valid when serving begins; a bounded restoration
 reports any unresolved ingress so it can reconnect.
+Account imports can use a saved authenticated directory when the account service
+is unreachable or the saved session has expired. A failed revocation refresh
+warns with the robot and cause; the import still checks the saved identity,
+source key and producer policy before requesting frames. Repeated refresh
+failures are counted and suppressed until recovery or a periodic reminder.
 Only graph runs that export producers require local serving authority, supplied
 by a prior login or an established local pairing. The serving gate starts no
 login transaction for producer-free runs.

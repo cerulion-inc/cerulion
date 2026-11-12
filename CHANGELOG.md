@@ -97,6 +97,8 @@ Semantic Versioning covers the graph YAML format, the `cerulion` command line an
 - `cerulion_remoted::shutdown::ShutdownStage` is the stage `serve_planes` runs when its accept loop stops, after it drops its shutdown future: each `ShutdownParticipant` registered on `OpsServing::shutdown_stage` is driven to settlement in order while the ops receipt log is alive, and after a stop signal the endpoint too. One that fails, panics or is cancelled is returned as `RemotedError::Shutdown`.
 
 ### Fixed
+- Graph imports keep usable saved authenticated trust when account revocation refresh is unavailable or the session has expired, with a counted warning and unchanged source checks.
+- Outbound shared-endpoint requests carry selected and held peers rather than the whole account membership, so unrelated robots do not exhaust the framing budget.
 - `cerulion-vizd` answers `list` and `status` from the last gathered mirror attribution instead of reading the mirror registry first whenever that attribution had expired, so a slow registry no longer holds their reply past the control client's deadline. A mirror attached by the local path shows the `robot` the last `discover` or local `attach` read; those two still refresh it.
 - Native Android account requests use verified system certificate roots without a Java context; client setup failures keep local topic reads available.
 - A successful session refresh has a separate bounded settlement window to save its replacement tokens, or revoke them after a concurrent sign-out, when the account store is briefly busy.

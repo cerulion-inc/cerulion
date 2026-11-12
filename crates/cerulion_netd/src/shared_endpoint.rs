@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Bounded same-user outbound mirrors on the remote server's owned endpoint.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::os::unix::net::UnixStream;
@@ -27,7 +27,7 @@ use crate::wan::{WanRegistry, WanRobot};
 
 const MAX_MESSAGE: usize = 256 * 1024;
 pub(crate) const MAX_CLIENTS: usize = 32;
-const MAX_ROBOTS: usize = 256;
+const MAX_REQUEST_PEERS: usize = 256;
 const MAX_ADDRESSES: usize = 16;
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -133,7 +133,7 @@ struct Configuration {
     peers: Vec<Peer>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     Probe {
@@ -170,6 +170,21 @@ enum Operation {
     },
     Sync,
     Invalidate,
+}
+
+impl Operation {
+    fn robot(&self) -> Option<&str> {
+        match self {
+            Self::Probe { robot, .. }
+            | Self::Catalog { robot, .. }
+            | Self::Schema { robot, .. }
+            | Self::Ensure { robot, .. }
+            | Self::Release { robot, .. }
+            | Self::HasReader { robot, .. }
+            | Self::Retire { robot } => Some(robot),
+            Self::Sync | Self::Invalidate => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -330,7 +345,7 @@ impl Configuration {
             .transpose()
     }
     fn robots(&self) -> Result<HashMap<String, WanRobot>, String> {
-        if self.peers.len() > MAX_ROBOTS {
+        if self.peers.len() > MAX_REQUEST_PEERS {
             return Err("outbound robot membership exceeds its limit".into());
         }
         let mut robots = HashMap::new();
@@ -362,11 +377,65 @@ impl Configuration {
 }
 
 /// A local connection owns all its mirrors; close is crash-safe release.
+struct ControlConnection {
+    stream: UnixStream,
+    readers: BTreeSet<TopicKey>,
+}
+
+impl ControlConnection {
+    fn record(&mut self, operation: &Operation, answer: &Answer) {
+        match (operation, answer) {
+            (
+                Operation::Ensure {
+                    robot,
+                    topic,
+                    observer,
+                    ..
+                },
+                Answer::Done,
+            ) => {
+                self.readers
+                    .insert(topic_key(robot.clone(), topic.clone(), *observer));
+            }
+            (
+                Operation::Release {
+                    robot,
+                    topic,
+                    observer,
+                },
+                Answer::Released(true),
+            )
+            | (
+                Operation::HasReader {
+                    robot,
+                    topic,
+                    observer,
+                },
+                Answer::Present(false),
+            ) => {
+                self.readers
+                    .remove(&topic_key(robot.clone(), topic.clone(), *observer));
+            }
+            (Operation::Retire { robot }, Answer::Done) => {
+                self.readers.retain(|key| key.robot != *robot);
+            }
+            (Operation::Sync, Answer::Retired(keys)) => {
+                for (robot, topic, observer) in keys {
+                    self.readers
+                        .remove(&topic_key(robot.clone(), topic.clone(), *observer));
+                }
+            }
+            (Operation::Invalidate, Answer::Done) => self.readers.clear(),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) struct SharedMirrorPlane {
     socket: PathBuf,
     manager: Arc<TransportManager>,
     registry: Arc<WanRegistry>,
-    connection: Mutex<Option<UnixStream>>,
+    connection: Mutex<Option<ControlConnection>>,
     invalidated: AtomicBool,
     transport_lost: AtomicBool,
 }
@@ -387,18 +456,31 @@ impl SharedMirrorPlane {
         }
     }
 
-    fn configuration(&self) -> Result<Configuration, String> {
-        let mut peers: Vec<_> = self
-            .registry
-            .membership_snapshot()?
-            .into_iter()
-            .map(|(name, peer)| Peer {
-                name,
-                key: *peer.eid.as_bytes(),
-                addresses: bounded_direct_addresses(peer.direct_addrs),
-            })
-            .collect();
-        peers.sort_by(|a, b| a.name.cmp(&b.name));
+    fn configuration(
+        &self,
+        operation: &Operation,
+        readers: Option<&BTreeSet<TopicKey>>,
+    ) -> Result<Configuration, String> {
+        // Keep membership refresh authoritative for live mirrors, without
+        // serializing unrelated account robots into every control request.
+        let mut names = BTreeSet::new();
+        if let Some(readers) = readers {
+            names.extend(readers.iter().map(|key| key.robot.clone()));
+        }
+        if let Some(robot) = operation.robot() {
+            names.insert(robot.to_owned());
+        }
+        let mut membership = self.registry.membership_snapshot()?;
+        let mut peers = Vec::new();
+        for name in names {
+            if let Some(peer) = membership.remove(&name) {
+                peers.push(Peer {
+                    name,
+                    key: *peer.eid.as_bytes(),
+                    addresses: bounded_direct_addresses(peer.direct_addrs),
+                });
+            }
+        }
         Ok(Configuration {
             key: DeviceIdentity::from_seed(&self.registry.desk_seed())
                 .public_key()
@@ -477,7 +559,7 @@ impl SharedMirrorPlane {
     fn lock_connection(
         &self,
         deadline: Option<Instant>,
-    ) -> Result<MutexGuard<'_, Option<UnixStream>>, String> {
+    ) -> Result<MutexGuard<'_, Option<ControlConnection>>, String> {
         let Some(deadline) = deadline else {
             return self
                 .connection
@@ -521,7 +603,7 @@ impl SharedMirrorPlane {
         if let Some(budget) = budget {
             // Discovery rows own no mirrors and cannot fence the persistent
             // connection on an offline peer, refusal or read timeout.
-            let configuration = self.configuration()?;
+            let configuration = self.configuration(&operation, None)?;
             let mut stream = UnixStream::connect(&self.socket)
                 .map_err(|_| "owned remote endpoint is not ready for outbound access")?;
             configure_stream(&stream)?;
@@ -554,7 +636,10 @@ impl SharedMirrorPlane {
         if self.invalidated.load(Ordering::Acquire) {
             return Err("outbound account changed; recreate the mirror plane".into());
         }
-        let configuration = self.configuration()?;
+        let configuration = self.configuration(
+            &operation,
+            connection.as_ref().map(|connection| &connection.readers),
+        )?;
         if connection.is_none() {
             let stream = if let Some(deadline) = deadline {
                 let address = socket2::SockAddr::unix(&self.socket)
@@ -572,13 +657,17 @@ impl SharedMirrorPlane {
                     .map_err(|_| "owned remote endpoint is not ready for outbound access")?
             };
             configure_stream(&stream)?;
-            *connection = Some(stream);
+            *connection = Some(ControlConnection {
+                stream,
+                readers: BTreeSet::new(),
+            });
         }
-        let stream = connection
+        let live = connection
             .as_mut()
             .ok_or("outbound connection was not constructed")?;
+        let stream = &mut live.stream;
         let result = if let Some(deadline) = deadline {
-            Self::request_until(stream, configuration, operation, deadline)
+            Self::request_until(stream, configuration, operation.clone(), deadline)
         } else {
             let deadline_setup = stream
                 .set_read_timeout(Some(CONTROL_TIMEOUT))
@@ -589,8 +678,11 @@ impl SharedMirrorPlane {
                 self.transport_lost.store(true, Ordering::Release);
                 return Err("outbound control deadline setup failed".into());
             }
-            Self::request(stream, configuration, operation)
+            Self::request(stream, configuration, operation.clone())
         };
+        if let Ok(answer) = &result {
+            live.record(&operation, answer);
+        }
         if matches!(result, Err(RequestError::Transport(_))) {
             // A framing failure fences the whole connection; never retry an operation
             // whose result may have been committed on the old endpoint.
@@ -613,15 +705,17 @@ impl SharedMirrorPlane {
         // for this lock before invalidation began.
         self.invalidated.store(true, Ordering::Release);
         let retired = match connection.as_mut() {
-            Some(stream) => self.configuration().and_then(|configuration| {
-                Self::request(stream, configuration, Operation::Invalidate)
-                    .map(|_| ())
-                    .map_err(RequestError::message)
-            }),
+            Some(live) => self
+                .configuration(&Operation::Invalidate, Some(&live.readers))
+                .and_then(|configuration| {
+                    Self::request(&mut live.stream, configuration, Operation::Invalidate)
+                        .map(|_| ())
+                        .map_err(RequestError::message)
+                }),
             None => Ok(()),
         };
-        if let Some(stream) = connection.take() {
-            let _closed = stream.shutdown(Shutdown::Both);
+        if let Some(live) = connection.take() {
+            let _closed = live.stream.shutdown(Shutdown::Both);
         }
         retired
     }

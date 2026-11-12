@@ -7,10 +7,10 @@ tracked `.gitignore` when creating `.cerulion/`; migrate polls with
 `acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
 Stage ports via `graph_cmd::stage_declared_node`.
 ## Invariants
-- Catalogs bind account/key; selectors resolve collisions. Paired skips implicit LAN; Open/locators/scan retain it; broken pairs diagnose. Refresh <=2s, save <=1s; enroll <=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; run warns if registration fails.
+- Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
 - Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
 - Paired graph producers need serving_authority; canonical ingress before GO retains pinned demands; refuse schema/QoS/writer mismatches.
-- Observers pin source/hash/channel; demand-free probes treat busy as unknown. Loss re-demands; graph inputs revalidate identity.
+- Observers pin source/hash/channel; busy=unknown. Loss re-demands, graph rechecks identity. Epoch errors retain trust and route latches on reconnect.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.
 - `account_robot_access`: netd opens WAN. Probes: 4 s (500 ms/robot), never pair/demand. Catalogs: 4 s; coalesce endpoint keys. LAN/account rows merge on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
   (`account_identity::pairing_account_id`). Login checks mapping, challenge,
