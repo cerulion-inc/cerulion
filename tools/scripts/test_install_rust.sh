@@ -83,9 +83,12 @@ case "$1" in
     toolchain)
         [ "$*" = 'toolchain install stable --profile minimal --no-self-update' ] || unexpected "$@"
         [ "${FIXTURE_FAIL_INSTALL:-0}" = 0 ] || exit 1
-        [ -z "${FIXTURE_BARRIER:-}" ] || sh "$FIXTURE_BARRIER"
+        # A fresh install has paused in the bootstrap already.
+        [ -z "${FIXTURE_BARRIER:-}" ] || [ -e "$FIXTURE_CASE/entered.$FIXTURE_ROLE" ] ||
+            sh "$FIXTURE_BARRIER"
         mkdir -p "$toolchains"
         printf '%s\n' "${FIXTURE_STABLE_RELEASE:-1.98.0}" > "$toolchains/stable"
+        printf '  stable-fixture installed - rustc %s (fixture)\n' "${FIXTURE_STABLE_RELEASE:-1.98.0}"
         ;;
     default)
         if [ "$#" -eq 1 ]; then
@@ -108,8 +111,11 @@ case "$1" in
 esac
 EOF
 # The fixture checks the exact HTTPS source and bootstrap arguments, then
-# installs the hand-written rustup into the requested Cargo home with stable
-# as its default toolchain, as the official installer does.
+# installs the hand-written rustup alone into the requested Cargo home, as the
+# official installer does with `--default-toolchain none`. Like rustup 1.29 it
+# prints its info lines on stderr, and its post-install note and the cc
+# crate's build-script lines from its linker check on stdout. A failing one
+# prints the same, then its error, and exits 1.
 cat > "$tools/curl" <<'EOF'
 #!/bin/sh
 set -eu
@@ -126,20 +132,75 @@ fi
 cat > "${15}" <<'INIT'
 #!/bin/sh
 set -eu
-[ "$*" = '-y --profile minimal --default-toolchain stable --no-modify-path' ]
-[ "${FIXTURE_FAIL_BOOTSTRAP:-0}" = 0 ] || exit 1
+[ "$*" = '-y --profile minimal --default-toolchain none --no-modify-path' ]
+cat "$FIXTURE_BOOTSTRAP_STDERR" >&2
+if [ "${FIXTURE_FAIL_BOOTSTRAP:-0}" != 0 ]; then
+    cat "$FIXTURE_BOOTSTRAP_STDOUT"
+    printf '%s\n' 'error: fixture bootstrap failed' >&2
+    exit 1
+fi
 [ -z "${FIXTURE_BARRIER:-}" ] || sh "$FIXTURE_BARRIER"
-mkdir -p "$CARGO_HOME/bin" "$RUSTUP_HOME/fixture-toolchains"
+mkdir -p "$CARGO_HOME/bin"
 cp "$FIXTURE_RUSTUP" "$CARGO_HOME/bin/rustup"
 chmod +x "$CARGO_HOME/bin/rustup"
-printf '%s\n' "${FIXTURE_STABLE_RELEASE:-1.98.0}" > "$RUSTUP_HOME/fixture-toolchains/stable"
-printf '%s\n' 'default_toolchain = "stable"' 'profile = "minimal"' > "$RUSTUP_HOME/settings.toml"
+printf '%s\n' 'profile = "minimal"' > "$RUSTUP_HOME/settings.toml"
+cat "$FIXTURE_BOOTSTRAP_STDOUT"
 INIT
 EOF
+# What rustup-init 1.29.3 printed on Ubuntu 24.04 with a C compiler installed.
+cat > "$work/bootstrap-stderr" <<'EOF'
+info: profile set to minimal
+info: default host tuple is aarch64-unknown-linux-gnu
+info: skipping toolchain installation
+EOF
+cat > "$work/bootstrap-stdout" <<'EOF'
+
+Rust is installed now. Great!
+
+To get started you need Cargo's bin directory ($HOME/.cargo/bin) in your PATH
+environment variable. This has not been done automatically.
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+Consider running the right command for your shell (note the leading DOT):
+. "$HOME/.cargo/env" # For sh/ash/dash/pdksh/bash
+cargo:rerun-if-env-changed=CC_aarch64-unknown-linux-gnu
+CC_aarch64-unknown-linux-gnu = None
+cargo:rerun-if-env-changed=CC_aarch64_unknown_linux_gnu
+CC_aarch64_unknown_linux_gnu = None
+cargo:rerun-if-env-changed=HOST_CC
+HOST_CC = None
+cargo:rerun-if-env-changed=CC
+CC = None
+cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+cargo:rerun-if-env-changed=CPATH
+cargo:rerun-if-env-changed=C_INCLUDE_PATH
+cargo:rerun-if-env-changed=CPLUS_INCLUDE_PATH
+cargo:rerun-if-env-changed=OBJC_INCLUDE_PATH
+cargo:rerun-if-env-changed=OBJCPLUS_INCLUDE_PATH
+cargo:rerun-if-env-changed=COMPILER_PATH
+cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH
+cargo:rerun-if-env-changed=GCC_EXEC_PREFIX
+cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+CRATE_CC_NO_DEFAULTS = None
+cargo:rerun-if-env-changed=CFLAGS
+CFLAGS = None
+cargo:rerun-if-env-changed=HOST_CFLAGS
+HOST_CFLAGS = None
+cargo:rerun-if-env-changed=CFLAGS_aarch64_unknown_linux_gnu
+CFLAGS_aarch64_unknown_linux_gnu = None
+cargo:rerun-if-env-changed=CFLAGS_aarch64-unknown-linux-gnu
+CFLAGS_aarch64-unknown-linux-gnu = None
+EOF
+# The lines of the bootstrap's stdout that must never reach a stream of a
+# successful install: every line but the blank ones.
+grep -v '^$' "$work/bootstrap-stdout" > "$work/bootstrap-lines"
 chmod +x "$tools/curl" "$work/rustup-fixture"
 # Bootstrap invokes sh explicitly; other tools cannot leak Rust from host PATH.
 ln -s /bin/sh "$tools/sh"
 export PATH="$tools" FIXTURE_RUSTUP="$work/rustup-fixture"
+export FIXTURE_BOOTSTRAP_STDOUT="$work/bootstrap-stdout" FIXTURE_BOOTSTRAP_STDERR="$work/bootstrap-stderr"
 export CARGO_HOME="$work/cargo 'home" RUSTUP_HOME="$work/rustup home"
 mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
 
@@ -238,21 +299,32 @@ grep -Fq 'default compiler and profile remain unchanged' "$work/orphaned.log"
 [ ! -e "$CARGO_HOME/bin/rustup" ]
 rm "$RUSTUP_HOME/settings.toml"
 
-# No Rust and no rustup: the official installer runs with stable as the
-# default toolchain, and that stable is used as it is.
+# No Rust and no rustup: the official installer installs rustup alone, then
+# rustup adds stable once and makes it the default. The bootstrap's stdout
+# reaches neither stream; its stderr and the toolchain step's stdout do.
 (
     unset HOME
     sh "$script_dir/install_rust.sh"
-) > "$work/fresh.log"
+) > "$work/fresh.log" 2> "$work/fresh.err" ||
+    { cat "$work/fresh.log" "$work/fresh.err" >&2; printf '%s\n' 'error: a fresh install failed' >&2; exit 1; }
 [ -x "$CARGO_HOME/bin/rustup" ]
-grep -Fq 'Installing current stable Rust/Cargo with rustup' "$work/fresh.log"
-grep -Fxq 'Rust/Cargo 1.98.0 is ready.' "$work/fresh.log"
+printf '%s\n' 'Installing current stable Rust/Cargo with rustup' \
+    '  stable-fixture installed - rustc 1.98.0 (fixture)' 'Rust/Cargo 1.98.0 is ready.' \
+    "Cargo executables: $CARGO_HOME/bin" > "$work/fresh.expected"
+cmp "$work/fresh.expected" "$work/fresh.log" ||
+    { printf '%s\n' 'error: fresh install stdout differs from the oracle' >&2; cat "$work/fresh.log" >&2; exit 1; }
+printf '%s\n' 'info: profile set to minimal' 'info: default host tuple is aarch64-unknown-linux-gnu' \
+    'info: skipping toolchain installation' > "$work/fresh-err.expected"
+cmp "$work/fresh-err.expected" "$work/fresh.err" ||
+    { printf '%s\n' 'error: fresh install stderr differs from the oracle' >&2; cat "$work/fresh.err" >&2; exit 1; }
 for proxy in rustup cargo rustc; do
     [ -L "$CARGO_HOME/bin/$proxy" ] || [ "$proxy" = rustup ]
 done
-if grep -Fq 'toolchain install' "$CARGO_HOME/calls"; then
-    printf '%s\n' 'error: the stable rustup just installed was installed again' >&2; exit 1
-fi
+[ "$(grep -c '^toolchain install' "$CARGO_HOME/calls")" -eq 1 ] ||
+    { printf '%s\n' 'error: a fresh install did not add stable exactly once' >&2; exit 1; }
+grep -Fxq 'toolchain install stable --profile minimal --no-self-update' "$CARGO_HOME/calls"
+grep -Fxq 'default stable' "$CARGO_HOME/calls"
+[ "$(cat "$RUSTUP_HOME/settings.toml")" = "$(printf '%s\n' 'profile = "minimal"' 'default_toolchain = "stable"')" ]
 
 # Ready in Cargo's home: a rerun prints the release and changes nothing.
 cp "$RUSTUP_HOME/settings.toml" "$work/settings-before"
@@ -320,6 +392,8 @@ cp "$RUSTUP_HOME/settings.toml" "$work/settings-before"
 : > "$CARGO_HOME/calls"
 sh "$script_dir/install_rust.sh" > "$work/old-default.log"
 grep -Fxq 'toolchain install stable --profile minimal --no-self-update' "$CARGO_HOME/calls"
+grep -Fxq 'Adding current stable Rust/Cargo alongside existing toolchains' "$work/old-default.log"
+grep -Fxq '  stable-fixture installed - rustc 1.98.0 (fixture)' "$work/old-default.log"
 if grep -Fq 'default stable' "$CARGO_HOME/calls"; then
     printf '%s\n' 'error: an existing default was replaced' >&2; exit 1
 fi
@@ -366,10 +440,27 @@ if FIXTURE_FAIL_DOWNLOAD=1 sh "$script_dir/install_rust.sh" > "$work/download.lo
     printf '%s\n' 'error: failed rustup download was accepted' >&2; exit 1
 fi
 grep -Fq 'could not download the official rustup installer' "$work/download.log"
-if FIXTURE_FAIL_BOOTSTRAP=1 sh "$script_dir/install_rust.sh" > "$work/init-fail.log" 2>&1; then
+# A failed bootstrap shows its whole stdout after its stderr, then the
+# helper's own error, and the helper exits 1.
+if FIXTURE_FAIL_BOOTSTRAP=1 sh "$script_dir/install_rust.sh" > "$work/init-fail.log" 2> "$work/init-fail.err"; then
     printf '%s\n' 'error: failed rustup bootstrap was accepted' >&2; exit 1
+else
+    init_fail_status=$?
 fi
-grep -Fq 'Rust/Cargo installation failed' "$work/init-fail.log"
+[ "$init_fail_status" -eq 1 ] ||
+    { printf 'error: a failed bootstrap exited %s, not 1\n' "$init_fail_status" >&2; exit 1; }
+printf '%s\n' 'Installing current stable Rust/Cargo with rustup' > "$work/init-fail.expected"
+cmp "$work/init-fail.expected" "$work/init-fail.log" ||
+    { printf '%s\n' 'error: a failed bootstrap wrote to stdout' >&2; cat "$work/init-fail.log" >&2; exit 1; }
+{
+    printf '%s\n' 'info: profile set to minimal' 'info: default host tuple is aarch64-unknown-linux-gnu' \
+        'info: skipping toolchain installation' 'error: fixture bootstrap failed'
+    cat "$work/bootstrap-stdout"
+    printf '%s\n' 'error: Rust/Cargo installation failed; Cerulion binaries have not been replaced'
+} > "$work/init-fail-err.expected"
+cmp "$work/init-fail-err.expected" "$work/init-fail.err" ||
+    { printf '%s\n' 'error: a failed bootstrap hid its output' >&2; cat "$work/init-fail.err" >&2; exit 1; }
+[ ! -e "$CARGO_HOME/bin/rustup" ]
 printf '%s\n' '#!/bin/sh' > "$tools/cargo"
 chmod +x "$tools/cargo"
 if sh "$script_dir/install_rust.sh" > "$work/unmanaged.log" 2>&1; then
@@ -566,6 +657,51 @@ grep -Fq 'archive is missing part of its Rust/Cargo setup' "$work/partial.log"
 rm "$stage/rustc-version.txt"
 cp "$work/install_rust.sh.current" "$stage/install_rust.sh"
 pack_archive
+
+# The installer on a machine with no Rust and no rustup, as the README runs
+# it: none of the bootstrap's stdout reaches either stream and the toolchain
+# step's stdout does. When the bootstrap fails, its whole stdout is shown
+# between its error and the helper's, and the installer exits 1.
+for fresh_case in pass fail; do
+    fresh_root=$work/fresh-installer-$fresh_case
+    mkdir -p "$fresh_root/cargo" "$fresh_root/rustup" "$fresh_root/installed"
+    if [ "$fresh_case" = pass ]; then fresh_fail=0; else fresh_fail=1; fi
+    if FIXTURE_FAIL_BOOTSTRAP=$fresh_fail PATH="$con_bin" CARGO_HOME="$fresh_root/cargo" \
+        RUSTUP_HOME="$fresh_root/rustup" sh "$script_dir/install.sh" --version v0.2.0 \
+        --base-url "file://$work/dist" --dir "$fresh_root/installed" \
+        > "$fresh_root/out.log" 2> "$fresh_root/err.log"; then
+        fresh_status=0
+    else
+        fresh_status=$?
+    fi
+    if [ "$fresh_case" = pass ]; then
+        [ "$fresh_status" -eq 0 ] || { cat "$fresh_root"/*.log >&2; exit 1; }
+        for fresh_log in out err; do
+            if grep -Fx -f "$work/bootstrap-lines" "$fresh_root/$fresh_log.log" >&2; then
+                printf 'error: the bootstrap stdout reached the installer %s\n' "$fresh_log" >&2; exit 1
+            fi
+        done
+        grep -Fxq '  stable-fixture installed - rustc 1.98.0 (fixture)' "$fresh_root/out.log"
+        grep -Fxq 'Rust/Cargo 1.98.0 is ready.' "$fresh_root/out.log"
+        cmp "$stage/cerulion" "$fresh_root/installed/cerulion"
+    else
+        [ "$fresh_status" -eq 1 ] ||
+            { printf 'error: a failed bootstrap made the installer exit %s, not 1\n' "$fresh_status" >&2; exit 1; }
+        {
+            printf '%s\n' 'error: fixture bootstrap failed'
+            cat "$work/bootstrap-stdout"
+            printf '%s\n' 'error: Rust/Cargo installation failed; Cerulion binaries have not been replaced' \
+                'error: Rust/Cargo setup failed; Cerulion binaries have not been replaced'
+        } > "$fresh_root/err.expected"
+        sed -n '/^error: fixture bootstrap failed$/,$p' "$fresh_root/err.log" > "$fresh_root/err.tail"
+        cmp "$fresh_root/err.expected" "$fresh_root/err.tail" ||
+            { printf '%s\n' 'error: the installer hid a failed bootstrap' >&2; cat "$fresh_root/err.log" >&2; exit 1; }
+        if grep -Fx -f "$work/bootstrap-lines" "$fresh_root/out.log" >&2; then
+            printf '%s\n' 'error: a failed bootstrap wrote to the installer stdout' >&2; exit 1
+        fi
+        [ ! -e "$fresh_root/installed/cerulion" ]
+    fi
+done
 
 # Real competing installers pause immediately before the fixture mutates Rust.
 # A failed real hardlink reports contention, so assertions need no guessed delay.

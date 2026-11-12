@@ -77,17 +77,20 @@ const RUSTUP_INIT_DOWNLOAD: [&str; 14] = [
 ];
 
 /// How the CLI runs the downloaded installer: the same arguments as
-/// `tools/scripts/install_rust.sh`. Shell startup files are left alone.
+/// `tools/scripts/install_rust.sh`. It installs rustup alone, and stable is
+/// added after it with [`RUSTUP_ADD_STABLE`]. Shell startup files are left
+/// alone.
 const RUSTUP_INIT_ARGS: [&str; 6] = [
     "-y",
     "--profile",
     "minimal",
     "--default-toolchain",
-    "stable",
+    "none",
     "--no-modify-path",
 ];
 
-/// How the CLI adds stable beside the toolchains an existing rustup manages.
+/// How the CLI adds stable beside the toolchains a rustup manages: an
+/// existing rustup, or the one the official installer just installed.
 const RUSTUP_ADD_STABLE: [&str; 6] = [
     "toolchain",
     "install",
@@ -295,7 +298,9 @@ pub enum InstallRoute {
     /// Stable added beside the toolchains this rustup already manages. Its
     /// default is set only when it has none.
     Rustup(Program),
-    /// The official rustup installer from `https://sh.rustup.rs`.
+    /// The official rustup installer from `https://sh.rustup.rs`, which
+    /// installs rustup alone; stable is then added as on the
+    /// [`Rustup`](Self::Rustup) route.
     RustupInit,
 }
 
@@ -696,26 +701,62 @@ fn rustup_has_default(rustup: &Path) -> bool {
 fn run_install(route: &InstallRoute) -> std::io::Result<bool> {
     match route {
         InstallRoute::Helper(helper) => run(Command::new(&helper.path)),
-        InstallRoute::Rustup(rustup) => {
-            let mut add = Command::new(&rustup.path);
-            add.args(RUSTUP_ADD_STABLE);
-            if !run(add)? {
-                return Ok(false);
-            }
-            // Only a missing default becomes stable.
-            if rustup_has_default(&rustup.path) {
-                return Ok(true);
-            }
-            let mut select = Command::new(&rustup.path);
-            select.args(["default", "stable"]);
-            run(select)
-        }
+        InstallRoute::Rustup(rustup) => add_stable(&rustup.path),
         InstallRoute::RustupInit => run_rustup_init(),
     }
 }
 
+/// Add stable beside the toolchains `rustup` manages, and make it the default
+/// only when there is none.
+fn add_stable(rustup: &Path) -> std::io::Result<bool> {
+    let mut add = Command::new(rustup);
+    add.args(RUSTUP_ADD_STABLE);
+    if !run(add)? {
+        return Ok(false);
+    }
+    if rustup_has_default(rustup) {
+        return Ok(true);
+    }
+    let mut select = Command::new(rustup);
+    select.args(["default", "stable"]);
+    run(select)
+}
+
 fn run(mut command: Command) -> std::io::Result<bool> {
     Ok(command.stdout(std::io::stderr()).status()?.success())
+}
+
+/// What of the bootstrap's held stdout is shown: nothing after a success,
+/// and every byte of it after a failure.
+fn bootstrap_stdout_shown(succeeded: bool, held: &[u8]) -> &[u8] {
+    if succeeded {
+        &[]
+    } else {
+        held
+    }
+}
+
+/// Run the official installer's bootstrap with its stdout held, and write
+/// what [`bootstrap_stdout_shown`] keeps of it to `shown`. Its stderr stays on
+/// this process's stderr.
+///
+/// The bootstrap's stdout carries rustup's post-install note and, in rustup
+/// 1.29, the cc crate's build-script lines from its default-linker check. The
+/// download progress of the toolchain is drawn by [`add_stable`], which keeps
+/// the terminal.
+fn run_bootstrap(mut command: Command, shown: &mut dyn Write) -> std::io::Result<bool> {
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()?;
+    let succeeded = output.status.success();
+    let held = bootstrap_stdout_shown(succeeded, &output.stdout);
+    if !held.is_empty() {
+        shown.write_all(held)?;
+        shown.flush()?;
+    }
+    Ok(succeeded)
 }
 
 /// Download the official installer into a private directory and run it.
@@ -749,7 +790,19 @@ fn download_and_run_rustup_init(script: &Path) -> std::io::Result<bool> {
     }
     let mut init = Command::new("sh");
     init.arg(script).args(RUSTUP_INIT_ARGS);
-    run(init)
+    if !run_bootstrap(init, &mut std::io::stderr())? {
+        return Ok(false);
+    }
+    let rustup = cargo_home_bin()
+        .map(|dir| dir.join("rustup"))
+        .filter(|rustup| is_executable_file(rustup))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the official installer left no rustup in Cargo's home",
+            )
+        })?;
+    add_stable(&rustup)
 }
 
 #[cfg(test)]
@@ -1069,7 +1122,7 @@ mod tests {
         );
         assert_eq!(
             RUSTUP_INIT_ARGS.join(" "),
-            "-y --profile minimal --default-toolchain stable --no-modify-path"
+            "-y --profile minimal --default-toolchain none --no-modify-path"
         );
         assert_eq!(
             RUSTUP_ADD_STABLE.join(" "),
@@ -1084,12 +1137,134 @@ mod tests {
              --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o"
         ));
         assert!(script.contains(
-            "sh \"$temp/rustup-init.sh\" -y --profile minimal --default-toolchain stable \
-             --no-modify-path"
+            "sh \"$temp/rustup-init.sh\" -y --profile minimal --default-toolchain none \
+             --no-modify-path \\\n        > \"$temp/rustup-init.out\"; then\n        \
+             cat \"$temp/rustup-init.out\" >&2 || :\n"
         ));
         assert!(script
             .contains("\"$rustup\" toolchain install stable --profile minimal --no-self-update"));
         assert!(script.contains("\nrust_floor=1.95\n"));
+    }
+
+    /// The lines rustup-init 1.29.3 printed on stdout after its post-install
+    /// note on Ubuntu 24.04 with a C compiler installed, cut to the first four.
+    const CC_LINES: &[u8] = b"cargo:rerun-if-env-changed=CC_aarch64-unknown-linux-gnu\n\
+        CC_aarch64-unknown-linux-gnu = None\n\
+        cargo:rerun-if-env-changed=CC_aarch64_unknown_linux_gnu\n\
+        CC_aarch64_unknown_linux_gnu = None\n";
+
+    #[test]
+    fn bootstrap_stdout_is_shown_only_after_a_failure() {
+        let empty: &[u8] = b"";
+        assert_eq!(bootstrap_stdout_shown(true, CC_LINES), empty);
+        assert_eq!(bootstrap_stdout_shown(true, b"partial\n"), empty);
+        assert_eq!(bootstrap_stdout_shown(true, b""), empty);
+        assert_eq!(bootstrap_stdout_shown(false, b"partial\n"), b"partial\n");
+        assert_eq!(bootstrap_stdout_shown(false, b"no newline"), b"no newline");
+        assert_eq!(
+            bootstrap_stdout_shown(false, CC_LINES),
+            b"cargo:rerun-if-env-changed=CC_aarch64-unknown-linux-gnu\n\
+              CC_aarch64-unknown-linux-gnu = None\n\
+              cargo:rerun-if-env-changed=CC_aarch64_unknown_linux_gnu\n\
+              CC_aarch64_unknown_linux_gnu = None\n"
+        );
+        assert_eq!(bootstrap_stdout_shown(false, b""), empty);
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    /// A bootstrap that prints the cc lines, then exits 0 or with the status.
+    #[cfg(unix)]
+    fn bootstrap_printing_cc_lines(status: u8) -> Command {
+        sh(&format!(
+            "printf '%s\\n' 'cargo:rerun-if-env-changed=CC_aarch64-unknown-linux-gnu' \
+             'CC_aarch64-unknown-linux-gnu = None' \
+             'cargo:rerun-if-env-changed=CC_aarch64_unknown_linux_gnu' \
+             'CC_aarch64_unknown_linux_gnu = None'; exit {status}"
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bootstrap_that_succeeds_shows_none_of_its_stdout() {
+        let mut shown = Vec::new();
+        assert!(run_bootstrap(bootstrap_printing_cc_lines(0), &mut shown).unwrap());
+        assert_eq!(shown, b"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bootstrap_that_fails_shows_every_byte_of_its_stdout_and_none_of_its_stderr() {
+        let mut shown = Vec::new();
+        assert!(!run_bootstrap(bootstrap_printing_cc_lines(1), &mut shown).unwrap());
+        assert_eq!(shown, CC_LINES);
+        for (script, expected) in [
+            ("printf 'partial'; exit 3", &b"partial"[..]),
+            (
+                "printf 'info: kept on stderr\\n' >&2; printf 'out\\n'; exit 1",
+                b"out\n",
+            ),
+            ("exit 1", b""),
+        ] {
+            let mut shown = Vec::new();
+            assert!(!run_bootstrap(sh(script), &mut shown).unwrap(), "{script}");
+            assert_eq!(shown, expected, "{script}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bootstrap_shows_the_same_bytes_on_every_run() {
+        let runs: Vec<(bool, Vec<u8>)> = (0..2)
+            .map(|_| {
+                let mut shown = Vec::new();
+                let succeeded = run_bootstrap(bootstrap_printing_cc_lines(2), &mut shown).unwrap();
+                (succeeded, shown)
+            })
+            .collect();
+        assert_eq!(runs[0], (false, CC_LINES.to_vec()));
+        assert_eq!(runs[0], runs[1]);
+    }
+
+    #[test]
+    fn a_bootstrap_that_cannot_start_is_an_error_and_shows_nothing() {
+        let mut shown = Vec::new();
+        let error = run_bootstrap(
+            Command::new("/nonexistent/cerulion-rust-setup-test/rustup-init"),
+            &mut shown,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(shown.is_empty());
+    }
+
+    /// A stream that refuses every write and flush.
+    struct Refusing;
+
+    impl Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// Showing a failed bootstrap's stdout can fail, and says so; a
+    /// successful one shows nothing, so a stream that refuses writes is never
+    /// touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_that_refuses_the_failed_bootstraps_stdout_is_an_error() {
+        let error = run_bootstrap(bootstrap_printing_cc_lines(1), &mut Refusing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(run_bootstrap(bootstrap_printing_cc_lines(0), &mut Refusing).unwrap());
+        assert!(!run_bootstrap(sh("exit 1"), &mut Refusing).unwrap());
     }
 
     #[test]
