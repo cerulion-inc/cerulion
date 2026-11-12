@@ -303,6 +303,7 @@ fn build_watcher(obs: Arc<CrashObs>) -> GraphRuntime {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: CRASH_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

@@ -27,6 +27,7 @@
 //! - Insertion order = execution order (Principle #5: Graph is source of truth)
 //! - Integer nanosecond arithmetic throughout (no floating-point drift)
 
+pub mod block;
 pub mod catchup_clamp;
 // The clamp's WIRING pins (all three `decide_node` call
 // sites + the once-per-step read). In-crate because two of the three sites are
@@ -661,6 +662,14 @@ struct ScheduledNode {
     /// them — and `None` contributes nothing, so an untouched graph's wake
     /// sizing is byte-identical.
     throttle_ns: Option<u64>,
+
+    /// The `block` hold of a producer with `block` consumers, read only by
+    /// [`Scheduler::ns_until_next_fire`]: when a due node held by a full
+    /// credit slot can next fire ([`crate::scheduler::block::node_hold`]).
+    /// The decision stays in `pre_fire_check`; both read the same slots and
+    /// stall marks, and this read changes neither. `None` for every node
+    /// without a `block` consumer, which contributes nothing.
+    block_hold: Option<Arc<dyn Fn() -> crate::scheduler::block::BlockHold + Send + Sync>>,
 
     /// How many times a TRACE-DRIVEN fire burst
     /// ([`FireKind::Replay`]) asked this node's [`TriggerRefill`] hook for the
@@ -2205,11 +2214,17 @@ impl Scheduler {
         }
     }
 
-    /// Nanoseconds until the soonest pending `Period` fire,
-    /// or `None` if no enabled Period node has a pending deadline and no
-    /// enabled Data node carries a FIFO backlog (which reports due-NOW). PURE
+    /// Nanoseconds until the soonest pending fire, or `None` if no enabled
+    /// node has one with a deadline: a node held by a `block` slot that only
+    /// a drain or a release frees contributes none. A Period node reports its
+    /// next deadline; a node due NOW
+    /// reports 0: a Data node carrying a FIFO backlog, a Sync node carrying a
+    /// Sync backlog (a complete aligned set it has not fired), or an External
+    /// node with a pending mark (a fire a pre-fire check deferred). PURE
     /// READ — reads only `policy` + `next_fire_ns` + `pending_data_count` +
-    /// `data_backlog_hint` + the disabled flag; performs no
+    /// `data_backlog_hint` + `sync_backlog_hint` + `external_triggered` + the
+    /// disabled flag, and a due node's throttle
+    /// window and `block` hold (a read of its credit slots); performs no
     /// `advance`/`fire`/trace/mutation. Called ONLY from the live loop
     /// (`GraphRuntime::run_live`) to size the WaitSet timeout so a `period_ms`
     /// node fires on time between data events. NEVER called from
@@ -2245,6 +2260,16 @@ impl Scheduler {
                     // waits for an unrelated publish to wake the loop, or for the
                     // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
                     TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
+                    // An External node whose mark the last step left set owes
+                    // a fire that a pre-fire check (a full `block` slot or
+                    // `throttle_ms`) deferred. For a doorbell or pipe source
+                    // nothing rings for it again: the sweep drained the source
+                    // when it set the mark. A device fd source stays ready
+                    // until the node reads it. Either way the node is due NOW,
+                    // so the throttle window and the `block` hold below bound
+                    // the wait at the instant it can fire. An unmarked
+                    // External node owes nothing and adds no deadline.
+                    TriggerPolicy::External if n.external_triggered => Some(0),
                     _ => None,
                 }?;
                 // A node that is DUE but THROTTLE-DEFERRED
@@ -2259,14 +2284,25 @@ impl Scheduler {
                 // cannot reach this arm anyway (`throttle_ms` and `period_ms`
                 // are mutually exclusive at the macro), so in practice this
                 // lifts a `Some(0)` to the remaining window.
-                //
-                // BLOCK-deferred nodes are deliberately NOT covered: block has
-                // its own wake channel (the credit word), and a deadline the
-                // loop polls toward would race the wake it now has.
-                Some(match n.throttle_remaining_ns(now_ns) {
+                let due = match n.throttle_remaining_ns(now_ns) {
                     Some(remaining) => due.max(remaining),
                     None => due,
-                })
+                };
+                // A node held by a full `block` slot is due by the same
+                // signals and cannot run either. It runs at the earliest
+                // `block_timeout_ms` release of its full slots, or after a
+                // drain or a release, each of which wakes the loop itself (the
+                // consumer drains on this level loop, or the peer's drain
+                // rings the credit park). A slot the loop may not wait on, or
+                // whose stall clock the next evaluation must start, keeps the
+                // node due.
+                match n.block_hold.as_ref().map(|hold| hold()) {
+                    None | Some(crate::scheduler::block::BlockHold::Clear) => Some(due),
+                    Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
+                        Some(due.max(at_ns.saturating_sub(now_ns)))
+                    }
+                    Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+                }
             })
             .min()
     }
@@ -2519,6 +2555,7 @@ impl Scheduler {
             // Installed at graph build for nodes that
             // declare `throttle_ms`; absent means the node has no rate cap.
             throttle_ns: None,
+            block_hold: None,
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
             replay_trailing_refill: false,
@@ -4415,6 +4452,29 @@ impl Scheduler {
                 node_id: node_id.to_string(),
             })?;
         node.throttle_ns = Some(throttle_ns);
+        Ok(())
+    }
+
+    /// Install `node_id`'s `block` hold, so [`Self::ns_until_next_fire`]
+    /// reports when a node held by a full credit slot can next fire instead
+    /// of `Some(0)` for as long as it is held.
+    ///
+    /// Paired with [`Self::set_pre_fire_check`] at the graph build, over the
+    /// same slots: the closure owns the decision, this owns the wake sizing.
+    /// Without it a held node keeps the 1 ms floor re-evaluation.
+    // hot-path-alloc-ok-fn: cold: a graph-BUILD setter; the `to_string` names
+    // an unknown node on a refusal that ends the build.
+    pub fn set_block_hold<F>(&mut self, node_id: &str, hold: F) -> TransportResult<()>
+    where
+        F: Fn() -> crate::scheduler::block::BlockHold + Send + Sync + 'static,
+    {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        node.block_hold = Some(Arc::new(hold));
         Ok(())
     }
 
@@ -9420,8 +9480,8 @@ pub fn record_backpressure_event_n(
                     input = %input_name,
                     policy = "block",
                     total,
-                    "backpressure event: producer's tick deferred (sole-Block-consumer-full \
-                     or all-Block-buffers-full) — no data lost, \
+                    "backpressure event: producer's tick deferred because this `block` \
+                     consumer's credit slot is full; no data lost, \
                      `backpressure_block_fires_deferred_count` incremented"
                 );
             } else {
@@ -11312,6 +11372,115 @@ mod tests {
         // At the cap it is accepted.
         s.set_replay_fire_plan(0, &plan(cap)).unwrap();
         s.set_replay_trailing_refills(0, &["sink"]).unwrap();
+    }
+
+    fn add_external(scheduler: &mut Scheduler, id: &str, fires: &Arc<AtomicU64>) {
+        let fires = Arc::clone(fires);
+        scheduler
+            .add_node(NodeConfig {
+                id: id.to_string(),
+                policy: TriggerPolicy::External,
+                callback: Box::new(move || {
+                    fires.fetch_add(1, Ordering::Relaxed);
+                }),
+            })
+            .unwrap();
+    }
+
+    /// An External node's mark that a full `block` slot deferred is a fire
+    /// owed with nothing left to ring, so the wait sizing reports the slot's
+    /// release deadline. Unmarked, the same held node reports nothing.
+    #[test]
+    fn a_deferred_external_mark_reports_its_block_release_deadline() {
+        use crate::scheduler::block::BlockHold;
+        use std::sync::atomic::AtomicBool;
+        const RELEASE_AT_NS: u64 = 10_000_000;
+
+        let clock = Arc::new(crate::clock::VirtualClock::new());
+        let mut s = Scheduler::with_virtual_clock(Arc::clone(&clock));
+        let fires = Arc::new(AtomicU64::new(0));
+        add_external(&mut s, "ext", &fires);
+        let held = Arc::new(AtomicBool::new(true));
+        let gate = Arc::clone(&held);
+        s.set_pre_fire_check("ext", move |_now_ns| gate.load(Ordering::Relaxed))
+            .unwrap();
+        let hold = Arc::clone(&held);
+        s.set_block_hold("ext", move || {
+            if hold.load(Ordering::Relaxed) {
+                BlockHold::Until(RELEASE_AT_NS)
+            } else {
+                BlockHold::Clear
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            s.ns_until_next_fire(0),
+            None,
+            "unmarked, a held External node owes no fire and adds no deadline"
+        );
+        s.trigger_external("ext").unwrap();
+        s.step(Duration::ZERO);
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            0,
+            "the full slot deferred the mark"
+        );
+        assert_eq!(s.ns_until_next_fire(0), Some(RELEASE_AT_NS));
+        assert_eq!(s.ns_until_next_fire(4_000_000), Some(6_000_000));
+
+        held.store(false, Ordering::Relaxed);
+        s.step(Duration::from_millis(10));
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            1,
+            "the released mark fires once"
+        );
+        assert_eq!(
+            s.ns_until_next_fire(10_000_000),
+            None,
+            "served, the node owes nothing again"
+        );
+    }
+
+    /// The same for a mark a `throttle_ms` window deferred: the wait sizing
+    /// reports the end of the window.
+    #[test]
+    fn a_deferred_external_mark_reports_its_throttle_deadline() {
+        const THROTTLE_NS: u64 = 50_000_000;
+        const FIRED_AT_NS: u64 = 10_000_000;
+
+        let clock = Arc::new(crate::clock::VirtualClock::new());
+        let mut s = Scheduler::with_virtual_clock(Arc::clone(&clock));
+        let fires = Arc::new(AtomicU64::new(0));
+        add_external(&mut s, "ext", &fires);
+        s.set_throttle_ns("ext", THROTTLE_NS).unwrap();
+        let handle = s.node_handle("ext").unwrap();
+        s.set_pre_fire_check("ext", move |now_ns| {
+            crate::graph::runtime::throttle_defers(
+                handle.fire_count(),
+                now_ns,
+                handle.last_fire_ns(),
+                THROTTLE_NS,
+            )
+        })
+        .unwrap();
+
+        clock.set(FIRED_AT_NS);
+        s.trigger_external("ext").unwrap();
+        s.step(Duration::ZERO);
+        assert_eq!(fires.load(Ordering::Relaxed), 1, "the first mark fires");
+        assert_eq!(s.ns_until_next_fire(FIRED_AT_NS), None, "and is spent");
+
+        s.trigger_external("ext").unwrap();
+        s.step(Duration::ZERO);
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            1,
+            "the throttle deferred the second"
+        );
+        assert_eq!(s.ns_until_next_fire(FIRED_AT_NS), Some(THROTTLE_NS));
+        assert_eq!(s.ns_until_next_fire(35_000_000), Some(25_000_000));
     }
 }
 

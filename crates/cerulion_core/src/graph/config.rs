@@ -403,10 +403,14 @@ fn is_default_reliability(r: &EgressReliability) -> bool {
 ///     external: true                  # published by a process outside this graph
 ///   - topic: /robot/camera/image
 ///     send_queue: 32                  # frames the gateway queues while the link is congested
+///   - topic: /robot/status
+///     backpressure: drop_oldest       # what egress always does; `block` is refused
 /// ```
 ///
 /// The bare string is the map with no `reliability`, no `send_queue` and
 /// `external: false`, and such an entry serializes back to the bare string.
+/// `backpressure:` is accepted only as `drop_oldest`, which parses to the
+/// same entry as no key; `backpressure: block` is refused by name.
 /// Unknown map keys are a parse error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTopic {
@@ -561,6 +565,10 @@ struct EgressTopicMap {
     external: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     send_queue: Option<NonZeroUsize>,
+    /// Accepted only as `drop_oldest`, which is what network egress always
+    /// does; `block` is refused at parse, by name.
+    #[serde(default, skip_serializing)]
+    backpressure: Option<InputBackpressure>,
 }
 
 impl Serialize for EgressTopic {
@@ -573,6 +581,7 @@ impl Serialize for EgressTopic {
                 reliability: self.reliability,
                 external: self.external,
                 send_queue: self.send_queue,
+                backpressure: None,
             }
             .serialize(serializer)
         }
@@ -586,8 +595,8 @@ impl<'de> Deserialize<'de> for EgressTopic {
             type Value = EgressTopic;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(
-                    "a topic name, or a map with `topic` and optional `reliability`, `external` \
-                     and `send_queue`",
+                    "a topic name, or a map with `topic` and optional `reliability`, `external`, \
+                     `send_queue` and `backpressure`",
                 )
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EgressTopic, E> {
@@ -599,6 +608,15 @@ impl<'de> Deserialize<'de> for EgressTopic {
             ) -> Result<EgressTopic, A::Error> {
                 let m =
                     EgressTopicMap::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                if m.backpressure == Some(InputBackpressure::Block) {
+                    return Err(serde::de::Error::custom(format!(
+                        "network egress topic '{}' sets `backpressure: block`, which network \
+                         egress cannot honour: the gateway's zenoh put never blocks and drops \
+                         under congestion, so no credit can reach the producer from another \
+                         host. Remove the key (egress is always `drop_oldest`)",
+                        m.topic
+                    )));
+                }
                 Ok(EgressTopic {
                     topic: m.topic,
                     reliability: m.reliability,
@@ -875,11 +893,53 @@ pub fn scalar_param_value(value: &serde_yaml::Value) -> Option<String> {
 ///
 /// `#[serde(deny_unknown_fields)]`: a misspelled key is a loud parse error,
 /// never a silently dropped setting — see [`GraphConfig`] for the rationale.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// The three optional keys set this edge's backpressure from the graph
+/// instead of the node's `#[input(...)]` attribute; each key present wins over
+/// the attribute's value. `block_timeout_ms` is legal only on an edge whose
+/// effective policy is `block`, on a topic with at most one in-graph producer
+/// that `multi_publisher_topics` does not list, whose producer runs in the
+/// consumer's process group (or with `--single-process`).
+///
+/// ```yaml
+/// inputs:
+///   - name: cmd
+///     source: /planner/cmd
+///     backpressure: block
+///     depth: 4
+///     block_timeout_ms: 250
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputDef {
     pub name: String,
     pub source: String,
+    /// `block` or `drop_oldest`; absent keeps the node's declared policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<InputBackpressure>,
+    /// The input's queue depth (1 to 64); absent keeps the node's declared
+    /// depth. Under `block` it is also the defer line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    /// Under `block`: release this consumer's slot once it has stayed full,
+    /// with nothing drained, for this many milliseconds. Absent: the producer
+    /// stays deferred until the consumer drains or dies. Graph load refuses it
+    /// on a topic with more than one in-graph producer or listed in
+    /// `multi_publisher_topics`, and on an edge whose producer runs in another
+    /// process group or executor unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_timeout_ms: Option<u64>,
+}
+
+/// The backpressure policy a graph's `inputs[].backpressure` key names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBackpressure {
+    /// Evict the oldest queued frame when the queue is full; never defers the
+    /// producer.
+    DropOldest,
+    /// Defer the producer while this consumer's queue is at depth.
+    Block,
 }
 
 /// Default buffer size when graph YAML omits `max_slice_len:` AND
@@ -1022,6 +1082,140 @@ mod network_block_tests {
     //! so they carry no hostname/prefix-defaulting dependency — the field
     //! mapping and mode-string parsing are pinned in isolation.
     use super::*;
+
+    /// The per-input backpressure keys parse, and serialize back only when
+    /// set.
+    #[test]
+    fn input_backpressure_keys_parse_and_round_trip() {
+        let yaml = r#"
+prefix: robo
+nodes:
+  - id: sink
+    type: sink
+    inputs:
+      - name: cmd
+        source: /planner/cmd
+        backpressure: block
+        depth: 4
+        block_timeout_ms: 250
+      - name: plain
+        source: /planner/plain
+"#;
+        let config: GraphConfig = serde_yaml::from_str(yaml).unwrap();
+        let i = &config.nodes[0].inputs[0];
+        assert_eq!(i.backpressure, Some(InputBackpressure::Block));
+        assert_eq!((i.depth, i.block_timeout_ms), (Some(4), Some(250)));
+        let plain = &config.nodes[0].inputs[1];
+        assert_eq!(
+            (plain.backpressure, plain.depth, plain.block_timeout_ms),
+            (None, None, None)
+        );
+        let out = serde_yaml::to_string(&config.nodes[0].inputs[1]).unwrap();
+        assert!(
+            !out.contains("backpressure") && !out.contains("depth"),
+            "{out}"
+        );
+        let bad = yaml.replace("backpressure: block", "backpressure: wedge");
+        assert!(serde_yaml::from_str::<GraphConfig>(&bad).is_err());
+    }
+
+    /// `backpressure: block` on a network egress entry is refused by name;
+    /// `drop_oldest` (what egress always does) is accepted.
+    #[test]
+    fn block_on_network_egress_is_refused_at_parse() {
+        let yaml = |bp: &str| {
+            format!(
+                "prefix: robo\nnodes: []\nnetwork:\n  mode: peer\n  egress:\n    - topic: /robo/cmd\n      backpressure: {bp}\n"
+            )
+        };
+        let err = serde_yaml::from_str::<GraphConfig>(&yaml("block"))
+            .expect_err("block on egress must be refused")
+            .to_string();
+        assert!(
+            err.contains("network egress topic '/robo/cmd'") && err.contains("backpressure: block"),
+            "{err}"
+        );
+        let ok: GraphConfig = serde_yaml::from_str(&yaml("drop_oldest")).unwrap();
+        let entry = &ok.network.unwrap().egress[0];
+        // `drop_oldest` leaves the entry as the bare topic name would.
+        assert_eq!(*entry, EgressTopic::new("/robo/cmd"));
+        assert_eq!(serde_yaml::to_string(entry).unwrap(), "/robo/cmd\n");
+    }
+
+    /// The keys a `network.egress` map entry accepts, hand-listed in the
+    /// order `EgressTopicMap` declares them.
+    const EGRESS_ENTRY_KEYS: [&str; 5] = [
+        "topic",
+        "reliability",
+        "external",
+        "send_queue",
+        "backpressure",
+    ];
+
+    /// The egress map keys the parser accepts are [`EGRESS_ENTRY_KEYS`], and
+    /// each one is named where a user reads what an entry may carry: the
+    /// parse error for an entry that is neither a name nor a map, the egress
+    /// row of `docs/networking.md`, and the `egress` bullet of
+    /// `docs/user-api.md`.
+    #[test]
+    fn every_egress_entry_key_is_named_where_a_user_reads_the_entry() {
+        let graph = |entry: &str| {
+            format!("prefix: robo\nnodes: []\nnetwork:\n  mode: peer\n  egress:\n    - {entry}\n")
+        };
+        let unknown =
+            serde_yaml::from_str::<GraphConfig>(&graph("{topic: /robo/cmd, sendqueue: 4}"))
+                .expect_err("an unknown egress key must be refused")
+                .to_string();
+        let accepted: Vec<&str> = unknown
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("the refusal lists no accepted keys: {unknown}"))
+            .1
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        assert_eq!(accepted, EGRESS_ENTRY_KEYS, "{unknown}");
+
+        let not_a_map = serde_yaml::from_str::<GraphConfig>(&graph("5"))
+            .expect_err("an integer egress entry must be refused")
+            .to_string();
+        for key in EGRESS_ENTRY_KEYS {
+            assert!(
+                not_a_map.contains(&format!("`{key}`")),
+                "{key}: {not_a_map}"
+            );
+        }
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |path: std::path::PathBuf| {
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        };
+        let networking = read(manifest.join("../../docs/networking.md"));
+        let rows: Vec<&str> = networking
+            .lines()
+            .filter(|l| l.starts_with("| `egress` |"))
+            .collect();
+        assert_eq!(rows.len(), 1, "docs/networking.md egress rows: {rows:?}");
+        let map = format!("`{{{}}}`", EGRESS_ENTRY_KEYS.join(", "));
+        assert!(
+            rows[0].contains(&map),
+            "networking.md lacks {map}: {}",
+            rows[0]
+        );
+
+        let user_api = read(manifest.join("../../docs/user-api.md"));
+        let bullet = user_api
+            .split_once("\n- `egress`: topics this graph exports")
+            .and_then(|(_, rest)| rest.split_once("\n- `").map(|(b, _)| b))
+            .expect("docs/user-api.md carries the network block's `egress` bullet");
+        for key in EGRESS_ENTRY_KEYS {
+            assert!(
+                bullet.contains(&format!("`{key}`")),
+                "user-api.md egress bullet lacks `{key}`"
+            );
+        }
+    }
 
     /// A no-`network:` YAML parses to `network == None` AND leaves every
     /// other field untouched (the byte-identical-when-absent contract).

@@ -292,6 +292,10 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["examples"],
         &[],
     ),
+    // The crate's own unit tests: `src/graph/config.rs` joins the networking
+    // and user API pages onto the manifest directory to check that they name
+    // every key a network egress entry accepts.
+    ("cerulion_core", "cerulion_core", &["docs"], &[]),
     // The test map it gates, held in a const and joined onto the root.
     (
         "cerulion_core",

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cerulion_core::clock::VirtualClock;
-use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
+use cerulion_core::graph::config::{GraphConfig, InputBackpressure, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::{DylibNodeEntry, NodeEntry};
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
@@ -154,6 +154,7 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
                 inputs: vec![InputDef {
                     name: "tf".to_string(),
                     source: TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "out".to_string(),
@@ -172,6 +173,7 @@ fn run(reader: Box<dyn NodeEntry>, prefix: &str) -> (Fires, Vec<u8>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "acc/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -288,4 +290,89 @@ fn two_cdylib_runs_receive_identical_frames() {
     let b = run(cdylib_reader(), &unique_prefix("accdet"));
     assert_eq!(a.0, oracle());
     assert_eq!(b.0, oracle());
+}
+
+/// The host reads a loaded library's `#[input(accumulate)]` mark off the
+/// capacity the library declares for the input: on the entry's own
+/// [`NodeInfo`](cerulion_core::graph::NodeInfo), in the checked metadata a
+/// node inspector re-parses, and so at graph build, which refuses
+/// `backpressure: block` on that input with the macro's own wording.
+#[test]
+#[serial]
+fn a_loaded_library_marks_its_accumulate_input_and_the_graph_cannot_make_it_block() {
+    let path = cerulion_core::testing::find_fixture_cdylib("test_node_macro_accumulate_cdylib");
+    let entry = DylibNodeEntry::load(&path).expect("load accumulate cdylib");
+    let info = entry.info().expect("the loaded library's info");
+    let marks: Vec<(&str, bool)> = info
+        .input_meta()
+        .iter()
+        .map(|m| (m.name.as_str(), m.accumulate))
+        .collect();
+    assert_eq!(marks, vec![("tf", true)], "the entry's input marks");
+    let checked = entry.checked_info_json().expect("checked metadata");
+    let reparsed = DylibNodeEntry::parse_info_json_labeled(&checked, "<inspector>")
+        .expect("the checked metadata parses");
+    let marks: Vec<(&str, bool)> = reparsed
+        .input_meta()
+        .iter()
+        .map(|m| (m.name.as_str(), m.accumulate))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![("tf", true)],
+        "the checked metadata an inspector reads: {checked}"
+    );
+
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: vec![],
+        name: None,
+        identity: "accumulate_block".to_string(),
+        prefix: unique_prefix("accblk"),
+        nodes: vec![
+            writer_def("writer_a"),
+            NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: "acc".to_string(),
+                node_type: "accumulate_node".to_string(),
+                inputs: vec![InputDef {
+                    name: "tf".to_string(),
+                    source: TOPIC.to_string(),
+                    backpressure: Some(InputBackpressure::Block),
+                    ..Default::default()
+                }],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+        ],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "writer_a".to_string(),
+        Box::new(WriterEntry::with_state(Writer::default())),
+    );
+    factories.insert("acc".to_string(), Box::new(entry));
+    let err =
+        match GraphRuntime::build_for_test(config, factories, Arc::new(VirtualClock::new()), 8) {
+            Ok(_) => {
+                panic!("`backpressure: block` on the library's accumulate input must be refused")
+            }
+            Err(e) => e.to_string(),
+        };
+    assert!(
+        err.contains("acc.tf")
+            && err
+                .contains("`#[input(accumulate)]` cannot be combined with `backpressure = block`"),
+        "the refusal names the input and carries the macro's wording: {err}"
+    );
 }

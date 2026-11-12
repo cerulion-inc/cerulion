@@ -728,6 +728,7 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -869,6 +870,7 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -994,10 +996,12 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
                 InputDef {
                     name: "a".to_string(),
                     source: EXT_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: EXT_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1145,10 +1149,12 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
                 InputDef {
                     name: "a".to_string(),
                     source: EXT_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: EXT_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1454,6 +1460,7 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

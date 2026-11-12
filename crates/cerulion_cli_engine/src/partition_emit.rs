@@ -1165,16 +1165,23 @@ fn derive_partition(
     // credit word. The derivation always co-locates (a boundary costs a real
     // hop), so writing the derived block over it DESTROYS that choice. The
     // `.bak` and the diff mitigate it, but neither says what was lost, and
-    // `--yes` skips the diff entirely. Name it.
+    // `--yes` skips the diff entirely. Name it. A split edge whose input sets
+    // `block_timeout_ms` is left out: `graph run` refuses it, through the same
+    // check (`split_edge_timeout_refusal_in_groups`), so it was never a
+    // credited deployment.
     let overwritten_creditable = if config.process_groups.is_empty() {
         Vec::new()
     } else {
-        cerulion_core::graph::creditable_split_block_edges(
+        let mut edges = cerulion_core::graph::creditable_split_block_edges(
             &config.process_groups,
             config,
             &entry_infos,
             &trigger_edges,
-        )
+        );
+        edges.retain(|edge| {
+            crate::multiprocess::split_edge_timeout_refusal_in_groups(&topology, edge).is_none()
+        });
+        edges
     };
 
     // Assemble the preview: mode + summary, the proposed bands, the diff.
@@ -1311,9 +1318,8 @@ fn derive_partition(
             preview,
             "  (co-located because crossing a process boundary costs a real hop; a split \
              `block` edge is legal only where the supervisor can mint it a cross-process \
-             credit word — one in-graph producer, no non-`block` consumers. The non-`block` \
-             siblings join too, or the worker would read its flow as all-`block` and INSTALL \
-             a defer that `--single-process` degrades)"
+             credit word: one in-graph producer, and no `block_timeout_ms` on the input. \
+             The non-`block` siblings join too, which keeps the hop off their edges)"
         );
     }
     let _ = writeln!(preview);

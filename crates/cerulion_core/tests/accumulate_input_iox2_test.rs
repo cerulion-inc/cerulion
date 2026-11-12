@@ -319,6 +319,7 @@ fn input(name: &str, source: &str) -> InputDef {
     InputDef {
         name: name.to_string(),
         source: source.to_string(),
+        ..Default::default()
     }
 }
 
@@ -392,6 +393,7 @@ fn build(prefix: &str, reader: Box<dyn NodeEntry>) -> GraphRuntime {
                 inputs: vec![InputDef {
                     name: "tf".to_string(),
                     source: TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

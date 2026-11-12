@@ -225,6 +225,7 @@ fn watcher_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
     config.nodes[0].inputs = vec![cerulion_core::graph::config::InputDef {
         name: "inp".to_string(),
         source: format!("/{prefix}/ext"),
+        ..Default::default()
     }];
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
     factories.insert(

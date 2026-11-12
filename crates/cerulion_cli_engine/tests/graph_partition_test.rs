@@ -2187,7 +2187,7 @@ fn the_consent_preview_frames_co_location_as_a_preference_not_a_refusal() {
         "the preview must frame it as a PREFERENCE; preview:\n{preview}"
     );
     assert!(
-        preview.contains("one in-graph producer, no non-`block` consumers"),
+        preview.contains("credit word: one in-graph producer"),
         "and name the split shape that IS legal; preview:\n{preview}"
     );
     assert!(
@@ -2261,6 +2261,53 @@ fn the_preview_warns_before_overwriting_a_hand_written_creditable_split() {
         !seen2.borrow().contains("deliberately SPLITS"),
         "an unpartitioned graph destroys nothing and must not warn; preview:\n{}",
         seen2.borrow()
+    );
+}
+
+/// A hand-written split whose `block` consumer sets `block_timeout_ms` is
+/// refused by `graph run`, so the supervisor credits it no word and writing
+/// the derived partition over it loses no credited split: the preview names
+/// none, while the same split without the key is named.
+#[test]
+fn the_preview_names_no_credited_split_for_an_edge_graph_run_refuses() {
+    let preview_of = |timeout: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = setup_workspace(tmp.path());
+        make_input_block(&ws, "sink");
+        let split = CHAIN_YAML
+            .replace(
+                "name: chain\n",
+                "name: chain\nprocess_groups:\n  front: [n0, n1]\n  back: [n2]\n",
+            )
+            .replace(
+                "        source: n1/out\n",
+                &format!("        source: n1/out\n{timeout}"),
+            );
+        write_graph(&ws, "chain", &split);
+        let seen = std::cell::RefCell::new(String::new());
+        let mut confirm = |preview: &str| -> CliResult<bool> {
+            seen.borrow_mut().push_str(preview);
+            Ok(false)
+        };
+        let _ = graph_partition(&ws.root, "chain", &opts(false, false), true, &mut confirm);
+        seen.into_inner()
+    };
+
+    let timed = preview_of("        block_timeout_ms: 50\n");
+    assert!(
+        timed.contains("`block` co-location:"),
+        "the preview rendered (non-vacuous); preview:\n{timed}"
+    );
+    assert!(
+        !timed.contains("deliberately SPLITS") && !timed.contains("/p/n1/out -> n2.inp (front"),
+        "a split graph run refuses is not a credited split the write replaces; preview:\n{timed}"
+    );
+
+    let untimed = preview_of("");
+    assert!(
+        untimed.contains("deliberately SPLITS")
+            && untimed.contains("/p/n1/out -> n2.inp (front -> back)"),
+        "the same split without the key is credited and named; preview:\n{untimed}"
     );
 }
 

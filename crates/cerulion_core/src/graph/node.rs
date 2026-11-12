@@ -190,10 +190,10 @@ pub enum BackpressurePolicy {
     /// each send; the consumer's subscriber decrements it on drain; the
     /// producer's scheduler pre-fire reads the mirror and skips the tick the
     /// moment `outstanding >= depth` (the declared depth IS the input's
-    /// real iceoryx2 queue, no clamp). Requires an
-    /// all-block topic — a MIXED topic (block + non-block consumers) degrades
-    /// its block consumers to `DropOldest` (deferring would starve the
-    /// non-block sibling).
+    /// real iceoryx2 queue, no clamp). Each block consumer has its own
+    /// mirror (its credit slot); the topic's non-block consumers have none and
+    /// receive whatever the producer publishes. A deferred producer defers its
+    /// whole node, every output included.
     Block,
     /// Accept at most one message per N ms, drop extras.
     Sample(u64),
@@ -245,6 +245,10 @@ pub struct InputMeta {
     /// (`#[input(trigger)]` and `#[input(expect_within_ms = N)]` are
     /// orthogonal).
     pub expect_within_ms: Option<u64>,
+    /// The port is `#[input(accumulate)]`: the node buffers every frame up to
+    /// its cap and evicts the oldest itself. The graph may not set `block`
+    /// or `depth` on such an input (the macro refuses both on the attribute).
+    pub accumulate: bool,
     /// The declared `consume = fifo | latest` of a trigger input. The macro
     /// and the info-JSON loader carry `Fifo` on every non-trigger input; the
     /// runtime reads this field only on a `DataTrigger` node's named input.
@@ -903,6 +907,12 @@ impl NodeInfo {
     /// trigger flag, etc.). Empty for nodes without `#[input]` attrs.
     pub fn input_meta(&self) -> &[InputMeta] {
         &self.input_meta
+    }
+
+    /// Mutable input metadata, for the graph's per-input overrides
+    /// (`crate::graph::topology::apply_input_backpressure_overrides`).
+    pub(crate) fn input_meta_mut(&mut self) -> &mut [InputMeta] {
+        &mut self.input_meta
     }
 
     /// Read-only access to output metadata. Empty for nodes without
@@ -4160,6 +4170,11 @@ impl DylibNodeEntry {
                 /// `DylibNodeEntry`-loaded consumer.
                 #[serde(default)]
                 schema_hash: u64,
+                /// The `#[input(accumulate)]` mark; absent = not accumulate.
+                /// A loaded node library's key is written by the loader from
+                /// the input's stable `accumulate_cap`.
+                #[serde(default)]
+                accumulate: bool,
                 /// The declared `consume`; absent = `fifo`. Accepted on a
                 /// trigger input only, checked below.
                 #[serde(default)]
@@ -4270,6 +4285,7 @@ impl DylibNodeEntry {
             "depth",
             "backpressure",
             "expect_within_ms",
+            "accumulate",
             // The per-input port-type layout hash.
             "schema_hash",
             // The declared consumption mode of a trigger input.
@@ -4381,6 +4397,7 @@ impl DylibNodeEntry {
             // The declared port-type schema hash (0 = legacy /
             // undeclared sentinel).
             schema_hash: u64,
+            accumulate: bool,
             consume: Option<ConsumeJson>,
         }
         let input_entries: Vec<NormalizedInput> = parsed
@@ -4399,6 +4416,7 @@ impl DylibNodeEntry {
                     trigger: false,
                     // No declared schema on the bare-string form → 0 sentinel.
                     schema_hash: 0,
+                    accumulate: false,
                     consume: None,
                 },
                 InputJson::Full {
@@ -4408,6 +4426,7 @@ impl DylibNodeEntry {
                     backpressure,
                     trigger,
                     schema_hash,
+                    accumulate,
                     consume,
                 } => NormalizedInput {
                     name,
@@ -4416,6 +4435,7 @@ impl DylibNodeEntry {
                     backpressure,
                     trigger,
                     schema_hash,
+                    accumulate,
                     consume,
                 },
             })
@@ -4620,6 +4640,7 @@ impl DylibNodeEntry {
                     .map(BackpressureJson::into_policy)
                     .unwrap_or_default(),
                 expect_within_ms: entry.expect_within_ms,
+                accumulate: entry.accumulate,
                 consume: match entry.consume {
                     Some(ConsumeJson::Latest) => InputConsume::Latest,
                     Some(ConsumeJson::Fifo) | None => InputConsume::Fifo,
@@ -5336,6 +5357,30 @@ mod tests {
         let info = DylibNodeEntry::parse_info_json(json).unwrap();
         assert!(info.input_names.is_empty());
         assert!(info.output_names.is_empty());
+    }
+
+    /// The `accumulate` input key: absent reads as not-accumulate, present
+    /// as accumulate. Neither warns as an unknown key.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_parse_info_json_accumulate_key_absent_reads_false() {
+        let without = r#"{"inputs":[{"name":"tf","depth":32}],"outputs":[]}"#;
+        let info = DylibNodeEntry::parse_info_json(without).unwrap();
+        assert!(
+            !info.input_meta[0].accumulate,
+            "absent key = not accumulate"
+        );
+        let with = r#"{"inputs":[{"name":"tf","depth":32,"accumulate":true}],"outputs":[]}"#;
+        let info = DylibNodeEntry::parse_info_json(with).unwrap();
+        assert!(info.input_meta[0].accumulate, "the key is read");
+        assert!(
+            !logs_contain("unknown key"),
+            "`accumulate` is a legal input key"
+        );
+        // The bare-string form carries no metadata at all.
+        let bare = r#"{"inputs":["tf"],"outputs":[]}"#;
+        let info = DylibNodeEntry::parse_info_json(bare).unwrap();
+        assert!(info.input_meta.iter().all(|m| !m.accumulate));
     }
 
     #[test]
@@ -6361,6 +6406,7 @@ mod tests {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
         assert!(meta.trigger);
@@ -6405,6 +6451,7 @@ mod tests {
             depth,
             backpressure: bp,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
         let _ = NodeInfo::with_meta(
@@ -6428,6 +6475,7 @@ mod tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
         let info = NodeInfo::with_meta(vec![meta("scan"), meta("imu")], Vec::new());
@@ -6525,6 +6573,7 @@ mod tests {
                 depth: 1,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
                 consume: Default::default(),
             }],
             output_meta: vec![OutputMeta {

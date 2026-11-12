@@ -325,7 +325,7 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
 - A diagnostic latch never wedges the path it observes and never silently resets its
   regime on a poisoned mutex (`lock_regime_latch` arm).
 - `transport/drain_clip_latch.rs` (`DrainClipLatch`) builds on `FailureRegimeLatch` for a
-  `block` input's drains that remove more frames than its credit word counts. An outside
+  `block` input's drains that remove more frames than its credit word has queued. An outside
   writer's clipped drains interleave with the counted producer's clean ones, so a regime
   closes after a run of consecutive clean drains: 1 for the input's first regime, so its
   first clean drain closes it, and every close doubles the run the next regime needs, up to

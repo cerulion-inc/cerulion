@@ -157,6 +157,7 @@ fn build_graph(val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -169,6 +170,7 @@ fn build_graph(val: f64) -> (GraphRuntime, Arc<AtomicU64>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "consumer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
