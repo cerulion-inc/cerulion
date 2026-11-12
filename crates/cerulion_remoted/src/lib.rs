@@ -68,6 +68,10 @@
 //!   stream to `cerud::OpsServer::serve_connection` via a `QuicOpsStream` adapter.
 //! - [`pairing_verbs`]: the self-gating bootstrap and safety verbs (`claim`, `pair`,
 //!   `code-pair-start`, `code-pair-finish`, `engage-estop`).
+//! - [`pair_code_request`]: on the daemon, reads an owner-only request file a
+//!   step on the robot leaves in the state directory, arms the code it carries
+//!   for `code-pair-start` and `code-pair-finish`, and writes what the code
+//!   comes to in a result file; no network peer can arm one.
 //! - [`estop_lease`]: the control lease shared with a count of the e-stop engages
 //!   waiting for its lock, which the act verbs read before each send.
 //! - [`flashback`]: publishes a capture request when the ops-plane e-stop is engaged.
@@ -112,6 +116,7 @@ mod local_schema;
 pub mod log_writer;
 pub mod ops;
 mod owner_only;
+pub mod pair_code_request;
 pub mod pairing_verbs;
 mod private_file;
 pub mod provision;
