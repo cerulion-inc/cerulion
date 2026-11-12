@@ -1178,7 +1178,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
 | `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused |
-| `cerulion_pairing::pair_code` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token |
+| `cerulion_pairing::pair_code`, `cerulion_remoted::owner_only` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the owner-only verdict |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,
