@@ -207,7 +207,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
-By default the run is readable from any computer signed in to your account, on this LAN or another network, with no addresses or flags: `cerulion topic list` on that computer finds it. A machine that is neither on your account nor paired with this one cannot read its topics or publish into it. Add `--network off` to keep a run on this machine. Setting `CERULION_LAN_ACCESS=open` here lets any computer on the LAN read the run's topics without signing in, and the run warns when it starts. After upgrading from 1.x, restart any `cerulion-netd` that is still running so it uses this default.
+By default the run is readable from any computer signed in to your account, on this LAN or another network, with no addresses or flags: `cerulion topic list` on that computer finds it. A machine that is neither on your account nor paired with this one cannot read its topics or publish into it. Add `--network off` to keep a run on this machine. For an intentionally open LAN, set `CERULION_LAN_ACCESS=open` for every Cerulion command and daemon on every machine that should send or receive topics over that LAN, restart `cerulion-netd` on each, and give the serving machine a listen endpoint (`CERULION_NETD_LISTEN`), as [Networking](docs/networking.md#making-a-robot-discoverable) shows. After upgrading from 1.x, restart any `cerulion-netd` that is still running so it uses this default.
 
 In a second terminal, watch the controller react:
 
@@ -335,7 +335,7 @@ cerulion ros2 launch my_robot_bringup camera.launch.py
 cerulion ros2 run my_robot_drivers imu_node
 ```
 
-Both set up `rmw_cerulion` and run the ROS 2 command, one launch file or one executable at a time. Your nodes keep their ROS 2 APIs and executors. Neither rewrites your source: publishers that copy keep copying until you migrate them. The ros2 CLI graph tools (`ros2 topic list`, `ros2 topic echo`, rqt) do not see Cerulion topics yet, because the rmw's discovery is process-local; inspect them with `cerulion topic list` and `cerulion topic echo`, which read the shared-memory plane.
+Both set up `rmw_cerulion` and run the ROS 2 command, one launch file or one executable at a time. Your nodes keep their ROS 2 APIs and executors. Neither rewrites your source: publishers that copy keep copying until you migrate them. The ros2 CLI graph tools (`ros2 topic list`, `ros2 topic echo`, rqt) do not see Cerulion topics, because the rmw's discovery is process-local; inspect them with `cerulion topic list` and `cerulion topic echo`, which read the shared-memory plane.
 
 <details>
 <summary>Optional: migrate C++ publishers to zero-copy loans</summary>
