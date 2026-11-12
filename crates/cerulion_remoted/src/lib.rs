@@ -111,6 +111,7 @@ pub mod host;
 mod local_schema;
 pub mod log_writer;
 pub mod ops;
+mod owner_only;
 pub mod pairing_verbs;
 mod private_file;
 pub mod provision;
