@@ -17,10 +17,10 @@
 
 ## What ships today
 
-- **Record and replay.** Runs record to standard MCAP. `cerulion bag play --resim all --verify` re-runs a supported native recording against new code and compares the outputs. Exit 1 names the topic that changed. ROS 2 gets deterministic resim of one process at a time (`cerulion ros2 run --record-deliveries` / `--replay-deliveries`).
+- **Record and replay.** Runs record to standard MCAP. `cerulion bag play --resim all --verify` re-runs a supported native recording against new code and compares the outputs. Exit 1 names the topic that changed. ROS 2 gets exact replay of one eligible process at a time (`cerulion ros2 run --record-deliveries` / `--replay-deliveries`), runtime-tested on Humble. A replay publishes live on its machine; [ROS 2 replay](docs/ros2_replay.md) lists which processes qualify and where a replay is safe to run.
 - **Hindsight, in early access.** Recording-analysis tools your agent calls over MCP. Hindsight investigates MCAP recordings and cites topics and timestamps. Hindsight and the hosted MCP server are closed source. [Request access](https://docs.cerulion.com/cerulion/hindsight).
 - **Open source.** The runtime is AGPL-3.0-only, with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side wire crates are MIT OR Apache-2.0.
-- **ROS 2.** `rmw_cerulion` runs ROS 2 nodes on Cerulion's transport and is validated on Jazzy. `cerulion ros2 attach` bridges a running robot's ROS 2 topics. It is validated on Jazzy, and on Foxy and Humble through local type resolution only. See [ROS 2 compatibility](docs/ros2_compatibility.md).
+- **ROS 2.** `rmw_cerulion` runs ROS 2 nodes on Cerulion's transport. It is tested in CI on Foxy, Galactic, Humble, Jazzy and Lyrical, and the Linux releases ship it prebuilt for Jazzy and Lyrical. `cerulion ros2 attach` bridges a running robot's ROS 2 topics. It is validated on Jazzy, and on Foxy and Humble through local type resolution only. See [ROS 2 compatibility](docs/ros2_compatibility.md).
 - **Python, new in 2.0.** `cerulion node create <type> --lang python --policy period_ms=<N>` writes a Python node that `graph run`, recording and replay treat like a Rust node. `import cerulion` publishes and subscribes to topics on the local machine over the same shared memory as Rust nodes, with no copy on receive. Both need the `cerulion` Python package, which you build from a Cerulion source checkout: the release downloads carry no wheel. A Python node also needs a `cerulion` CLI built from that checkout (`cargo install --path crates/cerulion_cli`). See [Python](docs/python.md).
 
 ## Why it's fast
@@ -118,16 +118,16 @@ The release installer places `cerulion-connectd` (the desk side of a remote conn
 
 </details>
 
-Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs: Jazzy on Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64: unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI but has not been run on a robot, and unlike the Jazzy package it is not installed in a clean container before release.
+Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs: Jazzy on Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64: unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI.
 
-Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Native node libraries use a stable ABI and can load across Rust compiler versions and CLI updates while boundary major 1 remains supported. Rebuild existing node libraries once with `cerulion node build <node>`. The [installation details](docs/install.md) cover the toolchain setup.
+Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them: the compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. Node libraries from an earlier release are refused with an instruction to rebuild them; run `cerulion node build <node>` once for each. The [installation details](docs/install.md) cover the toolchain setup.
 
 ## How it fits together
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/architecture-flow-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/media/architecture-flow-light.svg">
-  <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to Cerulion Studio (early access), the CLI and coding agents.">
+  <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to your tools, the CLI and coding agents.">
 </picture>
 
 - **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
@@ -180,10 +180,11 @@ cd safety_demo
 
 This obtains complete source bundled with your CLI, including tests and all
 variable-length scan fields, without GitHub credentials or a source download.
-Exact release dependencies are selected and `starter.toml` records compiler
-requirements. Existing paths are refused; failed installation leaves no partial
-workspace. The generated README also shows explicit graph creation, staging and
-wiring. To write nodes from scratch, start with
+Exact release dependencies are selected, and `starter.toml` records the
+starter's name, the CLI version and the compiler that built the CLI. Existing
+paths are refused; failed installation leaves no partial workspace. The
+generated README also shows explicit graph creation, staging and wiring. To
+write nodes from scratch, start with
 `cerulion workspace create my_robot` and the
 [getting-started tutorial](docs/tutorials/01-getting-started.md).
 
