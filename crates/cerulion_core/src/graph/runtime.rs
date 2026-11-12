@@ -8500,18 +8500,18 @@ impl GraphRuntime {
                         "CERULION_DRAIN_DISCIPLINE=separate forces the legacy dual-subscriber \
                          discipline"
                     } else if supports_sync_head_ops.get(&node_def.id) != Some(&true) {
-                        "this node does not implement the sync head ops (a raw-FFI cdylib, or a \
-                         closure built from names only)"
+                        "this node does not implement the host head ops (a hand-written NodeEntry, \
+                         or a closure built with unified drain off)"
                     } else {
                         "this node's trigger reads do not go through the frozen-slot path"
                     };
                     tracing::warn!(
                         node_id = %node_def.id,
                         reason,
-                        "Sync node DEGRADED to legacy latest-per-set — it fires once per \
+                        "Sync node DEGRADED to legacy latest-per-set: it fires once per \
                          complete alignment and its tick reads the FRESHEST frame on each trigger, \
-                         not the members the matcher chose. Fix: build this node with \
-                         `#[cerulion_node]` (which emits the ops), or unset \
+                         not the members the matcher chose. Fix: implement \
+                         NodeEntry::supports_sync_head_ops and sync_head_op, or unset \
                          CERULION_DRAIN_DISCIPLINE"
                     );
                 }
@@ -9550,8 +9550,7 @@ impl GraphRuntime {
         // arrival per queued frame, so `pending_data_count` already describes
         // the whole burst.
         //
-        // A node that cannot refill (a raw-FFI or earlier cdylib — no
-        // `cerulion_node_refill_trigger_input` export) installs nothing either,
+        // A hand-written NodeEntry that cannot refill installs nothing either,
         // and is NAMED once at the end of the build: the hook would answer
         // `(0, None)` on every call, costing a node lock per step to end the
         // burst the loop would have ended anyway. Such a binding is served one
@@ -9808,11 +9807,10 @@ impl GraphRuntime {
             refill_incapable.dedup();
             tracing::info!(
                 nodes = %refill_incapable.join(","),
-                "unified data-trigger nodes cannot refill between fires (no \
-                 `cerulion_node_refill_trigger_input` export — a raw-FFI or older \
-                 cdylib); their queued bursts are served one frame per \
-                 step. Rebuild the node crate to serve a burst within the step that \
-                 sees it."
+                "unified data-trigger nodes with a hand-written NodeEntry cannot refill \
+                 between fires; their queued bursts are served one frame per step. \
+                 Implement NodeEntry::refills_trigger_input and refill_trigger_input \
+                 to serve a burst within the step that sees it."
             );
         }
 
@@ -16984,8 +16982,8 @@ impl GraphRuntime {
     /// The shapes a `GraphConfig` can still express that outrun their stage are
     /// a `Period` node's unclamped catch-up burst on an input the freeze does
     /// not cover — a `block` input (excluded by POLICY), or ANY plain input of
-    /// a node whose entry cannot freeze (a `ClosureNodeEntry` or a raw-FFI
-    /// cdylib, which inherit a no-op `snapshot_inputs` and so read live on
+    /// a hand-written entry that cannot freeze (such as a `ClosureNodeEntry`,
+    /// which inherits a no-op `snapshot_inputs` and so reads live on
     /// every fire). Both are armed at [`READ_OUTCOME_STAGE_MAX`] and are what
     /// the run-length encoding closes. Driving THAT through a graph would take a stall of thousands of
     /// fires, so the marker's production path (the level-end merge, the
@@ -19875,13 +19873,9 @@ fn node_fire_burst_bound(policy: Option<&super::node::MacroPolicy>) -> FireBurst
 /// makes the derivation UNDER-size a shipping shape.
 /// [`build_snapshot_input_names`] is POLICY-only: it answers "is this input
 /// non-triggering, and not `block`?" — nothing about whether the node's ENTRY
-/// can actually fill the slot. Two shipping entry forms are in that set and
-/// still read LIVE on every fire, because both inherit the default no-op
-/// `snapshot_inputs`:
-///
-/// - a `ClosureNodeEntry` (every closure-built node), and
-/// - a `DylibNodeEntry` with no snapshot FFI symbols — i.e. every
-///   raw-FFI cdylib (`cerulion node create --raw-ffi`).
+/// can actually fill the slot. A hand-written entry that inherits the default
+/// no-op `snapshot_inputs`, such as a `ClosureNodeEntry`, still reads LIVE on
+/// every fire. Stable node libraries use the host's snapshot operations.
 ///
 /// For those, a `Period` node's plain depth-1 input really does stage one
 /// record per catch-up fire, and a name-only predicate would size it at 4.

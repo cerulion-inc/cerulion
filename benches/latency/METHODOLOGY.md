@@ -485,7 +485,9 @@ reports `published`, the pong node `forwarded`, the sink node
 `received` / `skipped` / `measured` (the per-node `RTT_DELIVERY`
 lines), and the host runtime prints its per-input `drop_oldest`
 eviction counters ("live loop delivery telemetry", one line per
-data-trigger input, per process).
+data-trigger input, per process). Those counters are `info` lines,
+which `graph run` hides by default, so the harness runs it with
+`RUST_LOG=error,cerulion=info` unless `RUST_LOG` is already exported.
 
 The **no-silent-loss reading** of those lines is:
 

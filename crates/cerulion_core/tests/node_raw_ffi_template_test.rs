@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Build test_node_raw_ffi_template_cdylib first. Tests the actual compiled raw
 //! template's checked interface, allocator ownership and diagnostic protocol.
+//! Build its modified_raw cdylib example too; run this binary with --test-threads=1.
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::node::{DylibNodeEntry, NodeContext, NodeEntry};
@@ -10,6 +11,102 @@ use cerulion_core::ShutdownSignal;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[test]
+#[serial_test::serial]
+fn modified_raw_node_delivers_both_added_ports_with_preserved_typed_facts() {
+    use cerulion_core::graph::node::AnyPublisher;
+    use cerulion_core::message::ShmMessage;
+    use cerulion_core::transport::{TransportConfig, TransportManager};
+    use cerulion_core::wire::MaxSliceLen;
+    use native_ros2_messages::geometry_msgs::Vector3;
+    let oracle = |values: [f64; 3]| {
+        let mut bytes = [0u8; 64];
+        bytes[..8].copy_from_slice(&Vector3::SCHEMA_HASH.to_le_bytes());
+        bytes[8..12].copy_from_slice(&64u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&64u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&777u64.to_le_bytes());
+        for (index, value) in values.into_iter().enumerate() {
+            bytes[40 + index * 8..48 + index * 8].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    };
+    let expected = [
+        oracle([1.0, 2.0, 3.0]),
+        oracle([4.0, 5.0, 6.0]),
+        oracle([7.0, 8.0, 9.0]),
+    ];
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let clock = Arc::new(VirtualClock::new());
+        clock.set(777);
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "modified_raw".into(),
+                clock: clock.clone(),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let mut publishers = IndexMap::new();
+        let mut receivers = Vec::new();
+        for name in ["original", "first", "second"] {
+            publishers.insert(
+                name.into(),
+                AnyPublisher::Ipc(
+                    manager
+                        .create_publisher(name, MaxSliceLen::try_new(64).unwrap(), 0)
+                        .unwrap(),
+                ),
+            );
+            receivers.push(manager.create_subscriber(name).unwrap());
+        }
+        let environment = Arc::new(HashMap::from([("RUST_LOG".into(), "off".into())]));
+        let mut context = NodeContext::with_runtime_env(
+            publishers,
+            IndexMap::new(),
+            clock,
+            ShutdownSignal::new(),
+            environment,
+        );
+        context.set_transport(manager.clone());
+        let profile = cerulion_core::testing::test_target_profile_dir();
+        let filename = cerulion_core::testing::cdylib_file_name("modified_raw");
+        let primary = profile.join("examples").join(&filename);
+        let path = if primary.exists() {
+            primary
+        } else {
+            profile
+                .parent()
+                .unwrap()
+                .join("debug/examples")
+                .join(filename)
+        };
+        let mut entry = DylibNodeEntry::load(&path).expect("built modified raw cdylib");
+        let info = entry.info().unwrap();
+        assert_eq!(info.output_names(), vec!["original", "first", "second"]);
+        entry
+            .init(context)
+            .expect("all three preserved typed bindings");
+        entry.tick().expect("publish through each typed host loan");
+        let delivered: Vec<[u8; 64]> = receivers
+            .iter_mut()
+            .map(|receiver| {
+                let frame = receiver
+                    .view_raw_expecting(Vector3::SCHEMA_HASH)
+                    .unwrap()
+                    .expect("downstream frame on original and both added outputs");
+                frame[..].try_into().unwrap()
+            })
+            .collect();
+        entry.shutdown().unwrap();
+        assert_eq!(delivered, expected);
+        runs.push(delivered);
+    }
+    assert_eq!(runs[0], runs[1]);
+}
 
 fn library() -> abi::CheckedNodeLibrary {
     let path = cerulion_core::testing::find_fixture_cdylib("test_node_raw_ffi_template_cdylib");

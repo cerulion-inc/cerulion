@@ -445,8 +445,10 @@ impl HostClient {
         }
     }
 
+    /// Read one value from the host environment snapshot before user construction.
+    #[doc(hidden)]
     // hot-path-alloc-ok-fn: preserves author String environment lookup, used during node init.
-    pub(super) fn environment(&self, key: &str) -> Option<String> {
+    pub fn environment(&self, key: &str) -> Option<String> {
         let mut required = 0;
         let status = host_call!(
             self,

@@ -190,6 +190,7 @@ impl PluginNodeContext {
         &self.clock
     }
     pub fn request_shutdown(&self) {
+        self.shutdown_signal.request();
         self.client.request_shutdown();
     }
     pub fn shutdown_signal(&self) -> &ShutdownSignal {

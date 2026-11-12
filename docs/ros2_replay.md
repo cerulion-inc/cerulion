@@ -38,15 +38,26 @@ Under `use_sim_time`, rclcpp takes `/clock` on its own thread. While recording, 
 
 ## Replaying
 
+A replay really publishes. It sends on this machine's shared-memory namespace, the same shared memory that live Cerulion and `rmw_cerulion` processes use: its messages under the recorded topic names, and its service requests and responses under the recorded service names, an action client's goals among them. Every process on this machine that subscribes to one of those topics receives the messages, and a live server of one of those services receives the requests and acts on them. A replay never waits for wall time, so its outputs can arrive faster than they did live. The replayed process keeps running after its log is used up, until you stop it, and anything it sends then, from a wall timer for example, goes out too. `ROS_DOMAIN_ID`, `ROS_LOCALHOST_ONLY` and `ROS_AUTOMATIC_DISCOVERY_RANGE` do not separate a replay: `rmw_cerulion` has no domains and ignores both discovery settings.
+
+Do not replay a node where its outputs can reach a live robot or anything that acts on that robot's topics or services, such as its controller, its driver, or a node that sends the robot commands, goals or service requests. Until the replayed process exits, this machine must run none of these:
+
+- a live node, including a `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach`;
+- `cerulion-vizd`, unless it was started with exactly `CERULION_NETD_NETWORK=off`: `cerulion viz` starts it, it runs until it is sent SIGINT or SIGTERM, and while it runs it starts `cerulion-netd` again, with its own environment, within seconds of netd stopping;
+- `cerulion-netd`, unless it was started with exactly `CERULION_NETD_NETWORK=off`;
+- `cerulion-remoted`.
+
+A machine of its own is not enough while any of these runs on it. The replayed process's own I/O outside the rmw also still runs: a driver that writes to a serial port, a CAN bus or a socket sends what it computes from the recorded inputs to that device, so replay such a node only where that device is disconnected or safe to drive. `cerulion doctor --check daemon.netd` reports only the netd at this shell's control socket, and a netd another user or a service started listens elsewhere, so check the machine's process list for `cerulion-vizd`, `cerulion-netd` and `cerulion-remoted` too. To watch a replay's outputs, use `cerulion topic echo --local`, which starts no network daemon.
+
+These can carry topics to other machines: `cerulion-netd`, `cerulion-remoted`, a `cerulion graph run` with an enabled `network:` block, which runs its own gateway, and a `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach` that cannot use `cerulion-netd` and runs its own gateway. A networked `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach`, `cerulion viz`, and `cerulion topic` and `cerulion schema info` commands that reach the network start netd when it is not running; it then stays up until nothing has been connected to it for its idle grace (30 s by default; each `daemon.netd` check of `cerulion doctor` restarts that wait), and never exits on its own if it was started with `CERULION_NETD_LISTEN` set.
+
 Replay one recorded process, alone, with the same command it was recorded with:
 
 ```bash
 cerulion ros2 run --replay-deliveries ./logs/my_node-4242.rdl.mcap my_pkg my_node --ros-args -p use_sim_time:=true
 ```
 
-or `CERULION_RMW_REPLAY=<log>` on any launch path. When the replay starts, `<log>.verdict.json` says `running`; the real verdict replaces it once the log is used up, so stop the process after the file no longer says `running` (Ctrl-C). A replay that crashes or is killed leaves `running`, never an earlier replay's verdict; a replay that cannot write the file (a read-only directory, a full disk) is refused at `rmw_init`. Nothing else needs to run: no talker, no clock, no robot.
-
-A replay really publishes. The replayed process sends its outputs on the transport as it did live, and through `cerulion-netd` they can reach other hosts. Do not replay a controller or a driver where a live robot, or anything that acts on its topics, can receive them: replay on a machine of its own, or on one where no live node runs and `cerulion-netd` is stopped or started with `CERULION_NETD_NETWORK=off`. `ros2 launch` has no replay flag, because a replay is one process.
+or set `CERULION_RMW_REPLAY=<log>` in the environment of that one process, however you start it, together with `RMW_IMPLEMENTATION=rmw_cerulion` as in the recording command above: only `rmw_cerulion` reads the variable, so a process started on another rmw ignores it and runs live on that rmw's own network. `cerulion ros2 launch` has no replay flag, because a replay is one process: replay each process a launch recorded with its own `cerulion ros2 run`, passing the arguments the launch gave it. A different command line is refused, and the refusal prints the recorded command line next to this process's. When the replay starts, `<log>.verdict.json` says `running`; the real verdict replaces it once the log is used up, so stop the process after the file no longer says `running` (Ctrl-C). A replay that crashes or is killed leaves `running`, never an earlier replay's verdict; a replay that cannot write the file (a read-only directory, a full disk) is refused at `rmw_init`. Nothing else needs to run: no talker, no clock, no robot.
 
 ## The verdict
 

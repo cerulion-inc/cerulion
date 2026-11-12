@@ -6,6 +6,7 @@ use cerulion_core::node_abi as abi;
 
 struct RawFfiTemplateState {
     context: Option<NodeContext>,
+    client: HostClient,
     tick_count: u64,
 }
 
@@ -31,8 +32,12 @@ impl PluginNode for RawFfiTemplateState {
         }
         Ok(Self {
             context: Some(context),
+            client,
             tick_count: 0,
         })
+    }
+    fn flush_deferred(&self) -> cerulion_core::TransportResult<()> {
+        self.client.flush_deferred()
     }
     fn tick(&mut self) -> cerulion_core::TransportResult<()> {
         // Replace this body with application logic over the local context.
@@ -40,6 +45,9 @@ impl PluginNode for RawFfiTemplateState {
         Ok(())
     }
     fn shutdown(&mut self) -> cerulion_core::TransportResult<()> {
+        if let Some(context) = &self.context {
+            context.shutdown_signal().request();
+        }
         self.context = None;
         Ok(())
     }

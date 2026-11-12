@@ -158,7 +158,8 @@ impl AccumulatorSet {
                     },
                 ));
             }
-            let _ = scan.take(16).map_err(super::state_error)?;
+            let _ = scan.take_array::<8>().map_err(super::state_error)?;
+            let _ = scan.take_array::<8>().map_err(super::state_error)?;
             let frames = scan.read_element_count().map_err(super::state_error)?;
             if frames > input.cap {
                 return Err(super::state_error(
@@ -179,7 +180,12 @@ impl AccumulatorSet {
             let record = cursor
                 .take(scan.position() - start)
                 .map_err(super::state_error)?;
-            input.client.restore_accumulate(input.port, record)?;
+            input
+                .client
+                .restore_accumulate(input.port, record)
+                .map_err(|error| crate::error::TransportError::GraphError {
+                    reason: super::diagnostic_reason(&error).into_owned(),
+                })?;
             input.serving = AccumulateInfoV1::default();
         }
         Ok(())

@@ -417,6 +417,12 @@ const IGNORE_CLASSES: &[(&str, &str)] = &[
 /// an arm added without an entry fails, and an entry naming an arm that no
 /// longer exists fails.
 const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
+    (
+        "macro_cdylib_policy_round_trip_test.rs",
+        "helper_shutdown_child",
+        "child",
+        "the bounded parent runs the real helper shutdown child twice for each stop path",
+    ),
     ("stable_node_abi_cross_compiler_test.rs", "different_compiler_delivers_oracle_frames_in_two_identical_runs", "compiler-skew", "tools/scripts/check_stable_node_compiler_skew.sh, Stable node compiler compatibility CI job"),
     (
         "barrier_level_gate_subprocess_iox2_test.rs",

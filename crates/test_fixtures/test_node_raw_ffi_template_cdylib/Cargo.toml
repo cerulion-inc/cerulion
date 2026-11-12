@@ -8,9 +8,17 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[[example]]
+name = "modified_raw"
+path = "tests/fixtures/modified_raw.rs"
+crate-type = ["cdylib"]
+
 # Stable adapters retain node-local state and call host services through the table.
 [dependencies]
 cerulion_core = { path = "../../cerulion_core" }
+
+[dev-dependencies]
+native_ros2_messages = { workspace = true }
 
 # The ONE strict lint table lives in the root `[workspace.lints]`.
 [lints]

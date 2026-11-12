@@ -182,8 +182,8 @@ pub unsafe extern "C" fn rmw_deserialize(
         }
         let payload = &bytes[cerulion_core::wire::WireHeader::SIZE..];
         // A member this build's C++ typesupport gives no way to WRITE (a
-        // `bool[]` before Humble, at the top level or inside a nested
-        // message) is refused HERE, before `unflatten` writes the first
+        // `bool[]` with neither `assign` nor the shim's accessorless path, at
+        // any depth) is refused HERE, before `unflatten` writes the first
         // field: this function decodes into a CALLER-owned message, so a
         // decode that walked half of it and then failed would hand back
         // `RMW_RET_ERROR` over a message the caller must now treat as

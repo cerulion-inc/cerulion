@@ -2595,8 +2595,54 @@ fn bagd_cli_run(args: BagdArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Whether the Cerulion runtime itself raises a capture of this kind: a
+/// worker process that died, a monitor verdict, a node disabled by its
+/// panics, or the bound run vanishing. Nobody at the terminal asked for one,
+/// so the recorder logs at `warn` where the capture went and when the hourly
+/// cap refuses one; a monitor verdict and a vanished run, which only the
+/// recorder observes, also log the request itself at `warn`. An operator's
+/// `cerulion flashback` prints its own result, and an e-stop or a declared
+/// incident comes from whoever engaged or declared it.
+fn raised_by_the_runtime(kind: cerulion_core::flashback::trigger::TriggerKind) -> bool {
+    use cerulion_core::flashback::trigger::TriggerKind;
+    match kind {
+        TriggerKind::ProcessFault
+        | TriggerKind::MonitorVerdict
+        | TriggerKind::PanicDisable
+        | TriggerKind::RunVanished => true,
+        TriggerKind::Manual | TriggerKind::EStop | TriggerKind::Declared => false,
+    }
+}
+
+/// Whether a suppressed request opens a `warn` regime: only when the hourly
+/// cap refused a capture [`raised_by_the_runtime`] (`Recorder`'s
+/// `runtime_rate_cap_latch` keeps its repeats at `info`). Every other reason,
+/// and a rate-capped manual, e-stop or declared request, keeps `info` (see the
+/// suppression arm of `decide_flashback_request`).
+fn suppression_is_loud(
+    kind: cerulion_core::flashback::trigger::TriggerKind,
+    reason: &cerulion_core::flashback::trigger::SuppressReason,
+) -> bool {
+    use cerulion_core::flashback::trigger::SuppressReason;
+    match reason {
+        SuppressReason::RateCapped { .. } => raised_by_the_runtime(kind),
+        SuppressReason::RegimeOpen { .. }
+        | SuppressReason::Refractory { .. }
+        | SuppressReason::Disabled { .. } => false,
+    }
+}
+
 /// The recorder's own logging default. `try_init` — a NO-OP if the host binary
 /// (`cerulion`) already installed a subscriber, so the fold never double-inits.
+///
+/// Only the `cerulion bagd` PROCESS reaches this (`bag record` runs the
+/// recorder in-process under the CLI's own filter), and that process is the
+/// recorder `graph run` spawns, so its default is `graph run`'s quiet `warn`:
+/// the run's stderr carries the recorder's warnings and none of its lifecycle
+/// lines. A Flashback capture the runtime raises is one of those warnings: the
+/// verdict or the vanished run that asked for it, and the path it was written
+/// to (see [`raised_by_the_runtime`]). `RUST_LOG` (for example
+/// `cerulion=info,cerulion_bagd=info`) restores the lifecycle lines.
 // P12 exception, per the comment inside: this is the tracing BOOTSTRAP — it
 // reports a set-but-invalid RUST_LOG before any subscriber exists, so a
 // `tracing::` call would go nowhere. Function-scoped because a `#[allow]` on a
@@ -2604,7 +2650,7 @@ fn bagd_cli_run(args: BagdArgs) -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::print_stderr)]
 fn init_bagd_logging() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    const DEFAULT_FILTER: &str = "cerulion=info,cerulion_bagd=info";
+    const DEFAULT_FILTER: &str = "cerulion=warn";
     let filter = match EnvFilter::try_from_default_env() {
         Ok(f) => f,
         Err(e) => {
@@ -10664,6 +10710,13 @@ struct Recorder {
     /// discovery regime must not swallow this one's loud head, and the two have
     /// nothing to do with each other.
     flashback_cap_latch: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    /// The regime of the hourly cap refusing captures the runtime raised (see
+    /// `suppression_is_loud`). A worker-death or disabled-node requester
+    /// re-publishes its request while it lingers, and every re-publish is
+    /// refused again, so the first refusal of a regime is the `warn` and every
+    /// later one is counted at `info`, except the latch's `warn` at each
+    /// tenfold total. Ends when the gate next admits a capture of such a kind.
+    runtime_rate_cap_latch: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
     /// The `/__cerulion/mirrors` provenance snapshot — `topic → origin
     /// robot` — read at arm time (see `gather_mirrors_once`).
     mirrors: BTreeMap<String, String>,
@@ -11975,6 +12028,8 @@ impl Recorder {
             below_generation_eval_ns: None,
             flashback_cap_latch:
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
+            runtime_rate_cap_latch:
+                cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             mirrors: BTreeMap::new(),
             mirrors_established: caller_mirrors_established,
             schema_resolver: None,
@@ -12756,6 +12811,7 @@ impl Recorder {
             return;
         };
         let held = std::mem::take(&mut self.state_ring_names);
+        let attached_mid_run = self.cfg.attached_mid_run;
         // The probe is a NAME EXISTENCE question, answered by the open itself:
         // the sweep needs to know which ranks answered, and a rank whose ring is
         // present but unopenable (a truncated or wrong-policy segment) is a rank
@@ -12780,10 +12836,21 @@ impl Recorder {
             if !cerulion_core::shm_ring::shm_object_exists(&name) {
                 return false;
             }
-            // A ring created by a live rank is being written RIGHT NOW, so the
-            // live cursor is the only sound attach: its head anchor is partial by
+            // The SAME open policy as a declared ring (`run_bagd`'s setup): a
+            // recorder that is present from the run's start reads every ring from
+            // record 0, so an anchor a rank published before this sweep found its
+            // ring (the step-0 anchor, taken a few hundred ms before the first
+            // sweep) is in the bag. Record 0 starts an anchor: the producer checks
+            // `free_records` before every anchor, so a backpressure ring is never
+            // lapped before its first consumer. Only a MID-RUN attach takes the
+            // live cursor, the one sound attach: its head anchor is partial by
             // construction and `StateAnchorLedger::for_open` discards it.
-            match StateRingConsumer::open_at_live(&name) {
+            let opened_ring = if attached_mid_run {
+                StateRingConsumer::open_at_live(&name)
+            } else {
+                StateRingConsumer::open(&name)
+            };
+            match opened_ring {
                 Ok(c) => opened.push((rank, name, c)),
                 Err(e) => refused.push((name, e.to_string())),
             }
@@ -12858,6 +12925,7 @@ impl Recorder {
                 rank,
                 generation = consumer.generation(),
                 nodes = consumer.node_ids().len(),
+                opened_at = if attached_mid_run { "live" } else { "start" },
                 "bagd discovered a node-state ring by its (arm tag, rank) name"
             );
             // Declared BEFORE the ring is handed anywhere —
@@ -12868,11 +12936,11 @@ impl Recorder {
             }
             let ring = SendStateRing {
                 ring: consumer,
-                ledger: StateAnchorLedger::for_open(true),
-                // A DISCOVERED ring is always opened at the live cursor, so its
-                // harvester is armed on exactly the same evidence its ledger is —
-                // one `attached_mid_run` fact, two readers, never two guesses.
-                anchors: self.anchor_harvester(true),
+                ledger: StateAnchorLedger::for_open(attached_mid_run),
+                // Paired with the ring's OPEN policy above, exactly as the ledger
+                // is: one `attached_mid_run` fact, three readers, never two
+                // guesses.
+                anchors: self.anchor_harvester(attached_mid_run),
                 declared_name: name,
                 discovered: true,
             };
@@ -15966,10 +16034,11 @@ impl Recorder {
             // ONCE per latched request, not once per retry pass. The request is
             // re-offered on every pass until the writer frees up, and repeating
             // this line each time would turn one incident into a stream of
-            // identical INFOs.
+            // identical WARNs. WARN because nobody at the terminal asked for this
+            // capture (see `raised_by_the_runtime`).
             if !self.run_vanished_announced {
                 self.run_vanished_announced = true;
-                tracing::info!(
+                tracing::warn!(
                     subject = %request.subject,
                     "flashback: the bound run vanished — asking to capture the moment"
                 );
@@ -16045,7 +16114,10 @@ impl Recorder {
         for action in actions {
             match action {
                 verdict_observer::VerdictAction::Capture(request) => {
-                    tracing::info!(
+                    // WARN: a topic that stalls or changes rate mid-run is a
+                    // fault nothing else on the run's terminal reports. Once
+                    // per transition (the observer re-arms only on `Recover`).
+                    tracing::warn!(
                         subject = %request.subject,
                         detail = %request.detail,
                         "flashback: a monitor verdict fired — asking to capture the moment"
@@ -16093,8 +16165,13 @@ impl Recorder {
                         .flashback
                         .as_mut()
                         .and_then(|p| p.recover(verdict_observer::VERDICT_KIND, &subject));
+                    // WARN, the level of the verdict line that opened this
+                    // regime. `recover` returns `None` when no regime is open,
+                    // which includes a verdict whose capture was refused
+                    // (writer busy or hourly cap), so that verdict's clearing
+                    // prints nothing.
                     if let Some(suppressed) = suppressed {
-                        tracing::info!(
+                        tracing::warn!(
                             subject = %subject,
                             suppressed,
                             "flashback: a monitor verdict cleared — its regime is re-armed"
@@ -16161,6 +16238,20 @@ impl Recorder {
                 // would be a second, staler copy of the same fact.
                 pinned: _,
             } => {
+                // The gate admitted a capture the runtime raised, so the
+                // hourly cap had room for it: close that regime. `on_success`
+                // returns a count only when the regime counted a repeat at
+                // `info`, and that line is a `warn`, the level the regime
+                // opened at; a regime of one refusal re-arms silently.
+                if raised_by_the_runtime(frame.request.kind) {
+                    if let Some(suppressed) = self.runtime_rate_cap_latch.on_success() {
+                        tracing::warn!(
+                            kind = frame.request.kind.as_wire(),
+                            suppressed,
+                            "flashback: the hourly cap admits the runtime's captures again"
+                        );
+                    }
+                }
                 let Some(path) = self.capture_path(seq) else {
                     // No filename could be RESERVED, so there is nowhere to write
                     // that does not destroy an existing capture. The gate has
@@ -16236,16 +16327,50 @@ impl Recorder {
                 }
             }
             TriggerDecision::Suppressed(reason) => {
-                // Loud, and with the numbers: the standing rule for the manual
-                // arm, and the same courtesy for the automatic ones — a
-                // suppression an operator cannot quantify is indistinguishable
-                // from the feature being broken.
-                tracing::info!(
-                    kind = frame.request.kind.as_wire(),
-                    subject = %frame.request.subject,
-                    reason = ?reason,
-                    "flashback: request suppressed"
-                );
+                // With the numbers: a suppression an operator cannot quantify
+                // is indistinguishable from the feature being broken. WARN only
+                // when the hourly cap refused a capture the runtime raised: that
+                // fault then has no capture, and nobody switched it off. Once
+                // per regime (`runtime_rate_cap_latch`), since such a requester
+                // re-publishes the same request while it lingers. Every other
+                // refusal stays INFO: an open regime or a refractory floor means
+                // the cause already has its capture, `Disabled` is a switch an
+                // operator turned off, and a manual, e-stop or declared request
+                // is not one the runtime raised (a manual request's verb prints
+                // its own refusal).
+                if suppression_is_loud(frame.request.kind, &reason) {
+                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                    match self.runtime_rate_cap_latch.on_failure() {
+                        RegimeDecision::Loud => tracing::warn!(
+                            kind = frame.request.kind.as_wire(),
+                            subject = %frame.request.subject,
+                            reason = ?reason,
+                            "flashback: request suppressed"
+                        ),
+                        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                            kind = frame.request.kind.as_wire(),
+                            subject = %frame.request.subject,
+                            reason = ?reason,
+                            total_failures = total,
+                            suppressed,
+                            "flashback: request suppressed"
+                        ),
+                        RegimeDecision::Suppressed { suppressed } => tracing::info!(
+                            kind = frame.request.kind.as_wire(),
+                            subject = %frame.request.subject,
+                            reason = ?reason,
+                            suppressed,
+                            "flashback: request suppressed"
+                        ),
+                    }
+                } else {
+                    tracing::info!(
+                        kind = frame.request.kind.as_wire(),
+                        subject = %frame.request.subject,
+                        reason = ?reason,
+                        "flashback: request suppressed"
+                    );
+                }
                 if let Some(plane) = self.flashback.as_ref() {
                     plane.publish_outcome(frame.request_id, FlashbackOutcome::Suppressed(reason));
                 }
@@ -17497,28 +17622,42 @@ impl Recorder {
         } = report;
         match result {
             Ok(stats) => {
-                tracing::info!(
-                    seq,
-                    path = %path.display(),
-                    bytes = stats.bytes,
-                    messages = stats.messages,
-                    // A capture of a shared topic carries
-                    // per-frame publisher attribution, and the line an operator
-                    // reads at the moment of the incident says so — a durable
-                    // artifact no shipped surface reports is a claim nobody can
-                    // check. ZERO on the ordinary single-writer capture.
-                    producer_labels = stats.producer_labels,
-                    catch_up_records = stats.catch_up_records,
-                    pinned,
-                    // What this capture claims and what it
-                    // carries, on the line an operator reads at the moment of
-                    // the incident — not only inside the bag they would have to
-                    // open to find out.
-                    claimed_span_ms = span.claimed_span_ms,
-                    achieved_span_ms = span.achieved_span_ms,
-                    coverage_shortfall_ms = span.shortfall_ms(),
-                    "flashback: capture written"
-                );
+                // A capture of a shared topic carries per-frame publisher
+                // attribution (`producer_labels`, ZERO on the ordinary
+                // single-writer capture), and the span fields state what the
+                // capture claims and what it carries, on the line an operator
+                // reads at the moment of the incident rather than only inside
+                // the bag. WARN when the runtime raised one of its causes, since
+                // this line is then the only place the terminal shows its path.
+                if causes.iter().any(|c| raised_by_the_runtime(c.kind)) {
+                    tracing::warn!(
+                        seq,
+                        path = %path.display(),
+                        bytes = stats.bytes,
+                        messages = stats.messages,
+                        producer_labels = stats.producer_labels,
+                        catch_up_records = stats.catch_up_records,
+                        pinned,
+                        claimed_span_ms = span.claimed_span_ms,
+                        achieved_span_ms = span.achieved_span_ms,
+                        coverage_shortfall_ms = span.shortfall_ms(),
+                        "flashback: capture written"
+                    );
+                } else {
+                    tracing::info!(
+                        seq,
+                        path = %path.display(),
+                        bytes = stats.bytes,
+                        messages = stats.messages,
+                        producer_labels = stats.producer_labels,
+                        catch_up_records = stats.catch_up_records,
+                        pinned,
+                        claimed_span_ms = span.claimed_span_ms,
+                        achieved_span_ms = span.achieved_span_ms,
+                        coverage_shortfall_ms = span.shortfall_ms(),
+                        "flashback: capture written"
+                    );
+                }
                 for id in &requesters {
                     plane.publish_outcome(
                         *id,
@@ -19674,6 +19813,8 @@ impl Recorder {
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             below_generation_eval_ns: None,
             flashback_cap_latch:
+                cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
+            runtime_rate_cap_latch:
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             mirrors: BTreeMap::new(),
             mirrors_established: None,
@@ -23977,6 +24118,458 @@ mod pre_close_drain_marker_tests {
                 None,
                 "a pass that emptied the queue is clean whatever a later probe says"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod flashback_verdict_level_tests {
+    //! What the window recorder `graph run` spawns prints under its quiet
+    //! default (`cerulion=warn`) about a Flashback capture the runtime raises.
+    //!
+    //! Driven on the `Recorder` directly, on the test thread, over a real
+    //! iceoryx2 tap and a manager whose `VirtualClock` the test advances: the
+    //! drain feeds the real liveness record book, `service_flashback` runs the
+    //! real monitor pass, and the capture is written by the real plane. Through
+    //! `run_bagd` the lines would come from another thread, which
+    //! `tracing-test` does not capture.
+    use super::*;
+    use cerulion_core::clock::VirtualClock;
+    use cerulion_core::flashback::channel::{mint_request_id, FlashbackRequestFrame};
+    use cerulion_core::flashback::trigger::{CaptureRequest, TriggerPolicy};
+    use cerulion_core::monitor::MONITOR_SAMPLE_INTERVAL_NS;
+    use cerulion_core::testing::{count_at, iceoryx_test_config, line_level};
+    use cerulion_core::transport::TransportConfig;
+    use cerulion_core::LivenessState;
+    use serial_test::serial;
+
+    const HASH: u64 = 0x5EED_CAFE;
+    const MIB: u64 = 1024 * 1024;
+    const POST_WINDOW_NS: u64 = 5_000_000;
+    /// Passes the topic streams for before it stops or the recorder stops:
+    /// 40 monitor intervals (16 s), past the 5 s settle window and the eight
+    /// samples a `stalled` baseline is learned from.
+    const STREAMING_PASSES: u64 = 40;
+    /// The ceiling on passes after the topic stops: 60 intervals (24 s), far
+    /// past the 5 s streaming recency and the 1.2 s confirmation span. Also
+    /// the ceiling on passes for a stalled topic to heal once it publishes
+    /// again.
+    const STALL_CEILING_PASSES: u64 = 60;
+    /// One rolling hour of the capture cap, in nanoseconds.
+    const HOUR_NS: u64 = 3_600 * 1_000_000_000;
+
+    const VERDICT_FIRED: &str = "flashback: a monitor verdict fired";
+    const VERDICT_CLEARED: &str = "flashback: a monitor verdict cleared";
+    const SUPPRESSED: &str = "flashback: request suppressed";
+    const CAP_RECOVERED: &str = "flashback: the hourly cap admits the runtime's captures again";
+    const RUN_VANISHED: &str = "flashback: the bound run vanished";
+    const CAPTURE_WRITTEN: &str = "flashback: capture written";
+
+    struct Harness {
+        rec: Recorder,
+        publisher: CerulionPublisher,
+        clock: Arc<VirtualClock>,
+        topic: String,
+        dir: PathBuf,
+        seq: u32,
+        at_ns: u64,
+    }
+
+    impl Harness {
+        fn new(tag: &str) -> Self {
+            Self::with_policy(
+                tag,
+                TriggerPolicy {
+                    post_window_ns: POST_WINDOW_NS,
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn with_policy(tag: &str, policy: TriggerPolicy) -> Self {
+            let clock = Arc::new(VirtualClock::new());
+            let mgr = TransportManager::init_for_test(
+                TransportConfig {
+                    node_name: format!("verdict_level_{tag}"),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 64,
+                    network: None,
+                },
+                iceoryx_test_config(),
+            )
+            .expect("isolated transport manager");
+            let topic = format!("/verdict_level/{tag}");
+            let publisher = mgr
+                .create_publisher(&topic, MaxSliceLen::const_new(64), 0)
+                .expect("publisher creates the topic");
+            let dir =
+                std::env::temp_dir().join(format!("verdict-level-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("flashback dir");
+            let mut cfg = BagdConfig::new(dir.join("unused.mcap"), vec![TapSpec::attach(&topic)]);
+            cfg.flashback = Some(flashback_plane::FlashbackSettings {
+                window_span: Duration::from_secs(30),
+                window_max_bytes: 8 * MIB,
+                anchor_max_bytes: 8 * MIB,
+                anchor_cap_basis: cerulion_core::flashback::CapBasis::Env,
+                trace_max_bytes: 1 << 20,
+                dir: dir.clone(),
+                label: "verdict_level".into(),
+                caps: cerulion_core::flashback::retention::RetentionCaps::default(),
+                policy,
+                // The shipped posture: `stalled` is on by default.
+                posture: cerulion_core::flashback::switch::TriggerPosture::default(),
+                window_only: true,
+                exclude_topics: cerulion_core::flashback::ExcludeTopics::default(),
+                tap_budget_bytes: cerulion_core::flashback::DEFAULT_FLASHBACK_TAP_BUDGET_MB
+                    * 1024
+                    * 1024,
+            });
+            let rec = Recorder::setup(&mgr, cfg, &AtomicBool::new(false))
+                .expect("Recorder::setup opens the data-only tap");
+            Self {
+                rec,
+                publisher,
+                clock,
+                topic,
+                dir,
+                seq: 0,
+                at_ns: 0,
+            }
+        }
+
+        /// One drive pass one monitor interval later, publishing one frame
+        /// stamped on the manager's clock first when `publish` is set.
+        fn pass(&mut self, publish: bool) {
+            self.at_ns += MONITOR_SAMPLE_INTERVAL_NS;
+            self.clock.set(self.at_ns);
+            if publish {
+                let total = WireHeader::SIZE + 24;
+                let mut header = WireHeader::new(HASH, self.seq, self.at_ns);
+                header.total_size = total as u32;
+                let mut frame = vec![0x5A; total];
+                header.write_to_buf(&mut frame[..WireHeader::SIZE]);
+                self.publisher.publish_raw(&frame).expect("publish");
+                self.seq += 1;
+            }
+            self.rec.drain_taps().expect("a clean drain");
+            self.rec.harvest_window(self.at_ns);
+            self.rec.service_flashback(self.at_ns);
+        }
+
+        /// The recorder stopping, as on a Ctrl-C: whatever is open is closed,
+        /// and whatever is being written is joined and reported.
+        fn stop(&mut self) {
+            self.rec.resolve_flashback_at_shutdown(self.at_ns + 1);
+        }
+
+        /// One request reaching the recorder's trigger gate at `at_ns`.
+        fn request(&mut self, frame: &FlashbackRequestFrame, at_ns: u64) {
+            let _ = self.rec.decide_flashback_request(frame, at_ns);
+        }
+
+        fn liveness_state(&self) -> Option<LivenessState> {
+            self.rec
+                .verdict
+                .as_ref()
+                .expect("a recorder with a plane holds a verdict observer")
+                .rows()
+                .into_iter()
+                .find(|r| r.topic == self.topic)
+                .and_then(|r| r.liveness_state)
+        }
+
+        fn captures_on_disk(&self) -> usize {
+            std::fs::read_dir(&self.dir)
+                .expect("read the flashback dir")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
+                .count()
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A topic that stops mid-run: the monitor's `stalled` verdict and the
+    /// capture it asks for each print once at `warn`, naming the topic and
+    /// the capture's path, so the quiet default still shows the fault; when
+    /// the topic publishes again, the verdict's clearing prints once at
+    /// `warn` too.
+    #[test]
+    #[serial]
+    #[tracing_test::traced_test]
+    fn a_topic_that_stalls_mid_run_warns_its_verdict_its_capture_path_and_its_recovery() {
+        let mut h = Harness::new("stalls");
+        for _ in 0..STREAMING_PASSES {
+            h.pass(true);
+        }
+        assert_eq!(
+            h.liveness_state(),
+            Some(LivenessState::Streaming),
+            "the topic streamed before it stopped"
+        );
+        let mut passes = 0;
+        while !logs_contain(VERDICT_FIRED) && passes < STALL_CEILING_PASSES {
+            h.pass(false);
+            passes += 1;
+        }
+        // Past the post window, so the capture closes on the due path.
+        h.pass(false);
+        // The topic publishes again until the verdict clears.
+        let mut passes = 0;
+        while !logs_contain(VERDICT_CLEARED) && passes < STALL_CEILING_PASSES {
+            h.pass(true);
+            passes += 1;
+        }
+        h.stop();
+        assert_eq!(h.captures_on_disk(), 1, "the verdict's one capture");
+
+        let subject = format!("stalled:local:{}", h.topic);
+        let dir = h.dir.display().to_string();
+        logs_assert(|lines: &[&str]| {
+            let warned = |marker: &str| -> Vec<String> {
+                lines
+                    .iter()
+                    .filter(|l| line_level(l) == Some("WARN") && l.contains(marker))
+                    .map(|l| (*l).to_string())
+                    .collect()
+            };
+            let fired = warned(VERDICT_FIRED);
+            let written = warned(CAPTURE_WRITTEN);
+            let cleared = warned(VERDICT_CLEARED);
+            let infos = [VERDICT_FIRED, CAPTURE_WRITTEN, VERDICT_CLEARED]
+                .iter()
+                .map(|m| count_at(lines, "INFO", m))
+                .sum::<usize>();
+            match (
+                fired.as_slice(),
+                written.as_slice(),
+                cleared.as_slice(),
+                infos,
+            ) {
+                ([f], [w], [c], 0)
+                    if f.contains(&subject) && w.contains(&dir) && c.contains(&subject) =>
+                {
+                    Ok(())
+                }
+                (f, w, c, infos) => Err(format!(
+                    "expected ONE WARN verdict and ONE WARN clear naming {subject}, and ONE \
+                     WARN capture line naming {dir}, with no INFO twin; got {f:?}, {w:?}, \
+                     {c:?} and {infos} INFO line(s)"
+                )),
+            }
+        });
+    }
+
+    /// The quickstart's happy path: a topic that streams until the recorder
+    /// stops, as on a clean Ctrl-C, prints nothing at `warn` or above, and no
+    /// verdict, vanished run or capture at any level.
+    #[test]
+    #[serial]
+    #[tracing_test::traced_test]
+    fn a_clean_stop_of_a_streaming_run_prints_no_flashback_line() {
+        let mut h = Harness::new("clean");
+        for _ in 0..STREAMING_PASSES {
+            h.pass(true);
+        }
+        // The monitor was watching: the same stream the stall arm stops.
+        assert_eq!(h.liveness_state(), Some(LivenessState::Streaming));
+        h.stop();
+        assert_eq!(h.captures_on_disk(), 0, "a clean stop takes no capture");
+
+        logs_assert(|lines: &[&str]| {
+            let loud: Vec<&&str> = lines
+                .iter()
+                .filter(|l| matches!(line_level(l), Some("WARN" | "ERROR")))
+                .collect();
+            let flashback: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(VERDICT_FIRED)
+                        || l.contains(RUN_VANISHED)
+                        || l.contains(CAPTURE_WRITTEN)
+                })
+                .collect();
+            if loud.is_empty() && flashback.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "a clean stop must stay quiet; WARN or ERROR: {loud:?}; flashback: \
+                     {flashback:?}"
+                ))
+            }
+        });
+    }
+
+    /// A run that vanishes: the recorder's request for a capture and the
+    /// capture's path each print once at `warn`.
+    #[test]
+    #[serial]
+    #[tracing_test::traced_test]
+    fn a_vanished_run_warns_its_capture_request_and_its_capture_path() {
+        let mut h = Harness::new("vanished");
+        for _ in 0..4 {
+            h.pass(true);
+        }
+        let subject = "0x000000000000000000000000000000a1";
+        h.rec.pending_run_vanished = Some(CaptureRequest::run_vanished(
+            subject,
+            "the bound run stopped publishing without announcing an end",
+        ));
+        h.pass(false);
+        h.stop();
+        assert_eq!(h.captures_on_disk(), 1, "the vanished run's one capture");
+
+        let dir = h.dir.display().to_string();
+        logs_assert(|lines: &[&str]| {
+            let warned = |marker: &str| -> Vec<String> {
+                lines
+                    .iter()
+                    .filter(|l| line_level(l) == Some("WARN") && l.contains(marker))
+                    .map(|l| (*l).to_string())
+                    .collect()
+            };
+            let infos =
+                count_at(lines, "INFO", RUN_VANISHED) + count_at(lines, "INFO", CAPTURE_WRITTEN);
+            match (
+                warned(RUN_VANISHED).as_slice(),
+                warned(CAPTURE_WRITTEN).as_slice(),
+                infos,
+            ) {
+                ([v], [w], 0) if v.contains(subject) && w.contains(&dir) => Ok(()),
+                (v, w, infos) => Err(format!(
+                    "expected ONE WARN request naming {subject} and ONE WARN capture line \
+                     naming {dir}, with no INFO twin; got {v:?}, {w:?} and {infos} INFO \
+                     line(s)"
+                )),
+            }
+        });
+    }
+
+    /// The hourly cap refusing a capture the runtime raised: the first
+    /// refusal prints at `warn`, the same request re-published by its
+    /// lingering requester is counted at `info`, and the next such capture
+    /// the cap admits closes the regime at `warn`, since the regime counted a
+    /// repeat.
+    ///
+    /// Hand oracle: a cap of one capture an hour with no manual reserve. A
+    /// manual capture spends it; a worker death offered twice is refused
+    /// twice (one `warn`, one `info` repeat); an hour later a disabled node's
+    /// capture is admitted, and the recovery line counts the one repeat.
+    #[test]
+    #[serial]
+    #[tracing_test::traced_test]
+    fn a_rate_capped_runtime_capture_warns_once_per_regime_and_says_when_it_ends() {
+        let mut h = Harness::with_policy(
+            "capped",
+            TriggerPolicy {
+                post_window_ns: POST_WINDOW_NS,
+                max_per_hour: 1,
+                manual_reserve: 0,
+                ..Default::default()
+            },
+        );
+        for _ in 0..4 {
+            h.pass(true);
+        }
+        let manual = FlashbackRequestFrame {
+            request_id: mint_request_id(),
+            request: CaptureRequest::manual("spend the hourly cap"),
+        };
+        h.request(&manual, h.at_ns);
+        h.stop();
+        let death = FlashbackRequestFrame {
+            request_id: mint_request_id(),
+            request: CaptureRequest::process_fault("group:a", "the worker process exited"),
+        };
+        h.request(&death, h.at_ns + 2);
+        h.request(&death, h.at_ns + 3);
+        assert_eq!(
+            h.captures_on_disk(),
+            1,
+            "the refused worker death has no capture"
+        );
+
+        let disabled = FlashbackRequestFrame {
+            request_id: mint_request_id(),
+            request: CaptureRequest::panic_disable("node:b", "disabled after its panics"),
+        };
+        h.at_ns += HOUR_NS + 4;
+        h.request(&disabled, h.at_ns);
+        h.stop();
+        assert_eq!(
+            h.captures_on_disk(),
+            2,
+            "the cap admits the next hour's capture"
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let at = |level: &str, marker: &str| -> Vec<String> {
+                lines
+                    .iter()
+                    .filter(|l| line_level(l) == Some(level) && l.contains(marker))
+                    .map(|l| (*l).to_string())
+                    .collect()
+            };
+            match (
+                at("WARN", SUPPRESSED).as_slice(),
+                at("INFO", SUPPRESSED).as_slice(),
+                at("WARN", CAP_RECOVERED).as_slice(),
+            ) {
+                ([loud], [repeat], [recovered])
+                    if loud.contains("RateCapped")
+                        && loud.contains("process_fault")
+                        && repeat.contains("suppressed=1")
+                        && recovered.contains("suppressed=1") =>
+                {
+                    Ok(())
+                }
+                (loud, repeat, recovered) => Err(format!(
+                    "expected ONE WARN rate-capped refusal of the worker death, ONE INFO \
+                     repeat and ONE WARN recovery counting it; got {loud:?}, {repeat:?} and \
+                     {recovered:?}"
+                )),
+            }
+        });
+    }
+
+    /// The level rule over every kind and every suppression reason, as a
+    /// hand-written table.
+    #[test]
+    fn the_runtime_raised_kinds_and_the_one_loud_suppression_are_the_table() {
+        use cerulion_core::flashback::switch::TriggerSwitch;
+        use cerulion_core::flashback::trigger::{SuppressReason, TriggerKind};
+        let kinds = [
+            (TriggerKind::Manual, false),
+            (TriggerKind::ProcessFault, true),
+            (TriggerKind::MonitorVerdict, true),
+            (TriggerKind::PanicDisable, true),
+            (TriggerKind::RunVanished, true),
+            (TriggerKind::EStop, false),
+            (TriggerKind::Declared, false),
+        ];
+        let capped = SuppressReason::RateCapped {
+            captures_in_window: 18,
+            cap: 18,
+            reserved_for_manual: 2,
+        };
+        let quiet_reasons = [
+            SuppressReason::RegimeOpen { suppressed: 1 },
+            SuppressReason::Refractory { retry_in_ns: 1 },
+            SuppressReason::Disabled {
+                switch: TriggerSwitch::Stalled,
+            },
+        ];
+        for (kind, runtime) in kinds {
+            assert_eq!(raised_by_the_runtime(kind), runtime, "{kind:?}");
+            assert_eq!(suppression_is_loud(kind, &capped), runtime, "{kind:?}");
+            for reason in &quiet_reasons {
+                assert!(!suppression_is_loud(kind, reason), "{kind:?} {reason:?}");
+            }
         }
     }
 }

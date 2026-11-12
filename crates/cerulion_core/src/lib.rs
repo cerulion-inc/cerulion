@@ -716,8 +716,9 @@ pub mod wire;
 ///   `ReplayReadViolation` and its kind) is reached through a crate-owned
 ///   `Arc` from that field, so those rows enter the `abi_layout` table at this
 ///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
-///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
-///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///   `(u64, Option<u64>)` to `RefillOutcome`, which was host-side only at v26:
+///   the legacy refill export remained unchanged. Stable node libraries now
+///   use the host head operations.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
@@ -936,12 +937,14 @@ pub use serde;
 ///
 /// The level is chosen by the caller's verb class:
 /// - `verbose` (any verb, `-v/--verbose`) → `cerulion=debug`
-/// - one-shot verbs (`quiet_default = true`: run-and-exit introspection /
-///   management commands like `topic list`, `schema list`, `node info`) →
-///   `cerulion=warn`, so lifecycle breadcrumbs ("discovery ladder gathered",
-///   the netd first-use spawn line) don't interleave with the command's output.
-/// - long-running / runtime verbs (`quiet_default = false`: `graph run`,
-///   `node run`, `replay`, `viz`, …) → `cerulion=info` (the legacy default).
+/// - one-shot verbs and the runtime verbs whose output is their result
+///   (`quiet_default = true`: run-and-exit introspection / management commands
+///   like `topic list`, `schema list`, `node info`, plus `graph run` and
+///   `bag play`) → `cerulion=warn`, so lifecycle breadcrumbs ("discovery ladder
+///   gathered", the netd first-use spawn line) don't interleave with the
+///   command's output.
+/// - the other long-running / runtime verbs (`quiet_default = false`:
+///   `node run`, `graph profile`, `bag record`, `viz`, …) → `cerulion=info`.
 ///
 /// This is the FALLBACK only — an explicit `RUST_LOG` always wins (see
 /// [`init_logging`]).

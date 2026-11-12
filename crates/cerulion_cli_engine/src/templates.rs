@@ -636,6 +636,28 @@ pub fn generate_info_fn(metadata: &NodeMetadata) -> String {
         "static INFO_BYTES: &[u8] = b\"{}\\0\";\n\n",
         info_json
     ));
+    // Schema names survive source parsing and subsequent node modify calls.
+    // They stay outside the runtime JSON, which accepts only wire facts.
+    let schemas: std::collections::BTreeMap<_, std::collections::BTreeMap<_, _>> =
+        [("inputs", &metadata.inputs), ("outputs", &metadata.outputs)]
+            .into_iter()
+            .filter_map(|(direction, ports)| {
+                let names: std::collections::BTreeMap<_, _> = ports
+                    .iter()
+                    .filter_map(|port| {
+                        port.schema
+                            .as_deref()
+                            .map(|schema| (port.name.as_str(), schema))
+                    })
+                    .collect();
+                (!names.is_empty()).then_some((direction, names))
+            })
+            .collect();
+    if !schemas.is_empty() {
+        s.push_str(crate::node_metadata::PORT_SCHEMAS_MARKER);
+        s.push_str(&serde_json::to_string(&schemas).expect("schema names serialize as strings"));
+        s.push('\n');
+    }
     s.push_str("#[no_mangle]\n");
     s.push_str("pub extern \"C\" fn cerulion_node_info() -> *const std::ffi::c_char {\n");
     s.push_str("    // SAFETY: INFO_BYTES is a static &[u8] with a trailing null byte.\n");
@@ -1538,6 +1560,7 @@ mod tests {
             "nodes().shutdown(handle)",
             "nodes().destroy(handle)",
             "nodes().copy_error(token, target, required)",
+            "self.client.flush_deferred()",
         ] {
             assert!(source.contains(callback));
         }

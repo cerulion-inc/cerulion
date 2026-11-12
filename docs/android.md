@@ -140,7 +140,7 @@ transport, but each macro node also probes its own linked iceoryx2 copy during
 create. Without Android shared-memory support, create refuses the node:
 
 ```text
-Node '<Type>' error: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
+Node '<library path>' error: init failed: the binary links an iceoryx2 build without Android shared-memory support; build the workspace with the iceoryx2 fork [patch.crates-io] block (see docs/android.md)
 ```
 
 Nodes call the host through opaque handles and borrowed slots. Their Rust

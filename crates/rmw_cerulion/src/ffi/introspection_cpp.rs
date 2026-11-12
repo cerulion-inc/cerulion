@@ -22,17 +22,17 @@
 //! | Lyrical, Rolling (`cerulion_has_is_rosidl_buffer`) | 120, `is_rosidl_buffer_` at 112 | 64 | 40 |
 //!
 //! Foxy and Galactic predate `fetch_function` and `assign_function`, so
-//! their member carries neither: a `std::vector<bool>` member is
-//! unreachable there (the generator emits no fetch or assign and leaves
-//! `get`/`get_const` null), and the bridge refuses such a message rather
-//! than guessing at its elements. Every other member kind is reachable
+//! their member carries neither, and their generator leaves every other
+//! accessor of a `bool` sequence null too. That member is still a
+//! `std::vector<bool>`, which the bridge reads and fills through the shim
+//! (`is_accessorless_bool_sequence`). Every other member kind is reachable
 //! through the accessors that do exist.
 //!
-//! Container access is exclusively through the member's function
-//! pointers (`size/get/get_const/fetch/assign/resize`) — never through
-//! assumed `std::vector` internals. The ONLY C++ ABI we touch directly
-//! is `std::string`, via the compiled shim (`shim/cppstring_shim.cpp`),
-//! which uses the platform's real ABI by construction.
+//! Container access is through the member's function pointers, except in
+//! the compiled shim (`shim/cppstring_shim.cpp`: `std::string`, the `uint8[]`
+//! fill, the accessorless `std::vector<bool>`, `rosidl::Buffer`, the adopted
+//! buffer release) and where the forged take and the borrow seal write a
+//! `VecTriplet`, only when `vector_triplet_layout_verified` holds.
 
 use std::os::raw::{c_char, c_void};
 
@@ -271,10 +271,10 @@ const _: () = {
 };
 
 /// The member's `fetch` accessor, or `None` where the C++ `MessageMember`
-/// of this build carries no such field (Foxy and Galactic). The two
-/// callers that need it are the `std::vector<bool>` element walks, which
-/// refuse the message on `None`; every other member kind reads through
-/// accessors that exist on every era.
+/// of this build carries no such field (Foxy and Galactic). The callers
+/// that need it are the `std::vector<bool>` element walks, which on `None`
+/// read an accessorless member through the shim and refuse any other;
+/// every other member kind reads through accessors that exist on every era.
 #[inline]
 pub fn member_fetch(member: &CppMessageMember) -> Option<CppFetchFn> {
     #[cfg(cerulion_has_fetch_function)]
@@ -343,6 +343,30 @@ extern "C" {
     pub fn rmw_cerulion_vector_u8_capacity(v: *const c_void) -> usize;
     /// `data()` of a `std::vector<uint8_t>` (test fixtures).
     pub fn rmw_cerulion_vector_u8_data(v: *const c_void) -> *const u8;
+
+    /// The `std::vector<bool>` operations behind an accessorless `bool`
+    /// sequence (Foxy and Galactic, `is_accessorless_bool_sequence`). Each
+    /// `static_cast`s its pointer to `std::vector<bool>*`, so a pointer to
+    /// anything else is undefined behaviour, and `get`/`set` index without a
+    /// bounds check. The bridge reaches them only through `vector_bool_len`,
+    /// `vector_bool_read` and `vector_bool_assign` below.
+    ///
+    /// `size()` and element `i`: read only, `pub` like the `uint8_t` readers
+    /// above, so fixtures read a vector back through the same calls.
+    pub fn rmw_cerulion_vector_bool_size(v: *const c_void) -> usize;
+    pub fn rmw_cerulion_vector_bool_get(v: *const c_void, i: usize) -> bool;
+    /// `resize(n)` (0 on success, 1 when it threw) and setting element `i`:
+    /// `pub(crate)` (NOT `pub`), because they write through the cast; tests
+    /// declare their own `extern "C"` block rather than reach these.
+    pub(crate) fn rmw_cerulion_vector_bool_resize(v: *mut c_void, n: usize) -> std::os::raw::c_int;
+    pub(crate) fn rmw_cerulion_vector_bool_set(v: *mut c_void, i: usize, value: bool);
+    /// `sizeof(std::vector<bool>)` on this platform (test fixtures).
+    pub fn rmw_cerulion_vector_bool_sizeof() -> usize;
+    /// Placement-construct a `std::vector<bool>` of `n` elements, element `k`
+    /// true when `bits[k]` is nonzero (test fixtures).
+    pub fn rmw_cerulion_vector_bool_construct(at: *mut c_void, bits: *const u8, n: usize);
+    /// Destruct a placement-constructed `std::vector<bool>` (test fixtures).
+    pub fn rmw_cerulion_vector_bool_destruct(v: *mut c_void);
 
     /// The introspection accessors, each called inside a `noexcept` C++
     /// wrapper that catches every exception and returns 0 on success,
@@ -431,8 +455,9 @@ extern "C" {
 /// `unsigned char` — layout-compatible but NOT type-`uint8`, kept off
 /// the path so the gate boundary stays exactly UINT8), `bool`
 /// (bit-packed), and every multi-byte primitive. `!is_upper_bound_`
-/// excludes a rosidl `BoundedVector<uint8_t, N>`, whose layout differs
-/// from `std::vector`. The caller additionally checks `!is_bool` and
+/// keeps a rosidl `BoundedVector<uint8_t, N>` on the resize()+copy path, so
+/// this gate is exactly the unbounded `uint8[]` class; the bridge refuses a
+/// count over the bound before either path writes. The caller additionally checks `!is_bool` and
 /// that this is a dynamic (non-fixed) array; a fixed `uint8[N]` array is
 /// classified elsewhere and never reaches this predicate's fast path. On
 /// Lyrical and Rolling a member flagged `is_rosidl_buffer_` is a rosidl
@@ -470,6 +495,96 @@ pub(crate) fn is_unbounded_u8_vector(member: &CppMessageMember) -> bool {
 /// empty).
 pub(crate) unsafe fn assign_u8_vector(field: *mut c_void, bytes: &[u8]) {
     rmw_cerulion_vector_u8_assign(field, bytes.as_ptr(), bytes.len());
+}
+
+/// Is `member` a `bool` sequence (unbounded, or bounded) whose typesupport
+/// gives it NO accessor at all: `size`, `get`, `get_const` and `resize` null,
+/// and no `fetch` or `assign`?
+///
+/// That is exactly what `rosidl_typesupport_introspection_cpp` emits for every
+/// `bool[]` and `bool[<=N]` member before Humble (Foxy and Galactic share one
+/// template, `msg__type_support.cpp.em`, which skips the accessors of a
+/// `std::vector<bool>` because it has no element addresses). Every C++ message
+/// rosidl generates declares such a member as `std::vector<bool>` with the
+/// default allocator, or as `rosidl_runtime_cpp::BoundedVector<bool, N>`,
+/// whose only base is that vector at offset 0 and which adds no member of its
+/// own. The bridge therefore reads and fills it through the shim's
+/// `std::vector<bool>` operations; the wire form is the one the `fetch` and
+/// `assign` accessors produce from Humble on (one byte per element, 1 or 0),
+/// so either end can be any distro.
+///
+/// Any other combination is not this shape: one with `fetch` and `assign`
+/// (Humble on) goes through those accessors, and one lacking them, such as a
+/// `size` function alone, is no generator's output and stays refused.
+/// A fixed `bool[N]` is not a sequence and is copied as plain bytes.
+pub(crate) fn is_accessorless_bool_sequence(member: &CppMessageMember) -> bool {
+    member.type_id_ == crate::type_bridge::ros_type::BOOLEAN
+        && member.is_array_
+        && (member.array_size_ == 0 || member.is_upper_bound_)
+        && member.size_function.is_none()
+        && member.get_const_function.is_none()
+        && member.get_function.is_none()
+        && member.resize_function.is_none()
+        && member_fetch(member).is_none()
+        && member_assign(member).is_none()
+}
+
+/// Element count of an accessorless `bool` sequence.
+///
+/// # Safety
+/// `field` points at the member's field inside a live C++ message, and
+/// [`is_accessorless_bool_sequence`] holds for the member, so the field is a
+/// `std::vector<bool>` (or the `BoundedVector` that is one at offset 0).
+pub(crate) unsafe fn vector_bool_len(field: *const c_void) -> usize {
+    // SAFETY: the caller's contract makes `field` a live std::vector<bool>,
+    // which is the shim's only requirement for size().
+    unsafe { rmw_cerulion_vector_bool_size(field) }
+}
+
+/// Copy the elements of an accessorless `bool` sequence into `dst` in the
+/// wire form, one byte per element, 1 for true and 0 for false. Err, with
+/// `dst` unwritten, when the sequence does not hold exactly `dst.len()`
+/// elements (it changed after the caller sized the frame).
+///
+/// # Safety
+/// As [`vector_bool_len`].
+pub(crate) unsafe fn vector_bool_read(
+    field: *const c_void,
+    dst: &mut [u8],
+) -> Result<(), &'static str> {
+    // SAFETY: the caller's contract makes `field` a live std::vector<bool>.
+    let len = unsafe { rmw_cerulion_vector_bool_size(field) };
+    if dst.len() != len {
+        return Err("the bool sequence's length changed between the size and copy passes");
+    }
+    for (i, b) in dst.iter_mut().enumerate() {
+        // SAFETY: `field` is a live std::vector<bool> and `i < dst.len() ==
+        // size()`, so the unchecked index in the shim is in range.
+        *b = u8::from(unsafe { rmw_cerulion_vector_bool_get(field, i) });
+    }
+    Ok(())
+}
+
+/// Fill an accessorless `bool` sequence with exactly `bytes.len()` elements,
+/// element `i` true when `bytes[i]` is nonzero (the decode rule of the
+/// `assign` path). False when the resize threw; the frame is then refused.
+///
+/// # Safety
+/// As [`vector_bool_len`], with `field` writable. A BOUNDED member's
+/// caller must already have refused a `bytes.len()` above its bound: the
+/// resize goes through the `std::vector<bool>` base, which does not know the
+/// bound.
+pub(crate) unsafe fn vector_bool_assign(field: *mut c_void, bytes: &[u8]) -> bool {
+    // SAFETY: the caller's contract makes `field` a live, writable
+    // std::vector<bool>; the shim catches a throwing resize and reports 1.
+    if unsafe { rmw_cerulion_vector_bool_resize(field, bytes.len()) } != 0 {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        // SAFETY: the resize above made size() == bytes.len() > i.
+        unsafe { rmw_cerulion_vector_bool_set(field, i, b != 0) };
+    }
+    true
 }
 
 /// Debug-only, run-once check that `std::vector<uint8_t>` has the default
@@ -723,5 +838,136 @@ mod accessor_wrapper_tests {
         };
         assert_eq!(status, 0);
         assert_eq!(out as usize, &marker as *const u8 as usize);
+    }
+}
+
+#[cfg(test)]
+mod accessorless_bool_tests {
+    use super::*;
+    use crate::type_bridge::ros_type;
+
+    unsafe extern "C" fn any_size(_: *const c_void) -> usize {
+        0
+    }
+    unsafe extern "C" fn any_get_const(m: *const c_void, _: usize) -> *const c_void {
+        m
+    }
+    unsafe extern "C" fn any_get(m: *mut c_void, _: usize) -> *mut c_void {
+        m
+    }
+    unsafe extern "C" fn any_resize(_: *mut c_void, _: usize) {}
+    #[cfg(cerulion_has_fetch_function)]
+    unsafe extern "C" fn any_fetch(_: *const c_void, _: usize, _: *mut c_void) {}
+    #[cfg(cerulion_has_fetch_function)]
+    unsafe extern "C" fn any_assign(_: *mut c_void, _: usize, _: *const c_void) {}
+
+    /// The Foxy and Galactic `bool[]` member: every accessor null.
+    fn foxy_bool_seq() -> CppMessageMember {
+        CppMessageMember {
+            name_: c"flags".as_ptr(),
+            type_id_: ros_type::BOOLEAN,
+            string_upper_bound_: 0,
+            members_: std::ptr::null(),
+            #[cfg(cerulion_has_is_key)]
+            is_key_: false,
+            is_array_: true,
+            array_size_: 0,
+            is_upper_bound_: false,
+            offset_: 0,
+            default_value_: std::ptr::null(),
+            size_function: None,
+            get_const_function: None,
+            get_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            fetch_function: None,
+            #[cfg(cerulion_has_fetch_function)]
+            assign_function: None,
+            resize_function: None,
+            #[cfg(cerulion_has_is_rosidl_buffer)]
+            is_rosidl_buffer_: false,
+        }
+    }
+
+    /// The predicate admits exactly the template's shape: an unbounded or
+    /// bounded `bool` sequence with every accessor null. Each single accessor
+    /// set, a fixed `bool[N]`, a scalar `bool` and a non-bool sequence are
+    /// all outside it, so each keeps the path it had (the accessors, the
+    /// fixed-section copy, or the refusal).
+    #[test]
+    fn only_a_bool_sequence_with_every_accessor_null_is_accessorless() {
+        assert!(is_accessorless_bool_sequence(&foxy_bool_seq()));
+        let mut bounded = foxy_bool_seq();
+        bounded.array_size_ = 4;
+        bounded.is_upper_bound_ = true;
+        assert!(is_accessorless_bool_sequence(&bounded));
+
+        let mut with: Vec<(&str, CppMessageMember)> = Vec::new();
+        let mut m = foxy_bool_seq();
+        m.size_function = Some(any_size);
+        with.push(("size", m));
+        let mut m = foxy_bool_seq();
+        m.get_const_function = Some(any_get_const);
+        with.push(("get_const", m));
+        let mut m = foxy_bool_seq();
+        m.get_function = Some(any_get);
+        with.push(("get", m));
+        let mut m = foxy_bool_seq();
+        m.resize_function = Some(any_resize);
+        with.push(("resize", m));
+        #[cfg(cerulion_has_fetch_function)]
+        {
+            let mut m = foxy_bool_seq();
+            m.fetch_function = Some(any_fetch);
+            with.push(("fetch", m));
+            let mut m = foxy_bool_seq();
+            m.assign_function = Some(any_assign);
+            with.push(("assign", m));
+        }
+        for (accessor, m) in &with {
+            assert!(
+                !is_accessorless_bool_sequence(m),
+                "a bool sequence with a {accessor} accessor is not the accessorless shape"
+            );
+        }
+
+        let mut fixed = foxy_bool_seq();
+        fixed.array_size_ = 3;
+        assert!(
+            !is_accessorless_bool_sequence(&fixed),
+            "bool[3] is not a sequence"
+        );
+        let mut scalar = foxy_bool_seq();
+        scalar.is_array_ = false;
+        assert!(!is_accessorless_bool_sequence(&scalar), "a scalar bool");
+        let mut bytes = foxy_bool_seq();
+        bytes.type_id_ = ros_type::UINT8;
+        assert!(!is_accessorless_bool_sequence(&bytes), "a uint8 sequence");
+    }
+
+    /// The read refuses a destination of any length other than the
+    /// vector's, longer (which would index past its end) or shorter, and
+    /// writes nothing into it; a destination of the vector's own length
+    /// reads every element as 1 or 0.
+    #[test]
+    fn the_read_refuses_a_destination_whose_length_is_not_the_vectors() {
+        #[repr(C, align(16))]
+        struct Slot([u8; 64]);
+        let mut slot = Slot([0; 64]);
+        let at = slot.0.as_mut_ptr() as *mut c_void;
+        assert!(unsafe { rmw_cerulion_vector_bool_sizeof() } <= 64);
+        let elems = [1u8, 0, 1];
+        unsafe { rmw_cerulion_vector_bool_construct(at, elems.as_ptr(), elems.len()) };
+
+        let mut long = [0xA5u8; 4];
+        assert!(unsafe { vector_bool_read(at, &mut long) }.is_err());
+        assert_eq!(long, [0xA5; 4], "a refused read writes nothing");
+        let mut short = [0xA5u8; 2];
+        assert!(unsafe { vector_bool_read(at, &mut short) }.is_err());
+        assert_eq!(short, [0xA5; 2], "a refused read writes nothing");
+        let mut exact = [0xA5u8; 3];
+        assert!(unsafe { vector_bool_read(at, &mut exact) }.is_ok());
+        assert_eq!(exact, [1, 0, 1]);
+        assert_eq!(unsafe { vector_bool_len(at) }, 3);
+        unsafe { rmw_cerulion_vector_bool_destruct(at) };
     }
 }
