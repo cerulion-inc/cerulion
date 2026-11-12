@@ -159,12 +159,19 @@ remove them before committing.
   none: a peer that never pairs cannot keep the server running past the last
   egress release or a lapsed serving hold, and pairing over a bootstrap-only
   session is served only while something else keeps the server: standing
-  serving, an egress registration, a serving hold, or work that holds the
-  fence (a paired session, outbound readers, the engaged latch or owed
-  delivery). An `RcpAdmit` connection re-checks the session floor every
+  serving, an egress registration, a serving hold, an armed pairing code, or
+  work that holds the fence (a paired session, outbound readers, the engaged
+  latch or owed delivery). A `PairCode` guard is held from before a pair-code
+  request is claimed until its first result is written; the armed code's own
+  source then holds the fence until a paired or expired end is written, an
+  exhausted code until its window plus a margin (so a later desk is told the
+  code was used up), and never past its window plus that margin however its
+  result writes go, so a desk pairing with the code needs no guard of its own.
+  An `RcpAdmit` connection re-checks the session floor every
   `RcpLimits::revoke_check`, with or without a stream open, so a revoked key's
-  connection closes and releases its guard. Latch and owed-delivery
-  sources refresh before the last shared unlock. Both daemons use
+  connection closes and releases its guard. Latch, owed-delivery and
+  armed-pairing-code sources refresh before the last shared unlock. Both
+  daemons use
   `serving_hold::fence_path(state_root)` for
   `<state_root>/serving/serving.hold`, outside the provisioned `remoted` directory.
   Its parent is created owner-only before the file opens, so fresh provisioning
