@@ -83,6 +83,20 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 
 ## Quickstart: Run, record and verify
 
+**Using a coding agent?** Paste this prompt into Claude Code, Codex or another agent that runs commands in its own terminal:
+
+```text
+Install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+Run cerulion login in the background, show me the URL and code it prints, and wait for it to finish while I approve the sign-in in my browser.
+Then run the quickstart at https://github.com/cerulion-inc/cerulion#quickstart-run-record-and-verify in your own terminal:
+cerulion workspace create safety_demo --starter obstacle_avoidance, then cd safety_demo.
+Build both nodes (cerulion node build laser_scanner --release, then cerulion node build safety_controller --release; the first build takes a few minutes).
+Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle_avoidance --release --record for at least five seconds, and stop it with Ctrl+C.
+Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
+In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
+Report what changed between the two verifications.
+```
+
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
 
 ```bash
@@ -144,25 +158,6 @@ cerulion bag play "$BAG" --resim all --verify
 This time verification reports a divergence and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation at the top of this page shows this whole run.
 
 If Cerulion is useful to you, a star helps other robotics engineers find it.
-
-<details>
-<summary>Using a coding agent?</summary>
-
-Paste this prompt into Claude Code, Codex or another agent that runs commands in its own terminal:
-
-```text
-Install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
-Run cerulion login in the background, show me the URL and code it prints, and wait for it to finish while I approve the sign-in in my browser.
-Then run the quickstart at https://github.com/cerulion-inc/cerulion#quickstart-run-record-and-verify in your own terminal:
-cerulion workspace create safety_demo --starter obstacle_avoidance, then cd safety_demo.
-Build both nodes (cerulion node build laser_scanner --release, then cerulion node build safety_controller --release; the first build takes a few minutes).
-Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle_avoidance --release --record for at least five seconds, and stop it with Ctrl+C.
-Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
-In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
-Report what changed between the two verifications.
-```
-
-</details>
 
 <details>
 <summary>What replay verification checks</summary>
