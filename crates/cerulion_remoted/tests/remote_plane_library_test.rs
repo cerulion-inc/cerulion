@@ -31,6 +31,7 @@ use cerulion_link::{
     RelayConfig, DEFAULT_MAX_FRAME_LEN,
 };
 use cerulion_pairing::format::{PrincipalKind, PublicKey, RootSet};
+use cerulion_pairing::pair_code::{PairCodeNonce, PairCodeRequest, REQUEST_FILE, RESULT_FILE};
 use cerulion_pairing::verify::TrustStore;
 use cerulion_remoted::{
     BoundPlane, DeviceAccountIndex, KeyFiles, KeyProvider, RemotePlane, RemotedConfig,
@@ -543,6 +544,55 @@ async fn a_library_host_refuses_the_daemon_only_verbs_by_name() {
             ("engage-estop".into(), ReceiptOutcome::Denied),
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_library_host_arms_no_pairing_code_from_a_request_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    provision(root.path(), public(ROBOT_SEED));
+    let remoted = root.path().join("remoted");
+    std::fs::set_permissions(&remoted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A well-formed, owner-only request, as the daemon would arm it.
+    let line = PairCodeRequest::new(PairCodeNonce::from_bytes([0x44; 16]), "48261937")
+        .unwrap()
+        .render();
+    let request = remoted.join(REQUEST_FILE);
+    std::fs::write(&request, &line).unwrap();
+    std::fs::set_permissions(&request, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let keys = MemoryKeys::new(ROBOT_SEED);
+    let bound = RemotePlane::new(
+        root.path(),
+        ROBOT,
+        root.path().join("no-daemon.sock"),
+        RelayConfig::Disabled,
+    )
+    .bind_bounded(&keys)
+    .await
+    .unwrap();
+    let plane = Hosted::start(bound);
+    let guest = disabled_endpoint([STRANGER_SEED; 32]).await;
+    let start = || vec![("code-pair-start", serde_json::json!({ "msg1": "00" }))];
+
+    // Serving, and for more than two of the daemon's poll intervals after.
+    let (_, before) = ops_calls(&guest, &plane, start()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    let (_, after) = ops_calls(&guest, &plane, start()).await;
+    plane.stop().await;
+    for results in [before, after] {
+        let (kind, message) = remote_error(&results[0]);
+        assert_eq!(kind, "verb_error", "{message}");
+        assert!(
+            message.contains("no code pairing is armed"),
+            "message: {message}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&request).unwrap(),
+        line,
+        "the request is left as it was"
+    );
+    assert!(!remoted.join(RESULT_FILE).exists(), "no result is written");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

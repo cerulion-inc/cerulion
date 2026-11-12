@@ -167,11 +167,11 @@ remove them before committing.
   exhausted code until its window plus a margin (so a later desk is told the
   code was used up), and never past its window plus that margin however its
   result writes go, so a desk pairing with the code needs no guard of its own.
-  An `RcpAdmit` connection re-checks the session floor every
-  `RcpLimits::revoke_check`, with or without a stream open, so a revoked key's
-  connection closes and releases its guard. Latch, owed-delivery and
-  armed-pairing-code sources refresh before the last shared unlock. Both
-  daemons use
+  The daemon's stop withdraws the armed code, which ends its hold. An `RcpAdmit`
+  connection re-checks the session floor every `RcpLimits::revoke_check`, with
+  or without a stream open, so a revoked key's connection closes and releases
+  its guard. Latch, owed-delivery and armed-pairing-code sources refresh
+  before the last shared unlock. Both daemons use
   `serving_hold::fence_path(state_root)` for
   `<state_root>/serving/serving.hold`, outside the provisioned `remoted` directory.
   Its parent is created owner-only before the file opens, so fresh provisioning
@@ -236,7 +236,8 @@ remove them before committing.
   `expires()` is measured from before the request, never later than netd's
   deadline. A lease does not take `serving.hold`: remoted shares that lock
   only for paired sessions, ops calls outside the bootstrap surface, outbound
-  readers and its own sources, so a connection from a peer without paired
+  readers, the pair-code poller's `PairCode` guard while it arms a request,
+  and its own sources, so a connection from a peer without paired
   authority never keeps the server past the hold's deadline
   (`automatic_serving_test.rs` pins the reap with two unpaired ops connections
   and a refused rcp connection held open, and the wait for a paired session).
