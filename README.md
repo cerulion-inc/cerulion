@@ -127,7 +127,7 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/architecture-flow-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/media/architecture-flow-light.svg">
-  <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to your tools, the CLI and coding agents.">
+  <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to Cerulion Studio (early access), the CLI and coding agents.">
 </picture>
 
 - **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
