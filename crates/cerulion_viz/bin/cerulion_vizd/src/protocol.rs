@@ -1308,7 +1308,12 @@ pub struct AttachedEntry {
     /// moves as the topic proves it is rendering, or degrades.
     pub view_kinds: Option<Vec<String>>,
     /// The ORIGIN ROBOT this tap's data comes from, or ABSENT when the
-    /// topic is a genuine local producer (a desk graph).
+    /// topic is a genuine local producer (a desk graph). For a mirror attached by
+    /// the local path this is as fresh as the last stored `discover` or local
+    /// `attach` gather: absent before the first, after a gather that failed,
+    /// behind any mirror registered or retired since, and absent for a topic this
+    /// daemon detached since, until the next such gather. `list` and `status`
+    /// never gather themselves.
     ///
     /// Same field, same meaning, same source of truth as
     /// [`DiscoveredEntry::robot`] — an attached netd MIRROR of a remote robot's
@@ -1761,6 +1766,12 @@ pub struct TopicStatus {
     /// reason this matters: an unattributed `hz` on a mirrored topic is what
     /// rendered a live "9.9 Hz" row under the desk's own section beside the
     /// identical row in the robot's.
+    ///
+    /// For a mirror attached by the local path this is as fresh as the last stored
+    /// `discover` or local `attach` gather: absent before the first, after a
+    /// gather that failed, behind any mirror registered or retired since, and
+    /// absent for a topic this daemon detached since, until the next such gather.
+    /// `list` and `status` never gather themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub robot: Option<String>,
     /// Is a producer still REGISTERED for this topic — see

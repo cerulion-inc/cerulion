@@ -21,12 +21,14 @@
 //! Each ask and each wrist frame is matched by its origin to its publisher,
 //! and the publisher to the iceoryx2 node it runs under
 //! ([`super::source`]). An ask from a replay's publisher (`cerulion bag
-//! play`, `bag play --resim`) gets no request, no answer and no receipt,
-//! with Jev on, off or unconfigured, and a frame from one is never held,
-//! whatever their wire timestamps say. The same holds for an ask and a
-//! frame from a publisher whose node cannot be named. Each dropped ask is
-//! counted in the status file and through a latch that logs the first and
-//! each decade at warn, the rest at debug.
+//! play`'s node, or a node named as a resim's) gets no request, no answer
+//! and no receipt, with Jev on, off or unconfigured, and a frame from one is
+//! never held, whatever their wire timestamps say. The same holds for an
+//! ask and a frame from a publisher whose node cannot be named. Each dropped
+//! ask is counted in the status file and through a latch that logs the first
+//! and each decade at warn, the rest at debug. A resim itself runs on a
+//! private shared-memory namespace, so its asks and frames never reach the
+//! eye and are not counted.
 //!
 //! An ask's deadline is its budget from when it was published
 //! ([`ask_sent`]): its wire timestamp read against

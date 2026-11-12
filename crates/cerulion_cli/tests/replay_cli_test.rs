@@ -587,13 +587,14 @@ fn illegal_flag_combinations_are_refused_by_name_and_never_as_a_violation() {
 // cdylib through `DylibNodeEntry` over an isolated per-test transport, then the
 // REAL `cerulion bag play <bag> --resim all --verify` binary is spawned with
 // cwd = the workspace root:
-// its engine resolves the same cdylib as the candidate and replays on the
-// GLOBAL transport namespace.
+// its engine resolves the same cdylib as the candidate and replays on a
+// private iceoryx2 namespace of its own.
 //
 // `#[serial]`: the parent's reference runs load a cdylib (the process-global
-// NODES registry) and the subprocesses use the GLOBAL iceoryx2 namespace —
-// unique per-run topic prefixes make collisions structurally unlikely, but the
-// serialization keeps the two subprocess transports from ever overlapping.
+// NODES registry), and the `graph run --record` subprocess and the arms that
+// open the topic from the parent use the GLOBAL iceoryx2 namespace. Unique
+// per-run topic prefixes make collisions structurally unlikely; the
+// serialization keeps those transports from ever overlapping.
 // ===========================================================================
 
 use std::io::Read as _;
@@ -657,8 +658,9 @@ fn nondet_fixture_cdylib() -> PathBuf {
 /// graphs/demo.yaml (one `ticker` period node producing `/{prefix}/ticker/cmd`),
 /// nodes/ticker/src/lib.rs (fixture source copy, for the metadata walkers), and
 /// target/debug/libticker.* (the PREBUILT fixture cdylib under the node-type
-/// name the resolver looks for). `prefix` must be unique per reference run —
-/// the subprocess replays on the global iceoryx2 namespace.
+/// name the resolver looks for). `prefix` must be unique per reference run:
+/// the arms that open the topic on the global iceoryx2 namespace share it with
+/// every other process on the host.
 fn build_replay_workspace(root: &Path, prefix: &str) -> String {
     build_replay_workspace_from(
         root,
@@ -1405,9 +1407,11 @@ fn subprocess_replay_of_thinned_trace_bag_exits_6_with_trace_divergence() {
 /// --workspace`) — the helpers PANIC with the exact build instruction if any
 /// artifact is missing.
 ///
-/// Runs the record + all three replays on the GLOBAL iceoryx2 namespace (the
-/// production `graph run` path has no isolation seam — that IS the point of a
-/// closed-loop e2e); `#[serial]` + a unique per-run prefix keep it safe.
+/// Runs the record on the GLOBAL iceoryx2 namespace (the production
+/// `graph run` path has no isolation seam, which IS the point of a closed-loop
+/// e2e) and the replays on a private resim namespace, one after another, so
+/// each takes slot 0 again once the one before it has exited; `#[serial]` and
+/// a unique per-run prefix keep it safe.
 #[test]
 #[serial]
 fn real_recorded_bag_replays_end_to_end() {
@@ -2247,4 +2251,439 @@ fn record_out_failures_are_loud_and_leave_no_file() {
         "stderr: {stderr}"
     );
     assert!(!out.exists(), "a refused invocation writes nothing");
+}
+
+// ===========================================================================
+// A resim runs on a PRIVATE shared-memory namespace: nothing attached to the
+// shared one receives what it publishes.
+//
+// The byte-for-byte match with the recording is
+// `subprocess_replay_of_matching_workspace_exits_0_with_pass`; two resims
+// producing the same frames is `record_out_writes_the_re_executed_frames_in_both_modes`
+// (each run's output bag equals one hand oracle).
+// ===========================================================================
+
+/// A transport on the SHARED iceoryx2 namespace: the host's resolved global
+/// config, the one a live `graph run`, `cerulion topic echo`, `bagd` and
+/// `cerulion-netd` build theirs on, not a per-test root.
+fn shared_namespace_transport(tag: &str) -> Arc<cerulion_core::TransportManager> {
+    cerulion_core::TransportManager::init_for_test(
+        cerulion_core::TransportConfig {
+            node_name: format!("{tag}_{}", std::process::id()),
+            ..Default::default()
+        },
+        iceoryx2::config::Config::global_config().clone(),
+    )
+    .expect("a transport on the shared namespace")
+}
+
+/// Every frame a data-only tap holds, oldest first (the drain loop
+/// `reference_run_cdylib` runs).
+fn drain_tap(tap: &mut cerulion_core::transport::subscriber::DataOnlySubscriber) -> Vec<Vec<u8>> {
+    let budget = tap.max_borrowed_samples().max(1);
+    let mut frames = Vec::new();
+    let mut scratch = Vec::new();
+    loop {
+        scratch.clear();
+        let n = tap
+            .drain_owned(budget, &mut scratch)
+            .expect("drain the tap");
+        frames.extend(scratch.drain(..).map(|s| s.payload().to_vec()));
+        if n < budget {
+            return frames;
+        }
+    }
+}
+
+/// Publish `frame` on `topic` from the shared namespace, the way any producer
+/// attached there does.
+fn publish_on_shared_namespace(
+    shared: &cerulion_core::TransportManager,
+    topic: &str,
+    frame: &[u8],
+) -> cerulion_core::transport::publisher::CerulionPublisher {
+    let slot = cerulion_core::wire::MaxSliceLen::try_new(frame.len() as u32)
+        .expect("a recorded frame holds its wire header");
+    let mut publisher = shared
+        .create_publisher_simple(topic, slot)
+        .expect("a producer on the shared namespace");
+    publisher
+        .publish_raw(frame)
+        .expect("publish one recorded frame on the shared namespace");
+    publisher
+}
+
+/// A consumer on the SHARED namespace, attached before the resim starts,
+/// receives nothing from it: neither a live graph's input subscriber on the
+/// topic nor the data-only tap `bagd` and `cerulion-netd`'s egress read with.
+///
+/// Anti-tautology: after the resim, one recorded frame published on the shared
+/// namespace reaches both, so they were attached and readable all along.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn a_resim_delivers_nothing_to_a_consumer_on_the_shared_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}iso", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let topic = format!("/{prefix}/ticker/cmd");
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    assert_eq!(frames.len(), 3, "one frame per step");
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let shared = shared_namespace_transport("rp_shared_consumer");
+    // A live input creates the topic's service when it comes up before its
+    // producer; the tap only ever opens an existing one.
+    let input = shared
+        .create_subscriber(&topic)
+        .expect("a live input on the shared namespace");
+    let mut tap = shared
+        .create_data_only_subscriber(&topic)
+        .expect("a tap on the shared namespace");
+
+    let out = run_replay_bin_in_workspace(root, &bag);
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the resim still matches the recording byte for byte; stderr: {stderr}"
+    );
+    assert!(stderr.contains("replay PASS"), "stderr: {stderr}");
+
+    let mut delivered = 0usize;
+    while input.try_receive_one(|_| {}).expect("read the live input") {
+        delivered += 1;
+    }
+    assert_eq!(
+        delivered, 0,
+        "a resim's frames reached a live input on the shared namespace"
+    );
+    assert_eq!(
+        drain_tap(&mut tap),
+        Vec::<Vec<u8>>::new(),
+        "a resim's frames reached a tap on the shared namespace"
+    );
+
+    let _producer = publish_on_shared_namespace(&shared, &topic, &frames[0]);
+    let recorded = WireHeader::read_from_buf(&frames[0]).expect("frame header");
+    let mut received = Vec::new();
+    while input
+        .try_receive_one(|m| received.push((m.header().sequence, m.header().timestamp_ns)))
+        .expect("read the live input")
+    {}
+    assert_eq!(
+        received,
+        vec![(recorded.sequence, recorded.timestamp_ns)],
+        "the live input receives what a producer on its namespace publishes"
+    );
+    assert_eq!(
+        drain_tap(&mut tap),
+        vec![frames[0].clone()],
+        "the tap receives what a producer on its namespace publishes"
+    );
+}
+
+/// What `cerulion-netd`'s egress does with a topic it was asked to forward,
+/// polled through the resim's whole life: open the producer's service on the
+/// shared namespace (open-only, never creating it) and drain it. The resim
+/// never gives it a service to open, while it runs or after it exits.
+///
+/// Anti-tautology: once a producer does exist on the shared namespace, the
+/// same open succeeds and the tap receives its frame.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn a_resim_creates_no_service_an_egress_tap_on_the_shared_namespace_can_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}egr", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let topic = format!("/{prefix}/ticker/cmd");
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    assert_eq!(frames.len(), 3, "one frame per step");
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let shared = shared_namespace_transport("rp_shared_egress");
+    assert!(
+        shared.create_data_only_subscriber(&topic).is_err(),
+        "no producer of the topic exists on the shared namespace before the resim"
+    );
+
+    let err_path = root.join("resim.stderr");
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_cerulion"))
+            .args(RESIM_VERIFY_ARGV)
+            .arg(&bag)
+            .current_dir(root)
+            .env_remove("CARGO_TARGET_DIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+            .spawn()
+            .expect("spawn the resim"),
+    );
+    let started = Instant::now();
+    let mut polls = 0usize;
+    let mut opened = 0usize;
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let status = loop {
+        // Polled BEFORE the exit check, so the resim's whole life is covered.
+        if let Ok(mut tap) = shared.create_data_only_subscriber(&topic) {
+            opened += 1;
+            received.extend(drain_tap(&mut tap));
+        }
+        polls += 1;
+        if let Some(status) = child.0.try_wait().expect("poll the resim") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the resim did not finish within 120 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let stderr = read_file(&err_path);
+    assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("replay PASS"), "stderr: {stderr}");
+    assert!(polls > 0, "the tap was polled while the resim ran");
+    assert_eq!(
+        (opened, received.len()),
+        (0, 0),
+        "an egress tap on the shared namespace opened a service the resim created"
+    );
+    assert!(
+        shared.create_data_only_subscriber(&topic).is_err(),
+        "the resim left a service of the topic on the shared namespace"
+    );
+
+    let slot = cerulion_core::wire::MaxSliceLen::try_new(frames[0].len() as u32)
+        .expect("a recorded frame holds its wire header");
+    let mut producer = shared
+        .create_publisher_simple(&topic, slot)
+        .expect("a producer on the shared namespace");
+    let mut tap = shared
+        .create_data_only_subscriber(&topic)
+        .expect("with a producer on the shared namespace, the egress tap opens its service");
+    producer
+        .publish_raw(&frames[0])
+        .expect("publish one recorded frame on the shared namespace");
+    assert_eq!(
+        drain_tap(&mut tap),
+        vec![frames[0].clone()],
+        "the tap receives what a producer on its namespace publishes"
+    );
+}
+
+/// Two resims of one bag, two processes on two private namespaces, write
+/// byte-identical reports: nothing a resim reports depends on its namespace
+/// or its process id. The first runs on slot 0, the lowest free one. The
+/// second runs while this test holds slot 0's lock, so its claim skips that
+/// slot as it skips one a running resim holds and takes slot 1. Each leaves
+/// its node on its own slot. The report itself is a PASS that byte-compared
+/// the one produced topic.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn two_resims_of_one_bag_write_byte_identical_reports() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}two", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let report = |name: &str| -> Vec<u8> {
+        let path = root.join(name);
+        let out = run_replay_bin_in_workspace_with_report(root, &bag, &path);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+        std::fs::read(&path).expect("the report is written")
+    };
+    // The iceoryx2 nodes registered on `slot`'s namespace.
+    let nodes_on = |slot: u32| -> std::collections::BTreeSet<PathBuf> {
+        resim_namespace_files()
+            .remove(&slot)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| path.to_string_lossy().ends_with(".node_monitor"))
+            .collect()
+    };
+
+    let slot_0_before = nodes_on(0);
+    let first = report("first.json");
+    let first_nodes = nodes_on(0);
+    assert_eq!(
+        first_nodes.len(),
+        1,
+        "the first resim leaves one node on slot 0: {first_nodes:?}"
+    );
+    assert!(
+        first_nodes.is_disjoint(&slot_0_before),
+        "the first resim ran on slot 0: {slot_0_before:?} then {first_nodes:?}"
+    );
+
+    let slot_0_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open("/dev/shm/cer_resim_00000000.lock")
+        .expect("open slot 0's lock file");
+    slot_0_lock
+        .try_lock()
+        .expect("no resim holds slot 0 once the first has exited");
+    let slot_1_before = nodes_on(1);
+    let second = report("second.json");
+    drop(slot_0_lock);
+    assert_eq!(
+        nodes_on(0),
+        first_nodes,
+        "the second resim left slot 0, whose lock this test held, as the first left it"
+    );
+    let second_nodes = nodes_on(1);
+    assert_eq!(
+        second_nodes.len(),
+        1,
+        "the second resim leaves one node on slot 1: {second_nodes:?}"
+    );
+    assert!(
+        second_nodes.is_disjoint(&slot_1_before),
+        "the second resim ran on slot 1: {slot_1_before:?} then {second_nodes:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        String::from_utf8_lossy(&second),
+        "two resims of one bag must report byte for byte alike"
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&first).expect("the report is JSON");
+    assert_eq!(parsed["passed"], true, "{parsed}");
+    assert_eq!(parsed["topics_checked"], 1, "{parsed}");
+    assert_eq!(parsed["topics_passed"], 1, "{parsed}");
+    assert!(
+        !String::from_utf8_lossy(&first).contains("cer_resim_"),
+        "the report names no private namespace: {parsed}"
+    );
+}
+
+/// Every resim namespace file on this machine, by slot: the shared-memory
+/// segments in `/dev/shm`, and the files under the iceoryx2 root (three levels
+/// down, which reaches a node's `<prefix>node.details`) whose name begins with
+/// a resim prefix.
+fn resim_namespace_files() -> std::collections::BTreeMap<u32, std::collections::BTreeSet<PathBuf>> {
+    use cerulion_cli_engine::replay_engine::resim_namespace_slot;
+    let root = PathBuf::from(String::from(
+        iceoryx2::config::Config::global_config().global.root_path(),
+    ));
+    let mut files = std::collections::BTreeMap::<u32, std::collections::BTreeSet<PathBuf>>::new();
+    let mut walk = vec![(PathBuf::from("/dev/shm"), 1usize), (root, 3usize)];
+    while let Some((dir, depth)) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(slot) = entry.file_name().to_str().and_then(resim_namespace_slot) {
+                files.entry(slot).or_default().insert(path.clone());
+            }
+            if depth > 1 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                walk.push((path, depth - 1));
+            }
+        }
+    }
+    files
+}
+
+/// Two resims run one after the other use ONE namespace. Each takes slot 0,
+/// the lowest free one, reclaims what was left there and leaves one iceoryx2
+/// management segment and one node, its own: the second's node replaces the
+/// first's, and the second leaves exactly as many files as the first. No other
+/// resim namespace gains or loses a file.
+///
+/// Before each run a file named with slot 0's prefix is planted in
+/// `/dev/shm`, and the run removes it: the resim's own slot claim walks the
+/// segment names, so a leftover segment no node accounts for goes too. A
+/// reused slot reopens its management segment under the same name, so the
+/// counts alone hold even with no walk.
+///
+/// Prerequisite: `cargo build -p test_node_macro_period_cdylib`.
+#[test]
+#[serial]
+fn two_resims_in_a_row_reuse_slot_0_and_leave_one_namespaces_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let prefix = format!("rp{}seq", std::process::id());
+    let graph_yaml = build_replay_workspace(root, &prefix);
+    let (frames, trace) = reference_run_cdylib(root, &prefix, &graph_yaml, 3);
+    let bag = root.join("in.mcap");
+    write_replay_bag(&bag, &prefix, &graph_yaml, &frames, &trace);
+
+    let other_slots = |mut files: std::collections::BTreeMap<u32, _>| {
+        files.remove(&0);
+        files
+    };
+    let before = other_slots(resim_namespace_files());
+    let mut left = Vec::new();
+    for run in ["first", "second"] {
+        let planted = PathBuf::from(format!(
+            "/dev/shm/cer_resim_00000000_planted_{run}_{}",
+            std::process::id()
+        ));
+        std::fs::write(&planted, b"").expect("plant a leftover segment name on slot 0");
+        let out = run_replay_bin_in_workspace(root, &bag);
+        let planted_left = planted.exists();
+        let _ = std::fs::remove_file(&planted);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the {run} resim; stderr: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            !planted_left,
+            "the {run} resim's slot claim left the planted slot 0 segment {planted:?}; stderr: {}",
+            stderr_of(&out)
+        );
+        let mut files = resim_namespace_files();
+        let slot_0 = files.remove(&0).unwrap_or_default();
+        assert_eq!(
+            files, before,
+            "the {run} resim touched a namespace other than slot 0's"
+        );
+        let names = |suffix: &str| -> Vec<PathBuf> {
+            slot_0
+                .iter()
+                .filter(|path| path.to_string_lossy().ends_with(suffix))
+                .cloned()
+                .collect()
+        };
+        let segments = names(".global_mgmt");
+        assert_eq!(
+            segments.len(),
+            1,
+            "the {run} resim leaves one management segment on slot 0: {slot_0:?}"
+        );
+        assert!(segments[0].starts_with("/dev/shm"), "{segments:?}");
+        let nodes = names(".node_monitor");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "the {run} resim leaves one node on slot 0: {slot_0:?}"
+        );
+        left.push((slot_0.len(), nodes[0].clone()));
+    }
+    assert_ne!(
+        left[0].1, left[1].1,
+        "the second resim reclaimed the first's node and left its own"
+    );
+    assert_eq!(
+        left[0].0, left[1].0,
+        "the second resim leaves exactly as many files on slot 0 as the first"
+    );
 }

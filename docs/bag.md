@@ -34,6 +34,13 @@ unrecognized subcommand.
 | Speed | Wall-paced from the bag's timeline | As fast as possible, no pacing knob |
 | Purpose | DRIVE consumers with realistic data | RE-RUN your current code against real inputs |
 | Needs the workspace? | No | Yes: it loads the cdylibs |
+| Who sees its frames | Anything attached to local shared memory | Nothing outside the resim: it runs on a private shared-memory namespace |
+
+The private namespace covers Cerulion topic frames only: a re-executed node
+that drives hardware or another network directly (for example a node that
+opens a robot's own command channel in `init`) still does so during a resim,
+so run a resim of such a node only where its devices are safe to drive or
+disconnected.
 
 Re-simulation re-injects only external-source topics and recomputes everything
 else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
@@ -1281,7 +1288,7 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 
 | Limit | Why | Remedy |
 |---|---|---|
-| Playback is LOCAL only: frames land in this machine's SHM | Serving a played bag to another machine composes from existing pieces (run the player on one machine, let a desk demand its topics) but is not wired here | Not supported; play the bag on the machine that reads it |
+| Playback is not confined to this machine: its frames reach every consumer of those topics here, and while `cerulion-netd` exports one of those topics for another run, every machine netd serves receives that topic's frames too | Playback publishes onto the shared namespace under the recorded topic names, so whatever reads those topics on this machine receives the frames, netd's egress included; under the open LAN posture netd also serves any live topic a peer demands by name, and `cerulion-remoted` streams any topic a paired desk with observe access demands; a `cerulion graph run` with its own network gateway serves the topics its `egress:` marks `external: true`, and a permissive one also serves any live topic a peer demands by name | To keep a bag's frames on this machine, play it while no Cerulion process here serves topics to the network: no `cerulion-netd`, no `cerulion-remoted`, and no `cerulion graph run` with its own network gateway (a run with a `network:` block, or one netd could not take) |
 | Inter-topic alignment comes from file position, so it is accurate to the recorder's flush window (~100 ms), not better | Cross-channel stamp comparison is the forbidden operation: stamps from different producers share no number line | None: inherent to the design |
 | A channel behind by more than 16 of its own deltas fast-forwards at up to 4x its recorded rate until it catches up | The deficit is carried in full so alignment is preserved; only the RATE is bounded, using the channel's own cadence. Routine write-batching deficits fall inside the free window and cost no wall time | None: inherent to the trade-off (the alternative is an unbounded backlog dump) |
 | The 4x bound does not apply to a channel whose consecutive stamps are identical | There is no recorded cadence to divide; such frames publish as fast as the loop runs | None: faithful to the recording (it says those frames were simultaneous) |
