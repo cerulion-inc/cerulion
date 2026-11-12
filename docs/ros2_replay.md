@@ -43,7 +43,7 @@ A replay really publishes. It sends on this machine's shared-memory namespace, t
 Do not replay a node where its outputs can reach a live robot or anything that acts on that robot's topics or services, such as its controller, its driver, or a node that sends the robot commands, goals or service requests. Until the replayed process exits, this machine must run none of these:
 
 - a live node, including a `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach`;
-- `cerulion-vizd`, unless it was started with exactly `CERULION_NETD_NETWORK=off`: `cerulion viz` and Studio start it, it runs until it is sent SIGINT or SIGTERM, and while it runs it starts `cerulion-netd` again, with its own environment, within seconds of netd stopping;
+- `cerulion-vizd`, unless it was started with exactly `CERULION_NETD_NETWORK=off`: `cerulion viz` starts it, it runs until it is sent SIGINT or SIGTERM, and while it runs it starts `cerulion-netd` again, with its own environment, within seconds of netd stopping;
 - `cerulion-netd`, unless it was started with exactly `CERULION_NETD_NETWORK=off`;
 - `cerulion-remoted`.
 
