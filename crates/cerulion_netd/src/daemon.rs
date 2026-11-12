@@ -69,7 +69,9 @@ use crate::mirror::MirrorPlane;
 use crate::protocol::{
     parse_request, CatalogQueryResponse, DemandEntry, DemandResponse, EgressReleaseResponse,
     EgressResponse, Hello, ReleaseResponse, Request, Response, RunsQueryResponse,
-    SchemaQueryResponse, StatusResponse, SubscribeCatalogResponse, MAX_REQUEST_LINE_BYTES,
+    SchemaQueryResponse, ServingHeldResponse, StatusResponse, SubscribeCatalogResponse,
+    MAX_REQUEST_LINE_BYTES, SERVING_HOLD_MAX_TTL_S, SERVING_HOLD_MIN_TTL_S,
+    SERVING_HOLD_TTL_REFUSAL,
 };
 use crate::query::{NoopQueryPlane, QueryPlane};
 use crate::registry::{
@@ -373,6 +375,7 @@ impl Ctx {
                 ix_config_json,
             } => self.register_egress(conn, id, plan, schema_serving, ix_config_json),
             Request::ReleaseEgress { id } => self.release_egress(conn, id),
+            Request::HoldServing { id, ttl_s } => self.hold_serving(conn, id, ttl_s),
             Request::QueryCatalog { id, robot } => self.query_catalog(id, robot),
             Request::QuerySchema {
                 id,
@@ -962,6 +965,42 @@ impl Ctx {
                     None,
                 )
             }
+        }
+    }
+
+    /// Handle a `hold_serving`. The hold length, the egress plane's state root
+    /// (refused when the plane runs no remote server or the root is unusable)
+    /// and the local serving authority are checked, in that order, before
+    /// anything is held, so a machine is never sent to log in for a server it
+    /// cannot run. Then the plane holds its remote server for this connection
+    /// until `ttl_s` seconds from now (a monotonic deadline), and the reply
+    /// names the state root. Every plane refusal is answered with its text.
+    fn hold_serving(&self, conn: ConnId, id: u64, ttl_s: u64) -> Response {
+        if !(SERVING_HOLD_MIN_TTL_S..=SERVING_HOLD_MAX_TTL_S).contains(&ttl_s) {
+            return Response::error(Some(id), SERVING_HOLD_TTL_REFUSAL, None, None);
+        }
+        let refused = |error: crate::egress::EgressError| {
+            tracing::warn!(conn, error = %error, "serving hold refused");
+            Response::error(Some(id), error.to_string(), None, None)
+        };
+        let state_root = match self.egress_plane.serving_state_root() {
+            Ok(state_root) => state_root,
+            Err(error) => return refused(error),
+        };
+        if let Err(reason) = self.egress_login.check() {
+            return Response::error(Some(id), reason, None, None);
+        }
+        let until = Instant::now() + Duration::from_secs(ttl_s);
+        match self.egress_plane.hold_serving(conn, until) {
+            Ok(()) => {
+                tracing::info!(conn, ttl_s, "serving held for a connection");
+                Response::ServingHeld(ServingHeldResponse {
+                    id,
+                    state_root,
+                    ttl_s,
+                })
+            }
+            Err(error) => refused(error),
         }
     }
 
@@ -2036,8 +2075,8 @@ fn handle_connection(mut stream: UnixStream, ctx: Ctx, shutdown: Arc<AtomicBool>
 
 /// Disconnect `conn`: release every demand AND egress registration it held (the
 /// crash-safe refcount), drive the mirror-plane teardown for each now-unheld mirror,
-/// and drive the egress-plane release if it held egress. Called on EVERY
-/// connection-handler exit path.
+/// drive the egress-plane release if it held egress, and release its serving hold,
+/// which needs no egress. Called on EVERY connection-handler exit path.
 fn cleanup_connection(ctx: &Ctx, conn: ConnId) {
     // The connection close IS the unsubscribe (the same crash-safe rule the
     // demand plane uses) — a dead consumer never accumulates a push slot nobody drains.
@@ -2056,6 +2095,7 @@ fn cleanup_connection(ctx: &Ctx, conn: ConnId) {
     if !out.egress_released.is_empty() {
         ctx.egress_plane.release_egress(conn);
     }
+    ctx.egress_plane.release_serving(conn);
 }
 
 /// Process ONE last-released `(robot, topic)` — the shared teardown path for BOTH
@@ -2454,6 +2494,242 @@ mod tests {
             conn_waker_total_drain: Arc::new(AtomicU64::new(0)),
             connect_endpoints: Vec::new(),
         }
+    }
+
+    /// An egress-plane double that records every serving hold it is asked
+    /// for, their releases and egress releases. Its state root is `root`
+    /// unless `root_refusal` refuses the root check; `hold_refusal` refuses
+    /// the hold itself once the root check passed.
+    struct HoldSpy {
+        root: String,
+        root_refusal: Option<fn() -> crate::egress::EgressError>,
+        hold_refusal: Option<fn() -> crate::egress::EgressError>,
+        holds: Mutex<Vec<(crate::egress::EgressId, Instant)>>,
+        released: Mutex<Vec<crate::egress::EgressId>>,
+        egress_released: Mutex<Vec<crate::egress::EgressId>>,
+    }
+    impl HoldSpy {
+        fn at(root: &str) -> Arc<Self> {
+            Self::refusing(root, None, None)
+        }
+        fn refusing(
+            root: &str,
+            root_refusal: Option<fn() -> crate::egress::EgressError>,
+            hold_refusal: Option<fn() -> crate::egress::EgressError>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                root: root.to_owned(),
+                root_refusal,
+                hold_refusal,
+                holds: Mutex::default(),
+                released: Mutex::default(),
+                egress_released: Mutex::default(),
+            })
+        }
+    }
+    impl EgressPlane for HoldSpy {
+        fn register_egress(
+            &self,
+            _id: crate::egress::EgressId,
+            _plan: &cerulion_core::GatewayPlan,
+            _serving: &cerulion_core::SchemaServing,
+            _ix_config_json: Option<&str>,
+        ) -> Result<bool, crate::egress::EgressError> {
+            Ok(false)
+        }
+        fn release_egress(&self, id: crate::egress::EgressId) {
+            self.egress_released.lock().unwrap().push(id);
+        }
+        fn serving_state_root(&self) -> Result<String, crate::egress::EgressError> {
+            match self.root_refusal {
+                Some(refusal) => Err(refusal()),
+                None => Ok(self.root.clone()),
+            }
+        }
+        fn hold_serving(
+            &self,
+            id: crate::egress::EgressId,
+            until: Instant,
+        ) -> Result<(), crate::egress::EgressError> {
+            self.holds.lock().unwrap().push((id, until));
+            match self.hold_refusal {
+                Some(refusal) => Err(refusal()),
+                None => Ok(()),
+            }
+        }
+        fn release_serving(&self, id: crate::egress::EgressId) {
+            self.released.lock().unwrap().push(id);
+        }
+    }
+
+    fn hold_ctx(spy: &Arc<HoldSpy>) -> Ctx {
+        let mut ctx = waker_ctx();
+        ctx.egress_plane = Arc::clone(spy) as Arc<dyn EgressPlane>;
+        ctx
+    }
+
+    /// A hold replies with the plane's state root and the granted length, holds
+    /// until a monotonic deadline `ttl_s` from the request, and the connection
+    /// close releases it although the connection never registered egress.
+    #[test]
+    fn a_serving_hold_names_its_root_and_deadline_and_closing_releases_it_without_egress() {
+        let spy = HoldSpy::at("/srv/robot-state");
+        let ctx = hold_ctx(&spy);
+        let conn = ctx.connect_unless_exiting().unwrap();
+        let before = Instant::now();
+        let reply = ctx.dispatch(conn, Request::HoldServing { id: 3, ttl_s: 600 });
+        let after = Instant::now();
+        assert_eq!(
+            reply.to_json_line(),
+            r#"{"id":3,"state_root":"/srv/robot-state","ttl_s":600}"#
+        );
+        let holds = spy.holds.lock().unwrap().clone();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].0, conn);
+        assert!(before + Duration::from_secs(600) <= holds[0].1);
+        assert!(holds[0].1 <= after + Duration::from_secs(600));
+        assert!(spy.released.lock().unwrap().is_empty());
+        cleanup_connection(&ctx, conn);
+        assert_eq!(*spy.released.lock().unwrap(), vec![conn]);
+        assert!(
+            spy.egress_released.lock().unwrap().is_empty(),
+            "no egress was held, so none is released"
+        );
+    }
+
+    #[test]
+    fn a_serving_hold_outside_one_to_nine_hundred_seconds_is_refused_before_holding() {
+        let spy = HoldSpy::at("/srv/robot-state");
+        let ctx = hold_ctx(&spy);
+        let conn = ctx.connect_unless_exiting().unwrap();
+        for ttl_s in [0, 901, u64::MAX] {
+            assert_eq!(
+                ctx.dispatch(conn, Request::HoldServing { id: 4, ttl_s }),
+                Response::error(
+                    Some(4),
+                    "hold_serving needs ttl_s from 1 to 900 seconds",
+                    None,
+                    None
+                ),
+                "ttl_s={ttl_s}"
+            );
+        }
+        assert!(spy.holds.lock().unwrap().is_empty());
+        for ttl_s in [1, 900] {
+            assert!(matches!(
+                ctx.dispatch(conn, Request::HoldServing { id: 5, ttl_s }),
+                Response::ServingHeld(ServingHeldResponse { ttl_s: granted, .. }) if granted == ttl_s
+            ));
+        }
+        assert_eq!(spy.holds.lock().unwrap().len(), 2);
+    }
+
+    /// The serving authority is read before anything is held, with the
+    /// shared login refusal.
+    #[test]
+    fn a_serving_hold_without_serving_authority_is_refused_before_any_hold() {
+        let spy = HoldSpy::at("/srv/robot-state");
+        let mut ctx = hold_ctx(&spy);
+        ctx.egress_login = crate::serving_login::EgressLoginPolicy::PriorLogin { auth_path: None };
+        let conn = ctx.connect_unless_exiting().unwrap();
+        assert_eq!(
+            ctx.dispatch(conn, Request::HoldServing { id: 6, ttl_s: 60 }),
+            Response::error(
+                Some(6),
+                "serving the network requires a prior login; run `cerulion login`",
+                None,
+                None
+            )
+        );
+        assert!(spy.holds.lock().unwrap().is_empty());
+        assert!(spy.released.lock().unwrap().is_empty());
+    }
+
+    /// A daemon whose plane runs no remote server refuses with that plane's
+    /// text, verbatim, before the serving-authority check: a machine that is
+    /// not logged in is not told to log in for a server it cannot run.
+    #[test]
+    fn a_serving_hold_on_a_daemon_without_remote_serving_is_refused_before_the_login_check() {
+        let refusal = Response::error(
+            Some(7),
+            "this cerulion-netd does not serve remote access: its network is off or it \
+             was built without remote serving; remove CERULION_NETD_NETWORK=off or rebuild \
+             it with the default wan feature, then restart cerulion-netd",
+            None,
+            None,
+        );
+        for policy in [
+            crate::serving_login::EgressLoginPolicy::default(),
+            crate::serving_login::EgressLoginPolicy::PriorLogin { auth_path: None },
+        ] {
+            let mut ctx = waker_ctx();
+            ctx.egress_login = policy;
+            let conn = ctx.connect_unless_exiting().unwrap();
+            assert_eq!(
+                ctx.dispatch(conn, Request::HoldServing { id: 7, ttl_s: 60 }),
+                refusal
+            );
+        }
+    }
+
+    /// A state root the plane refuses is answered with the plane's text,
+    /// verbatim and correlated to the request, before the serving-authority
+    /// check, whichever login policy applies; the plane is never asked to hold.
+    #[test]
+    fn an_unusable_state_root_is_refused_before_the_login_check_and_holds_nothing() {
+        let refusal = Response::error(
+            Some(8),
+            "the robot state root must be an absolute path with no '.' or '..' components; \
+             set CERULION_STATE_ROOT to such a path and restart cerulion-netd",
+            None,
+            None,
+        );
+        for policy in [
+            crate::serving_login::EgressLoginPolicy::default(),
+            crate::serving_login::EgressLoginPolicy::PriorLogin { auth_path: None },
+        ] {
+            let spy = HoldSpy::refusing(
+                "robot-state",
+                Some(|| crate::egress::EgressError::StateRootNotAbsolute),
+                None,
+            );
+            let mut ctx = hold_ctx(&spy);
+            ctx.egress_login = policy;
+            let conn = ctx.connect_unless_exiting().unwrap();
+            assert_eq!(
+                ctx.dispatch(conn, Request::HoldServing { id: 8, ttl_s: 60 }),
+                refusal
+            );
+            assert!(spy.holds.lock().unwrap().is_empty());
+        }
+    }
+
+    /// A refusal from the plane's hold itself, here a stopping daemon, is
+    /// answered with its text, verbatim and correlated to the request, and the
+    /// connection close still releases the connection's hold once.
+    #[test]
+    fn a_refused_hold_is_answered_with_the_planes_text_and_the_close_still_releases() {
+        let spy = HoldSpy::refusing(
+            "/srv/robot-state",
+            None,
+            Some(|| crate::egress::EgressError::Server {
+                reason: "network daemon is shutting down".into(),
+            }),
+        );
+        let ctx = hold_ctx(&spy);
+        let conn = ctx.connect_unless_exiting().unwrap();
+        assert_eq!(
+            ctx.dispatch(conn, Request::HoldServing { id: 9, ttl_s: 60 }),
+            Response::error(
+                Some(9),
+                "remote server startup failed: network daemon is shutting down",
+                None,
+                None
+            )
+        );
+        assert_eq!(spy.holds.lock().unwrap().len(), 1, "the plane was asked");
+        cleanup_connection(&ctx, conn);
+        assert_eq!(*spy.released.lock().unwrap(), vec![conn]);
     }
 
     #[test]

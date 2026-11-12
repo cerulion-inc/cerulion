@@ -1134,7 +1134,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":11,"wire_header":2}
+{"hello":"cerulion-netd","protocol":12,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":[],"lan_access":"paired"}
 ```
 

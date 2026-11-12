@@ -179,6 +179,41 @@ remove them before committing.
   its own refusal latch. Completed handshakes dispatch before new arrivals, and safety
   refresh waits never cancel a handshake.
   Shutdown aborts and joins pending handshakes before endpoint cleanup.
+- **Serving hold (protocol 12)**: the connection-scoped `hold_serving` verb
+  (`Request::HoldServing { id, ttl_s }`) makes the supervised remote server
+  wanted with no egress registration and announces nothing. The reply does not
+  wait for the server: netd's lifecycle worker starts it, and a start failure
+  is retried and logged there, never reported to the hold. Before anything is
+  held, in order: `ttl_s` must lie in
+  `SERVING_HOLD_MIN_TTL_S..=SERVING_HOLD_MAX_TTL_S` (1 to 900 s), else
+  `SERVING_HOLD_TTL_REFUSAL`; `EgressPlane::serving_state_root`, which changes
+  no state, must name a usable robot state root: its default refuses with
+  `REMOTE_SERVING_UNAVAILABLE` (network off, a build without `wan`, the no-op
+  and spy planes), and `SupervisedEgressPlane` requires the root to resolve
+  (`NO_STATE_ROOT`), be absolute with no `.` or `..` component
+  (`STATE_ROOT_NOT_ABSOLUTE`, the same predicate `RobotSupervisor` applies) and
+  be UTF-8 (`STATE_ROOT_NOT_UTF8`); then the serving-authority check
+  (`EgressLoginPolicy::check`, refusal `serving_login::REFUSAL`) must pass. So a
+  machine is never sent to log in for a server it cannot run. Each refusal text
+  is one named const in `protocol.rs`, `egress.rs` or `serving_login.rs`; a
+  hold that races shutdown is rolled back and refused with `SHUTTING_DOWN` in
+  `supervised_egress.rs`, shown as `remote server startup failed: network
+  daemon is shutting down`. `SupervisedEgressPlane` keeps one monotonic
+  (`Instant`) deadline per connection; a second hold on the same connection
+  replaces the first, shorter or longer. The one `State::wanted(now)` rule
+  (standing, any registration, or an unexpired hold) drives the worker's
+  decision and `State::may_reap`, its re-check under the exclusive fence, so a
+  hold stops counting at its deadline even while its connection stays open.
+  The worker also drops lapsed holds each pass and logs each at info.
+  `cleanup_connection` always releases the connection's hold, egress or not;
+  a stopping daemon clears every hold. The reply
+  `ServingHeld { id, state_root, ttl_s }` names the state root netd serves
+  (remoted's directory is `<state_root>/remoted`) and the granted length,
+  counted on netd's monotonic clock from when it took the hold.
+  `SERVING_HOLD_MIN_DAEMON_VERSION` is 12, so the client's per-verb gate tells
+  a user of an older daemon to upgrade it. A hold does not take
+  `serving.hold`: remoted shares that lock only for admitted work and its own
+  sources.
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway
