@@ -35,7 +35,7 @@ brew tap cerulion-inc/cerulion
 brew install cerulion-inc/cerulion/cerulion
 ```
 
-Homebrew treats a third-party tap as untrusted until you install a fully qualified name, which is why the second line spells the formula out. On Homebrew 6.0.x the tap itself can refuse first; run `brew trust --formula cerulion-inc/cerulion/cerulion` before the two lines and try again.
+If Homebrew 6.0.x refuses the tap, run `brew trust --formula cerulion-inc/cerulion/cerulion` first and try again.
 
 </details>
 
@@ -53,7 +53,7 @@ keyring=$(mktemp) &&
   sudo apt-get update && sudo apt-get install cerulion
 ```
 
-The first line installs the three programs the second needs. The second is one chain, where every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the key the archive signs with, stops it before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprints in the same form, lists both during a key rotation, and carries a longer form of this recipe that names which step failed.
+Each step runs only if the one before it succeeded, and the [APT distribution page](docs/packaging/apt.md) pins the same key fingerprints and has a longer form that names a failed step.
 
 </details>
 
@@ -75,9 +75,9 @@ In fish, end the line with `&& source ~/.cerulion/env.fish` instead.
 
 Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once, which installs current stable Rust unless a Rust 1.95 or newer is already there, and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. On a terminal, `cerulion workspace create` and `cerulion node build` offer to install it when Rust 1.95 or newer is missing.
 
-Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs: Jazzy on Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64: unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI.
+Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use. The macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs, which for Jazzy is Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64. Unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI.
 
-Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them: the compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. Node libraries from an earlier release are refused with an instruction to rebuild them; run `cerulion node build <node>` once for each. The [installation details](docs/install.md) cover the toolchain setup.
+Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them. The compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. Node libraries from an earlier release are refused with an instruction to rebuild them, so run `cerulion node build <node>` once for each. The [installation details](docs/install.md) cover the toolchain setup.
 
 </details>
 
@@ -100,7 +100,7 @@ cerulion login
 
 A robot or a headless box prints a short code to approve from a browser on any machine.
 
-Build both nodes, check the graph, then run it with recording on. The first node build also compiles the Cerulion runtime, so it takes a few minutes on a laptop; later builds take seconds.
+Build both nodes, check the graph, then run it with recording on. The first node build also compiles the Cerulion runtime, so it takes a few minutes on a laptop. Later builds take seconds.
 
 ```bash
 cerulion node build laser_scanner --release
@@ -119,7 +119,11 @@ In a second terminal, watch the controller react:
 cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
 ```
 
-The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses the distance threshold. Let it run for at least five seconds, then stop it with **Ctrl+C**; Cerulion prints the completed recording's path, `recordings/obstacle_avoidance_<timestamp>.mcap`, where the timestamp reads like `20260918T181449Z`.
+The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses the distance threshold. Let it run for at least five seconds, then stop it with **Ctrl+C**. Cerulion prints the completed recording's path:
+
+```text
+recordings/obstacle_avoidance_20260918T181449Z.mcap
+```
 
 Set `BAG` to that printed path, then verify the unchanged code first:
 
@@ -163,12 +167,12 @@ Report what changed between the two verifications.
 <details>
 <summary>What replay verification checks</summary>
 
-Cerulion re-executes the graph with recorded inputs and execution context, then compares the covered outputs against the recording. It checks behavior under those inputs; a passing result is not a claim about every environment the robot could encounter.
+Cerulion re-executes the graph with recorded inputs and execution context, then compares the covered outputs against the recording. It checks behavior under those inputs. A passing result is not a claim about every environment the robot could encounter.
 
 - Exit **0**: compared frames match.
-- Exit **1**: output data diverged; the report names the topic or field.
+- Exit **1**: output data diverged, and the report names the topic or field.
 - Exit **6**: the execution schedule diverged.
-- Exits **2 through 5**: verification could not complete; the error identifies why.
+- Exits **2 through 5**: verification could not complete, and the error says why.
 
 Comparisons are byte-exact by default. Add `--tolerance` for acceptable per-field differences and `--report` for a machine-readable report.
 
@@ -199,11 +203,7 @@ On one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, stock settings, re
 
 ### Native graph round trips
 
-Local shared-memory delivery stays nearly flat as payloads grow. These measurements include the native capture plane on the measured Linux x86_64 host.
-
-Each cell below is **p50 / p99**, in microseconds: median latency and the threshold at or below which 99% of measured round trips fall. Both legs use the advertised payload size.
-
-The native benchmark loans that payload without filling it. Timing starts after the publisher's loan and metadata setup and ends on echo receipt; the echo loans the same payload size and forwards the timestamp. Sensor production and payload processing add their own work.
+Each cell is **p50 / p99** in microseconds, measured on the Linux x86_64 host above at a nominal 100 Hz offered load with the advertised payload size on both legs. Timing starts after the publisher's loan and ends on echo receipt, so sensor production and payload processing add their own work. The Cerulion figures include recording and the ROS 2 figures do not.
 
 | Payload | Cerulion multi-process (default), p50 / p99 in µs | Cerulion single-process, p50 / p99 in µs | ROS 2 Jazzy / `rmw_fastrtps_cpp` defaults, p50 / p99 in µs |
 |---|---:|---:|---:|
@@ -213,19 +213,9 @@ The native benchmark loans that payload without filling it. Timing starts after 
 
 ![Native round-trip latency, with median lines and p50-to-p99 bands, from 64 B to 16 MiB.](docs/media/native-rtt.svg)
 
-This workload comparison uses a nominal 100 Hz offered load. The stock ROS 2 lane pipelines requests: at 16 MiB a round trip outlasts the 10 ms pacing interval, so requests overlap in flight. Native Cerulion includes recording; the ROS 2 and zenoh lanes do not. The [benchmark suite](benches/latency/README.md) documents the process layouts and timing boundaries.
+The stock ROS 2 lane pipelines requests, so at 16 MiB a round trip outlasts the 10 ms pacing interval and requests overlap in flight. The [benchmark suite](benches/latency/README.md) documents the process layouts and timing boundaries.
 
-### Free run and lockstep
-
-A multi-process graph free-runs by default: each process steps on its own clock and none waits on a barrier. `CERULION_EXECUTION_MODE=lockstep` opts out into barrier lockstep. Measured on one build and one Linux x86_64 machine, two processes, fixed 100 Hz, six interleaved reps per mode, recording enabled:
-
-| Payload | Free run (default), p50 / p99 in µs | Lockstep, p50 / p99 in µs |
-|---|---:|---:|
-| 64 B | 4.23 / 7.60 | 5.08 / 10.47 |
-| 1 MiB | 4.56 / 9.01 | 5.44 / 10.63 |
-| 16 MiB | 5.22 / 12.34 | 7.22 / 13.64 |
-
-Free run has the lower median and the lower p99 at every measured size; the lockstep median is about 20% higher up to 1 MiB. This machine is not the one behind the table above, so compare within each table. [All ten sizes](docs/PERFORMANCE.md#free-run-against-lockstep) · [Results and provenance](docs/benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/).
+Free run, the multi-process default, against barrier lockstep: [Free run against lockstep](docs/PERFORMANCE.md#free-run-against-lockstep).
 
 ### ROS 2 over Cerulion
 
@@ -235,21 +225,13 @@ The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion'
 
 ![Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.](docs/media/platform-rtt.svg)
 
-These native runs include recording. On the measured Apple M4, single-process medians are 3.38 to 3.75 µs; multi-process medians are 87 to 93 µs. That M4 row predates the macOS data wake: on macOS 14.4 and later, a two-process consumer now blocks on a kernel wake word that the producer's publish rings, instead of waking on the park's recheck timer. Measured before and after that change on an Apple M3 Max, five reps per cell with the two builds alternating. This pair uses quiescent pacing rather than the charts' fixed 100 Hz and a different machine, so compare within the table only, and its recorder state is not recorded:
+The Apple M4 row predates the macOS data wake change, which [macOS two-process data wake](docs/PERFORMANCE.md#macos-two-process-data-wake) measures.
 
-| Payload | Two-process before, p50 / p99 in µs | Two-process after, p50 / p99 in µs |
-|---|---:|---:|
-| 64 B | 70.17 / 141.54 | 10.42 / 28.21 |
-| 4 KiB | 77.75 / 143.79 | 12.79 / 29.83 |
-| 1 MiB | 80.12 / 152.42 | 16.14 / 41.67 |
-
-Single-process medians on that machine rose by one to three ticks of its 24 MHz clock, inside overlapping per-rep ranges (64 B: 4.46 before, 4.50 µs after). The M4 chart row has not been re-measured since the change. [Results and provenance](docs/benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/).
-
-Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99; both figures show round trips.
+Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99. Both figures show round trips.
 
 ## Write the node, declare the behavior
 
-A typed input, a typed output and a `tick` method define the quickstart's safety controller. The macro supplies the port plumbing; the graph declares the wiring and the runtime handles scheduling, transport, recording and observability. You do not configure an executor, register callbacks or write a spin loop.
+A typed input, a typed output and a `tick` method define the quickstart's safety controller. The macro supplies the port plumbing. The graph declares the wiring, and the runtime handles scheduling, transport, recording and observability. You do not configure an executor, register callbacks or write a spin loop.
 
 ```rust
 use cerulion_core::prelude::*;
@@ -281,9 +263,9 @@ Nodes can also be written in Python: `cerulion node create <type> --lang python 
 
 Here, `#[input(trigger)]` runs the controller when a scan arrives. The port deadlines make timing expectations observable through miss counters, alongside delivery-failure counts.
 
-Other nodes can run on synchronized input sets or external events. For a periodic node, use `#[cerulion_node(period_ms = 10)]` instead of a data trigger. Set queue depth and backpressure per input; for example, `backpressure = sample(3)` limits reads to one per 3 ms.
+Other nodes can run on synchronized input sets or external events. For a periodic node, use `#[cerulion_node(period_ms = 10)]` instead of a data trigger. Set queue depth and backpressure per input. For example, `backpressure = sample(3)` limits reads to one per 3 ms.
 
-Fixed fields write directly into the shared-memory slot. Variable-length fields have loaned writers too: `self.image.data.fill_from(producer)?` lets a camera or generator fill the final buffer in place. An untouched output publishes nothing; if this node's `tick` returns an error, its outputs are discarded.
+Fixed fields write directly into the shared-memory slot. Variable-length fields have loaned writers too, and `self.image.data.fill_from(producer)?` lets a camera or generator fill the final buffer in place. An untouched output publishes nothing. If this node's `tick` returns an error, its outputs are discarded.
 
 Guides: [Define a node](https://docs.cerulion.com/cerulion/guides/define-a-node) · [Wire a graph](https://docs.cerulion.com/cerulion/guides/wire-and-run-a-graph) · [Backpressure and deadlines](https://docs.cerulion.com/cerulion/guides/backpressure-and-deadlines)
 
@@ -296,7 +278,7 @@ cerulion ros2 launch my_robot_bringup camera.launch.py
 cerulion ros2 run my_robot_drivers imu_node
 ```
 
-Both set up `rmw_cerulion` and run the ROS 2 command, one launch file or one executable at a time. Your nodes keep their ROS 2 APIs and executors. Neither rewrites your source: publishers that copy keep copying until you migrate them. The ros2 CLI graph tools (`ros2 topic list`, `ros2 topic echo`, rqt) do not see Cerulion topics, because the rmw's discovery is process-local; inspect them with `cerulion topic list` and `cerulion topic echo`, which read the shared-memory plane.
+Both set up `rmw_cerulion` and run the ROS 2 command, one launch file or one executable at a time. Your nodes keep their ROS 2 APIs and executors. Neither rewrites your source, so publishers that copy keep copying until you migrate them. The ros2 CLI graph tools (`ros2 topic list`, `ros2 topic echo`, rqt) do not see Cerulion topics, because the rmw's discovery is process-local. Inspect them with `cerulion topic list` and `cerulion topic echo`, which read the shared-memory plane.
 
 <details>
 <summary>Optional: migrate C++ publishers to zero-copy loans</summary>
@@ -306,7 +288,7 @@ cerulion ros2 migrate --workspace ~/ros2_ws
 cerulion ros2 migrate --workspace ~/ros2_ws --write
 ```
 
-The first command previews which C++ publish sites can move to the loaned-message API; `--write` applies the rewrite. Publishing and subscribing with loans are separate choices; the [ROS 2 guide](https://docs.cerulion.com/cerulion/guides/bridge-ros2) covers both and what to expect from each.
+The first command previews which C++ publish sites can move to the loaned-message API, and `--write` applies the rewrite. Publishing and subscribing with loans are separate choices, and the [ROS 2 guide](https://docs.cerulion.com/cerulion/guides/bridge-ros2) covers both and what to expect from each.
 
 </details>
 
@@ -316,7 +298,7 @@ The first command previews which C++ publish sites can move to the loaned-messag
 cerulion ros2 attach --iface <local-interface-IP>
 ```
 
-Use the IP address of this computer's interface on the robot's LAN. Attach discovers the existing DDS stack and bridges its topics; it does not restart those nodes.
+Use the IP address of this computer's interface on the robot's LAN. Attach discovers the existing DDS stack and bridges its topics. It does not restart those nodes.
 
 Use `ros2:` entries to launch ROS 2 processes beside native nodes in one graph. The [MoveIt 2 example](examples/moveit_hero/) shows an unmodified planning stack running over `rmw_cerulion`.
 
@@ -332,7 +314,7 @@ Guides: [Bridge ROS 2](https://docs.cerulion.com/cerulion/guides/bridge-ros2) ·
   <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to Cerulion Studio (early access), the CLI and coding agents.">
 </picture>
 
-- **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
+- **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages, and capture records the data and execution context.
 - **Across machines:** robots on your account, and robots this computer is already paired with, are discovered automatically. Iroh connects directly when it can, including on one LAN, and through a relay when it cannot. The network daemon mirrors subscribed topics locally for your tools. An unpaired machine reads a robot's topics over the LAN only when the robot runs with `CERULION_LAN_ACCESS=open`.
 - **At your desk:** the CLI inspects, records and verifies the robot's data, and Cerulion MCP gives your coding agent tools for analyzing its recordings. A captured failure is a recording to inspect. Before re-running it, check `anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` attachment.
 
@@ -372,9 +354,9 @@ Guides: [Inspect topics](https://docs.cerulion.com/cerulion/guides/inspect-topic
 
 ## Capture the failure with Flashback
 
-A robot rarely fails on cue. Flashback keeps a memory-bounded window of recent activity in every running graph, so the moments before a problem are already there when you need them. It is event-based logging: nothing is written to disk until an event fires, and then the window around that event becomes a recording.
+Flashback keeps a memory-bounded window of recent activity in every running graph, so the moments before a problem are already there when you need them. It is event-based logging: nothing is written to disk until an event fires, and then the window around that event becomes a recording.
 
-**It captures on its own** when the runtime sees a fault: a worker process dies, a node is disabled after repeated panics, the run it was bound to vanishes, the e-stop is engaged, a topic stalls while its process stays alive, or a topic's rate collapses inside the window. Each capture holds the retained history plus a short period after the trigger, written to MCAP. A capture on a route that never produced at all is the one trigger that ships off.
+**It captures on its own** when the runtime sees a fault, such as a dying worker process or a stalled topic, and [Flashback](docs/flashback.md) lists every trigger.
 
 **You can also ask for one by hand** from another shell on the robot:
 
@@ -382,14 +364,11 @@ A robot rarely fails on cue. Flashback keeps a memory-bounded window of recent a
 cerulion flashback --note "controller stopped late"
 ```
 
-Re-execution uses the capture's execution trace and any state anchors its starting point needs; `bag info` reports whether a capture can be re-executed or only played back. To record an already-running graph instead, use `cerulion bag record --run=obstacle_avoidance`.
+Re-execution uses the capture's execution trace and any state anchors its starting point needs. `bag info` reports whether a capture can be re-executed or only played back. To record an already-running graph instead, use `cerulion bag record --run=obstacle_avoidance`.
 
 Guides: [Flashback](docs/flashback.md) · [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay) · [Bags and replay](docs/bag.md)
 
 ## Tools for your coding agent
-
-<details>
-<summary>Cerulion MCP and Hindsight: tools for your coding agent</summary>
 
 **Cerulion MCP** gives Claude Code, Codex and other MCP clients tools for analyzing MCAP recordings served over `https://`. The hosted endpoint has no local workspace tools: build, run and inspect nodes and topics with the `cerulion` CLI.
 
@@ -406,7 +385,6 @@ Hindsight and the hosted MCP server are closed source. [Request access](https://
 
 Guide: [Connect an MCP client](https://docs.cerulion.com/cerulion/guides/connect-an-mcp-client)
 
-</details>
 
 ## Roadmap
 
@@ -414,14 +392,13 @@ The direction is **review for robot changes**: bring recordings, simulations and
 
 | Area | What's next |
 |---|---|
-| **Faster execution** | Chain-fused nodes that pass data directly within a process; nanosecond-scale handoff as a measured target; lower macOS cross-process wake-up latency. |
+| **Faster execution** | Chain-fused nodes that pass data directly within a process, nanosecond-scale handoff as a measured target, and lower macOS cross-process wake-up latency. |
 | **C++** | First-class node authoring and a client library, with clear boundaries for zero-copy access, scheduling and reproducible execution. |
 | **Robot building blocks** | Native transforms and URDF support, parameters and lifecycle, with a clear path from the corresponding ROS 2 concepts. |
 | **Flashback from node code** | Declare an incident from a node's own code, so a bumper or a grasp check saves the moment it sees. |
 | **Services and actions** | A native request/response API for node authors on the shipped deterministic service layer, then actions: long-running goals with feedback, cancellation and streaming replies. |
 | **Pull-request verification** | A GitHub reviewer that runs recorded regressions and cloud simulations, reports behavioral differences and preserves the evidence with the change. |
 | **Scenario libraries** | User-defined environments and expected behavior, prior failure bags promoted to regression cases, and generated stress scenarios with reviewable test expectations. |
-| **Model and embodiment adapters** | Versioned robot capabilities, model interfaces, execution feedback and recorded outcomes so models can move between embodiments. |
 | **Agents and inspection** | A tighter loop for inspecting data, changing code and replaying results, with live runs, recordings and verification reports compared side by side. |
 | **Platforms and interoperability** | Windows support, broader hardware validation and easier exchange with existing robotics data tools. |
 | **Remote access** | Hardening the account-based pairing and remote access layer: robot-side provisioning, hosted account services and grant management across owned and shared robots. |
@@ -448,7 +425,7 @@ Report vulnerabilities through the [security policy](.github/SECURITY.md). Cerul
 
 ## License
 
-[AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side `cerulion_wire`, `cerulion_link`, `cerulion_ops_proto` and `cerulion_pairing` crates are MIT OR Apache-2.0; each manifest states its license.
+[AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side `cerulion_wire`, `cerulion_link`, `cerulion_ops_proto` and `cerulion_pairing` crates are MIT OR Apache-2.0, and each manifest states its license.
 
 ## Citing Cerulion
 
