@@ -125,7 +125,7 @@ pub use catalog_events::{
 };
 pub use client::{
     ClientError, ConvergenceAbort, FirstContactWait, NetdClient, NetdEventClient, NextEvent,
-    NETD_BIN_ENV,
+    ServingLease, NETD_BIN_ENV,
 };
 pub use convergence::{
     worst_case_wall, Converged, ConvergenceWait, WaitDecision, WaitOutcome,

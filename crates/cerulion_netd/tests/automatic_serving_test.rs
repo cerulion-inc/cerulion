@@ -56,6 +56,8 @@ fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Wait up to [`LIMIT`] for `ready`; a timeout names the caller's line.
+#[track_caller]
 fn until(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + LIMIT;
     while !ready() {
@@ -519,6 +521,175 @@ fn local_only_and_query_only_daemons_never_start_the_server() {
         assert!(children(daemon.child.id()).is_empty());
         daemon.stop();
     }
+}
+
+fn hold(id: u64, ttl_s: u64) -> Request {
+    Request::HoldServing { id, ttl_s }
+}
+
+/// A serving hold starts remoted with no egress registration and keeps exactly
+/// that one server while remoted itself holds no work, until its deadline. A
+/// short first hold on a fresh connection keeps its server up to the deadline,
+/// then the deadline alone lets netd reap it while the connection stays open.
+/// A second hold on one connection replaces the first, so a long hold
+/// shortened to one second is reaped the same way. Closing a hold's
+/// connection reaps its server at once.
+#[test]
+fn a_serving_hold_starts_remoted_with_no_egress_and_its_deadline_or_close_reaps_it() {
+    const SHORT: Duration = Duration::from_secs(4);
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let remoted = Path::new(env!("CARGO_BIN_EXE_cerulion-netd")).with_file_name("cerulion-remoted");
+    assert!(remoted.is_file(), "build the real remote daemon first");
+    let ix = IsolatedRoot::mint("h4");
+    let mut daemon = Daemon::start(&ix, false, false, None, false);
+    let state_root = daemon.root.path().join("robot-state");
+    let mut client = daemon.connect();
+    assert!(
+        children(daemon.child.id()).is_empty(),
+        "nothing serves before the hold"
+    );
+
+    // netd's deadline is no earlier than `sent + SHORT`: every sample taken a
+    // second ahead of that sees the one server the hold started.
+    let sent = Instant::now();
+    let held = request(&mut client, hold(1, SHORT.as_secs()));
+    let Response::ServingHeld(held) = held else {
+        panic!("hold refused: {held:?}")
+    };
+    assert_eq!(held.id, 1);
+    assert_eq!(Path::new(&held.state_root), state_root);
+    assert_eq!(held.ttl_s, SHORT.as_secs());
+    until(|| children(daemon.child.id()).len() == 1);
+    let first = children(daemon.child.id());
+    let mut samples = 0;
+    while Instant::now() + Duration::from_secs(1) < sent + SHORT {
+        assert_eq!(
+            children(daemon.child.id()),
+            first,
+            "the hold alone retains its server until its deadline"
+        );
+        samples += 1;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(samples > 0, "the server started too late to sample");
+    until(|| children(daemon.child.id()).is_empty());
+    assert!(
+        matches!(
+            request(&mut client, Request::Status { id: 2 }),
+            Response::Status(_)
+        ),
+        "the deadline released the hold, not the connection"
+    );
+
+    let long = request(&mut client, hold(3, 900));
+    assert!(
+        matches!(&long, Response::ServingHeld(r) if r.id == 3 && r.ttl_s == 900),
+        "{long:?}"
+    );
+    until(|| children(daemon.child.id()).len() == 1);
+    let server = children(daemon.child.id());
+    assert_ne!(server, first, "a fresh hold starts a new server");
+    let fence = cerulion_netd::serving_hold::fence_path(&state_root);
+    until(|| {
+        cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+            .unwrap()
+            .is_some()
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        children(daemon.child.id()),
+        server,
+        "with remoted idle, the hold alone retains its one server"
+    );
+    let Response::Status(status) = request(&mut client, Request::Status { id: 4 }) else {
+        panic!("status refused")
+    };
+    assert!(status.egress.is_none(), "a hold boots no egress gateway");
+    let replaced = request(&mut client, hold(5, 1));
+    assert!(
+        matches!(&replaced, Response::ServingHeld(r) if r.id == 5 && r.ttl_s == 1),
+        "{replaced:?}"
+    );
+    until(|| children(daemon.child.id()).is_empty());
+    assert!(
+        matches!(
+            request(&mut client, Request::Status { id: 6 }),
+            Response::Status(_)
+        ),
+        "the replacing deadline released the hold, not the connection"
+    );
+
+    let mut second = daemon.connect();
+    assert!(matches!(
+        request(&mut second, hold(1, 900)),
+        Response::ServingHeld(_)
+    ));
+    until(|| children(daemon.child.id()).len() == 1);
+    assert_ne!(children(daemon.child.id()), server);
+    drop(second);
+    until(|| children(daemon.child.id()).is_empty());
+    daemon.stop();
+}
+
+/// A local-only daemon has no remote server to hold, and a machine without
+/// serving authority is refused before anything is held; neither starts a
+/// server.
+#[test]
+fn a_serving_hold_is_refused_with_the_network_off_or_without_serving_authority() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    for off in [true, false] {
+        let ix = IsolatedRoot::mint("h5");
+        let mut daemon = Daemon::start(&ix, off, false, None, false);
+        let expected = if off {
+            "this cerulion-netd does not serve remote access: its network is off or it was \
+             built without remote serving; remove CERULION_NETD_NETWORK=off or rebuild it with \
+             the default wan feature, then restart cerulion-netd"
+        } else {
+            std::fs::write(
+                daemon.root.path().join("robot-state/remoted/device_key"),
+                [0x77; 32],
+            )
+            .unwrap();
+            "serving the network requires a prior login; run `cerulion login`"
+        };
+        let mut client = daemon.connect();
+        match request(&mut client, hold(1, 60)) {
+            Response::Error(refused) => assert_eq!(refused.error, expected),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(children(daemon.child.id()).is_empty());
+        daemon.stop();
+    }
+}
+
+/// A paired robot with no login whose `CERULION_STATE_ROOT` is relative is told
+/// its root is unusable, not sent to log in for a server it cannot run, and
+/// starts nothing.
+#[test]
+fn a_serving_hold_on_a_relative_state_root_is_refused_with_the_root_text_before_the_login_check() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let ix = IsolatedRoot::mint("h8");
+    let mut daemon = Daemon::start_with(&ix, false, false, None, false, None, |command, _| {
+        command.env("CERULION_STATE_ROOT", "robot-state");
+    });
+    assert!(
+        !daemon.root.path().join("auth.json").exists(),
+        "no login is saved"
+    );
+    let mut client = daemon.connect();
+    match request(&mut client, hold(1, 60)) {
+        Response::Error(refused) => assert_eq!(
+            (refused.id, refused.error.as_str()),
+            (
+                Some(1),
+                "the robot state root must be an absolute path with no '.' or '..' components; \
+                 set CERULION_STATE_ROOT to such a path and restart cerulion-netd"
+            )
+        ),
+        other => panic!("expected the state root refusal, got {other:?}"),
+    }
+    assert!(children(daemon.child.id()).is_empty());
+    daemon.stop();
 }
 
 #[test]

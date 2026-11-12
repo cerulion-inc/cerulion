@@ -626,6 +626,40 @@ pub struct NetdClient {
     mirror_busy_failures: FailureRegimeLatch,
 }
 
+/// A granted `hold_serving` on its own `cerulion-netd` connection, from
+/// [`NetdClient::hold_serving`]: a time-bounded lease on the machine's remote
+/// server. Dropping it closes the connection, which releases the hold at once;
+/// netd also releases it at its deadline, no earlier than [`Self::expires`],
+/// while the connection stays open. A lease takes no `serving.hold` lock
+/// ([`crate::serving_hold`]).
+#[derive(Debug)]
+pub struct ServingLease {
+    client: NetdClient,
+    state_root: PathBuf,
+    expires: Instant,
+}
+
+impl ServingLease {
+    /// The robot state root the held server uses; its own directory is
+    /// `<state_root>/remoted`.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// When the hold lapses. Measured from before the request was sent, so it
+    /// is never later than netd's own deadline for the hold.
+    pub fn expires(&self) -> Instant {
+        self.expires
+    }
+
+    /// The raw fd of the holding connection, for a liveness watch that polls
+    /// it. Borrowed: valid only while this lease is alive. Never close it: the
+    /// lease owns the close, and dropping the lease is the release.
+    pub fn control_fd(&self) -> std::os::unix::io::RawFd {
+        self.client.control_fd()
+    }
+}
+
 impl NetdClient {
     /// Connect to the well-known `cerulion-netd` control socket
     /// ([`default_socket_path`]), SPAWNING the daemon detached if it is not running
@@ -1696,6 +1730,70 @@ impl NetdClient {
             }),
             other => Err(ClientError::Protocol(format!(
                 "expected an egress response, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Hold this machine's remote server running for `ttl_s` seconds with no
+    /// egress registration, on THIS connection, which the returned
+    /// [`ServingLease`] keeps. Dropping the lease closes the connection, which
+    /// releases the hold at once; netd also releases it at its deadline while
+    /// the connection stays open. `ttl_s` runs from
+    /// [`SERVING_HOLD_MIN_TTL_S`](crate::protocol::SERVING_HOLD_MIN_TTL_S) to
+    /// [`SERVING_HOLD_MAX_TTL_S`](crate::protocol::SERVING_HOLD_MAX_TTL_S); netd
+    /// refuses anything else. Before holding anything it also refuses when it
+    /// runs no remote server or its robot state root is unusable, and then when
+    /// the machine lacks serving authority. The reply does not wait for the
+    /// server: netd's lifecycle worker starts it, and a start failure is
+    /// retried and logged there, never reported to the lease.
+    ///
+    /// A daemon older than
+    /// [`SERVING_HOLD_MIN_DAEMON_VERSION`](crate::protocol::SERVING_HOLD_MIN_DAEMON_VERSION)
+    /// is refused locally with the upgrade message. Like [`Self::register_egress`],
+    /// the FIRST request on a connection can race the daemon's idle exit, so it is
+    /// retried ONCE over a fresh connection.
+    pub fn hold_serving(mut self, ttl_s: u64) -> Result<ServingLease, ClientError> {
+        let first_request = self.next_id == 1;
+        let (state_root, expires) = match self.hold_serving_once(ttl_s) {
+            Err(e) if first_request && is_closed_early(&e) => {
+                self.reconnect()?;
+                self.hold_serving_once(ttl_s)
+            }
+            other => other,
+        }?;
+        Ok(ServingLease {
+            client: self,
+            state_root,
+            expires,
+        })
+    }
+
+    /// One `hold_serving` round-trip. The deadline is counted from before the
+    /// request is written, so it is never later than the daemon's own. A grant
+    /// longer than the request is a protocol error.
+    fn hold_serving_once(&mut self, ttl_s: u64) -> Result<(PathBuf, Instant), ClientError> {
+        let id = self.next_request_id();
+        let sent = Instant::now();
+        match self.round_trip(&Request::HoldServing { id, ttl_s })? {
+            Response::ServingHeld(held) if held.id == id => {
+                let expires = (held.ttl_s <= ttl_s)
+                    .then(|| sent.checked_add(Duration::from_secs(held.ttl_s)))
+                    .flatten()
+                    .ok_or_else(|| {
+                        ClientError::Protocol(format!(
+                            "netd granted a {}-second serving hold for a {ttl_s}-second request",
+                            held.ttl_s
+                        ))
+                    })?;
+                Ok((PathBuf::from(held.state_root), expires))
+            }
+            Response::Error(e) => Err(ClientError::Netd {
+                error: e.error,
+                robot: e.robot,
+                topic: e.topic,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "expected a serving hold response, got {other:?}"
             ))),
         }
     }
@@ -3150,6 +3248,228 @@ mod tests {
             2,
             "the egress verbs must not have moved"
         );
+    }
+
+    /// `hold_serving` needs a v12 daemon; every older one is refused locally,
+    /// before the line is sent, with the upgrade message.
+    #[test]
+    fn hold_serving_is_gated_to_a_v12_daemon_with_the_upgrade_message() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let hold = Request::HoldServing { id: 1, ttl_s: 660 };
+        assert_eq!(hold.min_daemon_version(), 12);
+        for old in 1u32..=11 {
+            let msg = verb_compat_error(old, &hold)
+                .unwrap_or_else(|| panic!("a v{old} daemon must refuse hold_serving"));
+            assert_eq!(
+                msg,
+                format!(
+                    "the connected cerulion-netd speaks protocol v{old} but the 'hold_serving' \
+                     verb needs protocol v12 (this client speaks v{PROTOCOL_VERSION}). Upgrade \
+                     cerulion-netd to use this feature."
+                )
+            );
+        }
+        assert!(verb_compat_error(12, &hold).is_none());
+        assert!(verb_compat_error(99, &hold).is_none());
+
+        // Through the client: a v11 daemon's peer reads no request line at all.
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let client = NetdClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            next_id: 1,
+            socket_path: PathBuf::new(),
+            daemon_protocol: 11,
+            poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
+        };
+        match client.hold_serving(660) {
+            Err(ClientError::Protocol(message)) => assert_eq!(
+                message,
+                format!(
+                    "the connected cerulion-netd speaks protocol v11 but the 'hold_serving' \
+                     verb needs protocol v12 (this client speaks v{PROTOCOL_VERSION}). Upgrade \
+                     cerulion-netd to use this feature."
+                )
+            ),
+            other => panic!("expected the upgrade refusal, got {other:?}"),
+        }
+        let mut sent = String::new();
+        peer.read_to_string(&mut sent).unwrap();
+        assert_eq!(sent, "", "nothing is sent to a daemon too old for the verb");
+    }
+
+    /// A client over one end of a socket pair whose other end reads one request
+    /// line and answers `reply`. When a 200 ms read after the reply then finds
+    /// the connection still open with nothing more sent, it says so on the
+    /// returned channel; either way it waits for the close. The thread returns
+    /// the request line it read.
+    fn scripted_hold_client(
+        reply: &'static str,
+    ) -> (
+        NetdClient,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<String>,
+    ) {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        let (open_tx, still_open) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // The timeout is set before the reply: once the client has its
+            // reply it may close, and setting a socket option after the peer
+            // closed fails on macOS.
+            server
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            writeln!(server, "{reply}").unwrap();
+            let mut rest = String::new();
+            match reader.read_line(&mut rest) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    let _ = open_tx.send(());
+                    // Fails only once the client has closed, and then the read
+                    // below returns end of file at once.
+                    let _ = server.set_read_timeout(None);
+                    assert_eq!(reader.read_line(&mut rest).unwrap(), 0, "only one request");
+                }
+                read => assert_eq!(read.unwrap(), 0, "only one request"),
+            }
+            request
+        });
+        let client = NetdClient {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+            next_id: 1,
+            socket_path: PathBuf::new(),
+            daemon_protocol: PROTOCOL_VERSION,
+            poisoned: false,
+            pending_losses: Vec::new(),
+            push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
+        };
+        (client, still_open, worker)
+    }
+
+    /// The client sends the hand-written request line, keeps the connection in
+    /// the returned lease, counts the deadline from before the request, and
+    /// dropping the lease closes the connection.
+    #[test]
+    fn a_serving_lease_keeps_its_connection_until_dropped_and_reports_root_and_deadline() {
+        let (client, still_open, server) =
+            scripted_hold_client(r#"{"id":1,"state_root":"/srv/robot-state","ttl_s":660}"#);
+        let before = Instant::now();
+        let lease = client.hold_serving(660).expect("held");
+        let after = Instant::now();
+        assert_eq!(lease.state_root(), Path::new("/srv/robot-state"));
+        assert!(before + Duration::from_secs(660) <= lease.expires());
+        assert!(lease.expires() <= after + Duration::from_secs(660));
+        assert!(lease.control_fd() >= 0);
+        still_open
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lease keeps the connection open");
+        drop(lease);
+        assert_eq!(
+            server.join().unwrap(),
+            "{\"method\":\"hold_serving\",\"id\":1,\"ttl_s\":660}\n"
+        );
+    }
+
+    /// A refusal arrives as the daemon's text; a reply for another id, or of
+    /// another shape, and a grant longer than the request, is a protocol error
+    /// rather than a lease.
+    #[test]
+    fn a_refused_or_mismatched_serving_hold_reply_is_an_error_not_a_hold() {
+        let (client, _still_open, server) = scripted_hold_client(
+            r#"{"id":1,"error":"serving the network requires a prior login; run `cerulion login`"}"#,
+        );
+        match client.hold_serving(60) {
+            Err(ClientError::Netd {
+                error,
+                robot,
+                topic,
+            }) => {
+                assert_eq!(
+                    error,
+                    "serving the network requires a prior login; run `cerulion login`"
+                );
+                assert_eq!((robot, topic), (None, None));
+            }
+            other => panic!("expected the daemon refusal, got {other:?}"),
+        }
+        server.join().unwrap();
+        for (reply, refusal) in [
+            (
+                r#"{"id":2,"state_root":"/srv/robot-state","ttl_s":60}"#,
+                "expected a serving hold response",
+            ),
+            (
+                r#"{"id":1,"released_topics":0}"#,
+                "expected a serving hold response",
+            ),
+            (
+                r#"{"id":1,"state_root":"/srv/robot-state","ttl_s":61}"#,
+                "netd granted a 61-second serving hold for a 60-second request",
+            ),
+        ] {
+            let (client, _still_open, server) = scripted_hold_client(reply);
+            match client.hold_serving(60) {
+                Err(ClientError::Protocol(message)) => {
+                    assert!(message.starts_with(refusal), "{message}");
+                }
+                other => panic!("expected a protocol error for {reply}, got {other:?}"),
+            }
+            server.join().unwrap();
+        }
+    }
+
+    /// The first request on a connection may meet a daemon that closes it
+    /// during its idle exit; the hold is retried once over a fresh connection.
+    #[test]
+    fn a_serving_hold_closed_early_on_the_first_request_is_retried_once_on_a_fresh_connection() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("netd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let banner = Hello::new().to_json_line();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for answer in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                writeln!(stream, "{banner}").unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                requests.push(request);
+                if answer {
+                    writeln!(
+                        stream,
+                        r#"{{"id":1,"state_root":"/srv/robot-state","ttl_s":30}}"#
+                    )
+                    .unwrap();
+                    let mut rest = String::new();
+                    reader.read_line(&mut rest).unwrap();
+                }
+            }
+            requests
+        });
+        let client = NetdClient::connect_or_spawn_at(socket).unwrap();
+        let lease = client
+            .hold_serving(30)
+            .expect("held on the second connection");
+        assert_eq!(lease.state_root(), Path::new("/srv/robot-state"));
+        drop(lease);
+        let line = "{\"method\":\"hold_serving\",\"id\":1,\"ttl_s\":30}\n".to_string();
+        assert_eq!(server.join().unwrap(), vec![line.clone(), line]);
     }
 
     #[test]
