@@ -184,6 +184,19 @@ Rules that must not drift:
   `prepare_recording_inputs` seam), never a copy of the on-disk graph file. The same
   renderer writes the run directory's `graph.yaml`, so run dir and bag agree by
   construction; changing one means checking the other.
+- **Environment divergence prints once and never changes the exit code.** A resim never
+  applies the bag's `env.json`: its nodes read the replay shell's environment, and
+  `replay_engine::compare_env_against` compares the two (no `env.json`, no comparison). One
+  pure rule, `env_reader`, names the variables that can change the re-execution
+  (`CERULION_`, `IOX2_`, `LD_`, `DYLD_`, `PYTHON`, minus every name the recorder's secret
+  marker rule marks); such a variable set only at replay is `Added`. The terminal text has
+  one source, `render_env_divergence_lines` (a `WARNING:` per such variable, then one
+  `NOTE:` counting the rest, with no value or hash), printed by the verdict and, through
+  `ResimReport::env_lines`, by both arms of the neutral summary. The engine follows the
+  one-emitter rule the violation and node-failure lines follow: no log line for a loud
+  variable on a run that returns an outcome, a `warn!` on an aborted one, and an `info!`
+  for every other variable, which `-v` shows. The `--report` entry's `read_by` is derived
+  from the name by the same rule.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.

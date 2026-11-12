@@ -27385,6 +27385,54 @@ mod env_divergence_tests {
             ]
         );
     }
+
+    /// The getting-started tutorial quotes the NOTE line a resim prints for
+    /// one differing shell variable, in a fence of its own in the section that
+    /// verifies the unchanged code, and names the WARNING prefix the renderer
+    /// prints; the old line it told readers to ignore is gone.
+    #[test]
+    fn the_getting_started_tutorial_quotes_the_environment_lines_the_resim_prints() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/tutorials/01-getting-started.md");
+        let tutorial = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let section = tutorial
+            .split_once("### Verify the unchanged code")
+            .expect("the tutorial verifies the unchanged code")
+            .1
+            .split_once("### Change the controller")
+            .expect("the section ends at the controller change")
+            .0;
+        let fences: Vec<&str> = section
+            .split("```")
+            .skip(1)
+            .step_by(2)
+            .map(str::trim)
+            .collect();
+        let note =
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]);
+        assert_eq!(note.len(), 1, "{note:?}");
+        assert!(
+            fences.contains(&note[0].as_str()),
+            "the tutorial must fence the exact NOTE line: {fences:?}"
+        );
+        let loud = render_env_divergence_lines(&[divergence(
+            "CERULION_DRAIN_DISCIPLINE",
+            EnvDivergenceKind::ValueChanged,
+        )]);
+        assert!(
+            loud[0].starts_with("WARNING: environment variable "),
+            "{loud:?}"
+        );
+        assert!(
+            section.contains("`WARNING: environment variable`"),
+            "the tutorial names the WARNING prefix"
+        );
+        assert!(
+            !tutorial.contains("WARNING: env divergence"),
+            "the old line is gone from the tutorial"
+        );
+    }
 }
 
 // ===========================================================================
