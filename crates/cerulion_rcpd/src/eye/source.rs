@@ -8,14 +8,17 @@
 //! and keeps the answer, so later frames cost one map lookup.
 //!
 //! `cerulion bag play` runs its transport under the node [`BAG_PLAY_NODE`],
-//! and `cerulion bag play --resim` under [`RESIM_NODE_PREFIX`] followed by
-//! the recording's identity. A frame either
-//! one publishes is [`Source::Replay`] whatever its wire timestamp says, so a
-//! replay is told apart from a live graph however its clock runs. A graph
-//! run's own node is `cerulion_` followed by the graph's name (and, in a
-//! multi-process run, `_` and the process group), so a graph named
-//! `bag_play`, one whose name begins `replay_`, or a multi-process graph
-//! named `replay` reads as a replay too.
+//! on the shared namespace the eye reads. A frame it publishes is
+//! [`Source::Replay`] whatever its wire timestamp says, so a played
+//! recording is told apart from a live graph however its clock runs.
+//! `cerulion bag play --resim` runs under [`RESIM_NODE_PREFIX`] followed by
+//! the recording's identity, on a private shared-memory namespace of its
+//! own, so its frames never reach the eye; a publisher on the shared
+//! namespace whose node name begins with that prefix is a [`Source::Replay`]
+//! too. A graph run's own node is `cerulion_` followed by the graph's name
+//! (and, in a multi-process run, `_` and the process group), so a graph
+//! named `bag_play`, one whose name begins `replay_`, or a multi-process
+//! graph named `replay` reads as a replay too.
 
 use std::collections::HashMap;
 
