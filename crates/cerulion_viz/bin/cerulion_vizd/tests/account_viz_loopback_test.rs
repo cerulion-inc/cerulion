@@ -158,7 +158,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
         worker,
         builtin_walker(),
         None,
-        Arc::new(NetdDemandPlane::with_socket(desk_socket)),
+        Arc::new(NetdDemandPlane::with_socket(desk_socket.clone())),
     )
     .unwrap();
     let mut client = support::Client::connect(&viz_socket);
@@ -171,18 +171,55 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
     );
     assert_eq!(attached["entity"], "world/account_loopback/telemetry");
     assert_eq!(netd.active_demand_count(), 1);
-    assert_eq!(desk.topic_publisher_count_checked(TOPIC), Some(1));
+    let observed = cerulion_netd::TopicKey::observed(&route, TOPIC).local_topic();
+    assert_eq!(desk.topic_publisher_count_checked(&observed), Some(1));
+    assert_eq!(desk.topic_publisher_count_checked(TOPIC), Some(0));
     let provenance = desk.gather_mirror_provenance_checked(BOUND).unwrap();
     assert!(provenance.completeness.is_settled());
     assert_eq!(provenance.records.len(), 1);
-    assert_eq!(provenance.records[0].topic, TOPIC);
+    assert_eq!(provenance.records[0].topic, observed);
     assert_eq!(provenance.records[0].origin_robot, route);
     robot.assert_one_owner_pair(&account);
 
-    let mut probe = desk.create_data_only_subscriber(TOPIC).unwrap();
+    let mut probe = desk.create_data_only_subscriber(&observed).unwrap();
     let mut scratch = Vec::new();
     let mut values = BTreeMap::new();
     for i in 0..PAYLOADS.len() {
+        if i == 1 {
+            // The held subscriber and viz tap survive a real mirror retirement.
+            // Reinstall through account lookup, then await the cold re-demand.
+            let identity = cerulion_netd::identity_snapshot::load_at(&home).unwrap();
+            let snapshot = cerulion_netd::account_access::AccountSnapshot {
+                auth_account_id: identity.auth_account_id().into(),
+                pairing_account_id: identity.account().0,
+                device_key: identity.device_key().0,
+                owner_chain: identity.owner_chain_wire().map(Vec::from),
+                robots: vec![],
+            };
+            let mut admin =
+                cerulion_netd::NetdClient::connect_existing_at(desk_socket.clone()).unwrap();
+            admin
+                .account_access_once(
+                    cerulion_netd::account_access::AccountAccessRequest::Install {
+                        snapshot: Box::new(snapshot),
+                    },
+                )
+                .unwrap();
+            assert_eq!(netd.active_demand_count(), 0);
+            let refreshed =
+                cerulion_cli_engine::account_robot_access::prepare_viz_target(&route, &[], &[])
+                    .unwrap();
+            assert_eq!(refreshed.route, route);
+            let deadline = Instant::now() + BOUND;
+            while netd.active_demand_count() != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "visualization did not re-demand the retired source"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         let oracle = frame(robot.hash, i);
         publisher.publish_raw(&oracle).unwrap();
         let deadline = Instant::now() + BOUND;
@@ -247,6 +284,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
             .unwrap();
         if netd.mirror_count() == 0
             && netd.lingering_count() == 0
+            && desk.topic_publisher_count_checked(&observed) == Some(0)
             && desk.topic_publisher_count_checked(TOPIC) == Some(0)
             && provenance.completeness.is_settled()
             && provenance.records.is_empty()

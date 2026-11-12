@@ -380,6 +380,7 @@ impl RemotePlane {
             trust_store,
             device_index,
             mac_key,
+            device_key,
         })
     }
 }
@@ -393,6 +394,7 @@ pub struct BoundPlane {
     trust_store: TrustStore,
     device_index: DeviceAccountIndex,
     mac_key: Vec<u8>,
+    device_key: [u8; 32],
 }
 
 impl BoundPlane {
@@ -421,7 +423,50 @@ impl BoundPlane {
             trust_store,
             device_index,
             mac_key,
+            device_key,
         } = self;
+        // Principle #8: serving and outbound mirrors use the same iceoryx2 node
+        // and the same device endpoint.
+        let outbound = if matches!(&plane.host, HostKind::Daemon { .. }) {
+            let manager = match &plane.transport {
+                Some(manager) => manager.clone(),
+                None => TransportManager::init(cerulion_core::TransportConfig::default())
+                    .map_err(|error| RemotedError::Config(error.to_string()))?,
+            };
+            let socket = plane
+                .files
+                .store_file
+                .parent()
+                .ok_or_else(|| {
+                    RemotedError::Config("remote state directory is unavailable".into())
+                })?
+                .join("outbound.sock");
+            Some(
+                cerulion_netd::shared_endpoint::OutboundServer::start_with_holds(
+                    socket,
+                    endpoint.clone(),
+                    tokio::runtime::Handle::current(),
+                    device_key,
+                    manager,
+                    cerulion_netd::serving_hold::ServingHolds::open(
+                        &cerulion_netd::serving_hold::fence_path(
+                            plane
+                                .files
+                                .store_file
+                                .parent()
+                                .and_then(Path::parent)
+                                .ok_or_else(|| {
+                                    RemotedError::Config("remote state root is unavailable".into())
+                                })?,
+                        ),
+                    )
+                    .map_err(|error| RemotedError::Config(error.to_string()))?,
+                )
+                .map_err(RemotedError::Config)?,
+            )
+        } else {
+            None
+        };
         let base = match plane.transport {
             Some(manager) => WirePlane::with_manager(plane.robot, manager),
             None => WirePlane::lazy(plane.robot),
@@ -455,6 +500,11 @@ impl BoundPlane {
             shutdown,
         )
         .await;
+        // Local readers settle on this runtime; keep its drivers running while
+        // the blocking control threads join, including current-thread hosts.
+        tokio::task::spawn_blocking(move || drop(outbound))
+            .await
+            .map_err(|_| RemotedError::Config("outbound control shutdown failed".into()))?;
         endpoint.close().await;
         result
     }

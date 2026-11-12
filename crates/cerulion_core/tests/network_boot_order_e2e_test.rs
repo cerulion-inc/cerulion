@@ -142,6 +142,9 @@ fn boot_producer(tag: &str, id: &str, topic: &str, connect: Vec<String>) -> (Pro
             root_a.clone(),
         )
         .expect("init G_prod");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
             announce: vec![topic.to_string()],
@@ -189,6 +192,9 @@ fn boot_consumer(tag: &str, id: &str, topic: &str, connect: Vec<String>) -> (Con
             root_b.clone(),
         )
         .expect("init G_cons manager");
+        mgr.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let sub = mgr.create_subscriber(topic).expect("B subscriber");
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowList(vec![]),

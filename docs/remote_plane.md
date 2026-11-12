@@ -8,6 +8,10 @@ iroh endpoint per robot, dial-by-key, the `cerulion/ops/1` and
 `cerulion/wire/2` protocols, designed to be reachable from boot, gated by the
 offline pairing access list.
 
+A serving machine can also read paired robots through that same device
+endpoint. Outbound topic mirrors use the existing pull protocol; releasing a
+mirror preserves the machine's incoming remote service.
+
 It is separate from [`docs/networking.md`](networking.md), which covers the LAN
 zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
@@ -74,6 +78,19 @@ access can:
   `cerulion-remoted` dropped (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
+The topic CLI and `viz --robot` also use this plane automatically for account-owned
+and explicitly paired robots. `topic list` shows the robot's reachability and its
+catalog without a manual connect command. Desk observers use private channels
+under `/__cerulion/observers/`, keeping a robot's topic separate from a local topic
+with the same canonical name; wire/2 still names the original topic. Observers of
+one source share a demand, and the last observer releases the channel. Graph
+ingress keeps canonical names and the single-writer contract.
+
+An expired session is refreshed and saved before account discovery, with a 2 s
+budget. If the service is unavailable, the saved account directory remains
+usable. Topic reads keep cache diagnostics at debug; `topic list` reports them
+on one stderr line, and an explicit `--robot` reports unavailable robot topics.
+
 A desk cannot write a topic on the robot or send it teleop commands over
 `cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
 never reads a data stream from the desk. The `teleop` and `deploy` verbs
@@ -89,19 +106,53 @@ act verbs, work on the robot's own shared memory; with `--robot`,
   `service-call` calls a robot service once. Both are refused while the
   robot's e-stop is engaged, and one already running stops when it engages.
   They check the e-stop, not the control lease, so the deadman does not cover
-  them. `topic-publish` refuses a topic under the reserved `/__cerulion`
-  namespace.
+  them.
 - With observe access, `topic-snapshot` reads the newest frame of a camera
   topic as a JPEG and `topic-echo-once` reads the newest message of a topic,
   decoded.
+
+Every act verb refuses a network mirror and topics under the reserved
+`/__cerulion` namespace. A live mirror is read on its source robot; other
+reserved topics produce a usage error. Producer exclusions name the refused
+topic and preserve its remote-access policy context.
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
 `cerulion rcp` is refused the same way.
 
-The only other desk to robot topic path today is LAN ingress (an `ingress:`
-block in a graph), which proves no identity per peer and is closed when
-`CERULION_LAN_ACCESS=paired`.
+A graph with declared `ingress:` can pull an exported topic from a unique
+same-account or explicitly paired producer over the authenticated remote plane.
+The receiving graph checks the declared topic, schema, QoS and single-writer
+rules. Declared imports require a native service provisioned for one publisher;
+a multi-publisher service is refused even with only one live writer. The
+producer serves its stream; the consumer does not send arbitrary data
+frames to the producer. A machine can serve and consume through the same owned
+endpoint. This is distinct from the ops `topic-publish` verb and its capability
+and e-stop checks.
+
+Account graph imports retain usable saved trust when a revocation refresh fails,
+including during an account-service outage or after session expiry. The failure
+is reported with the source robot and cause, and repeated failures are counted.
+Every reconnect still validates the pinned source identity and producer policy.
+The shared endpoint sends only the selected peer and peers with held readers;
+unrelated registered robots do not consume a request's framing budget.
+
+Each robot exports its own local producers. Imported graph topics and private
+observer channels keep their source robot's access policy: read them on that
+source robot. Schema reads without topic data use current producer metadata
+without opening a data reader; privacy and authorization are checked again
+after the metadata source returns. A refused outbound demand or an unavailable
+robot during metadata discovery preserves the machine's other active readers. Failed membership
+cleanup fences the outbound connection and reports transport loss. Ops snapshot, one-shot
+echo, publish and service calls enforce the same source restriction. Outbound
+readers retain the owned server against idle shutdown; new admission returns a retryable
+refusal while shutdown is already committed. Account ownership proofs survive
+the switch between consuming and serving. Reader restoration shares one bounded
+budget; unresolved readers receive a named loss notice and can reconnect.
+
+The zenoh LAN ingress compatibility path proves no identity per peer and is
+closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires
+explicit `CERULION_LAN_ACCESS=open` and warns at startup. Authenticated discovery is described in [networking](networking.md#making-a-robot-discoverable).
 
 ## The deadman: a quiet operator loses the lease
 
@@ -186,9 +237,26 @@ time.
 exhaustion and network delivery still decide whether a remote `engage-estop`
 arrives. Each session is bounded by a 120 s deadline that closes an
 authenticated-then-stalled connection, which is a per-session resource guard
-rather than a serialization point. Two caps that would bound the total footprint
-under a distributed flood, a global concurrency cap with a reserved safety-floor
-slot and the daemon's accept-loop cap, are **not implemented**.
+rather than a serialization point. At most 32 TLS handshakes are pending, each
+for at most 10 s. Once 16 are pending, an unvalidated address must answer a
+QUIC Retry before admission. Arrivals other than paired relay keys fill at
+most 24 pending slots: a validated IP holds at most four of them, relay
+arrivals from keys this robot has not paired share eight per relay URL, and
+custom transports share four. The last eight slots are a reserve for device
+keys this robot has paired and still allows that arrive by relay, and each
+such key holds at most four pending slots. A paired relay key answers one
+QUIC Retry, which travels over the relay to the key's holder, before it takes
+its slots or the reserve, so a peer that forges the key's relay address cannot
+take them. Unpaired peers can still fill the 24 shared slots, never the
+reserve: sixteen unanswered dials plus eight stranger relay handshakes, or
+plus four from each of two validated addresses, are enough, and one host can
+claim several addresses. A dial over a direct path uses the shared slots, and
+a dial that also carries a direct address (`--addr`) is classified by the copy
+that arrives first, so it gets the reserve only when the relay copy is first.
+A desk whose key this robot has not yet recorded as paired, such as an account
+desk on its first relay dial, also shares its relay URL's eight unpaired
+slots, which one unpaired key can hold on its own. Established sessions are
+not globally capped.
 
 ## A dropped connection does not drop the lease
 
@@ -205,12 +273,17 @@ which is correct: the operator is gone.
 
 ## It never bricks offline
 
+Robots on your account are reached by signing in with `cerulion login` on the
+desk: the robot adds the desk to its access list the first time the desk's
+network daemon reads one of its topics. Code pairing is not available in this
+release.
+
 On the LAN, an established pairing reaches the robot with no cloud anywhere in
 the connect path: a direct iroh dial to the robot address you give
 (`--addr ip:port`), with the relay disabled (`--relay-disabled`), and offline
-verification against the durable access list. mDNS supplies the robot's
-endpoint id to `cerulion pair`; it does not supply a dial address, so an
-offline connect needs `--addr`. Established pairings do not expire (a
+verification against the durable access list. The robot's mDNS record carries
+its endpoint id (`eid=`); it does not supply a dial address, so an offline
+connect needs `--addr`. Established pairings do not expire (a
 time-boxed guest grant from the owner is the exception), last until revoked
 (see [`docs/revocation.md`](revocation.md)), and never re-run the certificate
 chain per connect; the access row is the truth.
@@ -226,3 +299,17 @@ pairing on the LAN.
   access back.
 - [`docs/networking.md`](networking.md): the LAN plane, discovery and what a run
   exposes by default.
+
+## Graph ingress queue policy
+
+A graph producer declares its reliable queue policy with its served topic
+metadata. Wire forwarding sizes that queue to `send_queue`, or the actual tap
+depth when omitted. At capacity it refuses the new frame, retains queued
+frames in order, and exposes `wan_refused` separately from `wan_dropped`.
+A source without policy metadata is unverified for graph ingress.
+Best-effort datagram graph ingress is refused on this wire path.
+Changing a retained topic's queue policy requires restarting `cerulion-netd`.
+
+Observer reads use their existing bounded best-effort queue, including exports
+with BestEffort policy and multiple publishers. The reliable-policy and
+single-writer refusals apply to canonical graph imports.

@@ -1225,9 +1225,13 @@ or nested verb's `network_refusal` and `dispatch` hands it
 `command_network_refusal`, an exhaustive match over `Commands`. Each refusal is built
 from the engine function the verb's own path refuses with, so its text and exit code
 are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
-`service call`, and `rcp` (exit 2), `viz --robot` and `pair` (exit 1). The `rcp`
+`service call`, and `rcp` (exit 2), and `viz --robot` (exit 1). The `rcp`
 family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
-and `pair` do. `connect` prints a
+does. The hidden `pair` stub never reaches this check: `dispatch` answers it
+beside the removed `ros` family, above the switch and the gate, with
+`PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling, because no robot-side verb
+arms a pairing code (`SharedCodePairSessions::arm` has no caller outside tests);
+its table row is `Expect::Runs`. `connect` prints a
 `warning:` line of its own and exits 0, as its helper does, on the exact value `off`
 the helper reads, without resolving the robot or spawning the helper. A refusal now
 comes before the verb's other argument checks; `viz --robot` with no TOPIC is the one
