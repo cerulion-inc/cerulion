@@ -442,8 +442,10 @@ homepage = "https://github.com/cerulion-inc/cerulion"
 # SDK pulled by the `cerulion_viz` / `cerulion-vizd` members at 1.93 (`rerun`
 # declares 1.92; its transitive `fixed` 1.31.0 declares 1.93, the highest
 # rust-version in the lockfile). The release compiler
-# (.github/workflows/release-artifacts.yml) is pinned at the same 1.95.0, so a
-# release binary and the nodes built against it share one compiler at the floor.
+# (.github/workflows/release-artifacts.yml) is pinned at the same 1.95.0. Nodes
+# need any Rust at or above this floor, not that compiler: the installer's floor
+# (tools/scripts/install_rust.sh) and the CLI's (`rust_setup::RUST_FLOOR`) are
+# pinned to this value by their tests.
 rust-version = "1.95"
 
 # ───────────────────────────── Workspace lint table ────────────────────────

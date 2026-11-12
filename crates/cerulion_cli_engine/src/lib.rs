@@ -263,6 +263,9 @@ pub mod ros2_graph;
 // clean-git-tree refusal, ONE commit + patch file, then an automatic
 // `colcon build --packages-select` of the affected packages.
 pub mod ros2_migrate;
+// Whether a Rust 1.95 or newer is there for the verbs that build nodes, and the
+// offer to install it on a terminal. Pure decision core, injected probe.
+pub mod rust_setup;
 pub mod schema_cmd;
 pub mod schema_serve;
 /// `cerulion service call`.

@@ -307,23 +307,24 @@ holding a `stable.txt` beside the archives serves both, which is how the
 installer self-test exercises the channel offline.
 
 Every platform archive `release-artifacts.yml` builds carries a copy of the
-`tools/scripts/install_rust.sh` helper and a `rustc-version.txt` beside the
-binaries.
-The metadata is the output of the same `rustc -vV` that built them, never a
-compiler version written by hand into the mutable installer, and the archive
-checksum covers both files. Before activating any binary, `install.sh` runs that
-helper while it holds the install lock: the helper provisions the release
-compiler and its Cargo through rustup and verifies the full commit hash, so a
-failed setup leaves the previously installed binaries in place, though a partly
-installed Rust toolchain can remain under rustup's own management. Existing rustup
-defaults, profiles and shell startup files are preserved, and a rustup found
-only on `PATH` is reused by adding the missing command proxies to
-`CARGO_HOME/bin` without replacing a path that already exists. An archive that
-predates both files still installs, with a warning that it cannot set Rust up;
-an archive carrying only one of them is refused. A compiler is not enough on its
-own: Cargo links through the system C toolchain, so when no `cc` is on `PATH` the
-installer names the command that installs one before the user reaches a node
-build, on either archive shape.
+`tools/scripts/install_rust.sh` helper beside the binaries, and the archive
+checksum covers it. Before activating any binary, `install.sh` runs that helper
+while it holds the install lock, so a failed setup leaves the previously
+installed binaries in place, though a partly installed Rust toolchain can remain
+under rustup's own management. The helper leaves a Rust 1.95 or newer on `PATH`
+or in `CARGO_HOME/bin` as it is; otherwise it adds current stable through
+rustup, or installs rustup with stable where there is no Rust. Its floor is
+the workspace `rust-version`, and `test_install_rust.sh` fails when the two
+differ. An existing rustup default is kept (stable becomes the default only
+where there is none), profiles and shell startup files are preserved, and a
+rustup found only on `PATH` is reused by adding the missing command proxies to
+`CARGO_HOME/bin` without replacing a path that already exists. A 1.x archive
+pairs its helper with `rustc-version.txt`, the argument that helper takes, and
+`install.sh` still passes it; an archive with that file and no helper is
+refused, and an archive with neither still installs, with a warning that it
+cannot set Rust up. A compiler is not enough on its own: Cargo links through the
+system C toolchain, so when no `cc` is on `PATH` the installer names the command
+that installs one before the user reaches a node build, on every archive shape.
 `tools/scripts/test_install_rust.sh` drives the helper and the installer
 transaction against a hand-written rustup fixture, and CI runs it beside the
 installer self-test.
@@ -397,8 +398,8 @@ the branch push and the pull request are the token's two jobs, and the tap's
 
 The rendered formula installs the four binaries, plus the ROS 2 Jazzy rmw and
 the heap hook on Linux, generates shell completions, and carries the release's
-own `install_rust.sh` and `rustc-version.txt` in `libexec` behind a
-`cerulion-install-rust` command. Homebrew runs installs with `HOME` pointing at
+own `install_rust.sh` in `libexec` behind a `cerulion-install-rust` command,
+which installs current stable Rust (1.95 or newer). Homebrew runs installs with `HOME` pointing at
 a directory it deletes, so a formula cannot provision a Rust toolchain itself;
 the caveat names that one command and the `PATH` line that follows it, and it
 prints unconditionally, so `brew info cerulion` carries both before anyone
