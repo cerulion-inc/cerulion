@@ -23447,6 +23447,44 @@ mod tests {
     }
 
     #[test]
+    fn getting_started_step_five_output_matches_the_quiet_paired_default() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/tutorials/01-getting-started.md");
+        let tutorial = std::fs::read_to_string(path).expect("getting-started tutorial must exist");
+        let step = tutorial
+            .split_once("## Step 5: Build and Run")
+            .expect("tutorial must contain Step 5")
+            .1
+            .split_once("## Step 6: Inspect Topics")
+            .expect("Step 5 must end at Step 6")
+            .0;
+        let output = step
+            .split_once("**Expected output:**")
+            .expect("Step 5 must show its output")
+            .1
+            .split_once("```\n")
+            .expect("expected output must be fenced")
+            .1
+            .split_once("\n```")
+            .expect("expected output fence must close")
+            .0;
+        assert_eq!(
+            cerulion_core::LanAccess::platform_default(),
+            cerulion_core::LanAccess::Paired
+        );
+        assert!(output.contains("graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es)"));
+        assert!(output.contains("INFO safety_controller: emergency stop"));
+        assert!(
+            !tutorial.contains("OPEN BY DEFAULT"),
+            "the tutorial must not claim unauthenticated LAN access is the default"
+        );
+        assert!(
+            !output.lines().any(|line| line.starts_with("WARN ")),
+            "the paired first run must not show an open-access warning"
+        );
+    }
+
+    #[test]
     #[tracing_test::traced_test]
     fn explicit_open_lan_start_names_unpaired_access_and_the_default_remedy() {
         lan_access_breadcrumb("open_graph", Some(cerulion_core::LanAccess::Open));

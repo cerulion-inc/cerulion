@@ -195,7 +195,7 @@ A silent `/go2/camera/h264` is the bridge, not the camera: check
 ### 3. Watch from your desk
 
 ```bash
-# On your signed-in or explicitly paired desk (discovery is automatic):
+# On your signed-in desk (or one with an existing saved pairing):
 cerulion topic list
 cerulion viz --robot go2 /go2/utlidar/cloud /go2/camera/jpeg /tf /tf_static
 ```

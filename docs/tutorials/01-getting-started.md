@@ -830,7 +830,6 @@ per group, waits for each worker's READY, starts the recorder, then releases the
 together, and says so in one line. Representative lines (the ranges vary):
 
 ```
-WARN network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only. graph=obstacle_avoidance
 graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es); press Ctrl+C to stop
 INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2

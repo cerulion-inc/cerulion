@@ -28,7 +28,7 @@ compatibility and pairing.
   discovers same-account and explicitly paired robots. `topic echo`, `hz` and
   `info` read their topics through the same authenticated route. Cached identities
   and validated direct addresses support established pairings offline; new
-  enrollment retains its existing sign-in or pairing requirements.
+  machines enroll by signing in with `cerulion login`.
 - **The `network:` block restricts scope.** An enabled block exports exactly its
   `egress:` list and imports exactly its `ingress:` list. Under paired access,
   each import selects a unique authenticated producer and checks schema, QoS
