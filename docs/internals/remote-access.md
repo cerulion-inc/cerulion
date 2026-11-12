@@ -836,11 +836,20 @@ every slot is taken.
   soon, so admitted tries are at least the interval apart however the starts
   of several desks race. Each admitted try gets a fresh CPace responder
   created at the arm time with the policy's tries, so its own liveness check enforces the same
-  window and its own attempt bound never fires first. The CPace step runs
-  under the store's state lock. A wrong tag at
+  window and its own attempt bound never fires first. The responder's CPace
+  step runs with the state lock released: a start takes its try under the
+  lock, runs the step, then stores the responder under the lock again, and a
+  separate lock makes starts, arms and disarms take turns, so an ops
+  session's open and close (an `engage-estop` session's too) never wait for a
+  CPace computation (`estop_starvation_test.rs`). A code that ended while the
+  step ran refuses the try: expired counts it failed, paired drops it
+  uncounted. A wrong tag at
   `code-pair-finish` or a failed `respond` fails the try at once. A desk that
   sees a wrong code itself never calls `code-pair-finish`, so its try stays
-  pending until its desk key starts a new try or the window passes. A desk key's
+  pending until every ops session of its key has ended: `OpsServing` opens
+  each session on the store inside the session's blocking run and closes it
+  after `serve_connection` returns, so the try is counted failed only once no
+  finish for it can arrive, and its responder is dropped then. A desk key's
   new try counts its pending one failed; when the window passes, every pending
   try is counted failed. A right code's row is saved with the store's state
   lock released (a separate lock serializes saves, and arms and disarms wait
@@ -1192,10 +1201,10 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_link/tests/uni_and_ops_stream_test.rs` | Uni-stream helpers + the synchronous `QuicOpsStream` adapter, literal byte oracles |
 | `crates/cerulion_remoted/tests/authorizer_matrix_test.rs` | Every cell of the sacred verb table, real-crypto access rows |
 | `crates/cerulion_remoted/tests/loopback_test.rs` | Accept-gate routing over real endpoints (wire refuses unpaired; ops bootstraps) |
-| `crates/cerulion_remoted/tests/ops_loopback_test.rs` | The real ops plane over iroh: verbs, receipts, pair-then-allowed |
+| `crates/cerulion_remoted/tests/ops_loopback_test.rs` | The real ops plane over iroh: verbs, receipts, pair-then-allowed; a code-pairing try a desk leaves pending is counted failed once its connection is gone |
 | `crates/cerulion_remoted/tests/serving_fence_admission_test.rs` | Through `serve_endpoint`: a bootstrap-only ops session and a refused rcp connection leave `serving.hold` free, a paired ops session holds it until it closes and so does a paired rcp connection with no stream open; while the idle stop is committed a paired session is closed at admission, a bootstrap-only one is still served, and a key claimed on a bootstrap session has its next call refused, then served once the stop is withdrawn |
 | `crates/cerulion_remoted/tests/wire_plane_test.rs` | Wire plane e2e: catalog/demand/schema/status, byte-exact frames, demand gate |
-| `crates/cerulion_remoted/tests/estop_starvation_test.rs` | E-stop bounded latency under hostile concurrent sessions; the 120 s doc pin |
+| `crates/cerulion_remoted/tests/estop_starvation_test.rs` | E-stop bounded latency under hostile concurrent sessions, and on a fresh session while a `code-pair-start` is paused in its CPace step; the 120 s doc pin |
 | `crates/cerulion_remoted/tests/offline_connect_test.rs` | Established pairing connects with issuer down + relay unreachable |
 | `crates/cerulion_remoted/tests/epoch_push_e2e_test.rs` | Desk-push epoch through production plane/sink/gate/sweep |
 | `crates/cerulion_remoted/tests/daemon_epoch_sink_test.rs` / `daemon_demand_gate_test.rs` | Inert-wiring pins: the sink/authorizer wired by `serve_endpoint` itself |
@@ -1219,7 +1228,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
 | `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused; a wall-clock step neither stretches nor cuts the code window |
-| `cerulion_pairing::pair_code`, `cerulion_remoted::{owner_only, pairing_verbs}` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict |
+| `cerulion_pairing::pair_code`, `cerulion_remoted::{owner_only, pairing_verbs}` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, pending tries held until their sessions end and answered as in progress, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, a start's CPace step run with the state lock released (a session opens and closes meanwhile), a code that ends during the step refusing the try (expired counted, paired uncounted), arms and disarms waiting for a start in progress and a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,

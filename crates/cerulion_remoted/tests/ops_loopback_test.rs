@@ -15,7 +15,8 @@
 //! - an UNCLAIMED robot admits ONLY `claim`; after `claim`, normal verbs work for
 //!   the owner (the LIVE-shared-state pin — no restart);
 //! - CPace `code-pair` start→finish establishes a row via `CpaceConfirmed`; a wrong
-//!   code burns bounded attempts + denies; an expired TTL denies;
+//!   code burns bounded attempts + denies; an expired TTL denies; a desk that
+//!   drops its connection after a start leaves a try the robot counts failed;
 //! - `engage-estop` from a VIEWER-scoped session engages the safety floor;
 //! - a DOUBLE-FRAMING pin: the ops bytes on the wire are cerud's BE-u32 frames, NOT
 //!   `cerulion_link`'s LE frames (a raw stream read of the first frame's prefix).
@@ -714,6 +715,57 @@ async fn code_pair_expired_ttl_denies() {
         store.account_access(&guest, T_NOW).is_none(),
         "no row after an expired TTL"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_desk_that_drops_its_connection_after_a_start_leaves_a_failed_try() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([208; 32]).await;
+    let client = disabled_endpoint([34; 32]).await;
+    let client_key = *client.id().as_bytes();
+    let robot_key = *robot.id().as_bytes();
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+    let r = build_robot(dir.path(), robot_key, /*claim_owner=*/ true, &[]);
+    r.sessions
+        .arm("48213907", cerulion_pairing::pair_code::PAIR_CODE_POLICY);
+
+    let failed_while_open = with_serving(&r, &robot, async {
+        let sessions = r.sessions.clone();
+        run_client(&client, robot_addr, move |c| {
+            // A desk with the wrong code sees the mismatch itself and sends no
+            // finish: its try is pending while its connection is open.
+            let initiator = CpaceInitiator::new(
+                "11111111",
+                PakeIdentities::new(PublicKey(client_key), PublicKey(robot_key), Vec::new()),
+            );
+            let (_attempt, msg1) = initiator.begin().expect("cpace begin");
+            c.call(
+                "code-pair-start",
+                serde_json::json!({ "msg1": hex::encode(msg1) }),
+            )
+            .expect("an admitted try");
+            sessions.snapshot().unwrap().failed
+        })
+        .await
+    })
+    .await;
+    assert_eq!(failed_while_open, 0, "pending while the session is open");
+
+    // The connection closed: once the robot's session has ended, the try is
+    // counted failed and the code stays armed.
+    let deadline = std::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let snapshot = r.sessions.snapshot().unwrap();
+        if snapshot.failed == 1 {
+            assert_eq!(snapshot.report().status.as_str(), "armed");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the try was not counted failed: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Run ONE full CPace ceremony over the ops connection with `code`, returning the
