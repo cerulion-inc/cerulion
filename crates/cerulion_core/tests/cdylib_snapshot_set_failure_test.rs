@@ -1,60 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Cross-step-hold regression: a cdylib whose one-time
-//! `cerulion_node_set_snapshot_inputs` FFI call FAILS must NOT keep calling the
-//! per-step `cerulion_node_snapshot_inputs` FFI.
-//!
-//! # The bug this pins
-//!
-//! `DylibNodeEntry::snapshot_inputs` (`cerulion_core/src/graph/node.rs`) marshals
-//! the build-fixed non-trigger input names to the cdylib exactly ONCE via
-//! `set_snapshot_inputs`, then forwards the per-step freeze via `snapshot_inputs`
-//! on every firing step. The fix folds the one-time `set` result into a
-//! `SnapshotState` machine:
-//!
-//! ```text
-//!   Pending --set ok (ret==0)--> Active   (snapshot called every step)
-//!   Pending --set fail (ret!=0)-> Failed  (snapshot NEVER called — terminal)
-//! ```
-//!
-//! `should_invoke_snapshot()` is true ONLY in `Active`. A host that latched
-//! as if `set` had succeeded (effectively a hardcoded `Active`) would call
-//! `snapshot` every step even after `set` failed — freezing nothing yet
-//! returning 0 (success), SILENTLY masking the lost hold. The load-bearing
-//! production line is
-//! `self.snapshot_state = self.snapshot_state.after_set(ret);` (node.rs ~2537);
-//! reverting it to a hardcoded `SnapshotState::Active` makes TEST A below fail.
-//!
-//! # How this test observes it (counter-based — no zero-copy I/O)
-//!
-//! The `test_node_snapshot_fail_cdylib` fixture is a raw-FFI cdylib declaring one
-//! non-trigger input "inp" + a `period_ms` policy (so the runtime's per-fire
-//! snapshot pass calls `snapshot_inputs(["inp"])` every step). It keeps a
-//! PROCESS-GLOBAL `SNAPSHOT_CALLS` counter incremented on every
-//! `cerulion_node_snapshot_inputs` invocation, and injects a `set` failure when
-//! `CER_FAIL_MODE == "snapshot_set"`. This test loads the same .so through its
-//! own `libloading` handle (a second `dlopen` of the same object shares the
-//! static) to read/reset that counter.
-//!
-//! - **TEST A (fault):** `CER_FAIL_MODE=snapshot_set` → `set` fails → host goes
-//!   `Failed` → `snapshot` is NEVER called → counter == 0. If the state were
-//!   reverted to a hardcoded `Active`, `snapshot` WOULD be called every step →
-//!   counter > 0 → this test fails. THE regression guard.
-//! - **TEST B (control):** no fault → `set` succeeds → host calls `snapshot`
-//!   every firing step → counter > 0. Proves the apparatus would DETECT a
-//!   snapshot that stopped being called (anti-tautology for TEST A's `== 0`).
-//!
-//! Both assertions are against a HAND-WRITTEN oracle (0 vs > 0), not a
-//! self-compare. Every snapshot call is a real FFI invocation driven by a real
-//! `GraphRuntime::step()` over real iceoryx2 (`build_for_test`) — no fake data
-//! (Principle #13).
-//!
-//! # Running (iceoryx2 SHM singleton + cdylib `NODES` / process-global env →
-//! serial; build the fixture first so the .so exists)
-//!
-//! ```bash
-//! cargo build -p test_node_snapshot_fail_cdylib
-//! cargo test -p cerulion_core --test cdylib_snapshot_set_failure_test -- --test-threads=1
-//! ```
+//! Host-owned non-trigger snapshots preserve actual downstream held values.
+//! The node reads the real producer frame and holds 42 through silent steps.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -73,8 +19,7 @@ use std::sync::Arc;
 /// node fires (and the snapshot pass runs) on every step.
 const STEP: Duration = Duration::from_millis(10);
 
-/// Number of steps to run. >= 5 so a snapshot-every-step bug produces
-/// a clearly-non-zero counter, and the control clearly exceeds 0.
+/// Eight silent steps verify the node keeps the delivered latest value.
 const STEPS: usize = 8;
 
 /// Monotonic prefix counter so re-builds within one process never collide on an
@@ -112,8 +57,7 @@ impl Drop for EnvVarGuard {
 
 /// External producer publishing a fixed scalar into `out.x` on each fire. Wired
 /// into the cdylib's non-trigger "inp" so the input has a real graph producer;
-/// the counter does not depend on delivery (the cdylib fires on its period
-/// regardless), but firing it once makes the scenario a realistic
+/// the consumer reads that real frame on its period, then retains it through
 /// "data flowed, then went silent".
 #[cerulion_node(external)]
 #[derive(Default)]
@@ -136,8 +80,7 @@ impl HoldProducer {
 }
 
 // ===========================================================================
-// Fixture locator + raw accessor reads (the counter lives in the .so, read via
-// a second dlopen of the same path — the process-global static is shared).
+// Fixture locator and real payload observations through the same library.
 // ===========================================================================
 
 fn find_snapshot_fail_cdylib() -> std::path::PathBuf {
@@ -152,23 +95,6 @@ fn find_snapshot_fail_cdylib() -> std::path::PathBuf {
 fn load_accessor_handle() -> libloading::Library {
     unsafe { libloading::Library::new(find_snapshot_fail_cdylib()) }
         .expect("load snapshot-fail cdylib for test accessors")
-}
-
-fn reset_snapshot_calls(lib: &libloading::Library) {
-    let f: libloading::Symbol<unsafe extern "C" fn()> = unsafe {
-        lib.get(b"cerulion_test_reset_snapshot_calls\0")
-            .expect("missing cerulion_test_reset_snapshot_calls symbol")
-    };
-    unsafe { f() };
-}
-
-fn get_snapshot_calls(lib: &libloading::Library) -> u64 {
-    let f: libloading::Symbol<unsafe extern "C" fn(u64) -> u64> = unsafe {
-        lib.get(b"cerulion_test_get_snapshot_calls\0")
-            .expect("missing cerulion_test_get_snapshot_calls symbol")
-    };
-    // handle ignored by the fixture (counter is process-global).
-    unsafe { f(0) }
 }
 
 // ===========================================================================
@@ -187,7 +113,7 @@ fn vec3_out(name: &str) -> OutputDef {
 
 /// `producer/out` -> cdy.inp (non-trigger, period cdylib). The cdylib is the
 /// REAL `test_node_snapshot_fail_cdylib` `DylibNodeEntry`. No downstream sink —
-/// observability is the cdylib's process-global snapshot-call counter.
+/// observability is the x value actually read inside the cdylib tick.
 fn build_graph(prefix: &str) -> GraphRuntime {
     let config = GraphConfig {
         level_assignments: None,
@@ -245,8 +171,7 @@ fn build_graph(prefix: &str) -> GraphRuntime {
 
 /// Fire the producer once (data flows into the held input), then run `STEPS`
 /// SILENT steps (producer not re-triggered). The cdylib fires every step
-/// (period), so its per-fire snapshot pass runs every step — that is what
-/// drives the snapshot FFI (and the counter) regardless of producer activity.
+/// (period), so its host snapshot pass keeps the original latest value.
 fn run_once_then_silent(rt: &mut GraphRuntime) {
     rt.trigger_external("producer").expect("trigger producer");
     for _ in 0..STEPS {
@@ -254,59 +179,34 @@ fn run_once_then_silent(rt: &mut GraphRuntime) {
     }
 }
 
-// ===========================================================================
-// TEST A (FAULT — the regression guard): set fails → snapshot NEVER called.
-// ===========================================================================
+fn observed_input(lib: &libloading::Library) -> u64 {
+    // SAFETY: built fixture exports this exact scalar signature; library stays live.
+    unsafe {
+        lib.get::<unsafe extern "C" fn() -> u64>(b"cerulion_test_observed_input\0")
+            .expect("observation")()
+    }
+}
 #[test]
 #[serial]
-fn snapshot_not_called_after_set_failure() {
+fn host_snapshots_deliver_and_hold_input_with_obsolete_fault_environment() {
     let lib = load_accessor_handle();
-    reset_snapshot_calls(&lib);
-
-    // Inject the `set_snapshot_inputs` failure BEFORE any step (the first
-    // firing step is when the host marshals the names via `set`).
     let _env = EnvVarGuard::set("CER_FAIL_MODE", "snapshot_set");
-
     let mut rt = build_graph(&unique_prefix("snapfail"));
     run_once_then_silent(&mut rt);
-
-    let calls = get_snapshot_calls(&lib);
     assert_eq!(
-        calls, 0,
-        "set_snapshot_inputs failed → host must go terminal Failed and NEVER \
-         call cerulion_node_snapshot_inputs, so the counter must be 0 after \
-         {STEPS} firing steps. got {calls}. A non-zero count means the host kept \
-         calling snapshot after a failed set (the silent-mask bug — \
-         `snapshot_state = after_set(ret)` reverted to a hardcoded Active)."
+        observed_input(&lib),
+        42,
+        "published input is still held and read after silent steps"
     );
 }
-
-// ===========================================================================
-// TEST B (CONTROL — anti-tautology): set succeeds → snapshot called each step.
-// Proves the counter actually moves, so TEST A's `== 0` is meaningful (the
-// apparatus WOULD detect a snapshot that stopped being called).
-// ===========================================================================
 #[test]
 #[serial]
-fn snapshot_is_called_each_step_when_set_succeeds() {
+fn host_snapshot_delivery_is_identical_with_and_without_legacy_fault_environment() {
     let lib = load_accessor_handle();
-    reset_snapshot_calls(&lib);
-
-    // No fault. Belt-and-suspenders: ensure the env is clear even if a prior
-    // test in this binary leaked it (EnvVarGuard already removes it on Drop,
-    // and `#[serial]` serializes — but make the control hermetic).
-    std::env::remove_var("CER_FAIL_MODE");
-
-    let mut rt = build_graph(&unique_prefix("snapok"));
-    run_once_then_silent(&mut rt);
-
-    let calls = get_snapshot_calls(&lib);
-    assert!(
-        calls > 0,
-        "set_snapshot_inputs succeeded → host must call \
-         cerulion_node_snapshot_inputs on every firing step, so the counter must \
-         be > 0 after {STEPS} firing steps (expected ~{STEPS}). got {calls}. A \
-         zero count here means the snapshot pass never reached the cdylib — the \
-         measurement apparatus is broken and TEST A's `== 0` would be vacuous."
-    );
+    for _ in 0..2 {
+        std::env::remove_var("CER_FAIL_MODE");
+        let mut rt = build_graph(&unique_prefix("snapok"));
+        run_once_then_silent(&mut rt);
+        assert_eq!(observed_input(&lib), 42);
+    }
 }

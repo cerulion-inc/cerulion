@@ -26,13 +26,10 @@
 //! regime; repeats are demoted to `debug!`) and skips the publish. Drop must
 //! not panic. Every discard is counted, whatever the log level:
 //! `CerulionPublisher::output_discard_count()` on the port, and
-//! `NodeHandle::output_discard_count(output)` from outside the node. When this runs inside
-//! a macro-generated cdylib node (`#[cerulion_node]`), that `error!` lands on
-//! stderr via the cdylib-local subscriber the generated `cerulion_node_init`
-//! installs
-//! ([`install_cdylib_stderr_tracing`](crate::graph::node::install_cdylib_stderr_tracing)) —
-//! it is not a silent black hole. A hand-written raw-FFI cdylib gets that
-//! subscriber only if it calls the installer itself.
+//! `NodeHandle::output_discard_count(output)` from outside the node. For stable
+//! plugins the host owns the proxy and emits discard and recovery diagnostics
+//! through its own subscriber on stderr. Macro nodes and the raw-FFI template
+//! separately install a cdylib-local subscriber for the author's events.
 //!
 
 use std::marker::PhantomData;
@@ -43,6 +40,80 @@ use crate::wire::WireHeader;
 use super::events::PubSubEvent;
 use super::output_discard_latch::DiscardLogLevel;
 use super::shm_sample::{ProxyPublisher, SampleHandle};
+
+// Native and stable completions share these events and the publisher discard latch.
+pub(crate) fn log_tick_failed(topic: &str, schema_hash: u64) {
+    tracing::debug!(
+        topic = topic,
+        schema_hash = schema_hash,
+        "OutputProxy: tick did not complete — output discarded, loan released without publish" // dash-ok: native OutputProxy log text kept byte-identical
+    );
+}
+
+pub(crate) fn log_nested_failure(
+    topic: &str,
+    schema_hash: u64,
+    error: Option<&dyn std::fmt::Display>,
+    level: DiscardLogLevel,
+) {
+    match level {
+        DiscardLogLevel::Error => {
+            tracing::error!(
+                topic = topic,
+                schema_hash = schema_hash,
+                error = error.map(tracing::field::display),
+                "OutputProxy: staged nested-field flush failed; skipping publish"
+            );
+        }
+        DiscardLogLevel::Debug { suppressed } => {
+            tracing::debug!(
+                topic = topic,
+                schema_hash = schema_hash,
+                error = error.map(tracing::field::display),
+                suppressed_count = suppressed,
+                "OutputProxy discard suppressed: staged nested-field flush recurred as a failure; skipping publish — first occurrence logged loudly at error" // dash-ok: native OutputProxy log text kept byte-identical
+            );
+        }
+    }
+}
+
+pub(crate) fn log_missing_variable(topic: &str, schema_hash: u64, level: DiscardLogLevel) {
+    match level {
+        DiscardLogLevel::Error => {
+            tracing::error!(
+                topic = topic,
+                schema_hash = schema_hash,
+                "OutputProxy dropped without writing all declared variable fields; skipping publish"
+            );
+        }
+        DiscardLogLevel::Debug { suppressed } => {
+            tracing::debug!(
+                topic = topic,
+                schema_hash = schema_hash,
+                suppressed_count = suppressed,
+                "OutputProxy discard suppressed: incomplete output (missing declared variable field) recurred; skipping publish — first occurrence logged loudly at error" // dash-ok: native OutputProxy log text kept byte-identical
+            );
+        }
+    }
+}
+
+pub(crate) fn log_spill_output_recovered(topic: &str, schema_hash: u64, suppressed: u64) {
+    tracing::info!(
+        topic = %topic,
+        schema_hash = schema_hash,
+        suppressed_count = suppressed,
+        "OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again)" // dash-ok: native OutputProxy log text kept byte-identical
+    );
+}
+
+pub(crate) fn log_output_recovered(topic: &str, schema_hash: u64, suppressed: u64) {
+    tracing::info!(
+        topic = topic,
+        schema_hash = schema_hash,
+        suppressed_count = suppressed,
+        "OutputProxy: output recovered — complete publish after a discard regime (further discards on this port will log loudly again)" // dash-ok: native OutputProxy log text kept byte-identical
+    );
+}
 
 /// Zero-copy SHM-backed publish handle.
 ///
@@ -255,11 +326,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
             // record (the discard bit). Burns no sequence (returns above
             // `commit_sequence`), so replay can byte-exactly reproduce it.
             self.publisher.bump_discard_signal();
-            tracing::debug!(
-                topic = self.publisher.topic(),
-                schema_hash = T::SCHEMA_HASH,
-                "OutputProxy: tick did not complete — output discarded, loan released without publish"
-            );
+            log_tick_failed(self.publisher.topic(), T::SCHEMA_HASH);
             return;
         }
 
@@ -279,26 +346,8 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
             // failures downgrade to `debug!` with a running suppressed count so a
             // persistently broken node does not emit ~875 errors/s. Recovery
             // (a subsequent complete publish) re-arms the loud path.
-            match self.publisher.record_output_discard() {
-                DiscardLogLevel::Error => {
-                    tracing::error!(
-                        topic = self.publisher.topic(),
-                        schema_hash = T::SCHEMA_HASH,
-                        error = %e,
-                        "OutputProxy: staged nested-field flush failed; skipping publish"
-                    );
-                }
-                DiscardLogLevel::Debug { suppressed } => {
-                    tracing::debug!(
-                        topic = self.publisher.topic(),
-                        schema_hash = T::SCHEMA_HASH,
-                        error = %e,
-                        suppressed_count = suppressed,
-                        "OutputProxy discard suppressed: staged nested-field flush recurred as \
-                         a failure; skipping publish — first occurrence logged loudly at error"
-                    );
-                }
-            }
+            let level = self.publisher.record_output_discard();
+            log_nested_failure(self.publisher.topic(), T::SCHEMA_HASH, Some(&e), level);
             return;
         }
 
@@ -314,25 +363,8 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
             // sustained discards downgrade to `debug!` with a running suppressed
             // count; a subsequent complete publish reports recovery once (at the
             // send-success site below) and re-arms the loud path.
-            match self.publisher.record_output_discard() {
-                DiscardLogLevel::Error => {
-                    tracing::error!(
-                        topic = self.publisher.topic(),
-                        schema_hash = T::SCHEMA_HASH,
-                        "OutputProxy dropped without writing all declared variable fields; skipping publish"
-                    );
-                }
-                DiscardLogLevel::Debug { suppressed } => {
-                    tracing::debug!(
-                        topic = self.publisher.topic(),
-                        schema_hash = T::SCHEMA_HASH,
-                        suppressed_count = suppressed,
-                        "OutputProxy discard suppressed: incomplete output (missing declared \
-                         variable field) recurred; skipping publish — first occurrence logged \
-                         loudly at error"
-                    );
-                }
-            }
+            let level = self.publisher.record_output_discard();
+            log_missing_variable(self.publisher.topic(), T::SCHEMA_HASH, level);
             // Drop the sample without sending. The held SampleHandle / Vec
             // is released when `self` is dropped after this function returns.
             return;
@@ -476,14 +508,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                         // clear the discard flood-latch (no-op unless a discard
                         // regime was open on this port).
                         if let Some(suppressed) = pubr.record_output_complete() {
-                            tracing::info!(
-                                topic = %pubr.topic(),
-                                schema_hash = T::SCHEMA_HASH,
-                                suppressed_count = suppressed,
-                                "OutputProxy: output recovered — complete publish after a \
-                                 discard regime (further discards on this port will log \
-                                 loudly again)"
-                            );
+                            log_spill_output_recovered(pubr.topic(), T::SCHEMA_HASH, suppressed);
                         }
                     }
                 }
@@ -620,13 +645,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                 // regime), where one `info!` reports the total suppressed count
                 // and the port re-arms so a fresh breakage is loud again.
                 if let Some(suppressed) = pubr.record_output_complete() {
-                    tracing::info!(
-                        topic = pubr.topic(),
-                        schema_hash = T::SCHEMA_HASH,
-                        suppressed_count = suppressed,
-                        "OutputProxy: output recovered — complete publish after a discard \
-                         regime (further discards on this port will log loudly again)"
-                    );
+                    log_output_recovered(pubr.topic(), T::SCHEMA_HASH, suppressed);
                 }
                 // The frame went out — reset this output's
                 // `promise_within_ms` watchdog window (no-op unless wired).

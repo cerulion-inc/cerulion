@@ -35381,7 +35381,7 @@ struct CameraNode {
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(
             src_dir.join("lib.rs"),
-            // The port is named `inp` to match `test_node_snapshot_fail_cdylib`,
+            // The port is named `inp` to match `test_node_unknown_schema_cdylib`,
             // which one of these tests stages as this node's real cdylib. With
             // matching names the ingress gate fails for the RIGHT reason (the
             // consumer's schema hash is the 0 sentinel) rather than incidentally,
@@ -35459,13 +35459,13 @@ network:
     /// a REAL loaded cdylib whose consumer declares no schema is REFUSED at
     /// preflight.
     ///
-    /// This is the failure shape the gate exists for. `test_node_snapshot_fail_cdylib` is
+    /// This is the failure shape the gate exists for. `test_node_unknown_schema_cdylib` is
     /// a raw-FFI fixture whose legacy `{"inputs":["inp"]}` info JSON carries no
     /// per-input hash, so it parses to the `0` sentinel — the same value every
     /// cdylib consumer built from that legacy info shape carries.
     /// Without this gate the report is clean and `graph run` dies seconds later.
     ///
-    /// Needs the fixture built (`cargo build -p test_node_snapshot_fail_cdylib`);
+    /// Needs the fixture built (`cargo build -p test_node_unknown_schema_cdylib`);
     /// `cargo build --workspace` covers it.
     #[test]
     fn graph_validate_refuses_an_ingress_consumer_without_a_declared_schema() {
@@ -35477,7 +35477,8 @@ network:
         // a hand-built `NodeInfo`. That distinction is the entire bug: the macro's
         // in-process `info()` always carried a hash, and only the cdylib parse
         // path lost it.
-        let fixture = cerulion_core::testing::find_fixture_cdylib("test_node_snapshot_fail_cdylib");
+        let fixture =
+            cerulion_core::testing::find_fixture_cdylib("test_node_unknown_schema_cdylib");
         let placed = touch_cdylib(&ws_root, "camera", "debug");
         std::fs::copy(&fixture, &placed).expect("stage the raw-FFI fixture as the camera cdylib");
 
@@ -35526,7 +35527,7 @@ network:
     /// The ingress topic is built from `default_prefix` rather than hardcoded,
     /// because that value is derived from the host's name at runtime.
     ///
-    /// Needs the fixture built (`cargo build -p test_node_snapshot_fail_cdylib`).
+    /// Needs the fixture built (`cargo build -p test_node_unknown_schema_cdylib`).
     #[test]
     fn graph_validate_resolves_the_default_prefix_before_running_the_ingress_gate() {
         let _env = unset_target_dir_for_test();
@@ -35571,7 +35572,8 @@ network:
         )
         .unwrap();
 
-        let fixture = cerulion_core::testing::find_fixture_cdylib("test_node_snapshot_fail_cdylib");
+        let fixture =
+            cerulion_core::testing::find_fixture_cdylib("test_node_unknown_schema_cdylib");
         let placed = touch_cdylib(&ws_root, "camera", "debug");
         std::fs::copy(&fixture, &placed).expect("stage the raw-FFI fixture as the camera cdylib");
 

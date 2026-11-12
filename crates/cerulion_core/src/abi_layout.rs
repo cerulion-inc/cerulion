@@ -169,17 +169,11 @@
 //! unchanged tree — which is a *correct* signal to re-snapshot, not a false
 //! alarm.
 //!
-//! The assumption this table used to rest on, "the same rustc compiles both
-//! host and cdylib", is no longer merely assumed: [`crate::RUSTC_FINGERPRINT`]
-//! (ABI v22) is compared across the cdylib FFI boundary at LOAD time
-//! (`DylibNodeEntry::load`) and a host/cdylib pair built by different rustc
-//! releases is refused before either side runs. That guard exists precisely
-//! because this table's size and offset pin CANNOT see every divergence: two
-//! rustc releases can agree on every struct size and offset here and still
-//! encode a niche-holding `Option::None` with a different bit pattern (rustc
-//! 1.97.0 changed it), a class of ABI break this static table is structurally
-//! blind to, since it only measures size, align and offset, never bit
-//! patterns.
+//! The stable node boundary passes fixed C descriptors and host-owned scalar
+//! leases. These Rust layouts remain internal implementation regression pins;
+//! they no longer describe values shared between the host and a plugin.
+//! `cerulion_node_abi/tests/frozen_layout.rs` pins the compiler-independent
+//! records, including their literal IDs, sizes, alignment and field offsets.
 
 use crate::CERULION_ABI_VERSION;
 
@@ -328,7 +322,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 32;
+const EXPECTED_ABI: u32 = 33;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \

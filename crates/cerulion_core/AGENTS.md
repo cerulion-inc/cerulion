@@ -1,7 +1,6 @@
 # cerulion_core - agent notes
 
-Core runtime: wire format, codegen, iceoryx2 transport, scheduler/level executor, graph
-runtime, gateway plane; 260+ test binaries with per-binary serial rules.
+Core runtime; test maps and transport ownership: core-testing.md/core-transport.md.
 
 ## Invariants
 
@@ -9,7 +8,7 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   a fused chain may serve a frame it just committed, in-process.
 - Any change to a generated-cdylib FFI signature or error-code meaning bumps
   `CERULION_ABI_VERSION`; a missed bump misloads every cdylib.
-- The loader ALSO refuses a cdylib whose `RUSTC_FINGERPRINT` differs from the host's.
+- Native plugins: check boundary major and complete stable layout; ignore compiler provenance.
 - Never `#[cfg(feature)]`-gate a struct FIELD on a type crossing the cdylib boundary (the two
   sides see different layouts); fields stay, only setters gated.
 - Forbidden as raw SHM payload: types with internal pointers (`String`, `Vec`, `HashMap`);
@@ -32,9 +31,8 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
   order (`RestWalk::InsertionOrder`), never under rayon (replay-unstable, trace-blind).
 - iceoryx2 deps: ONE exact-pinned version workspace-wide; a skew silently kills the data plane.
 - Hot-path alloc lint sweeps `src/{transport,graph,scheduler}/`; column-0 `#[cfg(test)]` is SKIPPED, so a `mod tests` alloc is invisible.
-- Shipped surface (`check_public_surface.sh`): `examples/` here is no user example (in-code
-  graphs: tests only); no tracker ids or typographic dashes shipped; never bulk-rewrite inside
-  a string literal (a removed dash lowers the file's ledger line).
+
+- Shipped surface: in-code graphs are tests only; apply root public-text gates.
 
 ## Testing
 
@@ -52,9 +50,11 @@ runtime, gateway plane; 260+ test binaries with per-binary serial rules.
 ## Gotchas
 
 - `#[traced_test]` needs tracing-test's `no-env-filter` feature (on the dev-dep) or
-  production events silently vanish. `GraphRuntime` is `!Debug` - use `match`.
+  events vanish. `GraphRuntime` is `!Debug`: use `match`.
 - macOS iceoryx2 select() aborts when any fd NUMBER >= 1024 enters a WaitSet.
 - Per-frame byte-identity: publish in lockstep + `try_receive_one` (drain-all keeps newest).
 
 Read first (`docs/internals/`): `core-transport.md` (transport/latch/gateway), `core-scheduler-graph.md`
 (scheduler/graph/determinism), `core-testing.md`, `core-dynamic.md`.
+
+Stable diagnostics retain exact text/phase labels (core-dynamic.md); deferred terminal releases flush before user code (`node_plugin_raw_test`, serial).

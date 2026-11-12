@@ -156,7 +156,7 @@ class Cerulion < Formula
   def caveats
     <<~TEXT
       Running Cerulion needs nothing further. Building your own nodes needs the
-      exact Rust compiler that built this release, which is one command, once:
+      Rust 1.95 or newer. Install the tested toolchain with:
 
         cerulion-install-rust
 

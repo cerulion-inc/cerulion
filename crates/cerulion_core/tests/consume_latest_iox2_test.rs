@@ -846,7 +846,7 @@ fn a_frame_landing_between_the_drains_is_read_once_and_fires_nothing_more() {
     let _guard = EnvVarGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
     let (observed, fired) = run_gap_closure("latgapsep", Consumer::latest(), false);
     assert!(!logs_contain(
-        "cannot tell whether its read will find a frame"
+        "consume = latest inputs on a hand-written NodeEntry lack the body probe"
     ));
     assert_eq!(observed, vec![2, 3]);
     assert_eq!(
@@ -991,7 +991,7 @@ fn an_in_process_macro_node_reads_a_gap_frame_once_on_the_separate_drain() {
     assert!(entry.probes_trigger_input(), "the macro declares the probe");
     let (forwarded, fired) = run_gap_forwarder("latgapmac", Box::new(entry));
     assert!(!logs_contain(
-        "cannot tell whether its read will find a frame"
+        "consume = latest inputs on a hand-written NodeEntry lack the body probe"
     ));
     assert_eq!(forwarded, vec![2, 3]);
     assert_eq!(
@@ -1242,13 +1242,12 @@ fn the_build_names_a_latest_input_whose_body_answers_no_probe() {
     .expect("build no-probe graph");
     assert!(logs_contain("sink.inp"), "the warn names node and input");
     assert!(logs_contain(
-        "cannot tell whether its read will find a frame"
+        "consume = latest inputs on a hand-written NodeEntry lack the body probe"
     ));
 }
 
 /// An entry that implements the per-set Sync head ops for its Sync inputs
-/// alone and answers `Nothing` for any other input, as a node library whose
-/// head-op export serves Sync inputs only may. It declares no body probe, and
+/// alone and answers `Nothing` for any other input. It declares no body probe, and
 /// declares no unified drain, so its input is read through two subscribers.
 struct SyncOnlyHeadOps(ClosureNodeEntry);
 
@@ -1292,7 +1291,7 @@ fn head_ops_for_sync_inputs_alone_leave_a_latest_input_unprobed_and_firing() {
     .expect("build sync-only head-op graph");
     assert!(logs_contain("sink.inp"), "the warn names node and input");
     assert!(logs_contain(
-        "cannot tell whether its read will find a frame"
+        "consume = latest inputs on a hand-written NodeEntry lack the body probe"
     ));
     let mgr = runtime.test_transport().expect("test transport parked");
     let mut ext = mgr
@@ -1306,30 +1305,51 @@ fn head_ops_for_sync_inputs_alone_leave_a_latest_input_unprobed_and_firing() {
     assert_eq!(fires(&runtime), 1, "one fire on the one arrival");
 }
 
-/// A cdylib declares the body probe through its own export, not through its
-/// head ops: the macro fixture exports `cerulion_node_probes_trigger_input`,
-/// and the raw-FFI fixture exports the head ops without it.
+/// The host body probe observes the actual subscriber, without a node export.
 #[test]
 #[serial]
-fn a_cdylib_declares_the_probe_apart_from_its_head_ops() {
-    use cerulion_core::graph::node::DylibNodeEntry;
-    use cerulion_core::testing::find_fixture_cdylib;
-
-    let latest = DylibNodeEntry::load(&find_fixture_cdylib(
-        "test_node_macro_consume_latest_cdylib",
-    ))
-    .expect("load consume-latest fixture cdylib");
-    assert!(latest.supports_sync_head_ops());
-    assert!(latest.probes_trigger_input());
-    let raw = DylibNodeEntry::load(&find_fixture_cdylib("test_node_sync_op_fail_cdylib"))
-        .expect("load raw head-op fixture cdylib");
-    assert!(raw.supports_sync_head_ops(), "it exports the head ops");
-    assert!(!raw.probes_trigger_input(), "and declares no body probe");
+fn every_cdylib_gets_the_host_body_probe_without_an_export() {
+    use cerulion_core::graph::node::{AnySubscriber, DylibNodeEntry};
+    use cerulion_core::graph::node_host_abi::with_context;
+    use cerulion_core::testing::TestTransport;
+    use cerulion_core::transport::plugin_lease::LeaseDirection;
+    for _ in 0..2 {
+        let tt = TestTransport::with_buffer_size(4);
+        let topic = "test/consume_latest/host_probe/b";
+        let mut publisher = tt.publisher(topic, MaxSliceLen::const_new(64), 0);
+        let mut subscribers = IndexMap::new();
+        subscribers.insert("b".into(), AnySubscriber::Ipc(tt.subscriber(topic)));
+        let mut entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
+            "test_node_sync_op_fail_cdylib",
+        ))
+        .expect("load stable head-operation fixture");
+        entry
+            .init(NodeContext::for_tests(IndexMap::new(), subscribers))
+            .unwrap();
+        let context = entry.__test_host_context_handle().unwrap();
+        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Empty);
+        publish_all(&mut publisher, [42]);
+        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unread);
+        with_context(context, |host| {
+            host.begin_node_call()?;
+            host.begin_fire()?;
+            let port = host.bind_port(context, 1, Vector3::SCHEMA_HASH, LeaseDirection::Read)?;
+            let frame = host
+                .receive_input(context, port)?
+                .expect("published frame is read");
+            assert_eq!(frame.size, 64);
+            host.release_input(context, port, frame.lease)?;
+            host.end_node_call()
+        })
+        .unwrap();
+        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Empty);
+        entry.shutdown().unwrap();
+    }
 }
 
 /// A failed body probe on a cdylib is reported in its own words, on its own
-/// latch. The raw-FFI fixture's armed fault fails every head op naming input
-/// `b`, the probe's op code 0 and the per-set Sync ops alike, without touching
+/// latch. Holding the real host context lock refuses both the body probe
+/// and the per-set Sync operations with INVALID_STATE, without touching
 /// the node. Three failed probes give one loud line naming the probe, and the
 /// Sync op failing after them still gets its own loud line.
 #[test]
@@ -1338,23 +1358,29 @@ fn a_cdylib_declares_the_probe_apart_from_its_head_ops() {
 fn a_failed_cdylib_body_probe_says_so_on_its_own_latch() {
     use cerulion_core::graph::node::DylibNodeEntry;
 
-    let _fault = EnvVarGuard::set("CER_FAIL_MODE", "sync_op_fail");
     let mut entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
         "test_node_sync_op_fail_cdylib",
     ))
-    .expect("load raw head-op fixture cdylib");
+    .expect("load stable head-operation fixture cdylib");
     entry
         .init(NodeContext::for_tests(IndexMap::new(), IndexMap::new()))
-        .expect("init the raw head-op fixture");
-    for _ in 0..3 {
-        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unknown);
-    }
-    for _ in 0..3 {
-        assert_eq!(
-            entry.sync_head_op("b", SyncHeadOp::ProbeNext),
-            SyncOpAnswer::Failed
-        );
-    }
+        .expect("init the stable head-operation fixture");
+    let context = entry
+        .__test_host_context_handle()
+        .expect("initialized host context");
+    cerulion_core::graph::node_host_abi::with_context(context, |_| {
+        for _ in 0..3 {
+            assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unknown);
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                entry.sync_head_op("b", SyncHeadOp::ProbeNext),
+                SyncOpAnswer::Failed
+            );
+        }
+        Ok(())
+    })
+    .expect("hold the real host context lock");
     logs_assert(|lines: &[&str]| {
         let probe_heads: Vec<&str> = lines
             .iter()
@@ -1373,6 +1399,28 @@ fn a_failed_cdylib_body_probe_says_so_on_its_own_latch() {
                 probe_heads[0]
             ));
         }
+        if !probe_heads[0].contains("stable consume = latest body probe got no answer (host head op PROBE_NEXT failed or answered an unsupported kind); this input fires on every arrival its trigger subscriber counts, including a frame an earlier read already took, until the probe answers (suppressing further to debug until it recovers)") {
+            return Err("the probe must name the stable host operation exactly".into());
+        }
+        if !lines.iter().any(|line| line.contains("stable host Sync head op failed; the per-set Sync alignment pass ends here — no set member fabricated (suppressing further to debug until it recovers)")) { // dash-ok: native alignment message separator retained
+            return Err("the Sync failure must name the stable host operation exactly".into());
+        }
+        if !probe_heads[0].contains("status=9")
+            || !probe_heads[0].contains("kind=4")
+            || !probe_heads[0].contains("error=host head operation refused with status 9")
+        {
+            return Err(
+                "the probe must retain the actual host status, answer kind and refusal detail"
+                    .into(),
+            );
+        }
+        if !lines.iter().any(|line| {
+            line.contains("stable host Sync head op failed")
+                && line.contains("status=9")
+                && line.contains("error=host head operation refused with status 9")
+        }) {
+            return Err("the Sync failure must retain its host status and refusal detail".into());
+        }
         let sync_heads = lines
             .iter()
             .filter(|l| l.contains("ERROR") && l.contains("per-set Sync alignment pass ends here"))
@@ -1386,7 +1434,7 @@ fn a_failed_cdylib_body_probe_says_so_on_its_own_latch() {
     });
 }
 
-/// A cdylib's probe latch is per input. With the fault armed for input `b`,
+/// A cdylib's probe latch is per input. With host admission refused for input `b`,
 /// alternating probes of a failing `b` and an answering `a` give one loud
 /// line for `b` and no recovery line: `a`'s answer leaves `b`'s regime
 /// latched, as a shared latch would not.
@@ -1397,7 +1445,6 @@ fn a_cdylib_body_probe_failing_on_one_input_stays_latched_while_another_answers(
     use cerulion_core::graph::node::{AnySubscriber, DylibNodeEntry};
     use cerulion_core::testing::TestTransport;
 
-    let _fault = EnvVarGuard::set("CER_FAIL_MODE", "sync_op_fail");
     let tt = TestTransport::with_buffer_size(4);
     let mut subscribers: IndexMap<String, AnySubscriber> = IndexMap::new();
     subscribers.insert(
@@ -1407,12 +1454,19 @@ fn a_cdylib_body_probe_failing_on_one_input_stays_latched_while_another_answers(
     let mut entry = DylibNodeEntry::load(&cerulion_core::testing::find_fixture_cdylib(
         "test_node_sync_op_fail_cdylib",
     ))
-    .expect("load raw head-op fixture cdylib");
+    .expect("load stable head-operation fixture cdylib");
     entry
         .init(NodeContext::for_tests(IndexMap::new(), subscribers))
-        .expect("init the raw head-op fixture");
+        .expect("init the stable head-operation fixture");
+    let context = entry
+        .__test_host_context_handle()
+        .expect("initialized host context");
     for _ in 0..3 {
-        assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unknown);
+        cerulion_core::graph::node_host_abi::with_context(context, |_| {
+            assert_eq!(entry.probe_trigger_input("b"), TriggerProbe::Unknown);
+            Ok(())
+        })
+        .expect("refuse the probe through the real host admission lock");
         assert_eq!(entry.probe_trigger_input("a"), TriggerProbe::Empty);
     }
     logs_assert(|lines: &[&str]| {

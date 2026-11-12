@@ -84,6 +84,9 @@
 #[cfg(test)]
 mod abi_layout;
 
+/// Compiler-independent node plugin interface.
+pub use cerulion_node_abi as node_abi;
+
 // Lock-free, SHM-mappable counting barrier — the rendezvous
 // state machine for the cross-process DAG-level barrier. SHM page mapping,
 // doorbell wake, and scheduler integration are not wired yet; `pub`
@@ -181,9 +184,8 @@ pub mod posix_shm;
 pub mod prelude;
 pub mod read_outcome;
 pub mod replay_feed;
-// The rustc that compiled THIS copy of `cerulion_core`, compared across the
-// cdylib FFI boundary by `DylibNodeEntry::load` to catch a toolchain-skew
-// niche-encoding mismatch the ABI version cannot see. See the module doc.
+// Compiler provenance supports diagnostics and reproducible workspace defaults.
+// The stable node boundary is independent of this compiler fingerprint.
 pub mod rustc_fingerprint;
 #[allow(missing_docs)]
 pub mod scheduler;
@@ -319,10 +321,11 @@ pub mod wedge_page;
 #[allow(missing_docs)]
 pub mod wire;
 
-/// ABI version for cdylib node compatibility checking.
+/// ABI history version for node compatibility and diagnostics.
 ///
-/// Incremented when the cdylib entry point ABI changes. Dynamic libraries
-/// must export `cerulion_abi_version() -> u32` returning this exact value.
+/// Version 32 introduces stable boundary major 1. Native loading checks its
+/// complete frozen table identity, boundary major and capabilities; the compiler
+/// provenance and legacy version symbol do not govern stable compatibility.
 ///
 /// History:
 /// - v1: original handle-less ABI.
@@ -715,8 +718,9 @@ pub mod wire;
 ///   `ReplayReadViolation` and its kind) is reached through a crate-owned
 ///   `Arc` from that field, so those rows enter the `abi_layout` table at this
 ///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
-///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
-///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///   `(u64, Option<u64>)` to `RefillOutcome`, which was host-side only at v26:
+///   the legacy refill export remained unchanged. Stable node libraries now
+///   use the host head operations.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
@@ -842,42 +846,10 @@ pub mod wire;
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
-/// - v32: the `block` credit word ([`credit::CreditShared`]) grows from 24 to
-///   32 bytes with a `released` word at byte 24, the sticky per-consumer slot
-///   release, and the publish count reads it before counting. Its `u64`
-///   at byte 0 packs four counts (frames queued, frames a timeout release
-///   forgave that are still queued, and frames held in the matcher's slots,
-///   counted and forgiven), and a `connections` word at byte 28 sizes the
-///   consumer's queues for the forgiven backlog. `CerulionPublisher`'s
-///   `block_outstanding` holds one `BlockCountSlot` per `block` consumer of
-///   the topic: the consumer's credit word and the take-back of the frame
-///   being sent ([`credit::PublishUndo`]). A publish counts on every slot
-///   word before `send()`; a send that errs puts a slot word back by
-///   compare-exchange to the counts the count replaced, the forgiven backlog
-///   included, or subtracts one queued frame when another writer moved the
-///   word since the count. A drain returns [`credit::Drained`], the forgiven
-///   frames it paid and the frames it clipped at 0. A node library compiles
-///   its own copy of the count and the take-back (the publisher's) and of
-///   the drain (the subscriber's `BlockProbe`), both reached through the
-///   `CreditWord` the host hands it, so the two copies must agree on the
-///   word's layout: a library built against v31 or earlier reads the packed
-///   `u64` as one count, takes a count back by subtracting from it, counts
-///   into a released slot, and reads the word at its 24-byte size.
-///   `BackpressureCounters`, held by the same probe, gains
-///   `block_slot_releases_count`.
-///   [`graph::node::InputMeta`] gains `accumulate`, and a node library's info
-///   JSON carries it as an input key, so the host can refuse a graph key that
-///   contradicts the attribute. The wire header and the trace format are
-///   unchanged.
+/// Compiler-independent node table; legacy Rust boundaries require a rebuild.
 ///
-///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-///
-///   RENUMBERED 31 -> 32 at the merge of `main`. This change and `main`'s
-///   v31 count before `send()` were developed in parallel and each bumped
-///   30 -> 31 for a DIFFERENT layout. The merged host is v32 and refuses both
-///   v30 and v31 cdylibs at load, so rebuild every node library against this
-///   release (`cerulion node build <type>`) before loading it.
-pub const CERULION_ABI_VERSION: u32 = 32;
+/// v33: host-side per-consumer `block` credit slots; the stable node table is unchanged.
+pub const CERULION_ABI_VERSION: u32 = 33;
 
 // Re-export commonly used types
 #[cfg(unix)]

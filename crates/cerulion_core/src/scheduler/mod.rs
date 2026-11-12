@@ -375,7 +375,7 @@ impl RefillOutcome {
 /// verdicts.
 ///
 /// Deliberately ONE multiplexed op rather than four hooks, mirroring the ONE
-/// FFI symbol (`cerulion_node_sync_head_op`) it crosses on a cdylib: the four
+/// host-table `input_head` entry it crosses for a stable plugin: the four
 /// are transitions of ONE state machine, and four separate hooks would admit
 /// partial-capability nodes (advance-without-void) the degrade logic would then
 /// have to enumerate.
@@ -397,8 +397,7 @@ pub enum SyncHeadOp {
     /// and `Nothing` means it holds none, and the step fires the node only on
     /// `Present` (or `Failed`). The graph asks this of a Data input only on
     /// an entry whose `NodeEntry::probes_trigger_input` is `true` (on a
-    /// cdylib, one whose `cerulion_node_probes_trigger_input` returns a
-    /// positive value beside `cerulion_node_sync_head_op`), since an entry
+    /// stable node library, the host owns this probe), since an entry
     /// answering `Nothing` while that queue holds a frame leaves the input
     /// unfired.
     ProbeNext,
@@ -11533,10 +11532,8 @@ mod align_driver_tests {
 
     /// The double.
     ///
-    /// **The failure model mirrors the real FFI SPLIT, and that is load-bearing.**
-    /// `FillBoundary` / `FillRefill` do NOT cross `cerulion_node_sync_head_op` —
-    /// they ride the pre-existing drain symbols — so a fixture whose
-    /// `sync_head_op` fails still FILLS its heads. A double that failed the
+    /// The double faults descent operations while its fill operations remain
+    /// live, so its heads fill before a `sync_head_op` refusal. A double that failed the
     /// fills too would never reach the verdict loop at all: completeness would
     /// fail first, no gate would ever be scanned, and the arms that exist to
     /// pin the gate's failure POSITION would silently test nothing. (Measured:
@@ -11924,11 +11921,9 @@ mod align_driver_tests {
         );
     }
 
-    /// The TOTAL failure regime (a poisoned cdylib `NODES` mutex:
-    /// every `sync_head_op` returns a failure code).
+    /// A failure regime where every descent operation is refused.
     ///
-    /// The fills still work — they ride the drain symbols, not
-    /// `cerulion_node_sync_head_op` — so the heads fill and a complete
+    /// The double keeps fills live, so the heads fill and a complete
     /// in-window tuple forms. The ARGMIN's own probe is then the FIRST head op
     /// issued, it fails, and the failed-probe policy resolves it to `None` at that site: nothing
     /// to descend to, so the node FIRES GREEDY. Sound membership, loudly

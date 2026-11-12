@@ -56,9 +56,10 @@ pub mod raw;
 use std::path::{Path, PathBuf};
 
 use cerulion_core::codegen::{parse_rosmsg, CdrCodec, CdrCodecError, CdrEndianness, MessageSchema};
-use cerulion_core::transport::TransportManager;
+use cerulion_core::graph::node_plugin_abi::{RawIngress, RawPublisher};
+use cerulion_core::transport::FullQueueSend;
 use cerulion_core::wire::MaxSliceLen;
-use cerulion_core::{CerulionPublisher, TransportError};
+use cerulion_core::TransportError;
 
 use crate::registry::RosType;
 
@@ -490,7 +491,7 @@ pub enum RawRouteError {
 pub struct RawIngressRoute {
     ros_type: String,
     cerulion_topic: String,
-    publisher: CerulionPublisher,
+    publisher: RawPublisher,
     sequence: u32,
     published_total: u64,
     decode_failures_total: u64,
@@ -503,7 +504,7 @@ impl RawIngressRoute {
     /// like a foreign External writer; a topic owned by an in-graph
     /// single-writer producer is rejected by iceoryx2).
     pub fn open(
-        transport: &TransportManager,
+        transport: &RawIngress,
         codec: &CdrCodec,
         ros_type: &str,
         cerulion_topic: &str,
@@ -515,7 +516,16 @@ impl RawIngressRoute {
             });
         }
         let publisher = transport
-            .create_ingress_publisher(cerulion_topic, max_slice_len)
+            .create_publisher(
+                cerulion_topic,
+                codec
+                    .schema_hash(ros_type)
+                    .ok_or_else(|| RawRouteError::UnknownType {
+                        ros_type: ros_type.to_string(),
+                    })?,
+                max_slice_len,
+                FullQueueSend::ConfigDefault,
+            )
             .map_err(|source| RawRouteError::PublisherCreate {
                 ros_type: ros_type.to_string(),
                 cerulion_topic: cerulion_topic.to_string(),
@@ -547,8 +557,8 @@ impl RawIngressRoute {
         // lives in the GATEWAY process's bridge manager anyway, which this
         // worker-side check never reads).
         match codec.schema_hash(ros_type) {
-            Some(schema_hash) => {
-                match transport.register_dynamic_egress_topic(cerulion_topic, schema_hash) {
+            Some(_) => {
+                match publisher.register_egress() {
                     Ok(_) => {}
                     Err(error @ TransportError::InvalidTransportConfig { .. }) => {
                         // Per-NAME refusal (reserved / over-long) — at most a

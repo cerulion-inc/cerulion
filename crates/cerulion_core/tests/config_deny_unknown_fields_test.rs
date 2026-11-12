@@ -369,6 +369,17 @@ const PORT_ENTRY_SCAN: WarnScope = WarnScope {
 /// pre-authorisation for future drift.
 const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
     (
+        "cerulion_core/src/graph/node_dylib_abi.rs", "PortFact",
+        Classification::ExemptWithReason,
+        "generated internal ABI wire facts share the canonical author metadata; the canonical parser reports unknown author fields and this view must ignore unrelated port fields",
+    ),
+    (
+        "cerulion_core/src/graph/node_dylib_abi.rs", "PortFacts",
+        Classification::ExemptWithReason,
+        "generated ABI metadata envelope has author policy and params fields parsed by the canonical parser; this partial view extracts only validated wire facts",
+    ),
+
+    (
         "cerulion_cli_engine/src/graph_cmd.rs",
         "GatewayZenohMode",
         Classification::ExemptWithReason,

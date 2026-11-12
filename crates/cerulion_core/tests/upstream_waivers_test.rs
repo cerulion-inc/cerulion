@@ -448,10 +448,10 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
 ];
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,
-/// with the number of SUBTRACTION SITES each carries: eleven sites across
-/// ten arms in five binaries, because the wide level arm subtracts once per width.
+/// with the number of SUBTRACTION SITES each carries: thirteen sites across
+/// twelve arms in six binaries, because the wide level arm subtracts once per width.
 ///
-/// Paths are relative to the WORKSPACE root, not to this crate: the ninth arm
+/// Paths are relative to the WORKSPACE root, not to this crate: the CLI engine arm
 /// lives in `cerulion_cli_engine`, and CI found it after a core-only inventory
 /// missed it. A waiver inventory scoped to one crate is a waiver inventory that
 /// will be incomplete again.
@@ -460,6 +460,7 @@ const WAIVED_2035: &[(&str, usize)] = &[
         "crates/cerulion_core/tests/accumulate_zero_alloc_test.rs",
         1,
     ),
+    ("crates/cerulion_core/tests/node_host_abi_test.rs", 2),
     ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
     ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
     (
@@ -1725,8 +1726,8 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
         total += uses;
     }
     assert_eq!(
-        total, 11,
-        "the 2035 waiver covers eleven subtraction sites across ten arms (the wide level arm \
+        total, 13,
+        "the 2035 waiver covers thirteen subtraction sites across twelve arms (the wide level arm \
          subtracts twice, once per width). A change in that count needs a change here and a \
          reason in the commit."
     );
