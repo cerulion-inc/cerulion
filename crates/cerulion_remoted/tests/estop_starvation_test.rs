@@ -7,7 +7,9 @@
 //! stalled/reconnect-loop attacker delay a legitimate e-stop up to the
 //! session deadline. The daemon serves sessions CONCURRENTLY over a shared
 //! `Arc<OpsServer>` whose receipt sink is a brief-append `Mutex`, so the safety
-//! verb never waits on an attacker's session.
+//! verb never waits on an attacker's session. A code-pairing try runs its CPace
+//! step with the code-pairing store's lock released, so an e-stop on a fresh
+//! session, which opens on that store, never waits behind the step either.
 //!
 //! Every await is bounded so CI can never hang; every oracle is hand-built (real
 //! crypto, deterministic fixed-seed keys — Principle #13); the lease + receipt
@@ -144,6 +146,99 @@ async fn estop_is_served_under_multiple_stalled_sessions_within_a_small_bound() 
     assert_eq!(rx[0].verb, "engage-estop");
     assert_eq!(rx[0].outcome, ReceiptOutcome::Ok);
     verify_chain(&rx).expect("the receipt chain is intact after the concurrent run");
+}
+
+// The e-stop never waits behind a code-pairing CPace step.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn estop_on_a_fresh_session_is_served_while_a_code_pair_start_runs_its_cpace_step() {
+    use cerulion_pairing::format::PublicKey;
+    use cerulion_pairing::pair_code::PAIR_CODE_POLICY;
+    use cerulion_pairing::pake::{CpaceInitiator, PakeIdentities};
+    const CODE: &str = "48213907";
+
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([232; 32]).await;
+    let estop_client = disabled_endpoint([71; 32]).await; // paired: runs engage-estop
+    let desk = disabled_endpoint([72; 32]).await; // not paired: runs code-pair-start
+    let estop_key = *estop_client.id().as_bytes();
+    let desk_key = *desk.id().as_bytes();
+    let robot_key = *robot.id().as_bytes();
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+    let r = build_robot(
+        dir.path(),
+        robot_key,
+        /*claim_owner=*/ true,
+        &[(estop_key, OWNER)],
+    );
+    // A code is armed, and the next admitted try pauses just before its CPace
+    // step, with the code-pairing store's state lock released.
+    r.sessions.arm(CODE, PAIR_CODE_POLICY);
+    let held = r.sessions.hold_next_build_for_test();
+
+    let (start_res, (elapsed, estop_res)) = with_serving(&r, &robot, async {
+        let start = run_client(&desk, robot_addr.clone(), move |c| {
+            let (_attempt, msg1) = CpaceInitiator::new(
+                CODE,
+                PakeIdentities::new(PublicKey(desk_key), PublicKey(robot_key), Vec::new()),
+            )
+            .begin()
+            .expect("cpace begin");
+            c.call(
+                "code-pair-start",
+                serde_json::json!({ "msg1": hex::encode(msg1) }),
+            )
+        });
+        let estop = async {
+            let held = tokio::task::spawn_blocking(move || {
+                assert!(
+                    held.reached_within(Duration::from_secs(20)),
+                    "the code-pair-start reached its CPace step"
+                );
+                held
+            })
+            .await
+            .unwrap();
+            // A fresh ops session opens and is closed on the code-pairing
+            // store, so it would wait on a lock held across the step.
+            let begun = Instant::now();
+            let res = tokio::time::timeout(
+                ESTOP_CEILING,
+                run_client(&estop_client, robot_addr.clone(), |c| {
+                    c.call("engage-estop", serde_json::json!({}))
+                }),
+            )
+            .await;
+            let elapsed = begun.elapsed();
+            held.release();
+            (elapsed, res)
+        };
+        tokio::join!(start, estop)
+    })
+    .await;
+
+    let engaged = estop_res
+        .unwrap_or_else(|_| {
+            panic!(
+                "engage-estop was not served within {ESTOP_CEILING:?} while a code-pair-start ran \
+                 its CPace step: the e-stop waited behind it"
+            )
+        })
+        .expect("engage-estop is served");
+    assert_eq!(engaged["engaged"], true);
+    assert!(elapsed < ESTOP_CEILING, "engage-estop took {elapsed:?}");
+    {
+        let lease = r.lease.lock().unwrap();
+        assert_eq!(
+            lease.estop(),
+            &EstopState::Engaged {
+                by: hex::encode(estop_key)
+            }
+        );
+    }
+    // The paused try then finished its step and was answered.
+    let started = start_res.expect("the code-pair-start is answered once its step runs");
+    assert!(started["msg2"].is_string(), "{started}");
 }
 
 // ── concurrent-append hash-chain integrity ────────────────────────────────────

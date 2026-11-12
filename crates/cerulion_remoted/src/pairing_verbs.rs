@@ -35,6 +35,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+#[cfg(any(test, feature = "test-seam"))]
+use std::time::Duration;
 
 use cerud::error::{CerudError, CerudResult};
 use cerud::transport::CallerIdentity;
@@ -443,6 +445,8 @@ struct CodeState {
     ledger: Option<CodeLedger>,
     /// The responder of each desk key's pending try.
     pending: BTreeMap<[u8; 32], CpaceResponder>,
+    /// How many ops sessions each desk key has open.
+    open: BTreeMap<[u8; 32], usize>,
     /// The robot's last admitted try; a new arm leaves it.
     last_try_ns: Option<u64>,
     arms: u64,
@@ -479,7 +483,8 @@ impl CodeState {
         Some(CodeSnapshot::of(ledger, self.generation))
     }
 
-    /// A pending try of `initiator` counted failed; whether there was one.
+    /// A pending try of `initiator` counted failed, as when its sessions all
+    /// ended; whether there was one.
     fn fail_pending(&mut self, initiator: &[u8; 32]) -> bool {
         if self.pending.remove(initiator).is_none() {
             return false;
@@ -547,8 +552,48 @@ struct SessionsInner {
     /// every arm and disarm, so neither replaces a code whose row is being
     /// saved. Taken only on blocking threads, and never with `state` held.
     saving: Mutex<()>,
+    /// Held across every `code-pair-start`, the CPace step it runs with
+    /// `state` released included, and across every arm and disarm, so a try's
+    /// responder is stored before the next start is judged and no arm lands
+    /// while one is built. Taken after `saving` when both are, and never with
+    /// `state` held.
+    starting: Mutex<()>,
     clock: MonotonicClock,
     changed: tokio::sync::Notify,
+    /// A pause of the next start's CPace step ([`HeldBuild`]).
+    #[cfg(any(test, feature = "test-seam"))]
+    build_pause: Mutex<Option<BuildPause>>,
+}
+
+/// The two ends of a pause a [`HeldBuild`] holds: the start tells `reached`
+/// when its CPace step is due, and waits on `release`.
+#[cfg(any(test, feature = "test-seam"))]
+struct BuildPause {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// The next `code-pair-start` that is admitted, paused just before its CPace
+/// step, with the store's state lock released
+/// ([`SharedCodePairSessions::hold_next_build_for_test`]). Dropping it lets
+/// the step run.
+#[cfg(any(test, feature = "test-seam"))]
+pub struct HeldBuild {
+    reached: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl HeldBuild {
+    /// Whether the paused start reached its CPace step within `bound`.
+    pub fn reached_within(&self, bound: Duration) -> bool {
+        self.reached.recv_timeout(bound).is_ok()
+    }
+
+    /// Let the paused start run its CPace step.
+    pub fn release(self) {
+        let _ = self.release.send(());
+    }
 }
 
 /// The code-pairing store: the armed guest code and its tries, shared by
@@ -568,12 +613,14 @@ struct SessionsInner {
 ///
 /// **When a try fails.** A wrong tag at `code-pair-finish` and a failed
 /// `respond` fail the try at once. A desk that sees a wrong code itself never
-/// calls `code-pair-finish`, so its try stays pending until its desk key
-/// starts a new try, which replaces the pending one and counts it failed, or
-/// the window passes, when every pending try is counted failed. A right code
-/// whose row cannot be saved, a save that panics included, counts as a failed
-/// try when [`SAVE_FAILURE_IS_A_FAILED_TRY`] is set, and is given back when it
-/// is not; the desk's next try gets a fresh responder either way.
+/// calls `code-pair-finish`, so its try stays pending until every ops session
+/// of its key has ended ([`SharedCodePairSessions::open_session`]): then no
+/// finish for it can arrive, and it is counted failed. A desk key's new try
+/// replaces its pending one, which is counted failed too. When the window
+/// passes, every pending try is counted failed. A right code whose row cannot
+/// be saved, a save that panics included, counts as a failed try when
+/// [`SAVE_FAILURE_IS_A_FAILED_TRY`] is set, and is given back when it is not;
+/// the desk's next try gets a fresh responder either way.
 ///
 /// **The outcome stays.** The first outcome reached is kept: paired (the row
 /// was saved), exhausted (every try failed) or expired (the window passed),
@@ -586,9 +633,13 @@ struct SessionsInner {
 /// [`MonotonicClock`], so a step of the wall clock neither stretches nor cuts
 /// them.
 ///
-/// **No disk write under the lock.** A right code's row is saved with the
-/// store's state lock released, so a reader of the state never waits for a
-/// disk. A try's CPace step runs under the lock.
+/// **No disk write or CPace step under the lock.** A right code's row is
+/// saved, and a try's CPace step runs, with the store's state lock released,
+/// so an ops session's open and close, and a reader of the state, never wait
+/// for a disk or for a CPace computation. A start takes its try under the
+/// lock, runs the step, then stores the responder under the lock again: a
+/// code that ended meanwhile refuses the try, counted failed when the window
+/// passed and uncounted when a desk paired.
 #[derive(Clone)]
 pub struct SharedCodePairSessions(Arc<SessionsInner>);
 
@@ -610,13 +661,57 @@ impl SharedCodePairSessions {
         SharedCodePairSessions(Arc::new(SessionsInner {
             state: Mutex::new(CodeState::default()),
             saving: Mutex::new(()),
+            starting: Mutex::new(()),
             clock,
             changed: tokio::sync::Notify::new(),
+            #[cfg(any(test, feature = "test-seam"))]
+            build_pause: Mutex::new(None),
         }))
     }
 
     fn lock(&self) -> MutexGuard<'_, CodeState> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn starting(&self) -> MutexGuard<'_, ()> {
+        self.0
+            .starting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Pause the next admitted `code-pair-start` just before its CPace step,
+    /// with the state lock released, until the returned [`HeldBuild`] is
+    /// released or dropped.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn hold_next_build_for_test(&self) -> HeldBuild {
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *self
+            .0
+            .build_pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(BuildPause {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        HeldBuild { reached, release }
+    }
+
+    /// Wait on the pause [`SharedCodePairSessions::hold_next_build_for_test`]
+    /// set, if any.
+    #[cfg(any(test, feature = "test-seam"))]
+    fn pause_build(&self) {
+        let pause = self
+            .0
+            .build_pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.release.recv();
+        }
     }
 
     fn now(&self) -> u64 {
@@ -637,12 +732,14 @@ impl SharedCodePairSessions {
 
     /// Arm `code` under `policy` (`max_attempts` tries every desk shares, in a
     /// window of `ttl_ns` from now). Replaces any armed code, its tries and
-    /// its pending tries, once a right code's row being saved is saved; the
-    /// rate interval runs on from the last admitted try. Returns the new code's
-    /// state and the replaced code's last state, its outcome latched as
+    /// its pending tries, once a right code's row being saved is saved and a
+    /// start's CPace step in progress has ended; the rate interval runs on
+    /// from the last admitted try. Returns the new code's state and the
+    /// replaced code's last state, its outcome latched as
     /// [`SharedCodePairSessions::disarm`] answers it.
     pub fn arm(&self, code: impl Into<String>, policy: CeremonyConfig) -> CodeArmed {
         let _saving = self.0.saving.lock().unwrap_or_else(PoisonError::into_inner);
+        let _starting = self.starting();
         let mut st = self.lock();
         let now = self.now();
         if st.latch(now) {
@@ -673,12 +770,14 @@ impl SharedCodePairSessions {
     }
 
     /// Drop the armed code, if any, and every pending try, once a right
-    /// code's row being saved is saved; the code's last state, its outcome
-    /// latched as [`SharedCodePairSessions::snapshot`] does, or `None` when no
-    /// code was armed. A later start is refused with [`NOT_ARMED`], and a
-    /// later finish with [`NO_SESSION`].
+    /// code's row being saved is saved and a start's CPace step in progress
+    /// has ended; the code's last state, its outcome latched as
+    /// [`SharedCodePairSessions::snapshot`] does, or `None` when no code was
+    /// armed. A later start is refused with [`NOT_ARMED`], and a later finish
+    /// with [`NO_SESSION`].
     pub fn disarm(&self) -> Option<CodeSnapshot> {
         let _saving = self.0.saving.lock().unwrap_or_else(PoisonError::into_inner);
+        let _starting = self.starting();
         let mut st = self.lock();
         let now = self.now();
         if st.latch(now) {
@@ -710,17 +809,75 @@ impl SharedCodePairSessions {
         snapshot
     }
 
+    /// An ops session of the desk key `initiator` opened. When the last open
+    /// session of that key ends (the guard drops), its pending try, if any, is
+    /// counted failed: no finish for it can arrive any more.
+    pub fn open_session(&self, initiator: [u8; 32]) -> CodePairSession {
+        *self.lock().open.entry(initiator).or_insert(0) += 1;
+        CodePairSession {
+            sessions: self.clone(),
+            initiator,
+        }
+    }
+
+    fn session_ended(&self, initiator: [u8; 32]) {
+        let mut st = self.lock();
+        let now = self.now();
+        let mut changed = st.latch(now);
+        let last = match st.open.get_mut(&initiator) {
+            Some(open) if *open > 1 => {
+                *open -= 1;
+                false
+            }
+            _ => {
+                st.open.remove(&initiator);
+                true
+            }
+        };
+        if last && st.fail_pending(&initiator) {
+            st.latch(now);
+            changed = true;
+        }
+        if changed {
+            st.generation += 1;
+        }
+        drop(st);
+        self.notify(changed);
+    }
+
     /// Run the responder's step 2 for `initiator`'s `msg1` as one try on the
     /// armed code (see the type docs for when a start is admitted). A refused
     /// start uses no try: [`NOT_ARMED`], [`CODE_USED`], [`code_exhausted`],
     /// [`code_expired`], [`TRIES_IN_PROGRESS`] or [`TRY_THROTTLED`]. The CPace
-    /// step runs under the state lock.
+    /// step runs with the state lock released; a code that ended while it ran
+    /// refuses the try as [`code_expired`] (the try counted failed) or
+    /// [`CODE_USED`] (uncounted).
     pub fn start(
         &self,
         initiator: [u8; 32],
         responder_key: PublicKey,
         msg1: &[u8],
     ) -> CerudResult<(Vec<u8>, [u8; 32])> {
+        let _starting = self.starting();
+        let taken = self.take_try(initiator)?;
+        #[cfg(any(test, feature = "test-seam"))]
+        self.pause_build();
+        let mut responder = CpaceResponder::new(
+            taken.code,
+            PakeIdentities::new(PublicKey(initiator), responder_key, Vec::new()),
+            taken.policy,
+            taken.armed_at_ns,
+        );
+        let reply = responder.respond(msg1, taken.now_ns);
+        self.store_try(initiator, taken.arm, responder, reply.is_ok())?;
+        reply
+            .map(|r| (r.msg2, r.responder_confirm))
+            .map_err(map_pake)
+    }
+
+    /// Admit a try of `initiator` and take it from the budget, under the state
+    /// lock: what its CPace step needs.
+    fn take_try(&self, initiator: [u8; 32]) -> CerudResult<TakenTry> {
         let mut guard = self.lock();
         // Read with the lock held: a start that waited for the lock is judged
         // at the time it got it, after every try admitted before it.
@@ -741,31 +898,71 @@ impl SharedCodePairSessions {
             return Err(refusal_error(refusal, tries));
         }
         ledger.used += 1;
-        let mut responder = CpaceResponder::new(
-            ledger.code.clone(),
-            PakeIdentities::new(PublicKey(initiator), responder_key, Vec::new()),
-            ledger.policy,
-            ledger.armed_at_ns,
-        );
         st.last_try_ns = Some(now);
+        let taken = TakenTry {
+            arm: ledger.arm,
+            code: ledger.code.clone(),
+            policy: ledger.policy,
+            armed_at_ns: ledger.armed_at_ns,
+            now_ns: now,
+        };
         // A pending try of this key can no longer finish: its desk began a
         // new one, and that try's keys are gone.
         if st.fail_pending(&initiator) {
             st.generation += 1;
+            drop(guard);
+            self.notify(true);
         }
-        let reply = responder.respond(msg1, now);
-        if reply.is_ok() {
-            st.pending.insert(initiator, responder);
-        } else if let Some(ledger) = st.ledger.as_mut() {
-            ledger.failed = ledger.failed.saturating_add(1);
-        }
+        Ok(taken)
+    }
+
+    /// Store the outcome of the CPace step of a try `initiator` took on arm
+    /// `arm`, under the state lock: its `responder` pending when the step
+    /// worked, the try counted failed when it did not. A code that ended
+    /// meanwhile refuses the try instead (see [`SharedCodePairSessions::start`]).
+    fn store_try(
+        &self,
+        initiator: [u8; 32],
+        arm: u64,
+        responder: CpaceResponder,
+        worked: bool,
+    ) -> CerudResult<()> {
+        let mut guard = self.lock();
+        let now = self.now();
+        let st = &mut *guard;
+        st.latch(now);
+        let stored = match st.ledger.as_mut().filter(|ledger| ledger.arm == arm) {
+            // Arms and disarms wait for a start in progress, so the arm is
+            // the try's own while one is armed.
+            None => Err(CerudError::Verb(NOT_ARMED.into())),
+            Some(ledger) => match ledger.view().ended {
+                None => {
+                    if worked {
+                        st.pending.insert(initiator, responder);
+                    } else {
+                        ledger.failed = ledger.failed.saturating_add(1);
+                    }
+                    Ok(())
+                }
+                Some(ended) => {
+                    // A try whose step ran as the window passed is counted
+                    // failed, as a pending one is; once a desk paired, the
+                    // others' tries are dropped uncounted.
+                    if ended == Ended::Expired {
+                        ledger.failed = ledger.failed.saturating_add(1);
+                    }
+                    Err(refusal_error(
+                        ended_refusal(ended),
+                        ledger.policy.max_attempts,
+                    ))
+                }
+            },
+        };
         st.latch(now);
         st.generation += 1;
         drop(guard);
         self.notify(true);
-        reply
-            .map(|r| (r.msg2, r.responder_confirm))
-            .map_err(map_pake)
+        stored
     }
 
     /// Verify `initiator`'s confirmation tag for its pending try and, when
@@ -868,6 +1065,16 @@ impl SharedCodePairSessions {
     }
 }
 
+/// A try [`SharedCodePairSessions::start`] took from the budget: the arm it
+/// is on and what its CPace step needs.
+struct TakenTry {
+    arm: u64,
+    code: String,
+    policy: CeremonyConfig,
+    armed_at_ns: u64,
+    now_ns: u64,
+}
+
 /// The end of a right code's row save, run when it is dropped
 /// ([`SharedCodePairSessions::end_save`]): `paired` is the desk when the row
 /// was saved, and `None` for a save that failed or panicked.
@@ -880,6 +1087,18 @@ struct SaveEnd<'a> {
 impl Drop for SaveEnd<'_> {
     fn drop(&mut self) {
         self.sessions.end_save(self.arm, self.paired.take());
+    }
+}
+
+/// An open ops session of one desk key ([`SharedCodePairSessions::open_session`]).
+pub struct CodePairSession {
+    sessions: SharedCodePairSessions,
+    initiator: [u8; 32],
+}
+
+impl Drop for CodePairSession {
+    fn drop(&mut self) {
+        self.sessions.session_ended(self.initiator);
     }
 }
 
@@ -1344,7 +1563,6 @@ mod tests {
     use super::*;
     use cerud::lease::ControlLease;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     #[test]
     fn caller_device_key_requires_auth_and_a_32_byte_hex_id() {
@@ -1430,6 +1648,16 @@ mod tests {
         let (attempt, msg1) = initiator.begin().expect("cpace begin");
         let (msg2, confirm) = sessions.start(desk, PublicKey(ROBOT_KEY), &msg1)?;
         Ok((attempt, msg2, confirm))
+    }
+
+    /// The desk's step 1 for `code`: its attempt and its `msg1`.
+    fn step1(desk: [u8; 32], code: &str) -> (cerulion_pairing::pake::InitiatorAttempt, Vec<u8>) {
+        cerulion_pairing::pake::CpaceInitiator::new(
+            code,
+            PakeIdentities::new(PublicKey(desk), PublicKey(ROBOT_KEY), Vec::new()),
+        )
+        .begin()
+        .expect("cpace begin")
     }
 
     /// The desk's finish for a started try with the right code, saved by
@@ -1846,6 +2074,36 @@ mod tests {
     }
 
     #[test]
+    fn pending_tries_hold_the_budget_until_every_session_of_their_desk_ends() {
+        let (sessions, clock) = armed();
+        let mut open = Vec::new();
+        for (i, desk) in [A, B, C].into_iter().enumerate() {
+            clock.set(T0 + RATE * i as u64);
+            open.push(sessions.open_session(desk));
+            start(&sessions, desk, WRONG).expect("an admitted try");
+        }
+        // Every try is pending: no try is left, but none failed yet, so a
+        // desk with the right code is told to wait, not that its code burned.
+        assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 0));
+        clock.set(T0 + RATE * 3);
+        assert_eq!(refused(start(&sessions, D, CODE)), verb(TRIES_IN_PROGRESS));
+        // A second session of desk A that ends leaves A's try pending.
+        drop(sessions.open_session(A));
+        assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 0));
+        let mut failed = 0;
+        for session in open {
+            drop(session);
+            failed += 1;
+            let want = if failed == 3 {
+                PairCodeState::Exhausted
+            } else {
+                PairCodeState::Armed
+            };
+            assert_eq!(state(&sessions), (want, 3, failed));
+        }
+    }
+
+    #[test]
     fn the_right_code_on_the_third_try_pairs() {
         let (sessions, clock) = armed();
         for (i, desk) in [A, B].into_iter().enumerate() {
@@ -1942,15 +2200,17 @@ mod tests {
     fn the_window_counts_from_the_arm_and_a_quiet_expired_code_reads_expired() {
         let (sessions, clock) = armed();
         clock.set(T0 + WINDOW);
+        let session = sessions.open_session(A);
         let started = start(&sessions, A, CODE).expect("the last instant is admitted");
         clock.set(T0 + WINDOW + 1);
         // The window passed with A's try pending: it is counted failed, and
-        // the outcome stays expired.
+        // the outcome stays expired when A's session ends.
         assert_eq!(state(&sessions), (PairCodeState::Expired, 3, 1));
         assert_eq!(
             refused(finish(&sessions, A, started, |_| Ok(()))),
             verb(&code_expired())
         );
+        drop(session);
         assert_eq!(state(&sessions), (PairCodeState::Expired, 3, 1));
         assert_eq!(refused(start(&sessions, B, CODE)), verb(&code_expired()));
 
@@ -2069,12 +2329,14 @@ mod tests {
 
         // Desk A's try on the replaced code is pending at the re-arm.
         let (sessions, clock) = armed();
+        let a_session = sessions.open_session(A);
         let a = start(&sessions, A, CODE).unwrap();
         sessions.arm(LATER, cerulion_pairing::pair_code::PAIR_CODE_POLICY);
         assert_eq!(
             refused(finish(&sessions, A, a, |_| Ok(()))),
             format!("verb error: {NO_SESSION}")
         );
+        drop(a_session);
         assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 0));
         clock.set(T0 + RATE);
         new_pairs(&sessions, B);
@@ -2169,6 +2431,7 @@ mod tests {
     #[test]
     fn a_desk_mid_ceremony_when_another_pairs_is_refused_and_counts_nothing() {
         let (sessions, clock) = armed();
+        let b_session = sessions.open_session(B);
         let b = start(&sessions, B, CODE).unwrap();
         clock.set(T0 + RATE);
         pair(&sessions, A).expect("desk A pairs");
@@ -2176,6 +2439,7 @@ mod tests {
             refused(finish(&sessions, B, b, |_| Ok(()))),
             format!("verb error: {CODE_USED}")
         );
+        drop(b_session);
         clock.set(T0 + 2 * RATE);
         assert_eq!(
             refused(start(&sessions, C, CODE)),
@@ -2207,6 +2471,138 @@ mod tests {
             "verb error: code pairing rejected: CPace protocol error: bad step1 packet length"
         );
         assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 1));
+    }
+
+    #[test]
+    fn a_start_runs_its_cpace_step_with_the_state_lock_released() {
+        let (sessions, _clock) = armed();
+        let held = sessions.hold_next_build_for_test();
+        let (desk_step, msg1) = step1(A, CODE);
+        let starting = std::thread::spawn({
+            let sessions = sessions.clone();
+            move || sessions.start(A, PublicKey(ROBOT_KEY), &msg1)
+        });
+        assert!(held.reached_within(Duration::from_secs(10)));
+        // While the step is paused, an ops session of another key opens and
+        // closes, and the state is read, without waiting for it.
+        let (done, opened) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let sessions = sessions.clone();
+            move || {
+                drop(sessions.open_session(B));
+                let _ = done.send(sessions.snapshot());
+            }
+        });
+        let seen = opened
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a session opens and closes while a CPace step runs");
+        assert_eq!(
+            seen.map(|s| (s.state, s.failed)),
+            Some((PairCodeState::Armed, 0))
+        );
+        assert!(
+            sessions.0.state.try_lock().is_ok(),
+            "the state lock is free"
+        );
+        held.release();
+        let (msg2, confirm) = starting.join().unwrap().expect("the try is admitted");
+        // The try is pending and pairs.
+        let (_keys, tag) = desk_step.finish(&msg2, &confirm).expect("same code");
+        sessions
+            .finish_with(A, &tag, AccountId(A), PrincipalKind::Human, "d", |_| Ok(()))
+            .expect("the pending try pairs");
+        assert_eq!(state(&sessions).0.status().as_str(), "paired");
+    }
+
+    #[test]
+    fn a_code_that_ends_while_a_start_runs_its_cpace_step_refuses_the_try() {
+        // The window passes: the try is counted failed, as a pending one is.
+        let (sessions, clock) = armed();
+        let held = sessions.hold_next_build_for_test();
+        let (_desk, msg1) = step1(A, CODE);
+        let starting = std::thread::spawn({
+            let sessions = sessions.clone();
+            move || sessions.start(A, PublicKey(ROBOT_KEY), &msg1)
+        });
+        assert!(held.reached_within(Duration::from_secs(10)));
+        clock.set(T0 + WINDOW + 1);
+        held.release();
+        assert_eq!(refused(starting.join().unwrap()), verb(&code_expired()));
+        assert_eq!(state(&sessions), (PairCodeState::Expired, 3, 1));
+        assert!(sessions.lock().pending.is_empty());
+
+        // A desk pairs meanwhile: the try is dropped uncounted.
+        let (sessions, clock) = armed();
+        let b = start(&sessions, B, CODE).unwrap();
+        clock.set(T0 + RATE);
+        let held = sessions.hold_next_build_for_test();
+        let (_desk, msg1) = step1(A, CODE);
+        let starting = std::thread::spawn({
+            let sessions = sessions.clone();
+            move || sessions.start(A, PublicKey(ROBOT_KEY), &msg1)
+        });
+        assert!(held.reached_within(Duration::from_secs(10)));
+        finish(&sessions, B, b, |_| Ok(())).expect("desk B pairs");
+        held.release();
+        assert_eq!(
+            refused(starting.join().unwrap()),
+            format!("verb error: {CODE_USED}")
+        );
+        let (got, _, failed) = state(&sessions);
+        assert_eq!((got.status().as_str(), failed), ("paired", 0));
+        assert!(sessions.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn an_arm_and_a_disarm_wait_for_a_start_in_progress() {
+        let (sessions, _clock) = armed();
+        let held = sessions.hold_next_build_for_test();
+        let (_desk, msg1) = step1(A, CODE);
+        let starting = std::thread::spawn({
+            let sessions = sessions.clone();
+            move || sessions.start(A, PublicKey(ROBOT_KEY), &msg1)
+        });
+        assert!(held.reached_within(Duration::from_secs(10)));
+        let (done, disarmed) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let sessions = sessions.clone();
+            move || {
+                let _ = done.send(sessions.disarm());
+            }
+        });
+        assert_eq!(
+            disarmed.recv_timeout(Duration::from_millis(300)).err(),
+            Some(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a disarm landed while a CPace step ran"
+        );
+        held.release();
+        starting.join().unwrap().expect("the try is admitted");
+        let last = disarmed
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .expect("the code was armed");
+        assert_eq!((last.state, last.failed), (PairCodeState::Armed, 0));
+        assert!(
+            sessions.lock().pending.is_empty(),
+            "the disarm drops the try"
+        );
+    }
+
+    #[test]
+    fn a_store_emptied_under_a_start_in_progress_answers_not_armed() {
+        let (sessions, _clock) = armed();
+        let held = sessions.hold_next_build_for_test();
+        let (_desk, msg1) = step1(A, CODE);
+        let starting = std::thread::spawn({
+            let sessions = sessions.clone();
+            move || sessions.start(A, PublicKey(ROBOT_KEY), &msg1)
+        });
+        assert!(held.reached_within(Duration::from_secs(10)));
+        // Arms and disarms wait for the start; only a direct write empties it.
+        sessions.lock().ledger = None;
+        held.release();
+        assert!(refused(starting.join().unwrap()).ends_with(NOT_ARMED));
+        assert!(sessions.lock().pending.is_empty());
     }
 
     #[test]
@@ -2253,11 +2649,14 @@ mod tests {
         fn run() -> Vec<String> {
             let (sessions, clock) = armed();
             let mut seen = vec![format!("{:?}", sessions.snapshot())];
+            let a = sessions.open_session(A);
             // Desk A sees the wrong code itself and sends no finish.
             start(&sessions, A, WRONG).unwrap();
             seen.push(format!("{:?}", sessions.snapshot()));
             clock.set(T0 + RATE);
             refused(wrong_tag(&sessions, B));
+            seen.push(format!("{:?}", sessions.snapshot()));
+            drop(a);
             seen.push(format!("{:?}", sessions.snapshot()));
             clock.set(T0 + 2 * RATE);
             pair(&sessions, C).unwrap();
@@ -2267,7 +2666,7 @@ mod tests {
         let first = run();
         assert_eq!(first, run());
         assert!(first.last().unwrap().contains("Paired"), "{first:?}");
-        assert!(first[2].contains("failed: 1"), "{first:?}");
+        assert!(first[3].contains("failed: 2"), "{first:?}");
     }
 
     #[tokio::test]
