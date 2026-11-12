@@ -42,6 +42,7 @@
 //! per-consumer mirror (which would re-introduce the exact collision + double-
 //! network-crossing the shared daemon dissolves).
 
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -172,6 +173,39 @@ const SPAWN_POST_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// `query::tests::the_shipped_cold_start_budget_fits_inside_the_client_round_trip_timeout`,
 /// which is why this is `pub(crate)` rather than private.
 pub(crate) const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(5);
+
+const MIRROR_BUSY_BUDGET: Duration = Duration::from_secs(2);
+// Uneven deterministic delays avoid a fixed retry cadence without randomness.
+const MIRROR_BUSY_DELAYS: [Duration; 7] = [
+    Duration::from_millis(23),
+    Duration::from_millis(47),
+    Duration::from_millis(83),
+    Duration::from_millis(139),
+    Duration::from_millis(211),
+    Duration::from_millis(307),
+    Duration::from_millis(389),
+];
+
+fn mirror_busy_delay(retries: usize, remaining: Duration) -> Option<Duration> {
+    MIRROR_BUSY_DELAYS
+        .get(retries)
+        .copied()
+        .filter(|delay| *delay < remaining)
+}
+
+fn is_transient_mirror_refusal(message: &str, key: &crate::registry::TopicKey) -> bool {
+    if crate::account_access::is_transient_busy(message) {
+        return true;
+    }
+    [crate::account_access::CONTROLLER_BUSY, crate::account_access::IDENTITY_BUSY]
+        .iter()
+        .any(|busy| {
+            message == format!(
+                "mirror registration failed: failed to establish the iroh WAN mirror for robot='{}' topic='{}': {busy}",
+                key.robot, key.topic
+            )
+        })
+}
 
 /// The longest the first-contact wait sleeps without re-checking the
 /// caller's cancellation flag.
@@ -589,6 +623,7 @@ pub struct NetdClient {
     poisoned: bool,
     pending_losses: Vec<crate::protocol::MirrorLost>,
     push_fragment: Vec<u8>,
+    mirror_busy_failures: FailureRegimeLatch,
 }
 
 impl NetdClient {
@@ -887,6 +922,7 @@ impl NetdClient {
             poisoned: false,
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
         };
         let line = client.read_line()?;
         client.daemon_protocol = validate_hello(&line)?;
@@ -925,19 +961,21 @@ impl NetdClient {
     }
 
     /// Hold a source-qualified observer mirror until this connection closes.
+    /// Exact transient controller/identity refusals retry on this same connection
+    /// at most seven times within two seconds after the first Busy reply.
     pub fn observe(
         &mut self,
         robot: &str,
         topic: &str,
         schema_hash: u64,
     ) -> Result<crate::protocol::ObserveResponse, ClientError> {
-        let id = self.next_request_id();
-        match self.round_trip(&Request::Observe {
+        let (id, response) = self.mirror_request(robot, topic, |id| Request::Observe {
             id,
             robot: robot.into(),
             topic: topic.into(),
             schema_hash,
-        })? {
+        })?;
+        match response {
             Response::Observed(reply) => {
                 let key = crate::registry::TopicKey::observed(robot, topic);
                 if reply.demand.id != id
@@ -999,14 +1037,13 @@ impl NetdClient {
         topic: &str,
         schema_hash: u64,
     ) -> Result<DemandResponse, ClientError> {
-        let id = self.next_request_id();
-        let req = Request::Demand {
+        let (_, response) = self.mirror_request(robot, topic, |id| Request::Demand {
             id,
             robot: robot.to_string(),
             topic: topic.to_string(),
             schema_hash,
-        };
-        match self.round_trip(&req)? {
+        })?;
+        match response {
             Response::Demand(d) => Ok(d),
             Response::Error(e) => Err(ClientError::Netd {
                 error: e.error,
@@ -1016,6 +1053,54 @@ impl NetdClient {
             other => Err(ClientError::Protocol(format!(
                 "expected a demand response, got {other:?}"
             ))),
+        }
+    }
+
+    // hot-path-alloc-ok-fn: cold mirror acquisition over the control socket
+    fn mirror_request(
+        &mut self,
+        robot: &str,
+        topic: &str,
+        request: impl Fn(u64) -> Request,
+    ) -> Result<(u64, Response), ClientError> {
+        let key = crate::registry::TopicKey::new(robot, topic);
+        let mut retry_deadline = None;
+        let mut retries = 0;
+        loop {
+            let id = self.next_request_id();
+            // Keep the existing normal round-trip budget. Only a completed Busy
+            // reply starts the smaller absolute budget for all retry I/O/backoff.
+            let deadline = retry_deadline.unwrap_or_else(|| Instant::now() + ROUNDTRIP_TIMEOUT);
+            let response = self.bounded_round_trip(&request(id), deadline)?;
+            if let Response::Error(error) = &response {
+                if error.id == Some(id) && is_transient_mirror_refusal(&error.error, &key) {
+                    let end =
+                        *retry_deadline.get_or_insert_with(|| Instant::now() + MIRROR_BUSY_BUDGET);
+                    if let Some(delay) =
+                        mirror_busy_delay(retries, end.saturating_duration_since(Instant::now()))
+                    {
+                        tracing::debug!(robot = %key.robot, topic = %key.topic, attempt = retries + 1, delay_ms = delay.as_millis(), "remote mirror controller busy; retrying");
+                        std::thread::sleep(delay);
+                        if Instant::now() < end {
+                            retries += 1;
+                            continue;
+                        }
+                    }
+                    match self.mirror_busy_failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                            tracing::warn!(robot = %key.robot, topic = %key.topic, attempts = retries + 1, error = %error.error, total_failures = self.mirror_busy_failures.total_failures(), "remote mirror controller busy retry budget exhausted");
+                        }
+                        RegimeDecision::Suppressed { suppressed } => {
+                            tracing::debug!(robot = %key.robot, topic = %key.topic, suppressed, "remote mirror controller still busy after retry budget");
+                        }
+                    }
+                    return Ok((id, response));
+                }
+            }
+            if let Some(suppressed) = self.mirror_busy_failures.on_success() {
+                tracing::debug!(robot = %key.robot, topic = %key.topic, suppressed, "remote mirror controller recovered");
+            }
+            return Ok((id, response));
         }
     }
 
@@ -3105,6 +3190,7 @@ mod tests {
             poisoned: false,
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
         };
         assert_eq!(
             client.observe("arm", "/extra", 7).unwrap().local_topic,
@@ -3135,6 +3221,7 @@ mod tests {
             poisoned: false,
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
+            mirror_busy_failures: FailureRegimeLatch::new(),
         };
         client.poll_pushed_losses().unwrap();
         assert!(!client.poisoned);

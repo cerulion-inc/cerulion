@@ -37,6 +37,222 @@ fn client_and_peer() -> (NetdClient, UnixStream) {
     (client, peer)
 }
 
+// Hand-written control replies; one socket proves retries retain the held key.
+fn busy_mirror_peer(
+    messages: Vec<&'static str>,
+    persistent: bool,
+) -> (NetdClient, std::thread::JoinHandle<(usize, Vec<u64>)>) {
+    let (stream, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.write_all(b"{\"hello\":\"cerulion-netd\",\"protocol\":11,\"wire_header\":2}\n")
+        .unwrap();
+    let client =
+        NetdClient::finish_bounded_handshake(stream, "no-reconnect.sock".into(), deadline())
+            .unwrap();
+    let worker = std::thread::spawn(move || {
+        let mut reader = BufReader::new(peer.try_clone().unwrap());
+        let mut attempts = 0;
+        let mut ids = Vec::new();
+        let mut held = false;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = request["id"].as_u64().unwrap();
+            ids.push(id);
+            assert_eq!(request["robot"], "arm");
+            let method = request["method"].as_str().unwrap();
+            let reply = if request["topic"] == "/held" && method == "demand" {
+                assert!(!held);
+                held = true;
+                serde_json::json!({"id":id,"robot":"arm","topic":"/held",
+                    "refcount":1,"mirror_created":true})
+            } else if method == "release" {
+                assert_eq!(request["topic"], "/held");
+                assert!(held, "retry lost the pre-existing demand");
+                held = false;
+                serde_json::json!({"id":id,"robot":"arm","topic":"/held",
+                    "refcount":0,"last_release":true})
+            } else {
+                assert!(held);
+                assert!(matches!(method, "observe" | "demand"));
+                assert_eq!(request["topic"], "/topic");
+                assert_eq!(request["schema_hash"], 7);
+                let error = if persistent {
+                    messages.first().copied()
+                } else {
+                    messages.get(attempts).copied()
+                };
+                attempts += 1;
+                if let Some(message) = error {
+                    serde_json::json!({"method":"error","id":id,"error":message,
+                        "robot":"arm","topic":"/topic"})
+                } else if method == "observe" {
+                    serde_json::json!({"id":id,"robot":"arm","topic":"/topic",
+                        "refcount":1,"mirror_created":true,"local_topic":"/topic"})
+                } else {
+                    serde_json::json!({"id":id,"robot":"arm","topic":"/topic",
+                        "refcount":1,"mirror_created":true})
+                }
+            };
+            writeln!(peer, "{reply}").unwrap();
+        }
+        assert!(!held, "the healthy demand was not explicitly released");
+        (attempts, ids)
+    });
+    (client, worker)
+}
+
+#[test]
+fn busy_mirror_observe_and_demand_retry_then_acknowledge_on_the_same_connection() {
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        for observer in [true, false] {
+            let (mut client, worker) = busy_mirror_peer(
+                vec![
+                    crate::account_access::CONTROLLER_BUSY,
+                    crate::account_access::IDENTITY_BUSY,
+                ],
+                false,
+            );
+            client.demand("arm", "/held", 7).unwrap();
+            let result = if observer {
+                client.observe("arm", "/topic", 7).map(|reply| reply.demand)
+            } else {
+                client.demand("arm", "/topic", 7)
+            };
+            assert!(client.release("arm", "/held").unwrap().last_release);
+            drop(client);
+            let counts = worker.join().unwrap();
+            let reply = result.unwrap();
+            assert_eq!(
+                (reply.robot.as_str(), reply.topic.as_str(), reply.refcount),
+                ("arm", "/topic", 1)
+            );
+            assert_eq!(counts, (3, vec![1, 2, 3, 4, 5]));
+            runs.push(counts);
+        }
+    }
+    assert_eq!(runs[0..2], runs[2..4]);
+}
+
+#[test]
+fn busy_mirror_persistent_refusal_keeps_original_error_and_live_hold_within_a_bound() {
+    for observer in [true, false] {
+        let (mut client, worker) =
+            busy_mirror_peer(vec![crate::account_access::CONTROLLER_BUSY], true);
+        client.demand("arm", "/held", 7).unwrap();
+        let started = Instant::now();
+        let result = if observer {
+            client.observe("arm", "/topic", 7).map(|reply| reply.demand)
+        } else {
+            client.demand("arm", "/topic", 7)
+        };
+        assert!(started.elapsed() < Duration::from_millis(2500));
+        assert!(client.release("arm", "/held").unwrap().last_release);
+        drop(client);
+        let (attempts, ids) = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(ClientError::Netd { error, robot, topic })
+            if error == crate::account_access::CONTROLLER_BUSY
+                && robot.as_deref() == Some("arm") && topic.as_deref() == Some("/topic"))
+        );
+        assert_eq!(attempts, 8);
+        assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn busy_mirror_non_transient_refusals_are_not_retried_or_replaced() {
+    for message in [
+        "schema conflict",
+        "account robot controller is busy; retry the operation (fatal)",
+        "robot access revoked",
+    ] {
+        for observer in [true, false] {
+            let (mut client, worker) = busy_mirror_peer(vec![message], true);
+            client.demand("arm", "/held", 7).unwrap();
+            let result = if observer {
+                client.observe("arm", "/topic", 7).map(|reply| reply.demand)
+            } else {
+                client.demand("arm", "/topic", 7)
+            };
+            assert!(client.release("arm", "/held").unwrap().last_release);
+            drop(client);
+            assert_eq!(worker.join().unwrap(), (1, vec![1, 2, 3]));
+            assert!(matches!(result, Err(ClientError::Netd { error, .. }) if error == message));
+        }
+    }
+}
+
+#[test]
+fn busy_mirror_wrapped_ensure_refusals_retry_without_matching_another_source() {
+    let wrapped = "mirror registration failed: failed to establish the iroh WAN mirror for robot='arm' topic='/topic': account robot controller is busy; retry the operation";
+    for _ in 0..2 {
+        let (mut client, worker) = busy_mirror_peer(vec![wrapped], false);
+        client.demand("arm", "/held", 7).unwrap();
+        let reply = client.observe("arm", "/topic", 7).unwrap();
+        assert_eq!(reply.local_topic, "/topic");
+        assert!(client.release("arm", "/held").unwrap().last_release);
+        drop(client);
+        assert_eq!(worker.join().unwrap(), (2, vec![1, 2, 3, 4]));
+    }
+    let key = crate::registry::TopicKey::new("arm", "/topic");
+    for message in [
+        "mirror registration failed: failed to establish the iroh WAN mirror for robot='other' topic='/topic': account robot controller is busy; retry the operation",
+        "mirror registration failed: failed to establish the iroh WAN mirror for robot='arm' topic='/other': account robot controller is busy; retry the operation",
+        "mirror registration failed: failed to establish the iroh WAN mirror for robot='arm' topic='/topic': account robot controller is busy; retry the operation (fatal)",
+    ] {
+        assert!(!super::super::is_transient_mirror_refusal(message, &key));
+    }
+}
+
+#[test]
+fn busy_mirror_retry_schedule_has_attempt_and_time_limits() {
+    use super::super::{mirror_busy_delay, MIRROR_BUSY_BUDGET};
+    let expected = [23, 47, 83, 139, 211, 307, 389].map(Duration::from_millis);
+    let actual: Vec<_> = (0..8)
+        .filter_map(|index| mirror_busy_delay(index, MIRROR_BUSY_BUDGET))
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.iter().sum::<Duration>(), Duration::from_millis(1199));
+    for (index, delay) in expected.iter().enumerate() {
+        assert_eq!(mirror_busy_delay(index, *delay), None);
+        assert_eq!(
+            mirror_busy_delay(index, *delay + Duration::from_nanos(1)),
+            Some(*delay)
+        );
+    }
+    assert_eq!(mirror_busy_delay(0, Duration::ZERO), None);
+    assert_eq!(MIRROR_BUSY_BUDGET, Duration::from_secs(2));
+}
+
+#[test]
+fn busy_mirror_exhaustion_latches_until_a_completed_recovery() {
+    let (mut client, worker) =
+        busy_mirror_peer(vec![crate::account_access::CONTROLLER_BUSY; 16], false);
+    client.demand("arm", "/held", 7).unwrap();
+    for total in [1, 2] {
+        assert!(matches!(
+            client.observe("arm", "/topic", 7),
+            Err(ClientError::Netd { .. })
+        ));
+        assert!(client.mirror_busy_failures.is_failing());
+        assert_eq!(client.mirror_busy_failures.total_failures(), total);
+    }
+    assert_eq!(
+        client.observe("arm", "/topic", 7).unwrap().local_topic,
+        "/topic"
+    );
+    assert!(!client.mirror_busy_failures.is_failing());
+    assert_eq!(client.mirror_busy_failures.total_failures(), 2);
+    assert!(client.release("arm", "/held").unwrap().last_release);
+    drop(client);
+    assert_eq!(worker.join().unwrap(), (17, (1..=19).collect()));
+}
+
 #[test]
 fn bounded_status_carries_failures_and_refuses_uncorrelated_replies() {
     for reply in [

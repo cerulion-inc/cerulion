@@ -2026,9 +2026,12 @@ pub fn cerulion_node_impl(
     if let Some(err) = external_source_error {
         error_tokens.extend(err.to_compile_error());
     }
+    let plugin_helpers = helper_port_args.keys().cloned().collect();
+    let plugin_impl = crate::plugin_impl::generate(&item_impl, &plugin_helpers);
     quote! {
         #error_tokens
         #item_impl
+        #plugin_impl
     }
     .into()
 }

@@ -45,10 +45,24 @@ struct MacroCounter {
 
     #[output]
     cmd_out: Vector3,
+
+    panic_on_shutdown: bool,
 }
 
 #[cerulion_node_impl]
 impl MacroCounter {
+    fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
+        let phase = ctx.env_opt("CER_TEST_STABLE_PANIC_PHASE");
+        assert_ne!(phase.as_deref(), Some("init"), "fixture init panic");
+        self.panic_on_shutdown = phase.as_deref() == Some("shutdown");
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), NodeError> {
+        assert!(!self.panic_on_shutdown, "fixture shutdown panic");
+        Ok(())
+    }
+
     fn tick(&mut self) -> Result<(), NodeError> {
         // Direct SHM-to-SHM copy of the three f64 fields. The impl macro
         // wraps the body in a nested `try_view` for `velocity_in` plus a
@@ -67,4 +81,18 @@ impl MacroCounter {
 #[no_mangle]
 pub extern "C" fn cerulion_test_get_tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod context_compile_tests {
+    #[test]
+    fn stable_context_helpers_compile_with_the_author_migration() {
+        let cases = trybuild::TestCases::new();
+        cases.pass("tests/ui/annotated_context_helper.rs");
+        cases.pass("tests/ui/data_only_helpers.rs");
+        cases.pass("tests/ui/qualified_context_helper.rs");
+        // The stderr oracle pins rustc 1.99.1 context names; compiler upgrades
+        // may require re-blessing while preserving the migration error.
+        cases.compile_fail("tests/ui/free_context_helper.rs");
+    }
 }

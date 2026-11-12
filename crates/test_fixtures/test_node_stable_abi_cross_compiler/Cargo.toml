@@ -1,0 +1,21 @@
+[package]
+name = "test_node_stable_abi_cross_compiler"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Macro node for compiler-independent downstream delivery checks"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+cdylib = []
+default = ["cdylib"]
+
+[dependencies]
+cerulion_core.workspace = true
+native_ros2_messages.workspace = true
+stabby = { version = "=72.1.16", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

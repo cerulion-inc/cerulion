@@ -39,9 +39,11 @@ void rmw_cerulion_cppstring_assign(void *s, const char *data, size_t len) noexce
 /// value-init memset -- unlike resize()+copy, whose resize zero-fills the
 /// whole span first (a redundant `rep stos` on the receive
 /// path). The Rust caller GATES this to uint8[] payloads (introspection
-/// type id UINT8, unbounded): a std::vector<int8_t>/<std::byte> or a
-/// rosidl BoundedVector has a different layout, so reinterpreting it as
-/// vector<uint8_t> would be UB -- those keep the resize()+copy path.
+/// type id UINT8, unbounded): a std::vector<int8_t>/<std::byte> is a
+/// different type, so reinterpreting it as vector<uint8_t> would be UB, and
+/// a rosidl BoundedVector stays on the resize()+copy path so the gate is
+/// exactly the unbounded uint8[] class (the bridge refuses a count over the
+/// bound before either path writes).
 ///
 /// Reinterpret assumption: `v` is a std::vector<uint8_t> built with the
 /// platform's DEFAULT std::allocator (the 3-pointer libstdc++/libc++
@@ -59,6 +61,46 @@ void rmw_cerulion_cppstring_assign(void *s, const char *data, size_t len) noexce
 /// would UB-unwind through the extern "C" boundary into Rust frames.
 void rmw_cerulion_vector_u8_assign(void *v, const uint8_t *data, size_t len) noexcept {
   static_cast<std::vector<uint8_t> *>(v)->assign(data, data + len);
+}
+
+// std::vector<bool> without introspection accessors (Foxy and Galactic).
+// rosidl_typesupport_introspection_cpp before Humble emits a null size, get,
+// get_const and resize function for every `bool` sequence member, because
+// std::vector<bool> is bit-packed and has no element addresses. The member
+// is still a std::vector<bool, std::allocator<bool>> (an unbounded
+// sequence) or a rosidl_runtime_cpp::BoundedVector<bool, N> (a bounded one),
+// whose only base is that same vector, at offset 0, with no member of its
+// own; the generated accessors of every other bounded sequence on those
+// distros reinterpret the BoundedVector as the std::vector in the same way.
+// The Rust caller gates these four to that shape (a `bool` sequence whose
+// accessors are all null) and refuses a count above a bounded member's
+// bound before the resize. `i` is below size() on every call.
+
+/// size() of the std::vector<bool> at `v`.
+size_t rmw_cerulion_vector_bool_size(const void *v) noexcept {
+  return static_cast<const std::vector<bool> *>(v)->size();
+}
+
+/// Element `i` of the std::vector<bool> at `v`.
+bool rmw_cerulion_vector_bool_get(const void *v, size_t i) noexcept {
+  return (*static_cast<const std::vector<bool> *>(v))[i];
+}
+
+/// resize(n) of the std::vector<bool> at `v`. 0 on success, 1 when it threw
+/// (std::bad_alloc or std::length_error); the vector is then still a valid
+/// object, and the caller refuses the frame.
+int rmw_cerulion_vector_bool_resize(void *v, size_t n) noexcept {
+  try {
+    static_cast<std::vector<bool> *>(v)->resize(n);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+/// Set element `i` of the std::vector<bool> at `v` to `value`.
+void rmw_cerulion_vector_bool_set(void *v, size_t i, bool value) noexcept {
+  (*static_cast<std::vector<bool> *>(v))[i] = value;
 }
 
 }  // extern "C"
@@ -115,6 +157,22 @@ size_t rmw_cerulion_vector_u8_capacity(const void *v) noexcept {
 /// the vector is mutated or destroyed).
 const uint8_t *rmw_cerulion_vector_u8_data(const void *v) noexcept {
   return static_cast<const std::vector<uint8_t> *>(v)->data();
+}
+
+/// sizeof(std::vector<bool>) on this platform. Fixture helper.
+size_t rmw_cerulion_vector_bool_sizeof() noexcept { return sizeof(std::vector<bool>); }
+
+/// Placement-construct a std::vector<bool> at `at` holding `n` elements,
+/// element `k` true when `bits[k]` is nonzero, through the vector's own range
+/// constructor (caller provides aligned storage of
+/// rmw_cerulion_vector_bool_sizeof() bytes). Fixture helper.
+void rmw_cerulion_vector_bool_construct(void *at, const uint8_t *bits, size_t n) noexcept {
+  new (at) std::vector<bool>(bits, bits + n);
+}
+
+/// Destruct a placement-constructed std::vector<bool>. Fixture helper.
+void rmw_cerulion_vector_bool_destruct(void *v) noexcept {
+  static_cast<std::vector<bool> *>(v)->~vector();
 }
 
 /// Adopt-take memory safety: release the BUFFER of a

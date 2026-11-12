@@ -6,6 +6,7 @@ members = [
     # versions in step. Re-exports only; it carries no logic.
     "crates/cerulion",
     "crates/cerulion_core",
+    "crates/cerulion_node_abi",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_cli_engine",
@@ -51,6 +52,7 @@ members = [
     "crates/cerulion_telemetry", # desk-only consent and usage events (no-op without `posthog`)
     "crates/cerulion_tf",        # pure SE(3) transform math (std + thiserror; no cerulion_core dep)
     "crates/test_fixtures/test_node_cdylib",
+    "crates/test_fixtures/test_node_stable_abi_cross_compiler",
     "crates/test_fixtures/test_node_macro_cdylib",
     "crates/test_fixtures/test_node_failing_cdylib",
     # Returns one chosen NodeError arm (env-selected) from init, a chosen
@@ -77,6 +79,7 @@ members = [
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
     # Oracle-vector fixture for raw-FFI template emit.
     "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    "crates/test_fixtures/test_node_unknown_schema_cdylib",
     # Variable-schema spill round-trip across FFI.
     "crates/test_fixtures/test_node_macro_overflow_cdylib",
     # A cdylib's QoS (tick/throttle/expect/promise_within_ms)
@@ -363,6 +366,7 @@ default-members = [
     # in this set, so it adds nothing to a plain build.
     "crates/cerulion",
     "crates/cerulion_core",
+    "crates/cerulion_node_abi",
     "crates/cerulion_bag",
     "crates/cerulion_bagd",
     "crates/cerulion_discovery",
@@ -530,6 +534,7 @@ disallowed_methods = "deny"
 # matching on a 0.0.x prerelease is surprising, and these crates are released
 # in lockstep anyway, so `=<workspace version>` is both correct and clearest.
 [workspace.dependencies]
+cerulion_node_abi = { path = "crates/cerulion_node_abi", version = "=2.0.0" }
 cerulion_macros = { path = "crates/cerulion_macros", version = "=2.0.0" }
 cerulion_core = { path = "crates/cerulion_core", version = "=2.0.0" }
 cerulion_bag = { path = "crates/cerulion_bag", version = "=2.0.0" }

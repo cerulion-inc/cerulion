@@ -334,8 +334,8 @@ unsafe fn take_request_live(
         // only request take path cerulion_core offers, by design.
         let result = server.try_take_one_request(|envelope, payload| {
             // A member this build's C++ typesupport gives no way to WRITE (a
-            // `bool[]` before Humble, at the top level or inside a nested
-            // message) makes every request of this type undeliverable.
+            // `bool[]` with neither `assign` nor the shim's accessorless path,
+            // at any depth) makes every request of this type undeliverable.
             // Decided at registration, so this is one `Option` read per
             // request, and taken BEFORE `unflatten` so the caller's message
             // is untouched: a server that decoded half a request and then

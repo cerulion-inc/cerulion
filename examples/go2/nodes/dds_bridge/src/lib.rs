@@ -129,6 +129,7 @@ pub mod registry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use cerulion_core::graph::node_plugin_abi::RawIngress;
 use cerulion_core::prelude::*;
 use cerulion_core::shm_runtime::{u64s_as_bytes, u64s_as_bytes_mut};
 use cerulion_core::wire::MaxPayloadCapacity;
@@ -211,10 +212,8 @@ impl PortWriteLatches {
 // - cloud/odom/twist/request_json: the fixed output ports (registry table).
 // - queue: shared with the pump helper thread (it pushes; tick drains).
 // - total_evicted: running latest-wins eviction count (observability).
-// - transport: the HOST's TransportManager, stored by `init` from the
-//   NodeContext (the context-carried transport; the raw
-//   ingress routes publish on it). None until init / for hand-rolled
-//   contexts that never carried one.
+// - transport: the local raw-ingress factory stored at init; publishers and
+//   injected clocks remain host-owned behind the stable callback table.
 #[cerulion_node(external)]
 #[derive(Default)]
 pub struct DdsBridge {
@@ -232,7 +231,7 @@ pub struct DdsBridge {
     // write_latches: per-port write-error flood latches.
     tick_stats: Arc<TickStats>,
     write_latches: PortWriteLatches,
-    transport: Option<Arc<TransportManager>>,
+    transport: Option<RawIngress>,
     // The SHARED shutdown coordinator, cloned off the pump in
     // `external_source` BEFORE the pump is moved into the Blocking closure. It
     // is the ONLY path `shutdown()` retains to signal + join the drain thread
@@ -359,25 +358,16 @@ fn encode_header_bytes(
 
 #[cerulion_node_impl]
 impl DdsBridge {
-    /// Stash the CONTEXT-CARRIED transport — the host's process
-    /// `TransportManager`, injected into the `NodeContext` by the graph
-    /// runtime before `init()` and carried across the cdylib FFI (the same
-    /// path the ports take). The raw ingress routes publish on it; resolving
-    /// `TransportManager::get()` instead would consult the CDYLIB's OWN copy
-    /// of the `INSTANCE` static — never initialized by the host (the
-    /// cross-linkage-unit trap the live dry-run hit: 149 backoff retries).
+    /// Retain the local raw-ingress factory. Native contexts use the existing
+    /// process manager; plugin contexts use host-owned publisher handles.
     fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
-        self.transport = ctx.transport().cloned();
-        if self.transport.is_none() {
-            // Not fatal here: only RAW mappings need the manager, and the
-            // pump refuses loudly at raw-init. But a runtime-built context
-            // always carries it, so a None is worth a breadcrumb.
-            tracing::warn!(
-                "dds_bridge: NodeContext carries no TransportManager (hand-rolled \
-                 context?) — raw-generic mappings will fail loudly at pump init; \
-                 typed projections are unaffected"
-            );
-        }
+        self.transport = match ctx.raw_ingress() {
+            Ok(factory) => Some(factory),
+            Err(error) => {
+                tracing::warn!(error = %error, "dds_bridge: raw ingress unavailable; raw mappings refuse at pump init");
+                None
+            }
+        };
         Ok(())
     }
 
@@ -716,8 +706,11 @@ mod tests {
         let mut node = DdsBridge::with_shared_queue(Arc::new(Mutex::new(SampleQueue::default())));
         node.__cer_user_init(&mut ctx).expect("init succeeds");
         assert!(
-            Arc::ptr_eq(node.transport.as_ref().expect("init stored it"), &mgr),
-            "DdsBridge::init must store the CONTEXT's manager (ptr_eq)"
+            Arc::ptr_eq(
+                &node.transport.as_ref().expect("init stored it").clock_arc(),
+                &mgr.clock_arc()
+            ),
+            "DdsBridge::init preserves the context clock"
         );
 
         // build_pump (external_source's delegation) hands the SAME manager on.
@@ -728,14 +721,14 @@ mod tests {
         )
         .expect("raw config validates");
         let pump = node.build_pump(cfg);
-        let carried = Arc::clone(
-            pump.transport
-                .as_ref()
-                .expect("the pump must carry the context transport"),
-        );
+        let carried = pump
+            .transport
+            .as_ref()
+            .expect("the pump must carry raw ingress")
+            .clone();
         assert!(
-            Arc::ptr_eq(&carried, &mgr),
-            "build_pump must hand the pump the CONTEXT's manager (ptr_eq)"
+            Arc::ptr_eq(&carried.clock_arc(), &mgr.clock_arc()),
+            "build_pump preserves the same injected clock"
         );
 
         // The frame lands: a raw route opened on the CARRIED manager delivers

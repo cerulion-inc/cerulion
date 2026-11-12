@@ -117,6 +117,14 @@ pub enum MirrorError {
 }
 
 impl MirrorError {
+    pub(crate) fn is_transient_busy(&self) -> bool {
+        match self {
+            Self::Register { .. } => false,
+            #[cfg(feature = "wan")]
+            Self::Iroh { reason, .. } => crate::account_access::is_transient_busy(reason),
+        }
+    }
+
     /// The `(robot, topic)` this error concerns.
     pub fn key(&self) -> &TopicKey {
         match self {

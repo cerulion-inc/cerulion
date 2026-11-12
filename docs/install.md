@@ -66,15 +66,8 @@ In the archive the four sit at the top level beside the binaries. The package in
 
 Building nodes needs a C toolchain, installed before rustup. On Debian and Ubuntu: `sudo apt-get install -y curl git build-essential`. On macOS: `xcode-select --install`. An `apt-get install cerulion` pulls a C toolchain in through the package's Recommends; installing the `.deb` by hand with `dpkg -i` does not.
 
-## Build nodes with the compiler that built the CLI
+## Build nodes with a supported Rust compiler
 
-A node is a shared library the CLI loads into its own process. Two rustc releases can lay out a shared type identically and still encode it differently at run time, so the loader compares the full compiler fingerprint (release plus commit hash) and refuses a node built by a different one. The refusal names both compilers and the two ways out: rebuild the node with the host's compiler, or reinstall the CLI with yours.
+Nodes use stable boundary major 1 and load across Rust compiler versions. Build them with Rust 1.95 or newer and the C toolchain described above. The compiler does not have to match the CLI. Rebuild existing node libraries once with `cerulion node build <node>`; older Rust-boundary libraries and different boundary majors are refused with that instruction.
 
-- A workspace you create with `cerulion workspace create` or `cerulion workspace init` records the CLI's compiler in its own `rust-toolchain.toml`, so `cerulion node build` inside it selects the right one with no environment variable. The CLI writes that file only when a rustup toolchain whose release and full commit hash match its own is already installed; the check is offline, installs nothing, and leaves your rustup default alone. A missing, custom, nightly or beta compiler produces a warning instead, and the workspace keeps whatever compiler your environment selects. An existing `rust-toolchain.toml` in the workspace, or an explicit rustup override, is left in place and has to select a matching compiler itself.
-- In a workspace without a `rust-toolchain.toml`, the cloned example in the [README quickstart](../README.md#quickstart-run-record-and-verify) included, a rustup default that is a different compiler has to be overridden on the command line with the CLI's own compiler, Rust 1.95.0 for a 2.0.0 CLI and 1.93.0 for a 1.0.0 CLI:
-
-  ```bash
-  RUSTUP_TOOLCHAIN=1.95.0 cerulion node build <node>
-  ```
-
-- With `cargo install --locked cerulion_cli`, or a source build, the CLI carries whatever compiler Cargo selected at install time, so a plain `cerulion node build` already matches as long as you do not change your default toolchain in between. After changing it, rebuild the CLI and your nodes together. A distribution, custom, nightly or beta compiler may not reproduce the fingerprint from its release string alone: use one compiler installation for both sides.
+Workspace creation optionally records the CLI's stable compiler in `rust-toolchain.toml` when that exact toolchain is already installed. This is a reproducible build default, not a loading requirement. An existing toolchain file and explicit rustup overrides are preserved. If no verified toolchain is available, the workspace uses your environment's compiler without installing one or changing your rustup default.
