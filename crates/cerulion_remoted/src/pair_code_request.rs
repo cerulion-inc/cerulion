@@ -48,7 +48,8 @@
 //! `unconfirmed` when its result cannot be built or written. A refusal
 //! disarms the code an earlier request armed, since the result answers the
 //! request claimed last (see below for an end that code reached), and is
-//! counted in the store ([`SharedCodePairSessions::requests_refused`]) and
+//! counted in the store
+//! ([`SharedCodePairSessions::requests_refused`], in the wire `status`) and
 //! logged once at warn ([`REFUSED_LINE`]). Its result says `refused` with the
 //! reason, and with the request's nonce when it was parsed (`-` otherwise);
 //! when that result cannot be written, the result file is removed, so no

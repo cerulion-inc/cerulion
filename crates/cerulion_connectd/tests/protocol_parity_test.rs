@@ -150,12 +150,21 @@ fn wire_response_parity() {
             stream_alive: true,
         }],
         log_lines_dropped: Some(7),
+        pair_code: Some(cerulion_pairing::pair_code::PairCodeReport {
+            status: cerulion_pairing::pair_code::PairCodeStatus::Armed,
+            tries: 3,
+            failed: 2,
+        }),
+        pair_code_refused: Some(1),
     }));
-    // A host with no daemon log writer sends no count, and an older robot's
-    // reply, which has no such field, reads as `None`.
+    // A host with no daemon log writer sends no count, no armed code sends no
+    // code state, no refused request sends no refused count, and an older
+    // robot's reply, which has none of these fields, reads as `None` for each.
     cross::<_, robot::WireResponse>(&desk::WireResponse::Status(desk::StatusReply {
         topics: vec![],
         log_lines_dropped: None,
+        pair_code: None,
+        pair_code_refused: None,
     }));
     let older = r#"{"reply":"status","topics":[]}"#;
     assert_eq!(
@@ -163,6 +172,8 @@ fn wire_response_parity() {
         robot::WireResponse::Status(robot::StatusReply {
             topics: vec![],
             log_lines_dropped: None,
+            pair_code: None,
+            pair_code_refused: None,
         })
     );
     assert_eq!(
@@ -170,6 +181,8 @@ fn wire_response_parity() {
         desk::WireResponse::Status(desk::StatusReply {
             topics: vec![],
             log_lines_dropped: None,
+            pair_code: None,
+            pair_code_refused: None,
         })
     );
     cross::<_, robot::WireResponse>(&desk::WireResponse::Error {
