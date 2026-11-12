@@ -5086,14 +5086,15 @@ fn knob_and_other_env_json() -> Vec<u8> {
     .unwrap()
 }
 
-/// A completed run logs a differing variable that cannot change the
-/// re-execution ONCE at INFO, for `-v`, and logs nothing for one that can,
-/// because the verdict prints that one; each divergence reaches the terminal
-/// once.
+/// A completed run logs each environment divergence ONCE, at INFO: the
+/// verdict prints the variable Cerulion reads as a WARNING line, so its log
+/// line is for a log pipeline, and the NOTE line counts the other one, which
+/// `-v` lists. No environment line is a WARN, so the default output shows each
+/// divergence once.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn a_completed_run_logs_other_env_variables_at_info_and_leaves_loud_ones_to_the_verdict() {
+fn a_completed_run_logs_every_env_divergence_at_info_and_warns_none() {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("env_levels.mcap");
@@ -5114,19 +5115,14 @@ fn a_completed_run_logs_other_env_variables_at_info_and_leaves_loud_ones_to_the_
         "the verdict prints the knob once: {verdict}"
     );
     logs_assert(|lines: &[&str]| {
-        let knob = lines
+        let knob: Vec<&&str> = lines
             .iter()
-            .filter(|l| l.contains("CERULION_REPLAY_TEST_KNOB"))
-            .count();
-        let other_info = cerulion_core::testing::count_at(
-            lines,
-            "INFO",
-            "replay: an environment variable differs from the recording",
-        );
-        let other_named = lines
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
             .iter()
             .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
-            .collect::<Vec<_>>();
+            .collect();
         let env_warns = lines
             .iter()
             .filter(|l| {
@@ -5134,17 +5130,80 @@ fn a_completed_run_logs_other_env_variables_at_info_and_leaves_loud_ones_to_the_
                     && l.contains("replay: an environment variable")
             })
             .count();
-        match (knob, other_named.as_slice(), env_warns) {
-            (0, [line], 0)
-                if cerulion_core::testing::line_level(line) == Some("INFO")
-                    && line.contains("change=HashChanged")
-                    && other_info >= 1 =>
+        match (knob.as_slice(), other.as_slice(), env_warns) {
+            ([k], [o], 0)
+                if cerulion_core::testing::line_level(k) == Some("INFO")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged")
+                    && o.contains("replay: an environment variable differs from the recording")
+                    && !o.contains("read_by=") =>
             {
                 Ok(())
             }
-            (knob, other, warns) => Err(format!(
-                "expected no line naming the knob, ONE INFO naming CER_REPLAY_OTHER and no \
-                 environment WARN, got {knob} knob line(s), {other:?} and {warns} WARN(s)"
+            (k, o, warns) => Err(format!(
+                "expected ONE INFO naming the knob with its reader, ONE INFO naming the other \
+                 variable and no environment WARN, got {k:?}, {o:?} and {warns} WARN(s)"
+            )),
+        }
+    });
+}
+
+/// A PASSING run whose `--report` cannot be written returns the write error
+/// (exit 5) and the CLI prints only that error, no verdict, so a variable that
+/// can change the re-execution is logged at WARN, once, naming its reader; the
+/// other variable stays at INFO.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_passing_run_whose_report_cannot_be_written_warns_a_loud_env_variable() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_report_fail.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let blocker = dir.path().join("iam_a_regular_file");
+    std::fs::write(&blocker, b"x").unwrap();
+    let report = blocker.join("report.json"); // parent is a file, so unwritable.
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, Some(report));
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("a passing run whose report cannot be written is an error");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("cannot write report")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 5);
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
             )),
         }
     });

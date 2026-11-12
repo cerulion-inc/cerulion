@@ -3457,19 +3457,22 @@ impl EnvReader {
     }
 }
 
-/// Who reads `name` in a way that can change what a re-execution runs, or
-/// `None` when nothing Cerulion starts does.
+/// The reader whose settings namespace `name` is in, or `None` for a name in
+/// none of them or one that marks a secret.
 ///
-/// Loud means the re-execution itself, or a runtime it starts, reads the
-/// variable: Cerulion and its shared-memory transport (`CERULION_`, `IOX2_`),
-/// the dynamic linker that maps every node library (`LD_`, `DYLD_`), and the
-/// Python interpreter that runs Python nodes (`PYTHON`). Every other variable
+/// Loud means the name is in a namespace the re-execution itself, or a
+/// runtime it starts, reads its settings from: Cerulion and its shared-memory
+/// transport (`CERULION_`, `IOX2_`), the dynamic linker that maps every node
+/// library (`LD_`, `DYLD_`), and the Python interpreter that runs Python nodes
+/// (`PYTHON`). The rule is by namespace, not by a list of every read: the
+/// engine also reads `CARGO_TARGET_DIR`, which picks the directory a node
+/// library is loaded from, and that name is not loud. Every other variable
 /// (the shell's, the session's, `PATH`, `HOME`, locale, `RUST_LOG`, library
-/// knobs such as `OMP_NUM_THREADS`) can matter only through code in a node,
-/// which the replay cannot see. A name that marks a secret is never loud:
-/// credentials authenticate a session and do not decide what a re-execution
-/// computes. The secret rule is the recorder's own, so the two agree on every
-/// name. Case-sensitive, like Unix names. Pure.
+/// knobs such as `OMP_NUM_THREADS`) is counted with the rest; it matters when
+/// code in a node reads it, which the replay cannot see. A name that marks a
+/// secret is never loud: credentials authenticate a session and do not decide
+/// what a re-execution computes. The secret rule is the recorder's own, so the
+/// two agree on every name. Case-sensitive, like Unix names. Pure.
 fn env_reader(name: &str) -> Option<EnvReader> {
     if crate::graph_cmd::env_name_marks_a_secret(name) {
         None
@@ -4508,11 +4511,13 @@ pub enum ReplayNodes {
 /// Run the deterministic replay engine and return its [`ReplayOutcome`].
 ///
 /// Writes the JSON report to `inputs.report_path` when set. An environment
-/// variable that differs from the recording and cannot change the
-/// re-execution is a `tracing::info!` (the terminal counts those in one NOTE
-/// line, and `-v` shows these). One that can change it is printed by the
-/// verdict and by the neutral summary, so it is logged only on a run a rank
-/// ABORTS, as a `tracing::warn!`. A node failure is a `tracing::info!` (both
+/// variable that differs from the recording and that Cerulion does not read
+/// is a `tracing::info!` (the terminal counts those in one NOTE line, and `-v`
+/// shows these). One that can change the re-execution is a `tracing::info!` on
+/// a run that returns its outcome, because the verdict and the neutral summary
+/// each print it, and a `tracing::warn!` on a run that returns an error once
+/// the passes ran (a rank ABORTS, or a passing run's `--report` cannot be
+/// written), where the CLI prints only that error. A node failure is a `tracing::info!` (both
 /// terminal reports name each failed node). A data violation and a
 /// structural trace divergence are a `tracing::info!` under
 /// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
@@ -5276,11 +5281,19 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                  rank's pass; the abort's own error stands"
             );
         }
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
         drop(transport);
         drop(clock);
         return Err(e);
     }
-    persist_report(report_path.as_deref(), &outcome)?;
+    // A PASSING run whose `--report` cannot be written returns the write error,
+    // and the CLI prints only that error, so the environment lines are logged
+    // as on an abort.
+    if let Err(e) = persist_report(report_path.as_deref(), &outcome) {
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
+        return Err(e);
+    }
+    log_env_divergences(&outcome.env_divergence, OutcomeShown::Yes);
     // A bag that could not be finished is reported on the outcome, not raised
     // here: the engine does not know whether a verdict was asked for, and the
     // surface keeps a failing verdict's own exit code while never letting a
@@ -5921,32 +5934,11 @@ fn assemble_outcome(
         ));
     }
 
-    // 7. Env divergence (never exit-affecting) + report + verdict data.
-    //
-    // One emitter per divergence. A variable that can change the
-    // re-execution is printed by the verdict and by the neutral summary
-    // (`render_env_divergence_lines`), so a run that returns its outcome logs
-    // nothing for it, and an ABORTED run, which renders neither, logs it at
-    // WARN. Every other variable is counted by the one NOTE line and listed
-    // here at INFO, which `-v` shows.
+    // 7. Env divergence (never exit-affecting) + report + verdict data. The
+    // divergences are logged by `run_engine` once it knows whether the CLI
+    // shows this outcome, which a failed `--report` write decides after this
+    // epilogue (`log_env_divergences`).
     let env_divergence = compare_env(env_json);
-    for d in &env_divergence {
-        match env_reader(&d.name) {
-            None => tracing::info!(
-                env_var = %d.name,
-                change = %d.kind.label(),
-                "replay: an environment variable differs from the recording"
-            ),
-            Some(reader) if aborted.is_some() => tracing::warn!(
-                env_var = %d.name,
-                change = %d.kind.label(),
-                read_by = %reader.label(),
-                "replay: an environment variable that can change the re-execution differs \
-                 from the recording"
-            ),
-            Some(_) => {}
-        }
-    }
     // A completed `--verify`: INFO, because the verdict renders each violation
     // and the schedule divergence as its own block on the same stderr, so these
     // lines are for a log pipeline only. A bare `--resim`: WARN, because its
@@ -6173,6 +6165,47 @@ fn build_read_log_verdict(
         unmet_total,
         detail,
     })
+}
+
+/// Whether the CLI shows a run's outcome: `Yes` when [`run_engine`] returns it
+/// (the verdict and the neutral summary each print
+/// [`render_env_divergence_lines`]), `No` when it returns an error instead,
+/// which is all the CLI then prints.
+#[derive(Clone, Copy)]
+enum OutcomeShown {
+    Yes,
+    No,
+}
+
+/// Log each environment divergence once. A variable that can change the
+/// re-execution ([`env_reader`]) is an `info!` when the outcome is shown, which
+/// already prints it, and a `warn!` when it is not, so it still reaches the
+/// terminal. Every other variable is an `info!` either way: the NOTE line
+/// counts it, and `-v` lists it.
+fn log_env_divergences(divergences: &[EnvDivergence], shown: OutcomeShown) {
+    for d in divergences {
+        match (env_reader(&d.name), shown) {
+            (None, _) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                "replay: an environment variable differs from the recording"
+            ),
+            (Some(reader), OutcomeShown::Yes) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+            (Some(reader), OutcomeShown::No) => tracing::warn!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+        }
+    }
 }
 
 /// Persist the `--report` artifact, if one was requested, under the decided
@@ -26715,8 +26748,9 @@ fn compare_env_against(
     out
 }
 
-/// The NOTE line for `n` differing variables that cannot change the
-/// re-execution, or `None` for zero. It names no variable and no value.
+/// The NOTE line for `n` differing variables that Cerulion does not read
+/// ([`env_reader`] gives `None`), or `None` for zero. It names no variable and
+/// no value.
 fn render_other_env_note(n: usize) -> Option<String> {
     match n {
         0 => None,
@@ -27388,8 +27422,9 @@ mod env_divergence_tests {
 
     /// The getting-started tutorial quotes the NOTE line a resim prints for
     /// one differing shell variable, in a fence of its own in the section that
-    /// verifies the unchanged code, and names the WARNING prefix the renderer
-    /// prints; the old line it told readers to ignore is gone.
+    /// verifies the unchanged code, names the WARNING prefix the renderer
+    /// prints, and quotes no `WARNING: env divergence` line, a prefix the
+    /// renderer does not print.
     #[test]
     fn the_getting_started_tutorial_quotes_the_environment_lines_the_resim_prints() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -27430,7 +27465,8 @@ mod env_divergence_tests {
         );
         assert!(
             !tutorial.contains("WARNING: env divergence"),
-            "the old line is gone from the tutorial"
+            "the tutorial must not quote the `WARNING: env divergence` prefix, which the \
+             renderer does not print"
         );
     }
 }
