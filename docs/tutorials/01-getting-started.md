@@ -53,11 +53,12 @@ Three nodes forming a reactive pipeline:
   own `cargo`.
 
   Build the nodes below with Rust 1.95 or newer. Native libraries use a stable
-  boundary, so their compiler need not match the CLI. On Homebrew and apt,
-  `cerulion-install-rust` installs the tested compiler; put
-  `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. Workspace creation may record
-  that compiler as a reproducible default when it is already installed, and
-  otherwise keeps the compiler your environment selects.
+  boundary, so their compiler need not match the CLI. The installer above
+  installs current stable Rust when no Rust 1.95 or newer is there. On Homebrew
+  and apt, `cerulion-install-rust` does the same; put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. If Rust is still
+  missing when you create a workspace or build a node, the CLI offers to install
+  it. A new workspace names no compiler, so it uses the one your environment
+  selects.
 
 Every step below is a `cerulion` verb. You never run `cargo` yourself and you never
 write a `main`: a node is a library the runtime loads, and the graph file is the

@@ -78,7 +78,7 @@ Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-c
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
 ```
 
-In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with. To remove it, run the same script with `sh -s -- --uninstall`.
+In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also sets up Rust for building nodes: a Rust 1.95 or newer that is already there is left as it is, and otherwise it installs current stable Rust through rustup. To remove it, run the same script with `sh -s -- --uninstall`.
 
 **Homebrew**
 
@@ -104,7 +104,7 @@ keyring=$(mktemp) &&
 
 The first line installs the three programs the second needs. The second is one chain, where every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the key the archive signs with, stops it before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprints in the same form, lists both during a key rotation, and carries a longer form of this recipe that names which step failed.
 
-Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
+Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once, which installs current stable Rust unless a Rust 1.95 or newer is already there, and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. On a terminal, `cerulion workspace create` and `cerulion node build` offer to install it when Rust 1.95 or newer is missing.
 
 <details>
 <summary>Build the CLI from crates.io</summary>
@@ -119,7 +119,7 @@ The release installer places `cerulion-connectd` (the desk side of a remote conn
 
 Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs: Jazzy on Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64: unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI but has not been run on a robot, and unlike the Jazzy package it is not installed in a clean container before release.
 
-Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Native node libraries use a stable ABI and can load across Rust compiler versions and CLI updates while boundary major 1 remains supported. Rebuild existing node libraries once with `cerulion node build <node>`. The [installation details](docs/install.md) cover the toolchain setup and workspace selection.
+Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Native node libraries use a stable ABI and can load across Rust compiler versions and CLI updates while boundary major 1 remains supported. Rebuild existing node libraries once with `cerulion node build <node>`. The [installation details](docs/install.md) cover the toolchain setup.
 
 ## How it fits together
 
