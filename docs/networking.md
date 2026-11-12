@@ -110,7 +110,13 @@ resolves to exactly one of these, in evaluation order:
 not a deployment, so it stays LOCAL-ONLY by design (its transport is built
 `network: None`; it never resolves a network). Re-execution
 (`cerulion bag play <bag> --resim all`) is likewise network-inert by
-construction (the bag is the input, and a replay must match the live run).
+construction (the bag is the input, and a replay must match the live run):
+it runs on a private shared-memory namespace, so neither `cerulion-netd` nor
+`cerulion-remoted` on the same machine sees its frames. Cerulion opens no
+network session for it, but a re-executed node that drives hardware or
+another network directly (for example a robot's own command channel opened
+in `init`) still does so; run a resim of such a node only where its devices
+are safe to drive or disconnected.
 
 ## Local inspection and compatibility
 
@@ -831,7 +837,9 @@ workarounds:
 - drop `--record` to keep the network live.
 
 Re-execution (`cerulion bag play <bag> --resim all`) is structurally
-network-inert (the bag is the input, and a replay must match the live run).
+network-inert (the bag is the input, and a replay must match the live run):
+Cerulion opens no network session for it. A re-executed node's own device
+or network I/O still runs; see [The decision matrix](#the-decision-matrix).
 
 ## CLI introspection: `topic list`
 
