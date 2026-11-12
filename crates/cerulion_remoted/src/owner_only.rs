@@ -207,6 +207,18 @@ pub(crate) fn read_owner_only(
     Ok(Some(bytes))
 }
 
+/// The user this process runs as (its effective user id), read from the peer
+/// credentials of a connected anonymous socket pair, which opens no listening
+/// or remote endpoint. It needs a Tokio runtime with its I/O driver enabled:
+/// outside any runtime it is an error, and in a runtime built without I/O it
+/// panics.
+pub(crate) fn effective_uid() -> std::io::Result<u32> {
+    tokio::runtime::Handle::try_current()
+        .map_err(|_| std::io::Error::other("reading the user id needs a Tokio I/O runtime"))?;
+    let (socket, _peer) = tokio::net::UnixStream::pair()?;
+    Ok(socket.peer_cred()?.uid())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +534,22 @@ mod tests {
         assert_eq!(
             read_owner_only(&path, MAX, "the file", ExpectedOwner::Directory),
             Err("the file is 257 bytes, above the 256-byte bound".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_uid_is_the_owner_of_a_directory_this_process_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(dir.path()).unwrap().uid();
+        assert_eq!(effective_uid().unwrap(), owner);
+    }
+
+    #[test]
+    fn effective_uid_outside_a_runtime_is_an_error() {
+        let error = effective_uid().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "reading the user id needs a Tokio I/O runtime"
         );
     }
 }

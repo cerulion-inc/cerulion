@@ -9,7 +9,7 @@
 //! disconnect cannot strand safety state, and an armed pairing code's source,
 //! which holds the fence from the arm until the code's end is written and never
 //! past its window plus a margin (an exhausted code to that margin); the
-//! pair-code arm step takes a PairCode guard while it arms a request. Both
+//! pair-code poller takes a PairCode guard while it arms a request. Both
 //! admissions log through `admit_logged`. The native exclusive fence used by
 //! netd prevents fresh work from racing a committed idle stop.
 

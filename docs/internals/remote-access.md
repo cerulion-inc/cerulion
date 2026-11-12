@@ -83,7 +83,9 @@ the same entry instead of running the daemon.
   participant that returns an error, panics or is cancelled never stops a later
   one; `serve_planes` returns `RemotedError::Shutdown` naming each. `serve_core`
   then ends the rcpd e-stop delivery in flight (at most 5 s) and stops the
-  epoch poller, failed stage or not, and logs that it did; the entry closes the
+  epoch poller and, on the daemon, the pair-code poller (section 7), failed
+  stage or not, and logs that the e-stop sender and the epoch poller are
+  stopped; the entry closes the
   endpoint (about 3 s with default parameters, longer on a high round-trip
   path), and the runtime teardown waits for the work left on the blocking pool,
   such as a running ops verb. The exit status is 0, also when the stop started
@@ -797,9 +799,9 @@ every slot is taken.
   spawns one reader per accepted topic; the whole loop is pinned over real
   loopback iroh + real per-test SHM roots by `reinject_e2e_test.rs`.
 - **`cerulion pair`** is a hidden stub: no robot-side verb arms a pairing code
-  (`SharedCodePairSessions::arm` in `cerulion_remoted::pairing_verbs` is called
-  only by `PairCodeArm`, which no daemon or host runs), so `dispatch` in
-  `main.rs` refuses every spelling
+  (the daemon arms one only from a request file a step on the robot leaves,
+  below, and no `cerulion` verb writes that file), so `dispatch` in `main.rs`
+  refuses every spelling
   with `PAIR_UNAVAILABLE_MSG` and exit 2 above the login gate, and sends only
   its `cli_command_run` (verb `pair`, exit 2). The ceremony below lives on in
   `cerulion_cli_engine::pair_cmd` and `cerulion-connectd pair`, which no
@@ -827,7 +829,97 @@ every slot is taken.
   lists, error prose) is sanitized + length-bounded where it enters an error or
   a log line; `sanitize_peer_text` is the ONE policy, re-exported so the binary
   renders the catalog through it too (`connectd/src/lib.rs`, `pair.rs`).
-- `SharedCodePairSessions` keeps the armed code's ledger. Every desk shares
+- **The code a desk types is armed on the robot**, from a file, never over the
+  network: there is no ops verb and no authorizer cell for it. A step on the
+  robot, run as the user that owns `<state_root>/remoted/`, leaves
+  `pair-code.request` there, mode 0600, through a staging file whose name
+  starts with `.pair-code.request.` (`REQUEST_STAGING_PREFIX`, for example
+  `.pair-code.request.<pid>.tmp`) and a rename:
+  one line `cerulion-pair-code-request/1 <nonce> <code>`, the nonce 32
+  lowercase hex digits, the code exactly `CODE_LEN` ASCII digits
+  (`cerulion_pairing::pair_code` holds the grammar, the writer's rule and the
+  consts `CODE_LEN`, `PAIR_CODE_TRIES`, `PAIR_CODE_WINDOW`,
+  `PAIR_CODE_RATE_INTERVAL`, `POLL_INTERVAL` and `MAX_FILE_BYTES`,
+  oracle-tested in-module).
+  Only the daemon arms a code; a library host never does
+  (`cerulion_remoted::pair_code_request`). In `serve_core`, before the
+  `listening` line and whatever user the daemon runs as, `StartSweep::run`
+  removes every `pair-code.*` and `.pair-code.*` file in the directory: a
+  request left before that removal, by this start or an earlier run, is never
+  armed, and one left after the `listening` line is this run's to arm. While
+  the directory cannot be listed or a file left before the start cannot be
+  removed, no request is claimed: each poll tries the removal again first
+  (`FailureRegimeLatch`, counted), and the removal that then succeeds also
+  removes every request and staging file left in the meantime, unarmed and
+  unanswered. A writer cannot see when the removal ran, so when its request is
+  gone and no result naming its nonce appears within two poll intervals, it
+  leaves the request once more: a refused request is refused again, and an
+  armed one is armed again, its window counted from the new arm (no readiness
+  lock is used). The poller then looks every `POLL_INTERVAL`, and at once when
+  the code's state changes, beside the epoch poller under its own abort guard.
+  When a request is there it first takes a `HoldReason::PairCode` serving hold
+  (the enum lives in `cerulion_netd::serving_hold`), so a hold that is refused
+  during a stop for idle leaves the request on disk for the next look; it then
+  claims the request by renaming it to `pair-code.request.applying`; reads it
+  only when the directory and the file are owned by the user the daemon runs
+  as and give their group and others no permission bit, the file is a regular
+  single-link file of at most `MAX_FILE_BYTES` bytes, neither the directory
+  nor the file is a symbolic link (each is opened without following one at
+  its last component), and both are inspected through their open handles
+  (`owner_only.rs`, which also reads the fetched epoch); removes the claimed
+  file, and refuses the request when that fails or the file was gone before it
+  was read; arms the code under `PAIR_CODE_POLICY` (a window of
+  `PAIR_CODE_WINDOW` and `PAIR_CODE_TRIES` tries every desk shares); then
+  writes `pair-code.result`, mode 0600, staged and renamed:
+  `cerulion-pair-code-result/1 <nonce> <status> <reason> <eid> <ttl_s> <tries>
+  <failed> <desk_account> <desk_label>`, status `armed`, `paired`,
+  `exhausted`, `expired` or `refused`, the reason `-` unless refused, the desk
+  fields `-` unless paired, never the code. A result that cannot be written
+  disarms the code, which leaves no code armed (the arm replaced any earlier
+  one). A claimed request that arms no code is answered `refused` with a
+  `PairCodeRefusal` reason, each with one user text const in
+  `cerulion_pairing::pair_code`: `unreadable` (the owner-only read or the
+  removal of the claimed file failed), `malformed` (it does not parse) or
+  `unconfirmed` (its result could not be built or written), the nonce `-` when
+  the request was not parsed. The result answers the request claimed last, so
+  a refusal disarms the code an earlier request armed; it is counted in the
+  store (`SharedCodePairSessions::requests_refused`) and logged once at warn
+  (`REFUSED_LINE`, with `refusal`, `reason` and `requests_refused`). A refused
+  result that cannot be written is retried on each look, and the result file
+  is removed meanwhile, so no result names a code that is gone; a removal that
+  fails is logged at error. From then on `PairCodeArm::report` checks after
+  every look and whenever the store announces a change, and writes the result
+  again when the code's state changed since the last write; a write that fails
+  is counted and retried on the next look; a window that passes with no desk
+  acting is written as `expired`. A newer request's code replaces the armed
+  code and its nonce in the result, and a refusal replaces the armed code too,
+  once a right code's row being saved is saved (arms and disarms wait for the
+  save): an end the replaced code reached that the result does not state yet,
+  a desk's pairing included, is logged and written first, as that code's last
+  result (the pure `unwritten_end`). A last result that cannot be built or
+  written, for a replaced code or at the stop, is counted, logged
+  (`LAST_WRITE_FAILED_LINE`) and not written again, and the result file is
+  removed, so no result names a code that is gone. A claim, a removal, a
+  hold, a result write or a look that keeps failing is logged through
+  `FailureRegimeLatch`; a look
+  fails when it panics, and the poll loop counts it
+  (`PairCodeArm::look_failures`) and goes on. Arming stops on a stop request
+  before the shutdown stage runs, and again at the start of the teardown on
+  every path, a close of the endpoint's own included (a second stop does
+  nothing): the stop waits for a look or a write in progress, then disarms the
+  store once a right code's row being saved is saved (and a start's CPace step
+  has ended), so no desk pairs afterwards, and writes the result's last state:
+  the code's own end when the result does not state it yet, a pairing
+  included, `refused` with the reason `stopping` for a code with no end yet
+  (logged at info, `WITHDRAWN_LINE`, and counted as a refusal), or a refusal
+  not yet written. After it returns no further code is armed and no result is
+  written, and a later look leaves a request where it is, for the next start
+  to remove. A stop on the blocking pool that does not run to its end (it
+  panics or is cancelled) is counted (`PairCodeArm::stop_failures`) and logged
+  through a failure regime (`STOP_FAILED_LINE`). The armed code lives in
+  memory: a restart disarms it.
+
+  `SharedCodePairSessions` keeps the armed code's ledger. Every desk shares
   one budget of tries. `code-pair-start` admits a try while one is left,
   inside the window, and at least `PAIR_CODE_RATE_INTERVAL` after the robot's
   last admitted try, whatever code that was for (a new arm does not reset it);
@@ -881,20 +973,22 @@ every slot is taken.
   robot and is told the code was used up), and never past the window plus
   `HOLD_MARGIN`; which written ends release the hold at once is the pure
   `written_end_releases_hold`. That source and the `PairCode`
-  guard the arm step holds while it arms a request are all a code adds to the
+  guard the poller holds while it arms a request are all a code adds to the
   fence: a bootstrap-only ops session (`claim`, certificate `pair`,
   `present-grant` or `code-pair-*` from a key that is not paired) holds no
   guard of its own whether or not a code is armed (section 5), so no peer that
   is not paired holds the robot serving past the code's end being written or
   its window plus `HOLD_MARGIN`, however it reconnects, and a desk that pairs
   with the code runs its later calls fenced. While no code holds serving and
-  netd's idle stop is committed, the arm step's `PairCode` guard is refused, so
-  no code is armed then.
-  The wire `status` reply carries the armed code's state as `pair_code`
-  (`status`, `tries`, `failed`), and the refused requests as
-  `pair_code_refused`, absent while none was, next to `log_lines_dropped`.
-  Pinned over the real ops plane by `ops_loopback_test.rs` and against the
-  wall clock by `code_pair_account_test.rs`.
+  netd's idle stop is committed, the poller's `PairCode` guard is refused, so
+  no code is armed then. The wire `status` reply
+  carries the armed code's state as `pair_code` (`status`, `tries`,
+  `failed`), and the refused requests as `pair_code_refused`, absent while
+  none was, next to `log_lines_dropped`. Pinned through `serve_endpoint` by
+  `pair_code_request_test.rs`, through the binary by `pair_code_daemon_test.rs`,
+  over the real ops plane by `ops_loopback_test.rs`, against the wall clock by
+  `code_pair_account_test.rs`, and for the library host by
+  `remote_plane_library_test.rs`.
 
 ## 8. netd's iroh WAN plane (the dual-plane fold)
 
@@ -1171,7 +1265,9 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   plane answers every request with an error until it is a regular file only
   its owner has any permission on), `beacon_facts.json` (PUBLIC endpoint facts: eid, bound UDP port,
   claimable, for the gateway's mDNS TXT enrichment; no MAC because no secrets;
-  `beacon_facts_test.rs`).
+  `beacon_facts_test.rs`), and the code-pairing handoff (`pair-code.request`,
+  its `.applying` claim, `pair-code.result`; section 7), every file of which
+  the daemon removes when it starts, before it logs that it is listening.
 
   An empty trust-store MAC key file is refused while a trust store or device
   index exists (`RemotePlane::bind`), and the error names the file. A
@@ -1236,7 +1332,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/daemon_stop_signal_test.rs` | The real binary: SIGTERM and Ctrl-C stop it gracefully with exit 0 and the teardown line; a test-seam stage participant that never finishes is ended by `CERULION_REMOTED_HARD_EXIT_MS` with status 4, also when the endpoint's own close (a test seam) started the stop with no signal; a second signal during the stop exits 4 long before the deadline; after the endpoint's own close, the first stop signal exits 4 as a second one does; a participant that fails exits 3 after the teardown ran; the stage runs before the rcpd e-stop sender is stopped; with stderr full the deadline still exits 4, a graceful stop exits 0, and a graceful stop waits for its queued lines until the pipe drains |
 | `crates/cerulion_remoted/tests/estop_full_stderr_test.rs` | The real binary with its stderr pipe full and a log queue of one line (test seam): an rcp `estop` and an ops `engage-estop` each reach a stand-in rcpd within 5 s, with the desk's caller; `status` counts two or more dropped lines while the pipe is full; once it drains, the warn drop line and the info caught-up line are written, and every line `status` then counts is named by them or by a later drop or caught-up line |
 | `crates/cerulion_remoted/tests/shutdown_stage_test.rs` | `serve_planes` drops its shutdown future before the stage, on a stop request (endpoint open during the stage) and when the endpoint closes on its own (endpoint closed), and before the line that says the loop stopped; `run` under the kill switch drops it before its warn line; the drop before the endpoint-closed stop line and before the kill-switch warn is pinned against a log writer that blocks |
-| `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, key provider error arms |
+| `crates/cerulion_remoted/tests/remote_plane_library_test.rs` | The library entry: temp state root, in-memory keys, catalog through the injected control socket or an in-process schema source, a fresh state root refused before any write, daemon-only verbs refused, no pairing code armed from a request file, key provider error arms |
 | `crates/cerulion_connectd/tests/act_network_switch_test.rs` | The real `cerulion-connectd act` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same call dials it |
 | `crates/cerulion_connectd/tests/rcp_network_switch_test.rs` | The real `cerulion-connectd rcp` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same command dials it |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
@@ -1249,7 +1345,9 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
 | `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused; a wall-clock step neither stretches nor cuts the code window |
-| `cerulion_pairing::pair_code`, `cerulion_remoted::{pair_code_request, owner_only, pairing_verbs, wire}`, `cerulion_wireclient::protocol` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, pending tries held until their sessions end and answered as in progress, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, the hold's hard end, the pure `written_end_releases_hold` table (paired and expired release at once, exhausted serves to the hard end), a start's CPace step run with the state lock released (a session opens and closes meanwhile), a code that ends during the step refusing the try (expired counted, paired uncounted), arms and disarms waiting for a start in progress and a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict; a request that is not owner-only or well formed arms nothing, is removed and is answered `refused` and counted, and replaces the code an earlier request armed, its refusal logged once, and an unreadable, a malformed and an unconfirmed request answered identically on two runs; a directory that cannot be listed or a leftover that cannot be removed holds every request; a refused serving hold leaves the request; the result written on each change, including an end first found by a refused start or a session end and a wrong-tag finish, and the serving fence held from the arm until a `paired` or `expired` end is written and an `exhausted` one until its hard end, held through a failed write of each end; a failing result write counted and retried; a newer request replacing the code and its nonce, and one whose result cannot be written leaving no code and answered `unconfirmed` once a write works, a result file that cannot be removed logged at error; a refused or newer request first logging and writing each end the replaced code reached that the result does not state yet (a pairing, used-up tries, a quiet window), also while its row is saved, never an end already written or one of a code another armed, identically on two runs, and a last result that cannot be written counted, logged and its result file removed; the pure `unwritten_end` table; a stopped arm step arms and writes nothing, withdraws the armed code as `refused` `stopping`, writes a pairing or a refusal the result does not state yet, leaves a written end, removes the result when its last write fails, and gives identical results on two runs; the shared admission's refusal and recovery lines; the `status` reply's `pair_code` and `pair_code_refused` fields on the robot and on the desk |
+| `crates/cerulion_remoted/tests/pair_code_request_test.rs` | Through `serve_endpoint`: a request file the robot leaves is armed by the daemon's poller, its result names the nonce and the endpoint id and never the code, one desk pairs over the ops plane (row read from disk), the result reads `paired` with its account and label, the wire `status` reports it, and a second desk is refused as used; three desks with a wrong code that drop their connections use the shared tries up (`exhausted`, 3 of 3), the code keeps `serving.hold` taken past that result over a bounded watch, and a fourth with the right code reaches the robot and is refused; while the code is armed and no paired connection is open the code's own hold keeps `serving.hold` taken, an ops session of a desk that is not paired, opened before the code, while it is live or after its end, holds nothing, and once a desk pairs with the code the fence is free with those sessions still open; a claimed request that is not owner-only or does not parse is answered `refused` (`unreadable` with the nonce `-`, `malformed`), replaces the paired code and is counted in the wire `status` as `pair_code_refused`; a stop request and a close of the endpoint's own each withdraw the armed code, its result `refused` with the reason `stopping`; files an earlier run left are removed before the ops plane answers and arm nothing; no poller outlives the serve |
+| `crates/cerulion_remoted/tests/pair_code_daemon_test.rs` | The real binary: the handoff files left before the start are removed before the `listening` line and a request left right after it is armed, and the armed code holds the serving fence; a code armed before a stop request is withdrawn before the shutdown stage runs, its result `refused` with the reason `stopping`; a request left while a stop request's shutdown stage runs is not armed |
+| `cerulion_pairing::pair_code`, `cerulion_remoted::{pair_code_request, owner_only, pairing_verbs, wire}`, `cerulion_wireclient::protocol` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, pending tries held until their sessions end and answered as in progress, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, the hold's hard end, the pure `written_end_releases_hold` table (paired and expired release at once, exhausted serves to the hard end), a start's CPace step run with the state lock released (a session opens and closes meanwhile), a code that ends during the step refusing the try (expired counted, paired uncounted), arms and disarms waiting for a start in progress and a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict; a request that is not owner-only or well formed arms nothing, is removed and is answered `refused` and counted, and replaces the code an earlier request armed, its refusal logged once, and an unreadable, a malformed and an unconfirmed request answered identically on two runs; a directory that cannot be listed or a leftover that cannot be removed holds every request; a refused serving hold leaves the request; the result written on each change, including an end first found by a refused start or a session end and a wrong-tag finish, and the serving fence held from the arm until a `paired` or `expired` end is written and an `exhausted` one until its hard end, held through a failed write of each end; the poll loop writing a quiet expiry with no change announced, and going on after looks that panic, each counted and logged through the regime, and a stop that panics counted and logged the same way; a failing result write counted and retried; a newer request replacing the code and its nonce, and one whose result cannot be written leaving no code and answered `unconfirmed` once a write works, a result file that cannot be removed logged at error; a refused or newer request first logging and writing each end the replaced code reached that the result does not state yet (a pairing, used-up tries, a quiet window), also while its row is saved, never an end already written or one of a code another armed, identically on two runs, and a last result that cannot be written counted, logged and its result file removed; the pure `unwritten_end` table; a stopped arm step arms and writes nothing, withdraws the armed code as `refused` `stopping`, writes a pairing or a refusal the result does not state yet, leaves a written end, removes the result when its last write fails, and gives identical results on two runs; the shared admission's refusal and recovery lines; the `status` reply's `pair_code` and `pair_code_refused` fields on the robot and on the desk |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,

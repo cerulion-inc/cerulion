@@ -16,7 +16,8 @@
 //! first, and the removal that then succeeds also removes every request and
 //! staging file left in the meantime, unarmed and unanswered.
 //!
-//! A look for a request ([`PairCodeArm::apply_request`]):
+//! [`PairCodeArm`] looks for a request every [`POLL_INTERVAL`]
+//! ([`PairCodeArm::apply_request`]):
 //!
 //! 1. When a request is there, it takes a serving hold ([`HoldReason::PairCode`])
 //!    before it claims the request, so the daemon is not stopped for idle while
@@ -62,11 +63,12 @@
 //! be built (a policy with a window under one second, which only a test sets)
 //! is not written, and the result file is removed.
 //!
-//! From then on [`PairCodeArm::report`] writes the result again when the
-//! code's state changed since the last write: the failed count, then `paired`
-//! with the desk's account and label, `exhausted` or `expired`. A window that
-//! passes with no desk acting is written as `expired`. Once a paired or
-//! expired end is written the code's serving hold is released
+//! From then on [`PairCodeArm::report`] checks after every look and whenever
+//! the store announces a change, and writes the result again when the code's
+//! state changed since the last write: the failed count, then `paired` with
+//! the desk's account and label, `exhausted` or `expired`. A
+//! window that passes with no desk acting is written as `expired`. Once a
+//! paired or expired end is written the code's serving hold is released
 //! ([`SharedCodePairSessions::release_hold`]); an exhausted code keeps the
 //! daemon serving until its window plus
 //! [`HOLD_MARGIN`](crate::pairing_verbs::HOLD_MARGIN), so a desk that arrives
@@ -83,39 +85,45 @@
 //! ([`LAST_WRITE_FAILED_LINE`]) and not written again, and the result file is
 //! removed, so no result names a code that is gone.
 //!
-//! A claim, a removal of the handoff files, a serving hold or a write of the
-//! result that keeps failing is logged at warn once and again at each
-//! tenfold count, and at debug with a count in between; a claim, a hold or a
-//! result write that works again after a suppressed repeat is logged at
-//! info, and so is the removal that lets requests be armed. A failed try is
-//! logged at info, a pairing and an expiry at info, and a code whose tries
-//! all failed at warn. [`PairCodeArm::claim_failures`],
-//! [`PairCodeArm::removal_failures`], [`PairCodeArm::admission_failures`] and
-//! [`PairCodeArm::report_failures`] count every failure.
+//! A claim, a removal of the handoff files, a serving hold, a write of the
+//! result, a look or a stop that keeps failing (a look fails when it panics,
+//! a stop when it panics or is cancelled before it runs) is logged at warn
+//! once and again at each tenfold count, and at debug with a count in
+//! between; a claim, a hold, a result write, a look or a stop that works again
+//! after a suppressed repeat is logged at info, and so is the removal that
+//! lets requests be armed. A failed try is logged at info, a pairing and an
+//! expiry at info, and a code whose tries all failed at warn.
+//! [`PairCodeArm::claim_failures`], [`PairCodeArm::removal_failures`],
+//! [`PairCodeArm::admission_failures`], [`PairCodeArm::report_failures`],
+//! [`PairCodeArm::look_failures`] and [`PairCodeArm::stop_failures`] count
+//! every failure.
 //!
-//! [`PairCodeArm::stop_arming`] waits for a look or a write in progress to
-//! end, then withdraws the armed code once a right code's row being saved is
-//! saved, so no desk pairs with it afterwards, and writes what the result is
-//! to say last: the code's own end when it reached one the result does not
-//! state yet, `refused` with the reason `stopping` when it reached none, or a
-//! refusal not yet written. After it returns, no further code is armed and no
-//! result is written, and a look that starts later leaves a request where it
-//! is. The armed code is held in memory only: a restart of the daemon disarms
-//! it. Nothing here is reachable from the network.
+//! [`PairCodeArm::stop_arming`], which the daemon calls through
+//! [`PairCodeArm::stop`] on a stop request before the shutdown stage runs, and
+//! once the stage returned on every path, waits for a look or a write in
+//! progress to end, then withdraws the armed code once a right code's row
+//! being saved is saved, so no desk pairs with it afterwards, and writes what
+//! the result is to say last: the code's own end when it reached one the
+//! result does not state yet, `refused` with the reason `stopping` when it
+//! reached none, or a refusal not yet written. After it returns, no further
+//! code is armed and no result is written, and a look that starts later
+//! leaves a request where it is. The armed code is held in memory only: a
+//! restart of the daemon disarms it. Nothing here is reachable from the
+//! network.
 
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cerulion_core::transport::failure_regime_latch::{
     lock_regime_latch, FailureRegimeLatch, RegimeDecision,
 };
 use cerulion_pairing::pair_code::{
     is_handoff_file, PairCodeNonce, PairCodeRefusal, PairCodeRequest, PairCodeResult,
-    PairCodeState, PairCodeStatus, CLAIMED_FILE, MAX_FILE_BYTES, PAIR_CODE_POLICY, REQUEST_FILE,
-    RESULT_FILE, RESULT_STAGING_FILE,
+    PairCodeState, PairCodeStatus, CLAIMED_FILE, MAX_FILE_BYTES, PAIR_CODE_POLICY, POLL_INTERVAL,
+    REQUEST_FILE, RESULT_FILE, RESULT_STAGING_FILE,
 };
 use cerulion_pairing::pake::CeremonyConfig;
 use cerulion_pairing::PairingError;
@@ -144,10 +152,20 @@ pub const EXPIRED_LINE: &str = "cerulion_remoted: the pairing code expired and n
 pub const REFUSED_LINE: &str = "cerulion_remoted: refused a pair-code request; no code is armed \
                                 for it";
 /// The line logged at info, with `failed`, `tries` and `requests_refused`,
-/// when a stop of arming ([`PairCodeArm::stop_arming`]) withdrew a code no
-/// desk paired with.
+/// when the daemon's stop withdrew a code no desk paired with.
 pub const WITHDRAWN_LINE: &str = "cerulion_remoted: the daemon stops; the armed pairing code is \
                                   withdrawn and no desk can pair with it";
+/// The line logged at warn, and at debug while suppressed, with `error` and
+/// `total_failures`, when a look ended in a panic.
+pub const LOOK_FAILED_LINE: &str = "cerulion_remoted: a pair-code look ended in a panic; the \
+                                    poller looks again at the next poll";
+/// The line logged at warn, and at debug while suppressed, with `error` and
+/// `total_failures`, when the stop on the blocking pool
+/// ([`PairCodeArm::stop`]) did not run to its end: it panicked, or it was
+/// cancelled before it ran.
+pub const STOP_FAILED_LINE: &str = "cerulion_remoted: the pair-code stop did not run to its end; \
+                                    the armed code may not be withdrawn and its last result may \
+                                    not be written";
 /// The line logged at warn, and at debug while suppressed, with `error`,
 /// `path` and `total_failures`, when the last result for a code the arm step
 /// replaced or withdrew could not be written; the result file is removed.
@@ -206,7 +224,7 @@ pub enum ArmOutcome {
         /// Why.
         reason: String,
     },
-    /// Arming is stopped ([`PairCodeArm::stop_arming`]): no request is claimed.
+    /// The daemon's stop started: no request is claimed.
     Stopping,
 }
 
@@ -215,7 +233,7 @@ pub enum ArmOutcome {
 pub enum ReportOutcome {
     /// Nothing to write: no code this step armed and no refusal waits to be
     /// written, the state is already written, a newer arm replaced the code,
-    /// or arming is stopped.
+    /// or the daemon's stop started.
     Nothing,
     /// The result now states `status`.
     Written(PairCodeStatus),
@@ -321,6 +339,8 @@ pub struct PairCodeArm {
     claim_failures: Mutex<FailureRegimeLatch>,
     admission_failures: Mutex<FailureRegimeLatch>,
     report_failures: Mutex<FailureRegimeLatch>,
+    look_failures: Mutex<FailureRegimeLatch>,
+    stop_failures: Mutex<FailureRegimeLatch>,
     answer: Mutex<Option<Answer>>,
     /// Set by [`PairCodeArm::stop_arming`]; held across a look and a write.
     stopped: Mutex<bool>,
@@ -357,6 +377,8 @@ impl PairCodeArm {
             claim_failures: Mutex::new(FailureRegimeLatch::new()),
             admission_failures: Mutex::new(FailureRegimeLatch::new()),
             report_failures: Mutex::new(FailureRegimeLatch::new()),
+            look_failures: Mutex::new(FailureRegimeLatch::new()),
+            stop_failures: Mutex::new(FailureRegimeLatch::new()),
             answer: Mutex::new(None),
             stopped: Mutex::new(false),
         }
@@ -383,6 +405,17 @@ impl PairCodeArm {
     /// replaced or withdrew.
     pub fn report_failures(&self) -> u64 {
         lock_regime_latch(&self.report_failures).total_failures()
+    }
+
+    /// Every look of the poll loop that ended in a panic.
+    pub fn look_failures(&self) -> u64 {
+        lock_regime_latch(&self.look_failures).total_failures()
+    }
+
+    /// Every stop on the blocking pool ([`PairCodeArm::stop`]) that did not
+    /// run to its end.
+    pub fn stop_failures(&self) -> u64 {
+        lock_regime_latch(&self.stop_failures).total_failures()
     }
 
     /// Arm the code of [`REQUEST_FILE`] if one is there (see the module docs).
@@ -877,6 +910,119 @@ impl PairCodeArm {
         self.write_last(result);
     }
 
+    /// [`PairCodeArm::stop_arming`] on the blocking pool, so the wait for a
+    /// look in progress blocks no runtime worker. A stop that does not run to
+    /// its end (it panics, or is cancelled before it runs) is counted
+    /// ([`PairCodeArm::stop_failures`]) and logged through a failure regime
+    /// ([`STOP_FAILED_LINE`]).
+    pub async fn stop(self: Arc<Self>) {
+        self.stop_with(PairCodeArm::stop_arming).await;
+    }
+
+    /// [`PairCodeArm::stop`] with `stop` as the work run on the blocking pool.
+    async fn stop_with(self: Arc<Self>, stop: fn(&PairCodeArm)) {
+        let arm = Arc::clone(&self);
+        let ended = tokio::task::spawn_blocking(move || stop(&arm)).await;
+        self.stop_ended(ended);
+    }
+
+    /// Count and log a stop that did not run to its end, and log the first
+    /// stop that ends normally after suppressed ones.
+    fn stop_ended(&self, ended: Result<(), tokio::task::JoinError>) {
+        let mut latch = lock_regime_latch(&self.stop_failures);
+        match ended {
+            Ok(()) => {
+                if let Some(suppressed) = latch.on_success() {
+                    let total_failures = latch.total_failures();
+                    drop(latch);
+                    tracing::info!(
+                        suppressed,
+                        total_failures,
+                        "cerulion_remoted: pair-code stops end normally again"
+                    );
+                }
+            }
+            Err(error) => {
+                let decision = latch.on_failure();
+                let total_failures = latch.total_failures();
+                drop(latch);
+                match decision {
+                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                        tracing::warn!(error = %error, total_failures, "{STOP_FAILED_LINE}")
+                    }
+                    RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                        error = %error,
+                        total_failures,
+                        suppressed,
+                        "{STOP_FAILED_LINE}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Look for a request and write the result every [`POLL_INTERVAL`], and
+    /// at once when the store's state changes, until the task is dropped. A
+    /// look that panics is counted ([`PairCodeArm::look_failures`]) and logged
+    /// through a failure regime, and the loop goes on.
+    pub async fn run(self: Arc<Self>) {
+        self.run_looks(Arc::new(|arm: &PairCodeArm| {
+            arm.apply_request();
+            arm.report();
+        }))
+        .await;
+    }
+
+    /// [`PairCodeArm::run`] with `look` as each look.
+    async fn run_looks(self: Arc<Self>, look: Arc<dyn Fn(&PairCodeArm) + Send + Sync>) {
+        let mut tick = tokio::time::interval(POLL_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                () = self.sessions.changed() => {}
+            }
+            let arm = Arc::clone(&self);
+            let look = Arc::clone(&look);
+            let ended = tokio::task::spawn_blocking(move || look(&arm)).await;
+            self.look_ended(ended);
+        }
+    }
+
+    /// Count and log a look that ended in a panic, and log the first look
+    /// that ends normally after suppressed ones.
+    fn look_ended(&self, ended: Result<(), tokio::task::JoinError>) {
+        let mut latch = lock_regime_latch(&self.look_failures);
+        match ended {
+            Ok(()) => {
+                if let Some(suppressed) = latch.on_success() {
+                    let total_failures = latch.total_failures();
+                    drop(latch);
+                    tracing::info!(
+                        suppressed,
+                        total_failures,
+                        "cerulion_remoted: pair-code looks end normally again"
+                    );
+                }
+            }
+            Err(error) => {
+                let decision = latch.on_failure();
+                let total_failures = latch.total_failures();
+                drop(latch);
+                match decision {
+                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                        tracing::warn!(error = %error, total_failures, "{LOOK_FAILED_LINE}")
+                    }
+                    RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                        error = %error,
+                        total_failures,
+                        suppressed,
+                        "{LOOK_FAILED_LINE}"
+                    ),
+                }
+            }
+        }
+    }
+
     /// Arm under `policy` in place of [`PAIR_CODE_POLICY`].
     #[cfg(test)]
     fn with_policy(mut self, policy: CeremonyConfig) -> Self {
@@ -943,7 +1089,6 @@ fn remove(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::sync::Arc;
 
     use cerud::error::CerudResult;
     use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey};
@@ -1765,6 +1910,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_stop_on_the_blocking_pool_stops_arming() {
+        let f = fixture();
+        let arm = Arc::new(f.rebuilt(StartSweep(Ok(0))));
+        Arc::clone(&arm).stop().await;
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(arm.apply_request(), ArmOutcome::Stopping);
+        assert_eq!(arm.stop_failures(), 0);
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_stop_that_panics_is_counted_logged_through_the_regime_and_the_recovery_once() {
+        let f = fixture();
+        let arm = Arc::new(f.rebuilt(StartSweep(Ok(0))));
+        leave(&f.dir, &request_line(CODE), 0o600);
+        assert_eq!(arm.apply_request(), ArmOutcome::Armed);
+        for _ in 0..2 {
+            Arc::clone(&arm)
+                .stop_with(|_| panic!("a stop panicked"))
+                .await;
+        }
+        assert_eq!(arm.stop_failures(), 2);
+        // A stop that runs to its end withdraws the code and ends the regime;
+        // a second one logs nothing more.
+        Arc::clone(&arm).stop().await;
+        Arc::clone(&arm).stop().await;
+        assert_eq!(arm.stop_failures(), 2);
+        assert_eq!(f.result(), refused_line(NONCE_HEX, "stopping", 0));
+        assert_nothing_armed(&f.sessions);
+        logs_assert(|logs| {
+            let loud = lines_with(logs, &["WARN", STOP_FAILED_LINE, "total_failures=1"]);
+            let quiet = lines_with(logs, &["DEBUG", STOP_FAILED_LINE, "total_failures=2"]);
+            let back = lines_with(
+                logs,
+                &[
+                    "INFO",
+                    "pair-code stops end normally again",
+                    "suppressed=1",
+                    "total_failures=2",
+                ],
+            );
+            let all_back = lines_with(logs, &["pair-code stops end normally again"]);
+            let expected = usize::from(cerulion_core::testing::debug_level_compiled_in());
+            if loud.len() != 1 || quiet.len() != expected || back.len() != 1 || all_back.len() != 1
+            {
+                return Err(format!("stop lines: {loud:#?} {quiet:#?} {back:#?}"));
+            }
+            Ok(())
+        });
+    }
+
     #[test]
     #[tracing_test::traced_test]
     fn a_result_that_cannot_be_written_disarms_the_code_and_is_answered_unconfirmed_once_it_can() {
@@ -2043,6 +2240,32 @@ mod tests {
             ReportOutcome::Written(PairCodeStatus::Armed)
         );
         assert_eq!(f.result(), line(NONCE_HEX, "armed", 1, "- -"));
+    }
+
+    #[tokio::test]
+    async fn the_poll_loop_writes_an_expiry_no_change_announces() {
+        let f = fixture();
+        leave(&f.dir, &request_line(CODE), 0o600);
+        let arm = Arc::new(f.rebuilt(StartSweep(Ok(0))));
+        assert_eq!(arm.apply_request(), ArmOutcome::Armed);
+        // The arm announced a change; take that announcement first, so only
+        // the loop's own looks can write what follows.
+        tokio::time::timeout(std::time::Duration::from_secs(5), f.sessions.changed())
+            .await
+            .expect("the arm is a change");
+        f.clock.set(T_ARM + TTL_NS + 1);
+        let task = tokio::spawn(Arc::clone(&arm).run());
+        let want = line(NONCE_HEX, "expired", 0, "- -");
+        let deadline = std::time::Instant::now() + 10 * POLL_INTERVAL;
+        while f.result() != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop did not write the expiry: {}",
+                f.result()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
     }
 
     /// How a desk or the clock brings the armed code to one of its ends.
@@ -2781,6 +3004,72 @@ mod tests {
         for (label, arm, state, want) in cases {
             assert_eq!(unwritten_end(2, &snapshot(arm, state)), want, "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_look_that_panics_is_counted_logged_and_the_loop_keeps_polling() {
+        let f = fixture();
+        let arm = Arc::new(f.rebuilt(StartSweep(Ok(0))));
+        let panics = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        let left = Arc::clone(&panics);
+        let look: Arc<dyn Fn(&PairCodeArm) + Send + Sync> = Arc::new(move |arm| {
+            if left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                panic!("a look panicked");
+            }
+            arm.apply_request();
+            arm.report();
+        });
+        let task = tokio::spawn(Arc::clone(&arm).run_looks(look));
+        leave(&f.dir, &request_line(CODE), 0o600);
+        let deadline = std::time::Instant::now() + 20 * POLL_INTERVAL;
+        while !f.dir.join(RESULT_FILE).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop stopped polling after a panic"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
+        assert_eq!(arm.look_failures(), 2);
+        assert_eq!(panics.load(Ordering::SeqCst), 0);
+        assert_eq!(f.result(), line(NONCE_HEX, "armed", 0, "- -"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn each_look_that_panics_is_logged_through_the_regime_and_the_recovery_once() {
+        let f = fixture();
+        // A JoinError of a panicked task is what the loop hands over; a
+        // runtime makes one.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let join_error = || {
+            runtime
+                .block_on(async { tokio::task::spawn_blocking(|| panic!("a look panicked")).await })
+                .unwrap_err()
+        };
+        f.arm.look_ended(Err(join_error()));
+        f.arm.look_ended(Err(join_error()));
+        f.arm.look_ended(Ok(()));
+        f.arm.look_ended(Ok(()));
+        assert_eq!(f.arm.look_failures(), 2);
+        logs_assert(|logs| {
+            let loud = lines_with(logs, &["WARN", LOOK_FAILED_LINE, "total_failures=1"]);
+            let quiet = lines_with(logs, &["DEBUG", LOOK_FAILED_LINE, "total_failures=2"]);
+            let back = lines_with(
+                logs,
+                &["INFO", "pair-code looks end normally again", "suppressed=1"],
+            );
+            let expected = usize::from(cerulion_core::testing::debug_level_compiled_in());
+            if loud.len() != 1 || quiet.len() != expected || back.len() != 1 {
+                return Err(format!("look lines: {loud:#?} {quiet:#?} {back:#?}"));
+            }
+            Ok(())
+        });
     }
 
     #[test]

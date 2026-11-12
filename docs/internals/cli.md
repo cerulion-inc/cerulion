@@ -1230,8 +1230,8 @@ family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connec
 does. The hidden `pair` stub never reaches this check: `dispatch` answers it
 beside the removed `ros` family, above the switch and the gate, with
 `PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling, because no robot-side verb
-arms a pairing code (`SharedCodePairSessions::arm` is called only by `PairCodeArm`,
-which no daemon or host runs); its table row is `Expect::Runs`. `connect` prints a
+arms a pairing code (the daemon arms one only from a robot-local request file,
+which no `cerulion` verb writes); its table row is `Expect::Runs`. `connect` prints a
 `warning:` line of its own and exits 0, as its helper does, on the exact value `off`
 the helper reads, without resolving the robot or spawning the helper. A refusal now
 comes before the verb's other argument checks; `viz --robot` with no TOPIC is the one

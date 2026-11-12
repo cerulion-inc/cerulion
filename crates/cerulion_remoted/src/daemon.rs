@@ -34,6 +34,7 @@ use crate::epoch_pull::EpochPull;
 use crate::error::RemotedError;
 use crate::host::{OpsHost, PlaneFiles, DAEMON_SERVER_NAME};
 use crate::ops::OpsServing;
+use crate::pair_code_request::{PairCodeArm, StartSweep};
 use crate::pairing_verbs::SharedCodePairSessions;
 use crate::rcp::{RcpLink, RcpPlane};
 use crate::trust::SharedTrust;
@@ -398,13 +399,18 @@ pub async fn serve_endpoint(
 /// claim/pair takes effect at the next accept with no restart), the ops plane with the
 /// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
 /// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
-/// `shutdown`. On the daemon an armed pairing code keeps it serving until the
-/// code's end is written, and an exhausted code to its window plus a margin (a
-/// serving-hold source, bounded by that margin). The wire plane's `status`
-/// reports the armed code's state and the refused requests on every host. When
+/// `shutdown`. On the daemon it also arms pairing codes from request files in the
+/// remoted state directory ([`crate::pair_code_request`]): it removes the files of
+/// that handoff left before this start before it logs that it is listening,
+/// keeps serving while an armed code's end is not yet written, and an
+/// exhausted code to its window plus a margin (a serving-hold source, bounded
+/// by that margin), and stops arming, withdrawing the armed code and writing
+/// its last result, on a stop request before the shutdown stage runs and once
+/// the stage returned on every path. The wire plane's `status` reports the
+/// armed code's state and the refused requests on every host. When
 /// [`serve_planes`] returns, after its shutdown stage, it ends the rcpd e-stop
-/// delivery in flight and stops the epoch poller, then returns what
-/// `serve_planes` returned.
+/// delivery in flight and stops the epoch poller and the pair-code poller, then
+/// returns what `serve_planes` returned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_core(
     files: &PlaneFiles,
@@ -434,8 +440,9 @@ pub(crate) async fn serve_core(
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
     let sessions = SharedCodePairSessions::new();
-    // The wire plane's `status` reports the armed code of the SAME store the
-    // code-pair verbs read.
+    // The daemon arms codes into the SAME store the code-pair verbs read, and
+    // the wire plane's `status` reports that store's armed code.
+    let arm_sessions = sessions.clone();
     let status_sessions = sessions.clone();
     // The daemon's e-stop lease, for the rcp plane below: the same instance the
     // `engage-estop` and act verbs use, so its latch and its engage count are
@@ -484,6 +491,7 @@ pub(crate) async fn serve_core(
     } else {
         None
     };
+    let arm_holds = serving_holds.clone();
     let ops = Arc::new(OpsServing::for_host(
         ops_host,
         shared,
@@ -527,6 +535,15 @@ pub(crate) async fn serve_core(
         ))),
         _ => None,
     };
+    // On the daemon, the pair-code handoff files left before this start are
+    // removed before the listening line: a request left before the removal is
+    // never armed, and one left after the listening line is this run's to arm
+    // (once a removal has succeeded; see `pair_code_request`). A library host
+    // arms no code from a file.
+    let pair_code = match (server_name, files.beacon_facts_file.parent()) {
+        (DAEMON_SERVER_NAME, Some(dir)) => pair_code_arm(dir, arm_sessions, endpoint, arm_holds),
+        _ => None,
+    };
     tracing::info!(
         endpoint_id = %endpoint.id(),
         robot = %wire.robot(),
@@ -551,6 +568,18 @@ pub(crate) async fn serve_core(
         )
     });
     let poller = AbortOnDrop(pull.clone().map(|pull| tokio::spawn(pull.run())));
+    // The daemon's robot-local code arming, under its own guard. Arming stops,
+    // and the armed code is withdrawn with its last result written, on a stop
+    // request before the shutdown stage runs, and at the start of the
+    // teardown on every path (a second stop does nothing).
+    let pair_code_poller = AbortOnDrop(pair_code.clone().map(|arm| tokio::spawn(arm.run())));
+    let stop_arming = pair_code.clone();
+    let shutdown = async move {
+        shutdown.await;
+        if let Some(arm) = stop_arming {
+            arm.stop().await;
+        }
+    };
     let served = serve_planes(
         endpoint,
         classify,
@@ -563,25 +592,62 @@ pub(crate) async fn serve_core(
     .await;
     // `serve_planes` ran the ops plane's shutdown stage before it returned,
     // failed or not; the teardown below runs either way.
+    if let Some(arm) = pair_code {
+        arm.stop().await;
+    }
     if let Some(rcpd_estop) = rcpd_estop {
         rcpd_estop.shut_down().await;
     }
     poller.stop().await;
+    pair_code_poller.stop().await;
     tracing::info!("cerulion_remoted: the rcpd e-stop sender and the epoch poller are stopped");
     // The ops plane and its receipt sink stay alive until the teardown ends.
     drop(ops);
     served
 }
 
+/// The daemon's pair-code arm step over the remoted state directory `dir`, for
+/// the user this daemon runs as, arming under a hold from `holds`, after the
+/// handoff files left before this start are removed ([`StartSweep::run`],
+/// whatever that user is). `None`, logged at error, when that user cannot be
+/// read: no code is armed from a file this run.
+fn pair_code_arm(
+    dir: &Path,
+    sessions: SharedCodePairSessions,
+    endpoint: &Endpoint,
+    holds: Option<crate::serving_hold::ServingHolds>,
+) -> Option<Arc<PairCodeArm>> {
+    let start = StartSweep::run(dir);
+    match crate::owner_only::effective_uid() {
+        Ok(uid) => Some(Arc::new(PairCodeArm::new(
+            dir,
+            sessions,
+            *endpoint.id().as_bytes(),
+            uid,
+            holds,
+            start,
+        ))),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "cerulion_remoted: could not read the user this daemon runs as; no pairing \
+                 code is armed from a request file this run"
+            );
+            None
+        }
+    }
+}
+
 /// A spawned task aborted when this guard drops.
 struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
 
 impl AbortOnDrop {
-    /// Abort the task and wait for the aborted future to end. An apply already
+    /// Abort the task and wait for the aborted future to end. Work already
     /// handed to the blocking pool is not awaited: it runs to completion on its
-    /// own. That apply replaces the trust store by a rename in the same
-    /// directory, so the store file holds the old store or the new one, never
-    /// a torn one.
+    /// own. The epoch poller's apply replaces the trust store by a rename in the
+    /// same directory, so the store file holds the old store or the new one,
+    /// never a torn one. The pair-code poller's look arms nothing once
+    /// [`PairCodeArm::stop`] has returned, which the teardown awaits first.
     async fn stop(mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
