@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 /// First daemon protocol with the account access vocabulary.
 pub const MIN_DAEMON_VERSION: u32 = 9;
+/// First daemon with automatic account and paired robot catalogs.
+pub const REMOTE_DISCOVERY_MIN_DAEMON_VERSION: u32 = 10;
 /// Bound the account-service catalog and local control payload identically.
 pub const MAX_ROBOTS: usize = 4096;
 /// Total probe budget, below the control client's five-second round trip.
@@ -41,11 +43,12 @@ pub fn is_transient_busy(message: &str) -> bool {
     message == CONTROLLER_BUSY || message == IDENTITY_BUSY
 }
 
-/// How long a first-use caller waits one of those out before reporting it.
+/// How long directory installation waits one of those out before reporting it.
 ///
-/// It is at least as long as the daemon is willing to stay busy, so a client
-/// never gives up on a condition the daemon still considers normal; the
+/// It is at least as long as the daemon is willing to stay busy, so the
+/// installer never gives up on a condition the daemon still considers normal; the
 /// controller asserts that relationship against its own grace at compile time.
+/// Mirror acquisition has a separate attempt and time bound in the client.
 pub const TRANSIENT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Reserved identity route carried through existing robot-string fields.
@@ -209,6 +212,16 @@ fn validate_label(value: &str, max: usize, field: &str) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccountAccessRequest {
+    /// Replace the desk's explicit pairing pins, without connecting or granting access.
+    InstallPaired {
+        /// The complete local pin set; each remote robot still authorizes the desk.
+        robots: Vec<PairedRobot>,
+    },
+    /// Gather owned and paired robot catalogs under one total deadline.
+    Discover {
+        /// Includes endpoint startup, enrollment and metadata requests.
+        budget_ms: u64,
+    },
     /// Install a locally verified snapshot without connecting to any robot.
     Install {
         /// Complete replacement membership; no secret material.
@@ -239,6 +252,26 @@ impl AccountAccessRequest {
     /// Validate bounded public input before any state change or network operation.
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::InstallPaired { robots } => {
+                if robots.len() > MAX_ROBOTS {
+                    return Err("too many paired robots".into());
+                }
+                let mut names = BTreeSet::new();
+                for robot in robots {
+                    validate_label(&robot.name, 253, "paired robot name")?;
+                    if robot.name.trim() != robot.name
+                        || robot.name.starts_with(ACCOUNT_ROUTE_PREFIX)
+                        || !names.insert(&robot.name)
+                    {
+                        return Err("paired robot names must be distinct canonical names".into());
+                    }
+                }
+                Ok(())
+            }
+            Self::Discover { budget_ms } if !(1..=MAX_PROBE_BUDGET_MS).contains(budget_ms) => {
+                Err("robot discovery budget must be between 1 and 4000 milliseconds".into())
+            }
+            Self::Discover { .. } => Ok(()),
             Self::Install { snapshot } => snapshot.validate(),
             Self::Probe { budget_ms, .. } if !(1..=MAX_PROBE_BUDGET_MS).contains(budget_ms) => {
                 Err("robot probe budget must be between 1 and 4000 milliseconds".into())
@@ -257,6 +290,13 @@ impl AccountAccessRequest {
     /// Reject a reply for a different operation even when its correlation matches.
     pub fn accepts(&self, reply: &AccountAccessReply) -> bool {
         match (self, reply) {
+            (
+                Self::InstallPaired { robots },
+                AccountAccessReply::PairedInstalled { robot_count },
+            ) => robots.len() == *robot_count,
+            (Self::Discover { .. }, AccountAccessReply::Discovery { robots }) => {
+                robots.len() <= MAX_ROBOTS * 2
+            }
             (Self::Install { snapshot }, AccountAccessReply::Installed { robot_count }) => {
                 snapshot.robots.len() == *robot_count
             }
@@ -302,10 +342,72 @@ pub enum RobotPresence {
     },
 }
 
+/// The selected transport path observed on a TLS-authenticated connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RobotPath {
+    /// Direct UDP transport, including a shared LAN.
+    Direct,
+    /// Transport through an iroh relay.
+    Relayed,
+    /// No selected path was observable when the catalog arrived.
+    Unknown,
+}
+
+/// A durable explicit pairing pin, carrying no account ownership claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairedRobot {
+    /// Persisted local robot name for a saved pairing.
+    pub name: String,
+    /// Robot endpoint key authenticated by TLS.
+    pub endpoint_key: [u8; 32],
+}
+
+/// Which durable source makes this robot belong to the desk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RobotTrustSource {
+    /// Registered under the signed-in account.
+    Account,
+    /// Explicitly paired and pinned on the desk.
+    Paired,
+}
+
+/// One robot's bounded catalog result. Presence and metadata remain independent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RobotCatalog {
+    /// Exact route used for catalog, schema and topic demands.
+    pub route: String,
+    /// Display name, never identity evidence.
+    pub name: String,
+    /// Authenticated endpoint key, absent for older account registrations.
+    pub endpoint_key: Option<[u8; 32]>,
+    /// Durable directory source; shown by `topic list --all`.
+    pub trust: RobotTrustSource,
+    /// Reachability evidence from this attempt.
+    pub presence: RobotPresence,
+    /// Observed selected transport path, never inferred from configuration.
+    pub path: RobotPath,
+    /// Authorized topics; absent when the query failed or was not attempted.
+    pub catalog: Option<CatalogReply>,
+}
+
 /// Typed result; errors use the existing netd error response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccountAccessReply {
+    /// Pairing pins installed without a robot connection.
+    PairedInstalled {
+        /// Count of local pairing pins.
+        robot_count: usize,
+    },
+    /// Every owned and paired robot, including unattempted or unreachable rows.
+    Discovery {
+        /// Deterministically ordered robot results.
+        robots: Vec<RobotCatalog>,
+    },
     /// Snapshot verified and installed. No reachability claim.
     Installed {
         /// Number of catalog entries, including unknown endpoints.
@@ -382,5 +484,49 @@ mod busy_vocabulary_tests {
     fn the_transient_busy_wait_is_long_enough_to_be_worth_having() {
         assert!(TRANSIENT_BUSY_WAIT >= std::time::Duration::from_secs(5));
         assert!(TRANSIENT_BUSY_WAIT <= std::time::Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod automatic_tests {
+    use super::*;
+    #[test]
+    fn automatic_requests_enforce_budgets_and_pairing_name_boundaries() {
+        for budget_ms in [0, 4001, u64::MAX] {
+            assert!(AccountAccessRequest::Discover { budget_ms }
+                .validate()
+                .is_err());
+        }
+        for budget_ms in [1, 4000] {
+            assert!(AccountAccessRequest::Discover { budget_ms }
+                .validate()
+                .is_ok());
+        }
+        for name in ["", " local", "account:bad", "forged\nrow"] {
+            assert!(AccountAccessRequest::InstallPaired {
+                robots: vec![PairedRobot {
+                    name: name.into(),
+                    endpoint_key: [7; 32]
+                }]
+            }
+            .validate()
+            .is_err());
+        }
+        let robot = PairedRobot {
+            name: "paired".into(),
+            endpoint_key: [7; 32],
+        };
+        assert!(AccountAccessRequest::InstallPaired {
+            robots: vec![robot.clone(), robot.clone()]
+        }
+        .validate()
+        .is_err());
+        let request = AccountAccessRequest::InstallPaired {
+            robots: vec![robot],
+        };
+        assert!(request.validate().is_ok());
+        assert!(!request.accepts(&AccountAccessReply::PairedInstalled { robot_count: 0 }));
+        assert!(request.accepts(&AccountAccessReply::PairedInstalled { robot_count: 1 }));
+        assert!(!request.accepts(&AccountAccessReply::Discovery { robots: Vec::new() }));
     }
 }

@@ -760,6 +760,10 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // degraded-open behavior governs and a resulting warn is then GENUINE
         // (the create-side-floor precedent: create provisions the
         // ceiling, a later open merely tolerates it).
+        if let Err(error) = rt.claim_topic_scope(&topic) {
+            tracing::error!(topic = %topic, error = %error, "publisher scope admission failed");
+            return std::ptr::null_mut();
+        }
         let publisher = match rt.transport.create_publisher_with_topic_config(
             &topic,
             slice_len,
@@ -974,11 +978,13 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // loop-check must run before any egress flag can exist — and the call
         // is panic-CONTAINED, so it can neither null this already-constructed
         // handle nor leave it orphaned.
-        register_dynamic_egress(
-            &rt.transport,
-            &data_ref.topic,
-            data_ref.bridge.schema_hash(),
-        );
+        if !rt.topic_scope.excludes(&data_ref.topic) {
+            register_dynamic_egress(
+                &rt.transport,
+                &data_ref.topic,
+                data_ref.bridge.schema_hash(),
+            );
+        }
         // Delivery log / replay: the publisher's stable name (`pub:<topic>#n`).
         crate::replay::on_entity(
             EntityKind::Publisher,
@@ -2563,6 +2569,10 @@ pub unsafe extern "C" fn rmw_create_subscription(
         } else if can_loan_take {
             topic_config.create_borrow_floor = Some(RMW_TAKE_LOAN_BORROW_BUDGET);
         }
+        if let Err(error) = rt.claim_input_scope(&topic) {
+            tracing::error!(topic = %topic, error = %error, "subscription scope admission failed");
+            return std::ptr::null_mut();
+        }
         let subscriber = match rt.transport.create_subscriber_with_history_request(
             &topic,
             topic_config,
@@ -3055,8 +3065,8 @@ unsafe fn take_impl_live(
             });
         }
         // A member this build's C++ typesupport gives no way to WRITE
-        // (a `bool[]` before Humble: the generator emits no `assign` for
-        // `std::vector<bool>`), at the top level or inside a nested message,
+        // (a `bool[]` with neither `assign` nor the shim's accessorless
+        // path), at the top level or inside a nested message,
         // makes every frame of this type undeliverable.
         // Decided at registration, so this is one `Option` read per frame,
         // and taken BEFORE `unflatten` so the caller's message is untouched.

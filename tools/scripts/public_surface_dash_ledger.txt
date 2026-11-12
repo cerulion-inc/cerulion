@@ -54,7 +54,7 @@
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
-415 crates/cerulion_cli_engine/src/graph_cmd.rs
+412 crates/cerulion_cli_engine/src/graph_cmd.rs
 1 crates/cerulion_cli_engine/src/hostname_peers.rs
 7 crates/cerulion_cli_engine/src/ipc_cleanup.rs
 4 crates/cerulion_cli_engine/src/local_harvest.rs
@@ -89,14 +89,14 @@
 15 crates/cerulion_cli_engine/src/state_arm_attach.rs
 6 crates/cerulion_cli_engine/src/subnet_sweep.rs
 8 crates/cerulion_cli_engine/src/system_deps.rs
-20 crates/cerulion_cli_engine/src/templates.rs
+4 crates/cerulion_cli_engine/src/templates.rs
 1 crates/cerulion_cli_engine/src/tolerance.rs
 72 crates/cerulion_cli_engine/src/topic_cmd.rs
 4 crates/cerulion_cli_engine/src/viz_client.rs
 3 crates/cerulion_cli_engine/src/wedge_alarm.rs
 1 crates/cerulion_cli_engine/src/workspace.rs
 39 crates/cerulion_cli_engine/src/workspace_lock.rs
-6 crates/cerulion_connectd/src/main.rs
+5 crates/cerulion_connectd/src/main.rs
 2 crates/cerulion_connectd/src/pair.rs
 5 crates/cerulion_connectd/src/schema.rs
 9 crates/cerulion_connectd/src/worker.rs
@@ -124,9 +124,10 @@
 1 crates/cerulion_core/src/flashback/switch.rs
 3 crates/cerulion_core/src/flashback/trigger.rs
 3 crates/cerulion_core/src/graph/mod.rs
-36 crates/cerulion_core/src/graph/node.rs
+20 crates/cerulion_core/src/graph/node.rs
+1 crates/cerulion_core/src/graph/node_dylib_abi.rs
 33 crates/cerulion_core/src/graph/partition.rs
-103 crates/cerulion_core/src/graph/runtime.rs
+101 crates/cerulion_core/src/graph/runtime.rs
 20 crates/cerulion_core/src/graph/topology.rs
 33 crates/cerulion_core/src/graph/validation.rs
 1 crates/cerulion_core/src/graph/waitset.rs
@@ -189,7 +190,7 @@
 8 crates/cerulion_macros/src/state_derive.rs
 7 crates/cerulion_macros/src/validate.rs
 5 crates/cerulion_mdns/src/lib.rs
-9 crates/cerulion_netd/src/beacon.rs
+8 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
 16 crates/cerulion_netd/src/client.rs
 2 crates/cerulion_netd/src/convergence.rs
@@ -197,7 +198,7 @@
 2 crates/cerulion_netd/src/discovery_fold.rs
 7 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
-11 crates/cerulion_netd/src/iroh_plane.rs
+10 crates/cerulion_netd/src/iroh_plane.rs
 9 crates/cerulion_netd/src/main.rs
 9 crates/cerulion_netd/src/mirror.rs
 3 crates/cerulion_netd/src/net.rs
@@ -216,7 +217,7 @@
 4 crates/cerulion_remoted/src/tap.rs
 1 crates/cerulion_remoted/src/trust.rs
 5 crates/cerulion_remoted/src/wire.rs
-112 crates/cerulion_viz/bin/cerulion_vizd/src/daemon.rs
+111 crates/cerulion_viz/bin/cerulion_vizd/src/daemon.rs
 14 crates/cerulion_viz/bin/cerulion_vizd/src/events.rs
 5 crates/cerulion_viz/bin/cerulion_vizd/src/host.rs
 3 crates/cerulion_viz/bin/cerulion_vizd/src/main.rs
@@ -278,8 +279,8 @@
 16 examples/go2/nodes/dds_bridge/src/generic.rs
 1 examples/go2/nodes/dds_bridge/src/generic/raw.rs
 2 examples/go2/nodes/dds_bridge/src/latch.rs
-4 examples/go2/nodes/dds_bridge/src/lib.rs
-22 examples/go2/nodes/dds_bridge/src/pump.rs
+3 examples/go2/nodes/dds_bridge/src/lib.rs
+21 examples/go2/nodes/dds_bridge/src/pump.rs
 5 examples/go2/nodes/joystick_teleop/src/pump.rs
 2 examples/go2/nodes/keyboard_teleop/src/pump.rs
 2 examples/go2/nodes/teleop_mux/src/arbitrate.rs

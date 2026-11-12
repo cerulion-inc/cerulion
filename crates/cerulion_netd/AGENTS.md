@@ -1,59 +1,49 @@
-# cerulion_netd - agent notes
+# cerulion_netd
 
-The one-per-computer network gateway daemon: owns the machine's single zenoh session
-and serves refcounted remote-topic demands over a UDS NDJSON control seam. lib + bin
-split: tests drive an in-process daemon over a temp socket with an injected spy
-mirror plane - green there proves the wiring, not the live network planes.
+One host gateway/zenoh session; NDJSON refcounts; spy wiring pins
 
-## Invariants
-- One daemon per machine: an `flock`-held pidfile (`cerulion_hygiene::NETD`); the
-  kernel drops the lock on death. Never add a second lock scheme. Android: abstract
-  socket, same-UID peers only.
-- Connection close IS the release (crash-safe refcounts). The LAST release retires
+- Protocol11: paired catalogs. WAN observers use `/__cerulion/observers/`; LAN shares canonical demands. Last observer releases source/mode mirror; wire/2 canonical. MirrorLost queues without replacing replies; demand-free Busy probes mean unknown. Supervised forwards startup errors; Paired/Open watches latch them; serving clears them.
+- Demand/Observe: same-socket retry of exact controller/login Busy or same-source ensure wrapper, seven uneven deterministic backoffs within 2 s. Exhaustion preserves text/latches warn; retry/recovery debug.
+
+## Rules
+- LAN: Paired everywhere; explicit Open warns. Delivery fixtures: Open.
+- Gateway/probe/taps obey SHM producer scope even on open LAN: local-only and outputs omitted from declared egress stay private; taps retain leases.
+- Singleton is kernel flock on `cerulion_hygiene::NETD` pidfile, released on death; no second scheme. Android uses an abstract same-UID socket.
+- Connection close IS release (crash-safe refcounts). LAST release retires
   the mirror and frees the single-writer SHM slot; a re-demand recreates it.
-- ONE mirror per canonical topic across both planes, so frames cross once however
-  many consumers demand. Which plane served it is `MirrorPlane::serving_plane`,
-  on each `status` row from the route PINNED at ensure; absent is unknown, not LAN.
-- `wan` is DEFAULT-ON and netd is OUT of `default-members` - a plain `cargo build`
-  stays iroh-free, lean consumers set `default-features = false`. Either side
-  changes the whole workspace build.
-- Never answer a cold start with a confident empty: `DiscoveryState::NotConverged`
-  until discovery settles (`query::classify_gather`). An additive field whose serde
-  default is a POSITIVE claim needs a `PROTOCOL_VERSION` bump plus a client floor,
-  `<=`-asserted, never an equality pin.
-- Convergence waits call the non-reconnecting `_once` verbs (a reconnect re-runs
-  spawn-wait and falsifies the wall). A cancelled wait is never an absence claim.
-- The control loop waits on socket-readable OR push-slot-filled; socket-only stalls
-  catalog pushes on an idle client.
-- A nonzero non-loopback TCP `CERULION_NETD_LISTEN` port is the ONLY gate for the mDNS
-  beacon and standing mode (gateway boots at start, idle self-exit off). None means a
-  reported refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
-- LISTEN startup needs a persisted prior login: expired records still serve LAN
-  offline, never-logged-in refuses with `serving_login::REFUSAL`. Network-off, desk
-  and injected daemons are exempt. `register_egress` rechecks before mutating.
-- A WAN LISTEN machine owns ONE remoted child via `robot_supervisor`: registration
-  is deadline-bound, retried with capped backoff; shutdown reaps before releasing
-  the singleton, and the machine REFUSES outgoing WAN demands rather than building a second
-  endpoint or falling back to LAN. Beacon facts share `discovery::robot_state`.
-- ONE `account_controller::AccountWanController` serves manual and account routes:
-  install creates no endpoint, controller state is `try_lock` under registry
-  bookkeeping so LAN never waits on WAN metadata, and pins survive tearing. EVERY
-  demand calls `prepare_demand`, even an already-mirrored topic: a stale identity
-  or dead reader must not acknowledge a phantom mirror. Validate the reserved
-  `account:` route before `TopicKey` trims ordinary names.
-- Identity snapshots carry public bytes only, hold the auth-store lock across every
-  read, and refuse rather than wait on a busy writer. Expiry gates new enrollment,
-  never durable bindings; an account or key change fences the controller.
-- `release_max_level_info`: `debug!` is absent from a release build, so operator
-  outcomes log at `info!` or louder. Sibling lookup goes through
-  `resolve_netd_bin_from` (macOS `current_exe()` is not canonicalized), and netd
-  links READER-only `cerulion_discovery`: no peers.json write path here.
+- ONE mirror per source/mode across planes. Status uses `MirrorPlane::serving_plane`, pinned at ensure; absent is unknown, not LAN.
+- WAN default-on; netd outside default-members keeps plain builds iroh-free. Lean consumers use default-features=false; either changes workspace builds.
+- Never claim a confident empty at cold start: `DiscoveryState::NotConverged`
+  until `query::classify_gather` settles. Additive serde defaults making POSITIVE
+  claims require a `PROTOCOL_VERSION` bump and client floor `<=` assertion, never equality.
+- Convergence uses non-reconnecting `_once` (reconnect restarts spawn-wait); cancellation never proves absence.
+- Control waits on readable socket OR push slot; socket-only stalls idle catalogs.
+- Only nonzero non-loopback TCP `CERULION_NETD_LISTEN` admits mDNS and standing mode
+  (gateway boots at start, no idle exit). Missing means refusal, never a default port;
+  `CERULION_NETD_NETWORK=off` wins.
+- Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
+  LISTEN needs login; off/injected exempt. First nonempty WAN egress starts one
+  remoted without LISTEN; query/off starts none; standing persists until shutdown.
+- Idle reap waits for work/latch/owed delivery, retains singleton and exclusive
+  `serving.hold`; guards/sources share it, never unlink. Own process group, direct
+  TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
+- Lifecycle I/O runs outside verbs, unlocked; outbound readers fence reap.
+  begin/ready/end restore live pins in 5 s or name losses; no empty migration.
+- ONE `AccountWanController` serves manual/account routes. Install creates no endpoint.
+  State `try_lock` under registry bookkeeping keeps LAN from waiting on WAN metadata;
+  pins survive teardown. EVERY demand calls `prepare_demand`: stale identity/dead reader
+  cannot acknowledge a phantom. Validate `account:` before `TopicKey` trims names.
+- Bounded same-user `outbound.sock`: shared endpoint/runtime, key/namespace
+  gate. Metadata per-call; snapshot selected/held peers. Refusals keep holds; cleanup errors fence.
+  Loss retires readers; pre-Ensure Sync retries own none. Postcard owner; one key bind.
+- Identity reads hold auth lock; busy writers refuse. Expiry gates enrollment; durable bindings survive expiry, fenced by account/key changes.
+- Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery never writes peers.json.
 
-## Testing
-- `cargo test -p cerulion_netd` is parallel-safe; keep `--no-default-features` green.
-  Oracles are COUNTS, never wall clocks.
-- `wan_plane_iroh_test owner_pair::controller` wants `-- --test-threads=1`.
-- `#[traced_test]` capture is thread-local: a plane's tokio worker is invisible to
-  it. Test-only beacon suppression stays out of `src/**` (a walk enforces it).
+## Tests
+- `-- --test-threads=1` (CLI shares SHM); `--no-default-features` green. Count oracles, not clocks.
+- Build `cerulion_cli`/`cerulion_remoted` first. WAN fixtures use real CLI/default
+  SHM namespace and owner controller, serially.
+- `#[traced_test]` capture is thread-local: plane tokio workers are invisible.
+  Test-only beacon suppression stays out of `src/**` (walk enforced).
 
-Deep reference: docs/internals/network-daemons.md, docs/internals/remote-access.md.
+See: docs/internals/network-daemons.md, docs/internals/remote-access.md.

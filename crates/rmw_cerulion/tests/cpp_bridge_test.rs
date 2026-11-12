@@ -456,17 +456,18 @@ fn cpp_mixed_message_roundtrips_through_function_pointers() {
     out.name.destruct();
 }
 
-/// A `bool` sequence whose member carries NO fetch accessor is refused per
-/// message, with the text the user reads and with nothing written into the
-/// destination.
+/// A `bool` sequence whose member carries NO fetch accessor, and is not the
+/// accessorless shape the shim serves, is refused per message, with the
+/// text the user reads and with nothing written into the destination.
 ///
-/// This is the one member kind Foxy and Galactic cannot bridge: their C++
-/// generator emits no `fetch` or `assign` for `std::vector<bool>` and
-/// leaves `get`/`get_const` null, so the elements are unreachable. The
-/// fixture reaches the same state on every era by leaving the accessor
-/// unset, so the refusal is pinned wherever the suite runs, not only in the
-/// Foxy lane. The expected text is typed out here by hand: the oracle is
-/// the message the user reads, never the constant the bridge renders.
+/// The fixture has a `size_function` and nothing else, which no rosidl
+/// generator emits: Foxy and Galactic leave EVERY accessor of a `bool`
+/// sequence null (served through the shim, pinned by
+/// `an_accessorless_bool_sequence_is_carried_through_the_shim`), and Humble
+/// on emit `fetch` and `assign`. So the elements are unreachable, and the
+/// refusal is pinned wherever the suite runs. The expected text is typed
+/// out here by hand: the oracle is the message the user reads, never the
+/// constant the bridge renders.
 #[test]
 fn a_bool_sequence_without_a_fetch_accessor_is_refused_and_writes_nothing() {
     #[repr(C)]
@@ -474,7 +475,7 @@ fn a_bool_sequence_without_a_fetch_accessor_is_refused_and_writes_nothing() {
         flags: FakeVecBool,
     }
     // `size_function` ONLY: the element COUNT is readable, the elements are
-    // not. That is exactly the pre-Humble shape.
+    // not, and the member is not the all-null shape the shim reads.
     let mut m = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
     m.size_function = Some(vecbool_size);
     let members = make_members(
@@ -638,8 +639,9 @@ fn cpp_nested_ts(members: *const CppMessageMembers) -> *const rosidl_message_typ
 }
 
 /// A one-member `bool[]` type with `size_function` only: the element COUNT
-/// is readable and the elements are not, which is the pre-Humble shape and
-/// the shape a fixture reaches on any era by leaving the accessor unset.
+/// is readable and the elements are not. No generator emits it (Foxy and
+/// Galactic leave every accessor null, which the shim serves), so it is the
+/// shape that stays unwritable on every era.
 fn unwritable_bool_members(name: &str, size_of: usize) -> *const CppMessageMembers {
     let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
     flags.size_function = Some(vecbool_size);
@@ -2813,4 +2815,511 @@ fn cpp_reuse_pre_pass_releases_only_a_vector_that_owns_storage() {
         end_of_storage: 0x1001
     }
     .owns_storage());
+}
+
+// =====================================================================
+// Accessorless `bool` sequences (the Foxy and Galactic typesupport).
+//
+// rosidl_typesupport_introspection_cpp before Humble leaves the size, get,
+// get_const and resize functions of every `bool[]` and `bool[<=N]` member
+// null and has no fetch or assign at all, so the bridge reads and fills
+// such a member as the `std::vector<bool>` it is, through the compiled
+// shim. These fixtures therefore hold a REAL `std::vector<bool>` (placement
+// constructed through the vector's own range constructor), never a Rust
+// stand-in: the shim reinterprets the field, so a fake would be undefined
+// behaviour. The member shape is the plain `member(..)` one, every accessor
+// left null, which is exactly what the Foxy template emits (for
+// `rcl_interfaces/ParameterValue.bool_array_value`, every rclcpp node's
+// first publish). The fixtures build on every era, so the path is pinned
+// wherever the suite runs, the Foxy and Galactic lanes included.
+//
+// Oracles are typed out by hand: the payload bytes (offset table entries,
+// then one byte per element, 1 or 0, the form the `fetch`/`assign` path
+// writes from Humble on), and the element values read back.
+// =====================================================================
+
+use rmw_cerulion::ffi::introspection_cpp::{
+    rmw_cerulion_vector_bool_construct, rmw_cerulion_vector_bool_destruct,
+    rmw_cerulion_vector_bool_get, rmw_cerulion_vector_bool_size, rmw_cerulion_vector_bool_sizeof,
+};
+
+// The shim's `std::vector<bool>` resize is `pub(crate)` in the crate (it
+// writes through its cast); the throw test declares its own binding, like
+// the `uint8_t` assign above.
+extern "C" {
+    fn rmw_cerulion_vector_bool_resize(v: *mut c_void, n: usize) -> std::os::raw::c_int;
+}
+
+/// Aligned storage for one REAL `std::vector<bool>` (over-sized and
+/// over-aligned; `construct` checks the platform's size fits).
+#[repr(C, align(16))]
+struct VecBoolSlot([u8; 64]);
+
+impl VecBoolSlot {
+    fn uninit() -> Self {
+        VecBoolSlot([0; 64])
+    }
+    /// Construct in place, element `k` true when `bits[k]` is nonzero.
+    fn construct(&mut self, bits: &[u8]) {
+        assert!(
+            unsafe { rmw_cerulion_vector_bool_sizeof() } <= 64,
+            "vector<bool> slot too small"
+        );
+        unsafe {
+            rmw_cerulion_vector_bool_construct(
+                self.0.as_mut_ptr() as *mut c_void,
+                bits.as_ptr(),
+                bits.len(),
+            )
+        };
+    }
+    fn bools(&self) -> Vec<bool> {
+        let at = self.0.as_ptr() as *const c_void;
+        let n = unsafe { rmw_cerulion_vector_bool_size(at) };
+        (0..n)
+            .map(|i| unsafe { rmw_cerulion_vector_bool_get(at, i) })
+            .collect()
+    }
+    fn destruct(&mut self) {
+        unsafe { rmw_cerulion_vector_bool_destruct(self.0.as_mut_ptr() as *mut c_void) }
+    }
+}
+
+/// `{ bool[] flags }` (or `bool[<=bound]` when `bound` is given) with every
+/// accessor null: the Foxy and Galactic member.
+fn accessorless_flags_members(name: &str, bound: Option<usize>) -> *const CppMessageMembers {
+    let mut flags = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    if let Some(n) = bound {
+        flags.array_size_ = n;
+        flags.is_upper_bound_ = true;
+    }
+    make_members(
+        "test_msgs::msg",
+        name,
+        std::mem::size_of::<VecBoolSlot>(),
+        vec![flags],
+    )
+}
+
+/// `{ bool[] flags }` frame payload for `elems` (each 0 or 1): one offset
+/// table entry (offset 8, the byte right after the 8-byte table; length the
+/// element count), then the elements, one byte each. Written out from the
+/// wire format, not from the bridge.
+fn one_bool_entry_payload(elems: &[u8]) -> Vec<u8> {
+    let mut p = vec![8, 0, 0, 0];
+    p.extend_from_slice(&(elems.len() as u32).to_le_bytes());
+    p.extend_from_slice(elems);
+    p
+}
+
+/// A top-level accessorless `bool[]` is published and taken: the census
+/// records nothing, the frame carries the hand-written payload, and a take
+/// into a destination already holding other elements leaves exactly the
+/// frame's elements in it.
+///
+/// Two patterns: nine elements typed out byte by byte (crossing a byte of
+/// the vector's bit storage), and 130 from a formula (crossing a 64-bit
+/// storage word on libstdc++ and libc++ alike), whose oracle is the same
+/// formula applied to the index, never a read of the source vector.
+#[test]
+fn an_accessorless_bool_sequence_is_carried_through_the_shim() {
+    let members = accessorless_flags_members("ShimFlags", None);
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(
+        bridge.unwritable_bool_seq(),
+        None,
+        "the shim fills an accessorless bool sequence, so nothing is refused"
+    );
+
+    let short: [u8; 9] = [1, 0, 1, 1, 0, 0, 1, 0, 1];
+    let short_payload: [u8; 17] = [8, 0, 0, 0, 9, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1];
+    let long: Vec<u8> = (0..130usize)
+        .map(|i| u8::from(i % 3 == 0 || i % 7 == 0))
+        .collect();
+    for (elems, want_payload) in [
+        (&short[..], short_payload.to_vec()),
+        (&long[..], one_bool_entry_payload(&long)),
+    ] {
+        let mut src = VecBoolSlot::uninit();
+        src.construct(elems);
+        let src_ptr = &src as *const _ as *const c_void;
+        let frame = assert_cpp_flatten_into_identical(&bridge, src_ptr);
+        let header = WireHeader::read_from_buf(&frame).expect("header");
+        assert_eq!(
+            header.total_size as usize,
+            WireHeader::SIZE + want_payload.len()
+        );
+        assert_eq!(header.offset_table_offset, 0, "no fixed section");
+        assert_eq!(header.offset_table_count, 1);
+        assert_eq!(&frame[WireHeader::SIZE..], &want_payload[..]);
+
+        // The take: the destination holds three `true`s going in.
+        let mut dst = VecBoolSlot::uninit();
+        dst.construct(&[1, 1, 1]);
+        assert!(unsafe { bridge.unflatten(&want_payload, &mut dst as *mut _ as *mut c_void) });
+        let want: Vec<bool> = elems.iter().map(|&b| b != 0).collect();
+        assert_eq!(dst.bools(), want);
+        src.destruct();
+        dst.destruct();
+    }
+}
+
+/// The empty sequence: an entry of length 0, and a take of it EMPTIES a
+/// destination that held elements (rather than leaving them behind).
+#[test]
+fn an_empty_accessorless_bool_sequence_empties_the_destination() {
+    let members = accessorless_flags_members("ShimEmptyFlags", None);
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    let mut src = VecBoolSlot::uninit();
+    src.construct(&[]);
+    let frame = assert_cpp_flatten_into_identical(&bridge, &src as *const _ as *const c_void);
+    assert_eq!(&frame[WireHeader::SIZE..], &[8u8, 0, 0, 0, 0, 0, 0, 0]);
+    let mut dst = VecBoolSlot::uninit();
+    dst.construct(&[1, 0, 1]);
+    assert!(unsafe {
+        bridge.unflatten(
+            &frame[WireHeader::SIZE..],
+            &mut dst as *mut _ as *mut c_void,
+        )
+    });
+    assert!(dst.bools().is_empty());
+    src.destruct();
+    dst.destruct();
+}
+
+/// An accessorless `bool[]` inside a NESTED message, the shape of the
+/// `ParameterEvent` every rclcpp node publishes at startup (it reaches
+/// `ParameterValue.bool_array_value` through nested messages): the census
+/// records nothing, and the nested body carries the elements.
+///
+/// Oracle payload, typed out: the outer fixed section (`stamp` = 12.5, the
+/// little-endian f64 `00 00 00 00 00 00 29 40`), the outer offset table
+/// entry (offset 16, length 13), then the nested body: its own entry
+/// (offset 8, length 5) and the five elements.
+#[test]
+fn an_accessorless_bool_sequence_inside_a_nested_message_is_carried() {
+    #[repr(C)]
+    struct CppOuter {
+        stamp: f64,
+        inner: VecBoolSlot,
+    }
+    let inner = accessorless_flags_members("ShimInner", None);
+    let members = make_members(
+        "test_msgs::msg",
+        "ShimOuter",
+        std::mem::size_of::<CppOuter>(),
+        vec![
+            member("stamp", ROS_TYPE_DOUBLE, 0, false, std::ptr::null()),
+            member(
+                "inner",
+                ROS_TYPE_MESSAGE,
+                std::mem::offset_of!(CppOuter, inner) as u32,
+                false,
+                cpp_nested_ts(inner),
+            ),
+        ],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), None);
+
+    let mut src = CppOuter {
+        stamp: 12.5,
+        inner: VecBoolSlot::uninit(),
+    };
+    src.inner.construct(&[1, 0, 1, 1, 0]);
+    let frame = assert_cpp_flatten_into_identical(&bridge, &src as *const _ as *const c_void);
+    let want_payload: [u8; 29] = [
+        0, 0, 0, 0, 0, 0, 0x29, 0x40, // stamp
+        16, 0, 0, 0, 13, 0, 0, 0, // outer entry: inner
+        8, 0, 0, 0, 5, 0, 0, 0, // nested entry: flags
+        1, 0, 1, 1, 0, // flags
+    ];
+    assert_eq!(&frame[WireHeader::SIZE..], &want_payload[..]);
+
+    let mut dst = CppOuter {
+        stamp: 0.0,
+        inner: VecBoolSlot::uninit(),
+    };
+    dst.inner.construct(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(unsafe { bridge.unflatten(&want_payload, &mut dst as *mut _ as *mut c_void) });
+    assert_eq!(dst.stamp, 12.5);
+    assert_eq!(dst.inner.bools(), vec![true, false, true, true, false]);
+    src.inner.destruct();
+    dst.inner.destruct();
+}
+
+/// The decode rule is "nonzero is true", on the shim path as on the
+/// `assign` path: a frame whose element bytes are not 0 or 1 (a foreign or
+/// corrupt publisher) still decodes the same way on every distro. The
+/// oracle is the rule applied by hand to `02 FF 00 80`.
+#[test]
+fn an_accessorless_bool_sequence_reads_any_nonzero_byte_as_true() {
+    let members = accessorless_flags_members("ShimNonzeroFlags", None);
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    let mut dst = VecBoolSlot::uninit();
+    dst.construct(&[]);
+    assert!(unsafe { bridge.unflatten(&NONZERO_PAYLOAD, &mut dst as *mut _ as *mut c_void) });
+    assert_eq!(dst.bools(), vec![true, true, false, true]);
+    dst.destruct();
+}
+
+/// `{ bool[] flags }` payload whose four element bytes are not all 0 or 1.
+const NONZERO_PAYLOAD: [u8; 12] = [8, 0, 0, 0, 4, 0, 0, 0, 0x02, 0xFF, 0x00, 0x80];
+
+/// The depth `rcl_interfaces/ParameterEvent` reaches its `bool[]` at: a
+/// SEQUENCE of nested messages whose element carries the accessorless
+/// `bool[]` (`new_parameters[i].value.bool_array_value`). The elements are
+/// variable, so the array is the count-prefixed, length-prefixed element form.
+///
+/// Oracle payload, typed out: the outer entry (offset 8, length 33), the
+/// element count 2, element 0's length 11 and body (its entry, offset 8 and
+/// length 3, then `1 0 1`), element 1's length 10 and body (offset 8, length
+/// 2, then `0 1`).
+#[test]
+fn an_accessorless_bool_sequence_inside_a_nested_message_array_is_carried() {
+    #[repr(C)]
+    struct CppParam {
+        flags: VecBoolSlot,
+    }
+    /// A two-slot stand-in for `std::vector<CppParam>` whose elements stay
+    /// constructed: resize only moves the length, up to the two slots.
+    #[repr(C)]
+    struct ParamSeq {
+        elems: [CppParam; 2],
+        len: usize,
+    }
+    unsafe extern "C" fn params_size(f: *const c_void) -> usize {
+        (*(f as *const ParamSeq)).len
+    }
+    unsafe extern "C" fn params_get_const(f: *const c_void, i: usize) -> *const c_void {
+        &(*(f as *const ParamSeq)).elems[i] as *const CppParam as *const c_void
+    }
+    unsafe extern "C" fn params_get(f: *mut c_void, i: usize) -> *mut c_void {
+        &mut (*(f as *mut ParamSeq)).elems[i] as *mut CppParam as *mut c_void
+    }
+    unsafe extern "C" fn params_resize(f: *mut c_void, n: usize) {
+        (*(f as *mut ParamSeq)).len = n.min(2);
+    }
+    let param = accessorless_flags_members("ShimParam", None);
+    let mut params = member("params", ROS_TYPE_MESSAGE, 0, true, cpp_nested_ts(param));
+    params.size_function = Some(params_size);
+    params.get_const_function = Some(params_get_const);
+    params.get_function = Some(params_get);
+    params.resize_function = Some(params_resize);
+    let members = make_members(
+        "test_msgs::msg",
+        "ShimParamEvent",
+        std::mem::size_of::<ParamSeq>(),
+        vec![params],
+    );
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), None);
+
+    // Each vector is constructed where it then stays, never moved after.
+    let uninit_seq = || ParamSeq {
+        elems: [
+            CppParam {
+                flags: VecBoolSlot::uninit(),
+            },
+            CppParam {
+                flags: VecBoolSlot::uninit(),
+            },
+        ],
+        len: 0,
+    };
+    let mut src = uninit_seq();
+    src.elems[0].flags.construct(&[1, 0, 1]);
+    src.elems[1].flags.construct(&[0, 1]);
+    src.len = 2;
+    let frame = assert_cpp_flatten_into_identical(&bridge, &src as *const _ as *const c_void);
+    let want_payload: [u8; 41] = [
+        8, 0, 0, 0, 33, 0, 0, 0, // outer entry: params
+        2, 0, 0, 0, // element count
+        11, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0, 1, 0, 1, // element 0
+        10, 0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 1, // element 1
+    ];
+    assert_eq!(&frame[WireHeader::SIZE..], &want_payload[..]);
+
+    let mut dst = uninit_seq();
+    dst.elems[0].flags.construct(&[1, 1, 1, 1]);
+    dst.elems[1].flags.construct(&[]);
+    assert!(unsafe { bridge.unflatten(&want_payload, &mut dst as *mut _ as *mut c_void) });
+    assert_eq!(dst.len, 2);
+    assert_eq!(dst.elems[0].flags.bools(), vec![true, false, true]);
+    assert_eq!(dst.elems[1].flags.bools(), vec![false, true]);
+    for seq in [&mut src, &mut dst] {
+        for e in &mut seq.elems {
+            e.flags.destruct();
+        }
+    }
+}
+
+/// A BOUNDED accessorless `bool[<=4]` (rosidl's `BoundedVector`, which is
+/// the `std::vector<bool>` at offset 0): within the bound it is carried; a
+/// frame over the bound is refused by the read-only entry gate AND by the
+/// decode, which leaves the destination's elements untouched because the
+/// bound is checked before the resize.
+#[test]
+fn a_bounded_accessorless_bool_sequence_refuses_a_frame_over_its_bound_before_the_resize() {
+    let members = accessorless_flags_members("ShimBoundedFlags", Some(4));
+    let bridge = unsafe { CppBridgedMessage::new(members) }.expect("bridge");
+    assert_eq!(bridge.unwritable_bool_seq(), None);
+
+    let mut src = VecBoolSlot::uninit();
+    src.construct(&[0, 1, 1]);
+    let frame = assert_cpp_flatten_into_identical(&bridge, &src as *const _ as *const c_void);
+    assert_eq!(
+        &frame[WireHeader::SIZE..],
+        &[8u8, 0, 0, 0, 3, 0, 0, 0, 0, 1, 1]
+    );
+    src.destruct();
+
+    let over: [u8; 13] = [8, 0, 0, 0, 5, 0, 0, 0, 1, 1, 1, 1, 1];
+    assert!(
+        bridge.frame_entries_readable(&over).is_err(),
+        "five elements over a bound of four are refused before any write"
+    );
+    let mut dst = VecBoolSlot::uninit();
+    dst.construct(&[0, 1]);
+    assert!(!unsafe { bridge.unflatten(&over, &mut dst as *mut _ as *mut c_void) });
+    assert_eq!(
+        dst.bools(),
+        vec![false, true],
+        "the refusal comes before the resize, so the destination is untouched"
+    );
+    // At the bound exactly: carried.
+    let at: [u8; 12] = [8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 1];
+    assert!(unsafe { bridge.unflatten(&at, &mut dst as *mut _ as *mut c_void) });
+    assert_eq!(dst.bools(), vec![true, false, false, true]);
+    dst.destruct();
+}
+
+/// The shim's resize reports a throw instead of unwinding into Rust: a
+/// length past `max_size()` throws `std::length_error`, which the shim
+/// catches and answers 1, and the vector keeps its elements.
+#[test]
+fn the_shim_vector_bool_resize_reports_a_throw_as_a_status() {
+    let mut v = VecBoolSlot::uninit();
+    v.construct(&[1, 0]);
+    let status =
+        unsafe { rmw_cerulion_vector_bool_resize(v.0.as_mut_ptr() as *mut c_void, usize::MAX) };
+    assert_eq!(status, 1);
+    assert_eq!(v.bools(), vec![true, false]);
+    let status = unsafe { rmw_cerulion_vector_bool_resize(v.0.as_mut_ptr() as *mut c_void, 3) };
+    assert_eq!(status, 0);
+    assert_eq!(v.bools(), vec![true, false, false]);
+    v.destruct();
+}
+
+/// A Foxy publisher and a Humble-or-later subscriber agree, both ways: the
+/// accessorless member (the shim) and the `fetch`/`assign` member (the
+/// typesupport's own accessors, here over a bit-packed stand-in) put the
+/// SAME bytes on the wire for the same elements, the hand-written payload,
+/// and each decodes the other's frame. Both types carry the same name, so
+/// their schema hashes, and so their whole frames, match too.
+#[cfg(cerulion_has_fetch_function)]
+#[test]
+fn the_accessorless_and_the_accessor_bool_paths_put_the_same_bytes_on_the_wire() {
+    #[repr(C)]
+    struct CppFlags {
+        flags: FakeVecBool,
+    }
+    let shim_bridge =
+        unsafe { CppBridgedMessage::new(accessorless_flags_members("SameFlags", None)) }
+            .expect("shim bridge");
+    let mut m = member("flags", ROS_TYPE_BOOLEAN, 0, true, std::ptr::null());
+    m.size_function = Some(vecbool_size);
+    m.fetch_function = Some(vecbool_fetch);
+    m.assign_function = Some(vecbool_assign);
+    m.resize_function = Some(vecbool_resize);
+    let accessor_bridge = unsafe {
+        CppBridgedMessage::new(make_members(
+            "test_msgs::msg",
+            "SameFlags",
+            std::mem::size_of::<CppFlags>(),
+            vec![m],
+        ))
+    }
+    .expect("accessor bridge");
+
+    let elems: [u8; 9] = [1, 0, 1, 1, 0, 0, 1, 0, 1];
+    let want_payload: [u8; 17] = [8, 0, 0, 0, 9, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1];
+
+    let mut shim_src = VecBoolSlot::uninit();
+    shim_src.construct(&elems);
+    // 1 0 1 1 0 0 1 0 | 1, packed least significant bit first.
+    let mut bits = vec![0b0100_1101u8, 0b0000_0001];
+    let accessor_src = CppFlags {
+        flags: FakeVecBool {
+            bits: bits.as_mut_ptr(),
+            len: elems.len(),
+        },
+    };
+    let shim_frame =
+        unsafe { shim_bridge.flatten(&shim_src as *const _ as *const c_void, 3, 9) }.expect("shim");
+    let accessor_frame =
+        unsafe { accessor_bridge.flatten(&accessor_src as *const _ as *const c_void, 3, 9) }
+            .expect("accessor");
+    assert_eq!(&shim_frame[WireHeader::SIZE..], &want_payload[..]);
+    assert_eq!(&accessor_frame[WireHeader::SIZE..], &want_payload[..]);
+    assert_eq!(shim_frame, accessor_frame, "the whole frames match");
+
+    // Each side takes the other's frame.
+    let want: Vec<bool> = elems.iter().map(|&b| b != 0).collect();
+    let mut shim_dst = VecBoolSlot::uninit();
+    shim_dst.construct(&[]);
+    assert!(unsafe {
+        shim_bridge.unflatten(
+            &accessor_frame[WireHeader::SIZE..],
+            &mut shim_dst as *mut _ as *mut c_void,
+        )
+    });
+    assert_eq!(shim_dst.bools(), want);
+    let mut accessor_dst = CppFlags {
+        flags: FakeVecBool {
+            bits: std::ptr::null_mut(),
+            len: 0,
+        },
+    };
+    assert!(unsafe {
+        accessor_bridge.unflatten(
+            &shim_frame[WireHeader::SIZE..],
+            &mut accessor_dst as *mut _ as *mut c_void,
+        )
+    });
+    let got: Vec<bool> = (0..accessor_dst.flags.len)
+        .map(|i| {
+            let mut v = false;
+            unsafe {
+                vecbool_fetch(
+                    &accessor_dst.flags as *const _ as *const c_void,
+                    i,
+                    &mut v as *mut bool as *mut c_void,
+                )
+            };
+            v
+        })
+        .collect();
+    assert_eq!(got, want);
+
+    // The nonzero rule agrees across the two paths too.
+    assert!(unsafe {
+        accessor_bridge.unflatten(&NONZERO_PAYLOAD, &mut accessor_dst as *mut _ as *mut c_void)
+    });
+    let got: Vec<bool> = (0..accessor_dst.flags.len)
+        .map(|i| {
+            let mut v = false;
+            unsafe {
+                vecbool_fetch(
+                    &accessor_dst.flags as *const _ as *const c_void,
+                    i,
+                    &mut v as *mut bool as *mut c_void,
+                )
+            };
+            v
+        })
+        .collect();
+    assert_eq!(got, vec![true, true, false, true]);
+    shim_src.destruct();
+    shim_dst.destruct();
 }

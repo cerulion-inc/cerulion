@@ -208,9 +208,9 @@ becomes the **cross-check** and the **fallback**:
 | nothing | nothing | `0` | a `debug!` naming both silences |
 
 A node "says nothing" when it carries port metadata with no size on it: a
-hand-written `NodeEntry`, a raw-FFI cdylib whose info block omits the key,
-or a macro cdylib built before the key existed (it is an additive
-info-JSON key, so such a cdylib still loads and simply falls back). A node
+hand-written `NodeEntry` or a stable raw-FFI library whose info block omits
+the key. A library built before the stable boundary is refused at load with
+the instruction to rebuild using `cerulion node build`. A node
 with NO port metadata at all is a different case and does not reach the
 fallback: the recorder refuses outright rather than record a fabricated
 hash. A node saying `0` is a real answer: a purely variable schema has a

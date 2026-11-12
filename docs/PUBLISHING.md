@@ -17,7 +17,8 @@ dev-dependencies are stripped by `cargo package`):
 | Crate | Internal normal/build deps |
 |---|---|
 | `cerulion_macros` | (none; external only: proc-macro2, quote, syn) |
-| `cerulion_core` | `cerulion_macros`, `cerulion_pairing` |
+| `cerulion_node_abi` | (none) |
+| `cerulion_core` | `cerulion_macros`, `cerulion_node_abi`, `cerulion_pairing` |
 | `native_ros2_messages` | `cerulion_core` (as dep **and** build-dep) |
 | `cerulion` | `cerulion_core`, `cerulion_macros`, `native_ros2_messages` |
 | `cerulion_dds` | (none; published DDS forks are external dependencies) |
@@ -40,7 +41,7 @@ dev-dependencies are stripped by `cargo package`):
 
 Publish in this order:
 
-1. **`cerulion_macros`**, **`cerulion_pairing`**, **`cerulion_discovery`**,
+1. **`cerulion_node_abi`**, **`cerulion_macros`**, **`cerulion_pairing`**, **`cerulion_discovery`**,
    **`cerulion_dds`**, **`cerulion_hygiene`**, **`cerulion_link`** and
    **`cerulion_telemetry`** (no internal dependency; independent of one another)
 2. **`cerulion_core`** and **`cerulion_mdns`**
@@ -156,7 +157,7 @@ Run from the workspace root, in order:
       `./tools/scripts/test_build_deb.sh` check the three lists; the install
       smoke of `release-artifacts.yml` checks the installed release.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
-      access for all twenty-one publishable crates listed above.
+      access for all twenty-two publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
       the new version before publishing the next crate in the order.
 
@@ -236,8 +237,8 @@ and runs in the `Lint` job.
 
 ## First publication: new-crate rate limit and partial publishes
 
-Eighteen of the twenty-one publishable crates exist on crates.io; `cerulion_telemetry`,
-`cerulion_android` and `cerulion_msgio` are new and are published for the first time with the
+Eighteen of the twenty-two publishable crates exist on crates.io; `cerulion_telemetry`,
+`cerulion_android`, `cerulion_msgio` and `cerulion_node_abi` are new and are published for the first time with the
 release that adds them. The umbrella `cerulion` crate's name already exists on crates.io (at
 `0.0.2`), so it is not a new crate name. The `0.1.0` release
 published eleven of them for the first time (`cerulion_bag`, `cerulion_bagd`,
@@ -306,23 +307,24 @@ holding a `stable.txt` beside the archives serves both, which is how the
 installer self-test exercises the channel offline.
 
 Every platform archive `release-artifacts.yml` builds carries a copy of the
-`tools/scripts/install_rust.sh` helper and a `rustc-version.txt` beside the
-binaries.
-The metadata is the output of the same `rustc -vV` that built them, never a
-compiler version written by hand into the mutable installer, and the archive
-checksum covers both files. Before activating any binary, `install.sh` runs that
-helper while it holds the install lock: the helper provisions the release
-compiler and its Cargo through rustup and verifies the full commit hash, so a
-failed setup leaves the previously installed binaries in place, though a partly
-installed Rust toolchain can remain under rustup's own management. Existing rustup
-defaults, profiles and shell startup files are preserved, and a rustup found
-only on `PATH` is reused by adding the missing command proxies to
-`CARGO_HOME/bin` without replacing a path that already exists. An archive that
-predates both files still installs, with a warning that it cannot set Rust up;
-an archive carrying only one of them is refused. A compiler is not enough on its
-own: Cargo links through the system C toolchain, so when no `cc` is on `PATH` the
-installer names the command that installs one before the user reaches a node
-build, on either archive shape.
+`tools/scripts/install_rust.sh` helper beside the binaries, and the archive
+checksum covers it. Before activating any binary, `install.sh` runs that helper
+while it holds the install lock, so a failed setup leaves the previously
+installed binaries in place, though a partly installed Rust toolchain can remain
+under rustup's own management. The helper leaves a Rust 1.95 or newer on `PATH`
+or in `CARGO_HOME/bin` as it is; otherwise it adds current stable through
+rustup, or installs rustup with stable where there is no Rust. Its floor is
+the workspace `rust-version`, and `test_install_rust.sh` fails when the two
+differ. An existing rustup default is kept (stable becomes the default only
+where there is none), profiles and shell startup files are preserved, and a
+rustup found only on `PATH` is reused by adding the missing command proxies to
+`CARGO_HOME/bin` without replacing a path that already exists. A 1.x archive
+pairs its helper with `rustc-version.txt`, the argument that helper takes, and
+`install.sh` still passes it; an archive with that file and no helper is
+refused, and an archive with neither still installs, with a warning that it
+cannot set Rust up. A compiler is not enough on its own: Cargo links through the
+system C toolchain, so when no `cc` is on `PATH` the installer names the command
+that installs one before the user reaches a node build, on every archive shape.
 `tools/scripts/test_install_rust.sh` drives the helper and the installer
 transaction against a hand-written rustup fixture, and CI runs it beside the
 installer self-test.
@@ -396,8 +398,8 @@ the branch push and the pull request are the token's two jobs, and the tap's
 
 The rendered formula installs the four binaries, plus the ROS 2 Jazzy rmw and
 the heap hook on Linux, generates shell completions, and carries the release's
-own `install_rust.sh` and `rustc-version.txt` in `libexec` behind a
-`cerulion-install-rust` command. Homebrew runs installs with `HOME` pointing at
+own `install_rust.sh` in `libexec` behind a `cerulion-install-rust` command,
+which installs current stable Rust (1.95 or newer). Homebrew runs installs with `HOME` pointing at
 a directory it deletes, so a formula cannot provision a Rust toolchain itself;
 the caveat names that one command and the `PATH` line that follows it, and it
 prints unconditionally, so `brew info cerulion` carries both before anyone

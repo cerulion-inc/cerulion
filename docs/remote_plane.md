@@ -8,19 +8,45 @@ iroh endpoint per robot, dial-by-key, the `cerulion/ops/1` and
 `cerulion/wire/2` protocols, designed to be reachable from boot, gated by the
 offline pairing access list.
 
+A serving machine can also read paired robots through that same device
+endpoint. Outbound topic mirrors use the existing pull protocol; releasing a
+mirror preserves the machine's incoming remote service.
+
 It is separate from [`docs/networking.md`](networking.md), which covers the LAN
 zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
-**What ships today.** The lease, deadman and e-stop state machine, and the
+**What ships.** The lease, deadman and e-stop state machine, and the
 remote `engage-estop` verb. Engaging the e-stop records the engaged state and
-its engager and sends an `estop` to the robot's `cerulion-rcpd`, again until
-rcpd answers, which closes rcpd's own latch and publishes an e-stop frame to
-the graph; neither stops motion by itself. The engaged state is held in the daemon's memory, so a
-daemon restart clears it, and nothing else does; rcpd's latch, once that
-`estop` closed it, clears only through its `estop_clear` or by deleting its
-latch file and restarting rcpd.
-No verb returns that state yet; a verb or rcp tool call that it refuses says
-so in its error. An `engage-estop` engages the latch, sends that `estop`,
+its engager, refuses the calls listed below, and sends an `estop` to the
+robot's `cerulion-rcpd`, again until rcpd answers that its latch closed. On
+that `estop`, rcpd closes its own latch and publishes an e-stop frame on its
+`journal.calls_topic`. This e-stop stops motion only through the node that
+drives your actuators: write that node to read that topic and stop on a frame
+whose `tool` is `estop`. The frame needs a `cerulion-rcpd` that serves
+`--http` on the loopback address `cerulion-remoted` forwards to
+(127.0.0.1:7801 unless `--rcp-addr` changes it), with the token
+`cerulion-remoted` uses (see [Reaching rcpd from a desk](rcp.md#reaching-rcpd-from-a-desk));
+without one, the attempts fail, `cerulion-remoted` logs the first failure at warn,
+and no frame reaches the graph. The `engage-estop` reply does not wait for
+rcpd or the graph, so confirm the stop on the robot. When rcpd answers,
+`cerulion-remoted` logs a warning whose `graph_acknowledged` field says
+whether a graph node answered the frame within 2 s; an answer does not show
+that motion stopped.
+The engaged state lives in `cerulion-remoted`'s memory and holds while that
+daemon runs. Any exit of the daemon clears it: a crash, a stop or restart of
+`cerulion-netd` (which stops the daemon too) or a restart of the machine.
+After a crash, `cerulion-netd` starts the daemon again, after a wait of at
+least 5 s, only while this machine still serves (a live export or
+`CERULION_NETD_LISTEN`). No verb clears the state or reads it back: while you
+need the e-stop engaged, engage it again after a `cerulion-remoted` restart
+or any reconnect. A verb or rcp tool call that it
+refuses says so in its error. rcpd writes its latch to `<receipts>.estop`, where
+`<receipts>` is its `--receipts` path (see [E-stop](rcp.md#e-stop)), so that
+latch holds across rcpd restarts until its `estop_clear`, or deleting the
+file and restarting rcpd, clears it. If rcpd cannot write the file, it logs
+an error and its e-stop may not survive an rcpd restart: after one, engage
+the e-stop again. An
+`engage-estop` engages the `cerulion-remoted` latch, sends that `estop`,
 then writes a warning to the log, asks Flashback to save a recording
 and returns a reply to the caller; an `estop` over the rcp plane engages
 the latch without that ask.
@@ -30,10 +56,15 @@ It is the one e-stop latch the ops act verbs, `restart` and the
 `cerulion/rcp/1` plane except `estop` are refused, and an `estop` over that
 plane engages it too (see
 [`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
-reads it before it stops the graph and again before it starts it: an engage
-during the stop means the start command does not run, and an engage after
-the second read does not stop the graph it starts. LAN ingress does not read
-it. An `engage-estop`
+reads it before it stops the graph and again before it starts it, so an
+engage during the stop keeps the graph from starting again. An engage after
+the second read leaves the started graph running, as an engage leaves any
+running graph running. Apart from those refusals and the calls rcpd's latch
+refuses, the e-stop gates no topic data: a graph's nodes and other local
+publishers can keep publishing, and a graph's `ingress:` topics and the
+topics this machine mirrors keep receiving from their producers, including a
+paired producer over the remote plane and, under `CERULION_LAN_ACCESS=open`,
+LAN peers. Stop those producers where they run. An `engage-estop`
 refuses each rcp tool call other than `estop` that the plane has not yet sent
 to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
 rcpd just before each send), then sends an `estop` to rcpd without waiting
@@ -44,8 +75,10 @@ ends before rcpd answers, as at a stop by Ctrl-C or SIGTERM, at error; a kill,
 a crash, the hard-exit deadline or a second stop signal may end it with no
 line. That latch then refuses the mutating calls rcpd holds when the `estop`
 reaches it and has not yet published;
-an `estop` over the rcp plane closes rcpd's own latch too. A robot still needs its own stop path (a hardwired e-stop) to
-stop motion. Only the `cerulion-remoted` daemon serves
+an `estop` over the rcp plane closes rcpd's own latch too. Fit the robot
+with a hardwired e-stop and rely on it for any stop that must not depend on
+the network, Cerulion's daemons or a graph node. Only the `cerulion-remoted`
+daemon serves
 `engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
 `topic-snapshot`, `topic-echo-once`) and the `cerulion/rcp/1` plane: a process
 that hosts the remote plane as a library refuses each of those verbs with an
@@ -55,8 +88,8 @@ host the plane in its own process (see
 paired desk reads its catalog, schemas and topics there and cannot publish
 into the app. The public iroh relays an app or a robot uses by default are for
 development only: run your own relays for a robot in service. The `teleop` verb is classified
-(it needs `CAP_TELEOP` and at least the operator role) but has no handler yet,
-and the daemon does not run the deadman yet. The deadman and renewal rules below
+(it needs `CAP_TELEOP` and at least the operator role) but has no handler,
+and the daemon does not run the deadman. The deadman and renewal rules below
 are the contract a teleop handler runs under.
 
 ## What a desk can do today
@@ -74,6 +107,19 @@ access can:
   `cerulion-remoted` dropped (`status`);
 - deliver a revocation epoch it carries, which the robot checks on its own.
 
+The topic CLI and `viz --robot` also use this plane automatically for account-owned
+and explicitly paired robots. `topic list` shows the robot's reachability and its
+catalog without a manual connect command. Desk observers use private channels
+under `/__cerulion/observers/`, keeping a robot's topic separate from a local topic
+with the same canonical name; wire/2 still names the original topic. Observers of
+one source share a demand, and the last observer releases the channel. Graph
+ingress keeps canonical names and the single-writer contract.
+
+An expired session is refreshed and saved before account discovery, with a 2 s
+budget. If the service is unavailable, the saved account directory remains
+usable. Topic reads keep cache diagnostics at debug; `topic list` reports them
+on one stderr line, and an explicit `--robot` reports unavailable robot topics.
+
 A desk cannot write a topic on the robot or send it teleop commands over
 `cerulion/wire/2`. No verb on it takes a frame from the desk, and the robot
 never reads a data stream from the desk. The `teleop` and `deploy` verbs
@@ -89,19 +135,53 @@ act verbs, work on the robot's own shared memory; with `--robot`,
   `service-call` calls a robot service once. Both are refused while the
   robot's e-stop is engaged, and one already running stops when it engages.
   They check the e-stop, not the control lease, so the deadman does not cover
-  them. `topic-publish` refuses a topic under the reserved `/__cerulion`
-  namespace.
+  them.
 - With observe access, `topic-snapshot` reads the newest frame of a camera
   topic as a JPEG and `topic-echo-once` reads the newest message of a topic,
   decoded.
+
+Every act verb refuses a network mirror and topics under the reserved
+`/__cerulion` namespace. A live mirror is read on its source robot; other
+reserved topics produce a usage error. Producer exclusions name the refused
+topic and preserve its remote-access policy context.
 
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
 `cerulion rcp` is refused the same way.
 
-The only other desk to robot topic path today is LAN ingress (an `ingress:`
-block in a graph), which proves no identity per peer and is closed when
-`CERULION_LAN_ACCESS=paired`.
+A graph with declared `ingress:` can pull an exported topic from a unique
+same-account or explicitly paired producer over the authenticated remote plane.
+The receiving graph checks the declared topic, schema, QoS and single-writer
+rules. Declared imports require a native service provisioned for one publisher;
+a multi-publisher service is refused even with only one live writer. The
+producer serves its stream; the consumer does not send arbitrary data
+frames to the producer. A machine can serve and consume through the same owned
+endpoint. This is distinct from the ops `topic-publish` verb and its capability
+and e-stop checks.
+
+Account graph imports retain usable saved trust when a revocation refresh fails,
+including during an account-service outage or after session expiry. The failure
+is reported with the source robot and cause, and repeated failures are counted.
+Every reconnect still validates the pinned source identity and producer policy.
+The shared endpoint sends only the selected peer and peers with held readers;
+unrelated registered robots do not consume a request's framing budget.
+
+Each robot exports its own local producers. Imported graph topics and private
+observer channels keep their source robot's access policy: read them on that
+source robot. Schema reads without topic data use current producer metadata
+without opening a data reader; privacy and authorization are checked again
+after the metadata source returns. A refused outbound demand or an unavailable
+robot during metadata discovery preserves the machine's other active readers. Failed membership
+cleanup fences the outbound connection and reports transport loss. Ops snapshot, one-shot
+echo, publish and service calls enforce the same source restriction. Outbound
+readers retain the owned server against idle shutdown; new admission returns a retryable
+refusal while shutdown is already committed. Account ownership proofs survive
+the switch between consuming and serving. Reader restoration shares one bounded
+budget; unresolved readers receive a named loss notice and can reconnect.
+
+The zenoh LAN ingress compatibility path proves no identity per peer and is
+closed by the default `CERULION_LAN_ACCESS=paired`. Enabling that path requires
+explicit `CERULION_LAN_ACCESS=open` and warns at startup. Authenticated discovery is described in [networking](networking.md#making-a-robot-discoverable).
 
 ## The deadman: a quiet operator loses the lease
 
@@ -182,35 +262,69 @@ through its own subscriber and sends no such count. Each exit waits at most
 newest 8 are discarded, and one error line counts them if stderr takes it in
 time.
 
-**What this rules out is serialization, not unavailability.** Resource
-exhaustion and network delivery still decide whether a remote `engage-estop`
-arrives. Each session is bounded by a 120 s deadline that closes an
+**A remote e-stop needs a path to the robot.** It does not wait for another
+session to finish. It takes effect only when the network delivers it and
+`cerulion-remoted` is running on the robot, admits the dial (the handshake
+bounds below) and serves the session. After a session panics while it writes
+a receipt, the daemon refuses every new ops session, `engage-estop` included,
+until you restart `cerulion-remoted` on the robot; an `estop` over
+`cerulion rcp` still engages the e-stop meanwhile. For a stop that must not
+depend on the network, Cerulion's daemons or a graph node, fit the robot with
+a hardwired e-stop and rely on it.
+Each session is bounded by a 120 s deadline that closes an
 authenticated-then-stalled connection, which is a per-session resource guard
-rather than a serialization point. Two caps that would bound the total footprint
-under a distributed flood, a global concurrency cap with a reserved safety-floor
-slot and the daemon's accept-loop cap, are **not implemented**.
+rather than a serialization point. At most 32 TLS handshakes are pending, each
+for at most 10 s. Once 16 are pending, an unvalidated address must answer a
+QUIC Retry before admission. Arrivals other than paired relay keys fill at
+most 24 pending slots: a validated IP holds at most four of them, relay
+arrivals from keys this robot has not paired share eight per relay URL, and
+custom transports share four. The last eight slots are a reserve for device
+keys this robot has paired and still allows that arrive by relay, and each
+such key holds at most four pending slots. A paired relay key answers one
+QUIC Retry, which travels over the relay to the key's holder, before it takes
+its slots or the reserve, so a peer that forges the key's relay address cannot
+take them. Unpaired peers can still fill the 24 shared slots, never the
+reserve: sixteen unanswered dials plus eight stranger relay handshakes, or
+plus four from each of two validated addresses, are enough, and one host can
+claim several addresses. A dial over a direct path uses the shared slots, and
+a dial that also carries a direct address (`--addr`) is classified by the copy
+that arrives first, so it gets the reserve only when the relay copy is first.
+A desk whose key this robot has not yet recorded as paired, such as an account
+desk on its first relay dial, also shares its relay URL's eight unpaired
+slots, which one unpaired key can hold on its own. Established sessions are
+not globally capped.
 
 ## A dropped connection does not drop the lease
 
 The lease names its holder, and the e-stop its engager, by a session token,
 and the remote plane uses the TLS-authenticated device key as that token
-(`engage-estop` does today). The key is stable per pairing, unlike the
+(`engage-estop` records its engager by that key). The key is stable per pairing, unlike the
 connection id. A link that drops and reopens inside the deadman window
 re-presents the same identity, so a teleop handler renews the same lease: no
-fresh grant, no re-arbitration, no gap in actuation. An engaged e-stop persists
-across reconnects (the remote plane has no verb that clears it), and a
-different paired device cannot take the floor from the one that engaged it. A
+fresh grant, no re-arbitration, no gap in actuation. An engaged e-stop stays
+engaged across a dropped connection and its reconnect while `cerulion-remoted`
+keeps running, and an engage from a second paired device keeps the first
+engager on record. No verb clears it; any exit of `cerulion-remoted` does: a
+crash, a stop or restart of `cerulion-netd` (which stops `cerulion-remoted`
+too) or a restart of the machine. After a crash, `cerulion-netd` starts it
+again, after a wait of at least 5 s, only while this machine still serves. So while you need the e-stop
+engaged, engage it again after any reconnect. A
 drop **longer** than the window lapses the lease under the deadman contract,
 which is correct: the operator is gone.
 
 ## It never bricks offline
 
+Robots on your account are reached by signing in with `cerulion login` on the
+desk: the robot adds the desk to its access list the first time the desk's
+network daemon reads one of its topics. Code pairing is not available in this
+release.
+
 On the LAN, an established pairing reaches the robot with no cloud anywhere in
 the connect path: a direct iroh dial to the robot address you give
 (`--addr ip:port`), with the relay disabled (`--relay-disabled`), and offline
-verification against the durable access list. mDNS supplies the robot's
-endpoint id to `cerulion pair`; it does not supply a dial address, so an
-offline connect needs `--addr`. Established pairings do not expire (a
+verification against the durable access list. The robot's mDNS record carries
+its endpoint id (`eid=`); it does not supply a dial address, so an offline
+connect needs `--addr`. Established pairings do not expire (a
 time-boxed guest grant from the owner is the exception), last until revoked
 (see [`docs/revocation.md`](revocation.md)), and never re-run the certificate
 chain per connect; the access row is the truth.
@@ -226,3 +340,17 @@ pairing on the LAN.
   access back.
 - [`docs/networking.md`](networking.md): the LAN plane, discovery and what a run
   exposes by default.
+
+## Graph ingress queue policy
+
+A graph producer declares its reliable queue policy with its served topic
+metadata. Wire forwarding sizes that queue to `send_queue`, or the actual tap
+depth when omitted. At capacity it refuses the new frame, retains queued
+frames in order, and exposes `wan_refused` separately from `wan_dropped`.
+A source without policy metadata is unverified for graph ingress.
+Best-effort datagram graph ingress is refused on this wire path.
+Changing a retained topic's queue policy requires restarting `cerulion-netd`.
+
+Observer reads use their existing bounded best-effort queue, including exports
+with BestEffort policy and multiple publishers. The reliable-policy and
+single-writer refusals apply to canonical graph imports.

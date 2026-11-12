@@ -294,23 +294,6 @@ payload larger than its tier is still refused.
 (Windows commits shared memory eagerly, so this demand-paging property is
 specific to Linux and macOS; Windows is not a supported platform.)
 
-## vs Copper Robotics (cu29)
-
-(Copper claims below are from its public documentation; check the current version
-before relying on specifics.)
-
-| Dimension | Cerulion | Copper |
-|---|---|---|
-| Transport | iceoryx2 shared memory (same- **and** cross-process, zero-copy) | CopperList (cache-line contiguous), single-process; cross-process via an iceoryx2 integration (not native) |
-| Network | native zenoh | not built-in |
-| Scheduling | runtime DAG-level, deterministic, 4 trigger policies | compile-time generated |
-| ROS 2 compat | native `.msg` codegen + `rmw_cerulion` drop-in | not documented |
-| Dynamic nodes | runtime cdylib loading | compile-time only |
-
-**Where Copper wins:** compile-time scheduling (zero runtime dispatch overhead);
-embedded/baremetal targets (Cerulion targets Linux/macOS; Windows is not
-supported).
-
 ## Determinism
 
 Execution order is derived from the graph DAG, not from callback timing: the

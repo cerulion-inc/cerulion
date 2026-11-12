@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Shared local-only prerequisite for serving a network plane.
 //!
-//! A persisted prior login is sufficient even after token expiry. This reader
-//! never refreshes a session, prompts, creates a key, or writes account state.
+//! A persisted prior login is sufficient even after token expiry. WAN egress
+//! also accepts authenticated persistent robot pairing. These readers never
+//! refresh a session, prompt, create a key, or write account state.
 
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -55,15 +56,24 @@ pub enum EgressLoginPolicy {
         /// The configured login file, resolved once by the embedding process.
         auth_path: Option<PathBuf>,
     },
+    /// Durable pairing can serve without account enrollment. The remote daemon
+    /// verifies the persisted device index before binding its endpoint.
+    PriorLoginOrPairedRobot {
+        /// Saved login location, resolved once.
+        auth_path: Option<PathBuf>,
+        /// Existing remote-plane state, never created by this reader.
+        state_root: Option<PathBuf>,
+    },
 }
 
 impl EgressLoginPolicy {
     /// Resolve the production policy from whether a real network is configured.
     pub fn for_network(network_enabled: bool) -> Self {
         if network_enabled {
-            Self::PriorLogin {
+            Self::PriorLoginOrPairedRobot {
                 auth_path: cerulion_discovery::robot_state::config_dir()
                     .map(|dir| dir.join("auth.json")),
+                state_root: cerulion_discovery::robot_state::resolve(),
             }
         } else {
             Self::Unrestricted
@@ -73,6 +83,21 @@ impl EgressLoginPolicy {
     pub(crate) fn check(&self) -> Result<(), &'static str> {
         match self {
             Self::Unrestricted => Ok(()),
+            Self::PriorLoginOrPairedRobot {
+                auth_path,
+                state_root,
+            } => {
+                if state_root
+                    .as_deref()
+                    .is_some_and(|root| saved_robot(root).is_ok())
+                {
+                    return Ok(());
+                }
+                Self::PriorLogin {
+                    auth_path: auth_path.clone(),
+                }
+                .check()
+            }
             Self::PriorLogin { auth_path } => {
                 let decision = auth_path
                     .as_deref()
@@ -85,6 +110,103 @@ impl EgressLoginPolicy {
             }
         }
     }
+}
+
+/// Public identity read from authenticated persistent robot state. Login expiry
+/// does not erase an established pairing. No secret is retained in the result.
+pub(crate) struct SavedRobot {
+    pub robot_id: String,
+    pub endpoint_id: String,
+    pub owner_account: String,
+}
+
+pub(crate) fn saved_robot(root: &Path) -> Result<SavedRobot, LoginProblem> {
+    use cerulion_pairing::client::DeviceIdentity;
+    use cerulion_pairing::verify::TrustStore;
+    if !root.is_absolute()
+        || root.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(LoginProblem::Malformed);
+    }
+    let dir = root.join("remoted");
+    let seed: [u8; 32] = read_regular_bounded(&dir.join("device_key"), 32)?
+        .try_into()
+        .map_err(|_| LoginProblem::Malformed)?;
+    let mac = read_regular_bounded(&dir.join("trust_store.mac_key"), MAX_AUTH_BYTES)?;
+    if mac.is_empty() {
+        return Err(LoginProblem::Malformed);
+    }
+    let store_path = dir.join("trust_store");
+    read_regular_bounded(&store_path, 16 * 1024 * 1024)?;
+    let store = TrustStore::load(&store_path, &mac).map_err(|_| LoginProblem::Malformed)?;
+    let key = DeviceIdentity::from_seed(&seed).public_key();
+    if key != store.robot_transport_key() {
+        return Err(LoginProblem::Malformed);
+    }
+    let owner = store.owner().ok_or(LoginProblem::Malformed)?;
+    let index = read_regular_bounded(&dir.join("device_index.json"), 16 * 1024 * 1024)?;
+    verify_index(&index, &mac)?;
+    let encode =
+        |bytes: &[u8; 32]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    Ok(SavedRobot {
+        robot_id: encode(&store.robot_id().0),
+        endpoint_id: encode(&key.0),
+        owner_account: encode(&owner.0),
+    })
+}
+
+fn verify_index(bytes: &[u8], mac: &[u8]) -> Result<(), LoginProblem> {
+    #[derive(Deserialize)]
+    struct Index {
+        version: u16,
+        bindings: Vec<Binding>,
+    }
+    #[derive(Deserialize)]
+    struct Binding {
+        device_key: String,
+        account: String,
+    }
+    if bytes.len() < 14 + 32 {
+        return Err(LoginProblem::Malformed);
+    }
+    let (frame, tag) = bytes.split_at(bytes.len() - 32);
+    if !cerulion_pairing::verify::verify_persisted_mac(mac, frame, tag)
+        || &frame[..8] != b"CERIDX01"
+        || frame[8..10] != 1u16.to_le_bytes()
+        || u32::from_le_bytes(
+            frame[10..14]
+                .try_into()
+                .map_err(|_| LoginProblem::Malformed)?,
+        ) as usize
+            != frame.len() - 14
+    {
+        return Err(LoginProblem::Malformed);
+    }
+    let index: Index = serde_json::from_slice(&frame[14..]).map_err(|_| LoginProblem::Malformed)?;
+    let identity =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if index.version != 1
+        || index
+            .bindings
+            .iter()
+            .any(|binding| !identity(&binding.device_key) || !identity(&binding.account))
+    {
+        return Err(LoginProblem::Malformed);
+    }
+    Ok(())
+}
+
+/// Local serving authority shared by frontend and graph startup gates. A valid
+/// persisted claimed robot key, trust and authenticated device index suffice
+/// without auth.json; otherwise the saved prior-login rule applies. Peer pins
+/// in robots.toml never authorize this machine to serve. Performs no enrollment.
+pub fn require_serving_authority() -> Result<(), &'static str> {
+    EgressLoginPolicy::for_network(true).check()
 }
 
 // Mirror only the mandatory AuthState fields. Unknown fields (including future

@@ -430,18 +430,38 @@ fn spawn_with(
 /// device-code sign-in, or the command that signs in. (`logout`'s own "was
 /// not signed in" is none of these.)
 fn assert_no_sign_in(what: &str, run: &Run) {
-    let lower = run.stderr.to_lowercase();
-    for marker in [
-        "never signed in",
-        "not signed in to a cerulion account",
-        "signing you in",
-        "cerulion login",
-        "verification",
-    ] {
+    assert_no_sign_in_text(what, &run.stderr, &run.stderr);
+}
+
+/// [`assert_no_sign_in`] for a row whose own output `own` names a sign-in
+/// marker (the hidden `pair` stub's refusal points at `cerulion login`):
+/// `own` is taken out of stderr once, so any sign-in text beside it still
+/// fails. A row whose own text names no marker is checked whole.
+fn assert_no_sign_in_beside(what: &str, run: &Run, own: &str) {
+    let own_lower = own.to_lowercase();
+    if SIGN_IN_MARKERS.iter().any(|m| own_lower.contains(m)) {
+        assert_no_sign_in_text(what, &run.stderr.replacen(own, "", 1), &run.stderr);
+    } else {
+        assert_no_sign_in(what, run);
+    }
+}
+
+/// The sign-in texts [`assert_no_sign_in`] refuses, lowercase.
+const SIGN_IN_MARKERS: [&str; 5] = [
+    "never signed in",
+    "not signed in to a cerulion account",
+    "signing you in",
+    "cerulion login",
+    "verification",
+];
+
+/// No sign-in marker in `text`; `stderr` is the whole stream, for the message.
+fn assert_no_sign_in_text(what: &str, text: &str, stderr: &str) {
+    let lower = text.to_lowercase();
+    for marker in SIGN_IN_MARKERS {
         assert!(
             !lower.contains(marker),
-            "{what}: sign-in text ({marker:?}) under the switch; stderr={}",
-            run.stderr
+            "{what}: sign-in text ({marker:?}) under the switch; stderr={stderr}"
         );
     }
 }
@@ -639,7 +659,7 @@ fn every_verb_without_the_gate_runs_under_the_switch_and_sends_nothing() {
             run.stdout,
             run.stderr
         );
-        assert_no_sign_in(&what, &run);
+        assert_no_sign_in_beside(&what, &run, says);
         assert_no_contact(&what, &run);
         true
     });

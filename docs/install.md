@@ -26,26 +26,26 @@ This removes the programs and libraries from `~/.cerulion/bin` (or from the `--d
 
 ## How the install script provisions Rust
 
-Each release archive carries the compiler metadata of the build beside the binaries, and the script installs that exact toolchain through rustup:
+Each release archive carries `install_rust.sh`, the helper that makes Rust 1.95 or newer available for building nodes. The script runs it before it places any binary:
 
-- When rustup is not already installed, the script downloads the official rustup installer from `sh.rustup.rs` and runs it with the pinned compiler as the default toolchain, so nothing further is needed.
-- When rustup is already installed, the script adds the pinned compiler beside your existing toolchains and leaves your default untouched. A build outside a workspace Cerulion created then needs the compiler named on the command line (see below).
-- On either path the script then checks the installed compiler's release and commit hash against the metadata the archive carries, and stops without replacing any binary when they differ.
+- When the Rust that will build nodes reports Rust 1.95 or newer and its `cargo` runs, the helper says `Rust/Cargo <version> is ready.` and changes nothing. That is the `rustc` in `${CARGO_HOME:-$HOME/.cargo}/bin` when that directory holds both programs, since the script puts it first on your PATH, and otherwise the one on your PATH. This check turns rustup's automatic toolchain install off (`RUSTUP_AUTO_INSTALL=0`), and a toolchain file in the directory you run the script from does not apply.
+- When rustup is already installed, the helper adds current stable beside your existing toolchains (`rustup toolchain install stable --profile minimal`), unless the stable you have is already 1.95 or newer. Stable becomes the default only when you have no default. An older default is kept, and the helper says how to select stable: `rustup default stable`, or `RUSTUP_TOOLCHAIN=stable cerulion node build <node>` for one build.
+- When there is neither Rust nor rustup, the helper downloads the official rustup installer from `sh.rustup.rs` and runs it with stable as the default toolchain and the minimal profile, so nothing further is needed.
 - The Rust step honors `CARGO_HOME` and `RUSTUP_HOME`. Without `HOME`, set those two and `CERULION_INSTALL_DIR` to absolute paths first.
-- A machine that has Rust without rustup is left alone: the script stops there without replacing any binary. Add [rustup](https://rustup.rs) first, or take a route that does not provision Rust.
+- When there is no rustup, a Rust that is older than 1.95 or has no working Cargo is left alone: the script stops there without replacing any binary. Upgrade it with the tool that installed it, or add [rustup](https://rustup.rs) first.
 - The Rust step writes no startup file of its own; the one PATH line comes from the install script.
 
 ## Rust on the other routes
 
-Homebrew and the Debian package do not provision Rust. Both carry `cerulion-install-rust`, which installs the pinned compiler the same way the script does; run it once, then put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
+Homebrew and the Debian package do not provision Rust. Both carry `cerulion-install-rust`, which sets up Rust 1.95 or newer the same way the script does, installing current stable when none is ready; run it once, then put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
 
-An archive you unpack by hand carries the same helper as `install_rust.sh` beside `rustc-version.txt`:
+An archive you unpack by hand carries the same helper as `install_rust.sh`:
 
 ```bash
-sh install_rust.sh rustc-version.txt
+sh install_rust.sh
 ```
 
-The 2.0.0 release binaries are built with Rust 1.95.0 and the 1.0.0 binaries were built with Rust 1.93.0; the workspace's minimum is Rust 1.95, and each release archive names its own compiler in `rustc-version.txt`, pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. For another release, read that workflow at its tag.
+The 2.0.0 release binaries are built with Rust 1.95.0 and the 1.0.0 binaries were built with Rust 1.93.0, each pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. The workspace's minimum is Rust 1.95, and a node does not need the compiler that built the CLI.
 
 ## What the Debian package requires and ships
 
@@ -66,15 +66,20 @@ In the archive the four sit at the top level beside the binaries. The package in
 
 Building nodes needs a C toolchain, installed before rustup. On Debian and Ubuntu: `sudo apt-get install -y curl git build-essential`. On macOS: `xcode-select --install`. An `apt-get install cerulion` pulls a C toolchain in through the package's Recommends; installing the `.deb` by hand with `dpkg -i` does not.
 
-## Build nodes with the compiler that built the CLI
+## Build nodes with a supported Rust compiler
 
-A node is a shared library the CLI loads into its own process. Two rustc releases can lay out a shared type identically and still encode it differently at run time, so the loader compares the full compiler fingerprint (release plus commit hash) and refuses a node built by a different one. The refusal names both compilers and the two ways out: rebuild the node with the host's compiler, or reinstall the CLI with yours.
+Nodes use stable boundary major 1 and load across Rust compiler versions. Build them with Rust 1.95 or newer and the C toolchain described above. The compiler does not have to match the CLI. Rebuild existing node libraries once with `cerulion node build <node>`; older Rust-boundary libraries and different boundary majors are refused with that instruction.
 
-- A workspace you create with `cerulion workspace create` or `cerulion workspace init` records the CLI's compiler in its own `rust-toolchain.toml`, so `cerulion node build` inside it selects the right one with no environment variable. The CLI writes that file only when a rustup toolchain whose release and full commit hash match its own is already installed; the check is offline, installs nothing, and leaves your rustup default alone. A missing, custom, nightly or beta compiler produces a warning instead, and the workspace keeps whatever compiler your environment selects. An existing `rust-toolchain.toml` in the workspace, or an explicit rustup override, is left in place and has to select a matching compiler itself.
-- In a workspace without a `rust-toolchain.toml`, the cloned example in the [README quickstart](../README.md#quickstart-run-record-and-verify) included, a rustup default that is a different compiler has to be overridden on the command line with the CLI's own compiler, Rust 1.95.0 for a 2.0.0 CLI and 1.93.0 for a 1.0.0 CLI:
+A new workspace names no compiler: `cerulion workspace create` and `cerulion workspace init` write no `rust-toolchain.toml`, so Cargo and rustup select one as they do anywhere else. A toolchain file you add, and rustup overrides, keep their usual precedence, and an existing toolchain file is left as it is.
 
-  ```bash
-  RUSTUP_TOOLCHAIN=1.95.0 cerulion node build <node>
-  ```
+## When Rust is missing
 
-- With `cargo install --locked cerulion_cli`, or a source build, the CLI carries whatever compiler Cargo selected at install time, so a plain `cerulion node build` already matches as long as you do not change your default toolchain in between. After changing it, rebuild the CLI and your nodes together. A distribution, custom, nightly or beta compiler may not reproduce the fingerprint from its release string alone: use one compiler installation for both sides.
+`cerulion workspace create`, `cerulion workspace init` and `cerulion node build` check for Rust 1.95 or newer: the `cargo` on your PATH and the compiler it uses (`RUSTC`, then `CARGO_BUILD_RUSTC`, else `rustc`), with rustup's automatic toolchain install turned off. On a terminal, where stdin and stderr are both terminals, a missing or older Rust is offered for install:
+
+```text
+Rust 1.95 or newer is needed to build nodes. Install it now? [Y/n]
+```
+
+Enter or `y` runs `cerulion-install-rust` when it is on your PATH or beside `cerulion`. Without it, the CLI adds stable through the rustup you already have, or runs the official rustup installer with `-y`, stable and the minimal profile, leaving your shell startup files alone. Then it checks again and carries on with the command. When the new Cargo is only in `${CARGO_HOME:-$HOME/.cargo}/bin`, `node build` uses it from there and says how to put it on your PATH.
+
+Off a terminal, or after a no, nothing is installed: the CLI prints the command that installs Rust, and `node build` then fails with the same error and exit code as without the check. Workspace creation needs no Rust itself, so it still succeeds. When no rustup is found on your PATH or in Cargo's home, an older Rust is not offered an install; the CLI says how to upgrade it. An older Rust that a `rust-toolchain.toml` (or `rust-toolchain`) in the workspace or above it selects is not offered one either: the CLI names the file, which you can make name `stable` or remove. When Cargo is installed in Cargo's home but your PATH does not include it, the CLI names the PATH line to add. A compiler that reports no release is left to Cargo's own error, except rustup with no default toolchain, which is offered stable.

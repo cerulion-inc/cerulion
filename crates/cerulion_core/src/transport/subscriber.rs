@@ -533,6 +533,25 @@ fn classify_gap(base_seq: u32, first_seq: u32) -> GapClass {
 /// An inbound iceoryx2 sample (slice payload, no user header).
 type InboundSample = Sample<CerService, [u8], ()>;
 
+fn check_plugin_frame(
+    topic: &str,
+    frame: &[u8],
+    header: &WireHeader,
+    layout: Option<super::plugin_lease::PluginWireLayout>,
+) -> TransportResult<()> {
+    if let Some(layout) = layout {
+        if !layout.accepts(frame, header.total_size)
+            || frame.as_ptr().align_offset(layout.alignment as usize) != 0
+        {
+            return Err(TransportError::Deserialization {
+                topic: topic.to_string(),
+                reason: "plugin frame prefix, offset table or alignment is invalid".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A validated, zero-copy raw input frame.
 ///
 /// A live sample owns its inbound slot through this view. A held sample
@@ -885,6 +904,10 @@ pub struct DataOnlySubscriber {
     /// `dead_code = deny` satisfied without an `allow`.
     #[cfg(any(test, feature = "test-helpers"))]
     fault_inject_receive_after: Option<u32>,
+    // After the data port: a remote tap retains policy through port teardown.
+    remote_lease: Option<super::egress_scope::RemoteTopicLease>,
+    // Export taps retain local source identity until their data port drops.
+    local_lease: Option<super::mirror_origin::LocalObservationLease>,
 }
 
 impl DataOnlySubscriber {
@@ -908,9 +931,19 @@ impl DataOnlySubscriber {
             subscriber,
             max_borrowed_samples,
             data_service,
+            remote_lease: None,
+            local_lease: None,
             #[cfg(any(test, feature = "test-helpers"))]
             fault_inject_receive_after: None,
         }
+    }
+
+    pub(crate) fn hold_remote_lease(&mut self, lease: super::egress_scope::RemoteTopicLease) {
+        self.remote_lease = Some(lease);
+    }
+
+    pub(crate) fn hold_local_lease(&mut self, lease: super::mirror_origin::LocalObservationLease) {
+        self.local_lease = Some(lease);
     }
 
     /// The receive-queue depth this tap was ACTUALLY created
@@ -992,6 +1025,17 @@ impl DataOnlySubscriber {
     pub fn publisher_count(&self) -> u32 {
         use iceoryx2::prelude::PortFactory as _;
         self.data_service.dynamic_config().number_of_publishers() as u32
+    }
+
+    /// The native service's publisher capacity, fixed when the service is created.
+    ///
+    /// Principle #4: a declared graph import requires capacity one so a second
+    /// writer cannot join after admission. A live count of one does not establish
+    /// that invariant on a multi-publisher service. This static read allocates no
+    /// memory and opens no additional port.
+    pub fn max_publishers(&self) -> usize {
+        use iceoryx2::prelude::PortFactory as _;
+        self.data_service.static_config().max_publishers()
     }
 
     /// Returns the topic name.
@@ -1223,6 +1267,8 @@ struct DrainOutcome {
     /// a decimated Empty from a genuinely-empty queue; nothing on the
     /// serve/accounting path reads it.
     decimated: bool,
+    // Host ABI observation only; never changes the native read-log decision.
+    withheld: bool,
 }
 
 impl DrainOutcome {
@@ -1239,6 +1285,7 @@ impl DrainOutcome {
             popped: 0,
             latest_ts: None,
             decimated: false,
+            withheld: true,
         }
     }
 }
@@ -3677,7 +3724,7 @@ impl CerulionSubscriber {
     /// slot and do not advance the service cursor.
     #[must_use = "raw input view must be checked"]
     pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
-        self.view_raw_checked(None)
+        self.view_raw_checked(None, None)
     }
 
     /// [`Self::view_raw`] that also requires the frame's schema hash to equal
@@ -3688,12 +3735,23 @@ impl CerulionSubscriber {
         &mut self,
         schema_hash: u64,
     ) -> TransportResult<Option<RawInputView<'_>>> {
-        self.view_raw_checked(Some(schema_hash))
+        self.view_raw_checked(Some(schema_hash), None)
+    }
+
+    /// Host-owned plugin read through the same queue/frozen/held selection.
+    /// Schema prefix and offsets are checked before advancing the service cursor.
+    #[doc(hidden)]
+    pub fn view_plugin_frame(
+        &mut self,
+        layout: super::plugin_lease::PluginWireLayout,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        self.view_raw_checked(Some(layout.schema_hash), Some(layout))
     }
 
     fn view_raw_checked(
         &mut self,
         schema_hash: Option<u64>,
+        plugin_layout: Option<super::plugin_lease::PluginWireLayout>,
     ) -> TransportResult<Option<RawInputView<'_>>> {
         // THE shared frame checks (`validate_wire_frame_raw`, the untyped core
         // of the typed path's `validate_wire_frame`), so the raw and typed
@@ -3716,6 +3774,7 @@ impl CerulionSubscriber {
                     sample.payload(),
                     schema_hash,
                 )?;
+                check_plugin_frame(&self.topic, sample.payload(), &header, plugin_layout)?;
                 Ok(Some(RawInputView {
                     inner: RawInputViewInner::Held(&sample.payload()[..payload.end]),
                     header,
@@ -3728,6 +3787,7 @@ impl CerulionSubscriber {
                     sample.payload(),
                     schema_hash,
                 )?;
+                check_plugin_frame(&self.topic, sample.payload(), &header, plugin_layout)?;
                 // Only a frame that passed every check is served, so only then
                 // does the cursor advance: a rejected frame is re-offered.
                 self.record_service_cursor_from(&header);
@@ -4249,6 +4309,7 @@ impl CerulionSubscriber {
                 popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                 latest_ts: None,
                 decimated: false,
+                withheld: false,
             };
         }
         // `drop_oldest` (EXACT PER PUBLISHER STREAM):
@@ -4671,6 +4732,7 @@ impl CerulionSubscriber {
                             popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                             latest_ts: None,
                             decimated: true,
+                            withheld: false,
                         };
                     }
                 }
@@ -4711,6 +4773,7 @@ impl CerulionSubscriber {
                     popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                     latest_ts,
                     decimated: false,
+                    withheld: false,
                 }
             }
             None => DrainOutcome {
@@ -4718,6 +4781,7 @@ impl CerulionSubscriber {
                 popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                 latest_ts: None,
                 decimated: false,
+                withheld: false,
             },
         }
     }
@@ -5401,6 +5465,29 @@ impl CerulionSubscriber {
     /// The ONE drain-and-account body both trigger sites share, so the pop path
     /// (and its read-outcome record) cannot drift between them.
     fn drain_for_trigger(&mut self, site: TriggerDrainSite) -> (u64, Option<u64>) {
+        let (popped, stamp, _) = self.drain_for_trigger_observed(site);
+        (popped, stamp)
+    }
+
+    /// Same trigger drain with its existing admission cause made explicit.
+    /// Does not consult the read plan twice or change native recording sites.
+    pub(crate) fn plugin_trigger_drain(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> (u64, Option<u64>, bool, bool) {
+        let (popped, stamp, withheld) = self.drain_for_trigger_observed(match site {
+            SyncAlignSite::Boundary => TriggerDrainSite::Boundary,
+            SyncAlignSite::Refill => TriggerDrainSite::Refill,
+        });
+        (
+            popped,
+            stamp,
+            withheld,
+            matches!(self.frozen, Some(FrozenSlot::Err(_))),
+        )
+    }
+
+    fn drain_for_trigger_observed(&mut self, site: TriggerDrainSite) -> (u64, Option<u64>, bool) {
         // Per-message FIFO (the data-trigger default): an UNSERVED frozen
         // head must never be overwritten. Two ways a fire can fail to
         // consume the head this boundary froze, unified by ONE rule:
@@ -5485,10 +5572,10 @@ impl CerulionSubscriber {
                         // finds the head still frozen is the SAME observation the
                         // boundary already counted this step, not a new one.
                         self.note_head_reoffered();
-                        (1, head_ts)
+                        (1, head_ts, false)
                     }
                     // "Nothing new behind the head you are still holding."
-                    TriggerDrainSite::Refill => (0, None),
+                    TriggerDrainSite::Refill => (0, None, false),
                 };
             }
         }
@@ -5513,7 +5600,7 @@ impl CerulionSubscriber {
             (ConsumeMode::Latest, Some(FrozenSlot::Sample(sample))) => {
                 if site == TriggerDrainSite::Refill {
                     self.frozen = Some(FrozenSlot::Sample(sample));
-                    return (0, None);
+                    return (0, None, false);
                 }
                 Some(sample)
             }
@@ -5598,7 +5685,7 @@ impl CerulionSubscriber {
             // re-offer guard above returns while it is not), so this restates
             // the debt after that exit; the promotion is slot-to-slot.
             self.reconcile_block_slot_debt();
-            return (1, ts);
+            return (1, ts, false);
         }
         // Freeze the FIFO HEAD — one frame per boundary drain, older frames
         // stay queued for the following steps' drains (the scheduler fires
@@ -5715,18 +5802,18 @@ impl CerulionSubscriber {
                 // what this boundary popped.
                 let ts = wire_timestamp_ns(held.payload());
                 self.frozen = Some(FrozenSlot::Sample(held));
-                return (1, ts);
+                return (1, ts, false);
             }
             // A newer frame (or a drain error, surfaced as before) replaces
             // it: dropping `held` releases the superseded sample.
         }
-        let (popped, latest_ts) = (outcome.popped, outcome.latest_ts);
+        let (popped, latest_ts, withheld) = (outcome.popped, outcome.latest_ts, outcome.withheld);
         self.frozen = Some(outcome.slot);
         // SLOT ENTRY: a `Sample` frozen here is held UNSERVED until a
         // tick reads it, so it stays the producer's occupancy. `Empty` / `Err`
         // hold no frame and re-derive to nothing.
         self.reconcile_block_slot_debt();
-        (popped, latest_ts)
+        (popped, latest_ts, withheld)
     }
 
     /// One more boundary went by with the SAME unserved FIFO head.

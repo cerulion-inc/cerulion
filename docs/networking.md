@@ -1,137 +1,100 @@
-# Cross-Machine Networking: Permissive by Default, the Gateway, and the `network:` Block
+# Cross-Machine Networking: Paired by Default, the Gateway, and the `network:` Block
 
-A "how it works and why" reference. A Cerulion robot is
-**network-viewable by default**: every real-clock live run registers its
-produced topics with a network GATEWAY, which opens the machine's single
-zenoh session, announces those topics, and forwards a topic to the mesh the
-moment a remote subscriber asks for it. On Unix a permissive run registers
-with the machine's shared `cerulion-netd` gateway; a `network:` block and the
-fallback routes use a per-run gateway process instead. You restrict this by
-adding a `network:` block (the block is a TIGHTENING, not the on-switch), or
-turn it off for a run with `--local` (also spelled `--network off`).
+A Cerulion robot defaults to **paired access on every platform**. A live run
+makes its exported topics available to authorized desks through the authenticated
+remote plane. Robots on your account (and existing saved pairings) are discovered automatically;
+iroh takes a direct path when possible, including on one LAN, and uses a relay
+when direct connectivity is unavailable. No listen setting, IP address or
+`--connect` flag is needed for that path.
+
+The zenoh LAN plane refuses topic demands, catalog and schema queries, and inbound
+frames under paired access. Its transport details below describe the explicit
+`CERULION_LAN_ACCESS=open` compatibility path. A `network:` block restricts which
+topics cross machines; it does not enable networking or authenticate LAN peers.
+Turn networking off for a run with `--local` (also spelled `--network off`).
 
 Related: `docs/user-api.md` "Cross-machine networking" (the YAML reference +
-validation table), `docs/multi_process.md` (networked multi-process: the
-per-run gateway serves a monolith AND a supervised worker split alike),
-the transport-layer raw-wire-frame bridge, the permissive
-default + gateway, the discovery ladder, and pairing.
+validation table), `docs/multi_process.md` (shared authenticated serving for
+monoliths and supervised workers), the raw-wire-frame bridge, explicit open LAN
+compatibility and pairing.
 
 ## TL;DR
 
-- **Open by default on non-Android.** A real-clock `graph run` (monolith OR multi-process),
-  `node run`, or `ros2 attach` with NO `network:` block runs PERMISSIVE: one
-  zenoh session announces produced topics when LAN access is open, and peers
-  find each other
-  over mDNS (`_cerulion._tcp`) when the machine to be found listens (on the
-  default Unix path, `CERULION_NETD_LISTEN` set; see
-  [Making a robot discoverable](#making-a-robot-discoverable)). Zenoh multicast scouting is OFF by default
-  (gossip stays on); `CERULION_MULTICAST_SCOUTING=on` turns it back on. One
-  loud breadcrumb prints at start:
+- **Paired by default everywhere.** A real-clock `graph run`, `node run` or
+  `ros2 attach` registers its produced topics for export. The first live export
+  starts authenticated serving automatically; a query-only desk stays a consumer.
+  A correct paired start has no open-access warning.
+- **Find robots without locators.** `cerulion topic list` lists local topics and
+  discovers same-account and explicitly paired robots. `topic echo`, `hz` and
+  `info` read their topics through the same authenticated route. Cached identities
+  and validated direct addresses support established pairings offline; new
+  machines enroll by signing in with `cerulion login`.
+- **The `network:` block restricts scope.** An enabled block exports exactly its
+  `egress:` list and imports exactly its `ingress:` list. Under paired access,
+  each import selects a unique authenticated producer and checks schema, QoS
+  and single-writer compatibility. An unsupported graph policy is refused with
+  a reason instead of being silently changed. Explicit zenoh locators remain available with open LAN
+  access. Monolith and multiprocess graphs use the same rules.
+- **One shared remote endpoint.** A machine that serves and consumes topics uses
+  its existing authenticated endpoint for both. Graph and worker processes publish
+  and receive through local shared memory.
+- **Local-only is per run.** `--local`, `--network off` and `CERULION_NETWORK=off`
+  keep that run's topics out of every serving plane, including an already-running
+  daemon. The run remains locally readable. Query `--local` skips remote discovery
+  and demands. See [environment variables](user-api.md#environment-variables) for
+  parsing and command-specific behavior.
+- **Recording keeps networking.** `--record` keeps allowed exports visible. A
+  recording with declared `ingress:` is refused because external frame reinjection
+  cannot be replayed faithfully.
+- **Open LAN access is explicit and unauthenticated.** Selecting
+  `CERULION_LAN_ACCESS=open` lets unpaired peers demand exported topics and publish
+  into declared ingress. Strict and permissive export plans both warn:
 
-  > ``network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.``
+  > `LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.`
 
-- **The `network:` block TIGHTENS.** With an explicit enabled block the
-  gateway runs STRICT: it announces + egresses exactly the declared `egress`
-  allow-list, opens exactly the declared `ingress` bridges, and uses the
-  block's locators VERBATIM (no scouting, no bind ladder). The block is
-  how you RESTRICT a robot, not how you enable networking.
-- **One robot = one network peer.** The gateway is a SEPARATE process that
-  owns the entire network plane (one zenoh session per process). The graph/worker processes
-  stay network-free: they publish into and read from shared memory only.
-  The gateway taps their SHM zero-copy (listener-less capture subscribers)
-  and forwards frames; the tap adds no copy of its own.
-- **Kill-switches.** `cerulion graph run <g> --local` (also on `node
-  run`; `--network off` remains supported) or the env knob `CERULION_NETWORK=off`
-  (honored by the run and query entry points: `graph run`, `node run`,
-  `ros2 attach`, `topic list`, `topic echo`, `topic hz`, `topic info`,
-  `schema info`; `cerulion connect` and `cerulion-remoted` exit on it too, with
-  the parsing differences listed under
-  [Environment variables](user-api.md#environment-variables)) runs LOCAL-ONLY:
-  no gateway, no session, loud notice.
-- **Networked multi-process is FIRST-CLASS.** An enabled block is accepted on a
-  multi-process run exactly as on a monolith. The supervisor spawns ONE
-  gateway beside the workers; each worker stays network-free.
-- **Recording KEEPS the network.** `--record` does not force local-only:
-  the robot stays visible while recording. The ONE exception: `--record`
-  plus an explicit block that declares `ingress:` is refused (because
-  recorded ingress re-injection is not replay-faithful).
-- **`topic list` discovers local and LAN topics.** `cerulion topic list` lists
-  LOCAL topics instantly, then discovers REMOTE topics over the LAN by default
-  (the discovery ladder below). The remote half is the discovery ladder (~1.5 s ceiling), a
-  connect phase hard-bounded at 1 s, and the demand/announce reply gathers
-  (~0.5 s after). It completes within ~3 s worst case, ceiling-bounded; the
-  LOCAL list has already printed by then. `--local` (also spelled
-  `--no-network`), `CERULION_NETWORK=off` or `CERULION_NETD_NETWORK=off` skips the remote query; the
-  environment parser preserves its fail-closed behavior for other nonempty values; extra `--connect`/`--listen` locators reach peers the ladder can't
-  find.
-- **Robots are FOUND, not typed.** mDNS `_cerulion._tcp` is the ONE
-  gateway beacon and the PRIMARY discovery mechanism on every network: "your
-  robot shows up like a Chromecast"; SRV = the bound port, TXT `robot=<name>`.
-  **The beacon is gated on a nonzero fixed LISTEN port**, so which path you are on
-  decides whether it exists: a per-run gateway child binds 7683 and beacons; the
-  default netd-hosted plane listens and beacons **only when
-  `CERULION_NETD_LISTEN` is set** (see "Making a robot discoverable" below).
-  A robot with neither is not advertised over mDNS, so a default desk does not
-  find it. The client-side
-  discovery LADDER (mDNS browse, cached peers, hostname convention; in
-  parallel, ~1.5 s ceiling) produces candidate locators for `topic list`,
-  which prints a `ROBOTS` section above the remote topics. A ROBOTS row is
-  LIVE PRESENCE: a robot appears iff its ANNOUNCE tokens actually arrive in
-  the gather (each announce key carries the producing robot as its first
-  chunk, `cerulion_ann/{robot}{topic}`, so even absolute mirror topics
-  attribute exactly) OR an mDNS browse answers for it (a browse answer is
-  itself a live gateway); mDNS also enriches announce rows with the
-  locator. Port-zero and loopback TCP endpoints are not advertised. The Android
-  beacon is withdrawn when its gateway stops; netd holds its beacon for the
-  plane lifetime. Never a mere candidate. mDNS finds robots; zenoh connects and
-  does everything after. (There is no per-candidate verify probe: presence
-  IS the verification.)
-- **Open access is unauthenticated.** On non-Android platforms, a robot with
-  no `network:` block is viewable by any peer on the LAN; restrict it with a
-  `network:` block or `--network off`, or refuse every LAN peer with
-  `CERULION_LAN_ACCESS=paired`, which also stops LAN peers publishing into
-  the robot's ingress topics.
-- **Android is paired by default.** On an Android device the gateway and
-  `cerulion-netd` refuse every LAN request (demand, catalog, schema) and
-  re-inject no frame a LAN peer publishes, so the LAN can neither read nor
-  write topics, unless `CERULION_LAN_ACCESS=open` is set. While the app is
-  `paired`, a desk reads its topics only through the remote plane the app hosts
-  with its `remote` runtime key. A robot or app that runs the remote plane lets a paired desk with observe access
-  (`CAP_OBSERVE`) read topics over it, from robot to desk on
-  its `cerulion/wire/2` protocol. The `cerulion-remoted` daemon also lets a
-  paired desk with the teleoperate capability (`CAP_TELEOP`) and at least the
-  operator role publish a message on a robot topic or call a
-  robot service on its ops protocol (`cerulion topic pub --robot`,
-  `cerulion service call --robot`; see [remote access](remote_plane.md)),
-  refused while the robot's e-stop is engaged; the plane an app hosts refuses
-  both, so a desk cannot write into the app. The `teleop` verb
-  has no handler yet, so no remote command holds a control lease. An
-  Android app selects the same posture with its `lan_access` key (see [Android](android.md)). The gateway keeps the
-  posture in front of every installed demand authorizer; changing an inner
-  authorizer does not disable it. Choose the posture at startup with
-  `CERULION_LAN_ACCESS`, or use the Android app's `lan_access` key. In paired
-  mode, the robot identity announcement remains, but topic announce tokens are
-  withheld, so the topics this robot publishes are not named on the LAN. A
-  gateway that receives topics from the network still names each of those
-  topics in its demand queries on the LAN. The mDNS beacon remains available
-  when the first TCP listen endpoint has a LAN-dialable nonzero fixed port. Opening
-  access after a paired start does not replay topic announcements withheld
-  while paired; an Android app started with open access announces its
-  registered topics when its start completes.
+- **Every plane enforces producer scope.** Topics, schemas and run metadata of a
+  local-only run remain unavailable off-machine through an already-running
+  gateway, remote server or mirror. Other daemons also refuse outputs omitted
+  from that run's declared egress before opening a tap. Local reads and recording
+  keep working. Recorder status preserves the caller's directory spelling; resolve relative paths from the run's working directory.
+  Recorder status follows the same scope; if another run already
+  exports the shared status topic, this recording disables status publication. Opaque `ros2:` children inherit the run scope, including topics
+  registered later; config-mapped raw DDS outputs obey it too. A separately
+  launched third-party DDS participant has its own transport settings.
+- **Producer policy survives a topic restart.** Remote taps, mirrors and open-LAN
+  announcements retain admission until withdrawn. If an earlier remote operation
+  still holds a topic, a local-only successor refuses startup. Close the demand
+  and withdraw the announcement, or restart the serving daemon first.
+- **Discovery keeps source and reachability evidence.** Stale-session refresh has
+  a two-second request budget; a successful rotation can wait one additional second
+  for publication. Account lookup has a two-second deadline; robot catalogs share
+  a four-second budget. Offline and
+  unknown robot rows remain visible, and online rows show the actual direct or
+  relay path. Topic rows name their source. `find` and `viz --robot`
+  use these catalogs too; duplicate sources require `--robot NAME` or `--local`
+  for local reads. The last observer releases its private shared-memory channel.
+  The mDNS/cache/hostname ladder and zenoh gathers describe explicit open LAN,
+  locators or `--scan` compatibility; account and saved-pair discovery is the
+  default authenticated route. Paired access skips implicit LAN discovery and
+  stranger catalog queries. `topic snapshot --robot` uses authenticated ops.
 
-A refused catalog is not an empty catalog: topic resolution names the robot,
-states that its topics were not searched, and recommends
-`CERULION_LAN_ACCESS=open` (or `"lan_access": "open"` for an Android app) on a
-trusted development network. Pairing does not open a LAN lookup, because a LAN
-peer carries no paired identity.
+The paired gate stays in front of every installed LAN authorizer. Identity
+beacons may remain visible, but topic announcements are withheld while paired.
+Opening access after startup does not replay those withheld announcements.
+Android apps retain the same default through their `lan_access` runtime key and
+host their authenticated remote plane through `remote`; see [Android](android.md).
+Authenticated ops keep their capability and e-stop checks; a graph import pulls
+an allowed producer stream and does not grant an arbitrary remote publish verb.
 
-`CERULION_LAN_ACCESS` values that are not valid Unicode fail closed to
-`paired`. The netd egress response includes the shared gateway's posture, so
-`graph run` reports the posture of the process serving the run rather than
-assuming its own environment matches netd. A run that requires `paired` asks netd
-for its posture before it registers any topic, and shares netd only when netd
-reports `paired`; when netd reports `open` or reports no posture, the run
-registers nothing with netd and uses its own gateway, which enforces `paired`.
+Held remote reads survive a serving endpoint start or stop. If a reader cannot be
+restored within the transition's five-second budget, netd reports the robot and
+topic. CLI observers re-demand their pinned source and schema, or stop with a
+named error if recovery fails;
+graph imports revalidate the pinned producer before reconnecting, and
+visualization re-demands its pinned source and schema outside frame draining. Status checks use separate connections, so a busy daemon does not release healthy readers. Visualization retries each lost source with backoff independently.
+Initial reads and re-demands automatically retry transient controller or login-store
+contention on the same connection with a short bounded backoff. If contention
+persists, the command reports the daemon's refusal.
 
 ## The decision matrix
 
@@ -140,17 +103,23 @@ resolves to exactly one of these, in evaluation order:
 
 | Condition | Result |
 |---|---|
-| `--local` / `--network off` on graph/node run, **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway, no session; loud kill-switch notice. |
+| `--local` / `--network off` on graph/node run, **or** `CERULION_NETWORK=off` | LOCAL-ONLY: no gateway or session; other daemons cannot expose this run's topics, schemas or run metadata. Local observers and recording still work; loud kill-switch notice. |
 | `--time-source virtual` **or** `external` | Network INERT (replay-class: a zenoh session is a live side effect that would break replay byte-identity). Silent, no gateway. |
 | Enabled `network:` block + `--record` + declared `ingress:` | **Refused**, naming the topics + both workarounds. |
-| Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict** gateway: verbatim locators, egress allow-list, declared ingress. |
-| No / disabled block (incl. `--record`) | **Permissive**: gossip on, multicast scouting off unless `CERULION_MULTICAST_SCOUTING=on`, announce every produced topic. Egress rides the machine's shared `cerulion-netd` session on Unix (see below); the synthesized 7683 listen + bind ladder appear only on the permissive FALLBACK child (netd unreachable, or non-Unix). |
+| Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict export/import scope**: declared egress and ingress use authenticated producer selection under paired access; explicit open LAN access retains verbatim zenoh locators. |
+| No / disabled block (incl. `--record`) | **All produced topics eligible for paired export** through the shared daemon. The legacy zenoh announcements, scouting and fallback listen port apply only with explicit open LAN access. |
 
 `graph profile` is the one deliberate exception: a bounded MEASUREMENT run,
 not a deployment, so it stays LOCAL-ONLY by design (its transport is built
 `network: None`; it never resolves a network). Re-execution
 (`cerulion bag play <bag> --resim all`) is likewise network-inert by
-construction (the bag is the input, and a replay must match the live run).
+construction (the bag is the input, and a replay must match the live run):
+it runs on a private shared-memory namespace, so neither `cerulion-netd` nor
+`cerulion-remoted` on the same machine sees its frames. Cerulion opens no
+network session for it, but a re-executed node that drives hardware or
+another network directly (for example a robot's own command channel opened
+in `init`) still does so; run a resim of such a node only where its devices
+are safe to drive or disconnected.
 
 ## Local inspection and compatibility
 
@@ -177,18 +146,16 @@ The inspection verbs and `schema info` also stay local under the network
 daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
 parse), opening no discovery session of their own. `cerulion viz --robot`
 refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
-`CERULION_VIZD_NETWORK=off`, and `cerulion pair` refuses under
-`CERULION_NETWORK`.
+`CERULION_VIZD_NETWORK=off`.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and
 continues to label those rows REMOTE with their source robot, or
 `origin unavailable` if attribution failed. Required publisher markers retain
 network identity independently of robot attribution. Local observers refuse
-mirrors instead of demanding them from `cerulion-netd`. A graph's own strict
-gateway carries no such marker for the topics its `network: ingress:` list
-declares: they belong to that run, print under LOCAL, and are read from shared
-memory directly in either scope. A running local observer
+mirrors instead of demanding them from `cerulion-netd`. Declared graph ingress
+uses the canonical topic channel and retains its remote provenance; it does not
+turn a remote source into a genuine local producer. A running local observer
 also holds its local source until it exits: a remote injector must refuse that
 same topic while the observer retains it, even if the local producer exits.
 Concurrent local/remote creation can refuse both attempts; the command reports
@@ -200,91 +167,59 @@ with no attribution is indistinguishable from a local source.
 
 ## Egress converges onto cerulion-netd
 
-Every PERMISSIVE real-clock live `graph run` on a Unix machine routes its egress
-through that machine's ONE `cerulion-netd` session **by default**, NOT a per-run
-gateway child. There is no desk/robot branch in the routing: a robot running a
-bare permissive `graph run` joins netd exactly like a desk does. This is
-the one-zenoh-session-per-process rule applied to the whole machine: N graphs + N remote consumers share ONE
-zenoh session instead of one per graph.
+On Unix, live graph exports use the machine's shared `cerulion-netd`. Both a
+blockless run and a paired run with an enabled `network:` block register their
+export scope there. The first live registration starts the authenticated server;
+closing the registration releases its ownership. A desk that only lists or reads
+robots does not start serving merely because it queried them.
 
-A **desk**, a machine that both produces topics and consumes remote ones
-(Studio, `topic echo`, a bridge graph), is where the session count would
-otherwise multiply fastest. Graphs and remote consumers on one machine share
-that one daemon and one zenoh session, whatever the machine is.
+When a machine both serves and consumes, netd delegates outbound authenticated
+demands through the serving endpoint. It does not bind a second endpoint for the
+same device key. Graph processes remain network-free and use local shared memory.
 
-- **How.** A producing graph pushes its egress plan into `cerulion-netd` over
-  the `register_egress` UDS verb (spawning netd detached + refcounting exactly
-  like the ingress consumers do); netd boots ONE shared embedded gateway on the
-  first egress plan and grows the egress set at runtime. Closing the connection
-  (clean exit, panic, or Ctrl-C: anything that drops the fd) RELEASES the
-  registration (the crash-safe refcount). No per-run gateway child is spawned.
-- **Namespace verification.** The run forwards its resolved iceoryx2 namespace
-  in the register (`ix_config_json`: `Some` for a multi-process deployment, its
-  supervisor-minted shared worker namespace; `None` for a monolith, which shares
-  netd's default namespace). netd's gateway taps SHM on ITS namespace, so it
-  verifies the forwarded SHM-discovery identity matches its shared session before
-  tapping. That identity is every field that determines WHICH SHM files a topic
-  resolves to (`root_path` + `prefix`, the `service` and `node` directories, and
-  the per-file service suffixes), NOT just `(root_path, prefix)`: two configs that
-  agree on root+prefix but differ in `service.directory` discover DIFFERENT
-  services, so verifying root+prefix alone would let netd tap its own empty
-  service directory while the run silently egresses nothing. It deliberately does
-  NOT include the dead-node-cleanup flags (netd disables them, a forwarded run
-  leaves them on; folding them in would false-mismatch every common-case run). A
-  run that resolved a DIFFERENT namespace (a divergent `IOX2_CONFIG_FILE` between
-  netd's spawn and the run's, or a custom `service`/`node` directory) is REFUSED:
-  the run then falls back to a per-run gateway child on its OWN namespace, never a
-  silent no-egress.
-- **When a per-run gateway child is used instead.** Two cases, distinguished by
-  loudness:
-  1. **STRICT posture** (an explicit `network:` block: verbatim locators +
-     egress allow-list): a QUIET routing rule. netd's shared session has its own
-     locator config and boots its gateway PERMISSIVE, so a Strict run's verbatim
-     locators + egress allow-list are un-representable on the shared session.
-     **Strict is a permanent child-routing rule**: a Strict run
-     spawns a per-run gateway child that honors the block verbatim. This is the
-     designed steady state, not a degrade, so it routes on a `tracing::debug!`
-     (suppressed at the default `info` level): no loud warn. (A permissive run,
-     by contrast, still fires its one-shot `PERMISSIVE_EGRESS_NOTICE` warn when it
-     spawns a child, but a Strict run does not.)
-  2. **netd unreachable / a namespace mismatch**: LOUD. A netd registration
-     failure (netd unspawnable, or the run resolved a DIFFERENT iceoryx2
-     namespace than netd, caught by comparing the forwarded `ix_config_json`) is an
-     unexpected degrade, so it warns LOUDLY (`tracing::warn!`) before falling back
-     to a per-run gateway child on the run's own namespace (the same warn-but-run
-     posture as the local-only fallback).
+The run forwards its resolved iceoryx2 namespace with registration. The daemon
+checks the fields that determine shared-memory discovery before it taps or
+reinjects a topic: root path, prefix, service/node directories and service file
+suffixes. Cleanup flags do not change discovery identity. A namespace mismatch is refused rather than silently reading
+an unrelated namespace. Multiprocess graph data uses the resolved shared data
+namespace; its coordination namespace remains separate.
 
-The `cerulion-netd` daemon self-exits after an idle grace, so a machine that
-stops producing/consuming leaves nothing behind.
+Explicit open LAN strict plans keep their verbatim zenoh locators and per-run
+gateway routing. A blockless open LAN run uses the shared gateway, with the
+existing per-run fallback when netd is unavailable. Open access warns on either
+route; paired access cannot silently fall back to an unauthenticated import.
+
+The daemon retains serving ownership until its server has stopped. After the
+last producer and consumer release their connections, the idle grace permits
+shutdown once active ops sessions, control leases and owed e-stop work settle.
 
 ## Making a robot discoverable
 
-On the default permissive Unix path a run's egress rides the machine's shared
-`cerulion-netd` session, and **nothing forwards a synthesized 7683 listen to
-it**: netd takes its listen endpoints only from `CERULION_NETD_LISTEN`, and the
-embedded gateway's mDNS beacon is gated on a parseable `tcp/` listen endpoint.
-A stock robot with no env set and no `network:` block therefore does NOT
-answer on 7683 and does NOT show up over mDNS, so a default desk does not find
-it.
+A signed-in producer registers itself and starts authenticated serving on its
+first live export. A signed-in desk finds robots on that account through the
+account directory. Existing saved pairings join the same discovery and read path, including
+validated cached direct routes at offline sites. An authenticated reply establishes
+presence; a directory row alone does not prove that a robot is reachable.
 
-Give netd a listen endpoint on any machine that should be findable:
+No `CERULION_NETD_LISTEN`, IP address or `--connect` is required for authenticated
+access. A robot with durable pairing state can serve that pairing without a new
+sign-in. An existing robot reuses its validated registration offline; first
+registration still requires its account issuer.
+
+For an intentionally open zenoh LAN deployment, set `CERULION_LAN_ACCESS=open`
+for every Cerulion command and daemon on every machine that should send or
+receive topics over that LAN, restart `cerulion-netd` on each machine, and
+provide a listen endpoint on the serving machine:
 
 ```bash
 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
 ```
 
-Set it in the robot's service environment and restart `cerulion-netd`. With it
-set, the shared plane binds the port and the beacon advertises the bound port
-plus `robot=<name>`, and the Chromecast-style discovery above applies.
-
-The alternative is a per-run gateway child, and which child you get matters:
-
-- **Permissive fallback** (netd unreachable, or a non-Unix host): synthesizes the
-  well-known 7683 listen, bind-probes upward, and beacons on its own.
-- **Strict** (an explicit `network:` block): binds the block's `listen` locators
-  VERBATIM: no synthesized port, no bind ladder, and a stolen port fails the boot
-  loudly. It beacons only if one of those locators is a parseable `tcp/` endpoint.
-  Your config is the truth, so give it the port you want advertised.
+That optional setting binds the legacy LAN plane and permits its mDNS beacon
+when the endpoint has a LAN-dialable nonzero fixed TCP port. It is not the switch
+for authenticated serving or account discovery. A permissive fallback synthesizes
+its usual listen port; an explicit open LAN strict block uses its locators
+verbatim, without a bind ladder.
 
 ### Unencrypted QUIC first (opt-in)
 
@@ -339,10 +274,14 @@ wants this carrier.
 
 ## The gateway
 
+The process and zenoh key-space details in this section describe the explicit
+open LAN compatibility path. Paired runs use the shared authenticated serving
+and import path described above.
+
 A per-run gateway process owns one run's whole network plane: the single zenoh
 session, every egress announce, the demand watch, egress forwarding, and the
 ingress re-injection door. It is the **Strict-or-fallback** path everywhere:
-spawned for a Strict posture (an explicit `network:` block, which netd's shared
+spawned for an open LAN Strict posture (an explicit `network:` block, which netd's shared
 permissive session cannot represent), when netd registration fails, and on
 non-Unix platforms, which have no netd. On a permissive Unix run, robot
 included, egress goes to netd instead and no gateway child is spawned. It is spawned by the monolith
@@ -353,8 +292,9 @@ serialized plan + the run's iceoryx2 namespace.
 - **Port.** A per-run gateway CHILD listens on the well-known port **7683**
   (IANA-unassigned) and bind-probes UPWARD (up to 8 tries)
   on an address-in-use conflict, so two robots on one host coexist. This does
-  NOT apply to the default netd-hosted plane, which takes its listen endpoints
-  only from `CERULION_NETD_LISTEN` and synthesizes nothing. Override
+  NOT apply to netd's optional open zenoh listener, which takes its endpoints
+  only from `CERULION_NETD_LISTEN`. Authenticated serving starts automatically
+  and needs no zenoh listen endpoint. Override
   the base with `CERULION_GATEWAY_PORT=<n>` (parsed strictly; a non-integer
   is a loud error). A Strict gateway uses the block's `listen` locators
   VERBATIM: no ladder (your config is truth); a stolen port fails the boot
@@ -702,7 +642,8 @@ network:
   gateway logs a warning for a topic whose `refused` or `failed` rose (an
   info line when only best-effort `dropped` rose), and each topic's totals
   when it stops. A graph with a `network:`
-  block runs its own gateway process, so its log is where these appear. The
+  block using explicit open LAN access runs its own gateway process, so its log
+  is where these appear. The
   gateway `cerulion-netd` hosts for runs without a `network:` block also
   reports each topic's `forwarded`, `dropped`, `refused`, `failed`,
   `discarded`, `queued`, `in_flight` and `send_queue` in its `status` reply.
@@ -744,14 +685,35 @@ network:
   `CERULION_NETD_LISTEN`. It applies rules 7 to 9 below to those variables
   when it starts, reads each file then, and refuses to start, naming the
   variable, on a setting that cannot work.
-- **Discovery** still speaks TCP: the mDNS beacon advertises a `tcp/` listen
+- **Open zenoh LAN discovery** speaks TCP: the mDNS beacon advertises a `tcp/` listen
   port (plus `udp_rel=<port>` under `CERULION_UNENCRYPTED_QUIC=on`, below; a
   graph listening on `quic/` alone is not advertised), and
   `topic list --connect` takes `<carrier>/<host>:<port>` with no `?` metadata
   and probes it over TCP before it uses it, so it cannot reach a QUIC-only
-  robot. Reach one through `CERULION_NETD_CONNECT` or a graph's `connect:`.
+  zenoh listener. Explicit `CERULION_NETD_CONNECT` or a graph's `connect:`
+  can select that carrier. Authenticated account and paired access uses iroh
+  regardless of the optional zenoh listener's carrier.
 
 ### The egress/ingress model
+
+Declared graph ingress reserves one canonical local writer at the complete
+consumer capacity before an injector opens. Authenticated wire producers
+carry explicit Reliable/send_queue metadata: congestion refuses new frames
+and preserves queued frames, with `wan_refused` distinct from `wan_dropped`.
+A missing policy is unverified; best-effort datagram graph ingress is refused
+on the authenticated wire path. Before releasing graph workers, the CLI resolves
+each declared ingress topic to exactly one authenticated account or paired
+producer and checks its schema, reliable policy and single live writer. The
+producer's native service must also allow at most one publisher; a
+multi-publisher service with one live writer is refused for graph import.
+Missing or ambiguous producers fail startup. Held demands reconnect to the
+same pinned producer and release when the run stops. Observer reads retain
+their best-effort queue and can read every writer of a multi-publisher topic.
+Imported topics retain the source robot's access policy. A serving consumer
+exports its local producers; read its imported topics on their source robot.
+Metadata discovery and refused demands preserve other running ingress readers.
+Account authorization survives a switch to a shared serving endpoint. Restoration
+uses one total time budget and reports unresolved readers by name.
 
 The graph file stays the single source of truth: under a
 Strict block, which topics cross the machine boundary is declared in YAML.
@@ -880,17 +842,19 @@ workarounds:
 - drop `--record` to keep the network live.
 
 Re-execution (`cerulion bag play <bag> --resim all`) is structurally
-network-inert (the bag is the input, and a replay must match the live run).
+network-inert (the bag is the input, and a replay must match the live run):
+Cerulion opens no network session for it. A re-executed node's own device
+or network I/O still runs; see [The decision matrix](#the-decision-matrix).
 
 ## CLI introspection: `topic list`
 
 ```bash
-# Local topics, then whatever the LAN is advertising (no flags needed):
+# Local topics, then same-account and saved paired robots:
 cerulion topic list
 
-# Reach a peer the ladder can't find (another subnet). Works against a robot
-# that is actually LISTENING: a per-run gateway child on 7683, or a netd
-# plane given CERULION_NETD_LISTEN (see "Making a robot discoverable"):
+# Optional open LAN compatibility: reach a peer the LAN ladder cannot find.
+# This requires explicit open access and a listener on the serving robot,
+# configured with CERULION_NETD_LISTEN or the graph's explicit listen locators:
 cerulion topic list --connect tcp/192.168.123.99:7683
 
 # Multicast AND mDNS both blocked? Opt into a unicast /24 sweep (rung 4).
@@ -901,7 +865,12 @@ cerulion topic list --scan
 cerulion topic list --no-network
 ```
 
-`topic list` prints the LOCAL `TOPIC` section FIRST and instantly (a slow or
+Authenticated robots and their catalogs join the remote result with their source
+identity. A topic name shared by producers requires explicit source selection;
+see the `topic` command reference in [user API](user-api.md).
+
+The open LAN compatibility result below uses the legacy announce and mDNS
+gather. `topic list` prints the LOCAL `TOPIC` section FIRST and instantly (a slow or
 failing remote query never delays or hides it; the framework's own channels,
 `/bagd/status` and anything under `/__cerulion/`, are hidden there unless
 `--all`, and a count line says when any were), then a `ROBOTS` section
@@ -934,14 +903,17 @@ than folded in, and if the open still fails (a tarpit that accepts TCP but
 never speaks zenoh) it is retried ONCE with the reachable-explicit locators only,
 so a discovered false positive never sinks the gather. With nothing discovered
 the `ROBOTS` section is omitted and the `REMOTE TOPICS` section collapses to one
-line, `remote: none discovered in 500 ms (a robot off the LAN needs --connect
-tcp/<host>:7683)`; a peer that is reachable (a given locator, a discovered
+line, `remote: none discovered in 500 ms (sign in with the robot's account using cerulion login;
+account and paired robots are reached automatically)`; a peer that is reachable (a given locator, a discovered
 robot) but advertised no topic in time gets `retry` instead.
 
 **Mirror provenance: one data source = one topic.** When a desk
 process re-injects a remote robot's topic into local SHM (vizd's remote viz,
 `topic echo`'s auto-ingress, `cerulion connect`'s iroh re-inject), the mirror
-lands as a plain `{topic}/data` service, which `topic list`'s local
+lands as a canonical `{topic}/data` service for graph ingress and manual connect,
+or a source-qualified `/__cerulion/observers/.../data` service for CLI and viewer
+observers. Private observer channels are hidden unless `--all` is given, which
+marks them internal and names their origin robot. `topic list`'s local
 enumeration would otherwise surface as a phantom SECOND LOCAL topic. Each
 re-injector records the mirror's origin in an out-of-band provenance registry
 (`/__cerulion/mirrors`, a reserved SHM control service with NO `/data` suffix so
@@ -963,19 +935,21 @@ streaming. Crucially, the streaming rows are LOCAL SHM knowledge (read from the
 provenance registry, not the network), so they render even under `--no-network`
 and even when the remote query fails: a mirror is REMOTE by IDENTITY (it is a
 copy of a remote robot's data), independent of any live network query. The wire
-name is untouched (a consumer still subscribes to the exact mirrored name:
-"remote = local"); only the `topic list` presentation folds it into REMOTE. The
+name is untouched. Canonical graph consumers subscribe to the mirrored name;
+observers open the private channel netd returns, keeping identically named local
+and remote sources separate. The `topic list` presentation folds mirrors into REMOTE. The
 Studio sidebar parses the same rows: the topic path stays the row's first
 whitespace token, with the `● streaming` marker + robot in the trailing columns.
 
-- **Remote discovery is ON by default** (the ladder, gossip on; multicast
-  scouting only under `CERULION_MULTICAST_SCOUTING=on`): an unpaired robot on
-  the LAN shows up with no flags.
+- **Remote discovery is ON by default** for same-account and explicitly paired
+  robots on any network. Under explicit open LAN access, locators or `--scan`,
+  the LAN ladder also discovers robots offering open access. Multicast scouting
+  is enabled only under `CERULION_MULTICAST_SCOUTING=on`.
   `--no-network` opts out of the whole remote half, ladder included.
 - **Extra locators are additive**: `--connect` /
-  `--listen` add to the default discovery session (both repeatable) to reach
-  a peer the ladder cannot find (remote discovery is the default, so there is
-  no flag to turn it on). Ladder-found gateway locators fold into the
+  `--listen` add to an explicit open LAN discovery session (both repeatable) to
+  reach a peer the ladder cannot find. Account and paired access needs neither.
+  Ladder-found gateway locators fold into the
   same session the same way.
 - **`--scan` opts into the subnet sweep (rung 4)** for a network that blocks
   BOTH multicast and mDNS reflection. OFF by default and structurally
@@ -988,9 +962,9 @@ whitespace token, with the `● streaming` marker + robot in the trailing column
   a remote session/query failure is a LOUD one-line note on stderr (`remote:
   discovery unavailable (<error>; pass --no-network to skip it)`) and exit 0:
   never a fake-success, never a hang. An empty ladder run names the escape
-  (`--connect tcp/<host>:7683`). An isolated network with no LAN discovery has
-  no automatic answer: there is no rendezvous tier, so pass the robot's
-  locator with `--connect`.
+  (`--connect tcp/<host>:7683`) for explicit open LAN access. Account and paired
+  robots use their authenticated remote route automatically, including on an
+  isolated LAN; iroh uses a direct path when available and a relay otherwise.
 
 ## The catalog updates itself: change PUSHES
 
@@ -1058,7 +1032,13 @@ itself stop the vizd it spawned, so netd stays up until that vizd exits.
 
 ## Finding robots: the discovery ladder
 
-The ladder answers "which robots exist?" BEFORE any session is dialed. Its
+Authenticated discovery combines the signed-in account directory and saved
+pairings. Selected routes are checked by authenticated metadata replies or probes;
+validated identities and direct addresses may be cached for offline reconnects.
+The account directory does not authorize a stranger: the remote endpoint still
+checks identity, capability and revocation. See [remote access](remote_plane.md).
+
+The following legacy open LAN ladder answers "which robots exist?" BEFORE any session is dialed. Its
 rungs run in PARALLEL under one ~1.5 s ceiling, GATHER-ALL (multiple robots
 on one network is the norm: never short-circuit), deduped by resolved
 `(ip, port)`; a rung that fails or overruns is dropped loudly without
@@ -1097,16 +1077,15 @@ real Cerulion gateway); a bare open port stays on the labeled
 
 **A hard limit:** AP client isolation (common on enterprise/university
 wifi) blocks ALL station-to-station traffic and defeats every LAN rung;
-only a rendezvous point both sides dial out to survives it. There is no
-rendezvous tier.
+only a rendezvous point both sides dial out to survives it. The authenticated
+iroh path can use its relay; the open LAN ladder has no rendezvous tier.
 
-### `cerulion-netd` browses mDNS and folds the cache at boot
+### Optional zenoh LAN dial list at daemon boot
 
-The ladder above is what `topic list` runs. `cerulion-netd`, the daemon
-every OTHER surface rides (`topic hz`/`echo`/`info`, `schema info`, vizd/Studio
-attaches), runs its own boot-time version of it before it builds its one
-session, because with multicast scouting off a session dials only its connect
-endpoints. In order:
+Default account and paired discovery uses the authenticated remote plane and
+refreshes independently of zenoh's dial list. For open LAN compatibility,
+`cerulion-netd` builds its zenoh connect endpoints at boot. With multicast
+scouting off, that session dials only those endpoints, in this order:
 
 1. explicit `CERULION_NETD_CONNECT` locators, verbatim;
 2. one `_cerulion._tcp` mDNS browse (800 ms: one PTR query per interface and
@@ -1117,10 +1096,9 @@ endpoints. In order:
 
 Rows 2 and 3 are deduped by address and TCP-probed together; survivors are
 folded into the connect endpoints. The browse's mDNS daemon is shut down when
-the browse ends, so netd sends no further mDNS queries. A desk with no
-environment variable set therefore reaches every listening robot on its LAN
-on the first `topic echo`, `topic hz`, Studio attach or `cerulion viz`. A
-desk that finds nothing gets a plain "not found".
+the browse ends, so netd sends no further mDNS queries. This dial list reaches
+listening open LAN peers; it grants no access to a paired run. Account robots
+and saved pairings need no environment variable or entry in this list.
 
 Two details worth knowing:
 
@@ -1136,13 +1114,13 @@ Two details worth knowing:
   where one hanging endpoint sinks every other robot.)
 - **The fold happens once, at daemon start.** netd's session config is immutable
   after init, and netd self-exits on idle, so a restart is the refresh. A netd
-  held alive for hours by a running Studio keeps its boot-time dial list, and a
-  desk netd does not listen or advertise unless `CERULION_NETD_LISTEN` is set.
-  So a robot that boots after a running desk is found when the desk's netd next
-  starts (it exits 30 s after its last user), or right away if the robot was
-  listed in `CERULION_NETD_CONNECT` when that netd started: an explicit locator
-  is retried in the background until the robot answers. `CERULION_MULTICAST_SCOUTING=on` on both
-  machines also covers it, at the cost of periodic scout packets.
+  held alive for hours by a running Studio keeps its boot-time dial list. Its
+  optional zenoh listener and beacon require `CERULION_NETD_LISTEN`.
+  An open LAN peer that boots later enters that dial list on the next restart,
+  or is reached by background retries of an explicit `CERULION_NETD_CONNECT`
+  locator. `CERULION_MULTICAST_SCOUTING=on` on both machines also discovers
+  listening zenoh peers, at the cost of periodic scout packets. These refresh
+  rules do not limit automatic authenticated discovery or serving.
 
 To see what a running daemon is CONFIGURED to dial:
 
@@ -1161,8 +1139,8 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":9,"wire_header":2}
-{"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":["tcp/203.0.113.101:7683"],"lan_access":"open"}
+{"hello":"cerulion-netd","protocol":11,"wire_header":2}
+{"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":[],"lan_access":"paired"}
 ```
 
 `lan_access` is the shared gateway's LAN posture (`open` or `paired`). A daemon
@@ -1187,17 +1165,15 @@ Interpreting `connect_endpoints`:
 
 ## Two-machine quickstart (Go2: Mac ↔ robot)
 
-You do not NEED a `network:` block: a bare `cerulion graph run` on
-each side is network-viewable once the robot listens (set
-`CERULION_NETD_LISTEN=tcp/0.0.0.0:7683` on the robot; see
-[Making a robot discoverable](#making-a-robot-discoverable)). Add blocks to RESTRICT what crosses
-and to pin locators for a subnet mDNS can't bridge. The robot (Jetson
-Orin, `192.168.123.99`) LISTENS; the workstation (Mac) CONNECTS.
+Sign in with the same account on both machines, or use an established explicit
+pairing. Each real-clock graph registers its exports automatically. Add a
+`network:` block to restrict exports and declare imports; authenticated producer
+selection needs no listen or connect locators, on one LAN or across networks.
 
 The node types in these sketches (`lidar_driver`, `locomotion`,
 `keyboard_teleop`, `obstacle_monitor`) stand for your own `nodes/<type>/`
 crates. To just LOOK at the robot's topics from the workstation you need no
-graph and no node at all: `cerulion viz --robot <name>` demands them and
+graph and no node at all: `cerulion viz --robot <name> /go2/utlidar/cloud` demands them and
 renders them. The workstation graph below is for a node that computes on the
 robot's data.
 
@@ -1219,8 +1195,6 @@ nodes:
         source: /go2/cmd_vel/keyboard   # external source: arrives over the network
 network:
   mode: peer
-  listen:
-    - tcp/0.0.0.0:7447
   egress:
     - /go2/utlidar/cloud
   ingress:
@@ -1245,8 +1219,6 @@ nodes:
         source: /go2/utlidar/cloud      # external source: arrives over the network
 network:
   mode: peer
-  connect:
-    - tcp/192.168.123.99:7447
   egress:
     - /go2/cmd_vel/keyboard
   ingress:
@@ -1257,7 +1229,7 @@ Sanity-check the link before starting the Mac graph:
 
 ```bash
 # On the Mac, with the robot graph running:
-cerulion topic list --connect tcp/192.168.123.99:7447
+cerulion topic list
 # REMOTE TOPICS
 # /go2/utlidar/cloud
 ```

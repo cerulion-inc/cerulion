@@ -58,9 +58,11 @@ impl From<TimeSource> for EngineTimeSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum RecordEnv {
     /// Record every variable NAME, and VALUES only for CERULION_*, RUST_LOG
-    /// and IOX2_*. Every other value is stored as a hash, so a re-execution
-    /// can detect that it changed without the bag carrying your secrets. The
-    /// default.
+    /// and IOX2_* names with no TOKEN, KEY, SECRET, PASSWORD or CREDENTIAL
+    /// part, in any case, plural or with trailing digits (CERULION_KEY2 is
+    /// hashed). Every other value is stored as a hash, so a
+    /// re-execution can detect that it changed without the bag carrying your
+    /// secrets. The default.
     Allowlist,
     /// Record values verbatim. Full fidelity, but the bag embeds whatever
     /// secrets were in your environment (warned loudly at record time).
@@ -322,9 +324,9 @@ pub enum Commands {
         ///
         /// The daemon demands each topic from the robot named NAME; the robot's
         /// frames are mirrored into this machine's shared memory and rendered
-        /// from there, so the robot serves raw bytes and nothing else. On a
-        /// typical LAN the robot is found over mDNS with no configuration, and
-        /// no schema pin is needed: the daemon resolves each topic's ROS type
+        /// from there, so the robot serves raw bytes and nothing else. A
+        /// same-account or paired robot is found automatically, on one LAN or
+        /// across networks. No schema pin is needed: the daemon resolves each topic's ROS type
         /// from the robot's catalog and fetches any custom schema over the
         /// network. You may still pin `TOPIC=SCHEMA` (for example
         /// `/utlidar/cloud=sensor_msgs/PointCloud2`) to skip the catalog lookup.
@@ -363,15 +365,15 @@ pub enum Commands {
     /// at one anywhere else.
     Connect {
         /// The robot: a 64-char-hex endpoint id, OR a name pinned in
-        /// `~/.cerulion/robots.toml` (`[robots]` table). `cerulion pair <robot>`
-        /// writes that pin, so after pairing this name just works. Omit when
-        /// using `--eid`.
-        // The pins in `robots.toml` are one of `robot_names`' three
-        // sources, so a paired robot completes here by construction.
+        /// `~/.cerulion/robots.toml` (`[robots]` table, one
+        /// `name = "<64-hex-eid>"` line per robot). Omit when using `--eid`.
+        // The pins in `robots.toml` are one of `robot_names`' two
+        // sources, so a pinned robot completes here by construction.
         #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(completion::robot_names))]
         robot: Option<String>,
-        /// The robot's iroh endpoint id (64-char hex). Overrides a positional
-        /// name. From `cerulion pair`, the robot's mDNS TXT `eid=`, or the operator.
+        /// The robot's iroh endpoint id (64-char hex). Use instead of ROBOT;
+        /// passing both is refused. From the robot's mDNS TXT `eid=`, or the
+        /// operator.
         #[arg(long, value_name = "HEX")]
         eid: Option<String>,
         /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable. When
@@ -389,8 +391,9 @@ pub enum Commands {
         /// The desk device key file (32 raw bytes: an ed25519 seed). When
         /// omitted, this machine's key `~/.cerulion/identity/device.key` (also
         /// named `~/.cerulion/desk.key`) is used if it exists (written by
-        /// `cerulion pair` or `cerulion login`), else an EPHEMERAL key, which an
-        /// unpaired robot REFUSES, so pair the desk first with `cerulion pair`.
+        /// `cerulion login`), else an EPHEMERAL key, which no robot's access
+        /// list holds, so a robot REFUSES it; `cerulion login` creates this
+        /// machine's key.
         #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         key_file: Option<PathBuf>,
         /// Materialize fetched `.msg`/YAML schemas into this dir so `topic echo` /
@@ -410,78 +413,34 @@ pub enum Commands {
         #[arg(long)]
         network: Option<String>,
     },
-    /// Pair this desk with a robot.
+    /// Code pairing is not available in this release.
     ///
-    /// Runs the code-pairing ceremony with the robot, so the robot adds this
-    /// desk's device key to its access list, then records the robot's name and
-    /// endpoint id in `~/.cerulion/robots.toml` so `cerulion connect <robot>`
-    /// works afterwards with no flags.
-    ///
-    /// Runs the `cerulion-connectd` helper binary. The release packages place
-    /// it beside `cerulion`; a source build gets it from
-    /// `cargo build -p cerulion_connectd`, and `CERULION_CONNECTD_BIN` points
-    /// at one anywhere else.
-    ///
-    /// The robot owner starts code pairing on the robot and shares a short code;
-    /// you supply it here (`--code`, else typed at the prompt or piped on stdin).
-    /// The desk device key is this machine's key,
-    /// `~/.cerulion/identity/device.key` (also named `~/.cerulion/desk.key`),
-    /// created on the first pair or sign-in (0600 permissions) and reused
-    /// afterwards. An existing key is never overwritten.
-    ///
-    /// STDOUT carries deterministic, machine-parseable state lines:
-    /// `pairing: robot=<name> eid=<hex>`, then on success
-    /// `paired: robot=<name> eid=<hex> account=<hex>` and
-    /// `pinned: name=<name> eid=<hex>`. STDERR carries the logs and the
-    /// interactive code prompt.
-    ///
-    /// The exit code is the primary signal: 0 = paired, 1 = usage or config
-    /// error, 2 = the robot refused (no armed code, denied, or the window
-    /// expired), 3 = unreachable (dial failure or timeout), 4 = wrong pairing
-    /// code or attempts exhausted, 130 = interrupted (Ctrl-C or SIGTERM during
-    /// the ceremony; no pairing occurred).
+    /// Robots on your account are reached by signing in with `cerulion login`.
+    //
+    // No robot-side verb arms a pairing code, so the desk side of the code
+    // ceremony cannot complete against a real robot. The verb stays parseable
+    // so a script that calls it gets `dispatch`'s refusal (`PAIR_UNAVAILABLE_MSG`,
+    // exit 2, above the login gate) instead of clap's "unrecognized
+    // subcommand". No alias. Hidden from `--help` and from the completion of
+    // `cerulion <TAB>`; clap_complete offers a hidden verb only for a word no
+    // visible verb starts with (`p`, `pa`), and then with the first line
+    // above as its description.
+    //
+    // `disable_help_flag` and the swallowing positional work as on the `Ros`
+    // stub above: every spelling, `--help` and the old flags included,
+    // reaches the refusal rather than a help page or a clap parse error.
+    // (`cerulion help pair` still renders the doc comment above.)
+    #[command(hide = true, disable_help_flag = true)]
     Pair {
-        /// The robot: a 64-char-hex endpoint id, OR a name resolved via the
-        /// robot's mDNS TXT `eid=` record, else `~/.cerulion/robots.toml`. Omit
-        /// when using `--eid`.
-        // A robot seen on this LAN lands in the peer cache, so the
-        // FIRST pairing completes too, not only a re-pair of a pinned robot.
-        #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(completion::robot_names))]
-        robot: Option<String>,
-        /// The robot's iroh endpoint id (64-char hex). Overrides a positional
-        /// name (no name is pinned). From the robot operator or its mDNS `eid=`.
-        #[arg(long, value_name = "HEX")]
-        eid: Option<String>,
-        /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable. When
-        /// omitted, the eid is resolved via relay/discovery.
-        #[arg(long = "addr", value_name = "IP:PORT")]
-        addrs: Vec<String>,
-        /// The short pairing code the robot owner shared. PREFER omitting this
-        /// and typing the code at the prompt (or piping it on stdin): a code
-        /// passed via `--code` is VISIBLE in process listings (`ps`) for the
-        /// ceremony window, and it authorizes durable enrollment.
-        #[arg(long, value_name = "CODE")]
-        code: Option<String>,
-        /// The account (64-char hex) a code pairing binds. It must be the desk's
-        /// self-account (the public half of its device key), the value used when
-        /// omitted; any other value is refused.
-        #[arg(long, value_name = "HEX")]
-        account: Option<String>,
-        /// The access-list label the robot stores on its pairing row (so the
-        /// owner recognizes this desk). Default: this machine's hostname.
-        #[arg(long, value_name = "NAME")]
-        label: Option<String>,
-        /// The desk device key file (32 raw bytes: an ed25519 seed). Default:
-        /// this machine's key `~/.cerulion/identity/device.key` (created 0600 on
-        /// the first pair or sign-in, reused after).
-        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
-        key_file: Option<PathBuf>,
-        /// Self-hosted relay URL. Default: n0 public relays.
-        #[arg(long, value_name = "URL")]
-        relay_url: Option<String>,
-        /// Disable all relays (LAN / direct-dial only).
-        #[arg(long)]
-        relay_disabled: bool,
+        /// Swallows whatever followed (`go2 --code ...`, `--help` included) so
+        /// the user sees the refusal, never a clap parse error.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            hide = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
     },
     /// Sign in to a Cerulion account.
     ///
@@ -651,26 +610,33 @@ pub enum Commands {
 ///   `workspace *`, `trace inspect`, `clean`). These default QUIET
 ///   (`cerulion=warn`) so their command output isn't interleaved with
 ///   lifecycle breadcrumbs.
-/// - `LongRunning` — verbs that run a runtime loop / daemon (`graph run`,
-///   `graph profile`, `node run`, `bag play`, `ros2 attach`, `viz`, `connect`,
-///   and the hidden multi-process `run-worker`/`run-gateway` workers). These
-///   keep the legacy `cerulion=info` default.
+/// - `QuietRuntime`: the runtime verbs whose terminal output IS their result,
+///   `graph run` (with its hidden `run-worker` processes) and `bag play`. These
+///   default QUIET (`cerulion=warn`) too, so a run prints that it is running,
+///   its recording path and any warning, and a verification prints its
+///   verdict, with no lifecycle bookkeeping around them.
+/// - `LongRunning`: verbs whose lifecycle lines are the operator's window into
+///   a loop or daemon (`graph profile`, `node run`, `bag record`, `ros2 attach`,
+///   `viz`, `connect`, and the hidden `run-gateway`). These keep the
+///   `cerulion=info` default.
 ///
-/// `-v/--verbose` raises EITHER class to `cerulion=debug`; an explicit
-/// `RUST_LOG` always wins over the default (see `cerulion_core::init_logging`).
+/// `-v/--verbose` raises ANY class to `cerulion=debug`; an explicit `RUST_LOG`
+/// always wins over the default (see `cerulion_core::init_logging`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerbLogClass {
-    /// Run-and-exit verb — quiet (`warn`) default.
+    /// Run-and-exit verb: quiet (`warn`) default.
     OneShot,
-    /// Runtime / daemon verb — `info` default.
+    /// Runtime verb whose terminal output is its result: quiet (`warn`) default.
+    QuietRuntime,
+    /// Runtime / daemon verb: `info` default.
     LongRunning,
 }
 
 impl VerbLogClass {
-    /// True when this class defaults to the quiet `warn` filter — the
+    /// True when this class defaults to the quiet `warn` filter, the
     /// `quiet_default` argument threaded into `cerulion_core::init_logging`.
     pub fn is_quiet_default(self) -> bool {
-        matches!(self, VerbLogClass::OneShot)
+        matches!(self, VerbLogClass::OneShot | VerbLogClass::QuietRuntime)
     }
 }
 
@@ -685,20 +651,21 @@ impl Commands {
     /// for the TUI and dispatches `bagd` to its own logging init before
     /// `init_logging` runs), but they are classified here for exhaustiveness.
     pub fn log_verb_class(&self) -> VerbLogClass {
-        use VerbLogClass::{LongRunning, OneShot};
+        use VerbLogClass::{LongRunning, OneShot, QuietRuntime};
         match self {
             #[cfg(unix)]
             Commands::BootstrapRobot { .. } => OneShot,
             #[cfg(unix)]
             Commands::RobotSyncEpoch { .. } => OneShot,
-            // ── Long-running / runtime verbs: keep the `info` default ──
+            // ── Runtime verbs: quiet when the output is the result, else `info` ──
             Commands::Graph { action } => match action {
-                // Runtime loops: the live run, the live profiler, and the
-                // hidden multi-process worker / network-gateway processes.
-                GraphAction::Run { .. }
-                | GraphAction::Profile { .. }
-                | GraphAction::RunWorker { .. }
-                | GraphAction::RunGateway { .. } => LongRunning,
+                // The live run and its hidden workers: the run's own output
+                // (running, the recording path, the warnings) is its result,
+                // and the workers write to the run's stderr, so they take its
+                // class.
+                GraphAction::Run { .. } | GraphAction::RunWorker { .. } => QuietRuntime,
+                // The live profiler and the hidden network-gateway process.
+                GraphAction::Profile { .. } | GraphAction::RunGateway { .. } => LongRunning,
                 // create / validate / list / levels / partition all run-and-exit.
                 GraphAction::Create { .. }
                 | GraphAction::Validate { .. }
@@ -721,14 +688,10 @@ impl Commands {
                 | NodeAction::Info { .. } => OneShot,
             },
             // `viz` spawns/attaches the vizd daemon; `connect` spawns
-            // connectd and stays attached; `pair` drives the interactive
-            // pairing ceremony via connectd — all runtime verbs.
+            // connectd and stays attached: both runtime verbs.
             // `login` waits interactively for browser authorization
             // — keep `info` so any device-registration / auth warns are visible.
-            Commands::Viz { .. }
-            | Commands::Connect { .. }
-            | Commands::Pair { .. }
-            | Commands::Login => LongRunning,
+            Commands::Viz { .. } | Commands::Connect { .. } | Commands::Login => LongRunning,
             // `ros2 attach` runs a bridge graph; `ros2 run`/`launch` exec()
             // the real ros2 (runtime processes — the classification covers
             // only the pre-exec window, since init_logging runs before
@@ -743,24 +706,21 @@ impl Commands {
                 | Ros2Action::Launch { .. } => LongRunning,
                 Ros2Action::Migrate { .. } => OneShot,
             },
-            // The removed-`ros`-family stub never runs anything: `main`
-            // intercepts it above the login gate and prints the migration
-            // error before `init_logging` matters. Classified for
-            // exhaustiveness only.
-            Commands::Ros { .. } => OneShot,
-            // `bag play` and `bag record` run a loop until the bag
-            // ends / the duration elapses / Ctrl-C, and their lifecycle
-            // breadcrumbs (topics refused, taps attached, schemas learned) are
-            // the operator's only window into a run — `info` default. `bag
-            // info` is a pure run-and-exit render, so it stays quiet.
-            // `bag play --resim` RE-EXECUTES nodes, which is the same
-            // runtime-verb argument the removed `cerulion replay` made, and it
-            // arrives through this same arm.
-            // `bag migrate` is a run-and-exit rewrite whose product
-            // is the preview it prints and the file it writes — `info` default,
-            // like `bag info`.
+            // The removed-`ros`-family stub and the hidden `pair` stub never
+            // run anything: `main` intercepts both above the login gate and
+            // prints their refusal before `init_logging` matters. Classified
+            // for exhaustiveness only.
+            Commands::Ros { .. } | Commands::Pair { .. } => OneShot,
+            // `bag record` runs a loop until the duration elapses or Ctrl-C,
+            // and its lifecycle breadcrumbs (topics refused, taps attached,
+            // schemas learned) are the operator's only window into a run:
+            // `info` default. `bag play` prints its own result (a playback,
+            // or `--resim`'s verdict or summary), so it defaults quiet like
+            // `graph run`. `bag info` and `bag migrate` are run-and-exit
+            // renders whose product is what they print.
             Commands::Bag { action } => match action {
-                BagAction::Play { .. } | BagAction::Record { .. } => LongRunning,
+                BagAction::Play { .. } => QuietRuntime,
+                BagAction::Record { .. } => LongRunning,
                 BagAction::Info { .. } | BagAction::Migrate { .. } => OneShot,
             },
             // ── One-shot verbs: QUIET (`warn`) default ──
@@ -1226,7 +1186,7 @@ pub enum NodeAction {
         /// `--policy`.
         #[arg(long, value_name = "SPEC")]
         policy: Option<String>,
-        /// Use the legacy raw FFI template instead of the `#[cerulion_node]` macro
+        /// Use the stable raw FFI template instead of the `#[cerulion_node]` macro
         #[arg(long)]
         raw_ffi: bool,
     },
@@ -1362,8 +1322,9 @@ pub enum NodeAction {
         /// and no topic visible on the network. The switch keeps Cerulion
         /// service traffic off (robots, relays, hosted Cerulion services and
         /// telemetry); signing in to your account still works. Without a CLI or environment
-        /// kill-switch, a real-clock `node run` starts the network gateway and every produced
-        /// topic is announced on the LAN, viewable by any peer without pairing.
+        /// kill-switch, a real-clock `node run` offers its produced topics with paired access
+        /// by default on every platform: same-account and explicitly paired machines can
+        /// read them, and unpaired LAN peers are refused unless `CERULION_LAN_ACCESS=open` is set.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
     },
@@ -1583,8 +1544,9 @@ pub enum GraphAction {
         /// Without a CLI or environment kill-switch, a graph with an enabled `network:` block
         /// runs STRICT (exactly the declared egress and ingress), and a graph
         /// with no block, or a disabled one, runs PERMISSIVE: a gateway process
-        /// can announce every produced topic when LAN access is open. Android
-        /// defaults to paired-only access, which withholds topic announcements.
+        /// can announce every produced topic when LAN access is open. LAN access
+        /// defaults to paired on every platform, which withholds topic announcements;
+        /// `CERULION_LAN_ACCESS=open` opens it.
         /// Restrict exposure with a `network:` block, or pass `off` for local-only.
         #[arg(long = "network", value_name = "MODE", value_parser = ["off"])]
         network: Option<String>,
@@ -1874,18 +1836,18 @@ pub enum TopicAction {
     /// List active topics: local shared-memory topics, then remote ones.
     ///
     /// Genuinely LOCAL shared-memory topics are listed first, then REMOTE
-    /// topics. Remote discovery runs BY DEFAULT (an mDNS browse, the peer
-    /// cache and the hostname rung), so robots on the LAN show up with no
-    /// flags and no pairing; when it
-    /// finds nothing the listing ends with one `remote: none discovered` line.
+    /// topics. Remote discovery runs BY DEFAULT: same-account and explicitly
+    /// paired robots are listed on any network with no flags. With explicit open
+    /// LAN access, locators or --scan, the LAN ladder (mDNS, peer cache, hostname)
+    /// also finds robots serving open LAN access. When discovery finds nothing the listing ends with one `remote: none discovered` line.
     /// A local topic that is really a MIRROR of a remote robot's topic is
     /// listed under REMOTE as a `● streaming` row attributed to its robot,
     /// never under LOCAL. The framework's own channels (the recorder's
     /// `/bagd/status`, anything under `/__cerulion/`) are hidden from the
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
-    /// Pass `--connect` or `--listen` locators to reach
-    /// peers discovery cannot find; pass `--local` to skip the remote
+    /// Pass `--connect` or `--listen` locators for explicit open LAN compatibility;
+    /// account and paired discovery needs neither. Pass `--local` to skip the remote
     /// network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
@@ -1933,11 +1895,14 @@ pub enum TopicAction {
     },
     /// Show info about a topic (schema name + last sequence/timestamp)
     ///
-    /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
-    /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Pass `--local`
+    /// Reads a local topic or an account/paired robot's topic anywhere.
+    /// Remote topics are demanded automatically and released on exit.
+    /// Ambiguous topic names require --robot NAME. Pass `--local`
     /// to read genuine local producers without remote discovery or demand.
     Info {
+        /// Select a robot by its exact name or account route.
+        #[arg(long, value_name = "NAME", conflicts_with = "local", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
         /// is refused even when its bytes already exist locally.
@@ -1949,11 +1914,14 @@ pub enum TopicAction {
     },
     /// Echo messages from a topic as YAML
     ///
-    /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
-    /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Pass `--local`
+    /// Reads a local topic or an account/paired robot's topic anywhere.
+    /// Remote topics are demanded automatically and released on exit.
+    /// Ambiguous topic names require --robot NAME. Pass `--local`
     /// to read genuine local producers without remote discovery or demand.
     Echo {
+        /// Select a robot by its exact name or account route.
+        #[arg(long, value_name = "NAME", conflicts_with = "local", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
         /// is refused even when its bytes already exist locally.
@@ -1976,11 +1944,14 @@ pub enum TopicAction {
     },
     /// Measure publish rate on a topic
     ///
-    /// Reads a LOCAL topic or, if the name is not a local topic, a REMOTE
-    /// robot's topic discovered on the LAN: the topic is demanded
-    /// automatically and released when the command exits. Pass `--local`
+    /// Reads a local topic or an account/paired robot's topic anywhere.
+    /// Remote topics are demanded automatically and released on exit.
+    /// Ambiguous topic names require --robot NAME. Pass `--local`
     /// to read genuine local producers without remote discovery or demand.
     Hz {
+        /// Select a robot by its exact name or account route.
+        #[arg(long, value_name = "NAME", conflicts_with = "local", add = clap_complete::engine::ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
         /// Read genuine local shared-memory producers only. No remote
         /// discovery, schema query or network-daemon startup. A remote mirror
         /// is refused even when its bytes already exist locally.
@@ -2446,107 +2417,90 @@ mod graph_levels_dispatch_tests {
 #[cfg(test)]
 mod pair_dispatch_tests {
     use super::*;
+    use clap::CommandFactory;
 
-    /// `cerulion pair go2` parses to `Commands::Pair` with the positional
-    /// robot name and every optional flag defaulting to absent.
+    /// The hidden `pair` stub swallows EVERY spelling a script may still
+    /// use, the old flags and the help flags included, so `main` answers
+    /// each with its refusal. Without `disable_help_flag` the `--help` and
+    /// `-h` arms fail with clap's `DisplayHelp`; without the swallowing
+    /// positional the flag arms fail with an unknown-argument error.
     #[test]
-    fn pair_parses_positional_name_with_defaults() {
-        let cli = Cli::try_parse_from(["cerulion", "pair", "go2"])
-            .expect("`cerulion pair go2` must parse");
-        match cli.command {
-            Commands::Pair {
-                robot,
-                eid,
-                addrs,
-                code,
-                account,
-                label,
-                key_file,
-                relay_url,
-                relay_disabled,
-            } => {
-                assert_eq!(robot.as_deref(), Some("go2"));
-                assert!(eid.is_none());
-                assert!(addrs.is_empty());
-                assert!(code.is_none(), "the pairing code defaults to stdin");
-                assert!(account.is_none(), "the account defaults to the desk key");
-                assert!(label.is_none(), "the label defaults to the desk hostname");
-                assert!(
-                    key_file.is_none(),
-                    "the key file defaults to this machine's key"
-                );
-                assert!(relay_url.is_none());
-                assert!(!relay_disabled);
+    fn hidden_pair_stub_swallows_every_old_spelling() {
+        for argv in [
+            vec!["cerulion", "pair"],
+            vec!["cerulion", "pair", "go2"],
+            vec!["cerulion", "pair", "go2", "--code", "SWAN-42"],
+            vec![
+                "cerulion",
+                "pair",
+                "--eid",
+                "deadbeef",
+                "--addr",
+                "192.168.1.20:7842",
+                "--relay-disabled",
+            ],
+            vec!["cerulion", "pair", "--help"],
+            vec!["cerulion", "pair", "-h"],
+        ] {
+            let expected: Vec<String> = argv[2..].iter().map(|s| s.to_string()).collect();
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| {
+                panic!(
+                    "`{}` must parse into the hidden pair stub, never clap's own \
+                     help or error (kind {:?})",
+                    argv.join(" "),
+                    e.kind()
+                )
+            });
+            match cli.command {
+                Commands::Pair { args } => {
+                    assert_eq!(args, expected, "`{}`", argv.join(" "));
+                }
+                _ => panic!("expected the Commands::Pair stub"),
             }
-            _ => panic!("expected Commands::Pair"),
         }
     }
 
-    /// All flags together: `--eid`, `--addr` (repeatable), `--code`, `--account`,
-    /// `--label`, `--key-file`, `--relay-url`, `--relay-disabled`.
+    /// `cerulion help pair` is the one spelling clap answers itself: it renders
+    /// the stub's doc comment (the refusal's own words), never the old
+    /// ceremony's flags.
     #[test]
-    fn pair_parses_all_flags() {
-        let cli = Cli::try_parse_from([
-            "cerulion",
-            "pair",
-            "--eid",
-            "deadbeef",
-            "--addr",
-            "192.168.1.20:7842",
-            "--addr",
-            "[::1]:9000",
-            "--code",
-            "SWAN-42",
-            "--account",
-            "aabb",
-            "--label",
-            "my-desk",
-            "--key-file",
-            "/keys/desk.key",
-            "--relay-url",
-            "https://relay.example",
-            "--relay-disabled",
-        ])
-        .expect("all pair flags must parse");
-        match cli.command {
-            Commands::Pair {
-                robot,
-                eid,
-                addrs,
-                code,
-                account,
-                label,
-                key_file,
-                relay_url,
-                relay_disabled,
-            } => {
-                assert!(robot.is_none(), "--eid replaces the positional");
-                assert_eq!(eid.as_deref(), Some("deadbeef"));
-                assert_eq!(addrs, vec!["192.168.1.20:7842", "[::1]:9000"]);
-                assert_eq!(code.as_deref(), Some("SWAN-42"));
-                assert_eq!(account.as_deref(), Some("aabb"));
-                assert_eq!(label.as_deref(), Some("my-desk"));
-                assert_eq!(key_file, Some(PathBuf::from("/keys/desk.key")));
-                assert_eq!(relay_url.as_deref(), Some("https://relay.example"));
-                assert!(relay_disabled);
-            }
-            _ => panic!("expected Commands::Pair"),
-        }
+    fn help_pair_renders_the_unavailable_notice() {
+        let err = match Cli::try_parse_from(["cerulion", "help", "pair"]) {
+            Ok(_) => panic!("`cerulion help pair` must render help, not parse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = err.to_string();
+        assert!(
+            text.contains("Code pairing is not available in this release"),
+            "{text}"
+        );
+        assert!(text.contains("cerulion login"), "{text}");
+        assert!(!text.contains("--code"), "{text}");
     }
 
-    /// `cerulion pair` with no robot AND no `--eid` still PARSES (both are
-    /// optional at the clap layer) — the engine's `resolve_pair_target` produces
-    /// the "specify a robot" error, matching the `connect` verb's shape.
+    /// `pair` is hidden: `cerulion --help` lists no `pair` row. Completion is
+    /// pinned in `completion_wiring_tests`.
     #[test]
-    fn pair_with_no_target_parses_then_engine_errors() {
-        let cli = Cli::try_parse_from(["cerulion", "pair"]).expect("`cerulion pair` parses");
-        match cli.command {
-            Commands::Pair { robot, eid, .. } => {
-                assert!(robot.is_none());
-                assert!(eid.is_none());
-            }
-            _ => panic!("expected Commands::Pair"),
-        }
+    fn pair_is_hidden_from_the_root_help() {
+        let mut cmd = Cli::command();
+        let pair = cmd
+            .find_subcommand("pair")
+            .expect("`pair` stays a verb so old scripts reach its refusal");
+        assert!(pair.is_hide_set(), "`pair` must be hidden");
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("pair ")),
+            "`cerulion --help` lists `pair`:\n{help}"
+        );
+        // The listing is still rendered: the check above is not vacuous.
+        assert!(
+            help.lines()
+                .any(|line| line.trim_start().starts_with("connect ")),
+            "{help}"
+        );
     }
 }
 
@@ -3583,7 +3537,8 @@ mod time_source_flag_tests {
         // what it means. Read each arm as a sentence.
         fn want(flag: RecordEnv) -> RecordEnvMode {
             match flag {
-                // `allowlist` (the default): values only for CERULION_*/RUST_LOG/IOX2_*.
+                // `allowlist` (the default): values only for CERULION_*/RUST_LOG/IOX2_*
+                // names with no secret marker segment.
                 RecordEnv::Allowlist => RecordEnvMode::Allowlist,
                 // `all`: verbatim values, secrets included.
                 RecordEnv::All => RecordEnvMode::All,
@@ -4861,17 +4816,35 @@ mod verb_log_class_tests {
         }
     }
 
+    /// `graph run` and `bag play` print their own result, so they default
+    /// QUIET (`QuietRuntime`) while staying distinct from the run-and-exit
+    /// verbs.
+    #[test]
+    fn result_printing_runtime_verbs_default_quiet() {
+        let quiet_runtime: &[&[&str]] = &[
+            &["cerulion", "graph", "run", "g"],
+            &["cerulion", "graph", "run", "g", "--record"],
+            &["cerulion", "bag", "play", "bag.mcap"],
+            &[
+                "cerulion", "bag", "play", "bag.mcap", "--resim", "all", "--verify",
+            ],
+        ];
+        for argv in quiet_runtime {
+            assert_eq!(class_of(argv), VerbLogClass::QuietRuntime, "{argv:?}");
+            assert!(
+                class_of(argv).is_quiet_default(),
+                "{argv:?} defaults to the quiet `warn` filter"
+            );
+        }
+    }
+
     /// Runtime / daemon verbs keep the `info` default (`LongRunning`).
     #[test]
     fn long_running_verbs_keep_info() {
         let long_running: &[&[&str]] = &[
-            &["cerulion", "graph", "run", "g"],
             &["cerulion", "graph", "profile", "g"],
             &["cerulion", "node", "run", "camera"],
-            // `bag play --resim` is where the removed `cerulion
-            // replay`'s re-execution went, so it inherits its log class — as
-            // does plain playback, which was already `LongRunning`.
-            &["cerulion", "bag", "play", "bag.mcap", "--resim", "all"],
+            &["cerulion", "bag", "record", "/camera"],
             &["cerulion", "ros2", "attach", "--iface", "10.0.0.7"],
             &["cerulion", "viz"],
             &["cerulion", "connect", "robot1"],
@@ -4894,14 +4867,15 @@ mod verb_log_class_tests {
         }
     }
 
-    /// The hidden multi-process worker / gateway verbs run a runtime loop, so
-    /// they keep `info` (they are spawned by `graph run`, never typed).
+    /// The hidden worker verb takes its parent `graph run`'s quiet class (the
+    /// supervisor's stderr is the worker's), while the hidden gateway keeps
+    /// `info`. Both are spawned, never typed.
     #[test]
-    fn hidden_worker_verbs_keep_info() {
+    fn hidden_worker_verbs_follow_their_parent() {
         assert_eq!(
             class_of(&["cerulion", "graph", "run-worker", "--plan", "/tmp/p.json"]),
-            VerbLogClass::LongRunning,
-            "run-worker is a runtime process"
+            VerbLogClass::QuietRuntime,
+            "run-worker prints on its graph run's stderr"
         );
         assert_eq!(
             class_of(&[
@@ -4928,6 +4902,11 @@ mod verb_log_class_tests {
         );
         assert_eq!(
             class_of(&["cerulion", "-v", "graph", "run", "g"]),
+            VerbLogClass::QuietRuntime,
+            "-v does not reclassify a quiet runtime verb"
+        );
+        assert_eq!(
+            class_of(&["cerulion", "-v", "graph", "profile", "g"]),
             VerbLogClass::LongRunning,
             "-v does not reclassify a long-running verb"
         );

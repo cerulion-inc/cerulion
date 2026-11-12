@@ -1597,6 +1597,128 @@ impl CerulionPublisher {
         ))
     }
 
+    /// Host-private native loan for a checked plugin descriptor.
+    ///
+    /// Keeps the adaptive capacity and initializes only the wire prefix, as
+    /// `loan_proxy` does. The native owner stays in the host lease arena.
+    #[doc(hidden)]
+    pub(crate) fn loan_plugin_frame(
+        &mut self,
+        layout: super::plugin_lease::PluginWireLayout,
+    ) -> TransportResult<RawShmLoan> {
+        let prefix = layout
+            .prefix_len()
+            .ok_or_else(|| TransportError::InvalidTransportConfig {
+                reason: "plugin wire prefix or alignment is invalid".to_string(),
+            })?;
+        if prefix > self.max_slice_len.get() {
+            return Err(TransportError::BufferTooSmall {
+                topic: self.topic.to_string(),
+                needed: prefix as usize,
+                available: self.max_slice_len.get() as usize,
+            });
+        }
+        self.check_subscriber_events();
+        if self.fault_inject_loan_fail_next {
+            self.fault_inject_loan_fail_next = false;
+            self.bump_discard_signal();
+            return Err(TransportError::LoanCapacity {
+                topic: self.topic.to_string(),
+            });
+        }
+        let capacity = if layout.variable_fields == 0 {
+            prefix
+        } else {
+            self.adaptive_loan_size(prefix)
+        };
+        let mut loan = self
+            .loan_raw_uninit(capacity as usize)
+            .inspect_err(|_| self.bump_discard_signal())?;
+        let mut header_bytes = [0; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: capacity,
+            offset_table_offset: WireHeader::SIZE as u32 + layout.fixed_size,
+            offset_table_count: layout.variable_fields,
+            sequence: self.sequence(),
+            timestamp_ns: self.clock.now_ns(),
+            step_tag: crate::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut header_bytes);
+        let bytes = loan.bytes_uninit_mut();
+        for byte in &mut bytes[..prefix as usize] {
+            byte.write(0);
+        }
+        for (dst, src) in bytes.iter_mut().zip(header_bytes) {
+            dst.write(src);
+        }
+        // SAFETY: this is the same native mapping and prefix initialization
+        // as loan_proxy. Every mapping byte has an OS-defined value; only the
+        // initialized prefix is interpreted before the trusted plugin writes
+        // its payload. Host finish validates offset ranges and total_size and
+        // never sends an incomplete/abandoned loan. No lifetime is extended.
+        Ok(unsafe { loan.assume_init_shm_defined() })
+    }
+
+    /// Commit an already validated plugin loan through native accounting.
+    /// Header timestamp is the loan stamp; sequence is consumed here only.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_frame(
+        &mut self,
+        mut loan: RawShmLoan,
+        mut header: WireHeader,
+        total_size: u32,
+    ) -> TransportResult<()> {
+        header.total_size = total_size;
+        header.sequence = self.commit_sequence();
+        header.write_to_buf(loan.bytes_mut());
+        if let Err(error) = self.send_raw_loan(loan) {
+            self.record_send_fail_drop();
+            return Err(error);
+        }
+        self.record_payload_size(total_size);
+        self.complete_plugin_output(header.schema_hash, false);
+        if let Err(error) = self.notify_sent_sample() {
+            tracing::trace!(topic = %self.topic, error = %error, "plugin output notification failed after delivery");
+        }
+        Ok(())
+    }
+
+    /// Commit the explicitly advertised adaptive-spill exception.
+    /// Payload remains node-owned for this synchronous copy into a new loan.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_spill(
+        &mut self,
+        mut header: WireHeader,
+        payload: &[u8],
+    ) -> TransportResult<()> {
+        header.total_size = (WireHeader::SIZE + payload.len()) as u32;
+        header.sequence = self.commit_sequence();
+        let mut bytes = [0; WireHeader::SIZE];
+        header.write_to_buf(&mut bytes);
+        if let Err(error) = self.send_overflow_frame(&bytes, payload) {
+            self.record_payload_size(header.total_size);
+            self.record_dropped_overflow_frame();
+            return Err(error);
+        }
+        self.complete_plugin_output(header.schema_hash, true);
+        Ok(())
+    }
+
+    fn complete_plugin_output(&mut self, schema_hash: u64, spill: bool) {
+        if let Some(suppressed) = self.record_output_complete() {
+            if spill {
+                super::output_proxy::log_spill_output_recovered(
+                    self.topic(),
+                    schema_hash,
+                    suppressed,
+                );
+            } else {
+                super::output_proxy::log_output_recovered(self.topic(), schema_hash, suppressed);
+            }
+        }
+    }
+
     /// Best-effort `SentSample` notification — exposed for `OutputProxy::Drop`,
     /// the service layer, and raw-ingress `publish_raw`: the doorbell ring, then
     /// the listener notify. The rmw bridge's publish paths call the two halves
@@ -2356,6 +2478,43 @@ impl CerulionPublisher {
         // `promise_within_ms` watchdog (no-op unless one is wired).
         self.record_promise_within_published();
 
+        self.complete_raw_publish(data);
+
+        Ok(recipients)
+    }
+
+    /// Publish a fully initialized exact raw frame without replacing its stamps.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_raw_frame(
+        &mut self,
+        mut loan: RawShmLoan,
+    ) -> TransportResult<usize> {
+        let mut header = [0; WireHeader::SIZE];
+        header.copy_from_slice(&loan.bytes_mut()[..WireHeader::SIZE]);
+        let recipients = self
+            .send_raw_loan(loan)
+            .inspect_err(|_| self.record_send_fail_drop())?;
+        self.complete_raw_publish(&header);
+        Ok(recipients)
+    }
+
+    /// Loan an exact-size raw ingress frame. Header is initialized for validation;
+    /// the caller must overwrite its complete initialized frame before finishing.
+    #[doc(hidden)]
+    pub(crate) fn loan_plugin_raw_frame(&mut self, size: u32) -> TransportResult<RawShmLoan> {
+        let mut loan = self.loan_raw_uninit(size as usize)?;
+        for byte in &mut loan.bytes_uninit_mut()[..WireHeader::SIZE] {
+            byte.write(0);
+        }
+        // SAFETY: POSIX SHM supplies defined mapping bytes, as in loan_proxy.
+        // The prefix is initialized, the host retains the native owner, and the
+        // trusted raw caller initializes its complete frame before finish. Shape
+        // validation refuses an unwritten/malformed header; no lifetime extends.
+        Ok(unsafe { loan.assume_init_shm_defined() })
+    }
+
+    // Preserve the existing raw publish trace/notify effects in one shared path.
+    fn complete_raw_publish(&mut self, data: &[u8]) {
         // Regime A: record the publish into the trace
         // (when attached). Parsing 24 bytes of WireHeader is cheap
         // relative to the iceoryx2 send that just completed.
@@ -2422,8 +2581,6 @@ impl CerulionPublisher {
             // off-gate arm is the pin: its producer publishes exactly this way.
             self.unannounced_publish.store(true, Ordering::Relaxed);
         }
-
-        Ok(recipients)
     }
 
     /// Non-blocking check for subscriber events.

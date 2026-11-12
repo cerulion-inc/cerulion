@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Node source and Cargo.toml template generation.
 //!
-//! Generates cdylib node source for the handle-based FFI convention. The
-//! emitted `cerulion_abi_version()` tracks the transport-tagged ABI value of
-//! the `cerulion_core` it is compiled against, and the emitted
-//! `cerulion_rustc_fingerprint()` (ABI v22) tracks
-//! `cerulion_core::rustc_fingerprint_cstr()`. Neither is pinned to a specific
-//! value here, so a host rebuild propagates to every future generated node
-//! crate with no template regeneration.
-//! Uses programmatic `String` building (matching `codegen/generator/` pattern).
+//! Generates node source using checked stable boundary major 1. Native transport
+//! ownership stays in the host, and no compiler fingerprint governs loading.
+//! Uses programmatic String building for metadata and source emission.
 
 use crate::node_metadata::NodeMetadata;
 use crate::utils::to_pascal_case;
@@ -579,392 +574,14 @@ pub fn generate_macro_lib_rs(metadata: &NodeMetadata, trigger: Option<&str>) -> 
     src
 }
 
-/// Generate the `lib.rs` source for a node crate using raw FFI (legacy template).
-///
-/// This is the original template that produces explicit `extern "C"` functions.
-/// Use `--raw-ffi` flag to select this template.
+/// Generate a raw node with checked C tables and node-local state.
+/// The `--raw-ffi` flag selects this explicit-table template.
 pub fn generate_lib_rs(metadata: &NodeMetadata) -> String {
-    let mut src = String::new();
-
-    // A node is a shared library the graph runtime loads, not a program: its
-    // `println!` lands on whatever stdout the host happens to have, bypassing
-    // the log filter, and on a robot that is how a disk fills. So the scaffold
-    // makes it a clippy error and points at the alternative. Scoped
-    // `not(test)`, so the node's own unit tests still print freely; delete the
-    // line if you have a reason to print from node code.
-    src.push_str("// A node is a LIBRARY the runtime loads — log with `tracing`,\n");
-    src.push_str("// never `println!`. (Your own #[cfg(test)] tests may print.)\n");
-    src.push_str("#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]\n");
-    src.push('\n');
-
-    // Imports — the raw-FFI template's placeholder body never references
-    // `cerulion_core::prelude::*`, so the prelude is NOT pre-imported.
-    // Users replacing the placeholder body with real logic should add the
-    // imports they need — same as any Rust crate. Pre-importing the
-    // prelude would trip `unused_imports = deny` under the workspace's
-    // strict lint contract (see AGENTS.md). The macro template
-    // (`generate_macro_lib_rs`) is the recommended path and DOES import
-    // the prelude because its generated body actually uses it.
-    //
-    // `RefCell` and `CString` are referenced via
-    // fully-qualified `::std::cell::RefCell` and `::std::ffi::CString`
-    // paths in the LAST_ERROR machinery so a `use
-    // native_ros2_messages::std_msgs::CString;` (theoretical) cannot
-    // shadow them. The realistic shadow risk is `String` (std_msgs/String
-    // exists today); the rest are defense-in-depth. Pre-existing emit
-    // (`HashMap`, `Mutex`, `AtomicU64`, `Ordering`) retains its bare
-    // imports — those names don't collide with current ROS schemas.
-    src.push_str("use std::collections::HashMap;\n");
-    src.push_str("use std::sync::atomic::{AtomicU64, Ordering};\n");
-    src.push_str("use std::sync::Mutex;\n");
-    src.push('\n');
-
-    // Do not pre-import port schema
-    // types. The raw-FFI placeholder body never references them, so
-    // emitting `use native_ros2_messages::sensor_msgs::Image;` (etc.)
-    // would trip `unused_imports = deny` under the workspace's strict
-    // lint contract for any node with one or more port schemas. Users
-    // replacing the placeholder body add the imports they need — same
-    // pattern as the `cerulion_core::prelude::*` drop (see the Imports
-    // block comment above). The macro template (`generate_macro_lib_rs`)
-    // is unaffected; its struct fields use the schema types, so the
-    // imports are not unused there.
-
-    // Node state struct
-    src.push_str(&format!(
-        "struct {}State {{\n    tick_count: u64,\n}}\n\n",
-        to_pascal_case(&metadata.node_type)
-    ));
-
-    // Static state — handle-based multi-instance support
-    src.push_str("static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);\n");
-    src.push_str(&format!(
-        "static NODES: Mutex<Option<HashMap<u64, {}State>>> = Mutex::new(None);\n\n",
-        to_pascal_case(&metadata.node_type)
-    ));
-
-    // Per-cdylib thread-local for the most recent FFI error
-    // message. Init/tick/shutdown stash a string here on every non-success
-    // path; the host pulls it via `cerulion_take_last_error()` immediately
-    // after the offending FFI call and releases it via
-    // `cerulion_free_error()`. Thread-local rather than a global Mutex
-    // because the graph runtime is single-threaded per node — a separate
-    // tick on a different thread cannot clobber another thread's unread
-    // error. `const { ... }` keeps first-touch zero-cost.
-    //
-    // Fully-qualified `::std::string::String` and
-    // `::std::ffi::CString` paths in the emit — bare `String` would be
-    // shadowed by a `use native_ros2_messages::std_msgs::String;` import
-    // emitted alongside, breaking compilation for any raw-FFI node with
-    // a `std_msgs/String` port. The macro form does the same. Tests
-    // miss this when the unit-test metadata uses empty
-    // inputs/outputs; it takes a port-bound
-    // test of the emitted source to catch it.
-    src.push_str(
-        r#"thread_local! {
-    static LAST_ERROR: ::std::cell::RefCell<Option<::std::ffi::CString>> = const { ::std::cell::RefCell::new(None) };
-}
-
-fn __cer_set_last_error(msg: ::std::string::String) {
-    let cstring = ::std::ffi::CString::new(msg.replace('\0', "\\0"))
-        .unwrap_or_else(|_| ::std::ffi::CString::new("error message contained nul byte").unwrap());
-    LAST_ERROR.with(|cell| {
-        *cell.borrow_mut() = Some(cstring);
-    });
-}
-
-"#,
+    let template = include_str!("templates/raw_node_template.rs").replace(
+        "__NODE_STATE__",
+        &format!("{}State", to_pascal_case(&metadata.node_type)),
     );
-
-    // Transport-tagged ABI value. Emit the core method call rather than a
-    // baked value, so a generated raw-FFI node tracks the version and
-    // transport kind of the `cerulion_core` it is compiled against.
-    src.push_str("#[no_mangle]\npub extern \"C\" fn cerulion_abi_version() -> u32 {\n    ");
-    src.push_str("::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()\n");
-    src.push_str("}\n\n");
-
-    // ABI v22 rustc fingerprint. Required at every ABI 22 and later host: it
-    // reports the rustc that compiled THIS cdylib so the loader can refuse a
-    // load where the host and this node disagree on how a `repr(Rust)` type
-    // crossing the FFI (for example `Option<FrozenSlot>`) is laid out, a class
-    // the ABI version alone cannot see. Emitted the same "const name, not
-    // baked value" way as the ABI version above, for the same reason: a host
-    // rebuild picks up the new fingerprint with no template regeneration.
-    src.push_str(
-        "#[no_mangle]\npub extern \"C\" fn cerulion_rustc_fingerprint() -> *const ::std::ffi::c_char {\n    ",
-    );
-    src.push_str("::cerulion_core::rustc_fingerprint_cstr()\n");
-    src.push_str("}\n\n");
-
-    // Platform check. The host loader calls it at load, before init, so the
-    // probe runs against THIS cdylib's own `cerulion_core` and `iceoryx2`
-    // copy: the host's probe proves nothing about a separately linked
-    // library. Required on Android, where a stock-iceoryx2 build has no
-    // `shm_open`; off Android it is a no-op that returns 0.
-    src.push_str(
-        r#"// KEEP THIS. The host loader calls it before init so a stock-iceoryx2
-// build of this library is refused at load on Android (see docs/android.md).
-// A raw-FFI library without this export does not load on Android.
-#[no_mangle]
-pub extern "C" fn cerulion_node_platform_check() -> i32 {
-    match ::cerulion_core::graph::node::cdylib_platform_check() {
-        ::std::result::Result::Ok(()) => 0,
-        ::std::result::Result::Err(error) => {
-            __cer_set_last_error(::std::format!("node library: {error}"));
-            1
-        }
-    }
-}
-
-"#,
-    );
-
-    // Node info function with marker comments
-    src.push_str(&generate_info_fn(metadata));
-    src.push('\n');
-
-    // Init function (handle-based FFI: takes *mut u8, returns u64 handle).
-    //
-    // The warning block that follows lives in the
-    // EMITTED source so users opening their generated `lib.rs` see it.
-    // It documents the safety gap between the placeholder body (no-op
-    // counter, cannot fail) and a user-written body that might panic or
-    // return Err. Without this warning, users assume the cdylib carries
-    // the same panic-safety + Err-propagation as `#[cerulion_node]` and
-    // discover the gap only after a production crash.
-    //
-    // Generated function also mirrors the macro form's null-check on
-    // `ctx_ptr`: a null pointer from the host
-    // loader is a contract violation that must NOT result in a fresh
-    // handle. Return 0 + LAST_ERROR with the macro-parity wording.
-    src.push_str(
-        r#"// =================================================================
-// NOTE TO USERS REPLACING THE PLACEHOLDER BODY
-// =================================================================
-// The template's tick body is a no-op counter (`tick_count += 1`) and
-// CANNOT FAIL. As a result, this raw-FFI template DOES NOT EMIT:
-//   - `init failed: {e}` / `tick failed: {e}` Err-propagation wiring
-//     (the placeholder body has no `Result<_, _>` return).
-//   - `std::panic::catch_unwind(...)` panic-safety wrapper around
-//     init/tick/shutdown (the placeholder body cannot panic).
-//
-// If your real logic CAN return Err OR CAN panic, you MUST either:
-//   1. Migrate to `#[cerulion_node]` (drop `--raw-ffi` from
-//      `cerulion node create`) — the recommended path; the macro
-//      carries full panic-safety + Err propagation with no extra wiring.
-//   2. Hand-roll the equivalent wiring in every entry point below:
-//      wrap the body in `catch_unwind`, and on the error path call
-//      `__cer_set_last_error(format!("init failed: {}", e))` before
-//      returning the matching non-success code.
-//
-// Unwinding across the FFI boundary aborts the process (and was
-// undefined behaviour on older toolchains pre-Rust-1.71). Either way,
-// a panic must NOT cross the cdylib boundary back into the host.
-// Failing to translate Err to LAST_ERROR silently strips the diagnostic
-// — the host falls back to a generic "no detail provided" message that
-// is nearly impossible to debug from operator logs.
-
-"#,
-    );
-    let state_name = format!("{}State", to_pascal_case(&metadata.node_type));
-    src.push_str(&format!(
-        r#"#[no_mangle]
-pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {{
-    if ctx_ptr.is_null() {{
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_init: NodeContext pointer was null",
-        ));
-        return 0;
-    }}
-    // SAFETY: `ctx_ptr` is a `NodeContext` the runtime boxed and handed to
-    // this cdylib. Ownership transferred with it — the runtime will not free
-    // it — so pairing with `Box::from_raw` is required to avoid leaking one
-    // `NodeContext` per init call. This placeholder body doesn't use
-    // transport, so dropping the context at end of scope is the correct
-    // behavior. A node written with `#[cerulion_node]` instead STORES the
-    // boxed context so it can publish / subscribe — and so should you, once
-    // this node does real work.
-    let ctx = unsafe {{
-        ::std::boxed::Box::from_raw(ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext)
-    }};
-
-    // KEEP THIS, and keep it in `init`. A cdylib statically links its OWN
-    // copy of `iceoryx2-log`, whose level is a private static: the host
-    // process setting `IOX2_LOG_LEVEL` does NOTHING for this copy, so
-    // without this call iceoryx2 logs from THIS node at its crate default
-    // (`Info`) no matter what you configured. That is not cosmetic — a node
-    // logging at `Info` on a busy robot can emit thousands of lines a second
-    // and fill the disk. The value comes from the node's FROZEN env
-    // snapshot, never live `std::env`, so replay stays deterministic; empty
-    // means unset, which leaves Cerulion's default (`error`). Nodes written
-    // with `#[cerulion_node]` get this generated for them.
-    {{
-        let iox2_log = ctx.env_str("IOX2_LOG_LEVEL", "");
-        ::cerulion_core::iceoryx_logger::init_iceoryx_log_level(if iox2_log.is_empty() {{
-            ::std::option::Option::None
-        }} else {{
-            ::std::option::Option::Some(iox2_log.as_str())
-        }});
-    }}
-
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut guard) = NODES.lock() {{
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(handle, {state_name} {{ tick_count: 0 }});
-        handle
-    }} else {{
-        // Mutex poisoned: do NOT recover via `into_inner()` — a panic
-        // while holding the lock can leave per-node state inconsistent.
-        // Surface code + LAST_ERROR; let the host decide to restart.
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_init: NODES mutex poisoned",
-        ));
-        0
-    }}
-}}
-
-"#
-    ));
-
-    // Tick function (handle-based FFI: takes u64 handle)
-    src.push_str(
-        r#"#[no_mangle]
-pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
-    if let Ok(mut guard) = NODES.lock() {
-        match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-            Some(state) => {
-                state.tick_count += 1;
-                0
-            }
-            None => {
-                __cer_set_last_error(format!("cerulion_node_tick: handle {} not found", handle));
-                4
-            }
-        }
-    } else {
-        // Mutex poisoned: do NOT recover via `into_inner()` — see init.
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_tick: NODES mutex poisoned",
-        ));
-        3
-    }
-}
-
-"#,
-    );
-
-    // Pump-history function (handle-based FFI: takes u64 handle).
-    // ABI v7: the host calls this on every live step
-    // so cdylib nodes ALSO service quiescent late joiners (the in-process
-    // `pump_history` path cannot reach a cdylib node across the FFI). The
-    // placeholder body has no transport, so the pump is a no-op — but the
-    // symbol is REQUIRED by the loader, and the handle-lookup + error
-    // codes (4 not found / 3 NODES poisoned) mirror `cerulion_node_tick`.
-    // A user replacing the placeholder with a real publisher body should
-    // call their node's `pump_history()` here.
-    src.push_str(
-        r#"#[no_mangle]
-pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
-    if let Ok(mut guard) = NODES.lock() {
-        match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-            Some(_state) => {
-                // Placeholder node has no publishers — nothing to re-pump.
-                0
-            }
-            None => {
-                __cer_set_last_error(format!(
-                    "cerulion_node_pump_history: handle {} not found",
-                    handle
-                ));
-                4
-            }
-        }
-    } else {
-        // Mutex poisoned: do NOT recover via `into_inner()` — see init.
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_pump_history: NODES mutex poisoned",
-        ));
-        3
-    }
-}
-
-"#,
-    );
-
-    // Shutdown function (handle-based FFI: takes u64 handle)
-    // Shutdown returns code 4 on missing handle
-    // (never a silent 0). Every non-success path also
-    // stashes a human-readable message in LAST_ERROR, mirroring the
-    // macro-form FFI in `cerulion_macros/src/codegen.rs` so the host
-    // surfaces real diagnostics rather than bare codes.
-    src.push_str(
-        r#"#[no_mangle]
-pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
-    let mut guard = match NODES.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            // Mutex poisoned: do NOT recover via `into_inner()` — see init.
-            __cer_set_last_error(::std::string::String::from(
-                "cerulion_node_shutdown: NODES mutex poisoned",
-            ));
-            return 3;
-        }
-    };
-    match guard.as_mut().and_then(|m| m.remove(&handle)) {
-        Some(_node) => 0,
-        None => {
-            __cer_set_last_error(format!(
-                "cerulion_node_shutdown: handle {} not found (already shut down or never registered)",
-                handle
-            ));
-            4
-        }
-    }
-}
-
-"#,
-    );
-
-    // Take/free the most recent error message off the
-    // thread-local. Required by `DylibNodeEntry::load` — the host
-    // pulls the message via `cerulion_take_last_error` after any
-    // non-zero return from init/tick/shutdown and frees it via
-    // `cerulion_free_error`. Allocator pairing is critical: the
-    // CString MUST be freed by the same cdylib that allocated it.
-    // `cerulion_free_error` is `unsafe` because it dereferences a raw
-    // pointer (matching the hand-written
-    // `crates/test_fixtures/test_node_cdylib/src/lib.rs` precedent and
-    // satisfying clippy::not_unsafe_ptr_arg_deref under the strict
-    // workspace lint contract).
-    src.push_str(
-        r#"#[no_mangle]
-pub extern "C" fn cerulion_take_last_error() -> *mut std::ffi::c_char {
-    LAST_ERROR.with(|cell| match cell.borrow_mut().take() {
-        Some(cstr) => cstr.into_raw(),
-        None => std::ptr::null_mut(),
-    })
-}
-
-/// # Safety
-///
-/// `ptr` must be a pointer previously returned by
-/// `cerulion_take_last_error` from this same cdylib (allocator pairing
-/// requirement). Null is permitted and is a no-op. Calling with any
-/// other pointer is undefined behaviour.
-#[no_mangle]
-pub unsafe extern "C" fn cerulion_free_error(ptr: *mut std::ffi::c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: pointer originated from `CString::into_raw` in
-    // `cerulion_take_last_error`. Reclaiming via `from_raw`
-    // returns ownership and the CString drops here.
-    let _ = ::std::ffi::CString::from_raw(ptr);
-}
-"#,
-    );
-
-    src
+    template + &generate_info_fn(metadata)
 }
 
 /// Generate the `cerulion_node_info()` function with marker comments.
@@ -1019,6 +636,28 @@ pub fn generate_info_fn(metadata: &NodeMetadata) -> String {
         "static INFO_BYTES: &[u8] = b\"{}\\0\";\n\n",
         info_json
     ));
+    // Schema names survive source parsing and subsequent node modify calls.
+    // They stay outside the runtime JSON, which accepts only wire facts.
+    let schemas: std::collections::BTreeMap<_, std::collections::BTreeMap<_, _>> =
+        [("inputs", &metadata.inputs), ("outputs", &metadata.outputs)]
+            .into_iter()
+            .filter_map(|(direction, ports)| {
+                let names: std::collections::BTreeMap<_, _> = ports
+                    .iter()
+                    .filter_map(|port| {
+                        port.schema
+                            .as_deref()
+                            .map(|schema| (port.name.as_str(), schema))
+                    })
+                    .collect();
+                (!names.is_empty()).then_some((direction, names))
+            })
+            .collect();
+    if !schemas.is_empty() {
+        s.push_str(crate::node_metadata::PORT_SCHEMAS_MARKER);
+        s.push_str(&serde_json::to_string(&schemas).expect("schema names serialize as strings"));
+        s.push('\n');
+    }
     s.push_str("#[no_mangle]\n");
     s.push_str("pub extern \"C\" fn cerulion_node_info() -> *const std::ffi::c_char {\n");
     s.push_str("    // SAFETY: INFO_BYTES is a static &[u8] with a trailing null byte.\n");
@@ -1026,6 +665,18 @@ pub fn generate_info_fn(metadata: &NodeMetadata) -> String {
         "    // Casting *const u8 to *const c_char is safe: identical layout, valid and 'static.\n",
     );
     s.push_str("    INFO_BYTES.as_ptr() as *const std::ffi::c_char\n");
+    s.push_str("}\n");
+    // Keep wire facts in the same replaceable region as author metadata, so
+    // node modify updates both without rewriting application logic.
+    let facts = |ports: &[crate::node_metadata::PortDef]| {
+        ports.iter().map(|port| match &port.schema {
+            Some(schema) => format!("cerulion_core::graph::node_plugin_abi::HostClient::request::<{}>()", schema_to_import(schema)),
+            None => "cerulion_core::node_abi::LoanRequestV1 { schema_hash: 0, minimum_capacity: 40, wire_fixed_size: 0, variable_count: 0, alignment: 8 }".to_owned(),
+        }).collect::<Vec<_>>().join(", ")
+    };
+    s.push_str("\nfn __cer_raw_wire_metadata() -> std::ffi::CString {\n");
+    s.push_str("    let base = std::ffi::CStr::from_bytes_with_nul(INFO_BYTES)\n        .expect(\"static metadata has one trailing NUL\");\n");
+    s.push_str(&format!("    cerulion_core::graph::node_plugin_abi::raw_metadata(base, &[{}], &[{}])\n        .expect(\"raw schema facts match declared ports\")\n", facts(&metadata.inputs), facts(&metadata.outputs)));
     s.push_str("}\n");
     s.push_str("// CERULION:INFO_END\n");
     s
@@ -1859,840 +1510,104 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_lib_rs_does_not_pre_import_prelude() {
-        // The raw-FFI placeholder body
-        // never references `cerulion_core::prelude::*`, so pre-importing
-        // it would trip `unused_imports = deny` when the generated source
-        // is compiled under the strict workspace lint contract. Users
-        // adding real logic should add the imports they need.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            !src.contains("use cerulion_core::prelude::*;"),
-            "raw-FFI template must not pre-import the prelude (unused → -D unused-imports)"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_has_entry_points() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // 8 required FFI exports (handle-based FFI). Without the two LAST_ERROR
-        // symbols a raw-FFI-generated
-        // cdylib is unloadable via `DylibNodeEntry::load`. `cerulion_node_pump_history`
-        // (ABI v7) lets the host service quiescent late
-        // joiners on cdylib nodes across the FFI.
-        assert!(src.contains("cerulion_abi_version"));
-        assert!(src.contains("cerulion_node_info"));
-        assert!(src.contains("cerulion_node_init"));
-        assert!(src.contains("cerulion_node_tick"));
-        assert!(src.contains("cerulion_node_pump_history"));
-        assert!(src.contains("cerulion_node_shutdown"));
-        assert!(src.contains("cerulion_take_last_error"));
-        assert!(src.contains("cerulion_free_error"));
-    }
-
-    #[test]
-    fn test_generate_lib_rs_uses_transport_tagged_abi_value() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(src.contains("TRANSPORT_KIND.cdylib_abi_version()"));
-        assert!(!src.contains("CERULION_ABI_VERSION"));
-    }
-
-    #[test]
-    fn test_generate_lib_rs_has_marker_comments() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(src.contains("// CERULION:INFO_START"));
-        assert!(src.contains("// CERULION:INFO_END"));
-    }
-
-    #[test]
-    fn test_generate_lib_rs_with_ports() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![PortDef {
-                name: "image".to_string(),
-                schema: Some("sensor_msgs::Image".to_string()),
-                schema_alternatives: Vec::new(),
-                trigger: false,
-                backpressure: BackpressurePolicy::DropOldest,
-            }],
-        };
-        let src = generate_lib_rs(&metadata);
-        // Info JSON uses escaped quotes in byte string literal — port
-        // names DO flow into the info JSON regardless of whether their
-        // schemas get pre-imported.
-        assert!(src.contains("\\\"image\\\""));
-        // Schema imports are not
-        // emitted (placeholder body never uses them, would trip
-        // `unused_imports = deny`). Users replacing the body add the
-        // imports they need.
-        assert!(
-            !src.contains("use native_ros2_messages::sensor_msgs::Image;"),
-            "raw-FFI template must not pre-import port schema types (unused → -D unused-imports)"
-        );
-    }
-
-    #[test]
-    fn test_generate_info_fn_uses_static_bytes() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![PortDef {
-                name: "image".to_string(),
-                schema: None,
-                schema_alternatives: Vec::new(),
-                trigger: false,
-                backpressure: BackpressurePolicy::DropOldest,
-            }],
-        };
-        let info_fn = generate_info_fn(&metadata);
-        assert!(info_fn.contains("INFO_BYTES"));
-        assert!(info_fn.contains("static INFO_BYTES: &[u8]"));
-        assert!(!info_fn.contains("CString"));
-        assert!(!info_fn.contains("into_raw"));
-    }
-
-    #[test]
-    fn test_generate_lib_rs_handle_based_signatures() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // handle-based FFI signatures
-        assert!(src.contains("ctx_ptr: *mut u8"), "init should take *mut u8");
-        assert!(src.contains("-> u64"), "init should return u64");
-        assert!(
-            src.contains("handle: u64"),
-            "tick/shutdown should take handle"
-        );
-        assert!(
-            src.contains("NEXT_HANDLE"),
-            "should use atomic handle counter"
-        );
-        assert!(
-            src.contains("HashMap"),
-            "should use HashMap for multi-instance"
-        );
-        // CString usage is expected, for the LAST_ERROR
-        // thread-local. The "no CString" rule is about
-        // INFO_BYTES not leaking via `CString::into_raw` — that contract
-        // lives in `test_generate_info_fn_uses_static_bytes`, which
-        // pins INFO_BYTES to the static-byte-array shape.
-        assert!(
-            src.contains("static INFO_BYTES"),
-            "info function must use static bytes (no leak)"
-        );
-    }
-
-    // ── LAST_ERROR machinery structural tests ──
-    //
-    // These tests are structural pins — they assert the generator emits
-    // the specific code patterns the host loader and downstream tooling
-    // depend on. End-to-end loadability is proven by the
-    // `test_node_raw_ffi_template_cdylib` fixture + `DylibNodeEntry::load`
-    // tests in `crates/cerulion_core/tests/node_raw_ffi_template_test.rs`;
-    // the structural tests here let us pinpoint *which*
-    // generator change broke loadability if both layers fire together.
-
-    #[test]
-    fn test_generate_lib_rs_has_last_error_machinery() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains("thread_local!"),
-            "LAST_ERROR must be thread-local (per-cdylib, per-thread isolation)"
-        );
-        assert!(
-            src.contains("LAST_ERROR"),
-            "thread-local name must be LAST_ERROR"
-        );
-        assert!(
-            src.contains("__cer_set_last_error"),
-            "set helper must be present so init/tick/shutdown can stash messages"
-        );
-        assert!(
-            src.contains("CString::new"),
-            "set helper must allocate via CString::new (paired with from_raw in free)"
-        );
-        assert!(
-            src.contains("into_raw"),
-            "take must transfer ownership via CString::into_raw"
-        );
-        assert!(
-            src.contains("CString::from_raw"),
-            "free must reclaim via CString::from_raw (allocator pairing)"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_thread_local_uses_const_init() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // `const { ::std::cell::RefCell::new(None) }` keeps first-touch
-        // zero-cost. The macro form uses the same pattern; do not drift.
-        // RefCell is fully-qualified for shadow-proofing.
-        assert!(
-            src.contains("const { ::std::cell::RefCell::new(None) }"),
-            "thread_local should use const init for zero-cost first touch (with fully-qualified RefCell)"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_populates_last_error_on_mutex_poison() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // This test asserts the
-        // `__cer_set_last_error(::std::string::String::from(...))` call
-        // envelope is wired, not just the message string. A maintainer
-        // commenting out the call but leaving the literal as a
-        // doc-comment would pass a substring-only
-        // assertion. The envelope spans two lines after `cargo fmt`'s
-        // 100-char wrap; assert the open-paren prefix + the literal
-        // separately so a future formatting shift (e.g. wider column
-        // limit collapsing back to single-line) doesn't false-trip.
-        for path in [
-            "cerulion_node_init",
-            "cerulion_node_tick",
-            "cerulion_node_pump_history",
-            "cerulion_node_shutdown",
-        ] {
-            let msg = format!("{}: NODES mutex poisoned", path);
+    fn raw_fixture_dependencies_are_a_subset_of_the_scaffold() {
+        // Value's FromStr reads one TOML value; these are complete documents.
+        let generated: toml::Value = toml::from_str(&generate_cargo_toml("raw")).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!(
+            "../../test_fixtures/test_node_raw_ffi_template_cdylib/Cargo.toml"
+        ))
+        .unwrap();
+        let allowed = generated["dependencies"].as_table().unwrap();
+        for name in fixture["dependencies"].as_table().unwrap().keys() {
             assert!(
-                src.contains(&msg),
-                "{} mutex-poison must emit the LAST_ERROR message",
-                path,
+                allowed.contains_key(name),
+                "fixture dependency {name} must be shipped by the scaffold"
             );
-            // Locate the message and walk backwards over the prior
-            // lines to confirm the call envelope wraps it. The envelope
-            // is the literal `__cer_set_last_error(::std::string::String::from(`
-            // somewhere in the previous few lines.
-            let msg_pos = src.find(&msg).expect("message must be present");
-            let window_start = msg_pos.saturating_sub(200);
-            let window = &src[window_start..msg_pos];
-            assert!(
-                window.contains("__cer_set_last_error(::std::string::String::from("),
-                "{} mutex-poison message must be wrapped by the \
-                 __cer_set_last_error call envelope; got window:\n{}",
-                path,
-                window,
-            );
+        }
+        assert!(generate_lib_rs(&raw_metadata_for_test()).contains("cerulion_core::tracing::warn!"));
+    }
+
+    fn raw_metadata_for_test() -> NodeMetadata {
+        NodeMetadata {
+            throttle_ms: None,
+            tick_within_ms: None,
+            node_type: "camera".into(),
+            policy: None,
+            inputs: vec![],
+            outputs: vec![],
         }
     }
 
     #[test]
-    fn test_generate_lib_rs_populates_last_error_on_missing_handle() {
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // Assert the `__cer_set_last_error(format!(...))`
-        // CALL envelope, not just the format-string template. Shutdown
-        // wording matches the macro form so operators grepping logs see
-        // the same string from both cdylib types.
-        assert!(
-            src.contains(
-                r#"__cer_set_last_error(format!("cerulion_node_tick: handle {} not found", handle))"#
-            ),
-            "tick missing-handle must call __cer_set_last_error with the format envelope"
-        );
-        // Shutdown's longer message is multi-line in the emitted source;
-        // assert both halves of the format envelope in the right order.
-        assert!(
-            src.contains("__cer_set_last_error(format!("),
-            "shutdown missing-handle must call __cer_set_last_error(format!(...))"
-        );
-        assert!(
-            src.contains("cerulion_node_shutdown: handle {} not found (already shut down or never registered)"),
-            "shutdown missing-handle template must match the macro form wording"
-        );
-        // `pump_history` mirrors tick's missing-handle
-        // path. Its format string wraps across lines after `cargo fmt`,
-        // so assert the message literal + the format envelope separately
-        // (same shape as the shutdown assertion above).
-        assert!(
-            src.contains("cerulion_node_pump_history: handle {} not found"),
-            "pump_history missing-handle template must match the tick form wording"
-        );
+    fn raw_template_has_checked_tables_and_no_rust_owner_handoff() {
+        let source = generate_lib_rs(&raw_metadata_for_test());
+        syn::parse_file(&source).expect("raw template parses");
+        assert!(!is_macro_based(&source));
+        assert!(source.contains("export_node_api!(node_api)"));
+        assert!(source.contains("*const abi::HostApiV1"));
+        assert!(source.contains("abi::ContextHandle"));
+        assert!(source.contains("abi::NodeApiV1"));
+        assert!(!source.contains("Box::from_raw"));
+        assert!(!source.contains("cerulion_node_init"));
+        assert!(!source.contains("cerulion_free_error"));
     }
 
     #[test]
-    fn test_generate_lib_rs_init_drops_node_context_via_box_from_raw() {
-        // Init must reclaim the host's
-        // `Box::into_raw(NodeContext)` via `Box::from_raw` to avoid
-        // leaking one NodeContext per init call. A future maintainer
-        // reverting to `let _ = ctx_ptr;` (the leak pattern)
-        // would silently regress the user-API contract documented at
-        // `crates/cerulion_core/src/graph/node.rs`, where `DylibNodeEntry` hands the
-        // context over with `Box::into_raw`.
-        //
-        // The structural pin asserts the exact `Box::from_raw(ctx_ptr
-        // as *mut NodeContext)` shape; the runtime regression test in
-        // `crates/cerulion_core/tests/node_raw_ffi_template_test.rs` (specifically
-        // `test_raw_ffi_template_cdylib_init_drops_context_no_leak`)
-        // exercises 16 init+shutdown cycles to catch the leak end-to-end.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // The leak pattern is `let _ = ctx_ptr;` — explicitly NOT
-        // present in the emit. (Comments may mention it as an
-        // anti-example; the code-line filter excludes them.)
-        let code_lines: Vec<&str> = src
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        let leak_pattern_count: usize = code_lines
-            .iter()
-            .map(|line| line.matches("let _ = ctx_ptr").count())
-            .sum();
-        assert_eq!(
-            leak_pattern_count, 0,
-            "leak pattern `let _ = ctx_ptr;` must NOT appear in code; \
-             init must reclaim the context via Box::from_raw"
-        );
-        // And the fix pattern must be present in the emit.
-        assert!(
-            src.contains(
-                "Box::from_raw(ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext)"
-            ),
-            "init must reclaim the host's Box::into_raw'd NodeContext via Box::from_raw"
-        );
+    fn raw_template_uses_owner_local_registry_and_copy_errors() {
+        let source = generate_lib_rs(&raw_metadata_for_test());
+        for callback in [
+            "nodes().tick(handle)",
+            "nodes().shutdown(handle)",
+            "nodes().destroy(handle)",
+            "nodes().copy_error(token, target, required)",
+            "self.client.flush_deferred()",
+        ] {
+            assert!(source.contains(callback));
+        }
+        assert!(source.contains("abi::MutableBytes"));
+        assert!(source.contains("*mut u64"));
+        assert!(source.contains("NodeExports<CameraState>"));
     }
 
     #[test]
-    fn test_generate_lib_rs_init_null_check_present() {
-        // Init must null-check
-        // `ctx_ptr` and populate LAST_ERROR with the macro-parity
-        // wording. A silent fresh-handle return on a null ctx hides
-        // a loader contract violation behind a "success" return value.
-        //
-        // Assertions are whitespace-tolerant.
-        // Pinning a 12-space indent prefix would be fragile: a
-        // `cargo fmt` could rewrite the multi-line `String::from(...)`
-        // onto a single line and silently break the test even though
-        // the contract was preserved.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains("if ctx_ptr.is_null()"),
-            "init must null-check ctx_ptr before allocating a handle"
-        );
-        // The call envelope `__cer_set_last_error(::std::string::String::from(...))`
-        // is already pinned by `test_generate_lib_rs_set_last_error_call_sites`
-        // (count) + `test_generate_lib_rs_populates_last_error_on_mutex_poison`
-        // (envelope shape). Here we only need the macro-parity wording.
-        assert!(
-            src.contains(r#""cerulion_node_init: NodeContext pointer was null""#),
-            "init's null-ctx branch must use the macro-parity LAST_ERROR wording"
-        );
+    fn raw_template_retains_source_metadata_markers_and_policy() {
+        let mut metadata = raw_metadata_for_test();
+        metadata.policy = Some(cerulion_core::MacroPolicy::Period { period_ms: 1 });
+        let source = generate_lib_rs(&metadata);
+        assert!(source.contains("// CERULION:INFO_START"));
+        assert!(source.contains("// CERULION:INFO_END"));
+        assert!(source.contains("INFO_BYTES"));
+        assert!(source.contains("policy"));
+        assert!(source.contains("raw_metadata"));
     }
 
     #[test]
-    fn test_generate_lib_rs_set_last_error_call_sites() {
-        // Exactly 8 error-path call sites, wired into every reachable
-        // non-success branch in init/tick/pump_history/shutdown:
-        //   1. cerulion_node_init:         null ctx_ptr
-        //   2. cerulion_node_init:         NODES mutex poisoned
-        //   3. cerulion_node_tick:         missing handle
-        //   4. cerulion_node_tick:         NODES mutex poisoned
-        //   5. cerulion_node_pump_history: missing handle
-        //   6. cerulion_node_pump_history: NODES mutex poisoned
-        //   7. cerulion_node_shutdown:     NODES mutex poisoned
-        //   8. cerulion_node_shutdown:     missing handle
-        //   9. cerulion_node_platform_check: unsupported SHM refusal
-        //                                (cdylib_platform_check)
-        //
-        // Plus 1 definition (`fn __cer_set_last_error(...)`) - 10 total
-        // CODE occurrences in the generated source.
-        //
-        // Count only code occurrences, not mentions
-        // in `//` comments. The NOTE-TO-USERS block in the emitted source
-        // references `__cer_set_last_error(format!(...))` as an example
-        // of what users should hand-roll; that mention is documentary,
-        // not a call site, and must not inflate the count.
-        //
-        // If you ADD a new error path: wire LAST_ERROR + bump this count.
-        // If you REMOVE one: bump this count down AND ensure the removed
-        // path is no longer reachable.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        let code_lines: Vec<&str> = src
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        let count: usize = code_lines
-            .iter()
-            .map(|line| line.matches("__cer_set_last_error").count())
-            .sum();
-        assert_eq!(
-            count, 10,
-            "expected 10 code occurrences of __cer_set_last_error (1 definition + 9 error-path call sites); \
-             got {} — a new non-success return probably needs LAST_ERROR wiring, or one was removed unsafely",
-            count
-        );
+    fn raw_template_schema_facts_do_not_import_shadowing_string_types() {
+        let mut metadata = raw_metadata_for_test();
+        metadata.outputs.push(PortDef {
+            name: "output".into(),
+            schema: Some("std_msgs/String".into()),
+            schema_alternatives: vec![],
+            trigger: false,
+            backpressure: BackpressurePolicy::DropOldest,
+        });
+        let source = generate_lib_rs(&metadata);
+        syn::parse_file(&source).expect("schema-bearing raw template parses");
+        assert!(source.contains("HostClient::request::<native_ros2_messages::std_msgs::String>()"));
+        assert!(!source.contains("use native_ros2_messages::std_msgs::String"));
+        assert!(!source.contains("use cerulion_core::prelude::*"));
     }
 
     #[test]
-    fn test_generate_lib_rs_does_not_import_shadow_prone_std_types() {
-        // `String`, `CString`, `RefCell` are
-        // referenced via fully-qualified `::std::...` paths in the
-        // LAST_ERROR machinery so a `use native_ros2_messages::...;`
-        // schema import (specifically `std_msgs/String`) cannot shadow
-        // them and break compilation. The previous form imported
-        // `RefCell` + `CString` and used bare names; that worked for
-        // empty-port nodes but broke for any node with a String port.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            !src.contains("use std::cell::RefCell;"),
-            "RefCell must be fully-qualified `::std::cell::RefCell` in the emit, not imported"
-        );
-        assert!(
-            !src.contains("use std::ffi::CString;"),
-            "CString must be fully-qualified `::std::ffi::CString` in the emit, not imported"
-        );
-        // The fully-qualified form must actually be present in the
-        // LAST_ERROR thread-local declaration.
-        assert!(
-            src.contains("::std::cell::RefCell"),
-            "thread_local must use fully-qualified ::std::cell::RefCell"
-        );
-        assert!(
-            src.contains("::std::ffi::CString"),
-            "LAST_ERROR machinery must use fully-qualified ::std::ffi::CString"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_string_from_is_fully_qualified() {
-        // Every `String::from(...)` call in the
-        // emit must be fully-qualified to `::std::string::String::from`.
-        // Bare `String::from(...)` would be shadowed by a
-        // `use native_ros2_messages::std_msgs::String;` import emitted
-        // alongside for any raw-FFI node with a `std_msgs/String` port,
-        // resolving to `std_msgs::String::from` (which doesn't exist) at
-        // compile time. The macro form qualifies for the same reason.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        // Count fully-qualified vs bare `String::from` occurrences in
-        // CODE lines (excluding comments which may reference the bare
-        // form as an anti-example in the NOTE-TO-USERS block).
-        let code_lines: Vec<&str> = src
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        // Match the full call site `String::from(` (with open paren)
-        // to exclude `CString::from_raw(` (whose substring contains
-        // `String::from_raw` but not `String::from(`).
-        let qualified_count: usize = code_lines
-            .iter()
-            .map(|line| line.matches("::std::string::String::from(").count())
-            .sum();
-        let bare_count: usize = code_lines
-            .iter()
-            .map(|line| {
-                // `::std::string::String::from(` also contains `String::from(`,
-                // so count bare occurrences by subtracting the qualified
-                // matches from the total.
-                line.matches("String::from(").count()
-                    - line.matches("::std::string::String::from(").count()
-            })
-            .sum();
-        // `pump_history` adds one more mutex-poison (init null-ctx +
-        // init/tick/pump_history/shutdown mutex-poison = 5); the Android
-        // SHM-refusal arm formats its message directly.
-        assert_eq!(
-            qualified_count, 5,
-            "expected 5 fully-qualified ::std::string::String::from call sites; got {}",
-            qualified_count
-        );
-        assert_eq!(
-            bare_count, 0,
-            "no bare `String::from(...)` allowed in emit (shadow risk vs std_msgs/String); got {} bare occurrences",
-            bare_count
-        );
-        // And the helper signature must take the fully-qualified String.
-        assert!(
-            src.contains("fn __cer_set_last_error(msg: ::std::string::String)"),
-            "set helper must take fully-qualified ::std::string::String parameter"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_compiles_with_std_msgs_string_port() {
-        // Defense in depth:
-        // emit a node with a `std_msgs/String` output port. The
-        // schema import is not emitted (the shadow scenario is
-        // structurally eliminated), but the fully-qualified
-        // `::std::string::String::from(...)` paths remain — so if a
-        // future maintainer re-introduces schema-import emission, the
-        // shadow case is automatically immune. This test pins BOTH:
-        // (a) schema import is absent, AND (b) the qualification is
-        // still in place.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "stringnode".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![PortDef {
-                name: "msg".to_string(),
-                schema: Some("std_msgs/String".to_string()),
-                schema_alternatives: Vec::new(),
-                trigger: false,
-                backpressure: BackpressurePolicy::DropOldest,
-            }],
-        };
-        let src = generate_lib_rs(&metadata);
-        // The schema import is not emitted.
-        assert!(
-            !src.contains("use native_ros2_messages::std_msgs::String"),
-            "schema import for std_msgs/String must NOT be emitted (unused → -D unused-imports)"
-        );
-        // Defense in depth: every String::from in the emit
-        // must still be fully-qualified, even though the shadow scenario
-        // does not apply. If schema imports are ever
-        // introduced, the shadow case is automatically immune.
-        let code_lines: Vec<&str> = src
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        // Match `String::from(` with open paren to exclude
-        // `CString::from_raw(` which shares the substring `String::from`.
-        let bare_count: usize = code_lines
-            .iter()
-            .map(|line| {
-                line.matches("String::from(").count()
-                    - line.matches("::std::string::String::from(").count()
-            })
-            .sum();
-        assert_eq!(
-            bare_count, 0,
-            "shadow-prone bare `String::from(...)` in emit with std_msgs/String port — \
-             would fail to compile; got {} bare occurrences",
-            bare_count
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_free_error_is_unsafe() {
-        // `cerulion_free_error`
-        // dereferences a raw pointer arg via `CString::from_raw`. Per
-        // `clippy::not_unsafe_ptr_arg_deref` (deny-by-default), the
-        // function MUST be marked `unsafe` to compile under the
-        // workspace lint contract. The hand-written
-        // `crates/test_fixtures/test_node_cdylib/src/lib.rs:57` is the
-        // precedent. Drift back to safe-fn form would silently break
-        // the template fixture's compile and any user `cerulion node build`.
-        //
-        // The redundancy check uses token
-        // count rather than a whitespace-pinned substring. The earlier
-        // form pinned an 8-space indent, which a `cargo fmt` could
-        // silently invalidate.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains(r#"pub unsafe extern "C" fn cerulion_free_error"#),
-            "cerulion_free_error must be `pub unsafe extern \"C\"` (raw-ptr deref + clippy lint)"
-        );
-        // The fn-body's inner `unsafe { ... }` block is redundant once
-        // the function itself is unsafe (clippy::unused_unsafe). Walk
-        // the function body and count `unsafe` tokens: there must be
-        // exactly one (the fn-level keyword) — any inner block would
-        // bump the count to 2 and trip this assertion regardless of
-        // indentation.
-        let body_start = src
-            .find(r#"pub unsafe extern "C" fn cerulion_free_error"#)
-            .expect("cerulion_free_error must be present");
-        // Body ends at the next `\n}\n` (the function's closing brace
-        // on its own line). Falling back to end-of-string is sound for
-        // the trailing function in the emit; the assertion still fires
-        // correctly on the wider slice.
-        let body_end = src[body_start..]
-            .find("\n}\n")
-            .map(|i| body_start + i)
-            .unwrap_or(src.len());
-        let body = &src[body_start..body_end];
-        let unsafe_count = body.matches("unsafe").count();
-        assert_eq!(
-            unsafe_count, 1,
-            "cerulion_free_error must have exactly 1 `unsafe` keyword (fn-level only); got {} — \
-             a redundant inner `unsafe block` would trip clippy::unused_unsafe and fail the fixture compile",
-            unsafe_count
-        );
-        // And `cerulion_take_last_error` only RETURNS a raw pointer
-        // (no arg-deref), so it stays plain `extern "C"`.
-        assert!(
-            src.contains(r#"pub extern "C" fn cerulion_take_last_error"#),
-            "cerulion_take_last_error must remain plain extern \"C\" (no raw-ptr arg deref)"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_does_not_recover_poisoned_mutex() {
-        // Pin that no `.into_inner()` call
-        // ever appears in the generated source. A future "resilience"
-        // patch that recovers state via `into_inner()` after a
-        // panic-while-locked would visibly corrupt per-node state and
-        // surface as data corruption in user nodes rather than as a
-        // loud FFI failure. The non-recovery contract is documented
-        // in three places (one in each of init/tick/shutdown's
-        // mutex-poison branches) — this test ensures the contract
-        // can't drift silently.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            !src.contains(".into_inner()"),
-            "do NOT add into_inner() recovery on the mutex-poison branches — \
-             a panic while holding NODES can leave per-node state inconsistent; \
-             surface the poison via LAST_ERROR and let the host decide to restart"
-        );
-        // Belt-and-braces: the educational comment must remain above
-        // each of the three branches. (Once in init, twice as "see init"
-        // cross-references in tick / shutdown.)
-        assert!(
-            src.contains("do NOT recover via `into_inner()`"),
-            "the non-recovery rationale must remain in the emitted source so future readers see it"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_emits_placeholder_body_warning() {
-        // The warning block lives in the
-        // emitted source, so users opening their generated `lib.rs`
-        // see it. The first form put the warning in the generator
-        // file only (a Rust source comment in `templates.rs`), where
-        // users never look. Pinning the in-emit form here ensures the
-        // warning is delivered to the actual audience.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains("NOTE TO USERS REPLACING THE PLACEHOLDER BODY"),
-            "users must see the placeholder-body warning in their generated lib.rs"
-        );
-        // Each load-bearing claim is independently pinned so a partial
-        // edit of the warning (e.g. removing the catch_unwind mention)
-        // is loud at test time.
-        //
-        // `catch_unwind` is named twice in the
-        // warning — once in the "DOES NOT EMIT" bullet list, once in
-        // the "Hand-roll the equivalent wiring" reference. Requiring
-        // a count >= 2 catches a maintainer collapsing the bullet
-        // list (which would otherwise leave the second mention and
-        // still pass a `contains("catch_unwind")` check).
-        let catch_unwind_count = src.matches("catch_unwind").count();
-        assert!(
-            catch_unwind_count >= 2,
-            "warning must name catch_unwind in BOTH the 'DOES NOT EMIT' list AND \
-             the hand-roll-wiring reference; got {} occurrence(s)",
-            catch_unwind_count
-        );
-        assert!(
-            src.contains("init failed:") && src.contains("tick failed:"),
-            "warning must name the Err-propagation patterns users would otherwise miss"
-        );
-        assert!(
-            src.contains("Migrate to `#[cerulion_node]`"),
-            "warning must offer the recommended migration path"
-        );
-        assert!(
-            src.contains("Unwinding across the FFI boundary aborts the process"),
-            "warning must explicitly call out the UB consequence of an un-trapped panic"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_free_error_handles_null() {
-        // The null guard is a host-contract invariant. A drift back to
-        // unconditional `CString::from_raw(ptr)` would crash on the
-        // documented "no error to free" case.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains("if ptr.is_null()"),
-            "cerulion_free_error must guard against null (idempotent per host contract)"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_take_last_error_returns_null_when_clean() {
-        // The "no error buffered" path returns null. Structurally pin
-        // the match-arm so a drift that always returns a CString-style
-        // pointer is loud.
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains("None => std::ptr::null_mut()"),
-            "cerulion_take_last_error must return null when LAST_ERROR is empty"
-        );
-    }
-
-    #[test]
-    fn test_generate_lib_rs_set_last_error_has_nul_free_fallback() {
-        // The `__cer_set_last_error` fallback `unwrap()` is sound only
-        // because the fallback string contains no embedded nul. Pin
-        // the exact fallback string so a future maintainer can't
-        // silently introduce a nul that would panic the cdylib at the
-        // worst possible moment (while it's trying to surface an
-        // error to the host).
-        let metadata = NodeMetadata {
-            throttle_ms: None,
-            tick_within_ms: None,
-            node_type: "camera".to_string(),
-            policy: None,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let src = generate_lib_rs(&metadata);
-        assert!(
-            src.contains(r#"CString::new("error message contained nul byte").unwrap()"#),
-            "fallback message must be the exact nul-free literal so unwrap is provably infallible"
-        );
-        // Belt-and-braces: assert the literal itself contains no nul.
-        // If a future maintainer edits the string, this assertion
-        // catches it independently of the surrounding code.
-        const FALLBACK: &str = "error message contained nul byte";
-        assert!(
-            !FALLBACK.contains('\0'),
-            "fallback literal must not contain a nul byte (invariant under the unwrap())"
-        );
+    fn raw_template_default_tick_warns_and_binds_only_local_context() {
+        let source = generate_lib_rs(&raw_metadata_for_test());
+        assert!(source.contains(
+            "raw node template contains no application logic; implement tick before running"
+        ));
+        assert!(source.contains("NodeContext::new(client.clone(), &info)?"));
+        assert!(source.contains("install_cdylib_stderr_tracing"));
+        assert!(source.contains("self.context = None"));
+        assert!(source.contains("wrapping_add(1)"));
     }
 
     #[test]
@@ -3903,12 +2818,13 @@ struct CameraNode {
         // struct, FFI fns, no `#[cerulion_node]` anywhere on the
         // struct.
         let source = r#"
-use cerulion_core::prelude::*;
-
+use cerulion_core::graph::node_plugin_abi::{HostClient, PluginNode};
 struct CameraState { tick_count: u64 }
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_init(_ctx: *mut u8) -> u64 { 1 }
+impl PluginNode for CameraState {
+    fn create(_client: HostClient, _params: &[u8]) -> cerulion_core::TransportResult<Self> {
+        Ok(Self { tick_count: 0 })
+    }
+}
 "#;
         assert!(
             !is_macro_based(source),

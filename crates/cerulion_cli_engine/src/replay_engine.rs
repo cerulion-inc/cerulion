@@ -120,7 +120,7 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 
 /// The iceoryx2 node-name PREFIX every resim runs under
 /// (`{REPLAY_NODE_NAME_PREFIX}{identity}`, minted at
-/// [`TransportManager::init`] below).
+/// `init_resim_transport` below).
 ///
 /// A named constant rather than an inline literal because
 /// [`crate::replay_cmd`] has to SUBTRACT it: iceoryx2 caps a node name at
@@ -129,6 +129,533 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 /// twice would put a refused run one rename away (and, before
 /// `TransportManager::init`'s conversion became fallible, a PANIC one rename away).
 pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
+
+/// The fixed head of every resim's PRIVATE iceoryx2 prefix
+/// (`{RESIM_NAMESPACE_MARKER}{slot:08x}_`, see [`resim_namespace_prefix`]).
+///
+/// A resim publishes the frames it re-executes and the recorded external
+/// inputs it re-injects under the recording's own topic names, and its
+/// transport runs under this prefix. iceoryx2 names every node, service and
+/// shared-memory segment `{prefix}{name}` and opens only files carrying its own
+/// prefix, so a process on the shared namespace (iceoryx2's default `iox2_`,
+/// the one `graph run`, `cerulion-netd`, `bagd` and `topic echo` use) cannot
+/// open a service a resim creates, and a resim cannot open theirs.
+///
+/// It diverges from `iox2_` at its first character and from the multi-process
+/// planning namespace's `cer_p_` at its fifth, so iceoryx2's string-prefix
+/// listing of one namespace never reaches another's files.
+pub const RESIM_NAMESPACE_MARKER: &str = "cer_resim_";
+
+/// How many resim namespaces a machine has. A resim runs on the slot it holds
+/// ([`claim_resim_slot`]), so at most this many resims run at once, and the
+/// files resims leave behind belong to at most this many namespaces.
+const RESIM_NAMESPACE_SLOTS: u32 = 256;
+
+/// The private iceoryx2 prefix of resim namespace slot `slot`.
+///
+/// The slot is rendered as exactly eight lowercase hex digits (every `u32`
+/// fits), so every resim prefix has the same length and none is a strict
+/// prefix of another: iceoryx2 lists a namespace's nodes by string-prefix
+/// match, and prefixes of different lengths would let one slot's listing reach
+/// another's files. One process at a time holds a slot, so two resims running
+/// at once never share a namespace.
+///
+/// Nothing the run records or reports carries this prefix: it names files, and
+/// a topic's iceoryx2 service identity is derived from the topic alone.
+#[must_use]
+pub fn resim_namespace_prefix(slot: u32) -> String {
+    format!("{RESIM_NAMESPACE_MARKER}{slot:08x}_")
+}
+
+/// The resim namespace slot whose [`resim_namespace_prefix`] `file_name`
+/// begins with.
+///
+/// `None` for every other name: other namespaces' files, and a slot's lock
+/// file (`cer_resim_{slot:08x}.lock`, no `_` after the digits).
+#[must_use]
+pub fn resim_namespace_slot(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(RESIM_NAMESPACE_MARKER)?;
+    let hex = rest.get(..8)?;
+    if !rest.get(8..)?.starts_with('_')
+        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// The iceoryx2 config of resim namespace slot `slot`: `base` with the private
+/// [`resim_namespace_prefix`]. A resim passes the host's RESOLVED config
+/// (`Config::global_config()`), so an operator's iceoryx2 config file, its root
+/// path included, applies exactly as it does to a live run.
+fn resim_ix_config(
+    base: &iceoryx2::config::Config,
+    slot: u32,
+) -> Result<iceoryx2::config::Config, ReplayError> {
+    use iceoryx2::prelude::{FileName, SemanticString};
+    let prefix = resim_namespace_prefix(slot);
+    let file_name = FileName::new(prefix.as_bytes()).map_err(|e| ReplayError::Internal {
+        reason: format!(
+            "cannot build the resim's private iceoryx2 prefix '{prefix}': iceoryx2 rejects it \
+             ({e:?})"
+        ),
+    })?;
+    let mut ix_config = base.clone();
+    ix_config.global.prefix = file_name;
+    Ok(ix_config)
+}
+
+/// The directory that holds this machine's shared-memory segment names:
+/// `/dev/shm` on Linux, and on macOS the directory of the state files iceoryx2
+/// keeps one per segment. Segment names do not depend on the iceoryx2 root, so
+/// every namespace with one prefix shares its segment names here, whatever root
+/// its config names. `None` where a resim does not walk segment names.
+#[cfg(target_os = "linux")]
+const SEGMENT_NAME_DIR: Option<&str> = Some("/dev/shm/");
+#[cfg(target_os = "macos")]
+const SEGMENT_NAME_DIR: Option<&str> = Some(crate::shm_state::SHM_STATE_DIRECTORY);
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEGMENT_NAME_DIR: Option<&str> = None;
+
+/// The directory a resim takes its slot lock in: [`SEGMENT_NAME_DIR`], or
+/// `base`'s iceoryx2 root where there is none.
+///
+/// The lock sits where a slot's segment names collide, so its exclusion covers
+/// every process that could share them: two resims whose iceoryx2 configs name
+/// different roots, and two containers that share `/dev/shm` but not `/tmp`,
+/// still take different slots, and a slot's reclaim never removes a segment a
+/// running resim uses.
+fn resim_slot_lock_dir(base: &iceoryx2::config::Config) -> PathBuf {
+    SEGMENT_NAME_DIR.map_or_else(
+        || PathBuf::from(String::from(base.global.root_path())),
+        PathBuf::from,
+    )
+}
+
+/// A resim namespace slot this process holds: its lock file stays open, and
+/// its exclusive `flock` held, until the value is dropped or the process
+/// ends, a crash included (the kernel releases the lock with the descriptor).
+#[derive(Debug)]
+struct ResimSlot {
+    slot: u32,
+    /// Kept only to hold the lock.
+    _lock: std::fs::File,
+}
+
+/// Why a claim passed over a slot whose lock a running resim does not hold.
+#[derive(Debug)]
+enum SlotPassedOver {
+    /// Its lock file could not be opened or locked: the path and the error.
+    Lock(String),
+    /// The slot's private iceoryx2 config could not be built.
+    Config(String),
+    /// Its namespace did not reclaim clean: what the reclaim found, and
+    /// [`SlotReclaim::refusal`].
+    Reclaim {
+        reclaim: SlotReclaim,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SlotPassedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(failure) => {
+                write!(f, "its lock file could not be opened or locked: {failure}")
+            }
+            Self::Config(reason) | Self::Reclaim { reason, .. } => f.write_str(reason),
+        }
+    }
+}
+
+/// Log one slot a claim passed over, through the claim's `latch`: the first
+/// at warn, the repeats at debug, and the slot that takes the count across a
+/// power of ten at warn again.
+fn log_passed_over_slot(
+    latch: &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    slot: u32,
+    passed: &SlotPassedOver,
+) {
+    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+    let reclaim = match passed {
+        SlotPassedOver::Reclaim { reclaim, .. } => Some(reclaim),
+        SlotPassedOver::Lock(_) | SlotPassedOver::Config(_) => None,
+    };
+    let nodes_left = reclaim.and_then(|r| r.nodes_left.as_ref().ok().copied());
+    let cleanups = reclaim.map(|r| r.cleaned.cleanups);
+    let failed_cleanups = reclaim.map(|r| r.cleaned.failed_cleanups);
+    let deferred = reclaim.map(|r| r.cleaned.deferred);
+    let segments_failed = reclaim.map(|r| r.segments_failed);
+    match latch.on_failure() {
+        RegimeDecision::Loud => tracing::warn!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            error = %passed,
+            "replay: passed over a resim namespace slot whose lock could not be taken or whose \
+             namespace did not reclaim clean; the slot keeps its files and the resim tries the \
+             next one"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            total_failures = total,
+            suppressed,
+            error = %passed,
+            "replay: still passing over resim namespace slots"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            suppressed,
+            error = %passed,
+            "replay: passed over another resim namespace slot (suppressed)"
+        ),
+    }
+}
+
+/// Claim the lowest slot below `slots` whose lock file in `lock_dir`
+/// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
+/// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
+/// the lock is held.
+///
+/// A slot whose lock another process holds is skipped. A slot whose lock file
+/// cannot be opened or locked (another user's, say) or that `ready` refuses
+/// is passed over, its lock released, and logged through one
+/// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
+/// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
+/// suppressed repeats logs how many. With no slot left the claim is
+/// [`ReplayError::Internal`] (exit 5), naming the directory, the first failure
+/// to open or lock a file and the last slot `ready` refused, with its reason.
+fn claim_resim_slot(
+    lock_dir: &Path,
+    slots: u32,
+    mut ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
+) -> Result<ResimSlot, ReplayError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut latch = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
+    let mut first_failure: Option<String> = None;
+    let mut last_refusal: Option<(u32, SlotPassedOver)> = None;
+    for slot in 0..slots {
+        let path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))
+            .and_then(|lock| {
+                match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                {
+                    Ok(()) => Ok(Some(lock)),
+                    Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+                    Err(e) => Err(format!("{}: {e}", path.display())),
+                }
+            });
+        let lock = match opened {
+            Ok(Some(lock)) => lock,
+            // Held by a running resim.
+            Ok(None) => continue,
+            Err(failure) => {
+                first_failure.get_or_insert_with(|| failure.clone());
+                log_passed_over_slot(&mut latch, slot, &SlotPassedOver::Lock(failure));
+                continue;
+            }
+        };
+        match ready(slot) {
+            Ok(()) => {
+                if let Some(suppressed) = latch.on_success() {
+                    tracing::info!(
+                        slot,
+                        suppressed,
+                        total_failures = latch.total_failures(),
+                        "replay: claimed a resim namespace slot after passing over others"
+                    );
+                }
+                return Ok(ResimSlot { slot, _lock: lock });
+            }
+            Err(passed) => {
+                log_passed_over_slot(&mut latch, slot, &passed);
+                last_refusal = Some((slot, passed));
+            }
+        }
+    }
+    Err(ReplayError::Internal {
+        reason: format!(
+            "no resim namespace slot is free: none of the {slots} slot locks in '{}' could be \
+             taken by this process (each is held by a running resim, could not be opened or \
+             locked, or its namespace did not reclaim clean){}{}",
+            lock_dir.display(),
+            first_failure
+                .map(|failure| format!("; the first that could not be opened or locked: {failure}"))
+                .unwrap_or_default(),
+            last_refusal
+                .map(|(slot, passed)| format!(
+                    "; the last whose namespace was refused: slot {slot}, {passed}"
+                ))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+/// What reclaiming one slot's namespace found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotReclaim {
+    /// The dead-node sweep's counts.
+    cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
+    /// Nodes still registered after the sweep, or why the registry could not
+    /// be listed.
+    nodes_left: Result<u64, String>,
+    /// Leftover segments removed.
+    segments_removed: u64,
+    /// Leftover segments that could not be removed.
+    segments_failed: u64,
+}
+
+impl SlotReclaim {
+    /// Why a resim may not start on the slot, or `None` when it may: its
+    /// namespace holds no node, and every leftover segment the walk reached
+    /// was removed.
+    fn refusal(&self) -> Option<String> {
+        let cleaned = &self.cleaned;
+        match &self.nodes_left {
+            Err(error) => Some(format!(
+                "its namespace's node registry could not be listed after the dead-node sweep \
+                 ({error})"
+            )),
+            Ok(0) if self.segments_failed == 0 => None,
+            Ok(0) => Some(format!(
+                "leftover segments of its namespace that could not be removed: {}",
+                self.segments_failed
+            )),
+            Ok(left) => Some(format!(
+                "nodes still registered in its namespace after the dead-node sweep: {left} (the \
+                 sweep removed {}, failed on {} and deferred {}; it removes only the nodes of \
+                 processes that have ended and that this user can inspect)",
+                cleaned.cleanups, cleaned.failed_cleanups, cleaned.deferred
+            )),
+        }
+    }
+}
+
+/// Reclaim the namespace of a slot this process holds, within `budget`,
+/// before a resim starts on it.
+///
+/// A resim's iceoryx2 node lives as long as its process, so every resim
+/// leaves its node registered, and a killed one also leaves the services it
+/// held. The dead-node sweep removes those: their process is gone, so iceoryx2
+/// reads them dead, and only dead nodes are removed. Once no node is left,
+/// every segment in `segment_dir` named with the slot's prefix is removed too:
+/// whatever the sweep did not reach, and the namespace's iceoryx2 management
+/// segment, which iceoryx2 itself never removes. The caller holds the slot's
+/// lock, so no running resim uses any of them. A namespace that still holds a
+/// node keeps its segments. A walk the budget cuts short leaves the rest for
+/// the next resim on the slot.
+fn reclaim_resim_slot(
+    ix_config: &iceoryx2::config::Config,
+    slot: u32,
+    segment_dir: Option<&Path>,
+    budget: Duration,
+) -> SlotReclaim {
+    // Startup hygiene only: the elapsed time bounds how long the reclaim may
+    // delay the resim and never reaches anything the run executes or reports.
+    let started = std::time::Instant::now();
+    let cleaned =
+        cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(ix_config, budget);
+    let mut nodes = 0u64;
+    let listed =
+        iceoryx2::node::Node::<iceoryx2::service::ipc_threadsafe::Service>::list(ix_config, |_| {
+            nodes += 1;
+            iceoryx2::prelude::CallbackProgression::Continue
+        });
+    let mut reclaim = SlotReclaim {
+        cleaned,
+        nodes_left: listed.map(|()| nodes).map_err(|e| e.to_string()),
+        segments_removed: 0,
+        segments_failed: 0,
+    };
+    if reclaim.nodes_left != Ok(0) {
+        return reclaim;
+    }
+    let Some(dir) = segment_dir else {
+        return reclaim;
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                slot,
+                error = %error,
+                "replay: could not list the shared-memory segment names to reclaim a resim \
+                 namespace slot; its leftover segments stay until a later resim on the slot \
+                 lists them"
+            );
+            return reclaim;
+        }
+    };
+    for entry in entries.flatten() {
+        if started.elapsed() >= budget {
+            break;
+        }
+        if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
+            continue;
+        }
+        match remove_leftover_segment(&entry.path()) {
+            SegmentRemoval::Removed => reclaim.segments_removed += 1,
+            SegmentRemoval::NotASegment => {}
+            SegmentRemoval::Failed => reclaim.segments_failed += 1,
+        }
+    }
+    reclaim
+}
+
+/// What [`remove_leftover_segment`] did with one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentRemoval {
+    Removed,
+    /// Not a segment (a directory or a link, or on macOS anything but a state
+    /// file), so it was left alone.
+    NotASegment,
+    Failed,
+}
+
+/// Remove one leftover segment of a reclaimed namespace: a regular file, which
+/// on macOS is a state file and goes with the object it names
+/// ([`crate::shm_state::remove_unused_state_file`]).
+fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
+    let is_file = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    #[cfg(target_os = "macos")]
+    let is_segment = is_file
+        && path
+            .to_str()
+            .is_some_and(|p| p.ends_with(crate::shm_state::SHM_STATE_SUFFIX));
+    #[cfg(not(target_os = "macos"))]
+    let is_segment = is_file;
+    if !is_segment {
+        return SegmentRemoval::NotASegment;
+    }
+    #[cfg(target_os = "macos")]
+    let removed =
+        crate::shm_state::remove_unused_state_file(path, &crate::shm_state::LibcProbe).is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let removed = std::fs::remove_file(path).is_ok();
+    if removed {
+        SegmentRemoval::Removed
+    } else {
+        SegmentRemoval::Failed
+    }
+}
+
+/// The slot this process's resims run on: claimed, and its namespace
+/// reclaimed, by the first resim the process starts, then held until the
+/// process ends. The process has one transport, so every resim it runs uses
+/// that one namespace, and a later resim never reclaims the namespace the
+/// transport is running on.
+static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
+
+/// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
+/// claims the lowest free slot whose namespace reclaims clean, within the
+/// startup sweep budget for all the slots it tries.
+fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayError> {
+    let mut held = RESIM_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(running) = held.as_ref() {
+        return Ok(running.slot);
+    }
+    let budget = cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET;
+    // Startup hygiene only, as in `reclaim_resim_slot`.
+    let started = std::time::Instant::now();
+    let lock_dir = resim_slot_lock_dir(base);
+    // The iceoryx2 root a fallback names may not exist before the first node;
+    // a directory that cannot be made fails the claim's first open, by name.
+    let _ = std::fs::create_dir_all(&lock_dir);
+    // Summed over every slot whose namespace the claim reclaimed.
+    let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
+    let claimed = claim_resim_slot(&lock_dir, RESIM_NAMESPACE_SLOTS, |slot| {
+        let ix_config =
+            resim_ix_config(base, slot).map_err(|e| SlotPassedOver::Config(e.to_string()))?;
+        let reclaim = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            budget.saturating_sub(started.elapsed()),
+        );
+        cleanups += reclaim.cleaned.cleanups;
+        deferred += reclaim.cleaned.deferred;
+        segments += reclaim.segments_removed;
+        total_failures += reclaim.cleaned.failed_cleanups + reclaim.segments_failed;
+        match reclaim.refusal() {
+            None => Ok(()),
+            Some(reason) => Err(SlotPassedOver::Reclaim { reclaim, reason }),
+        }
+    })?;
+    tracing::debug!(
+        slot = claimed.slot,
+        cleanups,
+        deferred,
+        segments,
+        total_failures,
+        "replay: claimed and reclaimed a resim namespace slot"
+    );
+    let slot = claimed.slot;
+    *held = Some(claimed);
+    Ok(slot)
+}
+
+/// Start the process transport of a resim on the resim's private namespace.
+///
+/// The cross-process transport is built with [`resim_ix_config`] for the slot
+/// [`process_resim_slot`] holds. It is the process singleton (one iceoryx2
+/// node per process), so every later [`TransportManager::get`] in the run
+/// lands on the same private namespace. The singleton keeps the config of its
+/// FIRST initialization, so the namespace is checked after the call: a
+/// transport some earlier code started on another namespace refuses the run
+/// (exit 5) instead of re-executing onto it.
+///
+/// The `local-transport` build's transport is in-process only, so nothing
+/// outside the process can attach to it and it keeps the plain initializer.
+fn init_resim_transport(
+    config: cerulion_core::TransportConfig,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    match cerulion_core::transport::TRANSPORT_KIND {
+        cerulion_core::transport::TransportKind::InProcess => {
+            TransportManager::init(config).map_err(replay_transport_init_error)
+        }
+        cerulion_core::transport::TransportKind::CrossProcess => {
+            let base = iceoryx2::config::Config::global_config();
+            let slot = process_resim_slot(base)?;
+            let ix_config = resim_ix_config(base, slot)?;
+            let transport = TransportManager::init_with_config(config, ix_config)
+                .map_err(replay_transport_init_error)?;
+            let expected = resim_namespace_prefix(slot);
+            let running = transport.iox_config().global.prefix.to_string();
+            if running != expected {
+                return Err(ReplayError::Internal {
+                    reason: format!(
+                        "the replay transport was already running on the iceoryx2 namespace \
+                         '{running}' instead of the resim's private '{expected}'; refusing to \
+                         re-execute onto a namespace other processes attach to"
+                    ),
+                });
+            }
+            Ok(transport)
+        }
+    }
+}
 
 /// Burst-aware provisioning: headroom added on top of the recording's
 /// measured max intra-step burst when raising a topic's service ceiling —
@@ -502,8 +1029,8 @@ pub struct ReplayOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aborted: Option<ReplayAbort>,
     /// WHICH coordination contract this replay applied, and
-    /// whether the bag SAID so — the machine-readable twin of the verdict's
-    /// provenance line (the operator vocabulary). ALWAYS present, for the
+    /// whether the bag SAID so, in every state (the verdict prints a line for
+    /// the inferred one only, [`render_coordination_line`]). ALWAYS present, for the
     /// same reason [`Self::read_log`] is: the whole point is that a reader can
     /// tell "the bag was stamped lockstep" from "nothing said, so lockstep was
     /// assumed", and an absent key cannot carry that. Additive in the
@@ -556,33 +1083,33 @@ pub struct ReplayOutcome {
     pub record_out_error: Option<String>,
 }
 
-/// The verdict's coordination PROVENANCE line, verbatim.
+/// The verdict's coordination line, or `None` when the contract applied needs
+/// no word on the terminal.
 ///
-/// The three states are the canonical operator vocabulary, copied rather than
-/// re-worded — the verdict and the `--report` JSON print ONE vocabulary, so the
-/// text lives in one function and the JSON block ([`CoordinationReport`]) is the
-/// same three states in machine-readable form.
+/// A stamped contract, `free_run` or `lockstep`, is the recording saying how it
+/// ran, and the replay applied exactly that: nothing a reader can act on, so the
+/// terminal stays quiet and the `--report` JSON's [`CoordinationReport`] block
+/// carries it (always, all three states). The INFERRED lockstep of a bag that
+/// carries no stamp is a caveat, an assumption the replay made for the bag, so
+/// it is the one state that prints.
 ///
-/// `pub` because `resim_cmd`'s NEUTRAL renderer prints the SAME
-/// line (the rule is that the provenance is always visible, and a neutral
-/// resim is a surface like any other), and that crate half is
-/// platform-independent while this module is Unix-only — so the LINE crosses as
-/// a rendered `String` on `ResimReport`, produced here. A second `match` over
-/// there would be the two-copies class on the one vocabulary this function
-/// exists to keep single.
-pub fn render_coordination_line(report: &CoordinationReport) -> String {
+/// `pub` because `resim_cmd`'s NEUTRAL renderer prints the SAME line, and that
+/// crate half is platform-independent while this module is Unix-only, so the
+/// LINE crosses as a rendered `Option<String>` on `ResimReport`, produced here.
+/// A second `match` over there would be the two-copies class on the one
+/// vocabulary this function exists to keep single.
+pub fn render_coordination_line(report: &CoordinationReport) -> Option<String> {
     match (report.mode, report.inferred) {
-        (CoordinationMode::FreeRun, _) => "coordination: free_run (per-rank boundary streams + \
-             read-log agreement; cross-rank lockstep equality not applicable)"
-            .to_string(),
-        (CoordinationMode::Lockstep, false) => "coordination: lockstep".to_string(),
+        (CoordinationMode::FreeRun, _) | (CoordinationMode::Lockstep, false) => None,
         (CoordinationMode::Lockstep, true) => {
-            "coordination: lockstep (inferred: no coordination stamp)".to_string()
+            Some("coordination: lockstep (inferred: no coordination stamp)".to_string())
         }
     }
 }
 
-/// How a replay fed its reads, the second provenance line of the verdict.
+/// How a replay fed its reads: the `--report` JSON's `read_identity` block,
+/// and a verdict line when reads were fed best effort
+/// ([`render_read_identity_line`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ReadIdentityReport {
@@ -602,24 +1129,28 @@ pub enum ReadIdentityReport {
     },
 }
 
-/// The verdict line [`ReadIdentityReport`] renders as.
-pub fn render_read_identity_line(report: &ReadIdentityReport) -> String {
+/// The verdict line [`ReadIdentityReport`] renders as, or `None` for
+/// [`ReadIdentityReport::Fed`].
+///
+/// Fed by identity is the full-fidelity path every current recording takes, so
+/// it prints nothing and the `--report` JSON's `read_identity` block carries its
+/// counts. Best effort NARROWS what the verdict covers (a read reproduces only
+/// when the queue behaves as it did live), so it prints.
+pub fn render_read_identity_line(report: &ReadIdentityReport) -> Option<String> {
     match report {
-        ReadIdentityReport::Fed { reads, frames } => format!(
-            "reads: fed by recorded identity ({reads} reads, {frames} frames, each read through \
-             its own private feed)"
-        ),
+        ReadIdentityReport::Fed { .. } => None,
         ReadIdentityReport::BestEffort { reason } if reason.is_empty() => {
-            "reads: best effort, no read identity".to_string()
+            Some("reads: best effort, no read identity".to_string())
         }
         ReadIdentityReport::BestEffort { reason } => {
-            format!("reads: best effort, no read identity ({reason})")
+            Some(format!("reads: best effort, no read identity ({reason})"))
         }
     }
 }
 
-/// The `--report` JSON's coordination block — the three states
-/// the provenance line renders, in machine-readable form.
+/// The `--report` JSON's coordination block: the three states of the
+/// contract a replay applied, in machine-readable form (the terminal prints a
+/// line for the inferred one only, [`render_coordination_line`]).
 ///
 /// The two fields are independent by construction and only three of the four
 /// combinations are reachable, which is the point: `free_run` is only ever
@@ -3857,9 +4388,17 @@ pub enum ReplayNodes {
 /// Run the deterministic replay engine and return its [`ReplayOutcome`].
 ///
 /// Writes the JSON report to `inputs.report_path` when set. Emits a
-/// `tracing::warn!` per env divergence and per data violation for log
-/// pipelines; the human-readable verdict is [`render_verdict`] (printed by the
-/// CLI). A clean run yields `outcome.passed == true`; data divergences leave it
+/// `tracing::warn!` per env divergence and a `tracing::info!` per node failure
+/// (both terminal reports name each failed node). A data violation and a
+/// structural trace divergence are a `tracing::info!` under
+/// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
+/// printed by the CLI) states each in full, and a `tracing::warn!` under
+/// [`ReplayPurpose::Resim`], whose neutral summary only counts them. Those
+/// `info` levels hold only for a run that returns its outcome, because only
+/// then does the CLI render a verdict or a summary: on a run a rank ABORTS,
+/// which returns the aborting error, the completed ranks' violations, trace
+/// divergence and node failures are each a `tracing::warn!`. A clean
+/// run yields `outcome.passed == true`; data divergences leave it
 /// `false` (the CLI maps that to `EXIT_VIOLATION`). Bag-vs-graph mismatch and
 /// node-load failures short-circuit as typed [`ReplayError`]s (exit 2 / 3).
 pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutcome, ReplayError> {
@@ -4454,7 +4993,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 &transport,
                 &clock,
                 schema_hashes.as_ref(),
-                pass_wiring(&burst_floors, &verification.depth_floors),
+                pass_wiring(
+                    &burst_floors,
+                    &verification.depth_floors,
+                    plan.sibling_produced(),
+                ),
                 &wiring,
             ) {
                 Ok(runtime) => runtime,
@@ -4574,6 +5117,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             covered_range,
             coordination_report,
             ros2_entries_skipped,
+            purpose,
         },
         abort_marker,
     );
@@ -4730,6 +5274,10 @@ struct EpilogueInputs<'a> {
     covered_range: Option<CoveredRange>,
     coordination_report: CoordinationReport,
     ros2_entries_skipped: Vec<String>,
+    /// Which terminal report the CLI prints for this outcome: the `--verify`
+    /// verdict, which states every data violation and schedule divergence in
+    /// full, or the neutral `--resim` summary, which counts them.
+    purpose: ReplayPurpose,
 }
 
 /// The `?`-FREE epilogue of [`run_engine`] — fold the passes'
@@ -4785,6 +5333,7 @@ fn assemble_outcome(
         covered_range,
         coordination_report,
         ros2_entries_skipped,
+        purpose,
     } = ep;
 
     // 5. The read-log verdict, folded across the passes. Under lockstep there
@@ -5253,22 +5802,54 @@ fn assemble_outcome(
     for d in &env_divergence {
         tracing::warn!(var = %d.name, detail = %d.detail, "replay: environment divergence vs bag env.json");
     }
+    // A completed `--verify`: INFO, because the verdict renders each violation
+    // and the schedule divergence as its own block on the same stderr, so these
+    // lines are for a log pipeline only. A bare `--resim`: WARN, because its
+    // neutral summary only counts the differing topics and says the schedule
+    // differs, so these lines are where the terminal names each topic, frame
+    // and position. An ABORTED run renders neither (the CLI prints only the
+    // aborting error), so these lines are the only place the terminal names
+    // what the completed ranks found: WARN under both purposes.
+    let verdict_states_detail = purpose == ReplayPurpose::Verify && aborted.is_none();
     for v in &violations {
-        tracing::warn!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        if verdict_states_detail {
+            tracing::info!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        } else {
+            tracing::warn!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        }
     }
     if let Some(td) = &trace_divergence {
-        tracing::warn!(
-            position = td.position,
-            detail = %td.detail,
-            "replay: structural trace divergence vs the recorded scheduler trace"
-        );
+        if verdict_states_detail {
+            tracing::info!(
+                position = td.position,
+                detail = %td.detail,
+                "replay: structural trace divergence vs the recorded scheduler trace"
+            );
+        } else {
+            tracing::warn!(
+                position = td.position,
+                detail = %td.detail,
+                "replay: structural trace divergence vs the recorded scheduler trace"
+            );
+        }
     }
+    // INFO under both purposes on a completed run: the verdict and the neutral
+    // summary each name every failed node with its reason. WARN on an aborted
+    // run, which renders neither.
     for f in &node_failures {
-        tracing::warn!(
-            node_id = %f.node_id,
-            reason = %f.reason,
-            "replay: node suffered a panic-class failure (exit-3 root cause)"
-        );
+        if aborted.is_none() {
+            tracing::info!(
+                node_id = %f.node_id,
+                reason = %f.reason,
+                "replay: node suffered a panic-class failure (exit-3 root cause)"
+            );
+        } else {
+            tracing::warn!(
+                node_id = %f.node_id,
+                reason = %f.reason,
+                "replay: node suffered a panic-class failure (exit-3 root cause)"
+            );
+        }
     }
 
     // Surface every engaged ragged-tail tolerance (INFO — a benign,
@@ -7959,7 +8540,7 @@ struct ReplayContext {
     resume: Option<ResumePlan>,
 }
 
-/// Classify a `TransportManager::init` failure on the resim path.
+/// Classify a failure to start the resim's transport ([`init_resim_transport`]).
 ///
 /// One failure class here is NOT a harness bug: an
 /// [`UnrepresentableNodeName`](cerulion_core::TransportError::UnrepresentableNodeName)
@@ -8019,11 +8600,13 @@ fn build_replay_context(
             // The resume plan: after the load (so `NodeLoad` keeps precedence),
             // before the transport (so its seeds reach publisher creation).
             let resume = resolve_resume()?;
-            // Smart, dead-node-only cleanup (the `graph_run` precedent) — live
-            // sibling Cerulion processes are untouched.
-            let _ = crate::ipc_cleanup::cleanup_dead_iceoryx2_nodes();
             let clock = Arc::new(VirtualClock::new());
-            let transport = TransportManager::init(cerulion_core::TransportConfig {
+            // On the resim's PRIVATE namespace (`init_resim_transport`), so no
+            // live graph, recorder or network daemon on this host receives
+            // the frames it re-executes or the recorded inputs it re-injects.
+            // The resim opens nothing on the shared namespace, so it sweeps
+            // only its own slot's namespace (`reclaim_resim_slot`).
+            let transport = init_resim_transport(cerulion_core::TransportConfig {
                 node_name: format!("{REPLAY_NODE_NAME_PREFIX}{}", config.identity()),
                 clock: clock.clone(),
                 subscriber_buffer_size: REPLAY_SUBSCRIBER_BUFFER,
@@ -8034,8 +8617,7 @@ fn build_replay_context(
                 // deliberately NOT a warn, since this arm is hit by design
                 // on every replay of a networked graph).
                 network: None,
-            })
-            .map_err(replay_transport_init_error)?;
+            })?;
             if let Some(plan) = resume.as_ref() {
                 if !plan.seeds.is_empty() {
                     transport.set_replay_sequence_seeds(plan.seeds.clone());
@@ -8079,12 +8661,19 @@ fn build_replay_context(
 /// per `(node, input)` the depth a bag-fed input's subscriber is built at when
 /// its steered schedule holds more frames than it declares
 /// (`PassVerification::depth_floors`). An empty map adds nothing.
+///
+/// `sibling_topics` is the rank's [`RankPlan::sibling_produced`]: the topics
+/// another rank produces for this one, handed to the pass's validation exactly
+/// as a live worker hands its plan's set, so a correct cross-rank edge is not
+/// reported as a possible typo. It changes no wiring.
 fn pass_wiring<'a>(
     burst_floors: &'a BTreeMap<String, cerulion_core::transport::TopicRequirements>,
     depth_floors: &'a BTreeMap<(String, String), usize>,
+    sibling_topics: &'a cerulion_core::graph::SiblingProducedTopics,
 ) -> cerulion_core::graph::CrossProcessWiring<'a> {
     let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
-    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning);
+    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning)
+        .with_sibling_topics(sibling_topics);
     if depth_floors.is_empty() {
         wiring
     } else {
@@ -11207,7 +11796,7 @@ fn latest_input_depth(info: &cerulion_core::graph::NodeInfo, input: &str) -> Opt
 /// (`NodeInfo::unifies_data_trigger` refuses them on policy), so they are
 /// [`replay_rederive::LatestDrain::Separate`]. Every other input reads through
 /// one subscriber only when its entry answers `NodeEntry::unifies_trigger_drain`
-/// (a node library through its unified drain export, a closure unless built
+/// (a stable node library through its host-owned unified drain, a closure unless built
 /// with `ClosureNodeEntry::with_unified_drain(false)`) and
 /// `CERULION_DRAIN_DISCIPLINE=separate` did not force two at the graph build.
 /// Such a bag records neither, and the replayed entry need not be the recorded
@@ -18476,7 +19065,7 @@ mod node_trigger_decl_tests {
     }
 
     /// An older bag's `drop_oldest` latest input, whose node read it through
-    /// two subscribers (a library without the unified drain export, an
+    /// two subscribers (an entry without unified drain capability, an
     /// opted-out closure, or the drain override), recorded a step that popped
     /// a frame an earlier read already took and fired nothing. Judged as one
     /// subscriber that step is a false finding; declared from what the bag
@@ -21598,10 +22187,11 @@ fn validate_step_boundaries(
     // above (per-rank consecutive steps + non-decreasing targets) is the part
     // that still holds per rank and SURVIVES VERBATIM for both modes.
     //
-    // The skip is never silent: the verdict's coordination provenance line
-    // (`render_coordination_line`) states which contract was applied and
-    // that cross-rank lockstep equality is "not applicable" — that line is
-    // where a mode-gated validation says so.
+    // The skip is stated where the contract is: the `--report` JSON's
+    // `coordination` block names the `free_run` contract this replay applied,
+    // under which cross-rank lockstep equality is not applicable. The terminal
+    // prints a coordination line only for an INFERRED contract
+    // (`render_coordination_line`).
     if coordination == CoordinationMode::FreeRun {
         return Ok(BoundaryWalk {
             summaries,
@@ -26121,6 +26711,87 @@ fn declined_counts(outcome: &ReplayOutcome) -> (usize, usize) {
     (declined, matched)
 }
 
+/// The verdict's read-log ENFORCEMENT line, newline-terminated, or `None` when
+/// the enforcement ran clean or had nothing to do.
+///
+/// Prints when the enforcement says something that narrows the verdict: stages
+/// that could not be gated or a rank whose edges were not enforced (their
+/// intra-step arrival is whatever their queue held), and an `Enforced` run with
+/// any anomaly count above zero (a planned step never reached, a refill empty by
+/// enforcement, a consult the plan held no position for, a stage not gateable).
+/// A clean `Enforced` run, `NotApplicable` and `Lockstep` print nothing; the
+/// `--report` JSON's `read_log_enforcement` block carries every state with its
+/// counts.
+pub fn render_enforcement_line(enforcement: &ReadLogEnforcement) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    match enforcement {
+        ReadLogEnforcement::NotApplicable | ReadLogEnforcement::Lockstep => return None,
+        ReadLogEnforcement::NotGateable { stages, reasons } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: {stages} graph-produced stage(s) could NOT be \
+                 gated, so their intra-step arrival is whatever their queue held:"
+            );
+            for r in reasons {
+                let _ = writeln!(s, "  - {r}");
+            }
+        }
+        ReadLogEnforcement::NotEnforced { topics, reason } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
+                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
+                 whatever its queue held."
+            );
+        }
+        ReadLogEnforcement::Enforced {
+            stages,
+            steps,
+            frames_admitted,
+            consults_refused,
+            unplanned_consults,
+            enforced_empty_refills,
+            steps_not_reached,
+            stages_not_gateable,
+        } => {
+            if *steps_not_reached == 0
+                && *enforced_empty_refills == 0
+                && *unplanned_consults == 0
+                && *stages_not_gateable == 0
+            {
+                return None;
+            }
+            let _ = write!(
+                s,
+                "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
+                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
+                 consult(s) refused"
+            );
+            if *steps_not_reached > 0 {
+                let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
+            }
+            if *enforced_empty_refills > 0 {
+                let _ = write!(
+                    s,
+                    ", {enforced_empty_refills} refill(s) empty by enforcement"
+                );
+            }
+            if *unplanned_consults > 0 {
+                let _ = write!(
+                    s,
+                    ", {unplanned_consults} consult(s) the installed plan held no position for"
+                );
+            }
+            if *stages_not_gateable > 0 {
+                let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");
+            }
+            let _ = writeln!(s, ").");
+        }
+    }
+    Some(s)
+}
+
 /// Render the human-readable stderr verdict for `outcome` (the CLI prints this).
 ///
 /// A clean run prints a one-line PASS with the counts. A structural divergence
@@ -26139,13 +26810,17 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
 
-    // The PROVENANCE line — which coordination contract
-    // this replay applied — FIRST, above everything else, on the pass path and
-    // the fail path alike. It is where a mode-gated validation says so: when a
-    // free-run bag skips the cross-rank lockstep equality check, this line is
-    // the statement that it was skipped, never a silent difference.
-    let _ = writeln!(s, "{}", render_coordination_line(&outcome.coordination));
-    let _ = writeln!(s, "{}", render_read_identity_line(&outcome.read_identity));
+    // The two PROVENANCE caveats FIRST, on the pass path and the fail path
+    // alike: a coordination contract the replay had to infer, and reads fed
+    // best effort. Each narrows what the verdict below covers. The clean states
+    // (a stamped contract, reads fed by identity) print nothing; the
+    // `--report` JSON carries every state.
+    if let Some(line) = render_coordination_line(&outcome.coordination) {
+        let _ = writeln!(s, "{line}");
+    }
+    if let Some(line) = render_read_identity_line(&outcome.read_identity) {
+        let _ = writeln!(s, "{line}");
+    }
 
     for d in &outcome.env_divergence {
         let _ = writeln!(s, "WARNING: env divergence: {}", d.detail);
@@ -26353,87 +27028,14 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
             let _ = writeln!(s, "  - edge {}.{}: {}", u.node_id, u.input, u.detail);
         }
     }
-    // The ENFORCEMENT's positive line, on EVERY path, for the reason the
-    // `read log:` status line below exists: a clean verdict must say what it
-    // enforced, and silence is what a reader cannot audit.
-    match &outcome.read_log_enforcement {
-        ReadLogEnforcement::NotApplicable => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: no graph-produced input edge runs inside one rank \
-                 on this recording, so none was gated."
-            );
-        }
-        ReadLogEnforcement::Lockstep => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: none (a lockstep replay's one gating clock orders \
-                 every publish against every step)."
-            );
-        }
-        ReadLogEnforcement::NotGateable { stages, reasons } => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: {stages} graph-produced stage(s) could NOT be \
-                 gated, so their intra-step arrival is whatever their queue held:"
-            );
-            for r in reasons {
-                let _ = writeln!(s, "  - {r}");
-            }
-        }
-        ReadLogEnforcement::NotEnforced { topics, reason } => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
-                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
-                 whatever its queue held."
-            );
-        }
-        ReadLogEnforcement::Enforced {
-            stages,
-            steps,
-            frames_admitted,
-            consults_refused,
-            unplanned_consults,
-            enforced_empty_refills,
-            steps_not_reached,
-            stages_not_gateable,
-        } => {
-            let _ = write!(
-                s,
-                "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
-                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
-                 consult(s) refused"
-            );
-            if *steps_not_reached > 0 {
-                let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
-            }
-            if *enforced_empty_refills > 0 {
-                let _ = write!(
-                    s,
-                    ", {enforced_empty_refills} refill(s) empty by enforcement"
-                );
-            }
-            if *unplanned_consults > 0 {
-                let _ = write!(
-                    s,
-                    ", {unplanned_consults} consult(s) the installed plan held no position for"
-                );
-            }
-            if *stages_not_gateable > 0 {
-                let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");
-            }
-            let _ = writeln!(s, ").");
-        }
+    // The enforcement's line, when it says something the verdict does not:
+    // see `render_enforcement_line`.
+    if let Some(line) = render_enforcement_line(&outcome.read_log_enforcement) {
+        let _ = write!(s, "{line}");
     }
 
-    // The read-log verifier's POSITIVE status — one
-    // line on EVERY path (pass and fail), so "verified clean" is a visible
-    // claim distinct from "never looked" (inert/disabled), which is what
-    // makes a clean read log auditable by a human too.
-    // What the verifier DECLINED to compare, rendered on EVERY
-    // path — a clean read-log line beside an unstated exclusion is the claim
-    // this block exists to scope.
+    // What the verifier DECLINED to compare, rendered on EVERY path: the
+    // `read log:` line below names the quarantine, and this block scopes it.
     if !outcome.read_log_quarantine.is_empty() {
         let _ = writeln!(
             s,
@@ -26462,7 +27064,17 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         }
     }
 
+    // A clean verification with nothing quarantined is what the `replay PASS`
+    // line already says, so it prints nothing; the `--report` JSON's `read_log`
+    // block carries its edge count. Every other state scopes the verdict (what
+    // the verifier did not compare, never looked at, or stopped looking at), so
+    // it prints.
     match &outcome.read_log {
+        ReadLogStatus::VerifiedClean {
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+            ..
+        } => {}
         ReadLogStatus::VerifiedClean {
             edges_compared,
             quarantined_nodes,
@@ -28315,25 +28927,127 @@ mod recorder_info_version_tests {
         }
     }
 
-    /// The provenance line's three states, HAND-WRITTEN
-    /// verbatim. This is the operator vocabulary — verdict and `--report` JSON
-    /// print one wording, so the strings are pinned rather than described.
+    /// Only the INFERRED contract prints a coordination line; a stamped
+    /// `free_run` or `lockstep` prints none (the `--report` block carries all
+    /// three states, pinned by the arm below).
     #[test]
-    fn provenance_line_renders_three_states() {
+    fn only_an_inferred_coordination_contract_renders_a_line() {
         let line =
             |mode, inferred| render_coordination_line(&CoordinationReport { mode, inferred });
+        assert_eq!(line(CoordinationMode::FreeRun, false), None);
+        assert_eq!(line(CoordinationMode::Lockstep, false), None);
         assert_eq!(
-            line(CoordinationMode::FreeRun, false),
-            "coordination: free_run (per-rank boundary streams + read-log agreement; \
-             cross-rank lockstep equality not applicable)"
+            line(CoordinationMode::Lockstep, true).as_deref(),
+            Some("coordination: lockstep (inferred: no coordination stamp)")
+        );
+    }
+
+    /// Reads fed by identity print nothing; best effort prints, with its reason
+    /// when it has one.
+    #[test]
+    fn only_best_effort_reads_render_a_line() {
+        assert_eq!(
+            render_read_identity_line(&ReadIdentityReport::Fed {
+                reads: 346,
+                frames: 346
+            }),
+            None
         );
         assert_eq!(
-            line(CoordinationMode::Lockstep, false),
-            "coordination: lockstep"
+            render_read_identity_line(&ReadIdentityReport::BestEffort {
+                reason: String::new()
+            })
+            .as_deref(),
+            Some("reads: best effort, no read identity")
         );
         assert_eq!(
-            line(CoordinationMode::Lockstep, true),
-            "coordination: lockstep (inferred: no coordination stamp)"
+            render_read_identity_line(&ReadIdentityReport::BestEffort {
+                reason: "recorded before read identity".into()
+            })
+            .as_deref(),
+            Some("reads: best effort, no read identity (recorded before read identity)")
+        );
+    }
+
+    fn enforced(
+        unplanned_consults: u64,
+        enforced_empty_refills: u64,
+        steps_not_reached: usize,
+        stages_not_gateable: usize,
+    ) -> ReadLogEnforcement {
+        ReadLogEnforcement::Enforced {
+            stages: 1,
+            steps: 292,
+            frames_admitted: 290,
+            consults_refused: 2,
+            unplanned_consults,
+            enforced_empty_refills,
+            steps_not_reached,
+            stages_not_gateable,
+        }
+    }
+
+    /// The enforcement line prints only when it narrows the verdict: a clean
+    /// `Enforced` run, `NotApplicable` and `Lockstep` print nothing, while every
+    /// anomaly count, an ungateable stage set and an unenforced rank print, each
+    /// against its hand-written line.
+    #[test]
+    fn the_enforcement_line_renders_only_what_narrows_the_verdict() {
+        assert_eq!(render_enforcement_line(&enforced(0, 0, 0, 0)), None);
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotApplicable),
+            None
+        );
+        assert_eq!(render_enforcement_line(&ReadLogEnforcement::Lockstep), None);
+
+        let head = "NOTE: read-log enforcement: 1 graph-produced stage(s) gated across 292 \
+                    step(s) (290 frame(s) admitted, 2 consult(s) refused";
+        for (e, tail) in [
+            (enforced(0, 0, 3, 0), ", 3 planned step(s) never reached"),
+            (enforced(0, 4, 0, 0), ", 4 refill(s) empty by enforcement"),
+            (
+                enforced(5, 0, 0, 0),
+                ", 5 consult(s) the installed plan held no position for",
+            ),
+            (enforced(0, 0, 0, 6), ", 6 stage(s) NOT gateable"),
+        ] {
+            assert_eq!(
+                render_enforcement_line(&e),
+                Some(format!("{head}{tail}).\n")),
+                "{e:?}"
+            );
+        }
+        assert_eq!(
+            render_enforcement_line(&enforced(5, 4, 3, 6)),
+            Some(format!(
+                "{head}, 3 planned step(s) never reached, 4 refill(s) empty by enforcement, \
+                 5 consult(s) the installed plan held no position for, 6 stage(s) NOT \
+                 gateable).\n"
+            ))
+        );
+
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotGateable {
+                stages: 2,
+                reasons: vec!["a".into(), "b".into()],
+            })
+            .as_deref(),
+            Some(
+                "NOTE: read-log enforcement: 2 graph-produced stage(s) could NOT be gated, so \
+                 their intra-step arrival is whatever their queue held:\n  - a\n  - b\n"
+            )
+        );
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotEnforced {
+                topics: 3,
+                reason: "no read log".into(),
+            })
+            .as_deref(),
+            Some(
+                "NOTE: read-log enforcement: NONE over 3 topic(s) this rank both produces and \
+                 consumes (no read log), so each such edge's intra-step arrival is whatever \
+                 its queue held.\n"
+            )
         );
     }
 
@@ -32761,5 +33475,895 @@ mod unlisted_macro_output_tests {
     fn a_hand_written_node_output_the_embedded_graph_does_not_list_is_not_refused() {
         let info = NodeInfo::from_names(vec![], vec!["echo".to_string()]);
         assert!(refuse_unlisted_macro_output(&subgraph(), &entries(info)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod resim_namespace_tests {
+    use super::{
+        claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
+        resim_namespace_slot, ResimSlot, SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER,
+        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+    };
+    use cerulion_core::testing::IsolatedRoot;
+    use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
+    use iceoryx2::node::{Node, NodeBuilder, NodeState};
+    use iceoryx2::prelude::CallbackProgression;
+    use iceoryx2::service::ipc_threadsafe::Service;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// What the child below prints once it holds its node and publisher.
+    const CHILD_READY: &str = "resim slot child holds a publisher";
+
+    /// A slot no claim reaches (at or above [`RESIM_NAMESPACE_SLOTS`]), distinct
+    /// per test process and per `index`, so no resim on the machine and no
+    /// concurrent run of these tests shares its segment names.
+    fn unclaimable_slot(index: u32) -> u32 {
+        RESIM_NAMESPACE_SLOTS + std::process::id() * 4 + index
+    }
+
+    /// Every file under `dir`, `depth` levels down, named with `slot`'s prefix.
+    fn files_of_slot(dir: &Path, slot: u32, depth: usize) -> BTreeSet<PathBuf> {
+        let mut found = BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_str().and_then(resim_namespace_slot) == Some(slot) {
+                found.insert(path.clone());
+            }
+            if depth > 1 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                found.extend(files_of_slot(&path, slot, depth - 1));
+            }
+        }
+        found
+    }
+
+    /// Every file of `slot`'s namespace: under the isolated root (three levels
+    /// reach a node's `<prefix>node.details`) and among this machine's segment
+    /// names.
+    fn namespace_files(root: &IsolatedRoot, slot: u32) -> BTreeSet<PathBuf> {
+        let mut found = files_of_slot(Path::new(&root.root), slot, 3);
+        if let Some(dir) = SEGMENT_NAME_DIR {
+            found.extend(files_of_slot(Path::new(dir), slot, 1));
+        }
+        found
+    }
+
+    fn alive_nodes(ix_config: &iceoryx2::config::Config) -> usize {
+        let mut alive = 0usize;
+        Node::<Service>::list(ix_config, |state| {
+            if matches!(state, NodeState::Alive(_)) {
+                alive += 1;
+            }
+            CallbackProgression::Continue
+        })
+        .expect("list the resim namespace");
+        alive
+    }
+
+    /// The claim every caller below makes: any slot the lock admits is ready.
+    fn claim(dir: &Path, slots: u32) -> ResimSlot {
+        claim_resim_slot(dir, slots, |_| Ok(())).expect("a free slot")
+    }
+
+    /// Hand oracles: the marker, the slot in exactly eight lowercase hex
+    /// digits, then `_`, nineteen characters for every slot, and the name
+    /// parses back to its slot. The last slot a claim takes is `0xff`.
+    #[test]
+    fn the_private_prefix_is_the_marker_then_the_slot_in_eight_hex_digits() {
+        for (slot, prefix) in [
+            (0, "cer_resim_00000000_"),
+            (1, "cer_resim_00000001_"),
+            (RESIM_NAMESPACE_SLOTS - 1, "cer_resim_000000ff_"),
+            (0x1234, "cer_resim_00001234_"),
+            (u32::MAX, "cer_resim_ffffffff_"),
+        ] {
+            assert_eq!(resim_namespace_prefix(slot), prefix);
+            assert_eq!(prefix.len(), 19, "{prefix}");
+            assert_eq!(resim_namespace_slot(prefix), Some(slot), "{prefix}");
+        }
+    }
+
+    /// No resim prefix string-prefixes another resim's, the default
+    /// namespace's, the planning namespace's or iceoryx2's test namespaces',
+    /// in either direction: the property that keeps one namespace's node
+    /// listing out of another's files.
+    #[test]
+    fn no_resim_prefix_lists_another_namespace() {
+        let slots = [0u32, 1, 0x10, 0xff, 0x100, 0x1234, 0x0fff_ffff, u32::MAX];
+        let resim: Vec<String> = slots.iter().map(|&s| resim_namespace_prefix(s)).collect();
+        for a in &resim {
+            assert_eq!(a.len(), RESIM_NAMESPACE_MARKER.len() + 9, "{a}");
+            for b in &resim {
+                if a != b {
+                    assert!(!b.starts_with(a.as_str()), "{a} lists {b}'s files");
+                }
+            }
+            for other in ["iox2_", "cer_p_0123456789abcdef", "test_prefix_"] {
+                assert!(
+                    !other.starts_with(a.as_str()) && !a.starts_with(other),
+                    "{a} and {other} overlap"
+                );
+            }
+        }
+    }
+
+    /// iceoryx2 accepts every prefix, and the config keeps the base's root.
+    #[test]
+    fn the_private_config_is_the_base_with_the_private_prefix() {
+        let base = iceoryx2::config::Config::global_config();
+        for slot in [0, 0xff, u32::MAX] {
+            let ix_config = resim_ix_config(base, slot).expect("a prefix iceoryx2 accepts");
+            assert_eq!(
+                ix_config.global.prefix.to_string(),
+                resim_namespace_prefix(slot)
+            );
+            assert_eq!(
+                String::from(ix_config.global.root_path()),
+                String::from(base.global.root_path())
+            );
+        }
+    }
+
+    /// A file of a slot's namespace names the slot; every other name, a slot's
+    /// lock file and other namespaces' files included, names none.
+    #[test]
+    fn only_a_file_of_a_slots_namespace_names_the_slot() {
+        assert_eq!(
+            resim_namespace_slot("cer_resim_0000abcd_1234567890.node_monitor"),
+            Some(0xabcd)
+        );
+        assert_eq!(
+            resim_namespace_slot("cer_resim_00000000_x_node.0_10_0.global_mgmt"),
+            Some(0)
+        );
+        for name in [
+            // A slot's lock file: no `_` after the digits.
+            "cer_resim_00000000.lock",
+            // Upper case: the prefix renders lower case only.
+            "cer_resim_0000ABCD_1234567890.node_monitor",
+            // Seven digits, then the separator.
+            "cer_resim_000abcd_1234567890.node_monitor",
+            // No separator after the eight digits.
+            "cer_resim_0000abcd1234567890.node_monitor",
+            // A sign `u32::from_str_radix` would accept.
+            "cer_resim_+000abcd_1.node_monitor",
+            "iox2_1234567890.node_monitor",
+            "cer_p_0123456789abcdef1234567890.node_monitor",
+            "1234567890",
+            "cer_resim_",
+            "",
+        ] {
+            assert_eq!(resim_namespace_slot(name), None, "{name}");
+        }
+    }
+
+    /// Two claims held at once take different slots, the lowest free first,
+    /// each by its own lock file.
+    #[test]
+    fn two_concurrent_claims_take_different_slots() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        let second = claim(dir.path(), 4);
+        assert_eq!((first.slot, second.slot), (0, 1));
+        assert!(dir.path().join("cer_resim_00000000.lock").is_file());
+        assert!(dir.path().join("cer_resim_00000001.lock").is_file());
+    }
+
+    /// Dropping a holder closes its lock file, as the kernel does for every
+    /// descriptor of a process that ends: the next claim reuses that slot,
+    /// the lowest free one again, while the other holder keeps its own.
+    #[test]
+    fn a_claim_after_a_holder_lets_go_reuses_its_slot() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        let second = claim(dir.path(), 4);
+        drop(first);
+        let third = claim(dir.path(), 4);
+        assert_eq!((second.slot, third.slot), (1, 0));
+        drop(second);
+        drop(third);
+        assert_eq!(claim(dir.path(), 4).slot, 0);
+    }
+
+    /// A slot whose reclaim refuses it is passed over, and its lock released:
+    /// the next claim takes it.
+    #[test]
+    fn a_slot_its_reclaim_refuses_is_passed_over_and_released() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let mut tried = Vec::new();
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            tried.push(slot);
+            if slot == 0 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 1 is ready");
+        assert_eq!((claimed.slot, tried), (1, vec![0, 1]));
+        assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+    }
+
+    /// A reclaim that leaves a node: what the dead-node sweep did, from
+    /// `cleaned`, and the nodes left.
+    fn holding(left: u64, cleaned: BoundedCleanup) -> SlotReclaim {
+        SlotReclaim {
+            cleaned,
+            nodes_left: Ok(left),
+            segments_removed: 0,
+            segments_failed: 0,
+        }
+    }
+
+    /// Hand oracles: each way a reclaim does not come back clean gives its
+    /// own reason, with the counts it read; a clean reclaim gives none.
+    #[test]
+    fn a_reclaim_that_is_not_clean_names_its_cause() {
+        let clean = holding(0, BoundedCleanup::default());
+        assert_eq!(clean.refusal(), None);
+
+        let left = holding(
+            1,
+            BoundedCleanup {
+                cleanups: 2,
+                failed_cleanups: 3,
+                deferred: 4,
+            },
+        );
+        assert_eq!(
+            left.refusal().as_deref(),
+            Some(
+                "nodes still registered in its namespace after the dead-node sweep: 1 (the sweep \
+                 removed 2, failed on 3 and deferred 4; it removes only the nodes of processes \
+                 that have ended and that this user can inspect)"
+            )
+        );
+
+        let unlisted = SlotReclaim {
+            nodes_left: Err("NodeListFailure::InsufficientPermissions".to_string()),
+            ..clean.clone()
+        };
+        assert_eq!(
+            unlisted.refusal().as_deref(),
+            Some(
+                "its namespace's node registry could not be listed after the dead-node sweep \
+                 (NodeListFailure::InsufficientPermissions)"
+            )
+        );
+
+        let stuck = SlotReclaim {
+            segments_removed: 1,
+            segments_failed: 2,
+            ..clean
+        };
+        assert_eq!(
+            stuck.refusal().as_deref(),
+            Some("leftover segments of its namespace that could not be removed: 2")
+        );
+    }
+
+    /// Every slot refused by its reclaim: exit 5, naming the LAST slot passed
+    /// over and its reason, and no open failure, since every lock file opened.
+    #[test]
+    fn a_claim_with_every_slot_refused_names_the_last_refusal_in_its_exit_5_text() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let err = claim_resim_slot(dir.path(), 3, |slot| {
+            let reclaim = holding(u64::from(slot) + 1, BoundedCleanup::default());
+            let reason = reclaim.refusal().expect("a node is left");
+            Err(SlotPassedOver::Reclaim { reclaim, reason })
+        })
+        .expect_err("every slot refused");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(
+            text.contains(
+                "; the last whose namespace was refused: slot 2, nodes still registered in its \
+                 namespace after the dead-node sweep: 3 (the sweep removed 0, failed on 0 and \
+                 deferred 0;"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("could not be opened or locked:"), "{text}");
+        assert_eq!(
+            claim(dir.path(), 3).slot,
+            0,
+            "every refused lock was released"
+        );
+    }
+
+    /// Every slot held: exit 5, naming the directory and the slot count, and
+    /// neither an open failure, since every lock file opened, nor a refusal,
+    /// since no namespace was reclaimed.
+    #[test]
+    fn a_claim_with_every_slot_held_is_refused_with_exit_5() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let _first = claim(dir.path(), 2);
+        let _second = claim(dir.path(), 2);
+        let err = claim_resim_slot(dir.path(), 2, |_| Ok(())).expect_err("no free slot");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(text.contains("none of the 2 slot locks"), "{text}");
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+        assert!(!text.contains("could not be opened or locked:"), "{text}");
+        assert!(
+            !text.contains("the last whose namespace was refused"),
+            "{text}"
+        );
+    }
+
+    /// A lock directory that does not exist: exit 5, naming the first lock
+    /// file that could not be opened.
+    #[test]
+    fn a_missing_lock_directory_is_refused_naming_the_first_open_failure() {
+        let dir = tempfile::tempdir().expect("a parent directory");
+        let missing = dir.path().join("absent");
+        let err = claim_resim_slot(&missing, 2, |_| Ok(())).expect_err("nothing opens");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        let first = missing.join("cer_resim_00000000.lock");
+        assert!(
+            text.contains(&format!(
+                "the first that could not be opened or locked: {}",
+                first.display()
+            )),
+            "{text}"
+        );
+    }
+
+    /// The message of the warn a claim logs for the first slot it passes over.
+    const PASSED_OVER: &str = "replay: passed over a resim namespace slot whose lock could not be \
+                               taken or whose namespace did not reclaim clean";
+    /// The message of the debug line for a further slot it passes over.
+    const PASSED_OVER_AGAIN: &str = "replay: passed over another resim namespace slot (suppressed)";
+    /// The message of the warn for the slot that takes the count across a
+    /// power of ten (the tenth, the hundredth).
+    const STILL_PASSING_OVER: &str = "replay: still passing over resim namespace slots";
+    /// The message of the info line of a claim that took a slot after
+    /// suppressing at least one repeat.
+    const CLAIMED_AFTER: &str = "replay: claimed a resim namespace slot after passing over others";
+
+    /// How many of `lines` (a `#[traced_test]`'s own) are `level` events that
+    /// contain every one of `texts` and carry every one of `fields`, each a
+    /// whole `name=value` token as the log writes it.
+    fn logged(lines: &[&str], level: &str, texts: &[&str], fields: &[&str]) -> usize {
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(" {level} "))
+                    && texts.iter().all(|text| line.contains(text))
+                    && fields
+                        .iter()
+                        .all(|field| line.split(' ').any(|token| token == *field))
+            })
+            .count()
+    }
+
+    /// `Ok` when every `(what, got, want)` count matches, else every count and
+    /// the lines read.
+    fn counts_match(lines: &[&str], counts: &[(&str, usize, usize)]) -> Result<(), String> {
+        if counts.iter().all(|(_, got, want)| got == want) {
+            Ok(())
+        } else {
+            Err(format!("(what, got, want): {counts:#?}\nlines: {lines:#?}"))
+        }
+    }
+
+    /// One slot passed over, then a claim: one warn naming the slot, what its
+    /// reclaim counted (each count distinct, so a swapped field shows) and why
+    /// it was refused. A lone pass-over closes without a recovery line.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_that_passes_over_one_slot_warns_naming_the_slot_and_its_counts() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            if slot > 0 {
+                return Ok(());
+            }
+            let reclaim = SlotReclaim {
+                segments_failed: 5,
+                ..holding(
+                    1,
+                    BoundedCleanup {
+                        cleanups: 2,
+                        failed_cleanups: 3,
+                        deferred: 4,
+                    },
+                )
+            };
+            let reason = reclaim.refusal().expect("a node is left");
+            Err(SlotPassedOver::Reclaim { reclaim, reason })
+        })
+        .expect("slot 1 is ready");
+        assert_eq!(claimed.slot, 1);
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(
+                            lines,
+                            "WARN",
+                            &[
+                                PASSED_OVER,
+                                "error=nodes still registered in its namespace after the \
+                                 dead-node sweep: 1 (the sweep removed 2, failed on 3 and \
+                                 deferred 4;",
+                            ],
+                            &[
+                                "slot=0",
+                                "nodes_left=1",
+                                "cleanups=2",
+                                "failed_cleanups=3",
+                                "deferred=4",
+                                "segments_failed=5",
+                            ],
+                        ),
+                        1,
+                    ),
+                    (
+                        "any pass-over line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains("replay: passed over"))
+                            .count(),
+                        1,
+                    ),
+                    (
+                        "a recovery line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(CLAIMED_AFTER))
+                            .count(),
+                        0,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// Two slots passed over, then a claim of the third: the first at warn,
+    /// the repeat at debug with one suppressed, and an info line for the slot
+    /// taken naming the one suppressed and both passed over. A slot refused
+    /// before any reclaim carries no reclaim count. The repeat never logs at
+    /// a loud level, and the recovery line, at info, carries the count in
+    /// every build.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_after_two_slots_passed_over_logs_the_repeat_at_debug_and_the_claim_at_info() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            if slot < 2 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 2 is ready");
+        assert_eq!(claimed.slot, 2);
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(
+                            lines,
+                            "WARN",
+                            &[PASSED_OVER, "error=refused by the test"],
+                            &["slot=0"],
+                        ),
+                        1,
+                    ),
+                    (
+                        "the debug repeat for slot 1",
+                        logged(
+                            lines,
+                            "DEBUG",
+                            &[PASSED_OVER_AGAIN, "error=refused by the test"],
+                            &["slot=1", "suppressed=1"],
+                        ),
+                        cerulion_core::testing::debug_lines_expected(1),
+                    ),
+                    (
+                        "the repeat at a loud level",
+                        logged(lines, "WARN", &[PASSED_OVER_AGAIN], &[])
+                            + logged(lines, "INFO", &[PASSED_OVER_AGAIN], &[]),
+                        0,
+                    ),
+                    (
+                        "a reclaim count on a slot refused before its reclaim",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(" nodes_left="))
+                            .count(),
+                        0,
+                    ),
+                    (
+                        "the info for the slot taken",
+                        logged(
+                            lines,
+                            "INFO",
+                            &[CLAIMED_AFTER],
+                            &["slot=2", "suppressed=1", "total_failures=2"],
+                        ),
+                        1,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// Ten slots passed over, then a claim of the eleventh: the first at
+    /// warn, the next eight at debug counting up the suppressed, the tenth at
+    /// warn again with the total, and the claim at info with all ten.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_that_passes_over_ten_slots_warns_again_at_the_tenth() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 12, |slot| {
+            if slot < 10 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 10 is ready");
+        assert_eq!(claimed.slot, 10);
+        logs_assert(|lines| {
+            let mut counts = vec![
+                (
+                    "the warn for slot 0".to_string(),
+                    logged(lines, "WARN", &[PASSED_OVER], &["slot=0"]),
+                    1,
+                ),
+                (
+                    "debug repeats".to_string(),
+                    logged(lines, "DEBUG", &[PASSED_OVER_AGAIN], &[]),
+                    cerulion_core::testing::debug_lines_expected(8),
+                ),
+                (
+                    "the warn for slot 9".to_string(),
+                    logged(
+                        lines,
+                        "WARN",
+                        &[STILL_PASSING_OVER],
+                        &["slot=9", "total_failures=10", "suppressed=8"],
+                    ),
+                    1,
+                ),
+                (
+                    "the info for the slot taken".to_string(),
+                    logged(
+                        lines,
+                        "INFO",
+                        &[CLAIMED_AFTER],
+                        &["slot=10", "suppressed=8", "total_failures=10"],
+                    ),
+                    1,
+                ),
+            ];
+            for slot in 1..9 {
+                counts.push((
+                    format!("the debug repeat for slot {slot}"),
+                    logged(
+                        lines,
+                        "DEBUG",
+                        &[PASSED_OVER_AGAIN],
+                        &[&format!("slot={slot}"), &format!("suppressed={slot}")],
+                    ),
+                    cerulion_core::testing::debug_lines_expected(1),
+                ));
+            }
+            let counts: Vec<(&str, usize, usize)> = counts
+                .iter()
+                .map(|(what, got, want)| (what.as_str(), *got, *want))
+                .collect();
+            counts_match(lines, &counts)
+        });
+    }
+
+    /// Lock files that cannot be opened: a warn for the first naming the slot
+    /// and the file, a debug repeat for the second, no reclaim count, and no
+    /// claim line, since nothing was claimed.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_warned_naming_the_slot_and_the_file() {
+        let dir = tempfile::tempdir().expect("a parent directory");
+        let missing = dir.path().join("absent");
+        claim_resim_slot(&missing, 2, |_| Ok(())).expect_err("nothing opens");
+        let first = format!(
+            "error=its lock file could not be opened or locked: {}",
+            missing.join("cer_resim_00000000.lock").display()
+        );
+        let second = format!(
+            "error=its lock file could not be opened or locked: {}",
+            missing.join("cer_resim_00000001.lock").display()
+        );
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(lines, "WARN", &[PASSED_OVER, &first], &["slot=0"]),
+                        1,
+                    ),
+                    (
+                        "the debug repeat for slot 1",
+                        logged(
+                            lines,
+                            "DEBUG",
+                            &[PASSED_OVER_AGAIN, &second],
+                            &["slot=1", "suppressed=1"],
+                        ),
+                        cerulion_core::testing::debug_lines_expected(1),
+                    ),
+                    (
+                        "a reclaim count",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(" nodes_left="))
+                            .count(),
+                        0,
+                    ),
+                    (
+                        "a claim line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains("replay: claimed"))
+                            .count(),
+                        0,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// A namespace with no node: the reclaim removes the slot's segments in
+    /// the segment directory and nothing else (another slot's segment, the
+    /// slot's lock file, another namespace's segment, a directory). A zero
+    /// budget removes nothing and still reads clean.
+    #[test]
+    fn the_reclaim_of_an_empty_namespace_removes_its_slots_segments_only() {
+        let root = IsolatedRoot::mint("rslotseg");
+        let slot = unclaimable_slot(0);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let prefix = resim_namespace_prefix(slot);
+        let other = resim_namespace_prefix(slot + 1);
+        let kept: BTreeSet<String> = [
+            format!("{other}c.shm_state"),
+            format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"),
+            "iox2_d.shm_state".to_string(),
+            format!("{prefix}dir"),
+        ]
+        .into_iter()
+        .collect();
+        for name in [
+            format!("{prefix}a.shm_state"),
+            format!("{prefix}b.shm_state"),
+        ]
+        .iter()
+        .chain(kept.iter().filter(|name| !name.ends_with("dir")))
+        {
+            std::fs::write(segments.path().join(name), b"").expect("write a segment name");
+        }
+        std::fs::create_dir(segments.path().join(format!("{prefix}dir"))).expect("a directory");
+        let left = || -> BTreeSet<String> {
+            std::fs::read_dir(segments.path())
+                .expect("read the segment directory")
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        };
+
+        let untouched = reclaim_resim_slot(&ix_config, slot, Some(segments.path()), Duration::ZERO);
+        assert_eq!(
+            untouched,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(untouched.refusal(), None);
+        assert_eq!(
+            left().len(),
+            kept.len() + 2,
+            "a zero budget removes nothing"
+        );
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            reclaimed,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 2,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(reclaimed.refusal(), None);
+        assert_eq!(left(), kept);
+    }
+
+    /// A namespace with no node whose segment directory cannot be listed: a
+    /// warn naming the slot and the error, and a reclaim that removed nothing
+    /// and still reads clean.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_segment_directory_that_cannot_be_listed_is_warned_naming_the_slot() {
+        let root = IsolatedRoot::mint("rslotnodir");
+        let slot = unclaimable_slot(3);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let parent = tempfile::tempdir().expect("a parent directory");
+        let missing = parent.path().join("absent");
+        let reclaimed =
+            reclaim_resim_slot(&ix_config, slot, Some(&missing), Duration::from_secs(10));
+        assert_eq!(
+            reclaimed,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(reclaimed.refusal(), None);
+        let slot_field = format!("slot={slot}");
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[(
+                    "the warn for the unlisted directory",
+                    logged(
+                        lines,
+                        "WARN",
+                        &[
+                            "replay: could not list the shared-memory segment names to reclaim \
+                             a resim namespace slot",
+                            "(os error 2)",
+                        ],
+                        &[&slot_field],
+                    ),
+                    1,
+                )],
+            )
+        });
+    }
+
+    /// A namespace with a LIVE node is left as it is: the node is not reaped
+    /// and the slot's segment stays. Once the node is dropped, the reclaim of
+    /// the real segment names removes the namespace's iceoryx2 management
+    /// segment, the one segment a node leaves, and the namespace holds no file.
+    #[test]
+    fn the_reclaim_leaves_a_namespace_with_a_live_node_as_it_is() {
+        let root = IsolatedRoot::mint("rslotlive");
+        let slot = unclaimable_slot(1);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let node = NodeBuilder::new()
+            .config(&ix_config)
+            .create::<Service>()
+            .expect("a live node on the slot");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let segment = segments
+            .path()
+            .join(format!("{}a.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&segment, b"").expect("write a segment name");
+
+        let held = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            held,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(1),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert!(held.refusal().is_some());
+        assert!(
+            segment.exists(),
+            "a namespace with a node keeps its segments"
+        );
+        assert_eq!(alive_nodes(&ix_config), 1, "the live node was not reaped");
+
+        drop(node);
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            Duration::from_secs(10),
+        );
+        assert_eq!(reclaimed.nodes_left, Ok(0));
+        assert_eq!(reclaimed.refusal(), None);
+        if SEGMENT_NAME_DIR.is_some() {
+            assert_eq!(reclaimed.segments_removed, 1, "the management segment");
+        }
+        assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+
+    /// The child process the next test kills: a node and a publisher on the
+    /// slot namespace its parent names, held until it is killed.
+    #[test]
+    #[ignore = "a child process `the_reclaim_removes_every_file_a_killed_resim_left` spawns"]
+    fn child_holds_a_publisher_on_a_resim_slot() {
+        let Some(config) = cerulion_core::testing::child_iceoryx_config() else {
+            return;
+        };
+        let node = NodeBuilder::new()
+            .config(&config)
+            .create::<Service>()
+            .expect("a node on the slot");
+        let service = node
+            .service_builder(&"resim_slot_child".try_into().expect("a service name"))
+            .publish_subscribe::<u64>()
+            .open_or_create()
+            .expect("a service on the slot");
+        let _publisher = service.publisher_builder().create().expect("a publisher");
+        println!("{CHILD_READY}");
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// A resim killed while it held a service leaves its node, the service and
+    /// the namespace's management segment. The reclaim reaps the dead node,
+    /// which takes the service with it, then removes the management segment:
+    /// the namespace holds no file afterwards.
+    #[test]
+    fn the_reclaim_removes_every_file_a_killed_resim_left() {
+        let mut root = IsolatedRoot::mint("rslotdead");
+        let slot = unclaimable_slot(2);
+        root.prefix = resim_namespace_prefix(slot);
+        cerulion_core::testing::kill_child_holding_ports(
+            "replay_engine::resim_namespace_tests::child_holds_a_publisher_on_a_resim_slot",
+            &root,
+            CHILD_READY,
+            Duration::from_millis(200),
+        );
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let left = namespace_files(&root, slot);
+        assert!(
+            left.iter()
+                .any(|path| path.to_string_lossy().ends_with(".node_monitor")),
+            "the killed child left its node: {left:?}"
+        );
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            reclaimed.cleaned,
+            BoundedCleanup {
+                cleanups: 1,
+                failed_cleanups: 0,
+                deferred: 0,
+            },
+            "the dead node is reaped"
+        );
+        assert_eq!(reclaimed.nodes_left, Ok(0));
+        assert_eq!(reclaimed.refusal(), None);
+        assert_eq!(namespace_files(&root, slot), BTreeSet::new());
     }
 }

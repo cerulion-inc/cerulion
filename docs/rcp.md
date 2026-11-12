@@ -1,5 +1,7 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
+Experimental: not in any release; build from source.
+
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
 itself as `cerulion-rcp`. Every tool call is written to a hash-chained receipt
@@ -11,6 +13,8 @@ only.
 agent drives this way, with a recording that replays with no agent. Its demo
 script expects an [ASPIRE](https://github.com/NVlabs/ASPIRE) embodiment that is
 not yet published; the plant and the replay run from this repository alone.
+
+Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep their graph, state and tool journal local. Remote requests are refused before reaching those topics; configured external eye requests also respect this scope. Cached private state stays local after its producer exits. Remote graph topic diagnostics require an eligible live producer; local observations retain history. Local tool calls remain available. Emergency-stop operations remain available independently of network scope.
 
 ## Run it
 
@@ -361,19 +365,20 @@ The answer topic has no producer inside the graph, so
 their recorded steps, whatever the re-executed graph asks, and makes no Jev
 request itself. A gate that reads them with its own ask text sees an answer
 given for another ask text as `not_recorded`, and `--resim all --verify`
-reports a changed ask as a divergence on the ask topic. A running daemon's
-eye reads the same topics, and tells a played recording by where its frames
-come from: `bag play` publishes from the transport node `cerulion_bag_play`
-and `bag play --resim` from `cerulion_replay_` and the recording's identity.
-An ask from either gets no request, no answer and no receipt, with Jev on
-or off, and a wrist frame from either is never held, whatever their wire
-timestamps say, so an unpaced resim whose replay clock passes the host's
-time is dropped as surely as a recording from another boot. So are an ask
-and a frame whose publisher's node cannot be named. The first such ask is
-logged, later ones are counted, and `jev status` reports them. A live graph
-whose own node name takes one of those forms (a graph named `bag_play`, one
-whose name begins `replay_`, or a multi-process graph named `replay`) reads
-as a replay, and the log names the node.
+reports a changed ask as a divergence on the ask topic. A resim runs on a
+private shared-memory namespace a running daemon's eye never sees, so its
+asks and wrist frames never reach the eye: they are neither answered nor
+counted. Plain `bag play` publishes onto the topics the eye reads, from the
+transport node `cerulion_bag_play`, and the eye tells a played recording by
+that node: an ask from it gets no request, no answer and no receipt, with
+Jev on or off, and a wrist frame from it is never held, whatever their wire
+timestamps say. The eye drops an ask and a frame the same way when their
+publisher's node name begins `cerulion_replay_`, or when that node cannot
+be named. The first such ask is logged, later ones are counted, and
+`jev status` reports them. A live graph whose own node name takes one of
+those forms (a graph named `bag_play`, one whose name begins `replay_`, or
+a multi-process graph named `replay`) reads as a replay, and the log names
+the node.
 `--verify-bag` checks that every answer in a recording has its receipt,
 names an ask the recording holds and carries the SHA-256 of that ask's
 text, and, where the recording holds the frame, that the image and request
@@ -444,11 +449,17 @@ rcpd until rcpd answers, so rcpd engages its own latch too. While the ops latch 
   latch again after its stop command and before its start command, and an
   engage in between means the start command does not run (`unavailable:
   the robot's e-stop was engaged during the restart, so the graph was not
-  started again after its stop`). An engage after that second read does
-  not stop the graph the start command starts;
+  started again after its stop`). An engage after that second read
+  leaves the started graph running, as an engage leaves any running graph
+  running;
 - `estop`, `tools/list`, the resources and the session messages still work.
 
-LAN ingress does not read the latch.
+Apart from these refusals and the calls rcpd's own latch refuses, an e-stop
+gates no topic data: a graph's nodes and other local publishers can keep
+publishing, and a graph's `ingress:` topics and the topics this machine
+mirrors keep receiving from their producers, including a paired producer
+over the remote plane and, under `CERULION_LAN_ACCESS=open`, LAN peers. Stop
+those producers where they run.
 
 The ops latch is read when a desk's message arrives and again on the open
 connection to rcpd just before the plane sends it. A tool call already sent
@@ -476,23 +487,43 @@ warn once rcpd's latch closes. One such delivery runs at a time, under the
 identity of the first engager since rcpd last answered one: an `engage-estop`
 while one runs starts none, since the one running keeps sending, and when that
 `engage-estop` came after the attempt rcpd answers began, the delivery sends
-the `estop` once more. A delivery that ends before rcpd answers logs at error;
-one that ends after rcpd answered that its latch closed, while it deletes
-its MCP session, logs nothing. These lines go through the daemon's log queue,
-so a stderr that takes no more lines delays no attempt (see
+the `estop` once more. A delivery that ends before rcpd answers logs at error.
+One that ends after rcpd answered that its latch closed, while it deletes its
+MCP session, logs nothing, unless an `engage-estop` came after the answered
+attempt began: the `estop` it still owed that `engage-estop` was not sent, so
+it logs that at error, and the next `engage-estop` sends it. These lines go
+through the daemon's log queue, so a stderr that takes no more lines delays
+no attempt (see
 [`docs/remote_plane.md`](remote_plane.md#e-stop-does-not-wait-behind-another-session)).
 When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
 the middle of an attempt first deletes the MCP session rcpd issued it, within
 2 s, inside the 5 s the stop waits for the delivery's task. A stop the
-hard-exit deadline or a second signal ends, a SIGKILL (as a `cerulion-netd`
-stop sends) or a crash may end it with no line and no `DELETE`.
+hard-exit deadline or a second signal ends, a SIGKILL or a crash may end it
+with no line and no `DELETE`. A `cerulion-netd` stop sends SIGTERM, and sends
+SIGKILL only if `cerulion-remoted` has not exited within
+`CERULION_REMOTED_HARD_EXIT_MS` plus 500 ms.
 
-The latch clears only when `cerulion-remoted` restarts. To recover, restart
-`cerulion-remoted`, then clear rcpd's own latch: `estop_clear` under
-`limits.estop_clear: agent`, or deleting `<receipts>.estop` and restarting
-rcpd. While the ops latch is clear, `estop_clear` reaches rcpd like any other
-tool call. Clients that talk to rcpd directly, over stdio or its own HTTP
-listener, see only rcpd's latch.
+The ops latch holds while `cerulion-remoted` runs, and any exit of the daemon
+clears it: a crash, a stop or restart of `cerulion-netd` (which stops
+`cerulion-remoted` too) or a restart of the machine. After a crash,
+`cerulion-netd` starts `cerulion-remoted` again, after a wait of at least
+5 s, only while this machine still serves (a live export or
+`CERULION_NETD_LISTEN`); when it no longer serves, `cerulion rcp` cannot reach
+rcpd, so clear rcpd's latch locally (delete `<receipts>.estop` and restart
+rcpd, or call `estop_clear` from a local client under
+`limits.estop_clear: agent`). No verb reads the latch back, so
+while you need the e-stop engaged, engage it again after any reconnect or any
+restart you did not make to clear it. To clear both latches, restart
+`cerulion-remoted` on the robot, then clear rcpd's latch: `estop_clear` under
+`limits.estop_clear: agent` (after restarting the MCP server in your MCP
+client, since `cerulion rcp` exits when `cerulion-remoted` restarts), or
+deleting `<receipts>.estop` and restarting rcpd. rcpd's latch holds across
+rcpd restarts through that file. If rcpd cannot write the file, it logs an
+error and its e-stop may not survive an rcpd restart: after one, engage the
+e-stop again. While the ops
+latch is clear, `estop_clear` reaches rcpd like any other tool call. Clients
+that talk to rcpd directly, over stdio or its own HTTP listener, see only
+rcpd's latch.
 
 When rcpd restarts, it forgets every MCP session. The next request on a desk's
 session is answered with error `-32603` (`rcpd lost this MCP session (it

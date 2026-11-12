@@ -838,9 +838,18 @@ enum LayoutMode {
     Explicit,
 }
 
+struct RemoteDemandClaim {
+    robot: String,
+    local_channel: Option<String>,
+}
+
 /// The daemon's shared control state (poll thread + every controller thread).
 #[derive(Default)]
 struct DaemonState {
+    /// Serialize remote attach/rollback/detach without holding the poll-state lock.
+    remote_attaches: Arc<Mutex<()>>,
+    /// A demand claim becomes reusable only after its bounded plane call returns.
+    remote_demands: Arc<Mutex<()>>,
     /// The runtime taps.
     taps: TapManager,
     /// Per-attached-topic stats (keyed by absolute topic). A `detach` removes the
@@ -870,7 +879,7 @@ struct DaemonState {
     /// the entry (netd's refcount-0 teardown
     /// fires when the last consumer leaves). The demand is reserve-then-committed
     /// under this state lock so concurrent same-topic attaches demand exactly once.
-    demanded: BTreeMap<String, String>,
+    demanded: BTreeMap<String, RemoteDemandClaim>,
     /// A session-scoped PROVENANCE TOMBSTONE (topic → origin robot) recorded
     /// on every successful remote attach and — unlike [`Self::demanded`] — NEVER
     /// cleared on `detach`. When a remote topic is unchecked in Studio, the shared
@@ -882,17 +891,21 @@ struct DaemonState {
     /// survives the mirror's whole lifecycle; it is only overwritten by a later remote
     /// attach of the same topic (a different origin robot re-points it).
     remote_provenance: BTreeMap<String, String>,
-    /// A short-TTL CACHE of the mirror-provenance snapshot (topic → origin
-    /// robot) so `discover` does not pay a 150-600 ms `/__cerulion/mirrors` gather on
-    /// EVERY ~2 s sidebar poll while a mirror is live (the cerulion_core registry fast
-    /// path only short-circuits a registry-LESS desk — exactly NOT the fixed scenario).
-    /// Refreshed on a cache MISS (`None`, or older than [`PROVENANCE_CACHE_TTL`]) and
-    /// INVALIDATED on the mutation points vizd itself drives (`attach_remote` / `detach`,
-    /// which demand/release the mirror), so the user's own check/uncheck reflects on the
-    /// very next discover. A stale entry only mis-groups a row for at most ONE poll cycle
-    /// before the TTL forces a re-gather — acceptable (the defect to avoid is a PERSISTENT
-    /// mis-group, not a one-cycle transient).
-    mirror_provenance: Option<(Instant, BTreeMap<String, String>)>,
+    /// A short-TTL CACHE of the mirror-provenance snapshot (topic to origin
+    /// robot), with its gather stamp and invalidation generation (see
+    /// [`ProvenanceCache`]). While nothing invalidates it, the TTL bounds
+    /// back-to-back refreshes to one `/__cerulion/mirrors` gather per TTL
+    /// while a mirror is live (the cerulion_core registry fast path only
+    /// short-circuits a desk with no registry writer); a refresher polled slower
+    /// than the TTL gathers on every poll. `discover` and the local `attach` reply
+    /// refresh it on a cache MISS (never filled, invalidated, or older than
+    /// [`PROVENANCE_CACHE_TTL`]); `list` and `status` serve it HELD, at any age, and
+    /// never gather, so a slow mirror registry cannot hold their reply.
+    /// INVALIDATED per topic on the mutation points vizd itself drives
+    /// (`attach_remote` / `detach`, which demand/release the mirror): that topic
+    /// leaves the held map at once, and a gather already in flight cannot store
+    /// the pre-mutation map over it.
+    mirror_provenance: ProvenanceCache,
     /// The operator's per-TOPIC representation choice, for topics they
     /// overrode. Absent means [`Representation::Auto`].
     ///
@@ -998,8 +1011,9 @@ impl DaemonState {
     /// and compose or attach it before [`PROVENANCE_CACHE_TTL`] expires. MEASURED on
     /// that shape — the row read `robot: "ubuntu"` for a topic this desk was
     /// publishing itself, and it never healed, because once the record exists the
-    /// HELD half of `attribution_snapshot` re-asserts it to `list`/`status`/`discover`
-    /// forever. Worse than `None`, and on every surface at once.
+    /// authoritative per-tap half of `attribution_snapshot` re-asserts it to
+    /// `list`/`status`/`discover` forever. Worse than `None`, and on every surface
+    /// at once.
     ///
     /// There is no cheap way to CORROBORATE the map at stamp time: the registry's
     /// entire read surface is `gather_mirror_provenance{,_checked}`, both of which
@@ -1011,13 +1025,14 @@ impl DaemonState {
     ///
     /// # The bound, stated exactly
     ///
-    /// A wrong hint survives until the cached snapshot is REPLACED, which needs a
-    /// verb that gathers (`discover` / `list` / `status` / `attach_local`) to run past
-    /// the TTL — then at most one sampling interval more. On a live Studio, which
-    /// polls the sidebar every ~2 s, that is a few seconds. With NOTHING polling those
-    /// verbs it does not converge at all; the accurate reading is that the attribution
-    /// is only as fresh as the last question anyone asked, which is the same contract
-    /// `list` and `status` already serve under.
+    /// A wrong hint survives until the cached snapshot is REPLACED by a fresh
+    /// gather, which only a refreshing verb (`discover`, or the local `attach`
+    /// reply) makes, once the snapshot is past the TTL or invalidated; then at most
+    /// one sampling interval more. On a live Studio, which polls `discover` on its
+    /// own, that is a few seconds. With NOTHING calling those verbs it does not
+    /// converge at all: the attribution is only as fresh as the last refreshing
+    /// question anyone asked, which is the same contract `list` and `status` serve
+    /// under, since they read the stored snapshot and never gather.
     ///
     /// A STALE snapshot is HELD, never treated as an absence: expiry means "nobody has
     /// asked recently", not "the mirror is gone", and clearing on it would flap every
@@ -1027,10 +1042,8 @@ impl DaemonState {
         // MOVED OUT rather than cloned: the loop below mutates `self.stats` and
         // `self.monitors`, so it cannot hold a borrow of `self.mirror_provenance`.
         // Put back before returning, so this is a read of the cache and nothing more.
-        let Some((at, mirrors)) = self.mirror_provenance.take() else {
-            return;
-        };
-        if at.elapsed() < PROVENANCE_CACHE_TTL {
+        let cache = std::mem::take(&mut self.mirror_provenance);
+        if let Some(mirrors) = cache.fresh(Instant::now()) {
             for topic in self.taps.list() {
                 let Some(stat) = self.stats.get(&topic) else {
                     continue;
@@ -1044,7 +1057,7 @@ impl DaemonState {
                 }
             }
         }
-        self.mirror_provenance = Some((at, mirrors));
+        self.mirror_provenance = cache;
     }
 }
 
@@ -1067,24 +1080,237 @@ fn hint_refresh_target(
     Some(live.map(str::to_string))
 }
 
-/// How long a cached mirror-provenance snapshot stays fresh before
-/// `discover` re-gathers it. 3 s comfortably spans the ~2 s sidebar poll (so alternate
-/// polls are O(1)) while bounding staleness to one poll cycle: a topic that just became
-/// a mirror (or a torn-down one) is correctly grouped within one refresh. External
-/// mirror mutations (another desk consumer, `topic echo`) converge within the TTL; the
-/// user's OWN attach/detach are reflected immediately via cache invalidation.
+/// How long a cached mirror-provenance snapshot stays fresh before `discover` or
+/// a local `attach` gathers it again; `list` and `status` serve it at any age and
+/// never gather. While nothing invalidates, 3 s bounds back-to-back refreshes to
+/// one gather per TTL, and a refresher polled slower than the TTL gathers on every
+/// poll; either way a topic that just became a mirror (or a torn-down one) is
+/// correctly grouped within one gather. External mirror mutations (another desk
+/// consumer, `topic echo`) converge on the first refreshing verb after the TTL;
+/// the user's OWN remote attach and detach drop their topic at once through
+/// invalidation.
 ///
 /// `pub` because the e2e suite must
 /// DERIVE its attribution-convergence bound from this number rather than
 /// re-spell it. A gather that misses the record is cached exactly like a real
 /// snapshot (see `Ctx::gather_mirror_provenance` — deliberate, so a transient
-/// registry error cannot re-storm the gather), so a mirror can legitimately read
-/// as a LOCAL topic for up to one whole TTL. Two tests hard-coded budgets that
-/// did not account for that — one polled for 4 s against this 3 s, the other did
-/// not poll at all — and a contended macOS runner outran both. A test bound
+/// registry error cannot re-storm the gather), so on the refreshing verbs a mirror
+/// can legitimately read as a LOCAL topic for up to one whole TTL, and on `list`
+/// and `status` until a refreshing verb gathers after the TTL. Two tests
+/// hard-coded budgets that did not account for that (one polled for 4 s against
+/// this 3 s, the other did not poll at all), and a contended macOS runner outran
+/// both. A test bound
 /// written as a multiple of this constant cannot silently fall under it again if
 /// the TTL is ever raised.
 pub const PROVENANCE_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// The stored mirror-provenance snapshot: the last gathered `topic -> origin
+/// robot` map, when it was gathered, and an invalidation GENERATION.
+///
+/// A reader sees one of three states. NEVER FILLED: nothing has gathered yet, so
+/// [`Self::held`] is `None`. FRESH: gathered less than [`PROVENANCE_CACHE_TTL`]
+/// ago and not invalidated since, so [`Self::fresh`] serves it. HELD: filled but
+/// past the TTL or invalidated, still served by [`Self::held`], because expiry
+/// means nobody has asked recently, not that the mirrors are gone. An
+/// invalidation drops one topic and marks the rest stale, keeping them stored.
+///
+/// The generation orders gathers against invalidations. A gather reads it before
+/// it starts, and [`Self::store`] refuses the answer when an [`Self::invalidate`]
+/// has landed since, so a gather that read the registry before a `detach` cannot
+/// put the detached topic's robot back.
+///
+/// No clock read happens in here: every instant is a parameter.
+#[derive(Debug, Default, PartialEq)]
+struct ProvenanceCache {
+    /// The last stored map; `None` until the first store.
+    snapshot: Option<BTreeMap<String, String>>,
+    /// When the stored map was gathered; `None` before the first store and after
+    /// every invalidation.
+    gathered_at: Option<Instant>,
+    /// Bumped by every [`Self::invalidate`].
+    generation: u64,
+}
+
+impl ProvenanceCache {
+    /// The stored map while it is fresh at `now`: gathered strictly less than
+    /// [`PROVENANCE_CACHE_TTL`] before `now`, and not invalidated since.
+    fn fresh(&self, now: Instant) -> Option<&BTreeMap<String, String>> {
+        let at = self.gathered_at?;
+        if now.saturating_duration_since(at) < PROVENANCE_CACHE_TTL {
+            self.snapshot.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The stored map at any age, or `None` when nothing has been stored.
+    fn held(&self) -> Option<&BTreeMap<String, String>> {
+        self.snapshot.as_ref()
+    }
+
+    /// The generation a gather reads before it starts and hands back to
+    /// [`Self::store`].
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Store `map`, gathered at `at` by a gather that read `generation` before it
+    /// started. Refused, changing nothing, when an invalidation has landed since;
+    /// returns whether the map was stored.
+    fn store(&mut self, map: BTreeMap<String, String>, generation: u64, at: Instant) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.snapshot = Some(map);
+        self.gathered_at = Some(at);
+        true
+    }
+
+    /// Drop `topic` from the stored map, mark the rest stale, and move the
+    /// generation so a gather already in flight cannot store over it.
+    fn invalidate(&mut self, topic: &str) {
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            snapshot.remove(topic);
+        }
+        self.gathered_at = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Move the gather stamp `by` into the past. `false` when there is no stamp
+    /// or the clock cannot represent the earlier instant.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn age_by(&mut self, by: Duration) -> bool {
+        match self.gathered_at.and_then(|at| at.checked_sub(by)) {
+            Some(earlier) => {
+                self.gathered_at = Some(earlier);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// How a caller of [`Ctx::attribution_snapshot`] reads the name-keyed mirror half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvenanceRead {
+    /// Serve the snapshot while it is fresh; otherwise GATHER a new one first, up
+    /// to [`MIRROR_GATHER_WINDOW`](cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW)
+    /// plus whatever the registry open costs.
+    RefreshOnMiss,
+    /// Serve the stored snapshot at any age and never gather: one state-lock
+    /// acquisition and no registry read.
+    Held,
+}
+
+/// The gate every mirror-provenance gather passes between its registry read and
+/// the store of its answer, in builds with the test seams only.
+///
+/// Unheld, [`Self::pass`] returns at once. A test holds it through
+/// [`RunningDaemon::hold_provenance_gather_for_test`]; a gather that reaches it
+/// then parks until the hold is released, and the request that started that
+/// gather waits with it.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Default)]
+struct ProvenanceGate {
+    state: Mutex<ProvenanceGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Default)]
+struct ProvenanceGateState {
+    /// A gather reaching [`ProvenanceGate::pass`] waits while this is set.
+    held: bool,
+    /// Gathers waiting in [`ProvenanceGate::pass`] right now.
+    parked: u64,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ProvenanceGate {
+    /// Return at once when the gate is not held; otherwise wait until it is
+    /// released.
+    fn pass(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.held {
+            return;
+        }
+        st.parked += 1;
+        self.changed.notify_all();
+        let mut st = self
+            .changed
+            .wait_while(st, |s| s.held)
+            .unwrap_or_else(|e| e.into_inner());
+        st.parked -= 1;
+    }
+
+    /// Hold or release the gate, returning whether it was held. A release wakes
+    /// every parked gather.
+    fn set_held(&self, held: bool) -> bool {
+        let was = std::mem::replace(
+            &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).held,
+            held,
+        );
+        self.changed.notify_all();
+        was
+    }
+
+    /// Wait at most `bound` until at least `n` gathers are parked. Returns
+    /// whether they are.
+    fn wait_parked(&self, n: u64, bound: Duration) -> bool {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, _) = self
+            .changed
+            .wait_timeout_while(st, bound, |s| s.parked < n)
+            .unwrap_or_else(|e| e.into_inner());
+        st.parked >= n
+    }
+}
+
+/// Take one unit from `counter` when any remain; returns whether one was taken.
+/// Never wraps below zero, however many callers race it.
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_one_fault(counter: &AtomicU64) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(seen) => current = seen,
+        }
+    }
+    false
+}
+
+/// A test's hold on the mirror-provenance gate (see
+/// [`RunningDaemon::hold_provenance_gather_for_test`]). While it lives, every
+/// gather that has read the registry waits before storing its answer. Dropping it
+/// releases them all.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug)]
+#[must_use = "dropping the hold releases the gate at once"]
+pub struct ProvenanceGatherHold {
+    gate: Arc<ProvenanceGate>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ProvenanceGatherHold {
+    /// Wait at most `bound` until at least `n` gathers are parked at the gate.
+    /// Returns whether they are.
+    pub fn wait_parked(&self, n: u64, bound: Duration) -> bool {
+        self.gate.wait_parked(n, bound)
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for ProvenanceGatherHold {
+    fn drop(&mut self) {
+        self.gate.set_held(false);
+    }
+}
 
 /// The daemon's growable schema universe (remote arm). A schema-less (or
 /// pinned-but-unknown-custom-type) remote attach fetches the type's `.msg` closure
@@ -1305,7 +1531,7 @@ struct Ctx {
     /// shared mirror from the one-per-computer `cerulion-netd` daemon (instead of
     /// opening vizd's own ingress on the zenoh session), and `detach` releases it.
     /// A DI seam ([`DemandPlane`]): production is [`NetdDemandPlane`] (one persistent
-    /// UDS connection for the daemon's lifetime); tests inject a counting spy.
+    /// holding connection per source); tests inject a counting spy.
     demand_plane: Arc<dyn DemandPlane>,
     /// The schema-resolution walker, SWAPPABLE (remote arm): a schema-less
     /// remote attach grows it with a robot-served type's closure. Reads take a
@@ -1411,6 +1637,20 @@ struct Ctx {
     /// nanoseconds (`0` = off, the production value — nothing in the daemon ever
     /// writes it). See [`RunningDaemon::inject_runs_local_delay_for_test`].
     runs_local_delay_ns: Arc<AtomicU64>,
+    /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_started`].
+    provenance_gathers_started: Arc<AtomicU64>,
+    /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_discarded`].
+    provenance_gathers_discarded: Arc<AtomicU64>,
+    /// Principle #3 observable: see [`RunningDaemon::provenance_gathers_failed`].
+    provenance_gathers_failed: Arc<AtomicU64>,
+    /// TEST-ONLY gate between a provenance gather and the store of its answer.
+    /// See [`RunningDaemon::hold_provenance_gather_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gate: Arc<ProvenanceGate>,
+    /// TEST-ONLY count of provenance gathers still to fail (`0` = off). See
+    /// [`RunningDaemon::fail_next_provenance_gathers_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gather_faults: Arc<AtomicU64>,
     /// Principle #3 observable: passes that spent their wait BLOCKED ON A
     /// WAKE SET rather than on `thread::sleep`.
     ///
@@ -2877,6 +3117,16 @@ impl Ctx {
         if opened.is_empty() {
             return (0, Vec::new());
         }
+        let gate = remote_attach_gate(&self.state);
+        // Rollback must outwait an in-flight attach, not use a controller's
+        // three-second retry bound. The operation deadline covers a two-attempt
+        // netd constructor (20 s), catalog/schema/demand round trips (5 s each)
+        // and mirror visibility, while the poll-state mutex remains free.
+        let _operation =
+            match wait_remote_operation_until(&gate, Instant::now() + Duration::from_secs(45)) {
+                Ok(operation) => operation,
+                Err(error) => return (0, vec![error]),
+            };
         let mut removed_topics = Vec::new();
         let mut retained = Vec::new();
         {
@@ -3963,7 +4213,10 @@ impl Ctx {
         // Attribute the reply through the SAME map the sidebar surfaces
         // read, so a mirror attached by the local path (netd registered it before
         // Studio checked it — the live shape) still names its robot.
-        let robot = self.attribution_snapshot().get(&topic).cloned();
+        let robot = self
+            .attribution_snapshot(ProvenanceRead::RefreshOnMiss)
+            .get(&topic)
+            .cloned();
         Response::Attach(AttachResponse {
             id: Some(id),
             ok: true,
@@ -4002,10 +4255,28 @@ impl Ctx {
         robot: String,
         schema: Option<String>,
     ) -> Response {
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return Response::error_retryable(Some(id), error, Some(topic), None),
+        };
         // Validate before a pinned built-in can bypass catalog/schema lookup.
         // Account identity routes must never become ordinary LAN robot names.
         if let Err(error) = cerulion_netd::account_access::parse_robot_route(&robot) {
             return Response::error(Some(id), error, Some(topic));
+        }
+
+        {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.taps.contains(&topic)
+                && st.demanded.get(&topic).map(|claim| claim.robot.as_str()) != Some(robot.as_str())
+            {
+                return Response::error(
+                    Some(id),
+                    format!("topic '{topic}' is already attached from another source; detach it before selecting robot '{robot}'"),
+                    Some(topic),
+                );
+            }
         }
 
         // Guardrail 5: entity-override stability, checked EARLY (before any
@@ -4067,15 +4338,15 @@ impl Ctx {
         //     per-computer network gateway) ONCE per topic per daemon lifetime,
         //     instead of opening vizd's OWN ingress on the zenoh session. netd owns
         //     the single mirror publisher + the zenoh demand token + the mirror
-        //     PROVENANCE, so two consumers of the same remote topic (vizd + a user
-        //     graph) share ONE mirror and the frame crosses the network ONCE.
+        //     PROVENANCE. LAN readers share the canonical mirror; WAN observers
+        //     share a private source channel, separately from graph ingress.
         //     Each UDS control connection runs on its OWN handler
         //     thread, so RESERVE-THEN-COMMIT closes the concurrent-attach TOCTOU:
         //     atomically CLAIM `(topic → robot)` under ONE state lock, then demand
         //     OUTSIDE the lock (a network call — never held under the state mutex).
-        //     Exactly one thread demands; a concurrent same-topic attach sees the
-        //     claim and SKIPS (idempotent — the tap step below reports
-        //     `already_attached`), and a re-attach after `detach` re-demands cleanly
+        //     Remote attach and detach transactions share an operation lock outside
+        //     the poll-state lock. A concurrent attach reuses a completed demand and
+        //     its returned channel; a re-attach after detach re-demands cleanly
         //     (netd's teardown freed the slot). A demand FAILURE rolls the claim
         //     back so a retry re-demands with no phantom claim left behind.
         let newly_demanded = match perform_remote_demand(
@@ -4097,10 +4368,26 @@ impl Ctx {
                 );
             }
         };
+        let channel = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.demanded
+                .get(&topic)
+                .and_then(|claim| claim.local_channel.clone())
+                .ok_or_else(|| "observer demand has no committed local channel".to_string())
+        };
+        let source_channel = match channel {
+            Ok(channel) => channel,
+            Err(error) => {
+                if newly_demanded {
+                    let _ = perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic);
+                }
+                return Response::error(Some(id), error, Some(topic));
+            }
+        };
         // On a FRESH demand, wait for netd's just-created mirror service to become
         // cross-process-visible before tapping it (netd is a separate process).
         if newly_demanded {
-            wait_for_mirror_service(&self.manager, &topic);
+            wait_for_mirror_service(&self.manager, &source_channel);
         }
 
         // 3. Tap the now-local mirror by the IDENTICAL local tap path, and report
@@ -4113,14 +4400,9 @@ impl Ctx {
         //    a `VoxelMap`, an H.264 CompressedImage a `VideoStream`).
         //    `route_key` was resolved at the top (the entity-stability check).
         let archetype = classify_schema(&schema_name);
-        // Attach under the lock, but DROP the guard before any rollback (the release
-        // re-locks `state`). Guardrail 5: the entity-stability decision RE-runs
-        // under this FINAL commit lock (the early check alone cannot close the
-        // concurrent-attach_remote race — two racers both saw route_key None; here one
-        // has committed its route_key, so the other sees the conflict). A conflict
-        // refuses WITHOUT releasing the demand (a Conflict ⟹ AlreadyAttached ⟹ a
-        // surviving attach whose `detach` releases the topic-keyed demand); only a TAP
-        // error rolls the demand back.
+        // Recheck entity/schema/source under the final state lock, then drop it
+        // before rollback. Existing remote taps retain their demand; fresh demands
+        // refused by a surviving local tap are released.
         let commit = {
             let mut st = self.state.lock().unwrap();
             match self
@@ -4137,9 +4419,10 @@ impl Ctx {
                 })
                 .and_then(|()| {
                     st.taps
-                        .attach(
+                        .attach_source(
                             &self.manager,
                             &topic,
+                            &source_channel,
                             entity_override.as_deref(),
                             // Desk-side mirror publishers provide wake notifications.
                             WakeMode::Listener,
@@ -4209,9 +4492,15 @@ impl Ctx {
         let (already, archetype) = match commit {
             RemoteCommit::Ok { already, archetype } => (already, archetype),
             RemoteCommit::Conflict(msg) => {
-                // Refuse WITHOUT releasing the demand: the surviving attach's `detach`
-                // releases the topic-keyed demand; releasing here would tear down a
-                // mirror still in use by the winner.
+                if newly_demanded {
+                    if let Err(error) =
+                        perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic)
+                    {
+                        tracing::warn!(topic = %topic, robot = %robot, error = %error, "refused remote attach demand could not be released");
+                    }
+                }
+                // A re-attach retains the surviving remote tap's demand. A fresh
+                // rejected demand was released above because no remote tap owns it.
                 return Response::error(Some(id), msg, Some(topic));
             }
             RemoteCommit::TapErr(e) => {
@@ -4243,9 +4532,10 @@ impl Ctx {
             .remote_provenance
             .insert(topic.clone(), robot.clone());
         // This attach DEMANDED a mirror from netd (which registers its
-        // provenance), so the cached snapshot is now stale — drop it so the next
-        // discover re-gathers and folds the new mirror to its robot promptly.
-        self.invalidate_mirror_provenance_cache();
+        // provenance), so the stored snapshot's answer for this topic is stale: drop
+        // it, so the next read that refreshes gathers again and folds the new mirror
+        // to its robot, and a gather already in flight cannot store over it.
+        self.invalidate_mirror_provenance_cache(&topic);
         // Keep the reapply-warn snapshot current (a new remote tap changes the set).
         self.refresh_attached_snapshot();
         // Decision: a checked-but-unmappable REMOTE topic is LOUD too — its
@@ -4312,6 +4602,11 @@ impl Ctx {
     /// detach (the tap is already gone; the demand ages out when vizd's connection
     /// drops at worst).
     fn detach(&self, id: u64, topic: String) -> Response {
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return Response::error_retryable(Some(id), error, Some(topic), None),
+        };
         let detached = {
             let mut st = self.state.lock().unwrap();
             if let Some(route) = st
@@ -4361,9 +4656,11 @@ impl Ctx {
             );
         }
         // The release tears the mirror down (netd refcount-0), so its
-        // provenance is about to disappear — drop the cached snapshot so the next
-        // discover re-gathers and the topic returns to its robot row promptly.
-        self.invalidate_mirror_provenance_cache();
+        // provenance is about to disappear: drop this topic from the stored
+        // snapshot, so the next read that refreshes gathers again and the topic
+        // returns to its robot row promptly, and a gather already in flight cannot
+        // store the pre-detach answer over it.
+        self.invalidate_mirror_provenance_cache(&topic);
         // Keep the reapply-warn snapshot current (the detached topic left the set —
         // a reconnect re-applying a layout rooted only at it now warns it's empty).
         self.refresh_attached_snapshot();
@@ -4476,14 +4773,16 @@ impl Ctx {
     /// `list`: the attached taps with their resolved route/entity/schema.
     fn list(&self, id: u64) -> Response {
         // The SAME attribution map `discover` folds with, so an attached
-        // mirror's row and its robot's row are one row. Built BEFORE the state lock
-        // (it takes that lock itself; std mutexes are not reentrant).
-        let attribution = self.attribution_snapshot();
+        // mirror's row and its robot's row are one row. HELD: the stored snapshot at
+        // any age, never a gather, so this reply does not wait on the mirror registry.
+        // Built BEFORE the state lock (it takes that lock itself; std mutexes are not
+        // reentrant).
+        let attribution = self.attribution_snapshot(ProvenanceRead::Held);
         // Probed BEFORE the lock — see `registration_snapshot` for why the
         // probes must not run inside it.
         let registration = self.registration_snapshot();
-        // Dated OUTSIDE the lock so a cache-miss gather above cannot age
-        // every row's observation by the gather duration (the same reason `status`
+        // Dated after the probes and OUTSIDE the lock, so the probes cannot age
+        // every row's observation by their duration (the same reason `status`
         // captures `now` after its own snapshot).
         let now = Instant::now();
         let st = self.state.lock().unwrap();
@@ -4546,13 +4845,11 @@ impl Ctx {
 
     /// `status`: per-topic Hz + frame counts + the worker's global counters.
     fn status(&self, id: u64) -> Response {
-        // The SAME attribution map (see `list`), built before the lock.
-        // A cache MISS can block here for the gather window, so `now` is captured
-        // AFTER it — timestamping before would age every Hz window by the gather
+        // The SAME HELD attribution map (see `list`), built before the lock.
+        let attribution = self.attribution_snapshot(ProvenanceRead::Held);
+        // Probed BEFORE the lock (see `registration_snapshot`), and before `now`:
+        // timestamping before the probes would age every Hz window by their
         // duration and under-report the rate of every attached topic.
-        let attribution = self.attribution_snapshot();
-        // Probed BEFORE the lock (see `registration_snapshot`), and before
-        // `now` for the same reason the attribution gather is.
         let registration = self.registration_snapshot();
         let now = Instant::now();
         let topics = {
@@ -4652,60 +4949,104 @@ impl Ctx {
         })
     }
 
+    /// One read of the desk's `/__cerulion/mirrors` registry over THIS daemon's
+    /// transport node. It opens the registry service, a reader port and the gather
+    /// doorbell, which carry no timeout of their own, and then listens for the live
+    /// writers' records for at most
+    /// [`MIRROR_GATHER_WINDOW`](cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW).
+    /// In builds with the test seams, a fault armed by
+    /// [`RunningDaemon::fail_next_provenance_gathers_for_test`] fails it instead.
+    fn gather_mirror_provenance_uncached(
+        &self,
+    ) -> cerulion_core::TransportResult<Vec<cerulion_core::transport::mirror_registry::MirrorRecord>>
+    {
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            if take_one_fault(&self.provenance_gather_faults) {
+                return Err(cerulion_core::TransportError::Internal {
+                    reason: "mirror registry: gather refused by an injected fault".to_string(),
+                });
+            }
+        }
+        self.manager.gather_mirror_provenance(
+            cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW,
+        )
+    }
+
     /// The CURRENT mirror-provenance snapshot as a `topic → origin robot`
-    /// map, served from a short-TTL CACHE ([`DaemonState::mirror_provenance`]) so a live
-    /// mirror does not cost `discover` a 150-600 ms gather on every poll. On a cache
-    /// MISS (`None` or older than [`PROVENANCE_CACHE_TTL`]) it re-gathers from the desk's
+    /// map, served from a short-TTL CACHE ([`DaemonState::mirror_provenance`]) so
+    /// back-to-back refreshing reads with a live mirror pay at most one gather per
+    /// TTL. On a cache MISS (never filled, invalidated, or older than
+    /// [`PROVENANCE_CACHE_TTL`]) it
+    /// re-gathers from the desk's
     /// `/__cerulion/mirrors` registry over THIS daemon's transport node (the parity of
-    /// the CLI's `topic_cmd::gather_mirror_provenance`) and stores the fresh snapshot.
-    /// The gather runs OUTSIDE the state lock (it can block up to the window); a
-    /// concurrent double-gather just overwrites (harmless, last-write-wins). BEST-EFFORT
+    /// the CLI's `topic_cmd::gather_mirror_provenance`) and stores the fresh snapshot,
+    /// unless an invalidation landed after the gather read the generation: that store
+    /// is refused and counted ([`RunningDaemon::provenance_gathers_discarded`]), and
+    /// the caller still answers from its own gather.
+    /// The gather runs OUTSIDE the state lock (it opens the registry, then listens
+    /// for up to the window); two
+    /// concurrent gathers that read the same generation both store, and the later
+    /// store wins. BEST-EFFORT
     /// and network-free: a registry-less desk returns empty INSTANTLY (the no-publisher
     /// fast path in cerulion_core), and ANY gather error is treated as "no provenance" (a
     /// `debug!` breadcrumb, cached like a real snapshot so a transient registry error
     /// does not re-storm the gather) so `discover` never fails on the registry — the
     /// stated fallback is that a mirrored topic shows as LOCAL (pre-fold).
     fn gather_mirror_provenance(&self) -> std::collections::BTreeMap<String, String> {
-        // Fast path: a fresh cached snapshot (the common steady-state poll).
-        {
-            let st = self.state.lock().unwrap();
-            if let Some((at, snapshot)) = st.mirror_provenance.as_ref() {
-                if at.elapsed() < PROVENANCE_CACHE_TTL {
-                    return snapshot.clone();
-                }
+        // Fast path: a fresh snapshot (the common steady-state poll). A miss reads the
+        // generation under the same lock, so an invalidation after it refuses the store.
+        let generation = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(snapshot) = st.mirror_provenance.fresh(Instant::now()) {
+                return snapshot.clone();
             }
-        }
+            st.mirror_provenance.generation()
+        };
         // Cache miss — gather OUTSIDE the lock (the drain can block up to the window).
-        let fresh: std::collections::BTreeMap<String, String> =
-            match self.manager.gather_mirror_provenance(
-                cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW,
-            ) {
-                Ok(records) => records
-                    .into_iter()
-                    .map(|r| (r.topic, r.origin_robot))
-                    .collect(),
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "cerulion-vizd discover: mirror-provenance gather failed — treating as no \
-                         mirrors (any mirrored topics show as LOCAL this sweep)"
-                    );
-                    std::collections::BTreeMap::new()
-                }
-            };
-        let mut st = self.state.lock().unwrap();
-        st.mirror_provenance = Some((Instant::now(), fresh.clone()));
+        self.provenance_gathers_started
+            .fetch_add(1, Ordering::Relaxed);
+        let gathered = self.gather_mirror_provenance_uncached();
+        let fresh: std::collections::BTreeMap<String, String> = match gathered {
+            Ok(records) => records
+                .into_iter()
+                .map(|r| (r.topic, r.origin_robot))
+                .collect(),
+            Err(e) => {
+                self.provenance_gathers_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    error = %e,
+                    "cerulion-vizd: mirror-provenance gather failed, treating as no mirrors \
+                     (any mirrored topics show as LOCAL until the next refresh)"
+                );
+                std::collections::BTreeMap::new()
+            }
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.provenance_gate.pass();
+        // Stamped at completion, so the TTL runs from when the answer was known.
+        let stored = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mirror_provenance
+            .store(fresh.clone(), generation, Instant::now());
+        if !stored {
+            self.provenance_gathers_discarded
+                .fetch_add(1, Ordering::Relaxed);
+        }
         fresh
     }
 
     /// The attribution map EVERY sidebar surface reads — `discover`'s
     /// enumeration fold and the `list`/`status` attach-state rows.
     ///
-    /// It is the live `/__cerulion/mirrors` snapshot merged with the ORIGIN ROBOT
-    /// each currently-held tap recorded for ITSELF at attach ([`TopicStat`]'s
+    /// It is the stored or refreshed `/__cerulion/mirrors` snapshot merged with the
+    /// ORIGIN ROBOT each currently-held tap recorded for ITSELF at attach ([`TopicStat`]'s
     /// `origin_robot`). One map for all three surfaces is what makes "one data
     /// source = one topic" structural: they cannot place one topic in two sections,
-    /// because they are reading the same answer. Live provenance wins (see
+    /// because they are reading the same answer. The mirror snapshot wins (see
     /// [`cerulion_core::transport::mirror_registry::merge_attribution`]).
     ///
     /// The per-tap half matters because the live gather is BEST-EFFORT and cached:
@@ -4721,26 +5062,39 @@ impl Ctx {
     /// genuine desk producer taking the name; the tap's own record dies with the
     /// tap, so it can only ever describe the generation that earned it.
     ///
-    /// COST: a cache MISS pays the `/__cerulion/mirrors` gather (up to
+    /// COST, by `read`: [`ProvenanceRead::RefreshOnMiss`] (`discover`, the local
+    /// `attach` reply) pays the `/__cerulion/mirrors` gather on a cache MISS (the
+    /// registry open, then up to
     /// [`MIRROR_GATHER_WINDOW`](cerulion_core::transport::mirror_registry::MIRROR_GATHER_WINDOW),
-    /// ~600 ms, and instant on a desk with no live mirror), so `list`/`status` are
-    /// not unconditionally O(1). The [`PROVENANCE_CACHE_TTL`] cache means at most
-    /// one such gather per 3 s across all three verbs.
+    /// ~600 ms, and instant on a desk with no live mirror), at most one per
+    /// [`PROVENANCE_CACHE_TTL`] from serial callers while nothing invalidates
+    /// (concurrent misses each gather). [`ProvenanceRead::Held`] (`list`, `status`)
+    /// serves the stored snapshot at any age under one state-lock acquisition and
+    /// reads no registry.
     ///
     /// Takes the state lock, so callers must NOT already hold it.
-    fn attribution_snapshot(&self) -> std::collections::BTreeMap<String, String> {
+    fn attribution_snapshot(
+        &self,
+        read: ProvenanceRead,
+    ) -> std::collections::BTreeMap<String, String> {
         // Gather BEFORE the lock — `gather_mirror_provenance` takes it for the cache
-        // and std mutexes are not reentrant.
-        let mirrors = self.gather_mirror_provenance();
+        // and std mutexes are not reentrant. A HELD read gathers nothing.
+        let gathered = match read {
+            ProvenanceRead::RefreshOnMiss => Some(self.gather_mirror_provenance()),
+            ProvenanceRead::Held => None,
+        };
         // AUTHORITATIVE records only. A HINTED record is a per-tap cache of the very
         // map being merged here, so including it would add nothing on a hit — and on
         // a MISS it would do real harm, re-asserting a name-keyed claim the live
         // answer has just withdrawn. That is the fallback wanted for a tap
         // this daemon knowingly DEMANDED from a robot, and precisely what it does
         // NOT want for a guess about a name (see `TopicStat::origin_robot_hinted`).
-        let held = {
+        let (mirrors, remembered) = {
             let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.taps
+            let mirrors = gathered
+                .unwrap_or_else(|| st.mirror_provenance.held().cloned().unwrap_or_default());
+            let remembered = st
+                .taps
                 .list()
                 .into_iter()
                 .filter_map(|topic| {
@@ -4748,9 +5102,10 @@ impl Ctx {
                     let robot = stat.origin_robot.clone()?;
                     (!stat.origin_robot_hinted).then_some((topic, robot))
                 })
-                .collect()
+                .collect();
+            (mirrors, remembered)
         };
-        cerulion_core::transport::mirror_registry::merge_attribution(&mirrors, &held)
+        cerulion_core::transport::mirror_registry::merge_attribution(&mirrors, &remembered)
     }
 
     /// Every held tap's OWN data-flow observation, as one snapshot taken
@@ -4810,12 +5165,19 @@ impl Ctx {
             .collect()
     }
 
-    /// Drop the cached mirror-provenance snapshot so the NEXT `discover`
-    /// re-gathers fresh. Called on the mutation points vizd itself drives (`attach_remote`
-    /// demands a mirror, `detach` releases one), so the user's own check/uncheck is
-    /// reflected on the very next discover instead of waiting out the TTL.
-    fn invalidate_mirror_provenance_cache(&self) {
-        self.state.lock().unwrap().mirror_provenance = None;
+    /// Drop `topic` from the stored mirror-provenance snapshot, mark the rest
+    /// stale so the NEXT read that refreshes gathers again, and refuse the store of
+    /// any gather already in flight. Called on the mutation points vizd itself
+    /// drives (`attach_remote` demands a mirror, `detach` releases one), so the
+    /// user's own check/uncheck is reflected on the very next read instead of
+    /// waiting out the TTL, and a gather that read the registry before the
+    /// mutation cannot store the old answer over it.
+    fn invalidate_mirror_provenance_cache(&self, topic: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mirror_provenance
+            .invalidate(topic);
     }
 
     /// `discover`: every attachable local topic + a best-effort resolved schema.
@@ -4838,7 +5200,7 @@ impl Ctx {
         // from local SHM (network-free, best-effort), so the fold holds even under a
         // netd-unreachable catalog gather; a registry-less desk yields an empty map →
         // every topic stays LOCAL (as if there were no fold).
-        let mirrors = self.attribution_snapshot();
+        let mirrors = self.attribution_snapshot(ProvenanceRead::RefreshOnMiss);
         // This daemon's OWN tap observations, snapshotted once so every row
         // of this response reads the SAME truth `list`/`status` are reporting. The
         // desk runs no standing liveness observer, but a TAP IS one — so a topic
@@ -5346,7 +5708,7 @@ enum RemoteCommit {
         already: bool,
         archetype: Option<ArchetypeKind>,
     },
-    /// A conflicting override — refuse, do NOT release the demand.
+    /// Refuse a conflicting source/override; retain only a surviving remote tap's demand.
     Conflict(String),
     /// The tap open failed — refuse AND release the demand (rollback).
     TapErr(String),
@@ -5555,6 +5917,14 @@ pub trait DemandPlane: Send + Sync {
     /// against `schema_hash`. Called ONCE per topic (the reserve-then-commit
     /// guarantees it). A `String` error is surfaced to the controller verbatim.
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String>;
+    /// Cold control heartbeat, separate from frame draining. Re-demand lost readers.
+    fn check_remote_readers(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Local channel provided by the observer demand. Legacy test planes remain canonical.
+    fn local_channel(&self, _robot: &str, topic: &str) -> Result<String, String> {
+        Ok(topic.into())
+    }
     /// Release a previously-demanded `(robot, topic)` (the `detach` early release).
     fn release(&self, robot: &str, topic: &str) -> Result<(), String>;
     /// Query `robot`'s topic CATALOG over netd's shared session (the
@@ -5657,15 +6027,29 @@ pub trait DemandPlane: Send + Sync {
     }
 }
 
-/// The production demand plane — ONE persistent [`NetdClient`]
-/// connection to `cerulion-netd` for the daemon's lifetime (spawning netd detached
-/// on the first demand if it is not running). Every vizd demand rides this ONE
-/// connection, so netd sees vizd as ONE consumer; dropping the plane (at daemon
-/// shutdown) closes the connection, releasing every remaining demand (the crash-safe
-/// refcount). The client is behind a `Mutex` (its `demand`/`release` take `&mut
-/// self`, and controller threads share it) and opened LAZILY on the first demand, so
-/// a viz daemon that only ever serves LOCAL attaches never connects to netd.
+struct SourceClient {
+    client: Mutex<Option<NetdClient>>,
+    retired: AtomicBool,
+}
+
+struct RemoteChannel {
+    source: Arc<SourceClient>,
+    local_topic: Option<String>,
+    last_timeout: Option<Instant>,
+    schema_hash: u64,
+    misses: u8,
+    next_retry: Instant,
+    delay: Duration,
+    failures: FailureRegimeLatch,
+}
+
+/// The production demand plane. Each source owns its holding connection, so a
+/// failed recovery closes only that source's demands. Catalog, schema and runs
+/// queries use a separate demand-free client. All connections are lazy; a daemon
+/// serving only local attaches opens none.
 pub struct NetdDemandPlane {
+    channels: Mutex<BTreeMap<(String, String), RemoteChannel>>,
+    probe_failures: Mutex<FailureRegimeLatch>,
     client: Mutex<Option<NetdClient>>,
     /// `Some(socket)` targets a SPECIFIC control socket (the e2e's in-process netd);
     /// `None` uses the well-known default path (production, first-consumer-spawns).
@@ -5678,6 +6062,8 @@ impl NetdDemandPlane {
     pub fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            channels: Mutex::new(BTreeMap::new()),
+            probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: None,
         }
     }
@@ -5687,6 +6073,8 @@ impl NetdDemandPlane {
     pub fn with_socket(socket: PathBuf) -> Self {
         Self {
             client: Mutex::new(None),
+            channels: Mutex::new(BTreeMap::new()),
+            probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: Some(socket),
         }
     }
@@ -5699,6 +6087,34 @@ impl NetdDemandPlane {
         f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
     ) -> Result<R, String> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        self.run_client(&mut guard, f)
+    }
+
+    /// Remove only this source generation before any cleanup I/O. A concurrent
+    /// attach may already have replaced the same logical key with a fresh client.
+    fn remove_source(
+        &self,
+        key: &(String, String),
+        source: &Arc<SourceClient>,
+    ) -> Option<RemoteChannel> {
+        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if !channels
+            .get(key)
+            .is_some_and(|channel| Arc::ptr_eq(&channel.source, source))
+        {
+            return None;
+        }
+        let channel = channels.remove(key)?;
+        source.retired.store(true, Ordering::Release);
+        Some(channel)
+    }
+
+    /// One source's holding client or the separate demand-free query client.
+    fn run_client<R>(
+        &self,
+        guard: &mut Option<NetdClient>,
+        f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
+    ) -> Result<R, String> {
         if guard.is_none() {
             let client = match &self.socket {
                 Some(sock) => NetdClient::connect_or_spawn_at(sock.clone()),
@@ -5708,19 +6124,14 @@ impl NetdDemandPlane {
         }
         let client = guard.as_mut().expect("just connected");
         match f(client) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                // A CONNECTION-level error (broken pipe / a protocol desync — e.g.
-                // netd exited or was killed) leaves the client unusable, so DROP it:
-                // the NEXT demand reconnects (re-spawning netd if needed), instead of
-                // this long-lived daemon's demand plane staying permanently wedged on
-                // a dead socket (the crash-recovery model — netd is
-                // recovery-stateless). A `Netd(response)` error is a VALID refusal
-                // (schema conflict, …) — the connection is fine, so keep it.
-                if should_drop_client_on_error(&e) {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                // A framing failure closes only this source (or a demand-free
+                // query). A correlated refusal keeps its prior holding client.
+                if should_drop_client_on_error(&error) {
                     *guard = None;
                 }
-                Err(e.to_string())
+                Err(error.to_string())
             }
         }
     }
@@ -5733,16 +6144,334 @@ impl Default for NetdDemandPlane {
 }
 
 impl DemandPlane for NetdDemandPlane {
+    fn check_remote_readers(&self) -> Result<(), String> {
+        let mut held: Vec<_> = self
+            .channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(key, channel)| {
+                Some((
+                    key.clone(),
+                    channel.local_topic.clone()?,
+                    channel.schema_hash,
+                    channel.source.clone(),
+                    channel.last_timeout,
+                ))
+            })
+            .collect();
+        if held.is_empty() {
+            return Ok(());
+        }
+        // Stable ordering preserves canonical key order for ties. Untimed sources
+        // precede timed-out ones; oldest timeouts go first so offline peers rotate.
+        held.sort_by_key(|row| row.4);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let status = match &self.socket {
+            Some(socket) => NetdClient::connect_existing_at_until(socket.clone(), deadline),
+            None => NetdClient::connect_existing_until(deadline),
+        }
+        .and_then(|mut probe| probe.status_until(deadline));
+        if let Err(error) = &status {
+            let mut latch = self
+                .probe_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match latch.on_failure() {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                    tracing::debug!(error = %error, total_failures = latch.total_failures(), "netd busy during visualization status probe")
+                }
+                RegimeDecision::Suppressed { suppressed } => {
+                    tracing::debug!(suppressed, "visualization status probe remains busy")
+                }
+            }
+        } else {
+            let mut latch = self
+                .probe_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(suppressed) = latch.on_success() {
+                tracing::debug!(suppressed, "visualization status probe recovered");
+            }
+        }
+        let absent = matches!(&status, Err(ClientError::Connect { source, .. })
+            if matches!(source.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused));
+        if status.is_err() && !absent {
+            // Busy passes preserve pushed losses. An absent listener permits
+            // polling dead holding sockets and spawning a replacement daemon.
+            return Ok(());
+        }
+        let status = status.ok();
+        let mut errors = Vec::new();
+        for (key, expected_channel, hash, source, _) in held {
+            // Never wait for another caller's source operation, or hold the map
+            // over transport I/O. Retirement is recorded before release waits.
+            let mut client = match source.client.try_lock() {
+                Ok(client) => client,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+            };
+            if source.retired.load(Ordering::Acquire) {
+                continue;
+            }
+            let lost = match client.as_mut() {
+                Some(holding) => match holding.poll_pushed_losses() {
+                    Ok(()) => holding
+                        .take_mirror_losses()
+                        .iter()
+                        .any(|loss| loss.robot == key.0 && loss.topic == key.1),
+                    Err(_) => {
+                        *client = None;
+                        true
+                    }
+                },
+                None => true,
+            };
+            {
+                let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(channel) = channels
+                    .get_mut(&key)
+                    .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                else {
+                    continue;
+                };
+                if channel.local_topic.as_deref() != Some(&expected_channel)
+                    || channel.schema_hash != hash
+                {
+                    continue;
+                }
+                if !lost {
+                    let Some(status) = &status else {
+                        continue;
+                    };
+                    let present = status.demands.iter().any(|row| {
+                        row.robot == key.0
+                            && row.topic == key.1
+                            && row.refcount > 0
+                            && row.local_topic.as_deref().unwrap_or(&row.topic) == expected_channel
+                    });
+                    if present {
+                        channel.misses = 0;
+                        channel.delay = Duration::from_secs(1);
+                        channel.next_retry = Instant::now();
+                        channel.last_timeout = None;
+                        if let Some(suppressed) = channel.failures.on_success() {
+                            tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
+                        }
+                        continue;
+                    }
+                    channel.misses = channel.misses.saturating_add(1);
+                    if channel.misses < 2 {
+                        continue;
+                    }
+                }
+                if Instant::now() < channel.next_retry {
+                    continue;
+                }
+                channel.next_retry = Instant::now() + channel.delay;
+                channel.delay = (channel.delay * 2).min(Duration::from_secs(30));
+            }
+            if source.retired.load(Ordering::Acquire) {
+                continue;
+            }
+            let (robot, topic) = &key;
+            let result = self.run_client(&mut client, |client| client.observe(robot, topic, hash));
+            let connection_lost = result.is_err() && client.is_none();
+            if source.retired.load(Ordering::Acquire) {
+                // Detach owns this source and will release its client as soon as
+                // this guard drops. A late reply cannot commit a replacement.
+                if connection_lost {
+                    break;
+                }
+                continue;
+            }
+            match result {
+                Ok(reply) if reply.local_topic == expected_channel => {
+                    let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(channel) = channels
+                        .get_mut(&key)
+                        .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                    {
+                        channel.misses = 0;
+                        channel.delay = Duration::from_secs(1);
+                        channel.next_retry = Instant::now();
+                        channel.last_timeout = None;
+                        if let Some(suppressed) = channel.failures.on_success() {
+                            tracing::info!(robot = %robot, topic = %topic, suppressed, "visualization reader recovered");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    if self.remove_source(&key, &source).is_none() {
+                        continue;
+                    }
+                    let cleanup =
+                        self.run_client(&mut client, |client| client.unobserve(robot, topic));
+                    errors.push(match cleanup {
+                        Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                        Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+                    });
+                }
+                Err(error) => {
+                    let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(channel) = channels
+                        .get_mut(&key)
+                        .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                    {
+                        if connection_lost {
+                            channel.last_timeout = Some(Instant::now());
+                        }
+                        match channel.failures.on_failure() {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                                tracing::warn!(robot = %robot, topic = %topic, error = %error, total_failures = channel.failures.total_failures(), "visualization reader re-demand failed")
+                            }
+                            RegimeDecision::Suppressed { suppressed } => {
+                                tracing::debug!(robot = %robot, topic = %topic, suppressed, "visualization reader re-demand still failing")
+                            }
+                        }
+                    }
+                    errors.push(format!(
+                        "remote mirror lost for robot '{robot}' topic '{topic}': {error}"
+                    ));
+                    // netd may still own its registry lock after this client
+                    // timed out. Do not send a sibling into that stalled dial.
+                    if connection_lost {
+                        break;
+                    }
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
-        self.with_client(|c| c.demand(robot, topic, schema_hash).map(|_| ()))
+        let key = (robot.into(), topic.into());
+        let source = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            match channels.entry(key.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.get().source.clone(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let source = Arc::new(SourceClient {
+                        client: Mutex::new(None),
+                        retired: AtomicBool::new(false),
+                    });
+                    entry.insert(RemoteChannel {
+                        source: source.clone(),
+                        local_topic: None,
+                        last_timeout: None,
+                        schema_hash,
+                        misses: 0,
+                        next_retry: Instant::now(),
+                        delay: Duration::from_secs(1),
+                        failures: FailureRegimeLatch::new(),
+                    });
+                    source
+                }
+            }
+        };
+        let mut client = source.client.lock().unwrap_or_else(|e| e.into_inner());
+        if source.retired.load(Ordering::Acquire) {
+            return Err(format!("remote observer for robot '{robot}' topic '{topic}' was canceled before its demand completed"));
+        }
+        let reply = match self.run_client(&mut client, |client| {
+            client.observe(robot, topic, schema_hash)
+        }) {
+            Ok(reply) => reply,
+            Err(error) => {
+                let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(channel) = channels
+                    .get_mut(&key)
+                    .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                {
+                    // A concurrent attach may have initialized this generation
+                    // before its creator acquired the source lock. Retire only
+                    // an uninitialized demand, never that caller's live reader.
+                    if channel.local_topic.is_none() {
+                        channels.remove(&key);
+                        source.retired.store(true, Ordering::Release);
+                        *client = None;
+                    } else if client.is_none() {
+                        channel.last_timeout = Some(Instant::now());
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let conflict = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(channel) = channels
+                .get_mut(&key)
+                .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+            else {
+                // Release already removed the recovery intent. Closing the client
+                // also retires a demand that completed after that cancellation.
+                *client = None;
+                return Err(format!("remote observer for robot '{robot}' topic '{topic}' was canceled before its demand completed"));
+            };
+            let conflict = channel
+                .local_topic
+                .as_ref()
+                .is_some_and(|topic| topic != &reply.local_topic)
+                || channel.schema_hash != schema_hash;
+            if !conflict {
+                channel.local_topic = Some(reply.local_topic);
+                channel.last_timeout = None;
+            }
+            conflict
+        };
+        if conflict {
+            self.remove_source(&key, &source);
+            let cleanup = self.run_client(&mut client, |client| client.unobserve(robot, topic));
+            return Err(match cleanup {
+                Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+            });
+        }
+        Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
-        self.with_client(|c| c.release(robot, topic).map(|_| ()))
+        let channel = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let channel = channels.remove(&(robot.into(), topic.into()));
+            if let Some(channel) = &channel {
+                channel.source.retired.store(true, Ordering::Release);
+            }
+            channel
+        };
+        let Some(channel) = channel else {
+            return Ok(());
+        };
+        let mut client = channel
+            .source
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = match client.as_mut() {
+            Some(client) => client
+                .unobserve(robot, topic)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => Err("source holding connection is unavailable".into()),
+        };
+        result.map_err(|error| {
+            format!("cannot release remote observer for robot '{robot}' topic '{topic}': {error}")
+        })
+    }
+    fn local_channel(&self, robot: &str, topic: &str) -> Result<String, String> {
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(robot.into(), topic.into()))
+            .and_then(|channel| channel.local_topic.clone())
+            .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
-        // Route the catalog GET through the ONE persistent netd connection (netd runs
-        // it over the machine's ONE zenoh session). A connection-level error drops the
-        // client so the next call reconnects (`with_client`); the caller falls back.
+        // Query on the demand-free client. A failure cannot release source holds;
+        // netd still routes through the machine's single network session.
         self.with_client(|c| c.query_catalog(Some(robot)))
     }
 
@@ -5757,10 +6486,8 @@ impl DemandPlane for NetdDemandPlane {
         self.with_client(|c| c.query_catalog_with_discovery(Some(robot)))
     }
     fn query_catalog_all(&self) -> Result<Vec<CatalogReply>, String> {
-        // The LAN-wide gather — `query_catalog(None)` harvests every
-        // announcing robot over the SAME one persistent netd connection. A
-        // connection-level error drops the client (`with_client`) so the next call
-        // reconnects; `discover` degrades to local-only on the returned `Err`.
+        // The LAN-wide gather uses the demand-free query connection. A transport
+        // failure reconnects this query client and preserves every held source.
         self.with_client(|c| c.query_catalog(None))
     }
 
@@ -5774,7 +6501,7 @@ impl DemandPlane for NetdDemandPlane {
         self.with_client(|c| c.query_schema(Some(robot), requested))
     }
 
-    /// The REAL runs gather, over the ONE persistent netd connection.
+    /// The REAL runs gather, over the demand-free query connection.
     ///
     /// `query_runs_with_discovery` is netd's NON-looping verb — one round trip, and
     /// the client mutex is taken and DROPPED inside `with_client`. There is
@@ -6538,6 +7265,12 @@ fn perform_remote_demand(
     topic: &str,
     schema_hash: u64,
 ) -> Result<bool, String> {
+    let gate = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_demands
+        .clone();
+    let _operation = wait_remote_operation(&gate)?;
     use std::collections::btree_map::Entry;
     // Decide under the lock via the ENTRY API (one topic = ONE origin robot — the
     // decision). A plain `insert` would OVERWRITE the stored robot on a
@@ -6545,24 +7278,27 @@ fn perform_remote_demand(
     // would release the WRONG (robot, topic) and leak the real one. The entry API
     // makes each case explicit:
     // - Vacant → claim it here, demand OUTSIDE the lock (rolled back on failure).
-    // - Occupied, SAME robot → idempotent no-op (keep the value, never re-insert).
+    // - Occupied, SAME robot → reuse only after the in-flight demand gate opens.
     // - Occupied, DIFFERENT robot → LOUD refusal: no claim change, no demand, no
     //   release (a pure refusal that leaks nothing).
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         match st.demanded.entry(topic.to_string()) {
             Entry::Vacant(v) => {
-                v.insert(robot.to_string()); // claimed; demand below (outside the lock).
+                v.insert(RemoteDemandClaim {
+                    robot: robot.into(),
+                    local_channel: None,
+                });
             }
             Entry::Occupied(o) => {
-                if o.get() == robot {
-                    return Ok(false); // same robot — idempotent (re-attach / concurrent).
+                if o.get().robot == robot {
+                    return Ok(false); // same robot, with its channel already committed.
                 }
                 return Err(format!(
                     "topic '{topic}' is already mirrored from robot '{}' — one data source = one \
                      topic, so it cannot ALSO be demanded from robot '{robot}'; detach '{topic}' \
                      first if you meant to re-point it to a different robot",
-                    o.get()
+                    o.get().robot
                 ));
             }
         }
@@ -6574,6 +7310,27 @@ fn perform_remote_demand(
         st.demanded.remove(topic);
         return Err(e);
     }
+    let channel = match plane.local_channel(robot, topic) {
+        Ok(channel) => channel,
+        Err(error) => {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .demanded
+                .remove(topic);
+            if let Err(release) = plane.release(robot, topic) {
+                return Err(format!("{error}; demand rollback failed: {release}"));
+            }
+            return Err(error);
+        }
+    };
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .demanded
+        .get_mut(topic)
+        .expect("claim owner retains its demand")
+        .local_channel = Some(channel);
     Ok(true)
 }
 
@@ -6587,14 +7344,52 @@ fn perform_remote_release(
     state: &Mutex<DaemonState>,
     topic: &str,
 ) -> Result<bool, String> {
+    let gate = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_demands
+        .clone();
+    let _operation = wait_remote_operation(&gate)?;
     let robot = {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.demanded.remove(topic)
     };
     match robot {
-        Some(robot) => plane.release(&robot, topic).map(|_| true),
+        Some(claim) => plane.release(&claim.robot, topic).map(|_| true),
         None => Ok(false),
     }
+}
+
+fn wait_remote_operation(gate: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    wait_remote_operation_until(gate, Instant::now() + Duration::from_secs(3))
+}
+
+fn wait_remote_operation_until(
+    gate: &Mutex<()>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    loop {
+        match gate.try_lock() {
+            Ok(operation) => return Ok(operation),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "remote attachment is still in progress; retry after it completes".into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn remote_attach_gate(state: &Mutex<DaemonState>) -> Arc<Mutex<()>> {
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_attaches
+        .clone()
 }
 
 /// How long to wait for a freshly-demanded mirror's `{topic}/data`
@@ -6981,6 +7776,8 @@ pub struct RunningDaemon {
     /// The catalog-change forwarder thread (`None` when it could not be
     /// spawned — the daemon runs without pushes rather than failing to start).
     events_handle: Option<JoinHandle<()>>,
+    /// Cold mirror recovery worker; never blocks the frame drain.
+    demand_health_handle: Option<JoinHandle<()>>,
     /// The event hub, for observability (Principle #3) and the e2e.
     events: Arc<crate::events::EventHub>,
     /// The controller read-loop iteration counter (Principle #3) — see
@@ -7059,6 +7856,27 @@ pub struct RunningDaemon {
     /// same `dead_code = "deny"` reason as the field above.
     #[cfg(any(test, feature = "test-helpers"))]
     runs_local_delay_ns: Arc<AtomicU64>,
+    /// Mirror-provenance gathers started; see
+    /// [`Self::provenance_gathers_started`].
+    provenance_gathers_started: Arc<AtomicU64>,
+    /// Mirror-provenance answers refused at store time; see
+    /// [`Self::provenance_gathers_discarded`].
+    provenance_gathers_discarded: Arc<AtomicU64>,
+    /// Mirror-provenance gathers that failed; see
+    /// [`Self::provenance_gathers_failed`].
+    provenance_gathers_failed: Arc<AtomicU64>,
+    /// See [`Self::hold_provenance_gather_for_test`]; also released by
+    /// [`Self::shutdown`]. Gated for the same `dead_code = "deny"` reason as
+    /// `poll_injected_work_ns` above.
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gate: Arc<ProvenanceGate>,
+    /// See [`Self::fail_next_provenance_gathers_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_gather_faults: Arc<AtomicU64>,
+    /// See [`Self::age_provenance_snapshot_for_test`]. WEAK, so the seam never keeps
+    /// the taps and stats alive past [`Self::shutdown`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    provenance_state: std::sync::Weak<Mutex<DaemonState>>,
 }
 
 impl RunningDaemon {
@@ -7347,6 +8165,80 @@ impl RunningDaemon {
         self.runs_local_delay_ns.store(nanos, Ordering::Relaxed);
     }
 
+    /// Principle #3 observable: mirror-provenance gathers STARTED since this
+    /// daemon started, one per request that found no fresh snapshot and went to
+    /// the `/__cerulion/mirrors` registry, whether the read then succeeded or
+    /// failed (a fault injected by a test seam counts too). A request answered
+    /// from the stored snapshot does not count, so a ceiling on this is the oracle
+    /// that a verb never gathers.
+    pub fn provenance_gathers_started(&self) -> u64 {
+        self.provenance_gathers_started.load(Ordering::Relaxed)
+    }
+
+    /// Principle #3 observable: gathers whose answer was NOT stored because the
+    /// snapshot was invalidated while they ran (a `detach` or a remote `attach`
+    /// landed between the gather's start and its store). The request that ran the
+    /// gather still answers from it; only the stored snapshot refuses it.
+    pub fn provenance_gathers_discarded(&self) -> u64 {
+        self.provenance_gathers_discarded.load(Ordering::Relaxed)
+    }
+
+    /// Principle #3 observable: gathers whose registry read FAILED. Each one's
+    /// empty map is stored like a real answer (unless an invalidation refuses the
+    /// store, see [`Self::provenance_gathers_discarded`]), so until the next
+    /// refresh no topic is attributed from the name-keyed half. It only grows, so a
+    /// rise across a read means that read's empty answer came from an error, not
+    /// from the registry.
+    pub fn provenance_gathers_failed(&self) -> u64 {
+        self.provenance_gathers_failed.load(Ordering::Relaxed)
+    }
+
+    /// Hold every mirror-provenance gather between its registry read and the
+    /// store of its answer, until the returned hold is dropped.
+    ///
+    /// A real gather resists being made slow on demand (it returns the moment it
+    /// has heard every live writer), and a sleep proves only that a clock moved.
+    /// The hold keeps a gather in flight for exactly as long as a test needs, so the
+    /// test can show which other requests wait for it and which do not. Dropping
+    /// the hold, or [`Self::shutdown`], releases every parked gather.
+    ///
+    /// CFG-GATED for the same reason as [`Self::inject_poll_work_for_test`]: it
+    /// parks a handler thread for as long as the caller likes.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn hold_provenance_gather_for_test(&self) -> ProvenanceGatherHold {
+        let already = self.provenance_gate.set_held(true);
+        assert!(
+            !already,
+            "one provenance hold at a time: dropping either of two would release both"
+        );
+        ProvenanceGatherHold {
+            gate: Arc::clone(&self.provenance_gate),
+        }
+    }
+
+    /// Move the stored mirror-provenance snapshot's gather stamp `by` into the
+    /// past, so it reads as older than [`PROVENANCE_CACHE_TTL`] without a sleep.
+    ///
+    /// Returns `false`, and changes nothing, when the daemon state is gone, the
+    /// snapshot carries no stamp (nothing stored yet, or invalidated since), or
+    /// the monotonic clock cannot represent the earlier instant.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn age_provenance_snapshot_for_test(&self, by: Duration) -> bool {
+        let Some(state) = self.provenance_state.upgrade() else {
+            return false;
+        };
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.mirror_provenance.age_by(by)
+    }
+
+    /// Fail the next `n` mirror-provenance gathers with
+    /// `TransportError::Internal`, the error a registry refusal returns, instead
+    /// of reading the registry. `0` restores production behaviour.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn fail_next_provenance_gathers_for_test(&self, n: u64) {
+        self.provenance_gather_faults.store(n, Ordering::Relaxed);
+    }
+
     /// The bound control-socket path (for logging / the verb to connect to).
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -7413,6 +8305,11 @@ impl RunningDaemon {
         // worker-drop join would spin to its 6 s detach on every shutdown.
         self.worker_control.close();
         self.shutdown.store(true, Ordering::SeqCst);
+        // A test's provenance hold can outlive the requests it parked. Releasing it
+        // here, before the connection join below, means a hold still in scope
+        // cannot keep that join waiting.
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.provenance_gate.set_held(false);
         if let Some(h) = self.accept_handle.take() {
             let _ = h.join();
         }
@@ -7422,6 +8319,9 @@ impl RunningDaemon {
         // The forwarder observes the same shutdown flag (and sleeps in short
         // slices), so joining it here leaves no thread holding a netd subscription.
         if let Some(h) = self.events_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.demand_health_handle.take() {
             let _ = h.join();
         }
         let handles = std::mem::take(&mut *self.conns.lock().unwrap());
@@ -7585,6 +8485,13 @@ pub fn start_on_socket(
         poll_late_passes: Arc::new(AtomicU64::new(0)),
         poll_injected_work_ns: Arc::new(AtomicU64::new(0)),
         runs_local_delay_ns: Arc::new(AtomicU64::new(0)),
+        provenance_gathers_started: Arc::new(AtomicU64::new(0)),
+        provenance_gathers_discarded: Arc::new(AtomicU64::new(0)),
+        provenance_gathers_failed: Arc::new(AtomicU64::new(0)),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gate: Arc::new(ProvenanceGate::default()),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gather_faults: Arc::new(AtomicU64::new(0)),
         poll_wake_waits: Arc::new(AtomicU64::new(0)),
         poll_wake_fires: Arc::new(AtomicU64::new(0)),
         poll_layout_signal_reflows: Arc::new(AtomicU64::new(0)),
@@ -7664,6 +8571,38 @@ pub fn start_on_socket(
         }
     };
 
+    let demand_health_handle = {
+        let plane = Arc::clone(&ctx.demand_plane);
+        let sd = Arc::clone(&shutdown);
+        match std::thread::Builder::new().name("viz-demand-health".into()).spawn(move || {
+            use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+            let mut failures = FailureRegimeLatch::default();
+            while !sd.load(Ordering::Acquire) {
+                match plane.check_remote_readers() {
+                    Ok(()) => { if let Some(suppressed) = failures.on_success() {
+                        tracing::info!(suppressed, total_failures = failures.total_failures(), "remote visualization readers recovered");
+                    } }
+                    Err(error) => match failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote visualization reader recovery failed"),
+                        RegimeDecision::Suppressed { .. } => {}
+                    }
+                }
+                for _ in 0..10 {
+                    if sd.load(Ordering::Acquire) { break; }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                worker_control.close(); shutdown.store(true, Ordering::SeqCst);
+                let _ = accept_handle.join(); let _ = poll_handle.join();
+                if let Some(handle) = events_handle { let _ = handle.join(); }
+                return Err(error);
+            }
+        }
+    };
+
     tracing::info!(socket = %socket_path.display(), "cerulion-vizd listening (NDJSON control protocol)");
     Ok(RunningDaemon {
         #[cfg(test)]
@@ -7672,6 +8611,7 @@ pub fn start_on_socket(
         accept_handle: Some(accept_handle),
         poll_handle: Some(poll_handle),
         events_handle,
+        demand_health_handle,
         events: Arc::clone(&ctx.events),
         conn_loop_iterations: Arc::clone(&ctx.conn_loop_iterations),
         poll_period_ns: Arc::clone(&ctx.poll_period_ns),
@@ -7696,6 +8636,15 @@ pub fn start_on_socket(
         poll_injected_work_ns: Arc::clone(&ctx.poll_injected_work_ns),
         #[cfg(any(test, feature = "test-helpers"))]
         runs_local_delay_ns: Arc::clone(&ctx.runs_local_delay_ns),
+        provenance_gathers_started: Arc::clone(&ctx.provenance_gathers_started),
+        provenance_gathers_discarded: Arc::clone(&ctx.provenance_gathers_discarded),
+        provenance_gathers_failed: Arc::clone(&ctx.provenance_gathers_failed),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gate: Arc::clone(&ctx.provenance_gate),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_gather_faults: Arc::clone(&ctx.provenance_gather_faults),
+        #[cfg(any(test, feature = "test-helpers"))]
+        provenance_state: Arc::downgrade(&ctx.state),
         conns,
         worker_control,
         guard: Some(guard),
@@ -10206,6 +11155,20 @@ mod tests {
                     ctx.attach(1, topic.into(), None),
                     Response::Attach(_)
                 ));
+                let before = spy.demand_count();
+                let refused = ctx.attach_remote(
+                    2,
+                    topic.into(),
+                    None,
+                    "robot".into(),
+                    Some("std_msgs/String".into()),
+                );
+                let Response::Error(error) = refused else {
+                    panic!("local source change must refuse");
+                };
+                assert!(error.error.contains("another source"));
+                assert_eq!(spy.demand_count(), before);
+                assert!(spy.release_keys().is_empty());
                 perform_remote_demand(spy.as_ref(), &ctx.state, "robot", topic, 0).unwrap();
             }
             if with_model {
@@ -10239,10 +11202,49 @@ mod tests {
                 panic!("{response:?}")
             };
             assert!(detached.detached);
-            assert_eq!(
-                ctx.rollback_compose_attaches(&["/rollback".into()]),
-                (1, vec![])
-            );
+            if with_model {
+                assert_eq!(
+                    ctx.rollback_compose_attaches(&["/rollback".into()]),
+                    (1, vec![])
+                );
+            } else {
+                // A real schema-less attach holds the gate while its catalog
+                // request is pending. Cleanup must survive the controller's
+                // three-second retry bound, then remove the tap and its demand.
+                let (entered, entering) = std::sync::mpsc::channel();
+                let (finish, finishing) = std::sync::mpsc::channel();
+                *spy.catalog_wait.lock().unwrap() = Some((entered, finishing));
+                let metadata = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        ctx.attach_remote(5, "/metadata".into(), None, "other".into(), None)
+                    })
+                };
+                entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (completed, completing) = std::sync::mpsc::channel();
+                let cleanup = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = ctx.rollback_compose_attaches(&["/rollback".into()]);
+                        completed.send(result).unwrap();
+                    })
+                };
+                assert!(matches!(
+                    completing.recv_timeout(Duration::from_millis(3_200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert!(spy
+                    .release_keys()
+                    .iter()
+                    .all(|(_, topic)| topic != "/rollback"));
+                finish.send(()).unwrap();
+                assert_eq!(
+                    completing.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    (1, vec![])
+                );
+                cleanup.join().unwrap();
+                assert!(matches!(metadata.join().unwrap(), Response::Error(_)));
+            }
             assert_eq!(
                 spy.release_keys(),
                 vec![
@@ -10419,6 +11421,7 @@ mod tests {
         /// When set, the query methods return `Err` (netd-unreachable) so
         /// the caller's transient-session fallback path is exercised.
         fail_query: std::sync::atomic::AtomicBool,
+        catalog_wait: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
     impl SpyDemandPlane {
         fn set_fail_demand(&self, fail: bool) {
@@ -10459,6 +11462,13 @@ mod tests {
             Ok(())
         }
         fn query_catalog(&self, _robot: &str) -> Result<Vec<CatalogReply>, String> {
+            let wait = self.catalog_wait.lock().unwrap().take();
+            if let Some((entered, finish)) = wait {
+                entered.send(()).unwrap();
+                finish
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+            }
             if self.fail_query.load(Ordering::SeqCst) {
                 return Err("spy: netd unreachable".to_string());
             }
@@ -10489,6 +11499,7 @@ mod tests {
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(7),
                 schema_name: schema_name.map(str::to_string),
@@ -10537,6 +11548,7 @@ mod tests {
             entries: entries
                 .iter()
                 .map(|(topic, schema_name)| CatalogEntry {
+                    egress_qos: None,
                     topic: topic.to_string(),
                     schema_hash: Some(7),
                     schema_name: schema_name.map(str::to_string),
@@ -10647,6 +11659,7 @@ mod tests {
             robot: "go2".to_string(),
             entries: vec![
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/utlidar/cloud".to_string(),
                     schema_hash: Some(1),
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -10655,6 +11668,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/uslam/cloud_map".to_string(),
                     schema_hash: None,
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -10663,6 +11677,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/legacy".to_string(),
                     schema_hash: None,
                     schema_name: None,
@@ -10714,6 +11729,7 @@ mod tests {
         use cerulion_core::{CatalogProvenance, LivenessState, TopicLiveness, TopicRateEstimate};
         use std::collections::BTreeSet;
         let entry = |topic: &str, liveness: Option<TopicLiveness>| CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(1),
             schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -11866,6 +12882,7 @@ mod tests {
             version: 1,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(1),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -12059,6 +13076,7 @@ mod tests {
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(1),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -12428,6 +13446,109 @@ mod tests {
             rows[0].samples, learned,
             "…with everything it had learned: {rows:?}"
         );
+    }
+
+    /// The provenance cache against hand-written vectors: never filled, fresh
+    /// strictly inside the TTL, a per-topic invalidation that keeps the rest of the
+    /// map, and a store refused for a gather that read an older generation.
+    #[test]
+    fn provenance_cache_keeps_its_map_at_any_age_and_refuses_a_store_from_an_older_generation() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(topic, robot)| (topic.to_string(), robot.to_string()))
+                .collect()
+        };
+        let state = |pairs: Option<&[(&str, &str)]>, at: Option<Instant>, generation: u64| {
+            ProvenanceCache {
+                snapshot: pairs.map(map),
+                gathered_at: at,
+                generation,
+            }
+        };
+        let ab: &[(&str, &str)] = &[("/a", "r1"), ("/b", "r2")];
+        let run = |t0: Instant| -> (ProvenanceCache, ProvenanceCache) {
+            let t1 = t0 + Duration::from_secs(1);
+            let mut cache = ProvenanceCache::default();
+            assert_eq!(cache.fresh(t0), None, "never filled: nothing is fresh");
+            assert_eq!(cache.held(), None, "never filled: nothing is held");
+            assert_eq!(cache.generation(), 0);
+
+            assert!(cache.store(map(ab), 0, t1));
+            assert_eq!(
+                cache.fresh(t0),
+                Some(&map(ab)),
+                "a `now` before the stamp counts as no time elapsed"
+            );
+            assert_eq!(
+                cache.fresh(t1 + PROVENANCE_CACHE_TTL - Duration::from_nanos(1)),
+                Some(&map(ab)),
+                "fresh one nanosecond inside the TTL"
+            );
+            assert_eq!(
+                cache.fresh(t1 + PROVENANCE_CACHE_TTL),
+                None,
+                "stale at exactly the TTL"
+            );
+            assert_eq!(cache, state(Some(ab), Some(t1), 0), "stale, yet kept");
+            assert_eq!(cache.held(), Some(&map(ab)), "and served held at any age");
+
+            cache.invalidate("/a");
+            assert_eq!(
+                cache,
+                state(Some(&[("/b", "r2")]), None, 1),
+                "an invalidation drops only its own topic and marks the rest stale"
+            );
+            assert_eq!(cache.fresh(t1), None);
+            assert_eq!(cache.held(), Some(&map(&[("/b", "r2")])));
+            let mut aged = state(Some(&[("/b", "r2")]), None, 1);
+            assert!(
+                !aged.age_by(Duration::from_secs(1)),
+                "no stamp, nothing to age"
+            );
+
+            assert!(
+                !cache.store(map(&[("/a", "r1")]), 0, t1),
+                "a gather that read generation 0 is refused"
+            );
+            assert_eq!(
+                cache,
+                state(Some(&[("/b", "r2")]), None, 1),
+                "a refused store changes nothing"
+            );
+
+            assert!(cache.store(map(&[("/c", "r3")]), 1, t1));
+            assert_eq!(cache.fresh(t1), Some(&map(&[("/c", "r3")])));
+
+            let mut cold = ProvenanceCache::default();
+            cold.invalidate("/a");
+            assert_eq!(
+                cold,
+                state(None, None, 1),
+                "invalidating a never-filled cache keeps it never filled"
+            );
+            (cache, cold)
+        };
+        let t0 = Instant::now();
+        assert_eq!(run(t0), run(t0), "two runs of one sequence agree");
+
+        let mut wrapped = state(None, None, u64::MAX);
+        wrapped.invalidate("/a");
+        assert_eq!(wrapped.generation(), 0, "the generation wraps");
+    }
+
+    /// The injected-fault counter hands out exactly as many faults as were armed
+    /// and never wraps below zero.
+    #[test]
+    fn take_one_fault_hands_out_exactly_the_armed_faults() {
+        let faults = AtomicU64::new(0);
+        assert!(!take_one_fault(&faults), "nothing armed, nothing taken");
+        assert_eq!(faults.load(Ordering::Relaxed), 0);
+        faults.store(2, Ordering::Relaxed);
+        assert!(take_one_fault(&faults));
+        assert!(take_one_fault(&faults));
+        assert!(!take_one_fault(&faults), "two armed, two taken");
+        assert_eq!(faults.load(Ordering::Relaxed), 0, "and no wrap below zero");
     }
 
     /// Monitors: a HINTED record TRACKS the live map — set, re-pointed and
@@ -13109,6 +14230,143 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_reattach_cannot_read_or_release_an_unfinished_demand() {
+        struct BlockingPlane {
+            entered: std::sync::mpsc::Sender<()>,
+            finish: Mutex<std::sync::mpsc::Receiver<()>>,
+            ready: AtomicBool,
+            releases: AtomicU64,
+        }
+        impl DemandPlane for BlockingPlane {
+            fn query_catalog(&self, _: &str) -> Result<Vec<CatalogReply>, String> {
+                Err("catalog is outside this demand fixture".into())
+            }
+            fn query_catalog_all(&self) -> Result<Vec<CatalogReply>, String> {
+                Err("catalog is outside this demand fixture".into())
+            }
+            fn query_schema(&self, _: &str, _: &str) -> Result<Vec<SchemaReply>, String> {
+                Err("schema is outside this demand fixture".into())
+            }
+            fn demand(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+                self.entered.send(()).unwrap();
+                self.finish
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                self.ready.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release(&self, _: &str, _: &str) -> Result<(), String> {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn local_channel(&self, _: &str, _: &str) -> Result<String, String> {
+                if self.ready.load(Ordering::SeqCst) {
+                    Ok("/__cerulion/observers/oracle".into())
+                } else {
+                    Err("unfinished observer channel".into())
+                }
+            }
+        }
+        for _ in 0..2 {
+            let (entered, entry) = std::sync::mpsc::channel();
+            let (finish, ending) = std::sync::mpsc::channel();
+            let plane = Arc::new(BlockingPlane {
+                entered,
+                finish: Mutex::new(ending),
+                ready: AtomicBool::new(false),
+                releases: AtomicU64::new(0),
+            });
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let first = {
+                let plane = plane.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let fresh = perform_remote_demand(plane.as_ref(), &state, "robot", "/state", 7)
+                        .unwrap();
+                    (fresh, plane.local_channel("robot", "/state").unwrap())
+                })
+            };
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(state
+                .lock()
+                .unwrap()
+                .demanded
+                .get("/state")
+                .unwrap()
+                .local_channel
+                .is_none());
+            let (completed, done) = std::sync::mpsc::channel();
+            let second = {
+                let plane = plane.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let fresh = perform_remote_demand(plane.as_ref(), &state, "robot", "/state", 7)
+                        .unwrap();
+                    let channel = plane.local_channel("robot", "/state").unwrap();
+                    completed.send(()).unwrap();
+                    (fresh, channel)
+                })
+            };
+            assert!(matches!(
+                done.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            finish.send(()).unwrap();
+            assert_eq!(
+                first.join().unwrap(),
+                (true, "/__cerulion/observers/oracle".into())
+            );
+            assert_eq!(
+                second.join().unwrap(),
+                (false, "/__cerulion/observers/oracle".into())
+            );
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .demanded
+                    .get("/state")
+                    .unwrap()
+                    .local_channel
+                    .as_deref(),
+                Some("/__cerulion/observers/oracle")
+            );
+            assert_eq!(plane.releases.load(Ordering::SeqCst), 0);
+            assert!(perform_remote_release(plane.as_ref(), &state, "/state").unwrap());
+            assert_eq!(plane.releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn an_inflight_demand_timeout_keeps_the_owners_claim_and_does_not_release() {
+        let spy = SpyDemandPlane::default();
+        let state = Mutex::new(DaemonState::default());
+        state.lock().unwrap().demanded.insert(
+            "/state".into(),
+            RemoteDemandClaim {
+                robot: "owner".into(),
+                local_channel: None,
+            },
+        );
+        let gate = state.lock().unwrap().remote_demands.clone();
+        let _owner = gate.lock().unwrap();
+        let started = Instant::now();
+        let error = perform_remote_demand(&spy, &state, "owner", "/state", 7).unwrap_err();
+        assert_eq!(
+            error,
+            "remote attachment is still in progress; retry after it completes"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(spy.demand_count(), 0);
+        assert!(spy.release_keys().is_empty());
+        let st = state.lock().unwrap();
+        assert_eq!(st.demanded["/state"].robot, "owner");
+        assert!(st.demanded["/state"].local_channel.is_none());
+    }
+
+    #[test]
     fn concurrent_demand_of_same_topic_demands_exactly_once() {
         // THE TOCTOU pin: N controller
         // threads race to attach the SAME remote topic, each on its own handler
@@ -13157,7 +14415,7 @@ mod tests {
                     .unwrap()
                     .demanded
                     .get(topic)
-                    .map(String::as_str),
+                    .map(|claim| claim.robot.as_str()),
                 Some("go2"),
                 "the winning claim records the (topic → robot) demand"
             );
@@ -14519,6 +15777,7 @@ mod monitor_snapshot_tests {
             entries: entries
                 .iter()
                 .map(|(topic, liveness)| CatalogEntry {
+                    egress_qos: None,
                     topic: (*topic).to_string(),
                     schema_hash: None,
                     schema_name: None,

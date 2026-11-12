@@ -113,6 +113,13 @@ pub unsafe extern "C" fn rmw_create_service(
         let Ok(info) = service_type_info(type_support, name) else {
             return std::ptr::null_mut();
         };
+        let scope_topic = cerulion_core::transport::egress_scope::service_scope_topic(
+            &info.service_name_cerulion,
+        );
+        if let Err(error) = rt.claim_topic_scope(&scope_topic) {
+            tracing::error!(service = %name, error = %error, "service scope admission failed");
+            return std::ptr::null_mut();
+        }
         let server = match rt.transport.create_service_server(
             &info.service_name_cerulion,
             SERVICE_SLICE_LEN,
@@ -327,8 +334,8 @@ unsafe fn take_request_live(
         // only request take path cerulion_core offers, by design.
         let result = server.try_take_one_request(|envelope, payload| {
             // A member this build's C++ typesupport gives no way to WRITE (a
-            // `bool[]` before Humble, at the top level or inside a nested
-            // message) makes every request of this type undeliverable.
+            // `bool[]` with neither `assign` nor the shim's accessorless path,
+            // at any depth) makes every request of this type undeliverable.
             // Decided at registration, so this is one `Option` read per
             // request, and taken BEFORE `unflatten` so the caller's message
             // is untouched: a server that decoded half a request and then
@@ -535,6 +542,13 @@ pub unsafe extern "C" fn rmw_create_client(
         // clients of one service never share a reply topic.
         let guid = crate::gid::mint_gid();
 
+        let scope_topic = cerulion_core::transport::egress_scope::service_scope_topic(
+            &info.service_name_cerulion,
+        );
+        if let Err(error) = rt.claim_topic_scope(&scope_topic) {
+            tracing::error!(service = %name, error = %error, "service scope admission failed");
+            return std::ptr::null_mut();
+        }
         let client = match rt.transport.create_service_client(
             &info.service_name_cerulion,
             guid,

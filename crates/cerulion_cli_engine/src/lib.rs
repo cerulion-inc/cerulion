@@ -94,9 +94,10 @@ pub mod node_metadata;
 mod node_metadata_accumulate;
 mod node_metadata_consume;
 pub mod node_params_info;
-// The `cerulion pair` verb — PURE eid/name resolution ladder + the
+// The `cerulion pair` verb's engine: PURE eid/name resolution ladder + the
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
-// iroh-free; the CPace ceremony lives in the spawned sibling).
+// iroh-free; the CPace ceremony lives in the spawned sibling). No `cerulion`
+// verb calls it while `cerulion pair` is a hidden stub.
 pub mod pair_cmd;
 /// `--robot NAME` on `topic pub`, `topic snapshot` and `service call`.
 pub mod robot_act;
@@ -262,6 +263,9 @@ pub mod ros2_graph;
 // clean-git-tree refusal, ONE commit + patch file, then an automatic
 // `colcon build --packages-select` of the affected packages.
 pub mod ros2_migrate;
+// Whether a Rust 1.95 or newer is there for the verbs that build nodes, and the
+// offer to install it on a terminal. Pure decision core, injected probe.
+pub mod rust_setup;
 pub mod schema_cmd;
 pub mod schema_serve;
 /// `cerulion service call`.

@@ -139,25 +139,16 @@ fn inspect_node(lib: &std::path::Path) -> ExitCode {
         Ok(document) => document,
         Err(error) => return report_isolation_refusal(lib, &error),
     };
-    // The host's FULL read: `checked_info_json` parses the document AND
-    // applies the checks that need the library itself (a declared param with
-    // no `cerulion_node_init_with_params` symbol to receive it), so the
-    // parent, which only ever sees the raw document, cannot accept a library
-    // the run would refuse. It reads the document ONCE, so what crosses the
-    // pipe is the very document that passed those checks.
-    //
-    // The check's parse logs ERROR events only: the parent parses the same
-    // document again and emits its warnings (an unknown key, say) itself, so
-    // a warning here would reach the operator twice, once as the parent's own
-    // and once inside the child's relayed stderr. An ERROR (unparseable info)
-    // comes with a refusal, and the parent never gets a document to log it
-    // from, so it stays. `load` keeps the daemon's normal logging.
+    // Discovery and the checked metadata read share one errors-only subscriber.
+    // The parent emits metadata warnings once when it parses this checked document;
+    // discovery failures remain visible on the child's isolated stderr channel.
     let errors_only = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::ERROR)
         .finish();
-    match cerulion_core::graph::node::DylibNodeEntry::load(lib).and_then(|entry| {
-        tracing::subscriber::with_default(errors_only, || entry.checked_info_json())
+    match tracing::subscriber::with_default(errors_only, || {
+        cerulion_core::graph::node::DylibNodeEntry::load(lib)
+            .and_then(|entry| entry.checked_info_json())
     }) {
         Ok(json) => match document
             .write_all(json.as_bytes())
