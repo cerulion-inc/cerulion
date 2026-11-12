@@ -83,55 +83,14 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 
 ## Quickstart: Run, record and verify
 
-> **Using a coding agent?** Paste this prompt into Claude Code, Codex or another agent that runs commands in its own terminal:
->
-> ```text
-> Install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
-> Run cerulion login in the background, show me the URL and code it prints, and wait for it to finish while I approve the sign-in in my browser.
-> Then run the quickstart at https://github.com/cerulion-inc/cerulion#quickstart-run-record-and-verify in your own terminal:
-> cerulion workspace create safety_demo --starter obstacle_avoidance, then cd safety_demo.
-> Build both nodes (cerulion node build laser_scanner --release, then cerulion node build safety_controller --release; the first build takes a few minutes).
-> Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle_avoidance --release --record for at least five seconds, and stop it with Ctrl+C.
-> Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
-> In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
-> Report what changed between the two verifications.
-> ```
-
 This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
-
-Choose the acquisition route for your installed CLI. The 2.0.0 CLI includes `--starter`, so it takes the second route; the first is for a 1.0.0 install.
-
-### Released CLI 1.0.0
-
-The public 1.0.0 binaries do not include the starter option. Obtain the matching
-source tag and enter its complete example workspace:
-
-```bash
-git clone --depth 1 --branch v1.0.0 https://github.com/cerulion-inc/cerulion cerulion-starter-source
-cd cerulion-starter-source/examples/obstacle_avoidance
-```
-
-Continue with the sign-in, build and run commands below. The
-[example runbook](examples/obstacle_avoidance/README.md) describes the source.
-
-### CLI builds with --starter
-
-Use this route only when `cerulion workspace create --help` lists `--starter`:
 
 ```bash
 cerulion workspace create safety_demo --starter obstacle_avoidance
 cd safety_demo
 ```
 
-This obtains complete source bundled with your CLI, including tests and all
-variable-length scan fields, without GitHub credentials or a source download.
-Exact release dependencies are selected, and `starter.toml` records the
-starter's name, the CLI version and the compiler that built the CLI. Existing
-paths are refused; failed installation leaves no partial workspace. The
-generated README also shows explicit graph creation, staging and wiring. To
-write nodes from scratch, start with
-`cerulion workspace create my_robot` and the
-[getting-started tutorial](docs/tutorials/01-getting-started.md).
+To write nodes from scratch instead, follow the [getting-started tutorial](docs/tutorials/01-getting-started.md).
 
 Sign in once per machine. Cerulion commands run under an account, and the result is read locally from then on, so later commands keep working offline.
 
@@ -150,9 +109,9 @@ cerulion graph validate obstacle_avoidance
 cerulion graph run obstacle_avoidance --release --record
 ```
 
-The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
+The run splits into one process per node without changing the graph file, as the [multi-process guide](https://docs.cerulion.com/cerulion/guides/run-multi-process) explains.
 
-By default the run is readable from any computer signed in to your account, on this LAN or another network, with no addresses or flags: `cerulion topic list` on that computer finds it. A machine that is neither on your account nor paired with this one cannot read its topics or publish into it. Add `--network off` to keep a run on this machine. For an intentionally open LAN, set `CERULION_LAN_ACCESS=open` for every Cerulion command and daemon on every machine that should send or receive topics over that LAN, restart `cerulion-netd` on each, and give the serving machine a listen endpoint (`CERULION_NETD_LISTEN`), as [Networking](docs/networking.md#making-a-robot-discoverable) shows. After upgrading from 1.x, restart any `cerulion-netd` that is still running so it uses this default.
+By default the run is readable from any computer signed in to your account, with no addresses or flags. Add `--network off` to keep a run on this machine.
 
 In a second terminal, watch the controller react:
 
@@ -160,13 +119,7 @@ In a second terminal, watch the controller react:
 cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
 ```
 
-The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses the distance threshold. Let it run for at least five seconds, then stop it with **Ctrl+C**; Cerulion prints the completed recording's path, `recordings/obstacle_avoidance_<timestamp>.mcap`, where the timestamp reads like `20260918T181449Z`. To find the file again:
-
-```bash
-ls recordings/
-```
-
-Besides `recordings/`, the node builds leave `target/` in the example directory; a run leaves a `~/.cerulion/runs` directory and the `cerulion-netd` network daemon, which exits on its own after 30 seconds idle.
+The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses the distance threshold. Let it run for at least five seconds, then stop it with **Ctrl+C**; Cerulion prints the completed recording's path, `recordings/obstacle_avoidance_<timestamp>.mcap`, where the timestamp reads like `20260918T181449Z`.
 
 Set `BAG` to that printed path, then verify the unchanged code first:
 
@@ -189,6 +142,25 @@ This time verification reports a divergence and returns a nonzero exit code. On 
 If Cerulion is useful to you, a star helps other robotics engineers find it.
 
 <details>
+<summary>Using a coding agent?</summary>
+
+Paste this prompt into Claude Code, Codex or another agent that runs commands in its own terminal:
+
+```text
+Install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+Run cerulion login in the background, show me the URL and code it prints, and wait for it to finish while I approve the sign-in in my browser.
+Then run the quickstart at https://github.com/cerulion-inc/cerulion#quickstart-run-record-and-verify in your own terminal:
+cerulion workspace create safety_demo --starter obstacle_avoidance, then cd safety_demo.
+Build both nodes (cerulion node build laser_scanner --release, then cerulion node build safety_controller --release; the first build takes a few minutes).
+Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle_avoidance --release --record for at least five seconds, and stop it with Ctrl+C.
+Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
+In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
+Report what changed between the two verifications.
+```
+
+</details>
+
+<details>
 <summary>What replay verification checks</summary>
 
 Cerulion re-executes the graph with recorded inputs and execution context, then compares the covered outputs against the recording. It checks behavior under those inputs; a passing result is not a claim about every environment the robot could encounter.
@@ -202,61 +174,7 @@ Comparisons are byte-exact by default. Add `--tolerance` for acceptable per-fiel
 
 </details>
 
-Guides: [Quickstart](https://docs.cerulion.com/cerulion/quickstart) · [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay)
-
-## What ships today
-
-- **Record and replay.** Runs record to standard MCAP. `cerulion bag play --resim all --verify` re-runs a supported native recording against new code and compares the outputs. Exit 1 names the topic that changed. ROS 2 gets exact replay of one eligible process at a time (`cerulion ros2 run --record-deliveries` / `--replay-deliveries`), runtime-tested on Humble. A replay publishes live on its machine; [ROS 2 replay](docs/ros2_replay.md) lists which processes qualify and where a replay is safe to run.
-- **Hindsight, in early access.** Recording-analysis tools your agent calls over MCP. Hindsight investigates MCAP recordings and cites topics and timestamps. Hindsight and the hosted MCP server are closed source. [Request access](https://docs.cerulion.com/cerulion/hindsight).
-- **Open source.** The runtime is AGPL-3.0-only, with a [commercial license](docs/legal/COMMERCIAL.md) available. The client-side wire crates are MIT OR Apache-2.0.
-- **ROS 2.** `rmw_cerulion` runs ROS 2 nodes on Cerulion's transport. It is tested in CI on Foxy, Galactic, Humble, Jazzy and Lyrical, and the Linux releases ship it prebuilt for Jazzy and Lyrical. `cerulion ros2 attach` bridges a running robot's ROS 2 topics. It is validated on Jazzy, and on Foxy and Humble through local type resolution only. See [ROS 2 compatibility](docs/ros2_compatibility.md).
-- **Python, new in 2.0.** `cerulion node create <type> --lang python --policy period_ms=<N>` writes a Python node that `graph run`, recording and replay treat like a Rust node. `import cerulion` publishes and subscribes to topics on the local machine over the same shared memory as Rust nodes, with no copy on receive. Both need the `cerulion` Python package, which you build from a Cerulion source checkout: the release downloads carry no wheel. A Python node also needs a `cerulion` CLI built from that checkout (`cargo install --path crates/cerulion_cli`). See [Python](docs/python.md).
-
-## Why it's fast
-
-- **Zero-copy shared memory.** Nodes on one machine exchange messages through [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) shared memory. A publisher writes into a loaned slot and other local processes read the same bytes.
-- **Measured round trips.** On one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, stock settings, recording on, nominal 100 Hz load, 2026-09-16), a 1 MiB round trip has a median of 4.08 µs with the default multi-process layout and 10,952 µs on ROS 2 Jazzy with `rmw_fastrtps_cpp` defaults: about 2,700× faster than ROS 2 Jazzy defaults at 1 MiB. One machine, not a guarantee.
-- **Recording stays on.** The Cerulion figures above include the capture plane; the ROS 2 figures do not include a recorder.
-- **Platforms.** Release binaries run on Linux (x86_64, aarch64) and macOS.
-
-The [Performance](#performance) section has the full table, the p99 figures and the timing boundaries. The raw results are in [`docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes`](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md).
-
-## The runtime
-
-Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-copy shared memory, a scheduler that follows your node graph, ROS 2 interoperability and secure access to remote robots. The runtime records the data and execution context that re-execution needs.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/media/development-loop-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/media/development-loop-light.svg">
-  <img src="docs/media/development-loop.svg" alt="Cerulion connects a running robot, live inspection, failure capture and replay verification in one development loop.">
-</picture>
-
-## Why Cerulion
-
-- **Zero-copy, beyond fixed-size messages.** Write camera frames, scans and schema-defined variable-length fields directly into shared memory. Other local processes read the same bytes.
-- **A scheduler that knows your graph.** Dependency levels are computed ahead of time; trigger policies decide when nodes can run. Eligible nodes in the same level can run in parallel. Event-driven waits, reusable buffers and placement by measured cost reduce overhead; recorded scheduling and input decisions support deterministic replay.
-- **Low latency, including the tail.** A 1 MiB native round trip measures 4.08 µs median and 7.38 µs p99 in the Linux multi-process benchmark, with recording enabled. [See the measurements and configurations](#performance).
-- **Execution you can test.** Periodic, data-triggered, synchronized and external nodes; explicit backpressure and deadlines; recorded execution traces and a virtual clock for deterministic re-execution.
-- **Recordings you can check code against.** Standard MCAP, byte-exact output comparisons, per-field tolerances and machine-readable verdicts for CI. Test your changed code against the inputs that actually reached the robot.
-- **Flashback when you forgot to record.** Save the moments before and after a failure from a rolling in-memory history, then inspect the incident or replay its recorded topics.
-- **Your robots, wherever they are.** Sign in to the same account on the robot and on your computer, and your computer finds the robot and reads its topics with no addresses or flags to set, over a direct connection when it can and a relay when it cannot. By default, a machine on your LAN that is neither on your account nor paired with the robot cannot read them.
-- **A path from ROS 2.** Run an existing stack through `rmw_cerulion`, attach to one already running, or combine ROS 2 processes and native nodes in the same graph.
-- **Tools your coding agent can use.** Cerulion MCP gives an agent tools for analyzing MCAP recordings, and Hindsight investigates recordings with evidence tied to topics and timestamps.
-- **One workflow across machines.** Native single- and multi-process execution on Linux and macOS, with your robots' topics, on your LAN or across the internet, mirrored locally for your tools.
-
-## How it fits together
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/media/architecture-flow-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/media/architecture-flow-light.svg">
-  <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to Cerulion Studio (early access), the CLI and coding agents.">
-</picture>
-
-- **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
-- **Across machines:** robots on your account, and robots this computer is already paired with, are discovered automatically. Iroh connects directly when it can, including on one LAN, and through a relay when it cannot. The network daemon mirrors subscribed topics locally for your tools. An unpaired machine reads a robot's topics over the LAN only when the robot runs with `CERULION_LAN_ACCESS=open`.
-- **At your desk:** the CLI inspects, records and verifies the robot's data, and Cerulion MCP gives your coding agent tools for analyzing its recordings. A captured failure is a recording to inspect. Before re-running it, check `anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` attachment.
-
-Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-multi-process) · [Networking and remote robots](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots) · [Remote access](docs/remote_plane.md)
+Guide: [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay)
 
 ## Check a model change against a recording
 
@@ -276,6 +194,8 @@ RECORD_SECS=8 ./run_replay_demo.sh
 Choose tolerances that match the behavior you care about: bounding-box IoU, absolute or relative error, RMSE and set comparisons. Comparisons are byte-exact unless you set a field, topic or document-wide tolerance. The same checks can run on pull requests against recordings your team keeps as regression cases.
 
 ## Performance
+
+On one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, stock settings, recording on, nominal 100 Hz load, 2026-09-16), a 1 MiB round trip has a median of 4.08 µs with the default multi-process layout and 10,952 µs on ROS 2 Jazzy with `rmw_fastrtps_cpp` defaults: about 2,700× faster than ROS 2 Jazzy defaults at 1 MiB. One machine, not a guarantee. The raw results are in [`docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes`](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md).
 
 ### Native graph round trips
 
@@ -327,6 +247,46 @@ Single-process medians on that machine rose by one to three ticks of its 24 MHz 
 
 Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99; both figures show round trips.
 
+## Write the node, declare the behavior
+
+A typed input, a typed output and a `tick` method define the quickstart's safety controller. The macro supplies the port plumbing; the graph declares the wiring and the runtime handles scheduling, transport, recording and observability. You do not configure an executor, register callbacks or write a spin loop.
+
+```rust
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+use native_ros2_messages::sensor_msgs::LaserScan;
+
+#[cerulion_node]
+#[derive(Default)]
+struct SafetyControllerNode {
+    #[input(trigger, depth = 1, expect_within_ms = 100)]
+    scan: LaserScan,
+    #[output(promise_within_ms = 100)]
+    linear_velocity: Vector3,
+}
+
+#[cerulion_node_impl]
+impl SafetyControllerNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let ranges = self.scan.ranges();
+        let stop = ranges.is_empty()
+            || ranges.iter().any(|&r| r.is_nan() || r < 0.5);
+        self.linear_velocity.x = if stop { 0.0 } else { 0.3 };
+        Ok(())
+    }
+}
+```
+
+Nodes can also be written in Python: `cerulion node create <type> --lang python --policy period_ms=<N>` writes one that `graph run`, recording and replay treat like a Rust node, as [Python](docs/python.md) describes.
+
+Here, `#[input(trigger)]` runs the controller when a scan arrives. The port deadlines make timing expectations observable through miss counters, alongside delivery-failure counts.
+
+Other nodes can run on synchronized input sets or external events. For a periodic node, use `#[cerulion_node(period_ms = 10)]` instead of a data trigger. Set queue depth and backpressure per input; for example, `backpressure = sample(3)` limits reads to one per 3 ms.
+
+Fixed fields write directly into the shared-memory slot. Variable-length fields have loaned writers too: `self.image.data.fill_from(producer)?` lets a camera or generator fill the final buffer in place. An untouched output publishes nothing; if this node's `tick` returns an error, its outputs are discarded.
+
+Guides: [Define a node](https://docs.cerulion.com/cerulion/guides/define-a-node) · [Wire a graph](https://docs.cerulion.com/cerulion/guides/wire-and-run-a-graph) · [Backpressure and deadlines](https://docs.cerulion.com/cerulion/guides/backpressure-and-deadlines)
+
 ## Bring your ROS 2 stack
 
 **When you control startup**, keep your launch file and start it through Cerulion:
@@ -360,45 +320,39 @@ Use the IP address of this computer's interface on the robot's LAN. Attach disco
 
 Use `ros2:` entries to launch ROS 2 processes beside native nodes in one graph. The [MoveIt 2 example](examples/moveit_hero/) shows an unmodified planning stack running over `rmw_cerulion`.
 
+`rmw_cerulion` is tested in CI on Foxy, Galactic, Humble, Jazzy and Lyrical, the Linux releases ship it prebuilt for Jazzy and Lyrical, and `cerulion ros2 attach` is validated on Jazzy and on Foxy and Humble through local type resolution, as [ROS 2 compatibility](docs/ros2_compatibility.md) details. Exact replay of one eligible ROS 2 process at a time (`cerulion ros2 run --record-deliveries` and `--replay-deliveries`) is runtime-tested on Humble, and [ROS 2 replay](docs/ros2_replay.md) lists which processes qualify and where a replay is safe to run.
+
 Guides: [Bridge ROS 2](https://docs.cerulion.com/cerulion/guides/bridge-ros2) · [Compatibility and configuration](docs/ros2_compatibility.md)
 
-## Write the node, declare the behavior
+## How it fits together
 
-A typed input, a typed output and a `tick` method define the quickstart's safety controller. The macro supplies the port plumbing; the graph declares the wiring and the runtime handles scheduling, transport, recording and observability. You do not configure an executor, register callbacks or write a spin loop.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/architecture-flow-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/media/architecture-flow-light.svg">
+  <img src="docs/media/architecture-flow.svg" alt="Robot-side graph scheduling and shared memory connect through separate LAN and WAN network planes to Cerulion Studio (early access), the CLI and coding agents.">
+</picture>
 
-```rust
-use cerulion_core::prelude::*;
-use native_ros2_messages::geometry_msgs::Vector3;
-use native_ros2_messages::sensor_msgs::LaserScan;
+- **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
+- **Across machines:** robots on your account, and robots this computer is already paired with, are discovered automatically. Iroh connects directly when it can, including on one LAN, and through a relay when it cannot. The network daemon mirrors subscribed topics locally for your tools. An unpaired machine reads a robot's topics over the LAN only when the robot runs with `CERULION_LAN_ACCESS=open`.
+- **At your desk:** the CLI inspects, records and verifies the robot's data, and Cerulion MCP gives your coding agent tools for analyzing its recordings. A captured failure is a recording to inspect. Before re-running it, check `anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` attachment.
 
-#[cerulion_node]
-#[derive(Default)]
-struct SafetyControllerNode {
-    #[input(trigger, depth = 1, expect_within_ms = 100)]
-    scan: LaserScan,
-    #[output(promise_within_ms = 100)]
-    linear_velocity: Vector3,
-}
+### Why Cerulion
 
-#[cerulion_node_impl]
-impl SafetyControllerNode {
-    fn tick(&mut self) -> Result<(), NodeError> {
-        let ranges = self.scan.ranges();
-        let stop = ranges.is_empty()
-            || ranges.iter().any(|&r| r.is_nan() || r < 0.5);
-        self.linear_velocity.x = if stop { 0.0 } else { 0.3 };
-        Ok(())
-    }
-}
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/development-loop-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/media/development-loop-light.svg">
+  <img src="docs/media/development-loop.svg" alt="Cerulion connects a running robot, live inspection, failure capture and replay verification in one development loop.">
+</picture>
 
-Here, `#[input(trigger)]` runs the controller when a scan arrives. The port deadlines make timing expectations observable through miss counters, alongside delivery-failure counts.
+- **Zero-copy, beyond fixed-size messages.** Write camera frames, scans and schema-defined variable-length fields directly into shared memory. Other local processes read the same bytes.
+- **A scheduler that knows your graph.** Dependency levels are computed ahead of time, and periodic, data-triggered, synchronized and external nodes run when their inputs are ready. Recorded scheduling, explicit backpressure and deadlines and a virtual clock make that execution testable and deterministic on replay.
+- **Recordings you can check code against.** Standard MCAP, byte-exact output comparisons, per-field tolerances and machine-readable verdicts for CI. Test your changed code against the inputs that actually reached the robot.
+- **Flashback when you forgot to record.** Save the moments before and after a failure from a rolling in-memory history, then inspect the incident or replay its recorded topics.
+- **Your robots, wherever they are.** Sign in to the same account on the robot and on your computer, and your computer finds the robot and reads its topics with no addresses or flags to set. The same single- and multi-process workflow runs on Linux and macOS, on your LAN or across the internet.
+- **A path from ROS 2.** Run an existing stack through `rmw_cerulion`, attach to one already running, or combine ROS 2 processes and native nodes in the same graph.
+- **Tools your coding agent can use.** Cerulion MCP gives an agent tools for analyzing MCAP recordings, and Hindsight investigates recordings with evidence tied to topics and timestamps.
 
-Other nodes can run on synchronized input sets or external events. For a periodic node, use `#[cerulion_node(period_ms = 10)]` instead of a data trigger. Set queue depth and backpressure per input; for example, `backpressure = sample(3)` limits reads to one per 3 ms.
-
-Fixed fields write directly into the shared-memory slot. Variable-length fields have loaned writers too: `self.image.data.fill_from(producer)?` lets a camera or generator fill the final buffer in place. An untouched output publishes nothing; if this node's `tick` returns an error, its outputs are discarded.
-
-Guides: [Define a node](https://docs.cerulion.com/cerulion/guides/define-a-node) · [Wire a graph](https://docs.cerulion.com/cerulion/guides/wire-and-run-a-graph) · [Backpressure and deadlines](https://docs.cerulion.com/cerulion/guides/backpressure-and-deadlines)
+Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-multi-process) · [Networking and remote robots](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots) · [Remote access](docs/remote_plane.md)
 
 ## Cerulion on a real arm
 
@@ -447,6 +401,8 @@ The hosted endpoints are in early access. Register them with your client:
 claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
 claude mcp add --transport http hindsight https://mcp.cerulion.com/mcp/hindsight
 ```
+
+Hindsight and the hosted MCP server are closed source. [Request access](https://docs.cerulion.com/cerulion/hindsight).
 
 Guide: [Connect an MCP client](https://docs.cerulion.com/cerulion/guides/connect-an-mcp-client)
 
