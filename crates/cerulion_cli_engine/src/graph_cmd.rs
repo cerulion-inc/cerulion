@@ -16950,8 +16950,11 @@ fn permitted_core_count() -> std::num::NonZeroUsize {
 
 /// Whether `name` carries a secret marker segment (the rule on
 /// [`ENV_SECRET_NAME_MARKERS`]). Pure: it reads the name only, never the value.
+///
+/// Crate-visible because the replay's environment comparison applies the same
+/// rule: a secret-marked name is never one of the variables it warns about.
 #[cfg(unix)]
-fn env_name_marks_a_secret(name: &str) -> bool {
+pub(crate) fn env_name_marks_a_secret(name: &str) -> bool {
     name.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|segment| {
             let word = segment.trim_end_matches(|c: char| c.is_ascii_digit());
