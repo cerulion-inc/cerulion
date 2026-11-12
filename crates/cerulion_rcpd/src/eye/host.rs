@@ -698,19 +698,32 @@ impl Drop for EyeHost {
     }
 }
 
+struct RemoteGraphSubscriber {
+    subscriber: CerulionSubscriber,
+    _scope: cerulion_core::transport::egress_scope::RemoteTopicLease,
+}
+
+impl std::ops::Deref for RemoteGraphSubscriber {
+    type Target = CerulionSubscriber;
+    fn deref(&self) -> &Self::Target {
+        &self.subscriber
+    }
+}
+
 struct Ports {
     /// `None` until the graph has created the ask topic.
-    asks: Option<CerulionSubscriber>,
+    asks: Option<RemoteGraphSubscriber>,
     ask_topic: String,
     /// `None` without an `eyes.jev` section, and until the graph has created
     /// the frame topic.
-    frames: Option<CerulionSubscriber>,
+    frames: Option<RemoteGraphSubscriber>,
     frame_topic: String,
     /// Whether the eye reads a frame topic: it has an `eyes.jev` section.
     reads_frames: bool,
     answers: CerulionPublisher,
     /// When the topics not yet open are tried again.
     retry_at: Instant,
+    _answer_scope: cerulion_core::transport::egress_scope::RemoteTopicLease,
 }
 
 /// A subscriber on the graph topic `topic`, opened without creating it:
@@ -723,17 +736,25 @@ struct Ports {
 fn open_graph_topic(
     manager: &TransportManager,
     topic: &str,
-) -> Result<Option<CerulionSubscriber>, RcpdError> {
+) -> Result<Option<RemoteGraphSubscriber>, RcpdError> {
+    let scope = manager.acquire_remote_topic_lease(topic)?;
     match manager.create_subscriber_open_only(topic) {
-        Ok(subscriber) => Ok(Some(subscriber)),
+        Ok(subscriber) => Ok(Some(RemoteGraphSubscriber {
+            subscriber,
+            _scope: scope,
+        })),
         Err(_) if manager.data_service_missing(topic) => Ok(None),
         // Created since the first try, or a failure the second try reports.
-        Err(_) => Ok(Some(manager.create_subscriber_open_only(topic)?)),
+        Err(_) => Ok(Some(RemoteGraphSubscriber {
+            subscriber: manager.create_subscriber_open_only(topic)?,
+            _scope: scope,
+        })),
     }
 }
 
 impl Ports {
     fn open(manager: &TransportManager, settings: &EyeSettings) -> Result<Self, RcpdError> {
+        let answer_scope = manager.acquire_remote_topic_lease(&settings.answer_topic)?;
         let answers = manager.create_publisher_simple(
             &settings.answer_topic,
             MaxSliceLen::const_new(MAX_ANSWER_BYTES),
@@ -768,6 +789,7 @@ impl Ports {
             reads_frames,
             answers,
             retry_at: Instant::now() + OPEN_RETRY,
+            _answer_scope: answer_scope,
         })
     }
 }
@@ -1068,7 +1090,7 @@ impl EyeLoop {
     }
 
     /// One try at [`open_graph_topic`] for `topic`, logged.
-    fn try_open(&mut self, topic: &str) -> Option<CerulionSubscriber> {
+    fn try_open(&mut self, topic: &str) -> Option<RemoteGraphSubscriber> {
         match open_graph_topic(&self.manager, topic) {
             Ok(Some(subscriber)) => {
                 if let Some(suppressed) = self.open_failures.on_success() {

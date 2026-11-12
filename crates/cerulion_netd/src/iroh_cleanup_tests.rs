@@ -6,6 +6,101 @@ use cerulion_core::TransportConfig;
 use std::sync::mpsc;
 
 #[test]
+fn a_private_restoration_deadline_closes_the_incomplete_wire_demand() {
+    let server_runtime = tokio::runtime::Runtime::new().unwrap();
+    let server_endpoint = server_runtime
+        .block_on(cerulion_link::build_endpoint(
+            cerulion_link::EndpointConfig::new([0x51; 32])
+                .with_relay(cerulion_link::RelayConfig::Disabled),
+        ))
+        .unwrap();
+    let addresses = server_endpoint
+        .bound_sockets()
+        .into_iter()
+        .map(|address| {
+            let ip = if address.is_ipv4() {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            };
+            std::net::SocketAddr::new(ip, address.port())
+        })
+        .collect::<Vec<_>>();
+    let server = server_endpoint.clone();
+    let (seen_tx, seen_rx) = mpsc::sync_channel(1);
+    let serving = server_runtime.spawn(async move {
+        let accepted = cerulion_link::accept_one(&server).await.unwrap().unwrap();
+        let (_send, mut recv) = cerulion_link::accept_frame_stream(&accepted.connection)
+            .await
+            .unwrap();
+        let bytes = read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN).await.unwrap();
+        let request: WireRequest = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(request, WireRequest::Demand { topic, .. } if topic == "/native/stalled"));
+        seen_tx.send(()).unwrap();
+        accepted.connection.closed().await;
+    });
+    let manager = TransportManager::init_for_test(
+        TransportConfig::default(),
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .unwrap();
+    let registry = Arc::new(WanRegistry::new(
+        HashMap::new(),
+        [0x52; 32],
+        cerulion_link::RelayConfig::Disabled,
+    ));
+    let plane = IrohMirrorPlane::new(manager, registry).unwrap();
+    let endpoint = plane.rt.block_on(plane.build_desk_endpoint()).unwrap();
+    let connection = plane
+        .rt
+        .block_on(dial(
+            &endpoint,
+            direct_addr(server_endpoint.id(), addresses),
+            alpn::WIRE,
+        ))
+        .unwrap();
+    let (send, recv) = plane.rt.block_on(open_frame_stream(&connection)).unwrap();
+    plane.rt.block_on(async {
+        let mut state = plane.inner.lock().await;
+        state.endpoint = Some(endpoint);
+        state.robots.insert(
+            ("robot".into(), false),
+            RobotConn {
+                connection,
+                control_send: send,
+                control_recv: recv,
+                readers: HashMap::new(),
+                control_poisoned: false,
+            },
+        );
+    });
+    let key = TopicKey::new("robot", "/native/stalled");
+    let started = Instant::now();
+    assert_eq!(
+        plane
+            .ensure_mirror_until(&key, 11, started + Duration::from_millis(70))
+            .unwrap_err(),
+        "WAN mirror restoration deadline expired"
+    );
+    assert!(started.elapsed() < Duration::from_millis(250));
+    seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let state = plane.inner.try_lock().unwrap();
+    let connection = state.robots.get(&("robot".into(), false)).unwrap();
+    assert!(connection.control_poisoned);
+    assert!(connection.connection.close_reason().is_some());
+    drop(state);
+    assert!(!plane.has_reader(&key).unwrap());
+    server_runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .unwrap()
+            .unwrap();
+    });
+    plane.invalidate_account().unwrap();
+    server_runtime.block_on(server_endpoint.close());
+}
+
+#[test]
 fn reader_health_distinguishes_absence_busy_and_invalidated_state_without_dialing() {
     let manager = TransportManager::init_for_test(
         TransportConfig::default(),
@@ -54,6 +149,7 @@ fn delayed_old_cleanup_cannot_remove_replacement_provenance() {
         endpoint: None,
         robots: HashMap::new(),
         account_invalidated: false,
+        shared_endpoint: false,
     }));
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (continue_tx, continue_rx) = mpsc::sync_channel(1);

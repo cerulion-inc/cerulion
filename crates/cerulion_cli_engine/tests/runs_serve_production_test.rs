@@ -93,6 +93,10 @@ fn gateway_on_the_global_namespace(tag: &str) -> GatewayRuntime {
         iceoryx2::config::Config::global_config().clone(),
     )
     .expect("gateway host manager on the global namespace");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     GatewayRuntime::new(
         manager,
         GatewayPlan {

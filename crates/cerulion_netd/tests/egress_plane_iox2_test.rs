@@ -136,6 +136,9 @@ fn establish_machine_a_gated(
             root.clone(),
         )
         .expect("init shared gateway G");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         // The beacon advertises only LAN-dialable listen endpoints. The
         // loopback endpoints used by most transport tests are refused, while
         // wildcard endpoints exercise the Advertise decision. The test-only
@@ -868,6 +871,9 @@ fn receive_and_verify_over_hop(port: u16, topic: &str, node_suffix: &str) {
         iceoryx_test_config(),
     )
     .expect("init B");
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     // Create the reader FIRST (the consumer-first order), then the demand.
     let b_sub = b.create_subscriber(topic).expect("B subscriber");
     b.register_ingress_topic(topic, EGRESS_HASH, MaxSliceLen::const_new(256))
@@ -1361,6 +1367,9 @@ fn a_desk_shaped_netd_boots_its_gateway_and_advertises_nothing() {
         iceoryx_test_config(),
     )
     .expect("init a desk-shaped shared manager");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     // The PRODUCTION constructor, deliberately — a desk declines before the
     // advertiser is ever reached, so this arm opens no socket AND is the one
     // place that can prove production still installs the real advertiser.

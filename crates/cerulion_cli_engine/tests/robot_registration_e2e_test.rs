@@ -4,7 +4,7 @@
 //! service — the actual A2 `POST /v1/robots` issuer serves every request).
 //!
 //! Process-test prerequisites: `cargo build -p cerulion_cli --bin cerulion
-//! -p cerulion_remoted --bin cerulion-remoted`. Relay-disabled process tests
+//! -p cerulion_remoted --bin cerulion-remoted -p cerulion_netd --bin cerulion-netd`. Relay-disabled process tests
 //! open no discovery or public relay connection.
 //!
 //! Each test spins the real account-service router, drives the blocking
@@ -213,6 +213,127 @@ fn register_robot_binds_the_logged_in_account_and_returns_an_owner_grant() {
         .decode(&ownership.intermediate)
         .expect("intermediate is base64url")
         .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_legacy_desk_enrolls_without_login_and_the_real_robot_admits_its_key() {
+    use cerulion_cli_engine::{auth, owner_certificate, robot_bootstrap};
+    use cerulion_pairing::verify::{PairingSource, TrustStore};
+    use std::process::Command;
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let robot_home = tempfile::tempdir().unwrap();
+    let home = robot_home.path().canonicalize().unwrap();
+    let _robot_home = EnvGuard::set("CERULION_HOME", home.to_str().unwrap());
+    let robot_login = login(port, &email);
+    let root = home.join("robot-state");
+    let prepared = robot_bootstrap::prepare(&root).unwrap();
+    let writer = bounded_output(
+        Command::new(built_binary("cerulion-remoted"))
+            .arg("--state-root")
+            .arg(&root)
+            .arg("--provision-bundle")
+            .arg(&prepared.registration_bundle),
+    );
+    assert!(
+        writer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    let remoted = root.join("remoted");
+    let mac = std::fs::read(remoted.join("trust_store.mac_key")).unwrap();
+    let mut robot = TrustStore::load(remoted.join("trust_store"), &mac).unwrap();
+    let owner = robot.owner().unwrap();
+    let desk_home = tempfile::tempdir().unwrap();
+    let _desk_home = EnvGuard::set("CERULION_HOME", desk_home.path().to_str().unwrap());
+    let desk_login = login(port, &email);
+    assert_eq!(desk_login.account_id, robot_login.account_id);
+    let key = *auth::identity_layout()
+        .unwrap()
+        .load_machine_key()
+        .unwrap()
+        .unwrap()
+        .seed();
+    let peer = cerulion_pairing::format::PublicKey(
+        ed25519_dalek::SigningKey::from_bytes(&key)
+            .verifying_key()
+            .to_bytes(),
+    );
+    assert!(robot
+        .access_rows()
+        .iter()
+        .all(|row| row.device != Some(peer)));
+    std::fs::remove_file(desk_home.path().join("device.cert")).unwrap();
+    std::fs::remove_file(desk_home.path().join("device-chain.json")).unwrap();
+    let auth_before = std::fs::read(desk_home.path().join("auth.json")).unwrap();
+    assert!(login_cmd::enroll_device_once_within(Duration::from_secs(2)).unwrap());
+    assert_eq!(
+        std::fs::read(desk_home.path().join("auth.json")).unwrap(),
+        auth_before
+    );
+    assert_eq!(
+        *auth::identity_layout()
+            .unwrap()
+            .load_machine_key()
+            .unwrap()
+            .unwrap()
+            .seed(),
+        key
+    );
+    let presentation = owner_certificate::load().unwrap();
+    let now = auth::now_unix_ns();
+    assert_eq!(
+        robot
+            .verify_owner_certificate(&presentation, &peer, now)
+            .unwrap(),
+        owner
+    );
+    let admitted = robot.is_allowed(&owner, &peer, now).unwrap();
+    assert_eq!(admitted.device, Some(peer));
+    assert_eq!(admitted.source, PairingSource::CertificatePresentation);
+    assert_eq!(admitted.scope, cerulion_pairing::format::Scope::OWNER_FULL);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn real_registration_worker_names_the_permission_fix_for_a_0755_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.to_str().unwrap());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    login(port, &email);
+    let root = home.join("robot's state");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .args(["bootstrap-robot", "--state-root"])
+            .arg(&root)
+            .env("CERULION_LOGIN_GATE", "1"),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains(&format!(
+        "automatic robot registration: the robot state directory must be owner-only; run `chmod 700 '{}/robot'\\''s state'`", home.display())));
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!root.join("robot-registration.json").exists());
 }
 
 #[test]
@@ -453,6 +574,157 @@ fn real_background_worker_refuses_missing_login_without_interactive_flow() {
 #[cfg(unix)]
 #[test]
 #[serial]
+fn first_egress_enrolls_a_signed_in_robot_without_listen_and_reuses_it_offline() {
+    use cerulion_cli_engine::auth;
+    use cerulion_core::testing::IsolatedRoot;
+    use cerulion_core::wire::MaxSliceLen;
+    use cerulion_core::{
+        GatewayEgressPolicy, GatewayPlan, SchemaServing, TransportConfig, TransportManager,
+    };
+    use cerulion_netd::NetdClient;
+    use cerulion_pairing::format::AccountId;
+    use cerulion_pairing::verify::TrustStore;
+    use std::process::{Child, Command, Stdio};
+
+    struct NetdGuard(Child);
+    impl Drop for NetdGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &self.0.id().to_string()])
+                    .status();
+                let _ = wait_for(|| self.0.try_wait().ok().flatten(), Duration::from_secs(30));
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let _home = EnvGuard::set("CERULION_HOME", home.to_str().unwrap());
+    let _service = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let mut state = login(port, &email);
+    let ix = IsolatedRoot::mint("a2");
+    let manager = TransportManager::init_for_test(TransportConfig::default(), ix.config()).unwrap();
+    let _publisher = manager
+        .create_publisher_simple("/account/automatic", MaxSliceLen::const_new(64))
+        .unwrap();
+    std::fs::create_dir(home.join("config")).unwrap();
+    std::fs::write(
+        home.join("config/iceoryx2.toml"),
+        format!(
+            "[global]\nroot-path = {:?}\nprefix = {:?}\n",
+            ix.root, ix.prefix
+        ),
+    )
+    .unwrap();
+    let root = home.join("robot-state");
+    let facts_path = root.join("remoted/beacon_facts.json");
+    let socket = home.join("netd.sock");
+    let plan = GatewayPlan {
+        egress_policy: GatewayEgressPolicy::AllowList(vec!["/account/automatic".into()]),
+        announce: vec!["/account/automatic".into()],
+        ingress: vec![],
+    };
+    let mut trust_bytes = None;
+    for offline in [false, true] {
+        if offline {
+            state.expires_at_ns = 0;
+            auth::write_to(&home.join("auth.json"), &state).unwrap();
+            std::fs::remove_file(&facts_path).unwrap();
+        }
+        let mut daemon = NetdGuard(
+            Command::new(built_binary("cerulion-netd"))
+                .current_dir(&home)
+                .env("CERULION_NETD_SOCK", &socket)
+                .env("CERULION_NETD_IDLE_GRACE_MS", "60000")
+                .env("CERULION_NETD_RELAY_DISABLED", "1")
+                .env(
+                    "CERULION_ACCOUNT_SERVICE",
+                    if offline {
+                        "http://127.0.0.1:1".to_string()
+                    } else {
+                        format!("http://127.0.0.1:{port}")
+                    },
+                )
+                .env_remove("CERULION_STATE_ROOT")
+                .env_remove("CERULION_NETWORK")
+                .env_remove("CERULION_NETD_NETWORK")
+                .env_remove("CERULION_NETD_LISTEN")
+                .env_remove("CERULION_NETD_CONNECT")
+                .env_remove("CERULION_NETD_WAN_ROBOTS")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(home.join("automatic.log")).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let mut client = wait_for(
+            || NetdClient::connect_existing_at(socket.clone()).ok(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!facts_path.exists(), "query-only startup must not serve");
+        client
+            .register_egress(&plan, &SchemaServing::default(), None)
+            .unwrap();
+        let facts = wait_for(
+            || {
+                assert!(daemon.0.try_wait().unwrap().is_none());
+                std::fs::read(&facts_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "{}",
+                std::fs::read_to_string(home.join("automatic.log")).unwrap()
+            )
+        });
+        let dir = root.join("remoted");
+        let mac = std::fs::read(dir.join("trust_store.mac_key")).unwrap();
+        let trust = TrustStore::load(dir.join("trust_store"), &mac).unwrap();
+        assert_eq!(
+            trust.owner(),
+            Some(AccountId(
+                URL_SAFE_NO_PAD
+                    .decode(&state.account_id)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ))
+        );
+        assert_eq!(facts["eid"], hex::encode(trust.robot_transport_key().0));
+        let bytes = std::fs::read(dir.join("trust_store")).unwrap();
+        if let Some(before) = &trust_bytes {
+            assert_eq!(&bytes, before, "offline restart preserves ownership");
+        }
+        trust_bytes = Some(bytes);
+        drop(client);
+        assert!(Command::new("kill")
+            .args(["-TERM", &daemon.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            wait_for(|| daemon.0.try_wait().unwrap(), Duration::from_secs(30))
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
 fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_offline() {
     use cerulion_cli_engine::{auth, robot_bootstrap::BootstrapPrepared};
     use cerulion_pairing::format::AccountId;
@@ -551,6 +823,57 @@ fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_off
     assert!(facts["iroh_port"].as_u64().is_some_and(|port| port > 0));
     server.0.kill().unwrap();
     server.0.wait().unwrap();
+
+    // The command-wide gate accepts the same durable robot authority as netd.
+    // No account file or reachable issuer is needed, and the read writes no trust.
+    let saved_auth = std::fs::read(home.join("auth.json")).unwrap();
+    std::fs::remove_file(home.join("auth.json")).unwrap();
+    let saved_key = std::fs::read(remoted.join("device_key")).unwrap();
+    let saved_trust = std::fs::read(remoted.join("trust_store")).unwrap();
+    let saved_index = std::fs::read(remoted.join("device_index.json")).unwrap();
+    for _ in 0..2 {
+        let output = bounded_output(
+            Command::new(built_binary("cerulion"))
+                .args(["topic", "list", "--local"])
+                .env("CERULION_STATE_ROOT", &root)
+                .env("CERULION_LOGIN_GATE", "1")
+                .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(
+            std::fs::read(remoted.join("trust_store")).unwrap(),
+            saved_trust
+        );
+        assert_eq!(
+            std::fs::read(remoted.join("device_index.json")).unwrap(),
+            saved_index
+        );
+    }
+    for name in ["device_key", "device_index.json"] {
+        let path = remoted.join(name);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"corrupt").unwrap();
+        let output = bounded_output(
+            Command::new(built_binary("cerulion"))
+                .args(["topic", "list", "--local"])
+                .env("CERULION_STATE_ROOT", &root)
+                .env("CERULION_LOGIN_GATE", "1")
+                .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
+        );
+        assert_eq!(output.status.code(), Some(7));
+        assert!(!home.join("auth.json").exists());
+        std::fs::write(path, original).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(remoted.join("device_key")).unwrap(),
+        saved_key
+    );
+    std::fs::write(home.join("auth.json"), saved_auth).unwrap();
 
     // With the issuer unreachable and the login token expired, both actual
     // workers still accept the already committed same-account ownership.
