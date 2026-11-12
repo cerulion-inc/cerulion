@@ -437,11 +437,7 @@ fn verb_registry(
         Box::new(PairVerb::new(shared.clone(), clock.clone())),
         // Establish access from a desk-carried, owner-signed grant.
         Box::new(PresentGrantVerb::new(shared.clone(), clock.clone())),
-        Box::new(CodePairStartVerb::new(
-            shared.clone(),
-            sessions.clone(),
-            clock.clone(),
-        )),
+        Box::new(CodePairStartVerb::new(shared.clone(), sessions.clone())),
         Box::new(CodePairFinishVerb::new(shared.clone(), sessions, clock)),
         engage_estop,
         Box::new(crate::robot_settings::CloudAccessVerb::new(shared.clone())),

@@ -14,7 +14,11 @@
 //!   the self-account derived from it;
 //! - a WRONG code is a distinct `PairError::CodeMismatch` (detected structurally
 //!   desk-side) and writes NO row;
-//! - a robot with NO armed code is a `PairError::Refused` and writes NO row.
+//! - a robot with NO armed code is a `PairError::Refused` and writes NO row;
+//! - each refusal the robot's code-pairing store answers maps to its desk exit
+//!   class: every try failed is a code mismatch; a used code, a throttled try,
+//!   every try taken by a desk still pairing, an expired window, no armed code
+//!   and no try in progress are refusals.
 
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -266,7 +270,7 @@ async fn no_armed_code_is_refused_and_writes_no_row() {
     let dir = tempfile::tempdir().unwrap();
     let robot_ep = disabled_endpoint([202; 32]).await;
     let robot_key = *robot_ep.id().as_bytes();
-    // A CLAIMED robot, but NO code armed (the owner never started code pairing).
+    // A CLAIMED robot, but NO code armed (no request was left on the robot).
     let r = build_robot(dir.path(), robot_key);
 
     let desk_seed = [13u8; 32];
@@ -290,4 +294,33 @@ async fn no_armed_code_is_refused_and_writes_no_row() {
         store.account_access(&account, 0).is_none(),
         "no row without an armed code"
     );
+}
+
+#[test]
+fn each_robot_refusal_maps_to_its_desk_exit_class() {
+    use cerulion_connectd::pair::{classify_verb_error, VerbErrorClass};
+    use cerulion_remoted::pairing_verbs::{
+        code_exhausted, code_expired, CODE_USED, NOT_ARMED, NO_SESSION, TRIES_IN_PROGRESS,
+        TRY_THROTTLED,
+    };
+    // The texts the robot's store answers, as `code-pair-start` and
+    // `code-pair-finish` carry them in a `verb_error`.
+    let wrong = "code pairing rejected: pairing key confirmation failed (wrong code?)";
+    let cases = [
+        (code_exhausted(3), VerbErrorClass::CodeMismatch),
+        (wrong.to_string(), VerbErrorClass::CodeMismatch),
+        (CODE_USED.to_string(), VerbErrorClass::Refused),
+        (TRY_THROTTLED.to_string(), VerbErrorClass::Refused),
+        (TRIES_IN_PROGRESS.to_string(), VerbErrorClass::Refused),
+        (code_expired(), VerbErrorClass::Refused),
+        (NOT_ARMED.to_string(), VerbErrorClass::Refused),
+        (NO_SESSION.to_string(), VerbErrorClass::Refused),
+    ];
+    for (message, want) in cases {
+        assert_eq!(
+            classify_verb_error("verb_error", &message),
+            want,
+            "{message}"
+        );
+    }
 }

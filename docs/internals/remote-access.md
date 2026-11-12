@@ -447,8 +447,9 @@ snapshot (`topic-snapshot`).
   never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read
   from client args (`pairing_verbs.rs` module docs; `ops_loopback_test.rs`).
-  Validity, anti-rollback and the CPace TTL are evaluated against the robot's
-  trusted `RemotedClock`, never a client-supplied time.
+  Validity and anti-rollback are evaluated against the robot's trusted
+  `RemotedClock`, never a client-supplied time; an armed code's window runs on
+  the store's `MonotonicClock` (section 7).
 - **Live trust with fail-closed persistence** (`trust.rs`): one
   `Arc<Mutex<TrustInner>>` shared by the read side (accept gate) and write side
   (bootstrap verbs), so a claim/pair takes effect at the next accept with no
@@ -824,6 +825,46 @@ every slot is taken.
   lists, error prose) is sanitized + length-bounded where it enters an error or
   a log line; `sanitize_peer_text` is the ONE policy, re-exported so the binary
   renders the catalog through it too (`connectd/src/lib.rs`, `pair.rs`).
+- `SharedCodePairSessions` keeps the armed code's ledger. Every desk shares
+  one budget of tries. `code-pair-start` admits a try while one is left,
+  inside the window, and at least `PAIR_CODE_RATE_INTERVAL` after the robot's
+  last admitted try, whatever code that was for (a new arm does not reset it);
+  a refused start uses no try, and the pure `admit_try` checks in order: used
+  (a desk paired), every try failed, expired, no try left (the rest pending
+  or being saved), throttled. A start reads the store's clock with its state
+  lock held, and a reading before the last admitted try is refused as too
+  soon, so admitted tries are at least the interval apart however the starts
+  of several desks race. Each admitted try gets a fresh CPace responder
+  created at the arm time with the policy's tries, so its own liveness check enforces the same
+  window and its own attempt bound never fires first. The CPace step runs
+  under the store's state lock. A wrong tag at
+  `code-pair-finish` or a failed `respond` fails the try at once. A desk that
+  sees a wrong code itself never calls `code-pair-finish`, so its try stays
+  pending until its desk key starts a new try or the window passes. A desk key's
+  new try counts its pending one failed; when the window passes, every pending
+  try is counted failed. A right code's row is saved with the store's state
+  lock released (a separate lock serializes saves, and arms and disarms wait
+  for it), so a reader of the
+  store's state never waits for a disk; a save that fails or
+  panics counts as a failed try (`SAVE_FAILURE_IS_A_FAILED_TRY`), and the
+  desk's next try gets a fresh responder. The pure `settle` returns the first
+  outcome, which `CodeState::latch` latches: paired (the row was saved),
+  exhausted (every try failed), expired (the window passed), and none while a
+  right code's row is being saved. A
+  paired code refuses every later try (`CODE_USED`), so one code pairs one
+  desk, and the other desks' pending tries are dropped uncounted. The window
+  and the rate interval run on the store's `MonotonicClock` (the process's
+  `Instant` in production), so a step of the wall clock neither stretches nor
+  cuts them; on Linux and macOS time the system spends suspended is not
+  counted, so a suspend lengthens an armed code's window by that
+  time. The row's own times still come from `RemotedClock`. The refusal texts
+  are the consts `NOT_ARMED`, `CODE_USED`, `TRY_THROTTLED`,
+  `TRIES_IN_PROGRESS` and `NO_SESSION`, and the functions `code_exhausted` and
+  `code_expired`, which give the CPace errors' own text; the desk maps
+  `code_exhausted` and a wrong code to exit 4 and every other refusal to exit
+  2.
+  Pinned over the real ops plane by `ops_loopback_test.rs` and against the
+  wall clock by `code_pair_account_test.rs`.
 
 ## 8. netd's iroh WAN plane (the dual-plane fold)
 
@@ -1170,15 +1211,15 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_connectd/tests/rcp_network_switch_test.rs` | The real `cerulion-connectd rcp` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same command dials it |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
-| `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |
+| `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk; each refusal text of the robot's code-pairing store maps to its desk exit class (every try failed and a wrong code are a code mismatch; a used code, a throttled try, every try taken by a desk still pairing, an expired window, no armed code and no try in progress are refusals) |
 | `cerulion_wireclient` in-module tests | Dial-config parsers, epoch push decisions + cache-path pins, reply classification |
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |
 | `crates/cerulion_ops_proto/tests/wire_golden_test.rs` | Every `cerulion/ops/1` message type encodes to, and decodes from, a golden frame built from JSON text |
 | `crates/cerulion_accountd/tests/*` | Account-plane acceptance over a real server, CA↔shipped-verifier byte-compat, device-code state, 5xx error-leak ban |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
-| `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused |
-| `cerulion_pairing::pair_code`, `cerulion_remoted::owner_only` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the owner-only verdict |
+| `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused; a wall-clock step neither stretches nor cuts the code window |
+| `cerulion_pairing::pair_code`, `cerulion_remoted::{owner_only, pairing_verbs}` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,

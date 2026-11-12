@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A pairing code proves code possession, never membership of a named account.
+//! A pairing code proves code possession, never membership of a named account,
+//! and its window is measured on the code-pairing store's monotonic clock, not
+//! on the wall clock the row's times are read from.
 
 use cerud::authz::AuthzDecision;
 use cerud::transport::CallerIdentity;
@@ -8,13 +10,15 @@ use cerulion_pairing::format::{
     AccountId, DeviceCert, Grant, IntermediateCert, PrincipalKind, PublicKey, RobotId, RootSet,
     Scope, Validity, FORMAT_VERSION,
 };
-use cerulion_pairing::pake::{CeremonyConfig, CpaceInitiator, PakeIdentities};
+use cerulion_pairing::pair_code::PAIR_CODE_POLICY;
+use cerulion_pairing::pake::{CpaceInitiator, PakeIdentities};
 use cerulion_pairing::verify::{PairingSource, TrustStore};
 use cerulion_remoted::pairing_verbs::{
     CodePairFinishVerb, CodePairStartVerb, PairVerb, PresentationWire, SharedCodePairSessions,
+    NO_SESSION,
 };
 use cerulion_remoted::{
-    DeviceAccountIndex, KeyAccess, PairingAuthorizer, RemotedClock, SharedTrust,
+    DeviceAccountIndex, KeyAccess, MonotonicClock, PairingAuthorizer, RemotedClock, SharedTrust,
 };
 use ed25519_dalek::SigningKey;
 
@@ -39,6 +43,10 @@ struct Fixture {
     shared: SharedTrust,
     start: CodePairStartVerb,
     finish: CodePairFinishVerb,
+    /// The trusted wall clock the row's times are read from.
+    wall: RemotedClock,
+    /// The code-pairing store's clock, which the window runs on.
+    mono: MonotonicClock,
 }
 
 impl Fixture {
@@ -61,30 +69,34 @@ impl Fixture {
         index.save(MAC).unwrap();
         let clock = RemotedClock::fixed(NOW);
         let shared = SharedTrust::new_with_clock(store, index, MAC.to_vec(), clock.clone());
-        let sessions = SharedCodePairSessions::new();
-        sessions.arm(CODE, CeremonyConfig::default());
+        let mono = MonotonicClock::fixed(NOW);
+        let sessions = SharedCodePairSessions::with_clock(mono.clone());
+        sessions.arm(CODE, PAIR_CODE_POLICY);
         Self {
             directory,
-            start: CodePairStartVerb::new(shared.clone(), sessions.clone(), clock.clone()),
-            finish: CodePairFinishVerb::new(shared.clone(), sessions, clock),
+            start: CodePairStartVerb::new(shared.clone(), sessions.clone()),
+            finish: CodePairFinishVerb::new(shared.clone(), sessions, clock.clone()),
             shared,
+            wall: clock,
+            mono,
         }
     }
 
     fn confirmation(&self, seed: u8) -> Vec<u8> {
+        self.try_confirmation(seed).unwrap()
+    }
+
+    fn try_confirmation(&self, seed: u8) -> Result<Vec<u8>, cerud::error::CerudError> {
         let initiator =
             CpaceInitiator::new(CODE, PakeIdentities::new(public(seed), public(6), vec![]));
         let (attempt, msg1) = initiator.begin().unwrap();
-        let start = self
-            .start
-            .execute_with_caller(
-                &caller(seed),
-                &serde_json::json!({"msg1":hex::encode(msg1)}),
-            )
-            .unwrap();
+        let start = self.start.execute_with_caller(
+            &caller(seed),
+            &serde_json::json!({"msg1":hex::encode(msg1)}),
+        )?;
         let msg2 = hex::decode(start["msg2"].as_str().unwrap()).unwrap();
         let confirm = hex::decode(start["responder_confirm"].as_str().unwrap()).unwrap();
-        attempt.finish(&msg2, &confirm).unwrap().1
+        Ok(attempt.finish(&msg2, &confirm).unwrap().1)
     }
 
     fn store(&self) -> TrustStore {
@@ -214,13 +226,15 @@ fn bare_cloud_account_and_other_devices_confirmation_cannot_enroll_a_guest() {
         .execute_with_caller(&caller(4), &finish_args(cloud, &confirmation))
         .unwrap_err();
     assert!(error.to_string().contains("self-account"));
-    assert!(fixture
+    // Device 7 started no try: another device's confirmation finds none.
+    let error = fixture
         .finish
         .execute_with_caller(
             &caller(7),
-            &finish_args(AccountId(public(7).0), &confirmation)
+            &finish_args(AccountId(public(7).0), &confirmation),
         )
-        .is_err());
+        .unwrap_err();
+    assert_eq!(error.to_string(), format!("verb error: {NO_SESSION}"));
     assert_eq!(fixture.binding(4), None);
     assert_eq!(fixture.binding(7), None);
     assert!(fixture.store().account_access(&cloud, NOW).is_none());
@@ -252,4 +266,47 @@ fn self_account_still_requires_authenticated_caller_and_valid_code_confirmation(
         .store()
         .account_access(&AccountId(public(4).0), NOW)
         .is_none());
+}
+
+#[test]
+fn a_wall_clock_step_neither_stretches_nor_cuts_the_code_window() {
+    const SECOND: u64 = 1_000_000_000;
+    const DAY: u64 = 86_400 * SECOND;
+    let window = PAIR_CODE_POLICY.ttl_ns;
+
+    // Not cut: the wall clock jumps a day ahead between the arm, the start
+    // and the finish; one second has passed on the store's clock, and the
+    // desk pairs.
+    let fixture = Fixture::new();
+    fixture.wall.set(NOW + DAY);
+    fixture.mono.set(NOW + SECOND);
+    let confirmation = fixture.confirmation(4);
+    fixture.wall.set(NOW + 2 * DAY);
+    let guest = AccountId(public(4).0);
+    fixture
+        .finish
+        .execute_with_caller(&caller(4), &finish_args(guest, &confirmation))
+        .expect("a wall step forward does not end the window");
+    assert_eq!(fixture.binding(4), Some(guest));
+
+    // Not stretched: the window has passed on the store's clock while the
+    // wall clock reads the arm time again, as after a step back; the start is
+    // refused as expired.
+    let fixture = Fixture::new();
+    fixture.wall.set(NOW + DAY);
+    fixture.mono.set(NOW + window + 1);
+    fixture.wall.set(NOW);
+    let error = fixture.try_confirmation(4).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "verb error: {}",
+            cerulion_remoted::pairing_verbs::code_expired()
+        )
+    );
+    // The last instant of the window, whatever the wall clock says, is in.
+    let fixture = Fixture::new();
+    fixture.mono.set(NOW + window);
+    fixture.wall.set(NOW + 30 * DAY);
+    fixture.confirmation(4);
 }
