@@ -51,12 +51,14 @@ fn free_port() -> u16 {
 }
 
 fn manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> NetworkManager {
-    NetworkManager::new(NetworkConfig {
+    let manager = NetworkManager::new(NetworkConfig {
         listen_endpoints: listen,
         connect_endpoints: connect,
         auth: Some(NetworkAuth::Team(auth)),
         ..NetworkConfig::default()
-    })
+    });
+    manager.set_lan_access(cerulion_core::LanAccess::Open);
+    manager
 }
 
 /// A manager listening on a fresh loopback `link` locator, its session open,
@@ -343,12 +345,14 @@ fn a_machine_of_another_team_never_links() {
 }
 
 fn bundle_manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> NetworkManager {
-    NetworkManager::new(NetworkConfig {
+    let manager = NetworkManager::new(NetworkConfig {
         listen_endpoints: listen,
         connect_endpoints: connect,
         auth: Some(NetworkAuth::TeamBundleLane(auth)),
         ..NetworkConfig::default()
-    })
+    });
+    manager.set_lan_access(cerulion_core::LanAccess::Open);
+    manager
 }
 
 fn raw_linked(session: &zenoh::Session, budget: Duration) -> bool {
@@ -573,12 +577,14 @@ fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
 }
 
 fn cross_manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> NetworkManager {
-    NetworkManager::new(NetworkConfig {
+    let manager = NetworkManager::new(NetworkConfig {
         listen_endpoints: listen,
         connect_endpoints: connect,
         auth: Some(NetworkAuth::TeamCrossGeneration(auth)),
         ..NetworkConfig::default()
-    })
+    });
+    manager.set_lan_access(cerulion_core::LanAccess::Open);
+    manager
 }
 
 /// A raw session from `m`'s config with `policy` (the session's generated
@@ -779,6 +785,7 @@ fn team_credentials_with_certificate_files_fail_the_open() {
         }),
         ..NetworkConfig::default()
     });
+    m.set_lan_access(cerulion_core::LanAccess::Open);
     let err = m.session().expect_err("both set").to_string();
     assert!(err.contains("remove the graph tls: block"), "{err}");
 }
@@ -811,6 +818,7 @@ fn no_key_material_in_debug_or_serialized_config() {
         ..NetworkConfig::default()
     };
     let m = NetworkManager::new(cfg.clone());
+    m.set_lan_access(cerulion_core::LanAccess::Open);
     let zcfg = m.zenoh_config_for_test().expect("config builds");
     let texts = [
         format!("{cfg:?}"),
@@ -897,6 +905,10 @@ fn gateway_flow(
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init consumer gateway");
+    consumer
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let sub = consumer
         .create_subscriber(&topic)
         .expect("consumer subscriber");
@@ -909,6 +921,10 @@ fn gateway_flow(
         root_a,
     )
     .expect("init producer gateway");
+    gateway
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let mut producer_gw = GatewayRuntime::new(
         gateway,
         GatewayPlan {

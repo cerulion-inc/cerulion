@@ -21,7 +21,7 @@ const ACCOUNT_ROW: &str = concat!(
 // The one-line empty-gather notice; with a ROBOTS section above it a blank line
 // separates the two.
 const EMPTY_LAN: &str =
-    "remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)\n";
+    "remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)\n";
 const EMPTY_REACHABLE: &str =
     "remote: none discovered in 500 ms (a reachable peer advertised no topic in time; retry)\n";
 

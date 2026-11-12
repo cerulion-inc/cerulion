@@ -39,8 +39,8 @@ use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
-    account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, pair_cmd, partition_emit, ros_cmd,
-    schema_cmd, topic_cmd, viz_client, workspace,
+    account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, partition_emit, ros_cmd, schema_cmd,
+    topic_cmd, viz_client, workspace,
 };
 use cli::{
     AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
@@ -54,6 +54,14 @@ use cli::{
 /// the verb moved) and pinned byte-for-byte by
 /// `tests/ros2_attach_verb_test.rs`.
 const ROS_VERB_MOVED_MSG: &str = "`cerulion ros attach` has moved: the verb is now `cerulion ros2 attach` (the `ros` family was folded into `ros2`). Re-run the same invocation with `ros2` in place of `ros`.";
+
+/// The refusal of the hidden `cerulion pair` stub: no robot-side verb arms a
+/// pairing code, so the desk side of the code ceremony cannot complete.
+/// Printed by the `dispatch` intercept ABOVE the kill switch and the login
+/// gate, for every spelling (`cerulion help pair` renders the stub's doc
+/// comment instead), and pinned byte-for-byte by
+/// `tests/local_scope_e2e_test.rs`.
+const PAIR_UNAVAILABLE_MSG: &str = "code pairing is not available in this release; robots on your account are reached by signing in with `cerulion login`";
 
 fn main() -> ExitCode {
     // The shell completion hook, FIRST — before any other statement.
@@ -228,6 +236,13 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
         eprintln!("Error: {ROS_VERB_MOVED_MSG}");
         return ExitCode::from(2);
     }
+    // The hidden `cerulion pair` stub: refused HERE for the same reasons and
+    // with the same code. It reaches no robot and no daemon, so the kill
+    // switch has nothing to refuse and the login gate nothing to protect.
+    if matches!(cli.command, Commands::Pair { .. }) {
+        eprintln!("Error: {PAIR_UNAVAILABLE_MSG}");
+        return ExitCode::from(2);
+    }
 
     // The TUI takes over the terminal and is fragile to anything writing
     // to stderr/stdout out-of-band — every `tracing::info!("transport
@@ -373,14 +388,6 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
         }
     }
 
-    // `cerulion pair` SPAWNS `cerulion-connectd pair` (it links iroh; the
-    // `cerulion` CLI stays iroh-free) and forwards its 0–4 pairing exit code — the
-    // generic run() dispatch (SUCCESS/FAILURE only) cannot express that, so
-    // intercept here like `connect` / `bag play --resim`.
-    if matches!(cli.command, Commands::Pair { .. }) {
-        return pair_exit_code(cli.command);
-    }
-
     // Belt-and-braces for `cerulion ros2` invocations that reached clap
     // anyway (the raw-argv intercept that runs before the clap parse handles
     // every direct spelling): forward the parsed action through the same exec
@@ -424,10 +431,11 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
 
 /// The process exit status for an error a verb returned, built-in or family:
 /// `EXIT_NODE_FATAL` (3) for a run that stopped a node on a fatal error, in
-/// process or in a worker group, and 1 for every other error.
+/// process or in a worker group, 2 for an ambiguous topic, and 1 otherwise.
 fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
+        CliError::AmbiguousTopic(_) => 2,
         CliError::NodeFatal { .. }
         | CliError::WorkerNodeFatal { .. }
         | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
@@ -968,73 +976,6 @@ fn connect_exit_code(command: Commands) -> ExitCode {
             started.elapsed(),
             result.as_ref().map_or(1, |code| i64::from(*code)),
         ),
-    );
-    match result {
-        Ok(code) => ExitCode::from(code as u8),
-        Err(e) => {
-            eprintln!("Error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Resolve + spawn `cerulion-connectd pair`, streaming its stdio,
-/// FORWARDING its 0–4 pairing exit code, and — on a successful pairing — pinning
-/// `name → eid` into `~/.cerulion/robots.toml`. The `cerulion` CLI stays iroh-free
-/// (the CPace ceremony lives entirely in the spawned sibling), exactly as
-/// `cerulion connect` does. A resolution / config error is exit 1 (usage).
-fn pair_exit_code(command: Commands) -> ExitCode {
-    let Commands::Pair {
-        robot,
-        eid,
-        addrs,
-        code,
-        account,
-        label,
-        key_file,
-        relay_url,
-        relay_disabled,
-    } = command
-    else {
-        unreachable!("pair_exit_code is only called for Commands::Pair");
-    };
-    let args = pair_cmd::PairArgs {
-        robot,
-        eid,
-        addrs,
-        code,
-        account,
-        label,
-        key_file,
-        relay_url,
-        relay_disabled,
-    };
-    let plan = match pair_cmd::plan(&args) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            telemetry::emit(
-                telemetry_events::PAIR_COMPLETED,
-                telemetry_events::pair_completed(false),
-            );
-            // A resolution / config failure is exit 1 (usage), matching the
-            // `cerulion-connectd pair` contract.
-            return ExitCode::from(1u8);
-        }
-    };
-    // Same directed-signal forwarding as `connect` (see `connect_exit_code`).
-    let running = match setup_ctrlc_handler() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("warning: could not install a signal handler: {e}");
-            Arc::new(AtomicBool::new(true))
-        }
-    };
-    tracing::info!(bin = %plan.bin.display(), "cerulion pair: spawning cerulion-connectd pair");
-    let result = pair_cmd::spawn_and_pair(&plan, running);
-    telemetry::emit(
-        telemetry_events::PAIR_COMPLETED,
-        telemetry_events::pair_completed(matches!(result, Ok(0))),
     );
     match result {
         Ok(code) => ExitCode::from(code as u8),
@@ -2193,17 +2134,22 @@ fn run(cli: Cli) -> CliResult<()> {
                     &mut std::io::stderr(),
                 )
             }
-            TopicAction::Info { topic, local } => {
+            TopicAction::Info {
+                topic,
+                local,
+                robot,
+            } => {
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so `topic info` resolves + prints the schema NAME
                 // via the same local ladder `topic echo` uses. Workspace-OPTIONAL
                 // (built-ins-only local walker outside a workspace).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                let info = topic_cmd::topic_info_with_scope(
+                let info = topic_cmd::topic_info_with_selection(
                     &topic,
                     schemas_dir,
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )?;
                 println!("{}", info);
                 Ok(())
@@ -2212,6 +2158,7 @@ fn run(cli: Cli) -> CliResult<()> {
                 topic,
                 truncate_length,
                 local,
+                robot,
             } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
@@ -2224,16 +2171,21 @@ fn run(cli: Cli) -> CliResult<()> {
                 // rendered array; narrow the u64 flag to the engine's usize,
                 // saturating (never wrapping) on a hypothetical 32-bit target
                 // where a > usize::MAX bound would just render every element.
-                topic_cmd::topic_echo_with_scope(
+                topic_cmd::topic_echo_with_selection(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     usize::try_from(truncate_length).unwrap_or(usize::MAX),
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )
             }
-            TopicAction::Hz { topic, local } => {
+            TopicAction::Hz {
+                topic,
+                local,
+                robot,
+            } => {
                 let running = setup_ctrlc_handler()?;
                 // Pass the workspace `schemas/` dir (when in a
                 // workspace) so a REMOTE `topic hz` resolves a catalog-named
@@ -2242,12 +2194,13 @@ fn run(cli: Cli) -> CliResult<()> {
                 // `hz` also runs outside a workspace (built-ins-only resolution).
                 let ws = discover_workspace().ok();
                 let schemas_dir = ws.as_ref().map(|w| w.schemas_dir.as_path());
-                topic_cmd::topic_hz_with_scope(
+                topic_cmd::topic_hz_with_selection(
                     &topic,
                     schemas_dir,
                     running,
                     &mut std::io::stdout(),
                     topic_cmd::TopicScope::from_local(local),
+                    robot.as_deref(),
                 )
             }
         },
@@ -2417,11 +2370,6 @@ fn run(cli: Cli) -> CliResult<()> {
         Commands::Connect { .. } => {
             unreachable!("`cerulion connect` is dispatched in main() before run()")
         }
-        // `cerulion pair` never reaches `run()`: `main` intercepts it to
-        // spawn `cerulion-connectd pair` + forward its 0–4 pairing exit code.
-        Commands::Pair { .. } => {
-            unreachable!("`cerulion pair` is dispatched in main() before run()")
-        }
         // `cerulion bagd` never reaches `run()`: `main`
         // dispatches it (unix) or errors (non-unix) before the logging setup.
         #[cfg(unix)]
@@ -2434,6 +2382,10 @@ fn run(cli: Cli) -> CliResult<()> {
         // via the generic FAILURE mapping.
         Commands::Ros { .. } => Err(cerulion_cli_engine::error::CliError::Validation(
             ROS_VERB_MOVED_MSG.to_string(),
+        )),
+        // The hidden `cerulion pair` stub: the same belt-and-braces as `ros`.
+        Commands::Pair { .. } => Err(cerulion_cli_engine::error::CliError::Validation(
+            PAIR_UNAVAILABLE_MSG.to_string(),
         )),
         Commands::Ros2 { action } => match action {
             // `ros2 run|launch|migrate` never reach run() — `main` intercepts
@@ -2511,7 +2463,9 @@ fn run(cli: Cli) -> CliResult<()> {
                 // The live ros2-client/rustdds backend is wired HERE (the
                 // composition root); the engine stays DDS-free over the seam.
                 if !opts.dry_run && !graph_cmd::remote_network_suppressed() {
-                    login_cmd::require_serving_login()?;
+                    login_cmd::require_serving_authority().map_err(|reason| {
+                        cerulion_cli_engine::error::CliError::Login(reason.into())
+                    })?;
                 }
                 let discovery = cerulion_dds::LiveDiscovery;
                 // Compose the production schema-acquisition
@@ -3815,8 +3769,8 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 /// Two more things answer above this gate and therefore need no exemption here:
 /// clap's own `--help` and `--version`, which exit inside the clap parse
 /// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
-/// refusals `main` performs before the gate call (a moved verb, a malformed
-/// resim invocation). You do not have to
+/// refusals `main` performs before the gate call (a moved verb, the hidden
+/// `pair` stub, a malformed resim invocation). You do not have to
 /// prove who you are to be told a command line is wrong.
 ///
 /// The exemptions are:
@@ -3869,8 +3823,8 @@ fn command_needs_identity(command: &Commands) -> bool {
 /// The network kill-switch refusal of a `Commands` verb under `switch`, which
 /// `dispatch` gives before the login gate. Each verb's refusal is the one its
 /// own path gives further down, with the same text and exit code:
-/// `viz --robot` (exit 1) and `pair` (exit 1) under the run and query parse of
-/// `CERULION_NETWORK`, and `viz --robot` under `CERULION_NETD_NETWORK` or
+/// `viz --robot` (exit 1) under the run and query parse of
+/// `CERULION_NETWORK`, and under `CERULION_NETD_NETWORK` or
 /// `CERULION_VIZD_NETWORK` at `off` too; `connect` (a warning, exit 0) when
 /// `--network` or `CERULION_NETWORK` is exactly `off`, the value its helper
 /// reads. Every other verb is not refused here: it runs as without the
@@ -3892,14 +3846,25 @@ fn command_network_refusal(
             )?;
             Some(NetworkRefusal::error(refusal, 1))
         }
-        Commands::Pair { .. } => pair_cmd::network_refusal_from(switch.network.clone())
-            .map(|refusal| NetworkRefusal::error(refusal, 1)),
         Commands::Connect { network, .. } => {
             connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
                 .map(|refusal| NetworkRefusal::warning(refusal, 0))
         }
-        // Dispatched before this check (`main`'s internal workers, `bagd`),
-        // or not refused under the switch: the runs and queries go
+        Commands::Topic { action } => match action {
+            TopicAction::Info { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-info", switch)
+            }
+            TopicAction::Echo { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-echo", switch)
+            }
+            TopicAction::Hz { robot, .. } => {
+                topic_observer_network_refusal(robot.as_deref(), "topic-hz", switch)
+            }
+            TopicAction::List { .. } => None,
+        },
+        // Dispatched before this check (`main`'s internal workers, `bagd`,
+        // the `ros` and `pair` stubs), or not refused under the switch: the
+        // runs and queries go
         // local-only, and the account verbs reach the account service, which
         // the switch does not cover.
         #[cfg(unix)]
@@ -3907,8 +3872,8 @@ fn command_network_refusal(
         Commands::Workspace { .. }
         | Commands::Node { .. }
         | Commands::Graph { .. }
-        | Commands::Topic { .. }
         | Commands::Ros { .. }
+        | Commands::Pair { .. }
         | Commands::Ros2 { .. }
         | Commands::Login
         | Commands::Logout
@@ -3928,6 +3893,19 @@ fn command_network_refusal(
         #[cfg(not(unix))]
         Commands::Bagd => None,
     }
+}
+
+fn topic_observer_network_refusal(
+    robot: Option<&str>,
+    verb: &str,
+    switch: &network_switch::SwitchEnv,
+) -> Option<network_switch::NetworkRefusal> {
+    let robot = robot?;
+    network_switch::robot_refusal(Some(robot), verb, switch).or_else(|| {
+        graph_cmd::netd_network_off_from(switch.netd.as_deref()).then(|| {
+            network_switch::NetworkRefusal::error("remote topic reads are disabled by CERULION_NETD_NETWORK=off; unset CERULION_NETD_NETWORK to read a robot", 2)
+        })
+    })
 }
 
 /// The usage refusal of `cerulion viz --robot` with no TOPIC.
@@ -5346,9 +5324,9 @@ mod cli_error_exit_code_tests {
     use cerulion_cli_engine::error::CliError;
 
     /// A run that stopped a node on a fatal error exits 3, in process or in
-    /// a worker group; every other error exits 1.
+    /// a worker group; ambiguous topics exit 2 and other errors exit 1.
     #[test]
-    fn a_fatal_node_exits_3_and_every_other_error_exits_1() {
+    fn fatal_nodes_exit_3_ambiguous_topics_exit_2_and_other_errors_exit_1() {
         let in_process = CliError::NodeFatal {
             nodes: vec![("lidar".to_string(), "Fatal error: lost".to_string())],
         };
@@ -5358,6 +5336,10 @@ mod cli_error_exit_code_tests {
         assert_eq!(cli_error_exit_code(&in_process), 3);
         assert_eq!(cli_error_exit_code(&worker), 3);
         assert_eq!(cli_error_exit_code(&CliError::WorkerNodeFatalAnnounced), 3);
+        assert_eq!(
+            cli_error_exit_code(&CliError::AmbiguousTopic("candidates".into())),
+            2
+        );
         assert_eq!(
             cli_error_exit_code(&CliError::Validation("x".to_string())),
             1

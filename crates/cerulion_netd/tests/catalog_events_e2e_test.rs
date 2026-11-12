@@ -287,6 +287,7 @@ impl Client {
                 }
                 ControlLine::Event(_) => continue,
                 ControlLine::Unknown(t) => panic!("unclassifiable line: {t}"),
+                ControlLine::MirrorLost(event) => panic!("unexpected reader loss: {event:?}"),
             }
         }
         panic!("no subscribe response within {PROTOCOL_READ_TIMEOUT:?}");

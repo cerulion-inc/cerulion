@@ -196,7 +196,10 @@ pub fn prepare(state_root: &Path) -> CliResult<BootstrapPrepared> {
     create_state_root(state_root)?;
     let metadata = fs::symlink_metadata(state_root)?;
     if metadata.uid() != cerulion_hygiene::euid() || metadata.mode() & 0o077 != 0 {
-        return Err(refused("the robot state directory must be owner-only"));
+        let directory = state_root.to_string_lossy().replace('\'', "'\\''");
+        return Err(refused(&format!(
+            "the robot state directory must be owner-only; run `chmod 700 '{directory}'`"
+        )));
     }
     let bundle_path = state_root.join(BUNDLE_FILE);
     auth::with_store_lock(&bundle_path, || Ok(prepare_locked(&bundle_path, initial)))?
@@ -232,6 +235,7 @@ fn prepare_locked(bundle_path: &Path, initial: LoginSnapshot) -> CliResult<Boots
     if session != before.state.session_token {
         return Err(refused("the session changed before robot registration"));
     }
+    login_cmd::enroll_device_once_within(crate::account_robots::LISTING_FETCH_BUDGET)?;
     let proof = owner_certificate::load()?;
     let hostname = cerulion_core::graph::robot_identity_from_env();
     let registration = robot_cmd::register_robot(&session, &hostname)?;

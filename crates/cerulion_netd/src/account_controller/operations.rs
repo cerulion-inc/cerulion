@@ -5,6 +5,7 @@ use super::*;
 use crate::account_access::{AccountAccessReply, AccountAccessRequest, RobotPresence};
 use crate::iroh_plane::RobotProbeOutcome;
 use crate::mirror::{MirrorError, MirrorRelease};
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 
 impl AccountWanController {
     fn account_robot<'a>(
@@ -41,10 +42,16 @@ impl AccountWanController {
         action: &AccountAccessRequest,
     ) -> Result<AccountAccessReply, String> {
         action.validate()?;
+        if let AccountAccessRequest::Discover { budget_ms } = action {
+            return self
+                .discover(Duration::from_millis(*budget_ms))
+                .map(|robots| AccountAccessReply::Discovery { robots });
+        }
         let (robot_id, budget) = match action {
-            AccountAccessRequest::Install { .. } => {
+            AccountAccessRequest::Install { .. } | AccountAccessRequest::InstallPaired { .. } => {
                 return Err("account installation requires daemon registry coordination".into())
             }
+            AccountAccessRequest::Discover { .. } => unreachable!("discovery returned above"),
             AccountAccessRequest::Probe {
                 robot_id,
                 budget_ms,
@@ -92,7 +99,9 @@ impl AccountWanController {
             AccountAccessRequest::Schema { topic, .. } => plane
                 .query_schema(&route, topic, remaining(deadline)?)
                 .map(|schema| AccountAccessReply::Schema { robot_id, schema }),
-            AccountAccessRequest::Install { .. } => {
+            AccountAccessRequest::Install { .. }
+            | AccountAccessRequest::InstallPaired { .. }
+            | AccountAccessRequest::Discover { .. } => {
                 unreachable!("install was refused before identity and I/O")
             }
         };
@@ -156,6 +165,122 @@ impl AccountWanController {
         Ok(schema)
     }
 
+    fn restore_readers(&self, state: &mut State, deadline: Instant) -> Result<(), String> {
+        let Some(mut readers) = state.handover.take() else {
+            return Ok(());
+        };
+        {
+            let pins = self.pins()?;
+            readers.retain(|(key, hash)| {
+                pins.get(key).is_some_and(|pin| {
+                    pin.route == Route::Wan && pin.live && pin.schema_hash == *hash
+                })
+            });
+        }
+        // A producer with no outbound readers has nothing to migrate. Its child
+        // serves incoming access independently; outbound control opens on demand.
+        if readers.is_empty() {
+            return Ok(());
+        }
+        let mut sync_failures = FailureRegimeLatch::new();
+        let ready = match self.sync_identity(state) {
+            Err(error) => Err(error),
+            Ok(()) if state.serving_gateway => loop {
+                let result = self.ensure_plane(state).and_then(|plane| {
+                    plane
+                        .synchronize_shared_endpoint_until(deadline)
+                        .map(|_| ())
+                });
+                match result {
+                    Ok(()) => break Ok(()),
+                    Err(error) if Instant::now() >= deadline => break Err(error),
+                    Err(error) => {
+                        if !matches!(
+                            sync_failures.on_failure(),
+                            RegimeDecision::Suppressed { .. }
+                        ) {
+                            tracing::debug!(error = %error, total_failures = sync_failures.total_failures(),
+                                "outbound shared endpoint synchronization is waiting");
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            },
+            Ok(()) => Ok(()),
+        };
+        let mut first_error = None;
+        let mut failed = BTreeSet::new();
+        let mut restored_keys: BTreeSet<TopicKey> = BTreeSet::new();
+        if ready.is_ok() {
+            // Sync precedes every Ensure on this new endpoint. A failed earlier
+            // Sync owned no restored readers; its recovered framing loss must not
+            // retire readers that will be admitted on the fresh connection below.
+            if let Some(plane) = &state.plane {
+                plane.take_shared_transport_loss();
+            }
+        }
+        for (key, hash) in readers {
+            if !self
+                .pins()?
+                .get(&key)
+                .is_some_and(|pin| pin.route == Route::Wan && pin.live && pin.schema_hash == hash)
+            {
+                continue;
+            }
+            let restored = match &ready {
+                Ok(()) if restoration_time_left(deadline, Instant::now()).is_some() => self
+                    .ensure_plane(state)
+                    .and_then(|plane| plane.ensure_mirror_until(&key, hash, deadline)),
+                Ok(()) => Err("outbound reader restoration exceeded its time budget".into()),
+                Err(error) => Err(error.clone()),
+            };
+            if let Err(error) = restored {
+                tracing::debug!(robot = %key.robot, topic = %key.topic, observer = key.observer,
+                    serving = state.serving_gateway, error = %error, "outbound reader pin restoration failed");
+                if let Some(plane) = state
+                    .plane
+                    .as_ref()
+                    .filter(|plane| !plane.shares_owned_endpoint())
+                {
+                    // Native cancellation closes the affected robot/mode wire
+                    // connection, so earlier successes on it may also be lost.
+                    // This is an in-memory check, not another restoration attempt.
+                    for previous in &restored_keys {
+                        if previous.robot == key.robot
+                            && previous.observer == key.observer
+                            && !plane.has_reader(previous).unwrap_or(false)
+                        {
+                            failed.insert(previous.clone());
+                        }
+                    }
+                }
+                failed.insert(key.clone());
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "remote mirror lost for robot '{}' topic '{}': {error}",
+                        key.robot, key.topic
+                    )
+                });
+            } else {
+                restored_keys.insert(key);
+            }
+        }
+        if state
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.take_shared_transport_loss())
+        {
+            // A partially framed persistent exchange fences every shared reader,
+            // including pins restored before the failing exchange.
+            state.pending_all = true;
+            first_error.get_or_insert_with(|| {
+                "outbound readers lost their shared control transport during restoration".into()
+            });
+        }
+        state.pending_restores.extend(failed);
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn failed_robot(&self, state: &mut State, robot: &str) -> Result<(), String> {
         state.pending_robots.insert(robot.into());
         if let Some(plane) = state.plane.as_ref() {
@@ -172,6 +297,103 @@ impl AccountWanController {
 }
 
 impl MirrorPlane for AccountWanController {
+    fn begin_serving(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "account robot controller state is poisoned")?;
+        if state.handover.is_some() {
+            return Ok(());
+        }
+        // Keep the registry generation, holders and schema pins while endpoint
+        // ownership changes. Only failed restorations retire a demanded key.
+        state.handover = Some(
+            self.pins()?
+                .iter()
+                .filter(|(_, pin)| pin.route == Route::Wan && pin.live)
+                .map(|(key, pin)| (key.clone(), pin.schema_hash))
+                .collect(),
+        );
+        state.serving_gateway = true;
+        let proof = state.registry.owner_certificate()?;
+        let cleanup = state
+            .plane
+            .take()
+            .map_or(Ok(()), |plane| plane.invalidate_account());
+        let restored = state.registry.replace_owner_certificate(proof);
+        cleanup.and(restored)
+    }
+
+    fn serving_ready(&self) -> Result<(), String> {
+        let deadline = Instant::now() + RESTORATION_BUDGET;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("account robot controller state is poisoned".into());
+            }
+            Err(TryLockError::WouldBlock) => {
+                // begin_serving already retired the previous endpoint. Do not
+                // wait for unrelated metadata I/O before supervising the child.
+                // Registry retirement observes these canceled pins independently.
+                let mut first = None;
+                for (key, pin) in self.pins()?.iter_mut() {
+                    if pin.route == Route::Wan && pin.live {
+                        pin.live = false;
+                        first.get_or_insert_with(|| format!(
+                            "remote mirror lost for robot '{}' topic '{}': controller busy during restoration",
+                            key.robot, key.topic
+                        ));
+                    }
+                }
+                return first.map_or(Ok(()), Err);
+            }
+        };
+        self.restore_readers(&mut state, deadline)
+    }
+
+    fn holds_outbound_readers(&self) -> bool {
+        // Busy is not evidence that an idle stop is safe. The shared plane also
+        // retains a native admission hold, which closes the sampled-check race.
+        let Ok(state) = self.state.try_lock() else {
+            return true;
+        };
+        if !state.serving_gateway {
+            return false;
+        }
+        self.pins.try_lock().map_or(true, |pins| {
+            pins.values().any(|pin| pin.route == Route::Wan && pin.live)
+        })
+    }
+
+    fn end_serving(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if !state.serving_gateway && state.handover.is_none() {
+            return;
+        }
+        let readers = self.pins().map(|pins| {
+            pins.iter()
+                .filter(|(_, pin)| pin.route == Route::Wan && pin.live)
+                .map(|(key, pin)| (key.clone(), pin.schema_hash))
+                .collect()
+        });
+        if let Ok(readers) = readers {
+            state.handover = Some(readers);
+        }
+        let proof = state.registry.owner_certificate();
+        if let Some(plane) = state.plane.take() {
+            let _cleanup = plane.invalidate_account();
+        }
+        if let Ok(proof) = proof {
+            let _restored = state.registry.replace_owner_certificate(proof);
+        }
+        state.serving_gateway = false;
+        if let Err(error) = self.restore_readers(&mut state, Instant::now() + RESTORATION_BUDGET) {
+            tracing::warn!(error = %error, "outbound reader restoration failed after serving stopped");
+        }
+    }
+
     fn account_access(&self, action: &AccountAccessRequest) -> Result<AccountAccessReply, String> {
         self.account_operation(action)
     }
@@ -195,8 +417,38 @@ impl MirrorPlane for AccountWanController {
         self.named_schema(robot_id, requested)
     }
 
+    fn install_paired_robots(
+        &self,
+        robots: &[crate::account_access::PairedRobot],
+        registry: &mut DemandRegistry,
+    ) -> Result<(), String> {
+        self.install_paired(robots, registry)
+    }
+
+    fn paired_catalog(&self, robot: &str) -> Option<Result<CatalogReply, String>> {
+        self.paired_metadata(robot, None)
+            .map(|result| result.map(|(catalog, _)| catalog))
+    }
+
+    fn paired_schema(&self, robot: &str, requested: &str) -> Option<Result<SchemaReply, String>> {
+        self.paired_metadata(robot, Some(requested)).map(|result| {
+            result.and_then(|(_, schema)| {
+                schema.ok_or_else(|| "paired schema response was absent".into())
+            })
+        })
+    }
+
     fn refresh_identity(&self, registry: &mut DemandRegistry) -> Result<(), String> {
         self.refresh(registry)
+    }
+
+    /// Observer channel on WAN; legacy LAN mirrors keep their canonical channel.
+    fn local_channel(&self, key: &TopicKey) -> String {
+        if matches!(self.route(key), Ok(Route::Wan)) {
+            key.local_topic()
+        } else {
+            key.topic.clone()
+        }
     }
 
     /// The route this controller PINNED when it ensured the mirror, never the route
@@ -209,7 +461,7 @@ impl MirrorPlane for AccountWanController {
     /// one row cannot be attributed would lose the rows that can be, and the caller
     /// already has to handle unknown for every older daemon.
     fn serving_plane(&self, key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
-        match self.pins().ok()?.get(key)? {
+        match self.pins().ok()?.get(key)?.route {
             Route::Lan => Some(crate::protocol::ServingPlane::Zenoh),
             Route::Wan => Some(crate::protocol::ServingPlane::Iroh),
         }
@@ -221,6 +473,9 @@ impl MirrorPlane for AccountWanController {
         }
         self.network_allowed()?;
         let mut state = self.state()?;
+        if state.handover.is_some() {
+            return Err(BUSY.into());
+        }
         self.retire_pending(&mut state, registry)?;
         let result = self.sync_identity(&mut state);
         self.retire_pending(&mut state, registry)?;
@@ -228,7 +483,11 @@ impl MirrorPlane for AccountWanController {
         if state.registry.get(&key.robot)?.is_none() {
             return Err("robot has no current pinned WAN endpoint".into());
         }
-        if self.pins()?.get(key) == Some(&Route::Wan) {
+        if self
+            .pins()?
+            .get(key)
+            .is_some_and(|pin| pin.route == Route::Wan)
+        {
             let live = state
                 .plane
                 .as_ref()
@@ -251,6 +510,9 @@ impl MirrorPlane for AccountWanController {
             self.lan.ensure_mirror(key, schema_hash)?;
         } else {
             let mut state = self.state().map_err(wan_error)?;
+            if state.handover.is_some() {
+                return Err(wan_error(BUSY.into()));
+            }
             self.sync_identity(&mut state).map_err(wan_error)?;
             let stamp = state
                 .identity
@@ -268,12 +530,25 @@ impl MirrorPlane for AccountWanController {
                 }
             }
             if let Err(error) = result {
-                self.failed_robot(&mut state, &key.robot)
-                    .map_err(wan_error)?;
+                if !state
+                    .plane
+                    .as_ref()
+                    .is_some_and(IrohMirrorPlane::shares_owned_endpoint)
+                {
+                    self.failed_robot(&mut state, &key.robot)
+                        .map_err(wan_error)?;
+                }
                 return Err(error);
             }
         }
-        self.pins().map_err(wan_error)?.insert(key.clone(), route);
+        self.pins().map_err(wan_error)?.insert(
+            key.clone(),
+            Pin {
+                route,
+                schema_hash,
+                live: true,
+            },
+        );
         Ok(())
     }
 
@@ -285,12 +560,22 @@ impl MirrorPlane for AccountWanController {
         if route == Route::Lan {
             return self.lan.release_mirror(key);
         }
+        // Record the last holder's departure even while migration owns the WAN
+        // state. Restoration must never revive a reader released in that window.
+        if let Ok(mut pins) = self.pins() {
+            if let Some(pin) = pins.get_mut(key) {
+                pin.live = false;
+            }
+        }
         let Ok(state) = self.state() else {
             return MirrorRelease::Lingering;
         };
         // A full invalidation or failed-robot cleanup already closed the physical
         // reader. Keep the pin until the daemon confirms registry retirement.
-        if state.pending_all || state.pending_robots.contains(&key.robot) {
+        if state.pending_all
+            || state.pending_robots.contains(&key.robot)
+            || state.pending_restores.contains(key)
+        {
             return MirrorRelease::Retired;
         }
         state
