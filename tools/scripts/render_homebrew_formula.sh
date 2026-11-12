@@ -121,12 +121,14 @@ class Cerulion < Formula
 
     # Homebrew runs the install with HOME pointing at a directory it deletes
     # afterwards, so a formula cannot put a Rust toolchain in the home folder
-    # of the person installing it. Carry the archive's own setup helper, which
-    # installs current stable Rust (1.95 or newer), and hand over one command
-    # instead.
+    # of the person installing it. Carry the archive's own setup helper and
+    # the compiler fingerprint it reads, and hand over one command instead.
     helper = Dir["{,*/}install_rust.sh"].find { |candidate| File.file?(candidate) }
+    metadata = Dir["{,*/}rustc-version.txt"].find { |candidate| File.file?(candidate) }
+    odie "release archive carries only part of its Rust setup" if helper.nil? != metadata.nil?
     if helper
       libexec.install helper
+      libexec.install metadata
       (bin/"cerulion-install-rust").write <<~WRAPPER
         #!/bin/sh
         if [ "\$#" -ne 0 ]; then
@@ -136,7 +138,7 @@ class Cerulion < Formula
         # The helper speaks for the archive installer, whose failure arms say
         # the Cerulion binaries were left alone. Here they are already
         # installed and nothing was staged to replace, so say what happened.
-        /bin/sh "#{opt_libexec}/install_rust.sh"
+        /bin/sh "#{opt_libexec}/install_rust.sh" "#{opt_libexec}/rustc-version.txt"
         status=\$?
         if [ "\$status" -ne 0 ]; then
             echo "The Cerulion programs are installed; only the compiler setup failed." >&2
@@ -153,8 +155,8 @@ class Cerulion < Formula
   # command before anyone installs anything.
   def caveats
     <<~TEXT
-      Running Cerulion needs nothing further. Building your own nodes needs
-      Rust 1.95 or newer. Install current stable Rust with:
+      Running Cerulion needs nothing further. Building your own nodes needs the
+      Rust 1.95 or newer. Install the tested toolchain with:
 
         cerulion-install-rust
 

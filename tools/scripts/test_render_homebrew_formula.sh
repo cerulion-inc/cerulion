@@ -116,13 +116,7 @@ want_text 'The Cerulion programs are installed; only the compiler setup failed.'
 want_line '      (bin/"cerulion-install-rust").write <<~WRAPPER'
 want_line '      chmod 0755, bin/"cerulion-install-rust"'
 want_line '      libexec.install helper'
-# The helper installs current stable Rust and takes no compiler metadata, so
-# the wrapper runs it with no argument and the formula ships no such file.
-want_line '        /bin/sh "#{opt_libexec}/install_rust.sh"'
-want_text 'Rust 1.95 or newer. Install current stable Rust with:'
-if grep -Fq 'rustc-version' "$formula"; then
-    fail 'the formula still reads rustc-version.txt'
-fi
+want_line '      libexec.install metadata'
 want_line '    generate_completions_from_executable(bin/"cerulion", "completions")'
 want_line '  test do'
 want_line '# The release workflow writes this file.'

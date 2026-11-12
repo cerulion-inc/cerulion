@@ -1,100 +1,27 @@
 #!/bin/sh
-# Makes Rust 1.95 or newer available for building nodes. Bundled inside the
-# checksummed release archive and invoked before binary activation; the Debian
-# package and the Homebrew formula run it behind `cerulion-install-rust`.
-# An existing rustup default is never changed.
+# Bundled inside the checksummed release archive; invoked before binary activation.
 set -eu
-
-# The workspace MSRV: `rust-version` in the root Cargo.toml.
-# tools/scripts/test_install_rust.sh fails when the two differ.
-rust_floor=1.95
-floor_major=${rust_floor%%.*}
-floor_minor=${rust_floor#*.}
 
 die() {
     printf 'error: %s\n' "$*" >&2
     exit 1
 }
 
-[ "$#" -eq 0 ] || die "usage: install_rust.sh"
+[ "$#" -eq 1 ] || die "usage: install_rust.sh RUSTC_VERSION_FILE"
+[ -f "$1" ] || die "release archive is missing its Rust compiler metadata"
+metadata=$1
+release=$(awk '/^release: / { count++; value=$2; if (NF != 2) invalid=1 } END { if (count != 1 || invalid) exit 1; print value }' "$metadata") ||
+    die "release archive has invalid Rust release metadata"
+commit=$(awk '/^commit-hash: / { count++; value=$2; if (NF != 2) invalid=1 } END { if (count != 1 || invalid) exit 1; print value }' "$metadata") ||
+    die "release archive has invalid Rust compiler fingerprint"
+printf '%s\n' "$release" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+    die "release archive requires an unsupported Rust toolchain: $release"
+printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{40}$' ||
+    die "release archive has invalid Rust compiler fingerprint"
 
 cargo_home=${CARGO_HOME:-${HOME:?set HOME or CARGO_HOME to install Rust}/.cargo}
 rustup_home=${RUSTUP_HOME:-${HOME:?set HOME or RUSTUP_HOME to install Rust}/.rustup}
-# Absolute, so the probes below can run from / and still find them.
-case $cargo_home in /*) ;; *) cargo_home=$(pwd)/$cargo_home ;; esac
-case $rustup_home in /*) ;; *) rustup_home=$(pwd)/$rustup_home ;; esac
 export CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home"
-
-# Succeeds when release $1 is Rust $rust_floor or newer. The release must be
-# MAJOR.MINOR.PATCH; a pre-release or build suffix (1.96.0-nightly,
-# 1.95.0-beta.2) is ignored, as Cargo ignores it when it checks `rust-version`.
-meets_floor() {
-    floor_core=${1%%[-+]*}
-    case "$floor_core" in
-        '' | *[!0-9.]* | .* | *. | *..*) return 1 ;;
-    esac
-    floor_got_major=${floor_core%%.*}
-    floor_rest=${floor_core#*.}
-    floor_got_minor=${floor_rest%%.*}
-    floor_got_patch=${floor_rest#*.}
-    [ "$floor_rest" != "$floor_core" ] && [ "$floor_got_patch" != "$floor_rest" ] || return 1
-    case "$floor_got_patch" in *.*) return 1 ;; esac
-    [ "$floor_got_major" -gt "$floor_major" ] ||
-        { [ "$floor_got_major" -eq "$floor_major" ] && [ "$floor_got_minor" -ge "$floor_minor" ]; }
-}
-
-# Runs a Rust command as a probe: from /, so no toolchain file in the current
-# directory applies, and with rustup's automatic install of a missing
-# toolchain turned off (RUSTUP_AUTO_INSTALL=0).
-probe() {
-    (cd / && RUSTUP_AUTO_INSTALL=0 "$@")
-}
-
-# Prints the one `release:` line of the `rustc -vV` the arguments run; fails
-# when the command fails or reports no single release.
-rustc_release() {
-    rustc_release_output=$(probe "$@" -vV 2>/dev/null) || return 1
-    rustc_release_value=$(printf '%s\n' "$rustc_release_output" | sed -n 's/^release: //p')
-    [ -n "$rustc_release_value" ] || return 1
-    case "$rustc_release_value" in *'
-'*) return 1 ;; esac
-    printf '%s\n' "$rustc_release_value"
-}
-
-# Prints $1 as an absolute path.
-absolute() {
-    case $1 in
-        /*) printf '%s\n' "$1" ;;
-        *) printf '%s/%s\n' "$(pwd)" "$1" ;;
-    esac
-}
-
-# Prints the release when the Rust that will build nodes reports Rust
-# $rust_floor or newer and has a cargo that runs. While Cargo's home is not on
-# PATH and holds both programs, that is its Rust, since the installer puts the
-# directory first on PATH; otherwise it is the one PATH finds.
-ready_release() {
-    case ":$PATH:" in
-        *":$cargo_home/bin:"*) ready_home_first=0 ;;
-        *) ready_home_first=1 ;;
-    esac
-    if [ "$ready_home_first" -eq 1 ] && [ -x "$cargo_home/bin/rustc" ] && [ -x "$cargo_home/bin/cargo" ]; then
-        set -- "$cargo_home/bin/rustc" "$cargo_home/bin/cargo"
-    elif ready_rustc=$(command -v rustc 2>/dev/null) && ready_cargo=$(command -v cargo 2>/dev/null); then
-        set -- "$(absolute "$ready_rustc")" "$(absolute "$ready_cargo")"
-    else
-        return 1
-    fi
-    ready_value=$(rustc_release "$1") && meets_floor "$ready_value" &&
-        probe "$2" --version >/dev/null 2>&1 || return 1
-    printf '%s\n' "$ready_value"
-}
-
-# A usable Rust is left exactly as it is: no lock, no install, no file.
-if release=$(ready_release); then
-    printf 'Rust/Cargo %s is ready.\n' "$release"
-    exit 0
-fi
 
 # Different Cerulion destinations can share either Rust home. Always lock the
 # Rustup home first, then the Cargo home, before inspecting any shared state.
@@ -192,44 +119,51 @@ else
         [ -e "$cargo_home/bin/cargo" ] || [ -L "$cargo_home/bin/cargo" ] ||
         [ -e "$cargo_home/bin/rustc" ] || [ -L "$cargo_home/bin/rustc" ] ||
         [ -e "$cargo_home/bin/rustup" ] || [ -L "$cargo_home/bin/rustup" ]; then
-        die "Rust/Cargo is installed without rustup but is not a working Rust $rust_floor or newer with Cargo; upgrade or repair it with the tool that installed it, or install rustup explicitly to add current stable Rust without replacing your existing installation"
+        die "Rust/Cargo is installed without rustup; install rustup explicitly to add Rust $release without replacing your existing installation"
     fi
     temp=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-rust.XXXXXX") ||
         die "could not create Rust bootstrap directory"
-    printf '%s\n' 'Installing current stable Rust/Cargo with rustup'
+    printf 'Installing Rust/Cargo %s with rustup\n' "$release"
     # Plain --retry, which every curl accepts (--retry-all-errors needs 7.71).
     # --connect-timeout and --max-time bound one attempt, so a stalled
     # connection times out and is retried.
     curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 \
         --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o "$temp/rustup-init.sh" ||
         die "could not download the official rustup installer"
-    sh "$temp/rustup-init.sh" -y --profile minimal --default-toolchain stable --no-modify-path ||
+    sh "$temp/rustup-init.sh" -y --profile minimal --default-toolchain "$release" --no-modify-path ||
         die "Rust/Cargo installation failed; Cerulion binaries have not been replaced"
     rustup=$cargo_home/bin/rustup
     [ -x "$rustup" ] || die "rustup did not install into $cargo_home/bin"
 fi
+
+cargo_version_matches() {
+    case "$1" in
+        "cargo $release"|"cargo $release ("*")") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+compiler_matches() {
+    compiler=$("$rustup" run "$release" rustc -vV 2>/dev/null) || return 1
+    actual_release=$(printf '%s\n' "$compiler" | sed -n 's/^release: //p')
+    actual_commit=$(printf '%s\n' "$compiler" | sed -n 's/^commit-hash: //p')
+    [ "$actual_release" = "$release" ] && [ "$actual_commit" = "$commit" ] || return 1
+    actual_cargo=$("$rustup" run "$release" cargo --version 2>/dev/null) || return 1
+    cargo_version_matches "$actual_cargo"
+}
+
+if ! compiler_matches; then
+    printf 'Adding Rust/Cargo %s alongside existing toolchains\n' "$release"
+    "$rustup" toolchain install "$release" --profile minimal --no-self-update ||
+        die "could not install Rust/Cargo $release; Cerulion binaries have not been replaced"
+fi
+compiler_matches ||
+    die "installed Rust toolchain does not match the release fingerprint or Cargo version; Cerulion binaries have not been replaced"
+# A PATH-installed rustup need not have proxies in a custom Cargo home. Add
+# only absent paths; never replace an existing executable or dangling symlink.
 rustup_dir=$(CDPATH='' cd -- "$(dirname -- "$rustup")" && pwd) ||
     die "could not locate the selected rustup executable"
 rustup="$rustup_dir/${rustup##*/}"
-
-# An installed stable at or above the floor is reused; `rustup run` never
-# installs a missing toolchain.
-if stable=$(rustc_release "$rustup" run stable rustc) && meets_floor "$stable"; then
-    :
-else
-    printf '%s\n' 'Adding current stable Rust/Cargo alongside existing toolchains'
-    "$rustup" toolchain install stable --profile minimal --no-self-update ||
-        die "could not install stable Rust/Cargo; Cerulion binaries have not been replaced"
-    stable=$(rustc_release "$rustup" run stable rustc) ||
-        die "rustup installed stable Rust, but its rustc reports no release; Cerulion binaries have not been replaced"
-    meets_floor "$stable" ||
-        die "stable Rust from rustup is $stable, older than Rust $rust_floor; Cerulion binaries have not been replaced"
-fi
-stable_cargo=$("$rustup" run stable cargo --version 2>/dev/null) ||
-    die "stable Rust has no usable Cargo; Cerulion binaries have not been replaced"
-
-# A PATH-installed rustup need not have proxies in a custom Cargo home. Add
-# only absent paths; never replace an existing executable or dangling symlink.
 mkdir -p "$cargo_home/bin"
 for proxy in rustup cargo rustc; do
     proxy_path=$cargo_home/bin/$proxy
@@ -237,34 +171,16 @@ for proxy in rustup cargo rustc; do
         ln -s "$rustup" "$proxy_path" || die "could not create Rust proxy: $proxy_path"
     fi
 done
-proxy_compiler=$(RUSTUP_TOOLCHAIN=stable "$cargo_home/bin/rustc" -vV) ||
+proxy_compiler=$(RUSTUP_TOOLCHAIN="$release" "$cargo_home/bin/rustc" -vV) ||
     die "Cargo home's rustc proxy is unusable; existing files were preserved"
 proxy_release=$(printf '%s\n' "$proxy_compiler" | sed -n 's/^release: //p')
-[ "$proxy_release" = "$stable" ] ||
-    die "Cargo home's rustc proxy does not select stable Rust; existing files were preserved"
-proxy_cargo=$(RUSTUP_TOOLCHAIN=stable "$cargo_home/bin/cargo" --version) ||
+proxy_commit=$(printf '%s\n' "$proxy_compiler" | sed -n 's/^commit-hash: //p')
+if [ "$proxy_release" != "$release" ] || [ "$proxy_commit" != "$commit" ]; then
+    die "Cargo home's rustc proxy does not select the release compiler; existing files were preserved"
+fi
+proxy_cargo=$(RUSTUP_TOOLCHAIN="$release" "$cargo_home/bin/cargo" --version) ||
     die "Cargo home's cargo proxy is unusable; existing files were preserved"
-[ "$proxy_cargo" = "$stable_cargo" ] ||
-    die "Cargo home's cargo proxy does not match stable Rust's Cargo; existing files were preserved"
-
-# Only a missing default becomes stable; an existing one stays as it is. This
-# comes after every refusal above, so a refused run leaves the default alone.
-default_toolchain=
-if default_output=$("$rustup" default 2>/dev/null); then
-    default_toolchain=$(printf '%s\n' "$default_output" | awk 'NR == 1 { print $1 }')
-fi
-if [ -z "$default_toolchain" ]; then
-    "$rustup" default stable >/dev/null ||
-        die "could not make stable Rust the default toolchain"
-    default_toolchain=stable
-fi
-
-if default_release=$(rustc_release "$rustup" run "$default_toolchain" rustc) &&
-    meets_floor "$default_release"; then
-    printf 'Rust/Cargo %s is ready.\n' "$default_release"
-else
-    # shellcheck disable=SC2016  # the backticks are literal text for the reader
-    printf 'Rust %s or newer is now installed as `stable`, and your default toolchain was kept. Select stable with `rustup default stable`, or for one build with `RUSTUP_TOOLCHAIN=stable cerulion node build <node>`.\n' \
-        "$rust_floor"
-fi
+[ "$proxy_cargo" = "$actual_cargo" ] ||
+    die "Cargo home's cargo proxy does not match the release toolchain's Cargo; existing files were preserved"
+printf 'Rust/Cargo %s is ready. Existing rustup defaults are preserved.\n' "$release"
 printf 'Cargo executables: %s/bin\n' "$cargo_home"
