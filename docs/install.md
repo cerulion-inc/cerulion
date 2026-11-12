@@ -68,7 +68,7 @@ Building nodes needs a C toolchain, installed before rustup. On Debian and Ubunt
 
 ## Build nodes with a supported Rust compiler
 
-Nodes use stable boundary major 1 and load across Rust compiler versions. Build them with Rust 1.95 or newer and the C toolchain described above. The compiler does not have to match the CLI. To move a workspace made by Cerulion 1.0, follow the migration steps in the [2.0.0 release notes](../CHANGELOG.md#200---2026-11-12): change its `=1.0.0` pins to `=2.0.0`, then run `cerulion node build <node>` once per node. The loader names that rebuild for any library built against an earlier node interface.
+Nodes use stable boundary major 1 and load across Rust compiler versions. Build them with Rust 1.95 or newer and the C toolchain described above. The compiler does not have to match the CLI. To move a workspace made by Cerulion 1.0, follow the migration steps in the [2.0.0 release notes](../CHANGELOG.md#200---2026-11-12), which end with one `cerulion node build <node>` per node. The loader names that rebuild for any library built against an earlier node interface.
 
 A new workspace names no compiler: `cerulion workspace create` and `cerulion workspace init` write no `rust-toolchain.toml`, so Cargo and rustup select one as they do anywhere else. A toolchain file you add, and rustup overrides, keep their usual precedence, and an existing toolchain file is left as it is.
 
