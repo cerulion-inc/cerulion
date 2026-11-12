@@ -23,10 +23,10 @@ arm_sim node ──► /rcp/results  (the answer to each call)
   the calls it has received (`nodes/arm_sim/src/plant.rs`), which is what lets
   a replay recompute it.
 - **`rcp.yaml`** is the agent's whole view of the robot. The tools are
-  `arm.reset` and `arm.step`, plus the built-in `estop`; anything else does not
-  exist. Arguments are checked against each tool's schema before anything is
-  published, and each call writes a hash-chained receipt to disk before it
-  reaches the graph.
+  `arm.reset` and `arm.step`, plus the built-in `estop` and `estop_clear`;
+  anything else does not exist. Arguments are checked against each tool's
+  schema before anything is published, and each call writes a hash-chained
+  receipt to disk before it reaches the graph.
 - **The agent side** is a program you supply that speaks MCP to
   `cerulion-rcpd --stdio` and turns each control period into one `arm.step`
   call. `run_demo.sh` is written for a `cerulion` embodiment of
@@ -96,9 +96,12 @@ never reaches, such as the joint limit, changes nothing the bag can show.)
 - The replay check is for the machine and build that recorded the bag. The
   plant uses `f64` trigonometry from the platform's math library, so another
   platform can differ in the last bit.
-- `estop` closes a latch in `cerulion-rcpd` and writes it to
-  `<receipts>.estop`; every later motion call is refused until an operator
-  deletes that file and restarts the daemon. `arm_sim` latches too, until its
-  next `arm.reset`.
+- `estop` closes a latch in `cerulion-rcpd`, writes it to `<receipts>.estop`
+  and publishes an e-stop frame on `/rcp/calls`. `arm_sim` acts on that frame:
+  it zeroes its joint velocities and refuses every step until its next
+  `arm.reset`. rcpd refuses every later motion call until its latch is
+  cleared: call `estop_clear` (this `rcp.yaml` sets no `limits`, so the tool
+  is listed), or delete that file and restart `cerulion-rcpd`. Then call
+  `arm.reset`.
 - The receipt log records refused calls as well as published ones; the
   recording holds only the calls that reached the graph.
