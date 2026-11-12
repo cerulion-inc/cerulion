@@ -81,6 +81,9 @@ case "$1" in
         esac
         ;;
     toolchain)
+        # rustup 1.29 makes the first toolchain it installs the default; this
+        # one never sets a default, so a fresh install here runs the helper's
+        # own `default stable` step, which covers a rustup that does not.
         [ "$*" = 'toolchain install stable --profile minimal --no-self-update' ] || unexpected "$@"
         [ "${FIXTURE_FAIL_INSTALL:-0}" = 0 ] || exit 1
         # A fresh install has paused in the bootstrap already.
@@ -115,7 +118,8 @@ EOF
 # official installer does with `--default-toolchain none`. Like rustup 1.29 it
 # prints its info lines on stderr, and its post-install note and the cc
 # crate's build-script lines from its linker check on stdout. A failing one
-# prints the same, then its error, and exits 1.
+# prints the same, then its error, and exits 7, a status of its own, so the
+# helper's exit 1 is the helper's choice.
 cat > "$tools/curl" <<'EOF'
 #!/bin/sh
 set -eu
@@ -137,7 +141,7 @@ cat "$FIXTURE_BOOTSTRAP_STDERR" >&2
 if [ "${FIXTURE_FAIL_BOOTSTRAP:-0}" != 0 ]; then
     cat "$FIXTURE_BOOTSTRAP_STDOUT"
     printf '%s\n' 'error: fixture bootstrap failed' >&2
-    exit 1
+    exit 7
 fi
 [ -z "${FIXTURE_BARRIER:-}" ] || sh "$FIXTURE_BARRIER"
 mkdir -p "$CARGO_HOME/bin"
@@ -434,6 +438,37 @@ if FIXTURE_STABLE_RELEASE=1.94.0 sh "$script_dir/install_rust.sh" > "$work/old-s
     printf '%s\n' 'error: a stable older than the floor was accepted' >&2; exit 1
 fi
 grep -Fq 'stable Rust from rustup is 1.94.0, older than Rust 1.95' "$work/old-stable.log"
+rm -rf "$CARGO_HOME" "$RUSTUP_HOME"
+mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
+# No Rust and no rustup, and the bootstrap succeeds but the stable install
+# fails: the helper stops with its own error and exits 1, no default is set,
+# and none of the bootstrap's stdout reaches either stream.
+if FIXTURE_FAIL_INSTALL=1 sh "$script_dir/install_rust.sh" > "$work/fresh-fail.log" 2> "$work/fresh-fail.err"; then
+    printf '%s\n' 'error: a fresh install whose stable install failed was accepted' >&2; exit 1
+else
+    fresh_fail_status=$?
+fi
+[ "$fresh_fail_status" -eq 1 ] ||
+    { printf 'error: a fresh install whose stable install failed exited %s, not 1\n' "$fresh_fail_status" >&2; exit 1; }
+printf '%s\n' 'Installing current stable Rust/Cargo with rustup' > "$work/fresh-fail.expected"
+cmp "$work/fresh-fail.expected" "$work/fresh-fail.log" ||
+    { printf '%s\n' 'error: a failed fresh stable install wrote other stdout' >&2; cat "$work/fresh-fail.log" >&2; exit 1; }
+printf '%s\n' 'info: profile set to minimal' 'info: default host tuple is aarch64-unknown-linux-gnu' \
+    'info: skipping toolchain installation' \
+    'error: could not install stable Rust/Cargo; Cerulion binaries have not been replaced' \
+    > "$work/fresh-fail-err.expected"
+cmp "$work/fresh-fail-err.expected" "$work/fresh-fail.err" ||
+    { printf '%s\n' 'error: a failed fresh stable install hid or added output' >&2; cat "$work/fresh-fail.err" >&2; exit 1; }
+for fresh_fail_log in log err; do
+    if grep -Fx -f "$work/bootstrap-lines" "$work/fresh-fail.$fresh_fail_log" >&2; then
+        printf 'error: the bootstrap stdout reached the helper %s\n' "$fresh_fail_log" >&2; exit 1
+    fi
+done
+printf '%s\n' 'run stable rustc -vV [auto-install=0 cwd=/]' \
+    'toolchain install stable --profile minimal --no-self-update' > "$work/fresh-fail-calls.expected"
+cmp "$work/fresh-fail-calls.expected" "$CARGO_HOME/calls" ||
+    { printf '%s\n' 'error: a failed fresh stable install made other rustup calls' >&2; cat "$CARGO_HOME/calls" >&2; exit 1; }
+# The bootstrap left a rustup and its settings; the cases below need neither.
 rm -rf "$CARGO_HOME" "$RUSTUP_HOME"
 mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
 if FIXTURE_FAIL_DOWNLOAD=1 sh "$script_dir/install_rust.sh" > "$work/download.log" 2>&1; then
