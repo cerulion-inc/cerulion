@@ -1144,8 +1144,9 @@ logged and taken as a no. Install routes, after a yes only: `cerulion-install-ru
 else the existing rustup (stable added, default set only when unset), else the
 official installer with the release installer's arguments, which installs
 rustup alone with its stdout held (`run_bootstrap` shows it, through the pure
-`bootstrap_stdout_shown`, only when the installer fails) and is followed by
-the existing-rustup step on the rustup it installed. A route that installs
+`bootstrap_stdout_shown`, only when the installer fails) and is followed, in
+`bootstrap_then_add_stable`, by the existing-rustup step on the rustup it
+installed in Cargo's home. A route that installs
 into a Cargo home off `PATH` hands that directory to
 `node_build_with_cargo_dir`, which runs its `cargo` with the directory first on
 `PATH`. A declined or non-terminal check prints the command and returns, so
