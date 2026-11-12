@@ -34,6 +34,7 @@
 //! does not move ([`SharedCodePairSessions`]).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 #[cfg(any(test, feature = "test-seam"))]
 use std::time::Duration;
@@ -558,6 +559,8 @@ struct SessionsInner {
     /// while one is built. Taken after `saving` when both are, and never with
     /// `state` held.
     starting: Mutex<()>,
+    /// How many pair-code requests the daemon's arm step refused.
+    requests_refused: AtomicU64,
     clock: MonotonicClock,
     changed: tokio::sync::Notify,
     /// A pause of the next start's CPace step ([`HeldBuild`]).
@@ -597,7 +600,7 @@ impl HeldBuild {
 }
 
 /// The code-pairing store: the armed guest code and its tries, shared by
-/// every ops session.
+/// every ops session and the daemon's arm step.
 ///
 /// **One budget.** An armed code has one budget of tries (the policy's
 /// `max_attempts`) that every desk shares. `code-pair-start` admits a try
@@ -662,6 +665,7 @@ impl SharedCodePairSessions {
             state: Mutex::new(CodeState::default()),
             saving: Mutex::new(()),
             starting: Mutex::new(()),
+            requests_refused: AtomicU64::new(0),
             clock,
             changed: tokio::sync::Notify::new(),
             #[cfg(any(test, feature = "test-seam"))]
@@ -678,6 +682,17 @@ impl SharedCodePairSessions {
             .starting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Count one pair-code request the daemon's arm step refused; the new
+    /// count.
+    pub fn count_refused_request(&self) -> u64 {
+        self.0.requests_refused.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// How many pair-code requests the daemon's arm step refused.
+    pub fn requests_refused(&self) -> u64 {
+        self.0.requests_refused.load(Ordering::Relaxed)
     }
 
     /// Pause the next admitted `code-pair-start` just before its CPace step,
@@ -1562,7 +1577,6 @@ impl VerbHandler for EngageEstopVerb {
 mod tests {
     use super::*;
     use cerud::lease::ControlLease;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn caller_device_key_requires_auth_and_a_32_byte_hex_id() {
@@ -2637,11 +2651,15 @@ mod tests {
     }
 
     #[test]
-    fn a_disarm_latches_a_passed_window_as_expired() {
+    fn a_disarm_latches_a_passed_window_as_expired_and_counts_refusals_apart() {
         let (sessions, clock) = armed();
         clock.set(T0 + WINDOW + 1);
         let last = sessions.disarm().expect("a code was armed");
         assert_eq!((last.state, last.failed), (PairCodeState::Expired, 0));
+        assert_eq!(sessions.requests_refused(), 0);
+        assert_eq!(sessions.count_refused_request(), 1);
+        assert_eq!(sessions.count_refused_request(), 2);
+        assert_eq!(sessions.requests_refused(), 2);
     }
 
     #[test]
