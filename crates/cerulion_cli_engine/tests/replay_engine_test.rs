@@ -3567,12 +3567,12 @@ fn a_sampled_latest_relay_replays_byte_exact() {
 }
 
 // ===========================================================================
-// 10. Env divergence (WARN-only, never exit-affecting)
+// 10. Env divergence (never exit-affecting)
 // ===========================================================================
 
 #[test]
 #[serial]
-fn env_divergence_is_warn_only_and_surfaced() {
+fn env_divergence_never_fails_the_run_and_is_surfaced() {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 4);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("env.mcap");
@@ -4998,7 +4998,7 @@ fn env_missing_recorded_var_is_missing_divergence() {
     std::env::remove_var("CER_REPLAY_ABSENT_V"); // ensure absent
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let d = outcome
         .env_divergence
         .iter()
@@ -5035,7 +5035,7 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
     std::env::remove_var("CER_REPLAY_NULL_PRESENT");
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let names: Vec<&str> = outcome
         .env_divergence
         .iter()
