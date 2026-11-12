@@ -17598,7 +17598,7 @@ impl FieldMetric {
 pub(crate) const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
 
 impl CaptureTolerance {
-    /// The top-level fields a tolerance metric judges on a topic — the
+    /// The top-level fields a tolerance metric judges on a topic: the
     /// fields the byte-exact remainder leaves out, so a byte-mismatch line
     /// never names one. Empty with no tolerance plan.
     fn tolerated_fields(plan: Option<&Self>) -> Vec<&str> {

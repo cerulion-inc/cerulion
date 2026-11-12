@@ -982,7 +982,7 @@ own binary.
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
-| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
+| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
@@ -1011,7 +1011,9 @@ own binary.
 `ros2_graph.rs` carries its own unit oracles (the `classify_child_exit` matrix, relative
 launch/params resolution + missing-file refusal). Metric math + decodability
 classification live as unit tests inside `tolerance_metrics.rs` /
-`replay_field_registry.rs`.
+`replay_field_registry.rs`. The byte-mismatch value diff (`replay_value_diff.rs`: what a
+byte-mismatch line names, in which order, and how each value is spelled) carries its
+hand-oracle unit tests in `replay_value_diff/tests.rs`.
 
 ## 9. Test map: `cerulion_cli`
 

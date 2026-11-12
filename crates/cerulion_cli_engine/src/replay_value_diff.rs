@@ -15,8 +15,11 @@
 //!    the payload length and is in the size clause already), in byte order.
 //! 5. The first differing message value, in the schema's DECLARATION order
 //!    (the order `topic echo` prints), which can differ from byte order.
-//! 6. With every value equal: the first differing byte outside `total_size`
-//!    and the part of the frame it sits in.
+//! 6. With every value equal: the tolerance decoder's refusal of a frame,
+//!    when it refused one.
+//! 7. Otherwise the first differing byte outside `total_size` and the part
+//!    of the frame it sits in, or `total_size` itself when no other byte
+//!    differs.
 //!
 //! Every other differing value of the frame is counted, never named. Values
 //! use the YAML form's scalar spellings ([`cerulion_core::dynamic`]'s hidden
