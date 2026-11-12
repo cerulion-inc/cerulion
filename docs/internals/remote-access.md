@@ -358,7 +358,8 @@ idle stop never refuses an e-stop, and the engage latches and starts its
 delivery to rcpd before the server stops.
 `OpsBootstrapOnly`, `WireAdmit`, `Refuse` and `UnknownAlpn` connections hold
 none, so a peer that never pairs cannot keep the server running
-(`network-daemons.md`, authenticated serving). An `RcpAdmit` connection
+(`network-daemons.md`, authenticated serving); an armed pairing code keeps it
+serving through a bounded source of its own (section 7). An `RcpAdmit` connection
 re-checks the session floor every `RcpLimits::revoke_check`, with or without a
 stream open, so a revoked key's connection is closed with `rcp::CLOSE_REVOKED`
 and its guard released. Pinned by `serving_fence_admission_test.rs` and, for
@@ -854,8 +855,8 @@ every slot is taken.
   new try counts its pending one failed; when the window passes, every pending
   try is counted failed. A right code's row is saved with the store's state
   lock released (a separate lock serializes saves, and arms and disarms wait
-  for it), so a reader of the
-  store's state never waits for a disk; a save that fails or
+  for it), so neither the wire
+  `status` nor the serving-hold source waits for a disk; a save that fails or
   panics counts as a failed try (`SAVE_FAILURE_IS_A_FAILED_TRY`), and the
   desk's next try gets a fresh responder. The pure `settle` returns the first
   outcome, which `CodeState::latch` latches: paired (the row was saved),
@@ -866,13 +867,29 @@ every slot is taken.
   and the rate interval run on the store's `MonotonicClock` (the process's
   `Instant` in production), so a step of the wall clock neither stretches nor
   cuts them; on Linux and macOS time the system spends suspended is not
-  counted, so a suspend lengthens an armed code's window by that
+  counted, so a suspend lengthens an armed code's window and its hold by that
   time. The row's own times still come from `RemotedClock`. The refusal texts
   are the consts `NOT_ARMED`, `CODE_USED`, `TRY_THROTTLED`,
   `TRIES_IN_PROGRESS` and `NO_SESSION`, and the functions `code_exhausted` and
   `code_expired`, which give the CPace errors' own text; the desk maps
   `code_exhausted` and a wrong code to exit 4 and every other refusal to exit
   2.
+  The armed code keeps the daemon serving through a `ServingHolds` source that
+  reads one atomic and the store's monotonic clock: true from the arm until a
+  `paired` or `expired` end is written, for an `exhausted` code until the
+  window plus `HOLD_MARGIN` (so a desk that arrives later still reaches the
+  robot and is told the code was used up), and never past the window plus
+  `HOLD_MARGIN`; which written ends release the hold at once is the pure
+  `written_end_releases_hold`. That source and the `PairCode`
+  guard the arm step holds while it arms a request are all a code adds to the
+  fence: a bootstrap-only ops session (`claim`, certificate `pair`,
+  `present-grant` or `code-pair-*` from a key that is not paired) holds no
+  guard of its own whether or not a code is armed (section 5), so no peer that
+  is not paired holds the robot serving past the code's end being written or
+  its window plus `HOLD_MARGIN`, however it reconnects, and a desk that pairs
+  with the code runs its later calls fenced. While no code holds serving and
+  netd's idle stop is committed, the arm step's `PairCode` guard is refused, so
+  no code is armed then.
   The wire `status` reply carries the armed code's state as `pair_code`
   (`status`, `tries`, `failed`), and the refused requests as
   `pair_code_refused`, absent while none was, next to `log_lines_dropped`.
@@ -1232,7 +1249,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_netd/tests/wan_plane_iroh_test.rs` | The WAN plane against a real in-process robot (see `network-daemons.md` §12) |
 | `crates/cerulion_netd/tests/wan_plane_iroh_test/serving_plane.rs` | Which plane carried a mirror, asserted against the delivery it describes |
 | `crates/cerulion_remoted/tests/code_pair_account_test.rs` | Code pairing binds the self-account only; a named owner account is refused; a wall-clock step neither stretches nor cuts the code window |
-| `cerulion_pairing::pair_code`, `cerulion_remoted::{pair_code_request, owner_only, pairing_verbs, wire}`, `cerulion_wireclient::protocol` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, pending tries held until their sessions end and answered as in progress, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, a start's CPace step run with the state lock released (a session opens and closes meanwhile), a code that ends during the step refusing the try (expired counted, paired uncounted), arms and disarms waiting for a start in progress and a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict; a request that is not owner-only or well formed arms nothing, is removed and is answered `refused` and counted, and replaces the code an earlier request armed, its refusal logged once, and an unreadable, a malformed and an unconfirmed request answered identically on two runs; a directory that cannot be listed or a leftover that cannot be removed holds every request; the result written on each change, including an end first found by a refused start or a session end and a wrong-tag finish, and each end written by the next look after its write failed; a failing result write counted and retried; a newer request replacing the code and its nonce, and one whose result cannot be written leaving no code and answered `unconfirmed` once a write works, a result file that cannot be removed logged at error; a refused or newer request first logging and writing each end the replaced code reached that the result does not state yet (a pairing, used-up tries, a quiet window), also while its row is saved, never an end already written or one of a code another armed, identically on two runs, and a last result that cannot be written counted, logged and its result file removed; the pure `unwritten_end` table; a stopped arm step arms and writes nothing, withdraws the armed code as `refused` `stopping`, writes a pairing or a refusal the result does not state yet, leaves a written end, removes the result when its last write fails, and gives identical results on two runs; the `status` reply's `pair_code` and `pair_code_refused` fields on the robot and on the desk |
+| `cerulion_pairing::pair_code`, `cerulion_remoted::{pair_code_request, owner_only, pairing_verbs, wire}`, `cerulion_wireclient::protocol` in-module tests | Request and result line oracles for each status, each refusal reason and its user text, a `refused` result with and without a nonce (`-` only for `unreadable` and `malformed`), and every malformed line, the 8-digit code and the label token; the `settle` and `admit_try` oracle tables; one budget shared by every desk, pending tries held until their sessions end and answered as in progress, a new try counting the pending one, the rate gate across a re-arm and a reading before the last try, a start that waited for the lock judged at the time it got it, the window and its quiet expiry, a save error counted once with the same desk pairing next, a save that panics counted as a failed save, no outcome while a row is saved and the state lock free during the save, a second right code waiting for the first save and refused as used, a re-arm dropping the replaced code's tries, waiting for its row's save and answering the replaced code's last state with its outcome latched, each refusal of a finish with no try pending, single use, the hold's hard end, the pure `written_end_releases_hold` table (paired and expired release at once, exhausted serves to the hard end), a start's CPace step run with the state lock released (a session opens and closes meanwhile), a code that ends during the step refusing the try (expired counted, paired uncounted), arms and disarms waiting for a start in progress and a disarm waiting for a row's save, two runs of one script giving identical snapshots; the owner-only verdict; a request that is not owner-only or well formed arms nothing, is removed and is answered `refused` and counted, and replaces the code an earlier request armed, its refusal logged once, and an unreadable, a malformed and an unconfirmed request answered identically on two runs; a directory that cannot be listed or a leftover that cannot be removed holds every request; a refused serving hold leaves the request; the result written on each change, including an end first found by a refused start or a session end and a wrong-tag finish, and the serving fence held from the arm until a `paired` or `expired` end is written and an `exhausted` one until its hard end, held through a failed write of each end; a failing result write counted and retried; a newer request replacing the code and its nonce, and one whose result cannot be written leaving no code and answered `unconfirmed` once a write works, a result file that cannot be removed logged at error; a refused or newer request first logging and writing each end the replaced code reached that the result does not state yet (a pairing, used-up tries, a quiet window), also while its row is saved, never an end already written or one of a code another armed, identically on two runs, and a last result that cannot be written counted, logged and its result file removed; the pure `unwritten_end` table; a stopped arm step arms and writes nothing, withdraws the armed code as `refused` `stopping`, writes a pairing or a refusal the result does not state yet, leaves a written end, removes the result when its last write fails, and gives identical results on two runs; the shared admission's refusal and recovery lines; the `status` reply's `pair_code` and `pair_code_refused` fields on the robot and on the desk |
 
 Running: `cargo test -p <crate>` for each of `cerulion_pairing`,
 `cerulion_link`, `cerulion_wireclient`, `cerulion_connectd`, `cerulion_remoted`,

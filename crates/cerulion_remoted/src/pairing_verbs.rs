@@ -36,7 +36,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-#[cfg(any(test, feature = "test-seam"))]
 use std::time::Duration;
 
 use cerud::error::{CerudError, CerudResult};
@@ -261,6 +260,10 @@ pub fn code_expired() -> String {
 /// refused the row, or writing it failed) counts as a failed try. When it does
 /// not, the try is given back.
 pub const SAVE_FAILURE_IS_A_FAILED_TRY: bool = true;
+/// How long past an armed code's window the daemon serves for it at most,
+/// whether or not its end was written to the result file. A code whose tries
+/// were all used up serves to this end (`written_end_releases_hold`).
+pub const HOLD_MARGIN: Duration = Duration::from_secs(30);
 
 const NS_PER_S: u64 = 1_000_000_000;
 
@@ -293,6 +296,18 @@ struct CodeView {
 impl CodeView {
     fn past_window(&self, now_ns: u64) -> bool {
         now_ns.saturating_sub(self.armed_at_ns) > self.window_ns
+    }
+}
+
+/// Whether writing the end `ended` to the result file ends the code's hold on
+/// serving at once. A paired or expired code's hold ends when its end is
+/// written; an exhausted code keeps the daemon serving until its window plus
+/// [`HOLD_MARGIN`], so a desk that arrives later still reaches the robot and
+/// is told the code was used up.
+const fn written_end_releases_hold(ended: Ended) -> bool {
+    match ended {
+        Ended::Paired | Ended::Expired => true,
+        Ended::Exhausted => false,
     }
 }
 
@@ -559,6 +574,10 @@ struct SessionsInner {
     /// while one is built. Taken after `saving` when both are, and never with
     /// `state` held.
     starting: Mutex<()>,
+    /// The monotonic time until which the daemon serves for the armed code;
+    /// 0 for none. [`SharedCodePairSessions::holds_serving`] reads it without
+    /// a lock.
+    hold_until_ns: AtomicU64,
     /// How many pair-code requests the daemon's arm step refused.
     requests_refused: AtomicU64,
     clock: MonotonicClock,
@@ -639,11 +658,11 @@ impl HeldBuild {
 /// **No disk write or CPace step under the lock.** A right code's row is
 /// saved, and a try's CPace step runs, with the store's state lock released,
 /// so an ops session's open and close, and a reader of the state such as the
-/// wire plane's `status`, never wait for a disk or for a CPace computation. A
-/// start takes its try under the lock, runs the step, then stores the
-/// responder under the lock again: a code that ended meanwhile refuses the
-/// try, counted failed when the window passed and uncounted when a desk
-/// paired.
+/// wire plane's `status` or the serving-hold source, never wait for a disk or
+/// for a CPace computation. A start takes its try under the lock, runs the
+/// step, then stores the responder under the lock again: a code that ended
+/// meanwhile refuses the try, counted failed when the window passed and
+/// uncounted when a desk paired.
 #[derive(Clone)]
 pub struct SharedCodePairSessions(Arc<SessionsInner>);
 
@@ -666,6 +685,7 @@ impl SharedCodePairSessions {
             state: Mutex::new(CodeState::default()),
             saving: Mutex::new(()),
             starting: Mutex::new(()),
+            hold_until_ns: AtomicU64::new(0),
             requests_refused: AtomicU64::new(0),
             clock,
             changed: tokio::sync::Notify::new(),
@@ -777,6 +797,11 @@ impl SharedCodePairSessions {
         let snapshot = CodeSnapshot::of(&ledger, st.generation);
         st.ledger = Some(ledger);
         st.pending.clear();
+        let hold_until = now
+            .saturating_add(policy.ttl_ns)
+            .saturating_add(HOLD_MARGIN.as_nanos() as u64)
+            .max(1);
+        self.0.hold_until_ns.store(hold_until, Ordering::Release);
         drop(st);
         self.notify(true);
         CodeArmed {
@@ -785,12 +810,12 @@ impl SharedCodePairSessions {
         }
     }
 
-    /// Drop the armed code, if any, and every pending try, once a right
-    /// code's row being saved is saved and a start's CPace step in progress
-    /// has ended; the code's last state, its outcome latched as
-    /// [`SharedCodePairSessions::snapshot`] does, or `None` when no code was
-    /// armed. A later start is refused with [`NOT_ARMED`], and a later finish
-    /// with [`NO_SESSION`].
+    /// Drop the armed code, if any, every pending try and the code's hold on
+    /// serving, once a right code's row being saved is saved and a start's
+    /// CPace step in progress has ended; the code's last state, its outcome
+    /// latched as [`SharedCodePairSessions::snapshot`] does, or `None` when no
+    /// code was armed. A later start is refused with [`NOT_ARMED`], and a
+    /// later finish with [`NO_SESSION`].
     pub fn disarm(&self) -> Option<CodeSnapshot> {
         let _saving = self.0.saving.lock().unwrap_or_else(PoisonError::into_inner);
         let _starting = self.starting();
@@ -804,6 +829,7 @@ impl SharedCodePairSessions {
             st.generation += 1;
         }
         st.pending.clear();
+        self.0.hold_until_ns.store(0, Ordering::Release);
         drop(st);
         self.notify(last.is_some());
         last
@@ -823,6 +849,30 @@ impl SharedCodePairSessions {
         drop(st);
         self.notify(changed);
         snapshot
+    }
+
+    /// Whether the daemon keeps serving for the armed code: from the arm
+    /// until its end is written ([`SharedCodePairSessions::release_hold`]), an
+    /// exhausted code until its window plus [`HOLD_MARGIN`], and never past
+    /// it. Reads one atomic and the store's clock, and takes no lock, so it
+    /// can run under the serving holds' own lock.
+    pub fn holds_serving(&self) -> bool {
+        let until = self.0.hold_until_ns.load(Ordering::Acquire);
+        until != 0 && self.now() < until
+    }
+
+    /// Stop serving for the code of arm `arm` once its end is written, when
+    /// that end releases the hold at once (`written_end_releases_hold`); a
+    /// newer arm, a code with no outcome yet, and an exhausted code keep their
+    /// hold.
+    pub fn release_hold(&self, arm: u64) {
+        let st = self.lock();
+        let released = st.ledger.as_ref().is_some_and(|ledger| {
+            ledger.arm == arm && ledger.view().ended.is_some_and(written_end_releases_hold)
+        });
+        if released {
+            self.0.hold_until_ns.store(0, Ordering::Release);
+        }
     }
 
     /// An ops session of the desk key `initiator` opened. When the last open
@@ -2266,6 +2316,7 @@ mod tests {
             );
             late.set(T0 + WINDOW + 1);
             assert_eq!(state(&during), (PairCodeState::Armed, 3, 0));
+            assert!(during.holds_serving());
             Ok(())
         })
         .expect("a right code saved in the window pairs although the window then ends");
@@ -2389,6 +2440,8 @@ mod tests {
         );
         // The new code has no part in the save.
         assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 0));
+        sessions.release_hold(later.armed.arm);
+        assert!(sessions.holds_serving(), "the new code keeps its hold");
         clock.set(T0 + RATE);
         new_pairs(&sessions, B);
     }
@@ -2486,6 +2539,92 @@ mod tests {
             "verb error: code pairing rejected: CPace protocol error: bad step1 packet length"
         );
         assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 1));
+    }
+
+    #[test]
+    fn the_hold_is_set_on_arm_kept_until_released_and_ends_at_the_window_margin() {
+        let clock = MonotonicClock::fixed(T0);
+        let sessions = SharedCodePairSessions::with_clock(clock.clone());
+        assert!(!sessions.holds_serving(), "no code, no hold");
+        let first = sessions.arm(CODE, cerulion_pairing::pair_code::PAIR_CODE_POLICY);
+        assert!(sessions.holds_serving());
+        // An armed code with no outcome keeps its hold when asked to release.
+        sessions.release_hold(first.armed.arm);
+        assert!(sessions.holds_serving());
+        // Past the window, until its end is written, the hold stays...
+        clock.set(T0 + WINDOW + 1);
+        assert_eq!(state(&sessions).0, PairCodeState::Expired);
+        assert!(sessions.holds_serving());
+        // ...and never past the window plus the margin.
+        let margin = HOLD_MARGIN.as_nanos() as u64;
+        clock.set(T0 + WINDOW + margin - 1);
+        assert!(sessions.holds_serving());
+        clock.set(T0 + WINDOW + margin);
+        assert!(!sessions.holds_serving());
+
+        // A release once the end is written frees it; a stale arm's release
+        // leaves a newer arm's hold.
+        clock.set(T0);
+        let second = sessions.arm(CODE, cerulion_pairing::pair_code::PAIR_CODE_POLICY);
+        sessions.release_hold(first.armed.arm);
+        assert!(sessions.holds_serving());
+        pair(&sessions, A).unwrap();
+        sessions.release_hold(second.armed.arm);
+        assert!(!sessions.holds_serving());
+        // A release once every try failed keeps the hold to the window plus
+        // the margin, so a later desk still reaches the robot and is told the
+        // code was used up.
+        clock.set(T0 + RATE);
+        let used_up = sessions.arm(CODE, cerulion_pairing::pair_code::PAIR_CODE_POLICY);
+        for (i, desk) in [B, C, D].into_iter().enumerate() {
+            clock.set(T0 + RATE * (i as u64 + 1));
+            refused(wrong_tag(&sessions, desk));
+        }
+        assert_eq!(state(&sessions).0, PairCodeState::Exhausted);
+        assert!(sessions.holds_serving());
+        sessions.release_hold(used_up.armed.arm);
+        assert!(sessions.holds_serving(), "an exhausted code serves on");
+        clock.set(T0 + RATE + WINDOW + margin - 1);
+        assert!(sessions.holds_serving());
+        assert_eq!(
+            refused(start(&sessions, A, CODE)),
+            verb(&code_exhausted(3)),
+            "a later desk is told the code was used up"
+        );
+        clock.set(T0 + RATE + WINDOW + margin);
+        assert!(!sessions.holds_serving(), "the hard end ends it");
+        // A release once the window passed, with the margin still running,
+        // frees it.
+        clock.set(T0 + 3 * RATE);
+        let quiet = sessions.arm(CODE, cerulion_pairing::pair_code::PAIR_CODE_POLICY);
+        clock.set(T0 + 3 * RATE + WINDOW + 1);
+        assert_eq!(state(&sessions).0, PairCodeState::Expired);
+        assert!(sessions.holds_serving());
+        sessions.release_hold(quiet.armed.arm);
+        assert!(!sessions.holds_serving());
+        // A disarm drops the hold, and answers the code's last state.
+        let third = sessions.arm(CODE, cerulion_pairing::pair_code::PAIR_CODE_POLICY);
+        let last = sessions.disarm().expect("a code was armed");
+        assert_eq!(
+            (last.arm, last.state),
+            (third.armed.arm, PairCodeState::Armed)
+        );
+        assert!(!sessions.holds_serving());
+        assert_eq!(sessions.snapshot(), None);
+        assert!(refused(start(&sessions, B, CODE)).ends_with(NOT_ARMED));
+        assert_eq!(sessions.disarm(), None, "nothing is left to disarm");
+    }
+
+    #[test]
+    fn a_written_end_releases_the_hold_when_paired_or_expired_and_never_when_exhausted() {
+        let cases = [
+            (Ended::Paired, true),
+            (Ended::Expired, true),
+            (Ended::Exhausted, false),
+        ];
+        for (ended, released) in cases {
+            assert_eq!(written_end_releases_hold(ended), released, "{ended:?}");
+        }
     }
 
     #[test]
