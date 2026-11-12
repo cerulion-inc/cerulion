@@ -173,7 +173,7 @@ the same entry instead of running the daemon.
 - **Desk side, three consumers of the same robot surface**: the
   `cerulion connect` verb (spawns the `cerulion-connectd` sibling binary),
   `cerulion-connectd pair` (the code ceremony; the `cerulion pair` verb that
-  spawned it is a hidden stub that refuses, §7), and `cerulion_netd`'s
+  spawned it is a hidden stub that refuses on a desk, §7), and `cerulion_netd`'s
   embedded iroh WAN plane (the `wan` feature). All three dial the same two
   ALPNs and share one client substrate (§7 to §8).
 
@@ -798,14 +798,33 @@ every slot is taken.
   connectd's `worker::run_connect` dials, fetches the catalog, demands, and
   spawns one reader per accepted topic; the whole loop is pinned over real
   loopback iroh + real per-test SHM roots by `reinject_e2e_test.rs`.
-- **`cerulion pair`** is a hidden stub: no robot-side verb arms a pairing code
-  (the daemon arms one only from a request file a step on the robot leaves,
-  below, and no `cerulion` verb writes that file), so `dispatch` in `main.rs`
-  refuses every spelling
-  with `PAIR_UNAVAILABLE_MSG` and exit 2 above the login gate, and sends only
-  its `cli_command_run` (verb `pair`, exit 2). The ceremony below lives on in
+- **`cerulion pair`** is a hidden stub on a desk: `dispatch` in `main.rs`
+  refuses every spelling but `pair --start` with `PAIR_UNAVAILABLE_MSG` and
+  exit 2 above the login gate, and sends only its `cli_command_run` (verb
+  `pair`, exit 2). The ceremony below lives on in
   `cerulion_cli_engine::pair_cmd` and `cerulion-connectd pair`, which no
   `cerulion` verb calls.
+- **`cerulion pair --start`** is the step on the robot that leaves the request
+  file below (`cerulion_cli_engine::pair_start_cmd`). Below the kill switch
+  (exit 1) and the login gate, it checks `require_serving_authority`, draws the
+  nonce and the code from the operating system (rejection sampling below
+  4_200_000_000), asks `cerulion-netd` for a `hold_serving` lease of 790 s on
+  its own connection and refuses a lease whose state root is not its own. It
+  never creates `<state_root>/remoted/`: it waits, within 150 s or a shorter
+  lease, for the directory `cerulion-remoted` provisions, takes the writers'
+  exclusive lock on `pair-start.lock`, removes the result, leaves the request,
+  leaves it again when it is gone with no answer for two poll intervals, and
+  on its own nonce (or a `-` refusal) takes back a copy still on disk before
+  it shows the code, then releases the lock. A gone result never ends a run.
+  While the code is armed it reads the result every 250 ms and probes netd's
+  `status` every 2 s on a second connection: a startup error after a clear
+  probe ends the run (exit 3), and so does its own `stopping` result, which
+  names netd as the daemon that stopped when a probe within the next 2 s
+  cannot reach it, and cerulion-remoted otherwise; so does no end by the
+  window plus 30 s. Another nonce or `-` after its own is a replacement or a
+  withdrawal, and its own refusal other than `stopping` after the arm a
+  withdrawal by the daemon (exit 2). Every decision is a pure `Machine` over observations;
+  the runner is pinned with a scripted daemon over a temporary directory.
 - **The code ceremony** (`cerulion-connectd pair`): the desk is the CPace initiator over the robot's
   ops plane (`pair.rs`); a wrong code is detected structurally desk-side and
   mapped to a distinct exit code; stdout carries machine-parseable state lines

@@ -1157,8 +1157,9 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
     let sink = sink();
     let home = primed_home(&sink);
     let [key, host] = sending(&sink);
-    let cases: [(Option<&str>, &[&str]); 7] = [
+    let cases: [(Option<&str>, &[&str]); 8] = [
         (Some("off"), &["graph", "list"]),
+        (Some("off"), &["pair", "--start"]),
         (Some(" OFF "), &["graph", "list"]),
         (Some("typo"), &["graph", "list"]),
         (Some("off"), &["viz", "/camera", "--robot", "bench-arm"]),
@@ -1186,6 +1187,10 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
                 "{}",
                 out.stderr
             );
+        }
+        if args == ["pair", "--start"] {
+            assert_eq!(out.code, Some(1), "{}", out.stderr);
+            assert!(out.stderr.contains("start code pairing"), "{}", out.stderr);
         }
         assert_nothing_sent(
             &sink,

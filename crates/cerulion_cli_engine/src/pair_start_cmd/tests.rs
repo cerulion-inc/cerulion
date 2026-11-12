@@ -4,6 +4,11 @@
 
 use super::*;
 
+#[cfg(unix)]
+mod host;
+#[cfg(unix)]
+mod runs;
+
 use cerulion_pairing::pair_code::{
     REFUSED_MALFORMED, REFUSED_UNCONFIRMED, REFUSED_UNREADABLE, WRITER_LOCK_FILE,
 };

@@ -403,6 +403,45 @@ fn hidden_pair_refuses_every_spelling_before_discovery_the_switch_and_the_gate()
     }
 }
 
+/// `cerulion pair --start` serves the network, so the switch refuses it
+/// before netd is asked: exit 1, the refusal as the whole of stderr, nothing
+/// on stdout, no contact with the stand-in netd, and no robot state made.
+#[test]
+#[cfg(unix)]
+fn pair_start_under_the_network_kill_switch_refuses_before_netd() {
+    for (network, label) in [
+        ("off", "CERULION_NETWORK=off"),
+        (
+            "typo",
+            "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let output = run_with(
+            root.path(),
+            &["pair", "--start"],
+            &[
+                ("IOX2_LOG_LEVEL", "error"),
+                ("CERULION_NETWORK", network),
+                ("CERULION_STATE_ROOT", state.to_str().unwrap()),
+            ],
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{network}: {error}");
+        assert_eq!(
+            error,
+            format!(
+                "Error: cerulion pair --start makes this robot serve pairing over the network, \
+                 which {label} disables; unset CERULION_NETWORK to start code pairing\n"
+            ),
+            "{network}"
+        );
+        assert!(output.stdout.is_empty(), "{network}");
+        assert!(!state.exists(), "{network}: no robot state is made");
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn remote_viz_under_a_kill_switch_refuses_before_any_daemon() {
