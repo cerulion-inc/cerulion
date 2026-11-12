@@ -71,6 +71,20 @@ pub struct InputView<'sample, T: ShmMessage + 'sample> {
 }
 
 impl<'sample, T: ShmMessage + 'sample> InputView<'sample, T> {
+    /// Construct a local view from bytes whose owner keeps them borrowed.
+    /// A plugin read lease owns no native sample in this compilation unit.
+    pub(crate) fn from_borrowed(
+        topic: &str,
+        raw: &'sample [u8],
+    ) -> crate::error::TransportResult<Self> {
+        let (header, payload) = validate_wire_frame::<T>(topic, raw)?;
+        Ok(Self::new(
+            SampleHandle::ScheduledBytes { bytes: raw },
+            T::build_reader(&raw[payload]),
+            header,
+        ))
+    }
+
     /// Construct an `InputView` from an inbound sample and a reader over
     /// its payload.
     ///

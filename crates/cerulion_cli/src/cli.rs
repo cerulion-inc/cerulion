@@ -1186,7 +1186,7 @@ pub enum NodeAction {
         /// `--policy`.
         #[arg(long, value_name = "SPEC")]
         policy: Option<String>,
-        /// Use the legacy raw FFI template instead of the `#[cerulion_node]` macro
+        /// Use the stable raw FFI template instead of the `#[cerulion_node]` macro
         #[arg(long)]
         raw_ffi: bool,
     },

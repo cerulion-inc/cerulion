@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Hand-written subprocess oracles prove that a PATH compiler warning never
-//! prevents Cargo from running with its inherited RUSTC override. No toolchains
+//! Hand-written subprocess oracles prove that compiler provenance never
+//! overrides Cargo's inherited RUSTC selection. No toolchains
 //! are compiled or installed; this tests command selection and error propagation.
 
 #![cfg(unix)]
@@ -20,7 +20,7 @@ fn executable(path: &Path, source: &str) {
 }
 
 #[test]
-fn path_compiler_mismatch_preserves_cargo_override_and_result() {
+fn node_build_keeps_cargos_rustc_selection_and_never_probes_path_rustc() {
     if let Ok(mode) = std::env::var(CHILD) {
         let root = std::env::var_os("CERULION_COMPILER_TEST_ROOT").unwrap();
         let result = node_build(Path::new(&root), "probe_node", false);
@@ -53,8 +53,8 @@ fn path_compiler_mismatch_preserves_cargo_override_and_result() {
             "[package]\nname = \"probe_node\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        // This release is deliberately distinct from the host. The command
-        // validates its arguments so a skipped or changed probe cannot pass.
+        // The distinct PATH compiler records any probe; its marker must stay
+        // absent because Cargo alone selects the inherited RUSTC override.
         executable(
             &bin.join("rustc"),
             "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = -vV ] || exit 71\nprintf 'release: 0.0.0\n'\nprintf 'probed\n' > \"$CERULION_COMPILER_TEST_ROOT/probe-ran\"\n",
@@ -80,7 +80,7 @@ fi
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "path_compiler_mismatch_preserves_cargo_override_and_result",
+                "node_build_keeps_cargos_rustc_selection_and_never_probes_path_rustc",
                 "--nocapture",
             ])
             .env(CHILD, mode)
@@ -99,9 +99,9 @@ fi
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            std::fs::read_to_string(root.join("probe-ran")).unwrap(),
-            "probed\n"
+        assert!(
+            !root.join("probe-ran").exists(),
+            "PATH rustc must not be probed"
         );
         assert_eq!(
             std::fs::read_to_string(root.join("cargo-ran")).unwrap(),

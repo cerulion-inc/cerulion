@@ -681,12 +681,17 @@ impl Ctx {
                         }
                         Err(e) => {
                             reg.release(conn, &key, Instant::now());
-                            tracing::warn!(
-                                robot = %key.robot,
-                                topic = %key.topic,
-                                error = %e,
-                                "netd: mirror registration failed — demand refused, refcount rolled back"
-                            );
+                            if e.is_transient_busy() {
+                                tracing::debug!(robot = %key.robot, topic = %key.topic, error = %e,
+                                    "netd: mirror controller busy; demand refcount rolled back");
+                            } else {
+                                tracing::warn!(
+                                    robot = %key.robot,
+                                    topic = %key.topic,
+                                    error = %e,
+                                    "netd: mirror registration failed — demand refused, refcount rolled back" // dash-ok: exact non-transient refusal text
+                                );
+                            }
                             Response::error(
                                 Some(id),
                                 format!("mirror registration failed: {e}"),

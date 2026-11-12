@@ -2,18 +2,19 @@
 name = "test_node_drain_fail_cdylib"
 version = "0.1.0"
 edition = "2021"
-description = "Regression fixture: a raw-FFI cdylib whose cerulion_node_drain_trigger_input FFI fails on demand (proves a failed drain never fabricates a fire signal)"
+description = "Checked data-trigger node fixture"
 publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
-# The cdylib's `cerulion_node_init` reclaims the host's
-# `Box::into_raw(NodeContext)` via `Box::from_raw` to avoid leaking one
-# NodeContext per init call. This requires importing the `NodeContext` type
-# from `cerulion_core` (mirrors `test_node_snapshot_fail_cdylib`).
+[features]
+default = ["cdylib"]
+cdylib = []
+
 [dependencies]
 cerulion_core = { path = "../../cerulion_core" }
+native_ros2_messages = { workspace = true }
 
 # The ONE strict lint table lives in the root `[workspace.lints]`.
 [lints]

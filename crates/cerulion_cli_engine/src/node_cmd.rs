@@ -1233,7 +1233,7 @@ pub fn node_build_with_progress(
 /// This is what `cerulion-wsd`'s `node.build` streams to Studio. Everything
 /// before cargo runs is the same function as the CLI's build: the unknown-node
 /// and malformed-metadata refusals, the optional-system-dependency probe and
-/// notice, the PATH compiler advisory. `on_cargo_start` is called exactly
+/// notice, and Cargo toolchain selection. `on_cargo_start` is called exactly
 /// once, as soon as cargo has been spawned (a spawn that fails never calls
 /// it), so a caller can tell a build
 /// that was refused up front (an `Err` before the call) from one that ran and
@@ -1433,25 +1433,6 @@ fn build_node(
         warn_unsatisfied_deps(node_type, &tool);
     }
 
-    // PATH's rustc is only a hint: Cargo may use RUSTC, build.rustc, or a
-    // wrapper instead. Never reject a build based on this probe. The loader
-    // checks the built cdylib's full fingerprint before node initialization.
-    if let Some(detected_release) = detect_rustc_release(workspace_root) {
-        if let Some(warning) = rustc_release_mismatch_warning(
-            node_type,
-            &detected_release,
-            cerulion_core::RUSTC_RELEASE,
-        ) {
-            tracing::warn!(
-                node_type = %node_type,
-                path_rustc_release = %detected_release,
-                host_rustc_release = cerulion_core::RUSTC_RELEASE,
-                warning = %warning,
-                "PATH compiler differs from Cerulion; continuing with Cargo's compiler selection"
-            );
-        }
-    }
-
     let mut cmd = std::process::Command::new("cargo");
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
@@ -1629,52 +1610,6 @@ fn kill_process_group(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}
-
-/// Probe PATH's `rustc -vV` in the workspace directory. Rustup's directory
-/// selection is honored, but Cargo-specific compiler overrides need not match
-/// this executable. This is advisory only; missing or unreadable output yields
-/// no warning. The loader validates the built node's full fingerprint.
-fn detect_rustc_release(workspace_root: &Path) -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("-vV")
-        .current_dir(workspace_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let release = text
-        .lines()
-        .find_map(|line| line.strip_prefix("release: "))?;
-    let release = release.trim();
-    if release.is_empty() {
-        None
-    } else {
-        Some(release.to_string())
-    }
-}
-
-/// Describe a possible PATH compiler mismatch without claiming to know which
-/// compiler Cargo will select. An absent or matching release needs no warning.
-fn rustc_release_mismatch_warning(
-    node_type: &str,
-    detected_release: &str,
-    host_release: &str,
-) -> Option<String> {
-    if detected_release.is_empty() || detected_release == host_release {
-        return None;
-    }
-    Some(format!(
-        "PATH rustc reports {detected_release}, while the `cerulion` host was built by \
-         rustc {host_release}. Cargo may select a different compiler through an override; \
-         the build will continue. The built node's full compiler fingerprint must match \
-         the host at load time. If it does not, select the compiler that built the host \
-         (for an official stable compiler: `rustup toolchain install {host_release}`, then \
-         `RUSTUP_TOOLCHAIN={host_release} cerulion node build {node_type}`, ensuring any \
-         Cargo compiler overrides agree), or rebuild the CLI and node with the same compiler."
-    ))
-}
 
 /// Map a `cargo` spawn failure to the CLI's `BuildFailed` `reason` text.
 ///
@@ -2341,6 +2276,40 @@ fn remove_workspace_member(cargo_toml: &Path, node_type: &str) -> CliResult<()> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn modifying_raw_ports_keeps_author_logic_and_updates_stable_wire_facts() {
+        let mut metadata = crate::node_metadata::NodeMetadata::new("raw_ffi_template", None);
+        let original = crate::templates::generate_lib_rs(&metadata)
+            .replace("wrapping_add(1)", "wrapping_add(100)");
+        metadata.inputs.push(crate::node_metadata::PortDef {
+            name: "velocity".into(),
+            schema: Some("geometry_msgs/Vector3".into()),
+            schema_alternatives: vec![],
+            trigger: false,
+            backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
+        });
+        metadata.outputs.push(crate::node_metadata::PortDef {
+            name: "text".into(),
+            schema: Some("std_msgs/String".into()),
+            schema_alternatives: vec![],
+            trigger: false,
+            backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
+        });
+        let first = super::update_info_fn(&original, &metadata).unwrap();
+        let second = super::update_info_fn(&original, &metadata).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.split("// CERULION:INFO_START").next(),
+            original.split("// CERULION:INFO_START").next()
+        );
+        assert!(first.contains("wrapping_add(100)"));
+        assert!(
+            first.contains("HostClient::request::<native_ros2_messages::geometry_msgs::Vector3>()")
+        );
+        assert!(first.contains("HostClient::request::<native_ros2_messages::std_msgs::String>()"));
+        syn::parse_file(&first).expect("modified raw source remains valid Rust");
+    }
+
     /// Run `f` with `CERULION_PY_PATH` set to `value`, then put the previous
     /// value back. The variable is process-wide and the library tests run in
     /// parallel, so every test that sets it takes this one lock: without it
@@ -4529,12 +4498,9 @@ mod tests {
     }
 
     /// Raw-FFI arm: bare `Vector3` resolves on BOTH raw-FFI paths.
-    /// The INFO JSON carries port NAMES only (schema strings never
-    /// appear in it — see `generate_info_fn` /
-    /// `try_parse_raw_ffi_node`, which round-trips every port with
-    /// `schema: None`), so the observable schema string on this path
-    /// is the import `node modify` splices — it must be the QUALIFIED
-    /// one. Resolution also gates the raw-FFI create path: an
+    /// The INFO JSON carries port names, while the adjacent PORT_SCHEMAS
+    /// anchor retains qualified schema names for subsequent modifications.
+    /// Resolution also gates the raw-FFI create path: an
     /// ambiguous bare name fails with no directory created.
     #[test]
     fn test_raw_ffi_bare_schema_resolves_qualified_import() {
@@ -4556,6 +4522,10 @@ mod tests {
         // pinned below). The INFO JSON carries the port name.
         let metadata = parse_node_metadata(&nodes_dir.join("raw_vec")).unwrap();
         assert_eq!(metadata.outputs[0].name, "vec_out");
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
 
         // Modify: the spliced import is the QUALIFIED schema string —
         // the raw-FFI path's observable resolution product.
@@ -4579,6 +4549,14 @@ mod tests {
         );
         let metadata = parse_node_metadata(&nodes_dir.join("raw_vec")).unwrap();
         assert_eq!(metadata.inputs[0].name, "vec_in");
+        assert_eq!(
+            metadata.inputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
+        assert_eq!(
+            metadata.outputs[0].schema.as_deref(),
+            Some("geometry_msgs/Vector3")
+        );
 
         // The resolution gate applies to raw-FFI create too:
         // ambiguous bare name → Err, no node directory created.
@@ -4603,6 +4581,178 @@ mod tests {
             !nodes_dir.join("raw_ambig").exists(),
             "a failed raw-FFI create must not leave a node directory behind"
         );
+    }
+
+    #[test]
+    fn raw_modify_preserves_typed_facts_and_matches_the_linked_delivery_fixture() {
+        for _ in 0..2 {
+            let (_tmp, nodes_dir, cargo_toml) = setup_workspace();
+            node_create_with_options(
+                &nodes_dir,
+                &cargo_toml,
+                "raw_ffi_template",
+                Some(cerulion_core::MacroPolicy::Period { period_ms: 1 }),
+                &NodeCreateOptions {
+                    raw_ffi: true,
+                    outputs: vec![("geometry_msgs/Vector3".into(), "original".into())],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let node = nodes_dir.join("raw_ffi_template");
+            let created = parse_node_metadata(&node).unwrap();
+            assert_eq!(created.outputs.len(), 1);
+            assert_eq!(created.outputs[0].name, "original");
+            assert_eq!(
+                created.outputs[0].schema.as_deref(),
+                Some("geometry_msgs/Vector3")
+            );
+            for name in ["first", "second"] {
+                node_modify_add_port(
+                    &nodes_dir,
+                    "raw_ffi_template",
+                    name,
+                    Some("geometry_msgs/Vector3"),
+                    true,
+                    false,
+                )
+                .unwrap();
+                let parsed = parse_node_metadata(&node).unwrap();
+                assert!(parsed
+                    .outputs
+                    .iter()
+                    .all(|port| port.schema.as_deref() == Some("geometry_msgs/Vector3")));
+            }
+            let parsed = parse_node_metadata(&node).unwrap();
+            assert_eq!(
+                parsed
+                    .outputs
+                    .iter()
+                    .map(|port| port.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["original", "first", "second"]
+            );
+            let source = std::fs::read_to_string(node.join("src/lib.rs")).unwrap();
+            let fixture = include_str!("../../test_fixtures/test_node_raw_ffi_template_cdylib/tests/fixtures/modified_raw.rs");
+            let block = |text: &str| {
+                text.split_once("// CERULION:INFO_START")
+                    .unwrap()
+                    .1
+                    .split_once("// CERULION:INFO_END")
+                    .unwrap()
+                    .0
+                    .to_owned()
+            };
+            // Compare parsed bytes and request types so formatting punctuation
+            // cannot obscure a changed schema, layout constructor or port order.
+            let contract = |text: &str| {
+                let file = syn::parse_file(text).unwrap();
+                let bytes = file
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        syn::Item::Static(item) if item.ident == "INFO_BYTES" => {
+                            let syn::Expr::Lit(value) = &*item.expr else {
+                                panic!("metadata literal")
+                            };
+                            let syn::Lit::ByteStr(value) = &value.lit else {
+                                panic!("metadata bytes")
+                            };
+                            Some(value.value())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let method = file
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        syn::Item::Fn(item) if item.sig.ident == "__cer_raw_wire_metadata" => {
+                            Some(item)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let syn::Stmt::Expr(syn::Expr::MethodCall(end), _) =
+                    method.block.stmts.last().unwrap()
+                else {
+                    panic!("raw metadata result")
+                };
+                let syn::Expr::Call(call) = &*end.receiver else {
+                    panic!("raw metadata call")
+                };
+                let facts = [1, 2].map(|index| {
+                    let syn::Expr::Reference(arg) = &call.args[index] else {
+                        panic!("facts borrow")
+                    };
+                    let syn::Expr::Array(array) = &*arg.expr else {
+                        panic!("facts array")
+                    };
+                    array
+                        .elems
+                        .iter()
+                        .map(|fact| {
+                            let syn::Expr::Call(request) = fact else {
+                                panic!("typed facts required")
+                            };
+                            let syn::Expr::Path(path) = &*request.func else {
+                                panic!("request path")
+                            };
+                            let last = path.path.segments.last().unwrap();
+                            assert_eq!(last.ident, "request");
+                            let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                                panic!("typed request")
+                            };
+                            let syn::GenericArgument::Type(syn::Type::Path(ty)) = &args.args[0]
+                            else {
+                                panic!("schema type")
+                            };
+                            ty.path
+                                .segments
+                                .iter()
+                                .map(|part| part.ident.to_string())
+                                .collect::<Vec<_>>()
+                                .join("::")
+                        })
+                        .collect::<Vec<_>>()
+                });
+                (bytes, facts)
+            };
+            let actual = contract(&block(&source));
+            assert_eq!(
+                actual.1,
+                [
+                    vec![],
+                    vec!["native_ros2_messages::geometry_msgs::Vector3".to_owned(); 3]
+                ]
+            );
+            assert_eq!(
+                actual,
+                contract(&block(fixture)),
+                "the compiled delivery fixture must contain the actual modified metadata"
+            );
+            let schemas = |text: &str| {
+                text.lines()
+                    .find(|line| line.starts_with(PORT_SCHEMAS_MARKER))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(schemas(&source), schemas(fixture));
+            let before = source.clone();
+            assert!(node_modify_add_port(
+                &nodes_dir,
+                "raw_ffi_template",
+                "first",
+                Some("geometry_msgs/Vector3"),
+                true,
+                false
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read_to_string(node.join("src/lib.rs")).unwrap(),
+                before
+            );
+        }
     }
 
     // ── The unsatisfied-dep WARN must match the printed notice ──
@@ -4762,66 +4912,6 @@ mod tests {
         }
     }
 
-    /// The advisory warning names the PATH probe, Cargo override uncertainty,
-    /// both releases, and the stable-toolchain remedy.
-    #[test]
-    fn rustc_release_mismatch_warning_names_both_releases_and_the_fix() {
-        let reason = rustc_release_mismatch_warning("lidar_sensor", "1.97.1", "1.93.0")
-            .expect("differing releases must be reported");
-        assert!(reason.contains("1.97.1"), "{reason}");
-        assert!(reason.contains("1.93.0"), "{reason}");
-        assert!(reason.contains("PATH rustc"), "{reason}");
-        assert!(
-            reason.contains("Cargo may select a different compiler"),
-            "{reason}"
-        );
-        assert!(reason.contains("the build will continue"), "{reason}");
-        assert!(
-            reason.contains("rustup toolchain install 1.93.0"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("RUSTUP_TOOLCHAIN=1.93.0 cerulion node build lidar_sensor"),
-            "{reason}"
-        );
-    }
-
-    /// A matching release is not an error: the overwhelmingly common case (one
-    /// ambient toolchain) must build exactly as it did before this check
-    /// existed.
-    #[test]
-    fn rustc_release_mismatch_warning_is_none_on_a_match() {
-        assert_eq!(
-            rustc_release_mismatch_warning("lidar_sensor", "1.93.0", "1.93.0"),
-            None
-        );
-    }
-
-    /// An UNDETERMINED release (the pre-flight `rustc -vV` spawn or parse
-    /// failed) must never itself refuse a build this check cannot evaluate:
-    /// the probe is advisory and the load-time guard remains authoritative.
-    #[test]
-    fn rustc_release_mismatch_warning_is_none_when_detection_is_empty() {
-        assert_eq!(
-            rustc_release_mismatch_warning("lidar_sensor", "", "1.93.0"),
-            None
-        );
-    }
-
-    /// `detect_rustc_release` parses the real `rustc -vV` on this machine (no
-    /// fixture needed) and must return a non-empty `release:` field, never
-    /// `None`, when `rustc` is on `PATH` (true in every CI or dev environment
-    /// that can run this suite at all).
-    #[test]
-    fn detect_rustc_release_reads_a_real_release_field() {
-        let ws = tempfile::tempdir().unwrap();
-        let detected =
-            detect_rustc_release(ws.path()).expect("rustc -vV must be parseable in this suite");
-        assert!(!detected.is_empty());
-        // `release:` is always `<major>.<minor>.<patch>` optionally suffixed
-        // (`-nightly`, `-beta.N`): never empty, never containing a space.
-        assert!(!detected.contains(' '), "{detected}");
-    }
     #[cfg(unix)]
     fn sh(script: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("sh");

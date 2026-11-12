@@ -1455,6 +1455,7 @@ dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "codegen_fixture_msgs",
  "dirs",
@@ -1634,6 +1635,15 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "zenoh",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "libloading",
+ "stabby",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -9187,6 +9197,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]
@@ -9415,6 +9426,8 @@ name = "test_node_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+ "serde_json",
 ]
 
 [[package]]
@@ -9437,6 +9450,7 @@ name = "test_node_drain_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9493,6 +9507,7 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+ "trybuild",
 ]
 
 [[package]]
@@ -9715,6 +9730,7 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9722,6 +9738,16 @@ name = "test_node_snapshot_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_stable_abi_cross_compiler"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+ "stabby",
 ]
 
 [[package]]
@@ -9745,6 +9771,13 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_unknown_schema_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
 ]
 
 [[package]]

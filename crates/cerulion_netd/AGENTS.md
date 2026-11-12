@@ -1,26 +1,26 @@
 # cerulion_netd
 
-One gateway/zenoh session/host; refcounted NDJSON demands. Spies pin wiring.
+One host gateway/zenoh session; NDJSON refcounts; spy wiring pins
 
-- Protocol12: paired catalogs; WAN observers use `/__cerulion/observers/` channels, LAN observers share canonical demands. Last observer releases the source/mode mirror; wire/2 stays canonical. MirrorLost queues losses without replacing replies; demand-free probes treat busy as unknown. Supervised forwards startup errors; Paired/Open run watches latch them; serving clears them.
+- Protocol12: paired catalogs. WAN observers use `/__cerulion/observers/`; LAN shares canonical demands. Last observer releases source/mode mirror; wire/2 canonical. MirrorLost queues without replacing replies; demand-free Busy probes mean unknown. Supervised forwards startup errors; Paired/Open watches latch them; serving clears them.
+- Demand/Observe: same-socket retry of exact controller/login Busy or same-source ensure wrapper, seven uneven deterministic backoffs within 2 s. Exhaustion preserves text/latches warn; retry/recovery debug.
 
 ## Rules
-- LAN: Paired everywhere; explicit Open warns. Delivery fixtures use Open.
+- LAN: Paired everywhere; explicit Open warns. Delivery fixtures: Open.
 - Gateway/probe/taps obey SHM producer scope even on open LAN: local-only and outputs omitted from declared egress stay private; taps retain leases.
 - Singleton is kernel flock on `cerulion_hygiene::NETD` pidfile, released on death; no second scheme. Android uses an abstract same-UID socket.
 - Connection close IS release (crash-safe refcounts). LAST release retires
   the mirror and frees the single-writer SHM slot; a re-demand recreates it.
 - ONE mirror per source/mode across planes. Status uses `MirrorPlane::serving_plane`, pinned at ensure; absent is unknown, not LAN.
 - WAN default-on; netd outside default-members keeps plain builds iroh-free. Lean consumers use default-features=false; either changes workspace builds.
-- Never answer a cold start with a confident empty: `DiscoveryState::NotConverged`
-  until discovery settles (`query::classify_gather`). An additive field whose serde
-  default is a POSITIVE claim needs a `PROTOCOL_VERSION` bump plus a client floor,
-  `<=`-asserted, never an equality pin.
+- Never claim a confident empty at cold start: `DiscoveryState::NotConverged`
+  until `query::classify_gather` settles. Additive serde defaults making POSITIVE
+  claims require a `PROTOCOL_VERSION` bump and client floor `<=` assertion, never equality.
 - Convergence uses non-reconnecting `_once` (reconnect restarts spawn-wait); cancellation never proves absence.
-- Control waits on readable socket OR filled push slot; socket-only stalls idle catalogs.
-- A nonzero non-loopback TCP `CERULION_NETD_LISTEN` port is the ONLY gate for the mDNS
-  beacon and standing mode (gateway boots at start, idle self-exit off). None means a
-  refusal, never a default port; `CERULION_NETD_NETWORK=off` wins over both.
+- Control waits on readable socket OR push slot; socket-only stalls idle catalogs.
+- Only nonzero non-loopback TCP `CERULION_NETD_LISTEN` admits mDNS and standing mode
+  (gateway boots at start, no idle exit). Missing means refusal, never a default port;
+  `CERULION_NETD_NETWORK=off` wins.
 - Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
   LISTEN needs login; off/injected exempt. Nonempty egress or hold_serving starts
   one remoted without LISTEN; query/off start none; standing lasts to shutdown.
@@ -29,11 +29,10 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies pin wiring.
   TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.
 - Lifecycle I/O runs outside verbs, unlocked; outbound readers fence reap.
   begin/ready/end restore live pins in 5 s or name losses; no empty migration.
-- ONE `account_controller::AccountWanController` serves manual and account routes:
-  install creates no endpoint, controller state is `try_lock` under registry
-  bookkeeping so LAN never waits on WAN metadata; pins survive tearing. EVERY
-  demand calls `prepare_demand`: stale identity or dead reader cannot acknowledge
-  a phantom mirror. Validate `account:` before `TopicKey` trims ordinary names.
+- ONE `AccountWanController` serves manual/account routes. Install creates no endpoint.
+  State `try_lock` under registry bookkeeping keeps LAN from waiting on WAN metadata;
+  pins survive teardown. EVERY demand calls `prepare_demand`: stale identity/dead reader
+  cannot acknowledge a phantom. Validate `account:` before `TopicKey` trims names.
 - Bounded same-user `outbound.sock`: shared endpoint/runtime, key/namespace
   gate. Metadata per-call; snapshot selected/held peers. Refusals keep holds; cleanup errors fence.
   Loss retires readers; pre-Ensure Sync retries own none. Postcard owner; one key bind.
@@ -42,8 +41,8 @@ One gateway/zenoh session/host; refcounted NDJSON demands. Spies pin wiring.
 
 ## Tests
 - `-- --test-threads=1` (CLI shares SHM); `--no-default-features` green. Count oracles, not clocks.
-- Build `cerulion_cli`/`cerulion_remoted` first; WAN fixtures use the real CLI/default
-  SHM namespace and owner controller; CI runs serial.
+- Build `cerulion_cli`/`cerulion_remoted` first. WAN fixtures use real CLI/default
+  SHM namespace and owner controller, serially.
 - `#[traced_test]` capture is thread-local: plane tokio workers are invisible.
   Test-only beacon suppression stays out of `src/**` (walk enforced).
 

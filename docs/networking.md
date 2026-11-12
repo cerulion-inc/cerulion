@@ -92,6 +92,9 @@ topic. CLI observers re-demand their pinned source and schema, or stop with a
 named error if recovery fails;
 graph imports revalidate the pinned producer before reconnecting, and
 visualization re-demands its pinned source and schema outside frame draining. Status checks use separate connections, so a busy daemon does not release healthy readers. Visualization retries each lost source with backoff independently.
+Initial reads and re-demands automatically retry transient controller or login-store
+contention on the same connection with a short bounded backoff. If contention
+persists, the command reports the daemon's refusal.
 
 ## The decision matrix
 

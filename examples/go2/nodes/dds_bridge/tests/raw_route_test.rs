@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::codegen::CdrEndianness;
+use cerulion_core::graph::node_plugin_abi::RawIngress;
 use cerulion_core::message::ShmMessage;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
@@ -145,7 +146,7 @@ fn a_private_raw_route_retains_scope_and_delivers_locally_after_the_run_guard_dr
     let scope = manager.exclude_remote_topic(topic).unwrap();
     let codec = bridge_codec();
     let mut route = RawIngressRoute::open(
-        &manager,
+        &RawIngress::native(Arc::clone(&manager)),
         &codec,
         "geometry_msgs/Vector3",
         topic,
@@ -180,7 +181,7 @@ fn test_vector3_flows_end_to_end_with_zero_per_type_code() {
     let topic = "/rawroute/v3/flow";
 
     let mut route = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "geometry_msgs/Vector3",
         topic,
@@ -235,7 +236,7 @@ fn test_open_registers_dynamic_egress_with_codec_schema_hash() {
     );
 
     let _route = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "geometry_msgs/Vector3",
         topic,
@@ -254,7 +255,7 @@ fn test_open_registers_dynamic_egress_with_codec_schema_hash() {
     let missing = "/rawdyn/dynreg/never";
     assert!(
         RawIngressRoute::open(
-            &mgr,
+            &RawIngress::native(Arc::clone(&mgr)),
             &codec,
             "not_a_pkg/NotAType",
             missing,
@@ -277,7 +278,7 @@ fn test_decode_failure_drops_sample_and_burns_no_sequence() {
     let topic = "/rawroute/seq/gapfree";
 
     let mut route = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "std_msgs/String",
         topic,
@@ -338,7 +339,7 @@ fn test_unknown_type_refused_at_open_before_any_service_exists() {
     // (let-else, not unwrap_err: the Ok type `RawIngressRoute` is
     // deliberately not Debug — nothing useful to print about a live route.)
     let Err(err) = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "totally/Bogus",
         topic,
@@ -374,7 +375,7 @@ fn test_publish_cdr_body_is_byte_identical_to_publish_dds_payload() {
     let topic_body = "/rawroute/parity/body";
 
     let mut via_payload = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "std_msgs/String",
         topic_full,
@@ -382,7 +383,7 @@ fn test_publish_cdr_body_is_byte_identical_to_publish_dds_payload() {
     )
     .expect("open full-payload route");
     let mut via_body = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "std_msgs/String",
         topic_body,
@@ -438,7 +439,7 @@ fn test_decoded_frame_header_matches_a_natively_published_equivalent() {
     // Codec half, through the raw route.
     let codec = bridge_codec();
     let mut route = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "std_msgs/String",
         topic_raw,
@@ -479,7 +480,7 @@ fn test_two_routes_on_one_transport_are_independent() {
     let topic_s = "/rawroute/multi/s";
 
     let mut r_v3 = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "geometry_msgs/Vector3",
         topic_v3,
@@ -487,7 +488,7 @@ fn test_two_routes_on_one_transport_are_independent() {
     )
     .expect("v3 route");
     let mut r_s = RawIngressRoute::open(
-        &mgr,
+        &RawIngress::native(Arc::clone(&mgr)),
         &codec,
         "std_msgs/String",
         topic_s,
@@ -537,7 +538,7 @@ fn test_determinism_same_script_on_two_isolated_transports_is_byte_identical() {
         let codec = bridge_codec();
         let topic = "/rawroute/det/stream";
         let mut route = RawIngressRoute::open(
-            &mgr,
+            &RawIngress::native(Arc::clone(&mgr)),
             &codec,
             "geometry_msgs/Vector3",
             topic,

@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Regression pin: the cdylib-local stderr tracing subscriber
-//! (`install_cdylib_stderr_tracing`, called from the macro-generated
-//! `cerulion_node_init`) makes node-side `tracing` events host-visible.
-//!
-//! # The bug this pins
-//!
-//! A cdylib statically links its OWN copy of `cerulion_core` + `tracing`, so its
-//! `tracing` global dispatcher is a distinct static from the host binary's. The
-//! host initializing ITS subscriber does nothing for the cdylib's static, so
-//! every `tracing::error!`/`warn!`/`info!` emitted by node-side code — including
-//! cerulion_core's loud-by-design `OutputProxy` discard error ("OutputProxy
-//! dropped without writing all declared variable fields; skipping publish") —
-//! dispatched to a no-op. Production dylib graphs ran silently broken. The
-//! stopgap installs an `fmt` subscriber (respecting the env-snapshot RUST_LOG)
-//! on the cdylib's own static at node init, so those events land on stderr.
+//! Regression pins for separate host and cdylib tracing dispatchers.
+//! Macro-generated nodes install a cdylib-local stderr subscriber for author
+//! events. The host emits output discard and recovery diagnostics through its
+//! own subscriber on stderr. Graph environment filters apply to node events;
+//! the host subscriber keeps its own filter.
 //!
 //! # Why a subprocess
 //!
@@ -23,14 +13,14 @@
 //! --ignored --nocapture`) as a child, pipes the CHILD's stderr, drives a
 //! 1-node (or 2-node) graph over real iceoryx2 (`build_for_test`) that loads the
 //! `test_node_discard_probe_cdylib` fixture, and asserts on the captured stderr.
-//! The child installs NO host subscriber and uses NO `#[traced_test]` — the pin
-//! is that the CDYLIB's own subscriber writes to the child process stderr.
+//! The child installs the host subscriber for host-owned output diagnostics.
+//! The cdylib subscriber routes the author's events to the same stderr channel.
 //!
 //! Oracle: the literal error/warn strings (NOT a self-compare). Test 1 FAILS
 //! without the subscriber (the black hole — nothing reaches stderr). Portable: runs on
 //! macOS AND Linux CI (no `cfg(linux)` gate).
 //!
-//! # The 8 pins
+//! # The pins
 //!
 //! 1. `RUST_LOG=info` surfaces the discard error EXACTLY ONCE across the firing
 //!    steps (the discard error is now FLOOD-LATCHED — first occurrence
@@ -65,6 +55,8 @@
 //!    parses (`info`, `warn`): the breadcrumb names the effective filter only
 //!    when it differs from what the user wrote, which is the unparseable
 //!    fallback of pin 6.
+//! 9. Graph `RUST_LOG=off` suppresses author events while a separately
+//!    configured host filter still admits its output discard diagnostic.
 //!
 //! # Running (needs the fixture built first; `#[serial]` — each parent test
 //! spawns a child that builds over the iceoryx2 SHM singleton)
@@ -97,6 +89,8 @@ use serial_test::serial;
 const ENV_CHILD: &str = "CER_TRACING_STOPGAP_CHILD";
 /// Number of fixture instances the child wires into its graph (default 1).
 const ENV_INSTANCES: &str = "CER_TRACING_STOPGAP_INSTANCES";
+/// Optional host-only filter, independent of the graph environment snapshot.
+const ENV_HOST_FILTER: &str = "CER_TRACING_STOPGAP_HOST_FILTER";
 /// Consumed by the FIXTURE (`test_node_discard_probe_cdylib`): "healthy" ⇒ write
 /// all variable fields (no discard error); anything else ⇒ leave fields unwritten.
 const ENV_DISCARD_MODE: &str = "CER_DISCARD_MODE";
@@ -254,6 +248,16 @@ fn subprocess_child_discard_probe() {
     if std::env::var(ENV_CHILD).as_deref() != Ok("1") {
         return;
     }
+    let filter = match std::env::var(ENV_HOST_FILTER) {
+        Ok(spec) => tracing_subscriber::EnvFilter::try_new(spec).expect("valid host-only filter"),
+        Err(_) => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+    };
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     let instances = std::env::var(ENV_INSTANCES)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -283,6 +287,15 @@ struct ChildOutcome {
 /// exit (SIGKILL on timeout). `rust_log = None` REMOVES RUST_LOG from the child
 /// env (also clearing any the CI harness carries); `Some(v)` sets it.
 fn run_child(rust_log: Option<&str>, discard_mode: Option<&str>, instances: usize) -> ChildOutcome {
+    run_child_with_host_filter(rust_log, discard_mode, instances, None)
+}
+
+fn run_child_with_host_filter(
+    rust_log: Option<&str>,
+    discard_mode: Option<&str>,
+    instances: usize,
+    host_filter: Option<&str>,
+) -> ChildOutcome {
     assert_fixture_built();
 
     let exe = std::env::current_exe().expect("current_exe for child re-exec");
@@ -295,6 +308,11 @@ fn run_child(rust_log: Option<&str>, discard_mode: Option<&str>, instances: usiz
     ]);
     cmd.env(ENV_CHILD, "1");
     cmd.env(ENV_INSTANCES, instances.to_string());
+    if let Some(filter) = host_filter {
+        cmd.env(ENV_HOST_FILTER, filter);
+    } else {
+        cmd.env_remove(ENV_HOST_FILTER);
+    }
     match rust_log {
         Some(v) => {
             cmd.env("RUST_LOG", v);
@@ -364,9 +382,8 @@ fn run_child(rust_log: Option<&str>, discard_mode: Option<&str>, instances: usiz
 
 // --- Parent tests ----------------------------------------------------------
 
-/// THE regression guard: with RUST_LOG=info the cdylib subscriber routes the
-/// OutputProxy discard error AND the user warn to the process stderr. With
-/// no subscriber in the cdylib's tracing static, stderr carries neither.
+/// With RUST_LOG=info the host routes its output discard error to stderr,
+/// and the independent cdylib subscriber routes the author's warn there.
 ///
 /// The discard error is FLOOD-LATCHED. Under `info` it appears
 /// EXACTLY ONCE across the firing steps — the loud first-of-regime `error!`; the
@@ -733,6 +750,54 @@ fn rust_log_unset_prints_no_breadcrumb() {
          {breadcrumbs}. stderr:\n{}",
         out.stderr
     );
+}
+
+/// The graph's off filter silences author events without changing the host filter.
+#[test]
+#[serial]
+fn graph_rust_log_off_does_not_silence_host_output_diagnostics() {
+    for _ in 0..2 {
+        let out = run_child_with_host_filter(
+            Some("off"),
+            None,
+            1,
+            Some("cerulion_core::transport::output_proxy=info"),
+        );
+        assert!(out.success, "child must exit 0; stderr: {}", out.stderr);
+        assert_eq!(count_at(&out.stderr, "ERROR", DISCARD_ERROR), 1);
+        assert!(!out.stderr.contains(USER_WARN));
+        assert!(!out.stderr.contains(INFO_PROBE));
+        assert!(!out.stderr.contains(DEBUG_PROBE));
+    }
+}
+
+#[test]
+#[serial]
+fn field_default_info_reaches_stderr_before_user_initialization() {
+    // Only an invalid filter emits the banner that anchors constructor ordering.
+    let out = run_child(Some("foo=notalevel"), Some("healthy"), 2);
+    assert!(out.success, "child must exit cleanly: {}", out.stderr);
+    assert_eq!(
+        count_at(&out.stderr, "INFO", "discard probe field default ran"),
+        2
+    );
+    assert_eq!(out.stderr.matches(BREADCRUMB).count(), 1);
+    let install = out.stderr.find(BREADCRUMB).unwrap();
+    let default = out.stderr.find("discard probe field default ran").unwrap();
+    assert!(
+        install < default,
+        "the subscriber is installed before field Defaults"
+    );
+    let valid = run_child(Some("info"), Some("healthy"), 2);
+    assert!(valid.success, "child must exit cleanly: {}", valid.stderr);
+    assert_eq!(
+        count_at(&valid.stderr, "INFO", "discard probe field default ran"),
+        2
+    );
+    assert!(!valid.stderr.contains(BREADCRUMB));
+    let off = run_child(Some("off"), Some("healthy"), 1);
+    assert!(off.success, "child must exit cleanly: {}", off.stderr);
+    assert!(!off.stderr.contains("discard probe field default ran"));
 }
 
 /// A `RUST_LOG` that PARSES prints no breadcrumb: the effective filter is the

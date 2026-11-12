@@ -104,6 +104,8 @@ const RESOURCE_NAMES: &[&str] = &[
     "Barrier",
     // ---- Cerulion's own handles ------------------------------------------
     "TransportManager",
+    "RawIngress",
+    "RawPublisher",
     "NodeContext",
     "CerNodeRuntimeFields",
     "AnyPublisher",
@@ -193,6 +195,8 @@ mod tests {
     fn a_handle_is_recognised_through_the_wrappers_it_actually_ships_in() {
         // The shape the Go2 bridge holds today.
         assert!(resource(parse_quote!(Option<Arc<TransportManager>>)));
+        assert!(resource(parse_quote!(Option<RawIngress>)));
+        assert!(resource(parse_quote!(RawPublisher)));
         assert!(resource(parse_quote!(Arc<Mutex<File>>)));
         assert!(resource(parse_quote!(Vec<JoinHandle<()>>)));
         assert!(resource(parse_quote!(Box<TcpStream>)));
