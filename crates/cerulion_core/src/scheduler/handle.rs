@@ -959,6 +959,12 @@ impl NodeHandle {
         }
     }
 
+    /// The raw in-tick marker word, for a reader that samples it off the
+    /// executing thread and decodes `0` itself (the fire tap's `in_tick`).
+    pub(crate) fn in_tick_marker(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.in_tick_since_ns)
+    }
+
     /// Per-node count of publisher-loss transitions
     /// observed on this node's inputs by the runtime liveliness sweep
     /// (every `Lost` transition — a publisher disconnecting or crashing
