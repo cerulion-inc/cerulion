@@ -2485,10 +2485,7 @@ unsafe fn prepare_seq_cpp(member: &CppMessageMember, field: *mut c_void, count: 
     let Some(resize) = member.resize_function else {
         return false;
     };
-    if ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) != 0 {
-        return false;
-    }
-    true
+    ffi::introspection_cpp::rmw_cerulion_member_resize(resize, field, count) == 0
 }
 
 /// Decode a canonical Cerulion body into a C++ message value — the twin of

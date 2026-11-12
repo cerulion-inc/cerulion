@@ -10253,8 +10253,8 @@ fn replay_probing_reader(
 fn many_step_source_relay_bag(dir: &std::path::Path, steps: usize) -> std::path::PathBuf {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
     // Anchor the recording (not a self-compare): source.out.x == step+1.
-    for k in 0..steps {
-        assert_eq!(frame_x(&rec.messages["/sr/source/out"][k]), (k + 1) as f64);
+    for (k, frame) in rec.messages["/sr/source/out"][..steps].iter().enumerate() {
+        assert_eq!(frame_x(frame), (k + 1) as f64);
     }
     let bag = dir.join("advise_source_relay.mcap");
     write_bag(&rec, &bag, None);
@@ -10482,9 +10482,9 @@ fn advise_behind_de_pins_a_lagging_topics_frozen_consume_cursor() {
         steps,
     );
     // Anchor (not a self-compare): every topic recorded byte-clean, x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_lagging_topic.mcap");
@@ -10642,9 +10642,9 @@ fn advise_behind_engages_and_verdict_is_stable_under_a_lagging_consumed_topic() 
         steps,
     );
     // Anchor (not a self-compare): every recorded frame x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_reread_lagging.mcap");
@@ -10813,9 +10813,9 @@ fn advise_behind_evicted_pages_re_fault_byte_identical() {
         steps,
     );
     // Anchor the RECORDING (not a self-compare): every recorded frame x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_refault_bytes.mcap");
@@ -26377,8 +26377,8 @@ fn free_run_nonzero_epoch_first_boundary_does_not_burst_period_catchup() {
     let steps = 4usize;
     let mut rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
     // Anchor the RECORDING to a hand oracle before re-basing it.
-    for k in 0..steps {
-        assert_eq!(frame_x(&rec.messages["/sr/source/out"][k]), (k + 1) as f64);
+    for (k, frame) in rec.messages["/sr/source/out"][..steps].iter().enumerate() {
+        assert_eq!(frame_x(frame), (k + 1) as f64);
     }
     rebase_recording_onto_epoch(&mut rec, EPOCH_NS);
 
