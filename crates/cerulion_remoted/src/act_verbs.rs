@@ -57,18 +57,19 @@ use serde_json::{json, Value};
 
 use crate::estop_lease::EstopLease;
 
-/// Register the four act verbs in `verbs`; `topic-publish` and
-/// `service-call` check the e-stop on `lease`, the robot's one shared control
-/// lease and the count of the engages that wait for its lock. Every daemon ops
-/// constructor registers them through this function, with a clone of the
-/// `EstopLease` its `engage-estop` verb engages through; a library host
-/// registers refusals under the same names instead.
-pub fn register(verbs: &mut cerud::verbs::VerbRegistry, lease: EstopLease) {
-    verbs
-        .register(Box::new(TopicPublishVerb::new(lease.clone())))
-        .register(Box::new(ServiceCallVerb::new(lease)))
-        .register(Box::new(TopicSnapshotVerb))
-        .register(Box::new(TopicEchoOnceVerb));
+/// The four act verbs; `topic-publish` and `service-call` check the e-stop on
+/// `lease`, the robot's one shared control lease and the count of the engages
+/// that wait for its lock. Every daemon ops constructor registers them from
+/// this function, with a clone of the `EstopLease` its `engage-estop` verb
+/// engages through; a library host registers refusals under the same names
+/// instead.
+pub fn handlers(lease: EstopLease) -> [Box<dyn VerbHandler>; 4] {
+    [
+        Box::new(TopicPublishVerb::new(lease.clone())),
+        Box::new(ServiceCallVerb::new(lease)),
+        Box::new(TopicSnapshotVerb),
+        Box::new(TopicEchoOnceVerb),
+    ]
 }
 
 /// Publish a message on a topic.

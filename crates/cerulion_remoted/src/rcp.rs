@@ -23,9 +23,9 @@
 //! Then EVERY desk message is parsed by [`classify_message`] and checked by
 //! [`rcp_authorize`] for its class against the LIVE trust state before it is
 //! forwarded. Before each frame goes back to the desk, the class that produced it is checked
-//! again, and the session floor ([`RcpClass::Session`]) is checked every
-//! [`RcpLimits::revoke_check`] as well; a key that fails the floor has its
-//! connection closed.
+//! again, and the connection checks the session floor ([`RcpClass::Session`])
+//! every [`RcpLimits::revoke_check`] as well, with or without a stream open;
+//! a key that fails the floor has its connection closed.
 //!
 //! The e-stop takes no Observe/Act slot; its own bound is
 //! [`RcpLimits::estops_in_flight`]. A notification takes no slot. Requests
@@ -264,9 +264,11 @@ pub struct RcpLimits {
     /// (`--rcp-session-buffer-bytes`, default 32 MiB): two of the largest
     /// relayable messages ([`MAX_RESPONSE_MESSAGE`]).
     pub session_buffer_bytes: usize,
-    /// How often a session re-checks the session floor with no traffic
-    /// (`--rcp-revoke-check-ms`, default 5000): the longest a revoked, idle
-    /// desk keeps its connection; a frame sent or answered is checked at once.
+    /// How often a connection re-checks the session floor
+    /// (`--rcp-revoke-check-ms`, default 5000), on a fixed timer whether or
+    /// not it carries traffic: the longest a revoked, idle desk keeps its
+    /// connection, with or without a stream open; a frame sent or answered is
+    /// checked at once.
     pub revoke_check: Duration,
     /// How long rcpd may take to send a response head (`--rcp-head-timeout-ms`,
     /// default 30000): rcpd sends a streamed head before running the tool, so
@@ -1048,13 +1050,21 @@ impl Drop for ConnectionSlot {
 /// Serve one admitted rcp connection from `device_key` until it closes: each
 /// bidi stream is one session, at most [`RcpLimits::sessions_per_connection`]
 /// at once; past [`RcpLimits::connections_per_key`] a key's oldest connection
-/// is closed in favour of this one.
+/// is closed in favour of this one. Every [`RcpLimits::revoke_check`] the
+/// connection re-checks the session floor, with or without a stream open,
+/// and a key that fails it has the connection closed with [`CLOSE_REVOKED`].
 pub async fn serve_rcp_connection(
     connection: Connection,
     device_key: [u8; 32],
     plane: Arc<RcpPlane>,
 ) {
     let _slot = plane.admit_connection(device_key, &connection);
+    let _floor = AbortOnDrop(Some(tokio::spawn(watch_floor(
+        connection.clone(),
+        device_key,
+        plane.shared.clone(),
+        plane.link.limits.revoke_check,
+    ))));
     let slots = Arc::new(Semaphore::new(plane.link.limits.sessions_per_connection));
     let mut sessions = JoinSet::new();
     loop {
@@ -1077,6 +1087,31 @@ pub async fn serve_rcp_connection(
         });
     }
     sessions.shutdown().await;
+}
+
+/// Check the session floor ([`RcpClass::Session`]) for `device_key` against
+/// the live trust state `shared` every `period`, the first check one period
+/// after the connection is admitted, and close `connection` with
+/// [`CLOSE_REVOKED`] at the first check the key fails. It reads no stream, so
+/// a connection that holds none is checked as well.
+async fn watch_floor(
+    connection: Connection,
+    device_key: [u8; 32],
+    shared: SharedTrust,
+    period: Duration,
+) {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    loop {
+        tick.tick().await;
+        if let Err(reason) = authorize_key(&shared, &device_key, Some(RcpClass::Session)) {
+            tracing::warn!(
+                %reason,
+                "cerulion_remoted: rcp connection ended by the live trust state"
+            );
+            connection.close(CLOSE_REVOKED.into(), b"rcp access revoked");
+            return;
+        }
+    }
 }
 
 /// Per-session state shared by the request tasks.
@@ -1312,51 +1347,37 @@ async fn serve_session(
         capacity: limits.session_buffer_bytes,
     };
 
-    // The writer: each frame must still meet the requirement of the class that
-    // produced it; the session floor is also re-checked on a timer, and a key
-    // that fails it has its whole connection closed.
+    // The writer: each frame must still meet the session floor and the
+    // requirement of the class that produced it; a key that fails the floor
+    // has its whole connection closed. A quiet session is covered by the
+    // connection's own periodic check ([`watch_floor`]).
     let shared = plane.shared.clone();
     let writer_conn = connection.clone();
     let writer = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(limits.revoke_check);
-        let end = |reason: String| {
-            tracing::warn!(%reason, "cerulion_remoted: rcp session ended by the live trust state");
-            writer_conn.close(CLOSE_REVOKED.into(), b"rcp access revoked");
-        };
-        loop {
-            tokio::select! {
-                next = out_rx.recv() => {
-                    let Some(item) = next else { break };
-                    if let Err(reason) = authorize_key(&shared, &device_key, Some(RcpClass::Session)) {
-                        end(reason);
-                        break;
-                    }
-                    let frame = match authorize_key(&shared, &device_key, Some(item.class)) {
-                        Ok(()) => item.frame,
-                        // The scope no longer meets the class: a response is
-                        // answered with a denial, anything else is dropped.
-                        Err(reason) => match response_id(&item.frame) {
-                            Some(id) => error_frame(
-                                id,
-                                DENIED_CODE,
-                                &format!(
-                                    "result withheld: {reason}; rcpd may already have acted on \
-                                     this request"
-                                ),
-                            ),
-                            None => continue,
-                        },
-                    };
-                    if write_frame(&mut send, &frame).await.is_err() {
-                        break;
-                    }
-                }
-                _ = tick.tick() => {
-                    if let Err(reason) = authorize_key(&shared, &device_key, Some(RcpClass::Session)) {
-                        end(reason);
-                        break;
-                    }
-                }
+        while let Some(item) = out_rx.recv().await {
+            if let Err(reason) = authorize_key(&shared, &device_key, Some(RcpClass::Session)) {
+                tracing::warn!(%reason, "cerulion_remoted: rcp session ended by the live trust state");
+                writer_conn.close(CLOSE_REVOKED.into(), b"rcp access revoked");
+                break;
+            }
+            let frame = match authorize_key(&shared, &device_key, Some(item.class)) {
+                Ok(()) => item.frame,
+                // The scope no longer meets the class: a response is
+                // answered with a denial, anything else is dropped.
+                Err(reason) => match response_id(&item.frame) {
+                    Some(id) => error_frame(
+                        id,
+                        DENIED_CODE,
+                        &format!(
+                            "result withheld: {reason}; rcpd may already have acted on \
+                             this request"
+                        ),
+                    ),
+                    None => continue,
+                },
+            };
+            if write_frame(&mut send, &frame).await.is_err() {
+                break;
             }
         }
         let _ = send.finish();

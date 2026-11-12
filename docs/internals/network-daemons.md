@@ -151,8 +151,21 @@ remove them before committing.
   lock.
   Native admission uses `serving_hold::ServingHolds`, re-exported by remoted:
   acquire a guard before ops/RCP or shell/exec work and retain it through final
-  drain and witness. Latch and owed-delivery sources refresh before the last
-  shared unlock. Both daemons use `serving_hold::fence_path(state_root)` for
+  drain and witness. Remoted takes one after accept classification, for an
+  `OpsAdmit` or `RcpAdmit` session only (`daemon::fences_idle_teardown`), and
+  around each ops verb outside the bootstrap surface (`ops::FencedVerb`), so a
+  key that claims or pairs on a bootstrap-only session runs its later calls
+  fenced. A bootstrap-only, wire, refused or unknown-ALPN connection takes
+  none: a peer that never pairs cannot keep the server running past the last
+  egress release or a lapsed serving hold, and pairing over a bootstrap-only
+  session is served only while something else keeps the server: standing
+  serving, an egress registration, a serving hold, or work that holds the
+  fence (a paired session, outbound readers, the engaged latch or owed
+  delivery). An `RcpAdmit` connection re-checks the session floor every
+  `RcpLimits::revoke_check`, with or without a stream open, so a revoked key's
+  connection closes and releases its guard. Latch and owed-delivery
+  sources refresh before the last shared unlock. Both daemons use
+  `serving_hold::fence_path(state_root)` for
   `<state_root>/serving/serving.hold`, outside the provisioned `remoted` directory.
   Its parent is created owner-only before the file opens, so fresh provisioning
   still requires no existing robot directory. Netd takes that inode exclusively through
@@ -212,8 +225,12 @@ remove them before committing.
   counted on netd's monotonic clock from when it took the hold.
   `SERVING_HOLD_MIN_DAEMON_VERSION` is 12, so the client's per-verb gate tells
   a user of an older daemon to upgrade it. A hold does not take
-  `serving.hold`: remoted shares that lock only for admitted work and its own
-  sources.
+  `serving.hold`: remoted shares that lock only for paired sessions, ops
+  calls outside the bootstrap surface, outbound readers and its own sources,
+  so a connection from a peer without paired authority never keeps the server
+  past the hold's deadline (`automatic_serving_test.rs` pins the reap with two
+  unpaired ops connections and a refused rcp connection held open, and the
+  wait for a paired session).
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway

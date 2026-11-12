@@ -16,7 +16,8 @@ pub fn fence_path(state_root: &Path) -> PathBuf {
 /// Work which must remain reachable until it settles.
 #[derive(Clone, Copy, Debug)]
 pub enum HoldReason {
-    /// An accepted ops or RCP session.
+    /// An ops or RCP session admitted with paired authority, one ops call
+    /// outside the bootstrap surface, or a connection's outbound readers.
     Session,
     /// A remote shell or exec, including its final drain and witness.
     Shell,
