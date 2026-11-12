@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A first install on Linux no longer prints a block of Cargo build-script lines (`cargo:rerun-if-env-changed=...` and `... = None`) in the middle of its Rust setup. rustup-init 1.29 prints them on stdout from its default-linker check. The install script, `cerulion-install-rust` and the CLI's own offer to install Rust now run the official rustup installer for rustup alone (`--default-toolchain none`), hold back its stdout and show it in full only when it fails, then add current stable through that rustup, so the toolchain's download progress still shows. Stable is the default afterwards, as before. The command the CLI prints for a manual install is unchanged and still prints those lines with rustup 1.29.
+
 ## [2.0.0] - 2026-11-12
 
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. This release changes the command line in ways existing scripts notice, including paired LAN access by default on every platform, the output of `cerulion topic echo` and how `cerulion graph run` runs a graph by default (see Changed), so it is a major version. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 32 (see Changed).
