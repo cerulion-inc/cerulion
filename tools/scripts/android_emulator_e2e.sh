@@ -131,13 +131,11 @@ HOST_CER="$ROOT/target/debug/cerulion"
 HOST_STATE="$(mktemp -d "${TMPDIR:-/tmp}/cer-e2e-host.XXXXXX")"
 mkdir -p "$HOST_STATE/home"
 mkdir -m 700 "$HOST_STATE/run"
-# The host mirrors this fixture's unauthenticated zenoh streams. Producer-side
-# paired refusal checks below remain paired on the app itself.
 HOST_ENV=(env)
 while IFS= read -r name; do
   [[ "$name" == CERULION_LOGIN_GATE ]] || HOST_ENV+=(-u "$name")
 done < <(compgen -e | grep '^CERULION_' || true)
-HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run" RUST_LOG=warn CERULION_LAN_ACCESS=open)
+HOST_ENV+=(HOME="$HOST_STATE/home" XDG_RUNTIME_DIR="$HOST_STATE/run" RUST_LOG=warn)
 HOST_NETD_PID="$HOST_STATE/run/cerulion/netd.pid"
 DEV_CER="$DEV/cerulion"
 DEV_NETD="$DEV/cerulion-netd"

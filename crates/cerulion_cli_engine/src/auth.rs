@@ -1188,26 +1188,18 @@ pub(crate) struct StoreLock {
 #[cfg(not(unix))]
 pub(crate) struct StoreLock;
 
-fn hold_store_lock(auth_path: &Path, wait: std::time::Duration) -> std::io::Result<StoreLock> {
-    hold_lock_file(&store_lock_path(auth_path), auth_path, wait, "writing")
+fn hold_store_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
+    hold_lock_file(&store_lock_path(auth_path), auth_path, LOCK_WAIT, "writing")
 }
 
 /// The exclusive lock that serializes session refreshes across processes, held
 /// across the refresh request ([`REFRESH_LOCK_WAIT`] bounds the wait for it).
 /// Separate from the store lock, so a store write never waits on the network.
 pub(crate) fn hold_refresh_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
-    hold_refresh_lock_within(auth_path, REFRESH_LOCK_WAIT)
-}
-
-/// Acquire the refresh lock within the caller's remaining operation budget.
-pub(crate) fn hold_refresh_lock_within(
-    auth_path: &Path,
-    wait: std::time::Duration,
-) -> std::io::Result<StoreLock> {
     hold_lock_file(
         &auth_path.with_file_name(REFRESH_LOCK_FILE),
         auth_path,
-        wait,
+        REFRESH_LOCK_WAIT,
         "refreshing the session in",
     )
 }
@@ -1328,20 +1320,11 @@ pub fn with_store_lock<T>(
     auth_path: &Path,
     write: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    with_store_lock_within(auth_path, LOCK_WAIT, write)
-}
-
-/// Publish under the store lock within an existing operation's remaining budget.
-pub(crate) fn with_store_lock_within<T>(
-    auth_path: &Path,
-    wait: std::time::Duration,
-    write: impl FnOnce() -> std::io::Result<T>,
-) -> std::io::Result<T> {
     let lock_path = store_lock_path(auth_path);
     if HELD_LOCKS.with(|held| held.borrow().contains(&lock_path)) {
         return write();
     }
-    let held = hold_store_lock(auth_path, wait)?;
+    let held = hold_store_lock(auth_path)?;
     HELD_LOCKS.with(|h| h.borrow_mut().push(lock_path.clone()));
     // Released even if `write` panics — the guard drops during the unwind, and
     // the kernel drops the `flock` with the file.

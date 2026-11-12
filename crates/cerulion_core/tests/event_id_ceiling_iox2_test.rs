@@ -96,7 +96,6 @@ fn the_run_registry_doorbell_is_created_with_the_event_id_ceiling() {
     let _run = RunHandle::publish_on_config(
         &ix,
         RunRecord {
-            remote_visible: true,
             run_id: cerulion_core::transport::run_registry::mint_run_id(),
             supervisor_pid: std::process::id(),
             run_started_at_ns: 0,

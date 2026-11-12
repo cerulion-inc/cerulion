@@ -6359,19 +6359,6 @@ impl GraphRuntime {
                 } else {
                     PublisherProvisioning::SingleWriter
                 }
-            } else if config.network.as_ref().is_some_and(|network| {
-                network.is_enabled()
-                    && network.ingress.iter().any(|topic| {
-                        crate::transport::network::canonical_topic(topic) == flow.topic
-                    })
-            }) {
-                // Principle #8: the remote injector is this topic's sole local
-                // writer. Provision the complete consumer topology before it
-                // opens, including supervisor precreation for sliced workers.
-                if replay_wiring.feeds.is_none() {
-                    external_silence_topics.push(flow.topic.clone());
-                }
-                PublisherProvisioning::SingleWriter
             } else {
                 if listed_multi {
                     // Loud-over-silent: the listing only affects topics

@@ -55,95 +55,6 @@ fn walker() -> cerulion_core::codegen::FrameWalker {
     cerulion_msgio::checked_walker(cerulion_msgio::store_schemas(Some(store()))).unwrap()
 }
 
-#[test]
-#[serial]
-fn act_reads_refuse_mirrors_and_reserved_channels() {
-    store();
-    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
-    let topic = "/act_verbs_test/mirror";
-    let _mirror = manager
-        .create_remote_ingress_injector(topic, 11, MaxSliceLen::try_new(64).unwrap())
-        .unwrap();
-    let publish = TopicPublishVerb::new(lease());
-    let call = ServiceCallVerb::new(lease());
-    for topic in [
-        topic,
-        "/__cerulion",
-        "/__cerulion/observers/x/y",
-        "__cerulion/x",
-    ] {
-        for handler in [
-            &TopicSnapshotVerb as &dyn VerbHandler,
-            &TopicEchoOnceVerb,
-            &publish,
-            &call,
-        ] {
-            let error = handler
-                .execute(&json!({"topic": topic, "service": topic, "timeout_s": 0}))
-                .unwrap_err();
-            let expected = if topic == "/act_verbs_test/mirror" {
-                format!("unavailable: '{topic}' is a network mirror of another robot; read it on its source robot")
-            } else {
-                format!("usage: '{topic}' is in Cerulion's reserved control-plane namespace")
-            };
-            assert!(
-                matches!(error, CerudError::Verb(ref message) if message == &expected),
-                "{}: {error}",
-                handler.name()
-            );
-        }
-    }
-}
-
-#[test]
-#[serial]
-fn act_refusals_preserve_the_excluded_topic_context() {
-    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
-    let topic = "/act_verbs_test/excluded";
-    let _exclusion = manager.exclude_remote_topic(topic).unwrap();
-    let publish = TopicPublishVerb::new(lease());
-    let call = ServiceCallVerb::new(lease());
-    for handler in [
-        &TopicSnapshotVerb as &dyn VerbHandler,
-        &TopicEchoOnceVerb,
-        &publish,
-        &call,
-    ] {
-        let error = handler
-            .execute(&json!({"topic":topic,"service":topic,"timeout_s":0}))
-            .unwrap_err();
-        assert!(
-            matches!(error, CerudError::Verb(ref message) if message == &format!(
-                "unavailable: Remote access policy for topic '{topic}' refused: the producing run excludes this topic from network egress; remote access is refused"
-            )),
-            "{}: {error}",
-            handler.name()
-        );
-    }
-}
-
-#[test]
-#[serial]
-fn act_reads_allow_reserved_prefix_neighbor_and_local_sources() {
-    store();
-    for topic in ["/__cerulionx", "/act_verbs_test/local_oracle"] {
-        let stop = Arc::new(AtomicBool::new(false));
-        let publisher = publish_until(
-            topic,
-            "std_msgs/String",
-            "{\"data\":\"local oracle\"}".into(),
-            stop.clone(),
-        );
-        let result = TopicEchoOnceVerb.execute(&json!({"topic":topic,"timeout_s":5}));
-        stop.store(true, Ordering::SeqCst);
-        publisher.join().unwrap();
-        let result = result.unwrap();
-        assert_eq!(result["type"], "std_msgs/String");
-        assert_eq!(result["stamp_ns"], 77);
-        assert_eq!(result["message"], json!({"data":"local oracle"}));
-    }
-}
-
 /// Publish `text` as `ty` on `topic` every 20 ms until `stop`.
 fn publish_until(
     topic: &'static str,
@@ -373,28 +284,20 @@ fn service_call_with_no_server_is_unavailable() {
 #[serial]
 fn an_estop_engaged_during_the_server_wait_stops_the_call_as_unavailable() {
     store();
-    let service = "/act_verbs_test/call/estop";
     let l = lease();
     let engager = {
         let l = l.clone();
         std::thread::spawn(move || {
-            // The call opens its request publisher after the handler's latch
-            // check and the watcher's start, then waits for a server: engage
-            // once it has opened it, at the start of that wait.
-            let transport = cerulion_core::TransportManager::get_or_init().unwrap();
-            let request = cerulion_core::transport::service::request_topic(service);
-            let mut polls = 0;
-            while transport.topic_publisher_count(&request) == 0 {
-                polls += 1;
-                assert!(polls < 5000, "the call never opened its client");
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            std::thread::sleep(Duration::from_millis(300));
             l.lock().unwrap().engage_estop("test");
         })
     };
     let started = std::time::Instant::now();
     let err = ServiceCallVerb::new(l)
-        .execute(&json!({"service": service, "type": "demo_srvs/srv/Ping", "timeout_s": 10}))
+        .execute(
+            &json!({"service": "/act_verbs_test/call/estop", "type": "demo_srvs/srv/Ping",
+                         "timeout_s": 10}),
+        )
         .unwrap_err();
     engager.join().unwrap();
     match err {
@@ -535,28 +438,20 @@ fn an_estop_engaged_after_the_latch_checks_and_before_a_frame_publishes_no_frame
 #[serial]
 fn an_estop_engaged_during_the_subscriber_wait_stops_the_publish_as_unavailable() {
     store();
-    let topic = "/c1_act/publish/estop";
     let l = lease();
     let engager = {
         let l = l.clone();
         std::thread::spawn(move || {
-            // The publish opens its publisher after the handler's latch check
-            // and the watcher's start, then waits for a subscriber: engage
-            // once it has opened it, at the start of that wait.
-            let transport = cerulion_core::TransportManager::get_or_init().unwrap();
-            let mut polls = 0;
-            while transport.topic_publisher_count(topic) == 0 {
-                polls += 1;
-                assert!(polls < 5000, "the publish never opened its publisher");
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            std::thread::sleep(Duration::from_millis(300));
             l.lock().unwrap().engage_estop("test");
         })
     };
     let started = std::time::Instant::now();
     let err = TopicPublishVerb::new(l)
-        .execute(&json!({"topic": topic, "type": "std_msgs/String",
-                         "message": {"data": "x"}, "wait_subscribers_s": 10}))
+        .execute(
+            &json!({"topic": "/c1_act/publish/estop", "type": "std_msgs/String",
+                         "message": {"data": "x"}, "wait_subscribers_s": 10}),
+        )
         .unwrap_err();
     engager.join().unwrap();
     match err {

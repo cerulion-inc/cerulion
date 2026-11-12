@@ -84,7 +84,7 @@ fn gather_until_absent(manager: &TransportManager, gone: &MirrorRecord, budget: 
 /// Build a network-configured (scouting-off, ingress-only) manager over an
 /// isolated per-test SHM root.
 fn networked_test_manager(node: &str) -> Arc<TransportManager> {
-    let manager = TransportManager::init_for_test(
+    TransportManager::init_for_test(
         TransportConfig {
             node_name: node.to_string(),
             // NetworkConfig::default() is scouting-OFF + robot_identity None —
@@ -94,12 +94,7 @@ fn networked_test_manager(node: &str) -> Arc<TransportManager> {
         },
         iceoryx_test_config(),
     )
-    .expect("init networked test manager");
-    manager
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
-    manager
+    .expect("init networked test manager")
 }
 
 #[test]

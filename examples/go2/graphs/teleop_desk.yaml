@@ -7,10 +7,16 @@
 # is a hand edit so the desk publishes exactly the name the robot side
 # declares as ingress.
 #
-# With no network block, every produced topic is eligible for paired export.
-# The first export starts authenticated serving; the robot side demands the
-# keyboard stream through the same account or an established explicit pairing.
-# No listen setting, address or discovery override is needed.
+# No `network:` block: with none, this run is PERMISSIVE. Its egress registers
+# with this machine's cerulion-netd, which announces the topic and forwards
+# it once the robot side demands it. On one LAN nothing else is needed; to
+# reach a companion computer scouting cannot find, point this desk's netd at
+# it before the run:
+#
+#   export CERULION_NETD_CONNECT=tcp/<companion address>:7684
+#
+# (7684 is the port teleop_remote.yaml listens on; the companion's shared
+# netd plane keeps 7683 for the sensor graphs.)
 #
 # RUN (on the desk, in a real terminal):
 #

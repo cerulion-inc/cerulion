@@ -294,7 +294,6 @@ async fn connect_and_demand(
         &mut send,
         &mut recv,
         &WireRequest::Demand {
-            graph_ingress: false,
             topic: topic.to_string(),
         },
     )
@@ -466,7 +465,6 @@ async fn revoking_one_desks_device_evicts_it_and_leaves_the_accounts_other_desk_
     if let Ok(conn) = a_redial {
         if let Ok((mut s, mut r)) = open_frame_stream(&conn).await {
             let req = serde_json::to_vec(&WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic.clone(),
             })
             .unwrap();

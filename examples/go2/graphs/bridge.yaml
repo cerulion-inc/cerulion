@@ -28,14 +28,24 @@
 # shell. With no `network:` block both runs' egress converges onto the
 # machine's ONE `cerulion-netd` session instead of each binding a listener.
 #
-# SERVING: exported topics use paired access by default. The first live
-# export starts authenticated serving through cerulion-netd. A same-account
-# or explicitly paired desk finds and reads them with no listen setting,
-# address or --connect flag, on one LAN or across networks.
+# SERVING (how the desk sees this graph): networking is PERMISSIVE by default.
+# With no `network:` block the run registers its egress with `cerulion-netd`,
+# which announces every produced topic and forwards one only while a remote
+# subscriber demands it. ONE thing is required, on every network: give netd a
+# listen locator before the serve, in the shell (or service environment) that
+# runs the graph:
 #
-# A network block restricts exports and declares imports; it does not turn
-# networking on. Unpaired LAN topic access requires explicit
-# CERULION_LAN_ACCESS=open and warns at startup.
+#   export CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
+#
+# netd's listen list comes only from that variable and its default is empty,
+# so a netd started without it binds nothing and no desk can reach it; with
+# it set, netd also advertises itself over mDNS, so a desk on the same LAN
+# finds the robot with no configuration. Off the LAN, the desk names the
+# locator: `cerulion topic list --connect tcp/<companion address>:7683`.
+#
+# Do NOT add a `network:` block to "turn networking on": a block TIGHTENS the
+# run to Strict, which binds the block's locators verbatim in a per-run
+# gateway and ignores CERULION_NETD_LISTEN.
 #
 # RUN (on the companion computer):
 #   export GO2_IFACE=<this computer's robot-LAN interface IP>

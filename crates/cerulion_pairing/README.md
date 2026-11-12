@@ -23,7 +23,7 @@ working offline.
 
 ## Who uses it
 
-The `cerulion login` and `cerulion connect` verbs, the `cerulion-netd`
+The `cerulion pair` and `cerulion connect` verbs, the `cerulion-netd`
 gateway daemon and the robot-side remote-access daemon all build on it.
 
 See [remote access](https://github.com/cerulion-inc/cerulion/blob/main/docs/remote_plane.md).

@@ -366,7 +366,7 @@ impl PairingAuthorizer {
             // Ops plane: per-verb authz runs downstream in the ops server. At
             // accept we route by reachability — a paired+allowed key gets the
             // full surface; anyone else reaches only the bootstrap surface.
-            if paired_and_allowed(claimed, access) {
+            if claimed && matches!(access, KeyAccess::Allowed(_)) {
                 AcceptDecision::OpsAdmit
             } else {
                 AcceptDecision::OpsBootstrapOnly
@@ -399,21 +399,6 @@ impl PairingAuthorizer {
     pub fn shared(&self) -> &SharedTrust {
         &self.shared
     }
-
-    /// [`paired_and_allowed`] for `device_key`'s current trust snapshot.
-    pub(crate) fn is_paired_and_allowed(&self, device_key: &[u8; 32]) -> bool {
-        let (claimed, access) = self.shared.snapshot_for_key(device_key);
-        paired_and_allowed(claimed, access)
-    }
-}
-
-/// Whether a key gets past the bootstrap-only ops surface: the robot is claimed
-/// and the snapshot reads the key `Allowed` (its account on the access list, the
-/// device not revoked, cloud access on for a cloud row). Each verb is still
-/// authorized on its own. The ops accept gate and the pre-TLS paired relay
-/// reserve in the daemon both read this one predicate.
-pub(crate) fn paired_and_allowed(claimed: bool, access: KeyAccess) -> bool {
-    claimed && matches!(access, KeyAccess::Allowed(_))
 }
 
 /// The refusal for a cloud row on a robot whose allow-from-cloud switch is OFF
@@ -574,26 +559,6 @@ fn authed_device_key(caller: &CallerIdentity) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_a_claimed_robot_and_an_allowed_key_reach_the_paired_surface() {
-        let allowed = KeyAccess::Allowed(cerulion_pairing::format::Scope::OWNER_FULL);
-        for (claimed, access, expected) in [
-            (true, allowed, true),
-            (false, allowed, false),
-            (true, KeyAccess::Unpaired, false),
-            (true, KeyAccess::NotAllowed, false),
-            (true, KeyAccess::DeviceRevoked, false),
-            (true, KeyAccess::CloudRefused, false),
-            (false, KeyAccess::Unpaired, false),
-        ] {
-            assert_eq!(
-                paired_and_allowed(claimed, access),
-                expected,
-                "claimed {claimed}, {access:?}"
-            );
-        }
-    }
 
     #[test]
     fn classify_verb_covers_the_sacred_table_and_denies_the_rest() {

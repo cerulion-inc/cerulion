@@ -58,15 +58,16 @@ Two graphs wire this node, both under `graphs/`:
   `/go2/cmd_vel/keyboard` (a `topic:` override), and `teleop_remote.yaml`
   on the companion imports that name through an `ingress:` block and
   arbitrates it against the gamepad. The two headers say how the machines
-  find each other through the same account or an established explicit pairing,
-  without a listen setting or address on one LAN or across networks.
+  find each other: on one LAN nothing is needed; off it, point the desk's
+  `cerulion-netd` at the companion with `CERULION_NETD_CONNECT`.
 
-The desk graph carries no `network:` block: its produced keyboard topic is
-eligible for paired export. The companion graph declares that topic in `ingress:`
-and pulls it from a unique authenticated producer. A block restricts exports and
-declares imports; it does not turn networking on. Both graphs use the shared
-remote endpoint instead of requiring separate LAN ports. See
-`../../../../docs/networking.md`.
+The desk graph carries no `network:` block on purpose: with none it runs
+PERMISSIVE, its egress registers with the desk's `cerulion-netd`, which
+announces the topic and forwards it once the companion's ingress demands
+it. A block does not "turn networking on"; it TIGHTENS the run to Strict,
+which binds the block's locators VERBATIM in a per-run gateway and ignores
+`CERULION_NETD_LISTEN`. The companion side needs one because `ingress:` is
+only declarable inside a block. See `../../../../docs/networking.md`.
 
 ## Run
 

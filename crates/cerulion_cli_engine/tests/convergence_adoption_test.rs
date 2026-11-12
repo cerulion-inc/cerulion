@@ -302,16 +302,11 @@ fn each_seam_passes_the_posture_its_own_claim_licenses() {
          Body:\n{threading}"
     );
 
-    let ensure = fn_body(&code, "fn ensure_topic_available_with_selection(");
+    let ensure = fn_body(&code, "fn ensure_topic_available(");
     assert!(
         ensure.contains("ResolveWait::first_contact"),
-        "`ensure_topic_available_with_selection` owns the absence-claim decision \
-         (its empty answer becomes the UNKNOWN verdict), so it waits. Body:\n{ensure}"
-    );
-    let wrapper = fn_body(&code, "fn ensure_topic_available(");
-    assert!(
-        wrapper.contains("ensure_topic_available_with_selection("),
-        "the availability wrapper must delegate to the decision owner. Body:\n{wrapper}"
+        "`ensure_topic_available` is THE absence-claim seam (its empty answer becomes \
+         the UNKNOWN verdict), so it waits. Body:\n{ensure}"
     );
 
     let fetch = fn_body(&code, "pub fn fetch_remote_schema(");

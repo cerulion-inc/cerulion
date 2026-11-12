@@ -79,9 +79,6 @@ fn gateway_on(tag: &str, root: &iceoryx2::config::Config) -> GatewayRuntime {
         root.clone(),
     )
     .expect("init gateway manager");
-    g.network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![],
@@ -813,11 +810,6 @@ fn announce_failure_at_drain_defers_not_rejects_and_heals() {
         deferred,
         "the announce failure at the drain bumped reg_announce_deferred"
     );
-    assert_eq!(
-        gateway.runtime_topic_schema_hash(&topic),
-        Some(0xFEED),
-        "catalog identity is published before the fallible announcement",
-    );
     // It is a DEFERRAL, not a rejection, and not malformed.
     assert_eq!(
         gateway.registration_rejected_count(),
@@ -876,7 +868,7 @@ fn announce_failure_at_drain_defers_not_rejects_and_heals() {
         healed,
         "the announce self-heals on a later drain (idempotent re-attempt)"
     );
-    // Exactly ONE deferred blip: the Ok heal path retains the hash without
+    // Exactly ONE deferred blip — the Ok heal path stores the hash without
     // bumping the counter again, and never a rejection.
     assert_eq!(
         gateway.registration_announce_deferred_count(),
@@ -884,38 +876,12 @@ fn announce_failure_at_drain_defers_not_rejects_and_heals() {
         "exactly one deferred blip — the heal (Ok path) does not re-count it"
     );
     assert_eq!(gateway.registration_rejected_count(), 0);
-    // The advertised hash remains stored after the successful retry.
+    // The advertised hash is now stored (the heal's Ok drain stored it).
     assert_eq!(
         gateway.runtime_topic_schema_hash(&topic),
         Some(0xFEED),
-        "the successful retry retained the advertised hash"
+        "the heal's successful drain stored the advertised hash"
     );
-}
-
-#[test]
-fn an_excluded_runtime_registration_has_no_catalog_hash_or_name() {
-    let root = cerulion_core::testing::iceoryx_test_config();
-    let mut gateway = gateway_on("excluded_hash", &root);
-    let worker = worker_manager("excluded_hash", &root);
-    let topic = format!("/rt/excluded_hash/{}", unique_id());
-    let _scope = worker.exclude_remote_topic(&topic).unwrap();
-    worker
-        .register_dynamic_egress_topic(&topic, 0xFEED)
-        .unwrap();
-    for _ in 0..30 {
-        worker.republish_dynamic_egress_for_test();
-        gateway.drive_once().unwrap();
-        if gateway.registration_rejected_count() > 0 {
-            break;
-        }
-    }
-    assert!(gateway.registration_rejected_count() > 0);
-    assert_eq!(gateway.runtime_topic_schema_hash(&topic), None);
-    assert!(!gateway.is_runtime_registered(&topic).unwrap());
-    assert!(gateway
-        .catalog_serve_for_test("excluded_hash")
-        .entries
-        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -2054,10 +2020,6 @@ fn a_restarted_gateway_records_runtime_hashes_into_the_latched_catalog() {
         root.clone(),
     )
     .expect("init gateway manager");
-    manager
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let plan = || GatewayPlan {
         egress_policy: GatewayEgressPolicy::AllowAll,
         announce: vec![],
@@ -2109,12 +2071,7 @@ fn a_restarted_gateway_serves_its_schemas_through_the_latched_surface() {
         root,
     )
     .expect("init gateway manager");
-    manager
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let serving = |topic: &str, schema: &str, hash: u64| SchemaServing {
-        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
             schema_name: schema.to_string(),
@@ -2193,10 +2150,6 @@ fn a_restarted_gateway_withdraws_the_prior_runs_announcements() {
         root,
     )
     .expect("init gateway manager");
-    manager
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let kept = format!("/rt/withdraw/kept/{}", unique_id());
     let dropped = format!("/rt/withdraw/dropped/{}", unique_id());
     let plan = |announce: Vec<String>| GatewayPlan {
@@ -2260,10 +2213,6 @@ fn a_restarted_gateway_does_not_drive_the_prior_runs_unregistered_topics() {
         root,
     )
     .expect("init gateway manager");
-    manager
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let kept = format!("/rt/unregister/kept/{}", unique_id());
     let dropped = format!("/rt/unregister/dropped/{}", unique_id());
     let plan = |announce: Vec<String>| GatewayPlan {

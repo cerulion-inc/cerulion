@@ -54,22 +54,18 @@ impl RawIngress {
         full_queue_send: FullQueueSend,
     ) -> TransportResult<RawPublisher> {
         match &self.backend {
-            Backend::Native(manager) => {
-                let local_scope = manager.retain_local_topic_scope(topic)?.map(Box::new);
-                Ok(RawPublisher {
-                    backend: PublisherBackend::Native {
-                        publisher: Box::new(manager.create_ingress_publisher_with(
-                            topic,
-                            maximum,
-                            full_queue_send,
-                        )?),
-                        local_scope,
-                        manager: Arc::clone(manager),
-                        topic: Arc::from(topic),
-                        schema_hash,
-                    },
-                })
-            }
+            Backend::Native(manager) => Ok(RawPublisher {
+                backend: PublisherBackend::Native {
+                    publisher: Box::new(manager.create_ingress_publisher_with(
+                        topic,
+                        maximum,
+                        full_queue_send,
+                    )?),
+                    manager: Arc::clone(manager),
+                    topic: Arc::from(topic),
+                    schema_hash,
+                },
+            }),
             Backend::Plugin { client, .. } => {
                 let request = RawPublisherRequestV1 {
                     topic: super::client::bytes_span(topic.as_bytes()),
@@ -116,8 +112,6 @@ pub struct RawPublisher {
 enum PublisherBackend {
     Native {
         publisher: Box<CerulionPublisher>,
-        // Drop the port before its exclusion, and the exclusion before the manager.
-        local_scope: Option<Box<crate::transport::egress_scope::LocalOnlyTopic>>,
         manager: Arc<TransportManager>,
         topic: Arc<str>,
         schema_hash: u64,
@@ -226,17 +220,10 @@ impl RawPublisher {
                 manager,
                 topic,
                 schema_hash,
-                local_scope,
                 ..
-            } => {
-                if local_scope.is_some() {
-                    Ok(())
-                } else {
-                    manager
-                        .register_dynamic_egress_topic(topic, *schema_hash)
-                        .map(|_| ())
-                }
-            }
+            } => manager
+                .register_dynamic_egress_topic(topic, *schema_hash)
+                .map(|_| ()),
             PublisherBackend::Plugin(publisher) => publisher.client.register_raw(publisher.handle),
         }
     }

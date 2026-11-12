@@ -9,15 +9,7 @@
 //! (`RcpPlane::hold_after_connect_for_test`). The ops e-stop arms serve the
 //! whole daemon (`serve_endpoint`, its ops and rcp planes over one e-stop
 //! lease) and reach the real rcpd through a loopback proxy that reports each
-//! request, can hold it, and reports when rcpd begins to answer it. One of
-//! them runs in a child process of this binary with `CERULION_HOME` at a fresh
-//! directory: there each daemon's rcpd journal topics are excluded and its run
-//! is announced on the default iceoryx2 namespace too, under topic names and
-//! run ids that carry the child's pid. That child run calls
-//! `TransportManager::get_or_init()`, the process-wide default-namespace
-//! manager, directly, and a `tests/` file with a direct call marks every test
-//! `#[serial]` while its package runs parallel in CI, so no other test of this
-//! binary runs in the parent while the child uses that namespace.
+//! request, can hold it, and reports when rcpd begins to answer it.
 //!
 //! Every account row is established through a REAL certificate chain with a
 //! chosen scope (deterministic seeds). Expected values (the caller string, the
@@ -31,17 +23,9 @@ use std::time::Duration;
 
 use cerud::client::OpsClient;
 use cerud::lease::{ControlLease, EstopState};
-use cerud::receipt::ReceiptOutcome;
 use cerud::verbs::VerbHandler;
 use cerud::CerudError;
 use cerulion_core::message::ShmMessage;
-use cerulion_core::transport::egress_scope::LocalOnlyTopic;
-use cerulion_core::transport::run_artifacts::{
-    collect_run_entries, remote_visible, GRAPH_YAML_FILE, RUN_JSON_FILE,
-};
-use cerulion_core::transport::run_registry::{
-    run_dir_root, RunHandle, RunRecord, RunState, RUN_GATHER_WINDOW,
-};
 use cerulion_core::wire::MaxSliceLen;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
@@ -69,7 +53,6 @@ use cerulion_remoted::{
 use ed25519_dalek::SigningKey;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::{json, Value};
-use serial_test::serial;
 
 const STEP: Duration = Duration::from_secs(20);
 const T_NOW: u64 = 1_000_000_000_000;
@@ -392,8 +375,6 @@ impl Drop for Fixture {
 /// ephemeral loopback port) and the stand-in graph that answers it.
 struct RcpdSide {
     mgr: Arc<TransportManager>,
-    /// The journal's topics are `/{prefix}/calls` and `/{prefix}/results`.
-    prefix: String,
     receipts: std::path::PathBuf,
     seen: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
@@ -402,34 +383,11 @@ struct RcpdSide {
     rcpd: Rcpd,
     rcpd_addr: SocketAddr,
     stop_rcpd: Option<tokio::sync::oneshot::Sender<()>>,
-    /// The exclusions of [`RcpdSide::start_local_only`]. Declared last, so
-    /// they drop after `Drop::drop` has joined the graph thread, which closes
-    /// the graph's ports, and after the side's own tool host handle. The
-    /// journal's ports belong to the journal's own thread: it runs while any
-    /// tool host handle is left and closes them on its next poll after the
-    /// last one drops. rcpd's HTTP tasks hold a handle until their runtime
-    /// ends: a caller that keeps the exclusions until then takes them out
-    /// ([`RcpdSide::take_local_only`]).
-    local_only: Vec<LocalOnlyTopic>,
 }
 
 impl RcpdSide {
     /// Start the graph and rcpd, their files under `dir`.
     async fn start(dir: &Path) -> Self {
-        Self::start_with(dir, false).await
-    }
-
-    /// [`RcpdSide::start`] with the exclusions a local-only run takes. Before
-    /// the graph or the journal opens a port, it excludes the journal's calls
-    /// and results topics from remote access on rcpd's namespace and on the
-    /// default namespace, which the ops verbs read, as
-    /// `cerulion graph run --local` does for every topic of its graph. The run
-    /// itself is announced by [`LocalOnlyRun::announce`].
-    async fn start_local_only(dir: &Path) -> Self {
-        Self::start_with(dir, true).await
-    }
-
-    async fn start_with(dir: &Path, local_only: bool) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("rcp_e2e_{}_{n}", std::process::id());
         let manifest = format!(
@@ -475,19 +433,6 @@ tools:
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("isolated transport");
-        let mut excluded = Vec::new();
-        if local_only {
-            let default = TransportManager::get_or_init().expect("the default namespace");
-            for namespace in [&mgr, &default] {
-                for topic in [&loaded.journal.calls_topic, &loaded.journal.results_topic] {
-                    excluded.push(
-                        namespace
-                            .exclude_remote_topic(topic)
-                            .expect("the exclusion is taken before any remote lease"),
-                    );
-                }
-            }
-        }
         let stop = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let release = Arc::new(AtomicBool::new(false));
@@ -524,7 +469,6 @@ tools:
             .expect("rcpd binds");
         RcpdSide {
             mgr,
-            prefix,
             receipts,
             seen,
             stop,
@@ -533,19 +477,7 @@ tools:
             rcpd,
             rcpd_addr,
             stop_rcpd: Some(stop_rcpd),
-            local_only: excluded,
         }
-    }
-
-    /// The journal's calls topic.
-    fn calls_topic(&self) -> String {
-        format!("/{}/calls", self.prefix)
-    }
-
-    /// Take out the exclusions of [`RcpdSide::start_local_only`], for the
-    /// caller to drop once the runtime that runs rcpd's HTTP tasks has ended.
-    fn take_local_only(&mut self) -> Vec<LocalOnlyTopic> {
-        std::mem::take(&mut self.local_only)
     }
 
     /// Stop rcpd: it stops accepting and ends every response stream it has
@@ -598,40 +530,6 @@ tools:
             .into_iter()
             .map(|r| (r.verb, r.caller))
             .collect()
-    }
-
-    /// rcpd's receipts as `(verb, caller, outcome)`, once it has written at
-    /// least `n`. A receipt still being appended is not counted yet.
-    async fn receipts_once(&self, n: usize) -> Vec<(String, String, ReceiptOutcome)> {
-        bounded("rcpd writes its receipts", async {
-            loop {
-                let all =
-                    cerud::receipt::read_all(&self.receipts).expect("rcpd's receipt log reads");
-                if all.len() >= n {
-                    break all
-                        .into_iter()
-                        .map(|r| (r.verb, r.caller, r.outcome))
-                        .collect();
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-    }
-
-    /// The stand-in graph has seen one frame only, an `estop` with `args`
-    /// under `caller`, and rcpd's latch is engaged, its latch file written.
-    fn saw_only_the_estop(&self, args: Value, caller: &str) {
-        let seen = self.seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "only the estop reached the graph: {seen:?}");
-        assert_eq!(seen[0]["tool"], json!("estop"), "{seen:?}");
-        assert_eq!(seen[0]["args"], args, "{seen:?}");
-        assert_eq!(seen[0]["caller"], json!(caller), "{seen:?}");
-        assert!(self.rcpd.host.estopped(), "rcpd's latch is open");
-        assert!(
-            cerulion_rcpd::tools::latch_path(&self.receipts).exists(),
-            "rcpd wrote no latch file"
-        );
     }
 }
 
@@ -829,7 +727,6 @@ fn denied(reply: &Value, code: i64) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn operator_with_teleop_calls_a_tool_under_its_own_identity() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -879,7 +776,6 @@ async fn operator_with_teleop_calls_a_tool_under_its_own_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn viewer_reads_resources_but_its_tool_call_never_reaches_rcpd() {
     let f = Fixture::new().await;
     let mut s = f.session(VIEWER.0).await;
@@ -920,7 +816,6 @@ async fn viewer_reads_resources_but_its_tool_call_never_reaches_rcpd() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
     let f = Fixture::new().await;
     let mut s = f.session(VIEWER.0).await;
@@ -963,7 +858,6 @@ async fn any_paired_viewer_engages_the_estop_but_no_other_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_unpaired_key_is_refused_at_accept() {
     let f = Fixture::new().await;
     let mut s = f.session(UNPAIRED_SEED).await;
@@ -982,7 +876,6 @@ async fn an_unpaired_key_is_refused_at_accept() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn malformed_bodies_are_denied_and_the_session_continues() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1021,7 +914,6 @@ async fn malformed_bodies_are_denied_and_the_session_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_revoke_mid_session_denies_the_next_call() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1049,7 +941,6 @@ async fn a_revoke_mid_session_denies_the_next_call() {
 }
 
 #[test]
-#[serial]
 fn the_default_rcpd_address_matches_rcpd() {
     assert_eq!(
         cerulion_remoted::rcp::DEFAULT_RCPD_ADDR.to_string(),
@@ -1071,7 +962,6 @@ fn the_default_rcpd_address_matches_rcpd() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn the_estop_never_waits_behind_full_request_slots() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1112,7 +1002,6 @@ async fn the_estop_never_waits_behind_full_request_slots() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_reply_is_withheld_when_the_scope_loses_its_class_mid_call() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1173,7 +1062,6 @@ fn revoke_operator_device_in(trust: &SharedTrust) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_quiet_revoked_session_is_closed_by_the_periodic_check() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1188,7 +1076,6 @@ async fn a_quiet_revoked_session_is_closed_by_the_periodic_check() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_connection_past_the_per_key_cap_supersedes_the_oldest() {
     let f = Fixture::new().await;
     let cap = RcpLimits::default().connections_per_key;
@@ -1225,7 +1112,6 @@ async fn a_connection_past_the_per_key_cap_supersedes_the_oldest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn estops_in_flight_are_bounded_and_the_excess_answered_at_once() {
     let f = Fixture::new().await;
     let mut s = f.session(VIEWER.0).await;
@@ -1254,7 +1140,6 @@ async fn estops_in_flight_are_bounded_and_the_excess_answered_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
     let mut f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1300,7 +1185,6 @@ async fn an_rcpd_restart_answers_the_open_call_then_ends_the_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_cancel_reaches_rcpd_while_every_request_slot_is_taken() {
     let f = Fixture::with_limits(|l| l.in_flight = 1).await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1340,7 +1224,6 @@ async fn a_cancel_reaches_rcpd_while_every_request_slot_is_taken() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_engaged_ops_estop_refuses_rcp_tool_calls_but_not_the_estop() {
     let f = Fixture::new().await;
     let mut s = f.session(OPERATOR.0).await;
@@ -1422,7 +1305,6 @@ fn publish_unknown_type(lease: &EstopLease) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_rcp_estop_engages_the_latch_the_ops_act_verbs_obey() {
     let f = Fixture::new().await;
     let before = publish_unknown_type(&f.lease);
@@ -1667,7 +1549,6 @@ fn step_call(id: i64) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_rcp_estop_engages_the_ops_latch_while_rcpd_holds_a_ping() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1734,7 +1615,6 @@ async fn an_rcp_estop_engages_the_ops_latch_while_rcpd_holds_a_ping() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_act_call_queued_behind_a_held_ping_is_refused_after_an_ops_engage() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1758,7 +1638,6 @@ async fn an_act_call_queued_behind_a_held_ping_is_refused_after_an_ops_engage() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_queued_call_is_refused_when_its_scope_loses_the_class_before_it_is_sent() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1799,7 +1678,6 @@ async fn a_queued_call_is_refused_when_its_scope_loses_the_class_before_it_is_se
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn notifications_past_their_room_never_take_a_queued_estops_place() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1855,7 +1733,6 @@ async fn hold_a_call_at_its_connect(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_ops_engage_while_a_calls_connection_opens_refuses_the_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1879,7 +1756,6 @@ async fn an_ops_engage_while_a_calls_connection_opens_refuses_the_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_call_is_refused_when_its_scope_loses_the_class_while_its_connection_opens() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1919,7 +1795,6 @@ async fn a_call_is_refused_when_its_scope_loses_the_class_while_its_connection_o
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_cancel_reaches_rcpd_after_the_call_it_names_while_that_call_connects() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1952,7 +1827,6 @@ async fn a_cancel_reaches_rcpd_after_the_call_it_names_while_that_call_connects(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn a_key_revoked_after_accept_cannot_engage_the_estop() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -1995,7 +1869,6 @@ async fn a_key_revoked_after_accept_cannot_engage_the_estop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_estop_after_rcpd_loses_the_session_still_engages_the_ops_latch() {
     let dir = tempfile::tempdir().unwrap();
     let mut stand_in = stand_in_rcpd().await;
@@ -2076,7 +1949,6 @@ async fn ops_call(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn the_daemon_engages_the_ops_latch_from_an_rcp_estop_with_rcpd_down() {
     let dir = tempfile::tempdir().unwrap();
     let robot = endpoint(ROBOT_SEED).await;
@@ -2339,8 +2211,6 @@ struct Daemon {
     robot: EndpointAddr,
     proxy: Proxy,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
-    /// The ops plane's receipt log.
-    ops_receipts: std::path::PathBuf,
     side: RcpdSide,
     _dir: tempfile::TempDir,
 }
@@ -2348,22 +2218,8 @@ struct Daemon {
 impl Daemon {
     /// The daemon with its proxy's gate at `gate`.
     async fn start(gate: Gate) -> Self {
-        Self::start_with(gate, false).await
-    }
-
-    /// [`Daemon::start`] over an rcpd half with the exclusions of
-    /// [`RcpdSide::start_local_only`].
-    async fn start_local_only(gate: Gate) -> Self {
-        Self::start_with(gate, true).await
-    }
-
-    async fn start_with(gate: Gate, local_only: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let side = if local_only {
-            RcpdSide::start_local_only(dir.path()).await
-        } else {
-            RcpdSide::start(dir.path()).await
-        };
+        let side = RcpdSide::start(dir.path()).await;
         let proxy = Proxy::start(side.rcpd_addr, gate).await;
         let robot_endpoint = endpoint(ROBOT_SEED).await;
         let robot = loopback_addr(robot_endpoint.id(), &robot_endpoint.bound_sockets());
@@ -2376,7 +2232,6 @@ impl Daemon {
         // Past every bounded step: an engage that waited for rcpd's answer
         // fails its step.
         config.rcp.limits.head_timeout = 2 * STEP;
-        let ops_receipts = config.receipt_file.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let (serving, manager) = (robot_endpoint.clone(), side.mgr.clone());
         tokio::spawn(async move {
@@ -2400,7 +2255,6 @@ impl Daemon {
             robot,
             proxy,
             stop: Some(stop),
-            ops_receipts,
             side,
             _dir: dir,
         }
@@ -2416,28 +2270,12 @@ impl Daemon {
     /// The ops latch, as `topic-publish` from `desk` reads it: its refusal of
     /// a type no robot knows, past the e-stop check.
     async fn publish_refusal(&self, desk: &Endpoint) -> String {
-        self.publish_refusal_on(desk, "/rcp_e2e/latch").await
-    }
-
-    /// The refusal of a `topic-publish` from `desk` on `topic`, with a type no
-    /// robot knows: the topic's remote access policy, then the ops latch, are
-    /// checked before the type.
-    async fn publish_refusal_on(&self, desk: &Endpoint, topic: &str) -> String {
-        let args = json!({ "topic": topic, "type": "nope_msgs/msg/Nope", "message": {} });
+        let args =
+            json!({ "topic": "/rcp_e2e/latch", "type": "nope_msgs/msg/Nope", "message": {} });
         match ops_call(desk, self.robot.clone(), "topic-publish", args).await {
             Err(CerudError::Remote { kind, message }) if kind == "verb_error" => message,
             other => panic!("expected the verb's error, got {other:?}"),
         }
-    }
-
-    /// The ops plane's `engage-estop` receipts, as `(caller, outcome)`.
-    fn estop_engages(&self) -> Vec<(String, ReceiptOutcome)> {
-        cerud::receipt::read_all(&self.ops_receipts)
-            .expect("the ops receipts")
-            .into_iter()
-            .filter(|r| r.verb == "engage-estop")
-            .map(|r| (r.caller, r.outcome))
-            .collect()
     }
 }
 
@@ -2459,7 +2297,6 @@ const PUBLISH_REFUSED: &str =
     "verb error: unavailable: the robot's e-stop is engaged, so topic-publish is refused";
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_ops_engage_estop_closes_rcpds_latch_and_rcpd_refuses_the_call_it_holds() {
     let mut d = Daemon::start(Gate::Open).await;
     let mut s = open_session(&d.endpoint, OPERATOR.0).await;
@@ -2544,7 +2381,6 @@ async fn an_ops_engage_estop_closes_rcpds_latch_and_rcpd_refuses_the_call_it_hol
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_ops_engage_estop_answers_before_its_estop_reaches_rcpd() {
     let mut d = Daemon::start(Gate::Shut).await;
     let (viewer, operator) = (endpoint(VIEWER.0).await, endpoint(OPERATOR.0).await);
@@ -2584,331 +2420,7 @@ async fn an_ops_engage_estop_answers_before_its_estop_reaches_rcpd() {
     assert!(d.side.rcpd.host.estopped(), "rcpd's latch is open");
 }
 
-/// Set on the child run of the local-only test.
-const LOCAL_ONLY_CHILD_ENV: &str = "RCP_E2E_LOCAL_ONLY_CHILD";
-
-/// The local-only test, as its child run selects it with `--exact`.
-const LOCAL_ONLY_TEST: &str =
-    "an_estop_engage_reaches_the_graph_from_both_planes_while_a_local_only_run_holds_the_journal";
-
-/// How long the child run may take: past any one bounded step many times
-/// over, since a step that times out ends the child at once. It turns a
-/// wedged child into a failure.
-const LOCAL_ONLY_CHILD_DEADLINE: Duration = Duration::from_secs(300);
-
-/// The network label a run started with the network off stamps in its
-/// `run.json`, the one field `remote_visible` reads.
-const LOCAL_ONLY_RUN_JSON: &str = r#"{"network":"off"}"#;
-
-/// A live local-only run: its record is not remote-visible and is announced
-/// on rcpd's namespace and on the default namespace, and its run directory
-/// under the runs root holds a `graph.yaml` and a `run.json` with the network
-/// off. Dropping it ends both announcements.
-struct LocalOnlyRun {
-    record: RunRecord,
-    _announced: [RunHandle; 2],
-}
-
-impl LocalOnlyRun {
-    /// Announce the run of `side`'s graph, its directory under `runs_root`.
-    fn announce(runs_root: &Path, side: &RcpdSide) -> Self {
-        let pid = std::process::id();
-        let run_dir = runs_root.join(&side.prefix);
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::write(
-            run_dir.join(GRAPH_YAML_FILE),
-            "name: rcp_e2e_local\nnodes:\n  - id: arm\n    type: arm_node\n",
-        )
-        .unwrap();
-        std::fs::write(run_dir.join(RUN_JSON_FILE), LOCAL_ONLY_RUN_JSON).unwrap();
-        let record = RunRecord {
-            remote_visible: false,
-            // The pid keeps this run apart from any other process's run on
-            // the default namespace, and the counter from the child's other
-            // run.
-            run_id: (u128::from(pid) << 64) | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed)),
-            supervisor_pid: pid,
-            run_started_at_ns: T_NOW,
-            state: RunState::Live,
-            graph_name: "rcp_e2e_local".into(),
-            run_dir: run_dir.to_string_lossy().into_owned(),
-        };
-        let announced = [
-            RunHandle::publish_on_config(&side.mgr.iox_config(), record.clone())
-                .expect("announce the run on rcpd's namespace"),
-            RunHandle::publish(record.clone()).expect("announce the run on the default namespace"),
-        ];
-        LocalOnlyRun {
-            record,
-            _announced: announced,
-        }
-    }
-
-    /// `namespace` gathers this run live and not remote-visible, and a local
-    /// reader folds its entry from the run directory with the network off.
-    /// The registry keeps no history: a gather hears the run once its writer
-    /// answers the gather's doorbell, so it gathers again until then, within
-    /// [`STEP`].
-    async fn assert_live_in(&self, namespace: &TransportManager) {
-        let deadline = tokio::time::Instant::now() + STEP;
-        let heard = loop {
-            let gathered =
-                tokio::task::block_in_place(|| namespace.gather_live_runs(RUN_GATHER_WINDOW))
-                    .expect("gather the live runs");
-            let heard: Vec<RunRecord> = gathered
-                .records
-                .iter()
-                .filter(|r| r.run_id == self.record.run_id)
-                .cloned()
-                .collect();
-            if !heard.is_empty() {
-                break heard;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the run was not gathered within {STEP:?}; the last answer was {:?} ({:?})",
-                gathered.records,
-                gathered.completeness
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert_eq!(heard, std::slice::from_ref(&self.record));
-        let fold = collect_run_entries(std::slice::from_ref(&self.record));
-        assert!(fold.skipped.is_empty(), "{:?}", fold.skipped);
-        assert_eq!(fold.entries.len(), 1, "{fold:?}");
-        assert_eq!(fold.entries[0].run_json, LOCAL_ONLY_RUN_JSON);
-        assert!(!remote_visible(&fold.entries[0]), "{fold:?}");
-    }
-}
-
-/// A local-only run holds rcpd's journal: before any port opens, its calls
-/// and results topics are excluded from remote access on rcpd's namespace and
-/// on the default namespace the ops verbs read, and the run is announced on
-/// both as not remote-visible, its `run.json` with the network off. rcpd
-/// refuses the operator's remote tool call and the ops plane refuses a remote
-/// publish on the calls topic. An ops `engage-estop` on one such daemon (its
-/// args name the calls topic; the verb does not read them) and an rcp-plane
-/// `estop` on a second each engage their daemon's e-stop lease, which reads
-/// clear before them, and reach the graph under the viewer's identity, and
-/// rcpd receipts each.
-///
-/// The test runs again in a child process with `CERULION_HOME` at a fresh
-/// directory, so the run directories resolve under the runs root while this
-/// binary's environment stays as it is.
-#[test]
-#[serial]
-fn an_estop_engage_reaches_the_graph_from_both_planes_while_a_local_only_run_holds_the_journal() {
-    if std::env::var_os(LOCAL_ONLY_CHILD_ENV).is_some() {
-        let home = std::env::var_os("CERULION_HOME").expect("the child runs with CERULION_HOME");
-        let runs_root = run_dir_root().expect("the runs root resolves");
-        assert_eq!(runs_root, Path::new(&home).join("runs"));
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        let excluded = runtime.block_on(estop_engage_under_a_local_only_run(&runs_root));
-        // rcpd's HTTP tasks hold the last tool host handles until the runtime
-        // ends, so the exclusions drop after every handle that can queue a
-        // call. Each journal's own thread closes its ports on its next poll
-        // after that, which can come after the exclusions drop; the child
-        // exits right after.
-        drop(runtime);
-        drop(excluded);
-        return;
-    }
-    let scratch = tempfile::tempdir().unwrap();
-    let home = scratch.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    let log_path = scratch.path().join("child.log");
-    let log = std::fs::File::create(&log_path).unwrap();
-    let read_log = || {
-        String::from_utf8_lossy(&std::fs::read(&log_path).expect("the child run's log"))
-            .into_owned()
-    };
-    let mut child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([
-            "--exact",
-            LOCAL_ONLY_TEST,
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(LOCAL_ONLY_CHILD_ENV, "1")
-        .env("CERULION_HOME", &home)
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .expect("spawn the child run");
-    let started = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait for the child run") {
-            break status;
-        }
-        if started.elapsed() > LOCAL_ONLY_CHILD_DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "the child run did not end within {LOCAL_ONLY_CHILD_DEADLINE:?}:\n{}",
-                read_log()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let output = read_log();
-    print!("{output}");
-    assert!(
-        status.success(),
-        "the child run failed ({status}):\n{output}"
-    );
-    assert!(
-        output.contains("test result: ok. 1 passed;"),
-        "the child run did not run the test:\n{output}"
-    );
-}
-
-/// The child run of the local-only test, its run directories under
-/// `runs_root`: the ops leg, then the rcp leg on a daemon of its own. Returns
-/// the exclusions both daemons took.
-async fn estop_engage_under_a_local_only_run(runs_root: &Path) -> Vec<LocalOnlyTopic> {
-    let mut excluded = ops_engage_under_a_local_only_run(runs_root).await;
-    excluded.extend(rcp_estop_under_a_local_only_run(runs_root).await);
-    excluded
-}
-
-/// A [`Daemon::start_local_only`] with its local-only run announced under
-/// `runs_root` and gathered on both namespaces. rcpd refuses `operator`'s
-/// remote tool call, and the ops plane refuses its remote publish on the
-/// journal's calls topic while the ops latch reads clear.
-async fn local_only_daemon(runs_root: &Path, operator: &Endpoint) -> (Daemon, LocalOnlyRun) {
-    let d = Daemon::start_local_only(Gate::Open).await;
-    let run = LocalOnlyRun::announce(runs_root, &d.side);
-    run.assert_live_in(&d.side.mgr).await;
-    run.assert_live_in(&TransportManager::get_or_init().expect("the default namespace"))
-        .await;
-    let calls_topic = d.side.calls_topic();
-    let refused = format!(
-        "Remote access policy for topic '{calls_topic}' refused: the producing run excludes \
-         this topic from network egress; remote access is refused"
-    );
-
-    // rcpd refuses a remote tool call: the journal is local-only.
-    let mut op = open_session_from(operator.clone(), d.robot.clone()).await;
-    op.initialize().await;
-    let r = op.call_step(2).await;
-    assert_eq!(r["result"]["isError"], json!(true), "{r}");
-    let text = r["result"]["content"][0]["text"]
-        .as_str()
-        .expect("rcpd's refusal");
-    let body: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(
-        body["error"],
-        json!({ "code": "local_only", "message": refused }),
-        "{r}"
-    );
-    // The ops plane refuses a remote publish on the journal's calls topic.
-    assert_eq!(
-        d.publish_refusal_on(operator, &calls_topic).await,
-        format!("verb error: unavailable: {refused}")
-    );
-    // The ops latch reads clear: a publish on a topic no run excludes gets
-    // past it to the type lookup.
-    let clear = d.publish_refusal(operator).await;
-    assert!(
-        clear.starts_with("verb error: usage: unknown message type"),
-        "clear: {clear}"
-    );
-    (d, run)
-}
-
-/// rcpd's receipts on a local-only daemon once its estop is answered: the
-/// operator's refused remote call, then the viewer's estop and the graph's
-/// answer to it.
-fn local_only_estop_receipts() -> Vec<(String, String, ReceiptOutcome)> {
-    let viewer = expected_caller(VIEWER.0, VIEWER.1);
-    vec![
-        (
-            "arm.step".into(),
-            expected_caller(OPERATOR.0, OPERATOR.1),
-            ReceiptOutcome::Denied,
-        ),
-        ("estop".into(), viewer.clone(), ReceiptOutcome::Intent),
-        ("estop".into(), viewer, ReceiptOutcome::Ok),
-    ]
-}
-
-/// The ops leg of the local-only test. Returns the daemon's exclusions.
-async fn ops_engage_under_a_local_only_run(runs_root: &Path) -> Vec<LocalOnlyTopic> {
-    let (viewer, operator) = (endpoint(VIEWER.0).await, endpoint(OPERATOR.0).await);
-    let (mut d, _run) = local_only_daemon(runs_root, &operator).await;
-    let engaged = ops_call(
-        &viewer,
-        d.robot.clone(),
-        "engage-estop",
-        json!({ "topic": d.side.calls_topic() }),
-    )
-    .await
-    .expect("engage-estop answers under a local-only run");
-    assert_eq!(engaged["engaged"], json!(true), "{engaged}");
-    assert_eq!(
-        engaged["by"],
-        json!(hex::encode(desk_key(VIEWER.0))),
-        "{engaged}"
-    );
-
-    // Its estop reaches the graph under the engager's identity, and rcpd
-    // receipts the graph's answer.
-    d.side.graph_sees("estop").await;
-    assert_eq!(d.side.receipts_once(3).await, local_only_estop_receipts());
-    d.side
-        .saw_only_the_estop(ops_estop_args(), &expected_caller(VIEWER.0, VIEWER.1));
-
-    // The engage latched the ops lease the act verbs obey, and the ops plane
-    // receipts it under the viewer's key.
-    assert_eq!(d.publish_refusal(&operator).await, PUBLISH_REFUSED);
-    assert_eq!(
-        d.estop_engages(),
-        [(hex::encode(desk_key(VIEWER.0)), ReceiptOutcome::Ok)]
-    );
-    d.side.take_local_only()
-}
-
-/// The rcp leg of the local-only test, on a daemon whose e-stop lease reads
-/// clear until the estop. Returns the daemon's exclusions.
-async fn rcp_estop_under_a_local_only_run(runs_root: &Path) -> Vec<LocalOnlyTopic> {
-    let (viewer, operator) = (endpoint(VIEWER.0).await, endpoint(OPERATOR.0).await);
-    let (mut d, _run) = local_only_daemon(runs_root, &operator).await;
-    let mut s = open_session_from(viewer.clone(), d.robot.clone()).await;
-    s.initialize().await;
-    let r = s
-        .request(
-            2,
-            "tools/call",
-            json!({ "name": "estop", "arguments": { "reason": "rcp leg" } }),
-        )
-        .await;
-    assert_ne!(r["result"]["isError"], json!(true), "{r}");
-    let text = r["result"]["content"][0]["text"]
-        .as_str()
-        .expect("estop body");
-    let body: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(body["estopped"], json!(true), "{r}");
-
-    // The rcp plane latched the shared lease the ops act verbs obey, with no
-    // ops engage on this daemon.
-    assert_eq!(d.publish_refusal(&operator).await, PUBLISH_REFUSED);
-    assert!(d.estop_engages().is_empty(), "{:?}", d.estop_engages());
-
-    // The estop reached the graph under the viewer's identity, and rcpd
-    // receipts the graph's answer.
-    assert_eq!(d.side.receipts_once(3).await, local_only_estop_receipts());
-    d.side.saw_only_the_estop(
-        json!({ "reason": "rcp leg" }),
-        &expected_caller(VIEWER.0, VIEWER.1),
-    );
-    d.side.take_local_only()
-}
-
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn an_ops_engage_estop_with_rcpd_stopped_engages_and_its_estop_arrives_once_rcpd_serves() {
     let mut d = Daemon::start(Gate::Open).await;
     d.side.stop_rcpd();

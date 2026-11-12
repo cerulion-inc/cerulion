@@ -132,7 +132,6 @@ const SHRINK_LIVENESS_CEILING: Duration = Duration::from_secs(60);
 /// A hand-built run record. Every field DISTINCT and non-default.
 fn record(run_id: u128, graph: &str) -> RunRecord {
     RunRecord {
-        remote_visible: true,
         run_id,
         supervisor_pid: 4711,
         run_started_at_ns: 1_753_000_000_000_000_000,

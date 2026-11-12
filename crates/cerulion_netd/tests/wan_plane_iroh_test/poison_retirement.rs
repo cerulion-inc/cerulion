@@ -35,7 +35,6 @@ async fn serve_connection(
                 entries: topics
                     .iter()
                     .map(|topic| CatalogEntry {
-                        egress_qos: None,
                         topic: topic.clone(),
                         schema_hash: Some(ORACLE_SCHEMA_HASH),
                         schema_name: None,
@@ -47,7 +46,7 @@ async fn serve_connection(
                 error: None,
                 wire_header_version: cerulion_core::wire::WIRE_HEADER_VERSION,
             }),
-            WireRequest::Demand { topic, .. } if first && topic == topics[1] => {
+            WireRequest::Demand { topic } if first && topic == topics[1] => {
                 // Reset ONLY the control reply stream. The first topic continues
                 // producing until the desk explicitly closes this connection.
                 send.reset(7u32.into()).unwrap();
@@ -61,7 +60,7 @@ async fn serve_connection(
                 old_closed.lock().unwrap().take().unwrap().send(()).unwrap();
                 return;
             }
-            WireRequest::Demand { topic, .. } => {
+            WireRequest::Demand { topic } => {
                 assert!(topics.contains(&topic));
                 let mut stream = open_uni_frame_stream(&connection).await.unwrap();
                 write_frame(

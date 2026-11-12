@@ -50,94 +50,15 @@ impl GraphSnapshot {
 }
 
 /// A read handle on the cached document. Cheap to clone.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GraphFeed {
     rx: watch::Receiver<Arc<GraphSnapshot>>,
-    manager: std::sync::Weak<TransportManager>,
-}
-
-impl std::fmt::Debug for GraphFeed {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("GraphFeed").finish_non_exhaustive()
-    }
 }
 
 impl GraphFeed {
     /// The newest cached document.
     pub fn current(&self) -> Arc<GraphSnapshot> {
         Arc::clone(&self.rx.borrow())
-    }
-
-    /// Filter the cached document against current producer policy at remote serve time.
-    pub fn remote_snapshot(&self) -> Result<GraphSnapshot, String> {
-        let manager = self
-            .manager
-            .upgrade()
-            .ok_or("graph transport is unavailable")?;
-        let mut graph = self.current().graph.clone();
-        graph.catalog.entries.retain(|entry| {
-            manager
-                .topic_publisher_count_checked(&entry.topic)
-                .is_some_and(|count| count > 0)
-                && manager.remote_topic_allowed(&entry.topic).unwrap_or(false)
-        });
-        graph.monitors.retain(|row| {
-            graph
-                .catalog
-                .entries
-                .iter()
-                .any(|entry| entry.topic == row.topic)
-        });
-        let gather = manager
-            .gather_live_runs(RUN_GATHER_WINDOW)
-            .map_err(|error| error.to_string())?;
-        let visible: Vec<_> =
-            cerulion_core::transport::run_artifacts::collect_remote_run_entries(&gather.records)
-                .entries
-                .into_iter()
-                .filter(cerulion_core::transport::run_artifacts::remote_visible)
-                .collect();
-        graph
-            .runs
-            .records
-            .retain(|run| visible.iter().any(|entry| entry.run_id == run.run_id));
-        if let crate::graph::RunsCompleteness::Incomplete {
-            live_writers,
-            writers_heard,
-        } = &mut graph.runs.completeness
-        {
-            *live_writers = 0;
-            *writers_heard = 0;
-        }
-        let mut nodes = std::collections::BTreeSet::new();
-        for entry in visible {
-            if let Ok(config) =
-                serde_yaml::from_str::<cerulion_core::GraphConfig>(&entry.graph_yaml)
-            {
-                nodes.extend(
-                    config
-                        .nodes
-                        .into_iter()
-                        .map(|node| (node.id, node.node_type)),
-                );
-            }
-        }
-        graph
-            .nodes
-            .retain(|node| nodes.contains(&(node.node_id.clone(), node.node_type.clone())));
-        Ok(GraphSnapshot::new(graph))
-    }
-
-    /// Hold a state resource's remote admission through the read operation.
-    pub fn remote_topic_scope(
-        &self,
-        topic: &str,
-    ) -> Result<cerulion_core::transport::egress_scope::RemoteTopicLease, String> {
-        self.manager
-            .upgrade()
-            .ok_or("graph transport is unavailable")?
-            .acquire_remote_topic_lease(topic)
-            .map_err(|error| error.to_string())
     }
 
     /// Wait for the next refresh. Returns `false` once the source is gone.
@@ -195,7 +116,6 @@ impl GraphSource {
     pub fn feed(&self) -> GraphFeed {
         GraphFeed {
             rx: self.tx.subscribe(),
-            manager: Arc::downgrade(&self.manager),
         }
     }
 

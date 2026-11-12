@@ -1,11 +1,11 @@
 # rmw_cerulion - agent notes
 
-ROS 2/MoveIt 2 on zero-copy SHM (cdylib + rlib); C ABI tests run in-process, only
-`rclpy_xproc_test` proves `.so`. CLI `ros2 run/launch` and graph `ros2:` stage `RMW_IMPLEMENTATION`.
+Runs ROS 2/MoveIt 2 unmodified on zero-copy SHM (cdylib + rlib; tests call the C ABI in-process; only `rclpy_xproc_test` proves `.so`). `cerulion ros2 run/launch` and `ros2:` graph entries
+stage `RMW_IMPLEMENTATION`.
 
 ## Invariants
 
-- Every `extern "C"` uses `ffi::ffi_guard`; an escaping panic aborts the host.
+- Wrap every `extern "C"` entry point in `ffi::ffi_guard`: a panic across the C boundary aborts the host.
 - `#[repr(C)]` on every seam type; codecs zero padding byte-ranges.
 - Allocate and free on the SAME side with the SAME allocator: rcl out-params via the caller's `rcutils_allocator_t`, bridge/rosidl containers via libc `malloc`/`free`.
 - No `Box<dyn>`/`Arc<dyn>` across the cdylib seam - dispatch via `AnyBridge`.
@@ -13,14 +13,14 @@ ROS 2/MoveIt 2 on zero-copy SHM (cdylib + rlib); C ABI tests run in-process, onl
 - Reject hostile/over-bound counts BEFORE any resize/alloc in a codec.
 - NEVER write a destination the build cannot fill: takes and `rmw_deserialize` read the nested census first (`rmw_schema_mismatch_test`).
 - Failure paths: unconditional counters + flood-latched logs + decade re-announcements.
-- ROS names are verbatim (`/chatter` ⇔ `/chatter/data`), relative refused, no alias. Eligible publishers register best-effort, never unregister. Claim excluded topic/service-family guards before ports; retain for process lifetime. Ingress admits subscriptions only; only egress admits publishers.
+- ROS names are Cerulion names VERBATIM (`/chatter` ⇔ `/chatter/data`; relative refused, no alias); every publisher registers for egress (best-effort), never unregisters.
 - Windowed borrows: NEVER link `cerulion_heaphook` (2nd malloc interposer); dlsym per-symbol (`src/heaphook.rs`). Only a thread's FIRST borrow owns its window; a loan finished on the WRONG thread copies + HOLDS its slot till that thread borrows again (destroy/poisoned LEAKS slot + `PublisherData`: freeing it wedges the dead-node sweep); quarantine retires at slot REUSE, never publish. Every degrade = the copy path, never a failed publish.
 - NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out WHOLE, never stub it (`rmw_absent_export_table_test`, lane `nm` audit).
 - NEVER strip `ROS_DISTRO` around a fixture: a Kilted-and-later `.so` refuses it (`every_ros_distro_strip_is_declared`).
 
 ## Testing
 
-Default `-- --test-threads=1`: SHM singleton, global registries, one `#[traced_test]` slot (each installer needs its own binary). Transport-free bridge/codec suites are parallel. The two `*_linux_test` binaries (real `LD_PRELOAD`) and `rclpy_xproc_test` (Jazzy) use `--ignored`. Add binary contracts/serial reasons/prereqs to the Test map in docs/internals/rmw.md, not here.
+Default `-- --test-threads=1` (SHM singleton, global registries, the one `#[traced_test]` subscriber slot - a suite installing it needs its own binary); transport-free bridge/codec suites run parallel; the two `*_linux_test` binaries (real `LD_PRELOAD`) and `rclpy_xproc_test` (Jazzy container) are `--ignored`. Per-binary map (what each pins, why serial, its prereqs) is the Test map in docs/internals/rmw.md; update THAT when a binary is added, not here.
 
 ## Gotchas
 

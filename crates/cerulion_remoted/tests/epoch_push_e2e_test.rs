@@ -603,7 +603,6 @@ impl Desk {
             &mut self.send,
             &mut self.recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic.to_string(),
             },
         )

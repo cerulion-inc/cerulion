@@ -148,9 +148,6 @@ fn establish_machine_a(tag: &str, id: &str, topic: &str) -> MachineA {
             root.clone(),
         )
         .expect("init shared gateway G");
-        g.network()
-            .expect("network fixture")
-            .set_lan_access(cerulion_core::LanAccess::Open);
         // Capture G's namespace BEFORE it moves into the plane — the
         // MATCHING forward (a same-machine run resolves this identical config).
         let gateway_config_json =
@@ -258,9 +255,6 @@ fn receive_and_verify_over_hop(port: u16, topic: &str, node_suffix: &str) {
         iceoryx_test_config(),
     )
     .expect("init B");
-    b.network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     // Create the reader FIRST (the consumer-first order), then the demand.
     let b_sub = b.create_subscriber(topic).expect("B subscriber");
     b.register_ingress_topic(topic, EGRESS_HASH, MaxSliceLen::const_new(256))

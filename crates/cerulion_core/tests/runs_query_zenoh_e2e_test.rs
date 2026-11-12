@@ -137,9 +137,6 @@ fn boot_gateway(tag: &str, robot: &str) -> (Arc<TransportManager>, GatewayRuntim
             root.clone(),
         )
         .expect("init gateway manager");
-        g.network()
-            .expect("network fixture")
-            .set_lan_access(cerulion_core::LanAccess::Open);
         let manager = Arc::clone(&g);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
@@ -228,7 +225,6 @@ fn a_desk_get_reaches_a_serving_gateway_and_reads_the_runs_own_directory() {
     let _run = RunHandle::publish_on_config(
         &manager.iox_config(),
         RunRecord {
-            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_700_000_000_000_000_000,
@@ -238,33 +234,6 @@ fn a_desk_get_reaches_a_serving_gateway_and_reads_the_runs_own_directory() {
         },
     )
     .expect("the run announces on the gateway's namespace");
-
-    // The private run still exists locally even after its artifacts disappear.
-    // Its registry policy must omit both its identity and an undescribable error.
-    let private_id = 0x0f02;
-    let _private = RunHandle::publish_on_config(
-        &manager.iox_config(),
-        RunRecord {
-            remote_visible: false,
-            run_id: private_id,
-            supervisor_pid: std::process::id(),
-            run_started_at_ns: 1_700_000_000_000_000_000,
-            state: RunState::Live,
-            graph_name: "private".into(),
-            run_dir: runs_root
-                .join("missing_private_artifacts")
-                .display()
-                .to_string(),
-        },
-    )
-    .unwrap();
-    let local = manager
-        .gather_live_runs(cerulion_core::transport::run_registry::RUN_GATHER_WINDOW)
-        .unwrap();
-    assert!(local
-        .records
-        .iter()
-        .any(|record| record.run_id == private_id && !record.remote_visible));
 
     let desk = desk_session(port);
     let session = desk.session().expect("desk session");
@@ -330,7 +299,6 @@ fn an_unreadable_run_directory_is_named_over_the_wire_and_demotes_the_verdict() 
     let _run = RunHandle::publish_on_config(
         &manager.iox_config(),
         RunRecord {
-            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_700_000_000_000_000_000,

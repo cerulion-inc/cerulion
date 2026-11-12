@@ -169,9 +169,6 @@ impl GraphRegistry {
 
 /// Global runtime singleton.
 pub struct Runtime {
-    pub topic_scope: cerulion_core::transport::egress_scope::RunTopicScope,
-    local_exclusions:
-        Mutex<BTreeMap<String, cerulion_core::transport::egress_scope::LocalOnlyTopic>>,
     pub transport: Arc<TransportManager>,
     pub graph: RwLock<GraphRegistry>,
     /// Monotonic per-process entity counter: bytes 8 to 15 of subscription
@@ -391,34 +388,6 @@ pub(crate) fn install_tracing() {
         .try_init();
 }
 
-impl Runtime {
-    /// A process retains exclusions until its additive endpoint registrations end.
-    // hot-path-alloc-ok-fn: cold endpoint creation, never publish or take.
-    pub fn claim_topic_scope(&self, topic: &str) -> cerulion_core::TransportResult<()> {
-        self.claim_scope(topic, self.topic_scope.excludes(topic))
-    }
-
-    pub fn claim_input_scope(&self, topic: &str) -> cerulion_core::TransportResult<()> {
-        self.claim_scope(topic, self.topic_scope.excludes_input(topic))
-    }
-
-    // hot-path-alloc-ok-fn: cold endpoint creation, never publish or take.
-    fn claim_scope(&self, topic: &str, excluded: bool) -> cerulion_core::TransportResult<()> {
-        if !excluded {
-            return Ok(());
-        }
-        let mut scopes = lock_unpoisoned(&self.local_exclusions).ok_or_else(|| {
-            cerulion_core::TransportError::Internal {
-                reason: "producer scope registry is poisoned".into(),
-            }
-        })?;
-        if let std::collections::btree_map::Entry::Vacant(entry) = scopes.entry(topic.to_string()) {
-            entry.insert(self.transport.exclude_remote_topic(topic)?);
-        }
-        Ok(())
-    }
-}
-
 /// Initialize (or fetch) the process runtime. Called from `rmw_init`
 /// and every entry point that needs transport access.
 pub fn runtime() -> Result<&'static Runtime, String> {
@@ -438,16 +407,7 @@ pub fn runtime() -> Result<&'static Runtime, String> {
     .or_else(|_| TransportManager::get())
     .map_err(|e| format!("transport init failed: {e}"))?;
 
-    let topic_scope = cerulion_core::transport::egress_scope::RunTopicScope::from_values(
-        std::env::var("CERULION_NETWORK").ok().as_deref(),
-        std::env::var(cerulion_core::transport::egress_scope::RUN_SCOPE_ENV)
-            .ok()
-            .as_deref(),
-    )
-    .map_err(|error| error.to_string())?;
     let rt = Runtime {
-        topic_scope,
-        local_exclusions: Mutex::new(BTreeMap::new()),
         transport,
         graph: RwLock::new(GraphRegistry::default()),
         entity_counter: AtomicU64::new(1),

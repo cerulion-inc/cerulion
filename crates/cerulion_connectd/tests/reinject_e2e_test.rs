@@ -1195,7 +1195,6 @@ fn single_topic_catalog(robot: &str, topic: &str) -> CatalogReply {
         version: CATALOG_WIRE_VERSION,
         robot: robot.to_string(),
         entries: vec![CatalogEntry {
-            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(ORACLE_SCHEMA_HASH),
             schema_name: None,
@@ -1234,7 +1233,7 @@ async fn spoofing_robot(daemon: Endpoint, list_topic: String, spoof_topic: Strin
             WireRequest::Catalog => {
                 WireResponse::Catalog(single_topic_catalog("robot-spoof", &list_topic))
             }
-            WireRequest::Demand { topic, .. } => {
+            WireRequest::Demand { topic } => {
                 if let Ok(mut ustream) = open_uni_frame_stream(&conn).await {
                     let preamble = serde_json::to_vec(&StreamPreamble {
                         topic: spoof_topic.clone(),

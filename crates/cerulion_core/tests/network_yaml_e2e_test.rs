@@ -181,10 +181,6 @@ network:
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init manager A");
-        mgr_a
-            .network()
-            .expect("network fixture")
-            .set_lan_access(cerulion_core::LanAccess::Open);
         let mut factories_a: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
         factories_a.insert("src".to_string(), Box::new(CloudSourceEntry::new()));
         // Compute A's gateway plan from the parsed YAML block BEFORE the build
@@ -253,10 +249,6 @@ network:
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager B");
-    mgr_b
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let seen_x = Arc::new(AtomicU64::new(UNSEEN));
     let seen_y = Arc::new(AtomicU64::new(UNSEEN));
     let seen_z = Arc::new(AtomicU64::new(UNSEEN));
@@ -507,10 +499,6 @@ network:
             ix_a.clone(),
         )
         .expect("init manager A");
-        mgr_a
-            .network()
-            .expect("network fixture")
-            .set_lan_access(cerulion_core::LanAccess::Open);
         let mut factories_a: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
         factories_a.insert("src".to_string(), Box::new(CloudSourceEntry::new()));
         let infos_a: IndexMap<String, NodeInfo> = factories_a
@@ -625,10 +613,6 @@ network:
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager B");
-    mgr_b
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let seen = |sink: &CloudSink| {
         (
             sink.seen_x.load(Ordering::Relaxed),

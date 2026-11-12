@@ -29,7 +29,7 @@ Sourcing map (this runbook links rather than duplicates):
 |---|---|---|---|
 | 0.1 | Go2, charged, powered off | | check on arrival |
 | 0.2 | Companion computer on the robot LAN | wired to the robot's switch; the vendor's LAN is `192.168.123.0/24`, the main board `.161`, the EDU's Jetson `.18`; note the companion's own interface IP, it is `GO2_IFACE` for every command below | **Check on your robot:** confirm with `ip addr` on the companion |
-| 0.3 | Desk to companion path | same account or established explicit pairing; authenticated iroh uses direct connectivity or a relay | confirm reachable (1.3) |
+| 0.3 | Desk to companion path | one LAN, or a route to the companion; `cerulion-netd` on the companion listens on the well-known port once `CERULION_NETD_LISTEN=tcp/0.0.0.0:7683` is exported, and advertises itself over mDNS only then | confirm reachable (1.3) |
 | 0.4 | Companion toolchain | Rust at the repository's floor (the root README states it), `cerulion` on the PATH, `libudev-dev` on Linux (the joystick node's gamepad backend) | build ahead of time |
 | 0.5 | Companion: the workspace built | `README.md` "Build": one `cerulion node build <type> --release` per node, the camera last | build ahead of time |
 | 0.6 | Companion: GStreamer for the camera | `nodes/camera_jpeg/BRINGUP.md` lists the header and plugin packages; `cerulion node build camera_jpeg --release` probes for them and says what is missing | verify with the loopback rig (0.8) |
@@ -47,23 +47,29 @@ than a clobbered artifact).
 
 ## 1. Network bring-up
 
-Reference: `../../docs/networking.md`. Live exports use paired access by
-default. The first exporting run starts authenticated serving automatically;
-a desk on the same account or with an established explicit pairing finds and
-reads those topics without a listen setting or address, on one LAN or across
-networks. Unpaired LAN peers cannot read topics or publish into graph ingress.
+Reference: `../../docs/networking.md`. The robot is network-viewable by
+default: a real-clock `graph run` with no `network:` block announces every
+produced topic through the companion's one `cerulion-netd` and forwards a
+topic only while a desk demands it.
 
-This runbook names the companion `go2`. Set the optional display-name override
-before its first serving run if you want to use that name in the commands below:
+The one required step, on every network, LAN included: give netd a listen
+locator in the shell (or service environment) that will run the graph,
+before you start it. Export the announced name in the same shell, so the
+robot announces itself under the name this runbook uses:
 
 ```bash
 # On the companion computer:
+export CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
 export CERULION_ROBOT_IDENTITY=go2
 ```
 
-Without that override, use the name `cerulion topic list` reports under ROBOTS.
-The robot-LAN interface setting below is for the vendor's DDS participants,
-which still need the correct companion interface.
+netd takes its listen endpoints only from that variable and its default is
+empty, so a netd started without it binds nothing and no desk can reach it
+however close. With it set, the shared plane binds the port and advertises
+the robot over mDNS under its announced name: `CERULION_ROBOT_IDENTITY` when
+it is set, the companion's hostname otherwise. Every `--robot go2` below
+expects the export above; if you skip it, read the announced name off
+`cerulion topic list` under ROBOTS and pass that name instead.
 
 1.1 Bring up the robot-LAN interface on the companion and confirm the
 addresses. Replace `REPLACE_WITH_COMPANION_INTERFACE_IP` with the address
@@ -75,8 +81,8 @@ ping -c3 192.168.123.161               # the robot's main board (vendor conventi
 export GO2_IFACE="REPLACE_WITH_COMPANION_INTERFACE_IP"
 ```
 
-1.2 Confirm the desk and companion use the same account or an established
-explicit pairing. Direct LAN connectivity is optional for authenticated access.
+1.2 Confirm the desk reaches the companion (its OTHER interface, the one on
+your network), by hostname or address, with a plain `ping`.
 
 1.3 Sanity-check the link before demanding anything (the companion graph
 must be running, section 2):
@@ -84,19 +90,24 @@ must be running, section 2):
 ```bash
 # On the desk. Remote discovery is automatic; no flag turns it on:
 cerulion topic list
+# Off the LAN (another subnet, a VPN), name the companion's listener:
+cerulion topic list --connect tcp/<companion address>:7683
 # Expect a ROBOTS row for the companion and a REMOTE TOPICS section listing
 # what it produces: /tf and /tf_static from the tf graph, /go2/utlidar/cloud,
 # /go2/camera/h264 and /go2/camera/jpeg once the bridge graph runs.
 ```
 
-A directory entry alone is not live presence. The remote plane authenticates
-the selected robot and gathers its catalog before it reports usable topics.
-Use section 8 if the robot is absent or its topic sends no frames.
+The remote half is best-effort and loud: a bad locator errors naming the
+`tcp/<host>:<port>` form, an unreachable `--connect` is dropped with a warn
+rather than sinking the whole query, and a failed query is a note plus
+exit 0 (the local list has already printed). Section 7 has the failures.
 
-A `network:` block restricts exports and declares imports; it does not turn
-networking on. The sensor graphs need no block to export their topics.
-`graphs/teleop_remote.yaml` declares the keyboard import and restricts egress
-to the arbitrated command. Both paths use paired access by default.
+Do not add a `network:` block to any of the sensor graphs to "turn
+networking on". A block TIGHTENS the run to Strict: a per-run gateway binds
+the block's locators verbatim and ignores `CERULION_NETD_LISTEN`, and the
+desk's discovery rungs that survive off the LAN all assume the well-known
+port. A block is for a real egress allow-list or an `ingress:` import, which
+is exactly what `graphs/teleop_remote.yaml` uses it for.
 
 ## 2. Sensors first, no actuation
 
@@ -269,8 +280,8 @@ auto-zero, the Ctrl-C translation).
 
 `graphs/teleop_desk.yaml` runs the keyboard on your machine and
 `graphs/teleop_remote.yaml` imports it on the companion through an
-`ingress:` block; both machines use the same account or an established explicit
-pairing, with no listen setting or address required. Same preconditions as section 4.
+`ingress:` block; both headers say how the two find each other (mDNS on one
+LAN, `CERULION_NETD_CONNECT` off it). Same preconditions as section 4.
 **Experimental:** the graph pair validates; run it on a bench network before
 you rely on it.
 
@@ -311,13 +322,13 @@ are).
 |---|---|---|
 | iceoryx2 "Corrupted", a node will not start | `ulimit -n 65536`; it is usually the file-descriptor limit, not corruption | 0.9 |
 | Stale shared memory after a crash | `cerulion clean` between runs; start each demo from a clean state | `cerulion clean --help` |
-| `topic list` shows no ROBOTS or REMOTE TOPICS | confirm the companion graph is running and both machines share an account or explicit pairing; check its exported topics and `GO2_IFACE` for vendor DDS discovery | 1, 2a |
+| `topic list` shows no ROBOTS or REMOTE TOPICS | the companion graph is running? `CERULION_NETD_LISTEN=tcp/0.0.0.0:7683` exported on the companion? off the LAN, `--connect tcp/<companion address>:7683`? no `network:` block was added to a sensor graph? `GO2_IFACE` pinned to the robot-LAN interface (a multi-homed companion silently fails DDS discovery)? | 1, 2a |
 | No camera video | `cerulion topic hz /go2/camera/h264` FIRST: silent means the BRIDGE (config, mapping, interface), not the camera; flowing but no JPEG means a capture-less build (the launch would have refused) or a wait for the first keyframe | 2c, `nodes/camera_jpeg/BRINGUP.md` |
 | NVDEC pipeline will not link on a Jetson | `nvv4l2decoder ! nvjpegenc` may need an `nvvidconv` between them (not validated on a Jetson); use the software pipeline `avdec_h264 ! jpegenc` when its plugins are installed and the hardware pipeline is unavailable | `nodes/camera_jpeg/BRINGUP.md` |
 | Gamepad not detected | Bluetooth pairing (`bluetoothctl`) and evdev enumeration; the user is not in the `input` group, or add the `uaccess` udev rule | `nodes/joystick_teleop/BRINGUP.md` |
 | Terminal wedged after keyboard teleop | the restore is three-layered (shutdown, RAII guard, panic hook), so a clean or Ctrl-C exit restores it; if truly wedged, `reset` | `nodes/keyboard_teleop/DEMO.md` |
 | The robot does not move on a Move request | `GO2_IFACE`, `GO2_DOMAIN_ID`, the sport service up (vendor app); the driver's `total_failures` counter in its warn line says whether the publish itself failed | 4.1 |
-| The robot serves nothing after adding a `network:` block | check that `egress:` lists the canonical topics to export; an enabled block restricts scope, and its paired imports require a unique authenticated producer | 1, `../../docs/networking.md` |
+| The robot serves nothing after adding a `network:` block | remove it from the sensor graphs: a block TIGHTENS the run to Strict, which binds the block's locators verbatim and ignores `CERULION_NETD_LISTEN`; permissive (no block) is how a robot is served | 1, `../../docs/networking.md` |
 
 ## Validate on your robot
 

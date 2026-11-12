@@ -10,9 +10,6 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportError {
-    /// A local-only producer and a remote data port cannot share a topic.
-    #[error("Remote access policy for topic '{topic}' refused: {reason}")]
-    EgressScope { topic: String, reason: String },
     /// Failed to create iceoryx2 node.
     #[error("Failed to create node '{node_name}': {reason}. Check that no other Cerulion process is using the same node name, and that shared memory permissions are correct.")]
     NodeCreation { node_name: String, reason: String },

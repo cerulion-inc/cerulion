@@ -15,8 +15,6 @@ struct PublisherState {
     publisher: Option<CerulionPublisher>,
     leases: LeaseArena<RawShmLoan>,
     panicked: bool,
-    // Loans and port retire before the producer's exclusion.
-    local_scope: Option<crate::transport::egress_scope::LocalOnlyTopic>,
 }
 struct RawDiagnostic {
     token: u64,
@@ -196,7 +194,6 @@ impl RawServices {
             .manager
             .as_ref()
             .ok_or(HostServiceError::MissingCapability)?;
-        let local_scope = manager.retain_local_topic_scope(topic)?;
         let publisher = manager.create_ingress_publisher_with(topic, capacity, strategy)?;
         self.admit()?;
         let index = *next;
@@ -212,7 +209,6 @@ impl RawServices {
                 publisher: Some(publisher),
                 leases,
                 panicked: false,
-                local_scope,
             }),
         };
         self.rows[index]
@@ -365,11 +361,8 @@ impl RawServices {
     }
     fn register(&self, context: u64, port: u64) -> Result<(), HostServiceError> {
         let index = self.port_index(context, port)?;
-        self.with_publisher(index, |row, state| {
+        self.with_publisher(index, |row, _state| {
             self.admit()?;
-            if state.local_scope.is_some() {
-                return Ok(());
-            }
             self.manager
                 .as_ref()
                 .ok_or(HostServiceError::MissingCapability)?
@@ -385,7 +378,6 @@ impl RawServices {
                 return Err(HostServiceError::DestroyBusy);
             }
             state.publisher.take();
-            state.local_scope.take();
             Ok(())
         })
     }
@@ -397,10 +389,7 @@ impl RawServices {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let PublisherState {
-                publisher,
-                leases,
-                local_scope,
-                ..
+                publisher, leases, ..
             } = &mut *state;
             leases.revoke_with(|_, _, owner| {
                 if let Some(publisher) = publisher {
@@ -412,7 +401,6 @@ impl RawServices {
                 drop(owner);
             });
             publisher.take();
-            local_scope.take();
         }
     }
     pub(super) fn record_error(&self, error: HostServiceError) -> HostCallFailure {

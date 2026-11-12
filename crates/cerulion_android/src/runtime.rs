@@ -1174,7 +1174,6 @@ impl EmbeddedRuntime {
         let networked = !config.listen.is_empty() || !config.connect.is_empty();
         let lan_access = LanAccess::from(config.lan_access);
         let inert_ingress = inert_ingress(!ingress.is_empty(), networked, lan_access);
-        validate_ingress_path(inert_ingress)?;
         let ingress_topics = ingress.len();
         let remote = config.remote.as_ref().filter(|remote| remote.enabled);
         // The served set names EVERY served topic, including schema-less
@@ -1930,11 +1929,6 @@ fn commit(
     status: &Arc<Mutex<Status>>,
     robot: &str,
 ) -> Result<(), EmbedError> {
-    validate_ingress_path(plan.inert_ingress)?;
-    tracing::debug!(
-        ingress_topics = plan.ingress_topics,
-        "validated embedded ingress path"
-    );
     let gate = Arc::clone(&run.commit_gate);
     {
         let _commit = lock_gate(&gate);
@@ -2031,6 +2025,19 @@ fn commit(
             schema = %subscribe.schema,
             "subscribe topic is neither an app publish topic nor a graph output"
         );
+    }
+    match plan.inert_ingress {
+        None => {}
+        Some(InertIngress::NoGateway) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
+            "ingress is set but listen and connect are empty: this start builds no gateway, so \
+             no LAN frame reaches the ingress topics"
+        ),
+        Some(InertIngress::Paired) => tracing::warn!(
+            ingress_topics = plan.ingress_topics,
+            "ingress is set but lan_access is paired: the gateway refuses every frame a LAN \
+             peer publishes into the ingress topics"
+        ),
     }
     if plan.inert_egress {
         tracing::warn!(
@@ -2218,19 +2225,6 @@ fn inert_ingress(
         (false, _, _) | (true, true, LanAccess::Open) => None,
         (true, false, _) => Some(InertIngress::NoGateway),
         (true, true, LanAccess::Paired) => Some(InertIngress::Paired),
-    }
-}
-
-/// Refuse an ingress that this embedded host cannot deliver before setup.
-fn validate_ingress_path(reason: Option<InertIngress>) -> Result<(), EmbedError> {
-    match reason {
-        None => Ok(()),
-        Some(InertIngress::NoGateway) => Err(EmbedError::InvalidArgument(
-            "ingress requires a supported network path; configure listen or connect with open LAN access".into(),
-        )),
-        Some(InertIngress::Paired) => Err(EmbedError::InvalidArgument(
-            "authenticated graph ingress is unavailable in this embedded host; use the explicit open LAN compatibility path".into(),
-        )),
     }
 }
 
@@ -3458,7 +3452,6 @@ nodes:
                 expected,
                 "ingress={has_ingress} networked={networked} {lan_access:?}"
             );
-            assert_eq!(validate_ingress_path(expected).is_ok(), expected.is_none());
         }
     }
 

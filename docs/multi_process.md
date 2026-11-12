@@ -392,15 +392,17 @@ memory only. The deployment's produced topics reach the network through a
 GATEWAY, which taps them on the deployment's iceoryx2 namespace.
 One robot = one network peer: only the gateway process holds a zenoh session.
 
-- **Export scope follows the block.** Without a `network:` block, every
-  produced topic is eligible for paired export. An enabled block restricts
-  egress and declares ingress. Paired strict and blockless runs register with
-  the shared `cerulion-netd`; authenticated imports select a unique producer.
-  The data plane uses the resolved shared data namespace, separate from the
-  deployment's coordination namespace. A namespace mismatch is refused.
-  Explicit open LAN strict plans retain verbatim zenoh locators and their
-  per-run gateway; a blockless open LAN plan retains the shared gateway and
-  its fallback when unavailable.
+- **Which gateway you get follows the posture.** A run with NO `network:`
+  block is PERMISSIVE (every produced topic is egressable; topic announce tokens
+  are declared when LAN access is open), and on
+  Unix the supervisor registers the deployment's egress plan with the
+  machine's shared `cerulion-netd` daemon, forwarding the supervisor-minted
+  worker namespace so netd's gateway taps the right shared memory. An explicit
+  block is STRICT (the declared allow-list): verbatim locators and an
+  allow-list cannot be represented on that shared session, so a Strict run is
+  routed to a per-run gateway child (`cerulion graph run-gateway`, hidden)
+  that honors the block. A permissive run falls back to the same child,
+  loudly, when netd is unreachable or resolved a different namespace.
 - A per-run child is spawned AFTER the GO gate (the topics exist)
   and only while the run is live; a Ctrl-C'd spawn phase skips it.
 - The gateway is NOT a DAG worker: a per-run child is held in a separate

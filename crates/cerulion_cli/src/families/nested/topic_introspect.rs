@@ -33,7 +33,7 @@ enum TopicIntrospectAction {
     /// Print the message type of a topic
     ///
     /// Reads one message from a LOCAL topic or, if the name is not a local
-    /// topic, an account or paired robot's topic anywhere, and prints its
+    /// topic, a REMOTE robot's topic discovered on the LAN, and prints its
     /// type as `package/Type` (a workspace schema with no package prints its
     /// bare name). Pass `--local` to read genuine local producers
     /// without remote discovery or demand.

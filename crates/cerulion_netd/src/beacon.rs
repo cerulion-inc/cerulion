@@ -114,8 +114,8 @@ pub enum BeaconDecision {
     /// always stamps one); kept because the plane takes whatever config the
     /// manager was built with.
     NoIdentity,
-    /// No dialable `tcp/` listen endpoint: no legacy mDNS beacon is requested.
-    /// Authenticated remote serving is independent. Carries the endpoints offered so
+    /// No dialable `tcp/` listen endpoint — the DESK shape (and a robot that
+    /// forgot `CERULION_NETD_LISTEN`). Carries the endpoints that were offered so
     /// the log can show what it looked at.
     NoListenPort {
         /// The listen endpoints the config did carry (empty on a desk).
@@ -398,7 +398,7 @@ impl GatewayBeacon {
                 //
                 // NOT `warn!`: every desk on the fleet takes this arm and a
                 // silent desk is CORRECT, so the message has to read truthfully
-                // on both shapes and leave authenticated remote serving independent.
+                // on both shapes — benign for a desk, remedy for a robot.
                 tracing::info!(
                     listen = ?listen,
                     "cerulion-netd is NOT advertising this machine over mDNS \
@@ -406,9 +406,9 @@ impl GatewayBeacon {
                      loopback hosts are not advertised), so there is no port another machine \
                      could dial. On a DESK this is correct and expected: a desk is \
                      not a robot and must not appear in `cerulion topic list`'s ROBOTS section. \
-                     Authenticated remote serving and account discovery need no zenoh listen \
-                     locator. For explicit legacy LAN discovery, set \
-                     CERULION_NETD_LISTEN=tcp/0.0.0.0:7683 and restart the daemon."
+                     On a machine that is MEANT to serve topics to other machines, this line is \
+                     WHY it is undiscoverable — give cerulion-netd a listen locator \
+                     (CERULION_NETD_LISTEN=tcp/0.0.0.0:7683) and restart it."
                 );
                 false
             }

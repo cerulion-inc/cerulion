@@ -79,11 +79,14 @@ default = ["wan"]
 # `cerulion_netd::NetdClient` consumer with no cyclic package edge.
 #
 # The `wan` feature pulls `cerulion_link` (→ iroh, ~390 crates) +
-# `cerulion_wireclient` (the re-inject substrate) and a tokio runtime.
-# Pairing is also needed by lean clients for the shared local serving authority.
+# `cerulion_wireclient` (the re-inject substrate) + `cerulion_pairing` (to
+# derive the desk's public device key from its seed, so the WAN pre-flight's
+# `DemandSubject::Wan` carries netd's OWN demander identity — never the dial target)
+# + a tokio runtime.
 wan = [
     "dep:cerulion_link",
     "dep:cerulion_wireclient",
+    "dep:cerulion_pairing",
     "dep:tokio",
 ]
 
@@ -153,7 +156,7 @@ libc = "0.2"
 # Safe deadline-bound Unix connect on the cold local control path. Already locked.
 socket2 = "=0.6.5"
 # Safe readiness waits on borrowed control-socket descriptors. Already locked.
-rustix = { version = "=1.1.6", features = ["event", "process"] }
+rustix = { version = "=1.1.6", features = ["event"] }
 
 # ── iroh WAN plane deps. `optional = true` — pulled ONLY when the `wan`
 #    feature is active. `wan` is DEFAULT-ON (see the `[features]` block above), so a
@@ -181,9 +184,9 @@ cerulion_wireclient = { workspace = true, optional = true }
 # (`DeviceIdentity::from_seed(seed).public_key()`), so the iroh WAN plane's
 # demand-authorization pre-flight passes netd's OWN demander identity on
 # `DemandSubject::Wan` (never the dial target). Already a dev-dep for the WAN e2e;
-# also used to verify durable local serving authority in lean clients. Permissive-licensed
+# promoted to an optional `wan` dep for the production derivation. Permissive-licensed
 # (does not change netd's AGPL posture — already AGPL via cerulion_core).
-cerulion_pairing = { workspace = true }
+cerulion_pairing = { workspace = true, optional = true }
 # The iroh dial + control round-trips + the spawned per-topic reader tasks run on a
 # tokio runtime (the runtime iroh mandates). The sync `MirrorPlane` facade blocks on
 # it. Same trimmed feature set as cerulion_connectd's runtime.
@@ -192,15 +195,9 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "sync",
     "macros",
-    "net",
 ], optional = true }
 
 [dev-dependencies]
-# Exact existing-tree versions: the automatic CLI fixture binds real loopback
-# sockets with iroh's test builder and the same ring TLS provider as cerulion_link.
-# These are never dependencies of the shipped daemon.
-iroh = { version = "=1.0.2", default-features = false }
-rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 # test-helpers unlocks TransportManager::init_for_test + iceoryx_test_config so
 # the mirror-plane iox2 test drives the REAL demand→mirror path over an isolated
 # per-test SHM root (the gateway_iox2_test precedent) — proving the production

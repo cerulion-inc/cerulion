@@ -515,7 +515,6 @@ impl RawIngressRoute {
                 ros_type: ros_type.to_string(),
             });
         }
-        // The native or plugin host retains any local-only exclusion through port teardown.
         let publisher = transport
             .create_publisher(
                 cerulion_topic,

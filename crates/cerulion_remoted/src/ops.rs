@@ -140,7 +140,6 @@ pub const RESTART_STOPPED_NOT_STARTED: &str = "the robot's e-stop was engaged du
 /// through it CONCURRENTLY — the receipt sink serializes only the brief append,
 /// so no session ever blocks another (see the module docs).
 pub struct OpsServing {
-    serving_holds: Option<crate::serving_hold::ServingHolds>,
     /// Shared, `&self`-served across concurrent sessions. Its receipt sink is a
     /// brief-append `Mutex` (in `cerud`), so concurrent appends stay chain-valid
     /// without any whole-session serialization here.
@@ -222,7 +221,6 @@ impl OpsServing {
         })?;
         let server = OpsServer::new(server_name, authorizer, verbs, receipts);
         Ok(OpsServing {
-            serving_holds: None,
             server: Arc::new(server),
             deadline: OPS_SESSION_DEADLINE,
             shutdown,
@@ -236,19 +234,6 @@ impl OpsServing {
     /// on it is driven to settlement there.
     pub fn shutdown_stage(&self) -> &ShutdownStage {
         &self.shutdown
-    }
-
-    /// Native idle admission for a daemon; absent on an embedded ops host.
-    pub fn serving_holds(&self) -> Option<&crate::serving_hold::ServingHolds> {
-        self.serving_holds.as_ref()
-    }
-
-    pub(crate) fn with_serving_holds(
-        mut self,
-        holds: Option<crate::serving_hold::ServingHolds>,
-    ) -> Self {
-        self.serving_holds = holds;
-        self
     }
 
     /// Override the per-session deadline (tests only) so the deadline-unwedge +

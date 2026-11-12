@@ -50,8 +50,6 @@ frees partial node state and leaves no instance; the host never destroys it.
 Successful create is paired with exactly one destroy even if shutdown fails.
 
 The host serializes NodeApi, StateApi and ExternalApi entries for each instance.
-Raw publisher creation retains an existing local-only exclusion before opening its port.
-The host keeps it through outstanding loans and port teardown; private publishers do not announce egress.
 Raw create/loan/finish/discard/egress and injected-clock calls may run on any helper thread,
 concurrently with ticks and different publishers; short per-publisher locks do
 not take the tick lock or return BUSY for contention. Raw helper leases never

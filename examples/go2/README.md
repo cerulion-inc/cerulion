@@ -86,7 +86,7 @@ their overrides.
 | Bridge config file | none: the bridge refuses to launch without one | `DDS_BRIDGE_CONFIG` | `export DDS_BRIDGE_CONFIG=graphs/go2.bridge.yaml` |
 | Camera rendition | the 720-line rendition (the topic interleaves two, 360 and 720 lines high) | `CAMERA_TARGET_HEIGHT` | `export CAMERA_TARGET_HEIGHT=360` |
 | The robot's announced name | the companion computer's hostname | `CERULION_ROBOT_IDENTITY`, read by the process that announces | `export CERULION_ROBOT_IDENTITY=go2` in the shell that runs a serving graph, as step 2 below does; without it the robot announces under the companion's hostname, and every `--robot` below has to use that name instead |
-| Where the desk reaches the robot | authenticated direct or relayed iroh | same account or established explicit pairing | run the graph, then `cerulion topic list`; no listen setting or address is needed |
+| Where the desk reaches the robot | nothing bound: `cerulion-netd` listens only where `CERULION_NETD_LISTEN` says, and advertises itself over mDNS only then | `CERULION_NETD_LISTEN` in the companion's service environment | `export CERULION_NETD_LISTEN=tcp/0.0.0.0:7683` before every serve |
 | Teleop saturation limits | 0.6 m/s forward, 0.4 m/s sideways, 1 rad/s yaw (well under the sport API's maxima; first actuation happens on a stand) | constants in `nodes/joystick_teleop`, duplicated and pinned in lockstep in the keyboard and driver crates | edit the constants and rebuild |
 | Companion file-descriptor limit | the image default is too low for a whole-robot bridge | the shell that runs a graph | `ulimit -n 65536` in that shell |
 
@@ -163,6 +163,7 @@ Two ways forward from here, and both run the same `dds_bridge` node:
 # On the companion computer:
 export GO2_IFACE="REPLACE_WITH_COMPANION_INTERFACE_IP"
 export CERULION_ROBOT_IDENTITY=go2
+export CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
 export DDS_BRIDGE_CONFIG=graphs/go2.bridge.yaml
 ulimit -n 65536
 cerulion graph run bridge --release --single-process
@@ -195,7 +196,7 @@ A silent `/go2/camera/h264` is the bridge, not the camera: check
 ### 3. Watch from your desk
 
 ```bash
-# On your signed-in desk (or one with an existing saved pairing):
+# On your machine (remote discovery is automatic on one LAN):
 cerulion topic list
 cerulion viz --robot go2 /go2/utlidar/cloud /go2/camera/jpeg /tf /tf_static
 ```
@@ -203,9 +204,9 @@ cerulion viz --robot go2 /go2/utlidar/cloud /go2/camera/jpeg /tf /tf_static
 `--robot` takes the robot's announced name, which is the
 `CERULION_ROBOT_IDENTITY` exported in step 2, and needs at least one topic.
 `cerulion topic list` prints the announced name under ROBOTS if you are
-unsure. The same account works across networks without an
-address or listen setting. iroh uses a direct path when possible and a relay
-otherwise. The desk can decode the raw H.264 route
+unsure. Off the LAN, name the listener:
+`cerulion topic list --connect tcp/<companion address>:7683`, and the same
+`--connect` on `cerulion viz`. The desk can decode the raw H.264 route
 directly (`/go2/camera/h264`); the JPEG leg is the fallback for a desk that
 cannot.
 

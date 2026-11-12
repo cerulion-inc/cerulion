@@ -59,8 +59,9 @@ impl Drop for ChildGuard {
 /// the graph-run parent; bagd runs in its OWN process group (the production
 /// `process_group(0)`), so killing the parent on a mid-window panic ORPHANS
 /// bagd (holding the .mcap + SHM taps past tempdir teardown). On Drop this
-/// pgrep-discovers bagd from this file's `demo_` recording family,
-/// accepting relative and absolute output directories,
+/// pgrep-discovers any bagd spawned by THIS file's runs — the relative
+/// `--out recordings/demo_...` cmdline form is unique to the recording
+/// driver (the sibling subprocess suite passes absolute temp paths) —
 /// and SIGKILLs its process group (bagd is its own group leader, so
 /// `killpg(pid)` is exact). Best-effort; init reaps the orphan. Armed
 /// IMMEDIATELY after every spawn, not only in the kill variant.
@@ -68,7 +69,7 @@ struct BagdGuard;
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         if let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out (/[^[:space:]]*/)?recordings/demo_"])
+            .args(["-f", "bagd --out recordings/demo_"])
             .output()
         {
             for pid in String::from_utf8_lossy(&out.stdout)

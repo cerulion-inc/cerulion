@@ -15,10 +15,12 @@
 //!
 //! ## Name resolution
 //!
-//! A positional ROBOT name resolves via the `name = "<eid>"` pins in
-//! `~/.cerulion/robots.toml`, so a pinned robot's name just works here with no
-//! flags. No `cerulion` verb writes the file while `cerulion pair` is a hidden
-//! stub: it holds hand-written pins and any an earlier pairing wrote.
+//! A positional ROBOT name resolves via `~/.cerulion/robots.toml` — which
+//! `cerulion pair <robot>` WRITES on a successful pairing, so a paired robot's
+//! name just works here with no flags. (`cerulion pair` additionally resolves a
+//! name LIVE from the robot's mDNS TXT `eid=` record —
+//! [`crate::mdns_discovery::resolve_robot_eid`]; `connect` uses the pinned
+//! `robots.toml` entry the pairing left behind.)
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -185,8 +187,8 @@ pub fn desk_key_path() -> Option<PathBuf> {
 
 /// The default `--key-file` to hand `cerulion-connectd connect` when the user
 /// passed none: this machine's key IF one exists (a paired desk), else `None`
-/// (a desk with no key, so an ephemeral key the robot refuses, which is the
-/// correct "not on the access list" signal). Never generates a key; it may write the
+/// (an unpaired desk, so an ephemeral key the robot refuses, which is the
+/// correct "pair first" signal). Never generates a key; it may write the
 /// second name of an existing one (adoption, or the `desk.key` alias).
 ///
 /// The path handed over is [`desk_key_path`], the legacy name of the key
@@ -258,7 +260,8 @@ pub fn resolve_eid_with(
             } else {
                 Err(CliError::Validation(format!(
                     "unknown robot '{pos}': not a 64-char-hex endpoint id and not pinned in \
-                     ~/.cerulion/robots.toml. Pass `--eid <hex>`, or add a `[robots]` entry \
+                     ~/.cerulion/robots.toml. Pair it first with `cerulion pair {pos}` (which \
+                     pins it), pass `--eid <hex>`, or add a `[robots]` entry \
                      (`{pos} = \"<64-hex-eid>\"`)."
                 )))
             }
@@ -279,8 +282,8 @@ pub fn resolve_eid_with(
 /// robot choose which cached artifact it is handed, i.e. ask for another robot's signed
 /// epoch (whose revoked account/device ids are not its business). The epoch cache is
 /// filed under "the name this desk knows the robot by", and `~/.cerulion/robots.toml`
-/// is exactly that record: the desk's own name→eid pins, whose binding the dial then
-/// authenticates cryptographically.
+/// is exactly that record — written by `cerulion pair`, which pins the name→eid binding
+/// the dial then authenticates cryptographically.
 ///
 /// Two ways a name is desk-verified:
 ///
@@ -596,7 +599,7 @@ pub const NETWORK_REFUSAL: &str = "cerulion connect: network kill-switch engaged
 /// When the user passed no `--key-file`, this machine's paired key
 /// (`~/.cerulion/desk.key`, the same key as `identity/device.key`) is used
 /// automatically IF it exists (see
-/// `default_connect_key_file`), so a desk on the robot's access list connects
+/// `default_connect_key_file`) — so a desk paired via `cerulion pair` connects
 /// with no flags.
 pub fn plan(args: &ConnectArgs) -> CliResult<ConnectPlan> {
     // ONE read of `robots.toml` per plan. If `resolve_eid` and

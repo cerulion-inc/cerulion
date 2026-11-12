@@ -12,8 +12,6 @@ agent drives this way, with a recording that replays with no agent. Its demo
 script expects an [ASPIRE](https://github.com/NVlabs/ASPIRE) embodiment that is
 not yet published; the plant and the replay run from this repository alone.
 
-Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep their graph, state and tool journal local. Remote requests are refused before reaching those topics; configured external eye requests also respect this scope. Cached private state stays local after its producer exits. Remote graph topic diagnostics require an eligible live producer; local observations retain history. Local tool calls remain available. Emergency-stop operations remain available independently of network scope.
-
 ## Run it
 
 ```bash
@@ -490,10 +488,8 @@ no attempt (see
 When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
 the middle of an attempt first deletes the MCP session rcpd issued it, within
 2 s, inside the 5 s the stop waits for the delivery's task. A stop the
-hard-exit deadline or a second signal ends, a SIGKILL or a crash may end it
-with no line and no `DELETE`. A `cerulion-netd` stop sends SIGTERM, and sends
-SIGKILL only if `cerulion-remoted` has not exited within
-`CERULION_REMOTED_HARD_EXIT_MS` plus 500 ms.
+hard-exit deadline or a second signal ends, a SIGKILL (as a `cerulion-netd`
+stop sends) or a crash may end it with no line and no `DELETE`.
 
 The latch clears only when `cerulion-remoted` restarts. To recover, restart
 `cerulion-remoted`, then clear rcpd's own latch: `estop_clear` under

@@ -9,10 +9,6 @@
 //! desk key path, builds the exact `cerulion-connectd pair` argv, and SPAWNS that
 //! iroh-linking sibling (which owns the dial + the ceremony).
 //!
-//! No `cerulion` verb calls this module in this release: no robot-side verb
-//! arms a pairing code, so `cerulion pair` is a hidden stub that refuses
-//! every invocation with exit 2 before reaching it.
-//!
 //! This module is PURE + oracle-tested for the load-bearing seams: the
 //! [`resolve_pair_target_with`] eid/name ladder, the [`build_pair_argv`] byte
 //! oracle, and the [`merge_robots_toml`] round-trip (preserve existing entries +

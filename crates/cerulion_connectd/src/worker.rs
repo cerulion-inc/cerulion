@@ -507,7 +507,7 @@ const NO_DESK_NAME_LABEL: &str = "<unpinned robot>";
 /// # Which identity keys the cache
 ///
 /// `desk_robot_name` — the name THIS DESK knows the robot by (`~/.cerulion/robots.toml`,
-/// pinned there, resolved by `cerulion connect`) and NEVER
+/// pinned by `cerulion pair`, resolved by `cerulion connect`) — and NEVER
 /// `peer_reported_name`, the identity the robot puts in its own catalog. The desk dials
 /// an eid it chose and iroh authenticates; the cache is filed under the desk's own name
 /// for that robot. Keying the lookup by peer-supplied text would let the dialed robot
@@ -560,8 +560,9 @@ async fn push_epoch(
                 "cerulion connect: this desk has no pinned name for the robot it dialed, so it \
                  cannot tell WHICH cached revocation epoch is meant — pushing NONE. \
                  The robot's own reported name is deliberately NOT used to pick a cache file (a \
-                 dialed robot must not choose which artifact it is handed). Add a `[robots]` \
-                 entry to ~/.cerulion/robots.toml, then dial it by that name."
+                 dialed robot must not choose which artifact it is handed). Pair it \
+                 (`cerulion pair <name>`, which pins it) or add a `[robots]` entry to \
+                 ~/.cerulion/robots.toml, then dial it by that name."
             );
             return Ok(EpochPushOutcome::UnverifiedRobotIdentity);
         }
@@ -654,7 +655,6 @@ async fn demand_topic(
         send,
         recv,
         &WireRequest::Demand {
-            graph_ingress: false,
             topic: topic.to_string(),
         },
         timeout,
@@ -850,7 +850,6 @@ mod tests {
             entries: entries
                 .into_iter()
                 .map(|(t, h)| CatalogEntry {
-                    egress_qos: None,
                     topic: t.to_string(),
                     schema_hash: h,
                     schema_name: None,

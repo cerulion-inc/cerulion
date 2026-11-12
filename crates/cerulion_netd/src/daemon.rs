@@ -310,14 +310,6 @@ impl Ctx {
                     crate::account_access::AccountAccessRequest::Install { snapshot } => self
                         .plane
                         .install_account_snapshot(snapshot, &mut lock_registry(&self.registry)),
-                    crate::account_access::AccountAccessRequest::InstallPaired { robots } => self
-                        .plane
-                        .install_paired_robots(robots, &mut lock_registry(&self.registry))
-                        .map(
-                            |()| crate::account_access::AccountAccessReply::PairedInstalled {
-                                robot_count: robots.len(),
-                            },
-                        ),
                     _ => self.plane.account_access(&action),
                 }) {
                     Ok(reply) if action.accepts(&reply) => {
@@ -341,29 +333,6 @@ impl Ctx {
                 topic,
                 schema_hash,
             } => self.demand(conn, id, robot, topic, schema_hash),
-            Request::Observe {
-                id,
-                robot,
-                topic,
-                schema_hash,
-            } => {
-                let key = TopicKey::observed(&robot, &topic);
-                let observer = self.plane.local_channel(&key) != key.topic;
-                match self.demand_with_mode(conn, id, robot, topic, schema_hash, observer) {
-                    Response::Demand(demand) => {
-                        Response::Observed(crate::protocol::ObserveResponse {
-                            demand,
-                            local_topic: self.plane.local_channel(&key),
-                        })
-                    }
-                    response => response,
-                }
-            }
-            Request::Unobserve { id, robot, topic } => {
-                let key = TopicKey::observed(&robot, &topic);
-                let observer = self.plane.local_channel(&key) != key.topic;
-                self.release_with_mode(conn, id, robot, topic, observer)
-            }
             Request::Release { id, robot, topic } => self.release(conn, id, robot, topic),
             Request::Status { id } => self.status(id),
             Request::RegisterEgress {
@@ -450,20 +419,6 @@ impl Ctx {
             }
             Ok(_) => {}
         }
-        if let Some(result) = robot
-            .as_deref()
-            .and_then(|robot| self.plane.paired_catalog(robot))
-        {
-            return match result {
-                Ok(catalog) => Response::CatalogQuery(CatalogQueryResponse {
-                    id,
-                    catalogs: vec![catalog],
-                    discovery: crate::protocol::DiscoveryState::Settled,
-                    plane_unsettled_ms: None,
-                }),
-                Err(error) => Response::error(Some(id), error, robot, None),
-            };
-        }
         match self.query_plane.query_catalog(robot.as_deref()) {
             Ok(gather) => Response::CatalogQuery(CatalogQueryResponse {
                 id,
@@ -525,20 +480,6 @@ impl Ctx {
                 };
             }
             Ok(_) => {}
-        }
-        if let Some(result) = robot
-            .as_deref()
-            .and_then(|robot| self.plane.paired_schema(robot, &requested))
-        {
-            return match result {
-                Ok(reply) => Response::SchemaQuery(SchemaQueryResponse {
-                    id,
-                    replies: vec![reply],
-                    discovery: crate::protocol::DiscoveryState::Settled,
-                    plane_unsettled_ms: None,
-                }),
-                Err(error) => Response::error(Some(id), error, robot, None),
-            };
         }
         match self.query_plane.query_schema(robot.as_deref(), &requested) {
             Ok(gather) => Response::SchemaQuery(SchemaQueryResponse {
@@ -623,26 +564,10 @@ impl Ctx {
         topic: String,
         schema_hash: u64,
     ) -> Response {
-        self.demand_with_mode(conn, id, robot, topic, schema_hash, false)
-    }
-
-    fn demand_with_mode(
-        &self,
-        conn: ConnId,
-        id: u64,
-        robot: String,
-        topic: String,
-        schema_hash: u64,
-        observer: bool,
-    ) -> Response {
         if let Err(error) = crate::account_access::parse_robot_route(&robot) {
             return Response::error(Some(id), error, Some(robot), Some(topic));
         }
-        let key = if observer {
-            TopicKey::observed(&robot, &topic)
-        } else {
-            TopicKey::new(&robot, &topic)
-        };
+        let key = TopicKey::new(&robot, &topic);
         if key.robot.is_empty() || key.topic.is_empty() {
             return Response::error(
                 Some(id),
@@ -678,17 +603,12 @@ impl Ctx {
                         }
                         Err(e) => {
                             reg.release(conn, &key, Instant::now());
-                            if e.is_transient_busy() {
-                                tracing::debug!(robot = %key.robot, topic = %key.topic, error = %e,
-                                    "netd: mirror controller busy; demand refcount rolled back");
-                            } else {
-                                tracing::warn!(
-                                    robot = %key.robot,
-                                    topic = %key.topic,
-                                    error = %e,
-                                    "netd: mirror registration failed — demand refused, refcount rolled back" // dash-ok: exact non-transient refusal text
-                                );
-                            }
+                            tracing::warn!(
+                                robot = %key.robot,
+                                topic = %key.topic,
+                                error = %e,
+                                "netd: mirror registration failed — demand refused, refcount rolled back"
+                            );
                             Response::error(
                                 Some(id),
                                 format!("mirror registration failed: {e}"),
@@ -785,24 +705,10 @@ impl Ctx {
     /// WITHOUT the registry lock held (a blocking zenoh undeclare must
     /// never stall the idle-watch or a new connection).
     fn release(&self, conn: ConnId, id: u64, robot: String, topic: String) -> Response {
-        self.release_with_mode(conn, id, robot, topic, false)
-    }
-    fn release_with_mode(
-        &self,
-        conn: ConnId,
-        id: u64,
-        robot: String,
-        topic: String,
-        observer: bool,
-    ) -> Response {
         if let Err(error) = crate::account_access::parse_robot_route(&robot) {
             return Response::error(Some(id), error, Some(robot), Some(topic));
         }
-        let key = if observer {
-            TopicKey::observed(&robot, &topic)
-        } else {
-            TopicKey::new(&robot, &topic)
-        };
+        let key = TopicKey::new(&robot, &topic);
         let mut reg = lock_registry(&self.registry);
         match reg.release(conn, &key, Instant::now()) {
             ReleaseOutcome::LastRelease => {
@@ -851,14 +757,12 @@ impl Ctx {
                 // The plane is asked BEFORE the key is consumed: it is the one fact
                 // about a mirror that the frames themselves cannot carry.
                 plane: self.plane.serving_plane(&k),
-                local_topic: Some(self.plane.local_channel(&k)),
                 robot: k.robot,
                 topic: k.topic,
                 refcount,
             })
             .collect();
         Response::Status(StatusResponse {
-            robot_startup_error: self.egress_plane.robot_startup_error(),
             id,
             demands,
             active_connections: reg.active_connections(),
@@ -891,11 +795,7 @@ impl Ctx {
         // config matches netd's shared session before tapping.
         ix_config_json: Option<String>,
     ) -> Response {
-        if plan
-            .announce
-            .iter()
-            .all(|topic| crate::registry::canonical_topic(topic).is_empty())
-        {
+        if plan.announce.is_empty() {
             return Response::error(
                 Some(id),
                 "register_egress requires a non-empty announce set (the produced topics to \
@@ -1322,22 +1222,13 @@ pub fn start_with_planes_and_events(
         let shutdown = Arc::clone(&shutdown);
         let self_exit = Arc::clone(&self_exit);
         let guard = Arc::clone(&guard);
-        let egress_plane = Arc::clone(&ctx.egress_plane);
         let idle_grace = config.idle_grace;
         let poll = config.idle_watch_poll;
         Some(
             std::thread::Builder::new()
                 .name("netd-idle".to_string())
                 .spawn(move || {
-                    idle_watch(
-                        registry,
-                        shutdown,
-                        self_exit,
-                        guard,
-                        egress_plane,
-                        idle_grace,
-                        poll,
-                    )
+                    idle_watch(registry, shutdown, self_exit, guard, idle_grace, poll)
                 })?,
         )
     } else {
@@ -1461,7 +1352,6 @@ fn idle_watch(
     shutdown: Arc<AtomicBool>,
     self_exit: Arc<AtomicBool>,
     guard: Arc<Mutex<Option<SocketGuard>>>,
-    egress_plane: Arc<dyn EgressPlane>,
     idle_grace: Duration,
     poll: Duration,
 ) {
@@ -1484,9 +1374,7 @@ fn idle_watch(
         // just stops the threads.
         let committed = {
             let reg = lock_registry(&registry);
-            if reg.should_self_exit(Instant::now(), idle_grace)
-                && !egress_plane.holds_serving_endpoint()
-            {
+            if reg.should_self_exit(Instant::now(), idle_grace) {
                 self_exit.store(true, Ordering::Release);
                 // Drop the guard AT the commit (close to new clients now, not ~200ms
                 // later when main notices self_exit) to close the race window.
@@ -1958,19 +1846,6 @@ fn handle_connection(mut stream: UnixStream, ctx: Ctx, shutdown: Arc<AtomicBool>
                 return; // consumer gone / wedged — only this connection dies.
             }
         }
-        let losses = ctx.registry.try_lock().map_or_else(
-            |_| Default::default(),
-            |mut registry| registry.take_mirror_losses(conn),
-        );
-        for key in losses {
-            if !write_line(
-                &mut stream,
-                &crate::protocol::MirrorLost::new(&key).to_json_line(),
-            ) {
-                cleanup_connection(&ctx, conn);
-                return;
-            }
-        }
         // Wait for socket-readable OR push-slot-filled, instead of
         // blocking in `read` and discovering the push only when that timed out. The
         // drain ABOVE runs before every wait, so a push that landed while we were
@@ -2176,7 +2051,6 @@ mod tests {
         release_calls: Mutex<Vec<TopicKey>>,
         /// When true, `release_mirror` returns `Retired` (models a real teardown).
         retired: bool,
-        canonical_channels: bool,
     }
     impl TestSpy {
         fn release_count(&self) -> usize {
@@ -2187,13 +2061,6 @@ mod tests {
         fn ensure_mirror(&self, _key: &TopicKey, _schema_hash: u64) -> Result<(), MirrorError> {
             *self.ensure_calls.lock().unwrap() += 1;
             Ok(())
-        }
-        fn local_channel(&self, key: &TopicKey) -> String {
-            if self.canonical_channels {
-                key.topic.clone()
-            } else {
-                key.local_topic()
-            }
         }
         fn release_mirror(&self, key: &TopicKey) -> MirrorRelease {
             self.release_calls.lock().unwrap().push(key.clone());
@@ -2459,167 +2326,6 @@ mod tests {
             conn_waker_total_drain: Arc::new(AtomicU64::new(0)),
             connect_endpoints: Vec::new(),
         }
-    }
-
-    #[test]
-    fn lan_observers_and_canonical_readers_share_one_mirror_until_last_release() {
-        let spy = Arc::new(TestSpy {
-            retired: true,
-            canonical_channels: true,
-            ..Default::default()
-        });
-        let mut ctx = waker_ctx();
-        ctx.plane = spy.clone();
-        let echo = ctx.connect_unless_exiting().unwrap();
-        let viz = ctx.connect_unless_exiting().unwrap();
-        assert!(matches!(
-            ctx.dispatch(
-                echo,
-                Request::Demand {
-                    id: 1,
-                    robot: "lan".into(),
-                    topic: "/state".into(),
-                    schema_hash: 7
-                }
-            ),
-            Response::Demand(_)
-        ));
-        let Response::Observed(reply) = ctx.dispatch(
-            viz,
-            Request::Observe {
-                id: 2,
-                robot: "lan".into(),
-                topic: "/state".into(),
-                schema_hash: 7,
-            },
-        ) else {
-            panic!("viewer must share LAN mirror");
-        };
-        assert_eq!(reply.local_topic, "/state");
-        assert_eq!(reply.demand.refcount, 2);
-        assert!(!reply.demand.mirror_created);
-        assert_eq!(*spy.ensure_calls.lock().unwrap(), 1);
-        let producer = ctx.connect_unless_exiting().unwrap();
-        assert_eq!(
-            ctx.registry
-                .lock()
-                .unwrap()
-                .register_egress(producer, vec!["/state".into()]),
-            RegisterEgressOutcome::LoopConflict {
-                topic: "/state".into(),
-                robot: "lan".into()
-            }
-        );
-        cleanup_connection(&ctx, echo);
-        assert_eq!(spy.release_count(), 0);
-        ctx.dispatch(
-            viz,
-            Request::Unobserve {
-                id: 3,
-                robot: "lan".into(),
-                topic: "/state".into(),
-            },
-        );
-        assert_eq!(
-            *spy.release_calls.lock().unwrap(),
-            vec![TopicKey::new("lan", "/state")]
-        );
-        assert_eq!(ctx.registry.lock().unwrap().mirror_count(), 0);
-        cleanup_connection(&ctx, viz);
-        assert_eq!(spy.release_count(), 1);
-        ctx.registry
-            .lock()
-            .unwrap()
-            .register_egress(producer, vec!["/local".into()]);
-        assert!(matches!(
-            ctx.dispatch(
-                producer,
-                Request::Observe {
-                    id: 4,
-                    robot: "lan".into(),
-                    topic: "/local".into(),
-                    schema_hash: 7
-                }
-            ),
-            Response::Error(_)
-        ));
-        assert_eq!(*spy.ensure_calls.lock().unwrap(), 1);
-        cleanup_connection(&ctx, producer);
-    }
-
-    #[test]
-    fn observer_reads_share_only_their_source_and_release_after_the_last_reader() {
-        let mut runs = Vec::new();
-        for _ in 0..2 {
-            let spy = Arc::new(TestSpy {
-                retired: true,
-                ..Default::default()
-            });
-            let mut ctx = waker_ctx();
-            ctx.plane = spy.clone();
-            let a = ctx.connect_unless_exiting().unwrap();
-            let b = ctx.connect_unless_exiting().unwrap();
-            let request = |id, robot: &str, hash| Request::Observe {
-                id,
-                robot: robot.into(),
-                topic: "/state".into(),
-                schema_hash: hash,
-            };
-            let first = ctx.dispatch(a, request(1, "a", 7));
-            let Response::Observed(reply) = &first else {
-                panic!("{first:?}");
-            };
-            assert_eq!(
-                reply.local_topic,
-                TopicKey::observed("a", "/state").local_topic()
-            );
-            assert_eq!(reply.demand.refcount, 1);
-            assert!(reply.demand.mirror_created);
-            let Response::Observed(shared) = ctx.dispatch(b, request(2, "a", 7)) else {
-                panic!("same-source observer refused");
-            };
-            assert_eq!(shared.local_topic, reply.local_topic);
-            assert_eq!(shared.demand.refcount, 2);
-            assert!(!shared.demand.mirror_created);
-            assert!(matches!(
-                ctx.dispatch(b, request(3, "a", 8)),
-                Response::Error(_)
-            ));
-            let Response::Observed(other) = ctx.dispatch(a, request(4, "b", 9)) else {
-                panic!("independent robot refused");
-            };
-            assert_ne!(other.local_topic, reply.local_topic);
-            assert!(matches!(
-                ctx.dispatch(a, request(5, "", 7)),
-                Response::Error(_)
-            ));
-            cleanup_connection(&ctx, a);
-            assert_eq!(
-                *spy.release_calls.lock().unwrap(),
-                vec![TopicKey::observed("b", "/state")]
-            );
-            assert_eq!(
-                ctx.registry
-                    .lock()
-                    .unwrap()
-                    .refcount(&TopicKey::observed("a", "/state")),
-                1
-            );
-            ctx.dispatch(
-                b,
-                Request::Unobserve {
-                    id: 6,
-                    robot: "a".into(),
-                    topic: "/state".into(),
-                },
-            );
-            assert_eq!(spy.release_count(), 2);
-            assert_eq!(ctx.registry.lock().unwrap().mirror_count(), 0);
-            cleanup_connection(&ctx, b);
-            assert_eq!(spy.release_count(), 2);
-            runs.push(first.to_json_line());
-        }
-        assert_eq!(runs[0], runs[1]);
     }
 
     /// Read a descriptor's `O_NONBLOCK` bit back off the kernel.

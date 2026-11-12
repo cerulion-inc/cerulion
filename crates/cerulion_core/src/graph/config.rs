@@ -151,22 +151,26 @@ pub struct GraphConfig {
     /// OPTIONAL cross-machine networking surface. The block RESTRICTS
     /// networking; it does not switch it on.
     ///
-    /// Under `cerulion graph run` on the real clock, an absent block (or
-    /// `mode: disabled`) makes every produced topic eligible for paired export.
-    /// An enabled block restricts exports to `egress` and declares `ingress`.
-    /// Paired runs register with the shared daemon and select authenticated
-    /// same-account or explicitly paired producers for imports; no zenoh
-    /// locator is required for that path.
+    /// Under `cerulion graph run` on the real clock, an absent block (and a
+    /// block whose `mode` is `disabled`) means the PERMISSIVE default: one
+    /// gateway outside the graph process opens the machine's zenoh session and
+    /// announces the topics the graph produces when LAN access is open. On the default Unix path that
+    /// gateway is hosted by `cerulion-netd`, which listens and advertises over
+    /// mDNS only when `CERULION_NETD_LISTEN` is set; the per-run fallback
+    /// gateway child listens on port 7683 (`CERULION_GATEWAY_PORT` overrides
+    /// it) and advertises itself over mDNS. An enabled
+    /// block (`mode: peer` or `client`) replaces that with a STRICT posture:
+    /// the `connect` / `listen` locators used verbatim, no scouting, and only
+    /// the listed `egress` and `ingress` topics crossing. No value of this
+    /// block means "no network": that is `graph run --network off` (or
+    /// `CERULION_NETWORK=off`). The virtual and external clocks never start a
+    /// gateway.
     ///
-    /// With explicit `CERULION_LAN_ACCESS=open`, `connect` and `listen` apply
-    /// verbatim to the zenoh compatibility path. Strict open LAN runs use a
-    /// per-run gateway; blockless open LAN runs use the shared gateway with
-    /// its existing fallback. The graph process itself opens no network
-    /// session and exchanges messages through local shared memory.
-    ///
-    /// `graph run --network off` (or `CERULION_NETWORK=off`) keeps the run's
-    /// topics local. Virtual and external clocks never start a gateway. The
-    /// block's transport settings and topic scope are validated at
+    /// The graph process itself opens no zenoh session in any of these cases;
+    /// the gateway is its own process. When present the block declares this
+    /// graph's role in the zenoh mesh (`mode`), the
+    /// endpoints to reach (`connect`/`listen`), and which topics leave
+    /// (`egress`) or enter (`ingress`) over the network. Validated at
     /// graph-load by `validate_graph` (the `validate_network_block` arm in
     /// `super::validation`); the transport wiring that CONSUMES it is
     /// `GraphConfig::network_transport_config`, and the block itself is parse +

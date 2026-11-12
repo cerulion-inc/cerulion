@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion-connectd` — the desk-side iroh sibling binary.
 //!
-//! Four subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
+//! Three subcommands, ONE iroh-linking sibling (the `cerulion` CLI stays iroh-free
 //! and SPAWNS this, exactly as it spawns the gateway / `vizd`):
 //!
 //! - `cerulion-connectd connect …`, dial a robot's `cerulion/wire/2` ALPN, demand
@@ -16,10 +16,8 @@
 //!   ALPN, so the robot's `cerulion-rcpd` serves as a local stdio MCP server.
 //!   STDOUT carries only MCP messages.
 //!
-//! The subcommands are spawned by `cerulion connect`, `cerulion rcp` and the
-//! `--robot` forms of `topic pub`, `topic snapshot` and `service call` (the
-//! hidden `pair` subcommand has no `cerulion` caller); users run those verbs,
-//! not this binary directly. All logic
+//! The subcommands are spawned by `cerulion connect` / `cerulion pair` /
+//! `cerulion rcp`; users run those verbs, not this binary directly. All logic
 //! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
@@ -46,8 +44,7 @@ use cerulion_core::transport::cerulion_q::CatalogReply;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{RelayConfig, RelayUrl};
 
-/// The desk-side iroh sibling `cerulion connect`, `cerulion rcp` and the
-/// `--robot` forms of `topic pub`, `topic snapshot` and `service call` spawn.
+/// The desk-side iroh sibling `cerulion connect` / `cerulion pair` spawn.
 //
 // `about` is spelled out here. A bare `about` takes the crate's manifest
 // description, which is written for crates.io, not for a terminal.
@@ -55,7 +52,7 @@ use cerulion_link::{RelayConfig, RelayUrl};
 #[command(
     name = "cerulion-connectd",
     version,
-    about = "The helper that `cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, `topic snapshot` and `service call` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
+    about = "The helper that `cerulion connect`, `cerulion pair` and `cerulion rcp` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
     long_about = None
 )]
 struct Cli {
@@ -73,10 +70,6 @@ enum ConnectdCommand {
     /// Runs the code-pairing ceremony, so the robot adds this desk's device key
     /// to its access list. Afterwards `cerulion connect <robot>` is admitted
     /// with no flags.
-    //
-    // Hidden from `--help`: no robot-side verb arms a pairing code, and the
-    // `cerulion pair` verb that ran this is a hidden stub that refuses.
-    #[command(hide = true)]
     Pair(PairCli),
     /// Call one of the robot's act verbs (`topic-publish`, `service-call`,
     /// `topic-snapshot`, `topic-echo-once`) and print its JSON result.
@@ -172,8 +165,8 @@ struct RcpCli {
 #[derive(Parser, Debug)]
 struct ConnectCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
-    /// 32-byte device key). Obtain it from the robot's mDNS TXT `eid=`
-    /// record or the robot operator.
+    /// 32-byte device key). Obtain it from `cerulion pair`, the robot's mDNS
+    /// TXT `eid=` record, or the robot operator.
     #[arg(long, value_name = "HEX")]
     eid: String,
 
@@ -203,9 +196,8 @@ struct ConnectCli {
 
     /// The desk device key file (32 raw bytes: an ed25519 seed whose public
     /// half is the desk identity the robot pairs with). When omitted, an
-    /// EPHEMERAL key is used, which no robot's access list holds, so a robot
-    /// refuses it; `cerulion connect` passes this machine's key, which
-    /// `cerulion login` creates.
+    /// EPHEMERAL key is used, which an unpaired robot REFUSES: pair the desk
+    /// first with `cerulion pair`.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -241,8 +233,8 @@ struct ConnectCli {
 #[derive(Parser)]
 struct PairCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
-    /// 32-byte device key), from the robot's mDNS `eid=` record or the robot
-    /// operator.
+    /// 32-byte device key). `cerulion pair` resolves it from the robot name you
+    /// typed (mDNS `eid=`, else `robots.toml`) or takes it from `--eid`.
     #[arg(long, value_name = "HEX")]
     eid: String,
 
@@ -252,8 +244,8 @@ struct PairCli {
 
     /// The desk device key file (32 raw bytes: an ed25519 seed). REQUIRED for
     /// pairing (an ephemeral key the robot added to its access list would
-    /// vanish on exit). Pass this machine's key,
-    /// `~/.cerulion/identity/device.key`, which `cerulion login` creates.
+    /// vanish on exit). `cerulion pair` creates and passes
+    /// `~/.cerulion/desk.key`.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -271,7 +263,7 @@ struct PairCli {
     account: Option<String>,
 
     /// The human label the robot stores on its access-list row (so the owner
-    /// recognizes this desk). Default: the desk hostname.
+    /// recognizes this desk). `cerulion pair` defaults it to the desk hostname.
     #[arg(long, value_name = "NAME")]
     label: Option<String>,
 
@@ -728,10 +720,8 @@ async fn run_connect_command(cli: ConnectCli) -> ExitCode {
             match &e {
                 ConnectError::Refused(reason) => tracing::error!(
                     reason = %sanitize_peer_text(reason),
-                    "cerulion connect: the robot refused the wire plane (the reason says why); a \
-                     desk signed in with `cerulion login` to the robot's account joins its access \
-                     list the first time this machine's network daemon reads one of the robot's \
-                     topics, which `cerulion viz --robot` does"
+                    "cerulion connect: the robot refused the wire plane — pair the desk with the \
+                     robot first (`cerulion pair <robot>`)"
                 ),
                 other => tracing::error!(
                     error = %sanitize_peer_text(&other.to_string()),
@@ -759,8 +749,8 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     // access-lists would vanish the moment this process exits.
     let Some(key_file) = cli.key_file.as_deref() else {
         tracing::error!(
-            "cerulion pair: --key-file is required (a persistent desk device key): pass this \
-             machine's key, `~/.cerulion/identity/device.key`, which `cerulion login` creates."
+            "cerulion pair: --key-file is required (a persistent desk device key). Run \
+             `cerulion pair <robot>`, which creates + passes this machine's key."
         );
         return ExitCode::from(EXIT_USAGE);
     };
@@ -1002,29 +992,6 @@ mod tests {
         }
     }
 
-    /// `pair` is hidden from `cerulion-connectd --help`: no `cerulion` verb runs it.
-    #[test]
-    fn the_pair_subcommand_is_hidden_from_help() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let pair = cmd
-            .find_subcommand("pair")
-            .expect("`pair` stays a subcommand");
-        assert!(
-            pair.is_hide_set(),
-            "`cerulion-connectd pair` must be hidden"
-        );
-        let help = cmd.clone().render_long_help().to_string();
-        assert!(
-            !help.lines().any(|l| l.trim_start().starts_with("pair ")),
-            "{help}"
-        );
-        assert!(
-            help.lines().any(|l| l.trim_start().starts_with("connect ")),
-            "{help}"
-        );
-    }
-
     /// The `--label` fallback resolves the desk identity (hostname / override) and
     /// is NEVER blank — the robot always stores a non-empty label for this desk.
     #[test]
@@ -1051,7 +1018,6 @@ mod tests {
     #[test]
     fn catalog_lines_neuter_and_bound_every_peer_string() {
         let entry = |topic: &str| CatalogEntry {
-            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(0xdead_beef),
             schema_name: None,

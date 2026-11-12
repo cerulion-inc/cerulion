@@ -15,9 +15,7 @@ pub use cerulion_msgio::snapshot::{
     write_jpeg, RawImage, SnapshotReport, DEFAULT_JPEG_QUALITY, DEFAULT_SNAPSHOT_TIMEOUT,
 };
 
-use super::{
-    ensure_topic_available_with_selection, local_walker_from_workspace, TopicScope, TopicSource,
-};
+use super::{ensure_topic_available, local_walker_from_workspace, TopicScope, TopicSource};
 use crate::message_text::VerbError;
 
 /// How long the verb waits before it tries again to open a topic that could
@@ -36,7 +34,7 @@ pub struct SnapshotRequest<'a> {
     pub timeout: Duration,
     /// JPEG quality, 1 to 100 (unused for a `CompressedImage` JPEG).
     pub quality: u8,
-    /// Local only, or automatic account, pairing and LAN discovery.
+    /// Local only, or local plus the LAN.
     pub scope: TopicScope,
 }
 
@@ -55,16 +53,6 @@ pub fn topic_snapshot(
     schemas_dir: Option<&Path>,
     running: &AtomicBool,
 ) -> Result<SnapshotReport, VerbError> {
-    topic_snapshot_with_robot(req, schemas_dir, running, None)
-}
-
-/// Snapshot a selected robot through the shared authenticated wire plane.
-pub fn topic_snapshot_with_robot(
-    req: &SnapshotRequest<'_>,
-    schemas_dir: Option<&Path>,
-    running: &AtomicBool,
-    robot: Option<&str>,
-) -> Result<SnapshotReport, VerbError> {
     if !(1..=100).contains(&req.quality) {
         return Err(VerbError::Usage(format!(
             "--quality must be 1 to 100, got {}",
@@ -73,17 +61,8 @@ pub fn topic_snapshot_with_robot(
     }
     let deadline = Instant::now() + req.timeout;
     let (_transport, subscriber, source) = loop {
-        match ensure_topic_available_with_selection(
-            req.topic,
-            schemas_dir,
-            Some(running),
-            req.scope,
-            robot,
-        ) {
+        match ensure_topic_available(req.topic, schemas_dir, Some(running), req.scope) {
             Ok(opened) => break opened,
-            Err(crate::error::CliError::AmbiguousTopic(message)) => {
-                return Err(VerbError::Usage(message))
-            }
             Err(e) if Instant::now() >= deadline || !running.load(Ordering::Relaxed) => {
                 return Err(VerbError::Unavailable(format!(
                     "'{}' could not be opened within {} s: {}",
@@ -95,14 +74,12 @@ pub fn topic_snapshot_with_robot(
             Err(_) => std::thread::sleep(REOPEN_DELAY), // ALLOW: a one-shot CLI retry while the camera topic appears, bounded by --timeout
         }
     };
-    // Remote connection setup has its own network deadlines; preserve the
-    // frame wait after setup so a cold relay connection does not consume it.
-    let (walker, frame_deadline) = match source {
-        TopicSource::Remote { walker, .. } => (walker, Instant::now() + req.timeout),
-        TopicSource::Local => (local_walker_from_workspace(schemas_dir), deadline),
+    let walker = match source {
+        TopicSource::Remote { walker, .. } => walker,
+        TopicSource::Local => local_walker_from_workspace(schemas_dir),
     };
 
-    let Some(frame) = take_newest_frame(&subscriber, frame_deadline, running)? else {
+    let Some(frame) = take_newest_frame(&subscriber, deadline, running)? else {
         return Err(VerbError::Unavailable(format!(
             "no frame on '{}' within {} s",
             req.topic,

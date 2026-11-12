@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! One automatic registration attempt and one owned robot-server child.
 //!
-//! Gateway startup never waits for account HTTP or this supervisor. Failure
-//! leaves the local gateway available; shutdown gracefully stops and reaps the
-//! remote server currently owned by the worker.
+//! LAN startup never waits for account HTTP or this supervisor. Failure leaves
+//! LAN serving; shutdown kills and reaps the child currently owned by the worker.
 
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -74,51 +73,37 @@ pub struct RobotSupervisor {
 }
 
 impl RobotSupervisor {
-    /// Start after netd acquires its singleton and a run registers egress (or
-    /// explicit LISTEN requests standing serving). Endpoint transfer happens on
-    /// this worker after provisioning, immediately before the real child starts.
+    /// Start once, after netd has acquired its singleton and opened its LAN plane.
     pub fn start(
         running: Arc<AtomicBool>,
         gateway: Arc<crate::GatewayEgressPlane>,
-        mirror: Arc<dyn crate::mirror::MirrorPlane>,
-        holds_endpoint: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let worker_running = Arc::clone(&running);
         let stop_grace = epoch_sync_stop_grace_from_env();
         let thread = std::thread::Builder::new()
             .name("netd-robot-supervisor".into())
             .spawn(move || {
-                let ownership = EndpointOwnership {
-                    mirror,
-                    held: holds_endpoint,
-                    stop_grace,
-                };
                 let mut attempt = 0u32;
                 while worker_running.load(Ordering::SeqCst) {
                     attempt += 1;
                     let started = Instant::now();
-                    let result = run(&worker_running, &ownership, |eid| {
-                        // This callback runs after the child passes try_wait.
-                        // Serving recovered even if refreshing the beacon fails.
-                        gateway.set_robot_startup_error(None);
-                        let refreshed = gateway
+                    let result = run(&worker_running, stop_grace, |eid| {
+                        gateway
                             .refresh_robot_beacon(eid)
-                            .map_err(|error| error.to_string())?;
-                        Ok(refreshed)
+                            .map_err(|error| error.to_string())
                     });
                     let Err(error) = result else { return };
                     attempt = counted_attempt(attempt, started.elapsed());
                     if !worker_running.load(Ordering::SeqCst) {
                         return;
                     }
-                    gateway.set_robot_startup_error(Some(error.clone()));
                     match retry_delay(attempt) {
                         Some(delay) => {
                             tracing::warn!(
                                 error = %error,
                                 attempt,
                                 retry_in_s = delay.as_secs(),
-                                "robot remote startup failed; local gateway remains available"
+                                "robot WAN startup failed; LAN remains available"
                             );
                             if !wait_while_running(&worker_running, delay) {
                                 return;
@@ -128,8 +113,8 @@ impl RobotSupervisor {
                             tracing::error!(
                                 error = %error,
                                 attempts = attempt,
-                                "robot remote startup failed and will not be retried until \
-                                 cerulion-netd restarts; local gateway remains available"
+                                "robot WAN startup failed and will not be retried until \
+                                 cerulion-netd restarts; LAN remains available"
                             );
                             return;
                         }
@@ -143,8 +128,8 @@ impl RobotSupervisor {
         })
     }
 
-    /// The shutdown budget for a running revocation fetch
-    /// ([`EPOCH_SYNC_STOP_GRACE_ENV`]), excluding [`remoted_stop_grace`].
+    /// The longest [`Self::shutdown`] waits for a running revocation fetch
+    /// ([`EPOCH_SYNC_STOP_GRACE_ENV`]).
     pub fn stop_grace(&self) -> Duration {
         self.stop_grace
     }
@@ -214,7 +199,7 @@ fn validate_prepared(prepared: &Prepared, root: &Path) -> Result<(), String> {
 
 fn run(
     running: &AtomicBool,
-    ownership: &EndpointOwnership,
+    stop_grace: Duration,
     refresh_facts: impl Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     let root = cerulion_discovery::robot_state::resolve()
@@ -224,48 +209,13 @@ fn run(
     }
     let current = std::env::current_exe().map_err(|error| error.to_string())?;
     let canonical = std::fs::canonicalize(&current).ok();
+    let cli = resolve_sibling("cerulion", &current, canonical.as_deref(), is_executable)?;
     let remoted = resolve_sibling(
         "cerulion-remoted",
         &current,
         canonical.as_deref(),
         is_executable,
     )?;
-    // A robot paired without account enrollment has no registration bundle.
-    // Its authenticated persistent trust is enough; never invent a login step.
-    let paired = crate::serving_login::saved_robot(&root).ok();
-    let paired = paired.map(|saved| Provisioned {
-        version: 1,
-        robot_id: saved.robot_id,
-        endpoint_id: saved.endpoint_id,
-        owner_account: saved.owner_account,
-    });
-    if let Some(provisioned) = paired {
-        let cli = if root
-            .join("robot-registration.json")
-            .try_exists()
-            .map_err(|error| error.to_string())?
-        {
-            match resolve_sibling("cerulion", &current, canonical.as_deref(), is_executable) {
-                Ok(cli) => Some(cli),
-                Err(error) => {
-                    tracing::warn!(error = %error, "claimed robot serves cached trust but its revocation fetch worker is unavailable");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        return serve(
-            &root,
-            &remoted,
-            cli,
-            provisioned,
-            running,
-            ownership,
-            refresh_facts,
-        );
-    }
-    let cli = resolve_sibling("cerulion", &current, canonical.as_deref(), is_executable)?;
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
     let mut registration = Command::new(&cli);
     registration
@@ -291,112 +241,35 @@ fn run(
     {
         return Err("robot state writer returned a different registered identity".into());
     }
-    serve(
-        &root,
-        &remoted,
-        Some(cli),
-        provisioned,
-        running,
-        ownership,
-        refresh_facts,
-    )
-}
-
-struct EndpointOwnership {
-    mirror: Arc<dyn crate::mirror::MirrorPlane>,
-    held: Arc<AtomicBool>,
-    stop_grace: Duration,
-}
-
-struct OwnedEndpoint<'a>(&'a EndpointOwnership);
-
-impl EndpointOwnership {
-    fn begin(&self, root: &Path) -> Result<OwnedEndpoint<'_>, String> {
-        let _fence =
-            crate::serving_hold::IdleFence::try_acquire(&crate::serving_hold::fence_path(root))
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "remote serving endpoint still has active work".to_owned())?;
-        self.held.store(true, Ordering::Release);
-        let lease = OwnedEndpoint(self);
-        // The guard restores ownership even if transfer or child spawn fails.
-        self.mirror.begin_serving()?;
-        Ok(lease)
-    }
-}
-
-impl Drop for OwnedEndpoint<'_> {
-    fn drop(&mut self) {
-        self.0.mirror.end_serving();
-        self.0.held.store(false, Ordering::Release);
-    }
-}
-
-fn serve(
-    root: &Path,
-    remoted: &Path,
-    cli: Option<PathBuf>,
-    provisioned: Provisioned,
-    running: &AtomicBool,
-    ownership: &EndpointOwnership,
-    refresh_facts: impl Fn(&str) -> Result<bool, String>,
-) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    if !running.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    let endpoint = ownership.begin(root)?;
     if !running.load(Ordering::SeqCst) {
         return Ok(());
     }
     let mut command = Command::new(remoted);
     command
         .arg("--state-root")
-        .arg(root)
+        .arg(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .process_group(0);
-    if std::env::var_os("CERULION_NETD_RELAY_DISABLED").is_some_and(|value| !value.is_empty()) {
-        command.arg("--relay-disabled");
-    }
-    let mut child = OwnedRemoted(
-        OwnedChild(
-            command
-                .spawn()
-                .map_err(|error| format!("starting robot server: {error}"))?,
-        ),
-        remoted_stop_grace(),
+        .stderr(Stdio::inherit());
+    let mut child = OwnedChild(
+        command
+            .spawn()
+            .map_err(|error| format!("starting robot server: {error}"))?,
     );
     tracing::info!(endpoint_id = %provisioned.endpoint_id, "registered robot server started");
-    if let Err(error) = ownership.mirror.serving_ready() {
-        // The mirror controller queues retirement for affected holders after a
-        // bounded migration failure. Keep the live ops plane and its e-stop latch.
-        tracing::warn!(error = %error, "remote outbound reader migration failed; robot ops plane remains available");
-    }
     let period = epoch_sync_period_from_env();
-    let mut epoch_sync = cli.map(|cli| {
-        EpochSync::new(
-            cli,
-            root.to_path_buf(),
-            period,
-            ownership.stop_grace,
-            Instant::now(),
-        )
-    });
+    let mut epoch_sync = EpochSync::new(cli, root.clone(), period, stop_grace, Instant::now());
     let result = supervise_server(
-        &mut child.0,
+        &mut child,
         &mut epoch_sync,
         running,
         &provisioned.endpoint_id,
         &refresh_facts,
     );
-    // Gracefully reap the child, then finish the revocation fetch before
-    // returning the shared endpoint and restoring outgoing reader pins.
+    // Dropping the server child kills and reaps it, so the robot stops serving
+    // before the wait for a running fetch.
     drop(child);
-    if let Some(sync) = epoch_sync.as_mut() {
-        sync.stop();
-    }
-    drop(endpoint);
+    epoch_sync.stop();
     result
 }
 
@@ -405,7 +278,7 @@ fn serve(
 /// the first [`FACT_REFRESH_WINDOW`].
 fn supervise_server(
     child: &mut OwnedChild,
-    epoch_sync: &mut Option<EpochSync>,
+    epoch_sync: &mut EpochSync,
     running: &AtomicBool,
     endpoint_id: &str,
     refresh_facts: &impl Fn(&str) -> Result<bool, String>,
@@ -418,9 +291,7 @@ fn supervise_server(
             return Err(format!("robot server exited ({status})"));
         }
         let now = Instant::now();
-        if let Some(sync) = epoch_sync.as_mut() {
-            sync.poll(now);
-        }
+        epoch_sync.poll(now);
         if !refresh_failed && now < refresh_deadline && now >= next_refresh {
             match refresh_facts(endpoint_id) {
                 Ok(true) => {
@@ -681,62 +552,6 @@ impl EpochSync {
 
 struct OwnedChild(Child);
 
-/// The remoted stop deadline, including a margin for its final log drain.
-pub fn remoted_stop_grace() -> Duration {
-    resolve_remoted_stop_grace(
-        std::env::var("CERULION_REMOTED_HARD_EXIT_MS")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn resolve_remoted_stop_grace(value: Option<&str>) -> Duration {
-    let deadline = value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|ms| *ms != 0)
-        .map_or(Duration::from_secs(30), Duration::from_millis);
-    deadline.saturating_add(Duration::from_millis(500))
-}
-
-struct OwnedRemoted(OwnedChild, Duration);
-
-impl Drop for OwnedRemoted {
-    fn drop(&mut self) {
-        stop_remoted(&mut self.0, self.1, send_sigterm);
-        // OwnedChild escalates only after the deadline, then reaps.
-    }
-}
-
-fn send_sigterm(pid: u32) -> io::Result<()> {
-    // Child ids are positive. Never turn an invalid id into a group signal.
-    let pid = i32::try_from(pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid owned child id"))?;
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(Into::into)
-}
-
-fn stop_remoted(
-    child: &mut OwnedChild,
-    grace: Duration,
-    signal: impl FnOnce(u32) -> io::Result<()>,
-) {
-    if matches!(child.0.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    let started = Instant::now();
-    if let Err(error) = signal(child.0.id()) {
-        tracing::error!(error = %error, "could not signal the owned remote server to stop gracefully; waiting within its stop deadline");
-    }
-    while started.elapsed() < grace {
-        if matches!(child.0.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        std::thread::sleep(POLL_INTERVAL.min(grace.saturating_sub(started.elapsed())));
-    }
-    tracing::error!("owned remote server exceeded its graceful stop deadline");
-}
-
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         if !matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -762,7 +577,7 @@ fn run_json<T: serde::de::DeserializeOwned>(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::inherit());
     let mut child = OwnedChild(
         command
             .spawn()
@@ -773,23 +588,6 @@ fn run_json<T: serde::de::DeserializeOwned>(
         .stdout
         .take()
         .ok_or_else(|| format!("{stage}: no result pipe"))?;
-    let stderr = child
-        .0
-        .stderr
-        .take()
-        .ok_or_else(|| format!("{stage}: no error pipe"))?;
-    let (error_sender, error_receiver) = mpsc::sync_channel(1);
-    let error_reader = std::thread::Builder::new()
-        .name("robot-bootstrap-error".into())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let result = stderr
-                .take(MAX_RESULT_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
-            let _ = error_sender.send(result);
-        })
-        .map_err(|error| format!("{stage} error reader: {error}"))?;
     let (sender, receiver) = mpsc::sync_channel(1);
     // Both child entry points are leaf workers. A concurrent bounded reader
     // prevents pipe backpressure; dropping/killing the owned child closes its EOF.
@@ -815,33 +613,14 @@ fn run_json<T: serde::de::DeserializeOwned>(
             .join()
             .map_err(|_| format!("{stage} result reader panicked"))?;
     }
-    let errors =
-        error_receiver.recv_timeout(pipe_deadline.saturating_duration_since(Instant::now()));
-    if errors.is_ok() {
-        error_reader
-            .join()
-            .map_err(|_| format!("{stage} error reader panicked"))?;
-    }
     let status = status?;
     let bytes = output
         .map_err(|_| format!("{stage} result did not close before the bootstrap deadline"))?
         .map_err(|error| format!("{stage} result: {error}"))?;
     if !status.success() {
-        let errors = errors
-            .map_err(|_| format!("{stage} error pipe did not close before the bootstrap deadline"))?
-            .map_err(|error| format!("{stage} error pipe: {error}"))?;
-        let reason: String = String::from_utf8_lossy(&errors)
-            .chars()
-            .take(4096)
-            .map(|character| {
-                if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect();
-        return Err(format!("{stage} exited ({status}): {}", reason.trim()));
+        return Err(format!(
+            "{stage} exited ({status}); see the child error above"
+        ));
     }
     if bytes.len() as u64 > MAX_RESULT_BYTES {
         return Err(format!("{stage} result exceeded the size limit"));

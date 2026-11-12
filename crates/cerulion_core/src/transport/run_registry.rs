@@ -339,11 +339,9 @@ const _: () = assert!(
 /// that does not open with this is not one of ours.
 const RUN_MAGIC: [u8; 2] = [0xCE, 0x81];
 
-/// Legacy public record version. Private records use version 2 with the same
-/// layout so legacy serving daemons refuse them instead of disclosing them.
+/// The record wire-format version. Bumped only on an incompatible
+/// record layout change; a mismatched version is rejected as malformed.
 const RUN_VERSION: u8 = 1;
-// Local-only records keep the same layout but old readers reject their version.
-const LOCAL_RUN_VERSION: u8 = 2;
 
 /// The fixed record header length — `magic(2) + version(1) +
 /// writer_id(8) + run_id(16) + supervisor_pid(4) + run_started_at_ns(8) +
@@ -439,9 +437,6 @@ impl std::fmt::Display for RunState {
 /// only by the gather's completeness gate, deliberately NOT surfaced here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
-    /// Durable producer visibility, carried in the registry before artifact reads.
-    /// Local readers still discover the run; remote readers must omit it entirely.
-    pub remote_visible: bool,
     /// The 128-bit run identity, minted once per `graph run` invocation. A
     /// restart mints a new one BY CONSTRUCTION, which is what makes "one bag =
     /// one run" checkable rather than promised.
@@ -515,7 +510,7 @@ impl std::fmt::Display for RunRecordError {
             RunRecordError::BadMagic => write!(f, "bad record magic (not a Cerulion run record)"),
             RunRecordError::BadVersion { found } => write!(
                 f,
-                "unsupported record version {found} (expected {RUN_VERSION} or {LOCAL_RUN_VERSION})"
+                "unsupported record version {found} (expected {RUN_VERSION})"
             ),
             RunRecordError::BadState { found } => {
                 write!(
@@ -566,11 +561,7 @@ pub fn encode_record(writer_id: u64, record: &RunRecord) -> Result<Vec<u8>, RunR
     let mut buf =
         Vec::with_capacity(RUN_HEADER_LEN + record.graph_name.len() + record.run_dir.len());
     buf.extend_from_slice(&RUN_MAGIC);
-    buf.push(if record.remote_visible {
-        RUN_VERSION
-    } else {
-        LOCAL_RUN_VERSION
-    });
+    buf.push(RUN_VERSION);
     buf.extend_from_slice(&writer_id.to_le_bytes());
     buf.extend_from_slice(&record.run_id.to_le_bytes());
     buf.extend_from_slice(&record.supervisor_pid.to_le_bytes());
@@ -600,7 +591,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<(u64, RunRecord), RunRecordError> {
     if bytes[0..2] != RUN_MAGIC {
         return Err(RunRecordError::BadMagic);
     }
-    if !matches!(bytes[OFF_VERSION], RUN_VERSION | LOCAL_RUN_VERSION) {
+    if bytes[OFF_VERSION] != RUN_VERSION {
         return Err(RunRecordError::BadVersion {
             found: bytes[OFF_VERSION],
         });
@@ -647,7 +638,6 @@ pub fn decode_record(bytes: &[u8]) -> Result<(u64, RunRecord), RunRecordError> {
     Ok((
         writer_id,
         RunRecord {
-            remote_visible: bytes[OFF_VERSION] == RUN_VERSION,
             run_id,
             supervisor_pid,
             run_started_at_ns,
@@ -2040,7 +2030,6 @@ mod tests {
     /// A hand-built record used across the codec oracles.
     fn sample() -> RunRecord {
         RunRecord {
-            remote_visible: true,
             run_id: 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210,
             supervisor_pid: 4711,
             run_started_at_ns: 1_753_000_000_000_000_000,
@@ -2080,23 +2069,6 @@ mod tests {
         let (got_writer, got) = decode_record(&bytes).expect("decodable");
         assert_eq!(got_writer, writer_id);
         assert_eq!(got, record);
-    }
-
-    #[test]
-    fn local_only_visibility_survives_registry_encoding_and_lifecycle_changes() {
-        let mut record = sample();
-        record.remote_visible = false;
-        for state in [RunState::Live, RunState::Ending] {
-            record.state = state;
-            for _ in 0..2 {
-                let bytes = encode_record(7, &record).unwrap();
-                assert_eq!(bytes[OFF_VERSION], 2);
-                let decoded = decode_record(&bytes).unwrap().1;
-                assert!(!decoded.remote_visible);
-                assert_eq!(decoded.state, state);
-            }
-        }
-        assert_eq!(encode_record(7, &sample()).unwrap()[OFF_VERSION], 1);
     }
 
     /// The `Ending` state round-trips as its OWN byte — a state flip must be
@@ -2156,11 +2128,11 @@ mod tests {
         assert_eq!(decode_record(&bad_magic), Err(RunRecordError::BadMagic));
 
         let mut bad_version = good.clone();
-        bad_version[OFF_VERSION] = LOCAL_RUN_VERSION + 1;
+        bad_version[OFF_VERSION] = RUN_VERSION + 1;
         assert_eq!(
             decode_record(&bad_version),
             Err(RunRecordError::BadVersion {
-                found: LOCAL_RUN_VERSION + 1
+                found: RUN_VERSION + 1
             })
         );
 
@@ -2629,7 +2601,6 @@ mod lifetime_tests {
             run_started_at_ns: 1_000,
         };
         let base = RunRecord {
-            remote_visible: true,
             run_id: 0x2222,
             supervisor_pid: 7,
             run_started_at_ns: 2_000,
@@ -2646,7 +2617,6 @@ mod lifetime_tests {
                 &own,
                 OWN_ID,
                 &RunRecord {
-                    remote_visible: true,
                     run_id: OWN_ID,
                     ..base.clone()
                 }

@@ -228,42 +228,6 @@ fn the_decision_agrees_with_every_row_under_every_spelling() {
 }
 
 #[test]
-fn selected_topic_reads_refuse_before_identity_and_conflict_with_local() {
-    for verb in ["echo", "hz", "info"] {
-        let matches = families::cli_command()
-            .try_get_matches_from(["cerulion", "topic", verb, "/camera", "--robot", "bench-arm"])
-            .unwrap();
-        let refusal = families::network_refusal(&matches, &SwitchEnv::network(Some("off")))
-            .expect("remote read refused before login");
-        assert_eq!(refusal.code(), 2);
-        assert!(refusal
-            .line()
-            .contains("reaches the robot over the network"));
-        let netd = SwitchEnv {
-            netd: Some("off".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            families::network_refusal(&matches, &netd).unwrap().code(),
-            2
-        );
-        let error = families::cli_command()
-            .try_get_matches_from([
-                "cerulion",
-                "topic",
-                verb,
-                "/camera",
-                "--robot",
-                "bench-arm",
-                "--local",
-            ])
-            .unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-        assert!(families::network_refusal(&matches, &SwitchEnv::default()).is_none());
-    }
-}
-
-#[test]
 fn viz_robot_also_refuses_under_the_daemon_switches() {
     let matches = parse(
         CASES

@@ -16,10 +16,6 @@
 //! `cerulion connect`'s `run_topic_reader` drives, so there is ONE validated re-inject
 //! implementation, never a fork).
 //!
-//! Canonical ingress and isolated observers share the desk endpoint. Observer
-//! injectors use `TopicKey::local_topic`, preserving the canonical topic in wire/2
-//! requests and reader bookkeeping while keeping a local producer's slot separate.
-//!
 //! # LAN parity: the injector is created SYNCHRONOUSLY (no phantom mirror)
 //!
 //! The zenoh plane's `register_ingress_topic` fails SYNCHRONOUSLY + loudly when the
@@ -76,7 +72,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cerulion_core::transport::cerulion_q::{
     CatalogReply, SchemaReply, CATALOG_WIRE_VERSION, SCHEMA_WIRE_VERSION,
@@ -103,7 +99,7 @@ pub use cerulion_wireclient::epoch::{EpochPushOutcome, EpochPushSeverity};
 use cerulion_wireclient::protocol::{
     decode_first_reply, is_unpaired_refusal, StreamPreamble, WireRequest, WireResponse,
 };
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
@@ -117,31 +113,6 @@ use crate::wan::{WanRegistry, WanRobot};
 /// loud rather than pin every other control op. Overridable via
 /// [`IrohMirrorPlane::with_dial_timeout`] (tests shorten it).
 pub const DEFAULT_WAN_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
-
-enum PlaneRuntime {
-    Owned(Runtime),
-    Shared(Handle),
-}
-
-impl PlaneRuntime {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        match self {
-            Self::Owned(runtime) => runtime.block_on(future),
-            Self::Shared(runtime) => runtime.block_on(future),
-        }
-    }
-
-    fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        match self {
-            Self::Owned(runtime) => runtime.spawn(future),
-            Self::Shared(runtime) => runtime.spawn(future),
-        }
-    }
-}
 
 /// TLS reachability of a registered endpoint, without requesting access or data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,26 +170,6 @@ struct RobotConn {
     control_poisoned: bool,
 }
 
-struct DemandGuard<'a> {
-    connection: &'a mut RobotConn,
-    completed: bool,
-}
-
-impl Drop for DemandGuard<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            // Cancellation can leave framed control or a new tap half consumed.
-            self.connection.control_poisoned = true;
-            self.connection
-                .connection
-                .close(0u32.into(), b"mirror demand cancelled");
-            for reader in self.connection.readers.values() {
-                reader.abort();
-            }
-        }
-    }
-}
-
 struct CatalogFailure {
     unpaired: bool,
     reason: String,
@@ -241,10 +192,8 @@ struct IrohState {
     /// lazily on the first `ensure_mirror`.
     endpoint: Option<Endpoint>,
     /// robot name → its live connection.
-    robots: HashMap<(String, bool), RobotConn>,
+    robots: HashMap<String, RobotConn>,
     account_invalidated: bool,
-    /// Shared endpoints belong to the serving host and must never be closed here.
-    shared_endpoint: bool,
 }
 
 /// The iroh WAN mirror plane. Owns the desk's iroh endpoint, the per-robot
@@ -258,7 +207,7 @@ pub struct IrohMirrorPlane {
     /// The WAN robot registry (dial params + the desk seed + relay posture).
     registry: Arc<WanRegistry>,
     /// The dedicated tokio runtime the async iroh world runs on.
-    rt: PlaneRuntime,
+    rt: Runtime,
     /// The lazy endpoint + per-robot connections.
     inner: Arc<AsyncMutex<IrohState>>,
     /// The bound on a dial + each control/stream await.
@@ -290,21 +239,9 @@ pub struct IrohMirrorPlane {
     /// reconnect. A plain `std` mutex (no `.await` is ever held across it) so the
     /// shared push substrate can consult it as a synchronous gate.
     missing_cache_noted: Arc<std::sync::Mutex<HashSet<String>>>,
-    shared_control: Option<crate::shared_endpoint::SharedMirrorPlane>,
 }
 
 impl IrohMirrorPlane {
-    #[cfg(test)]
-    pub(crate) fn poison_membership_cleanup_for_test(&self) {
-        let diagnostics = self.missing_cache_noted.clone();
-        assert!(std::thread::spawn(move || {
-            let _guard = diagnostics.lock().unwrap();
-            panic!("poison the retired-membership diagnostics lock");
-        })
-        .join()
-        .is_err());
-    }
-
     /// Build the iroh WAN plane over the desk's `manager` (its SHM mirror target) and
     /// `registry` (the WAN dial params). Builds the dedicated tokio runtime; binds NO
     /// iroh endpoint yet (the endpoint is lazy — bound on the first ensure).
@@ -319,18 +256,6 @@ impl IrohMirrorPlane {
             .thread_name("netd-iroh")
             .build()
             .map_err(|e| format!("failed to build the cerulion-netd iroh runtime: {e}"))?;
-        Ok(Self::from_runtime(
-            manager,
-            registry,
-            PlaneRuntime::Owned(rt),
-        ))
-    }
-
-    fn from_runtime(
-        manager: Arc<TransportManager>,
-        registry: Arc<WanRegistry>,
-        rt: PlaneRuntime,
-    ) -> Self {
         // Derive netd's OWN desk device key (the demander identity) from the
         // WAN registry's desk seed — the SAME ed25519 public half the endpoint's iroh
         // id would carry, computed here without binding the (lazy) endpoint so the
@@ -338,7 +263,7 @@ impl IrohMirrorPlane {
         let desk_key = DeviceIdentity::from_seed(&registry.desk_seed())
             .public_key()
             .0;
-        Self {
+        Ok(Self {
             manager,
             registry,
             rt,
@@ -346,154 +271,12 @@ impl IrohMirrorPlane {
                 endpoint: None,
                 robots: HashMap::new(),
                 account_invalidated: false,
-                shared_endpoint: false,
             })),
             dial_timeout: DEFAULT_WAN_DIAL_TIMEOUT,
             desk_key,
             authorizer: Arc::new(AllowAllAuthorizer),
             epoch_pushes: Arc::new(AsyncMutex::new(HashMap::new())),
             missing_cache_noted: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            shared_control: None,
-        }
-    }
-
-    /// Build directly on the owner's runtime without starting per-client
-    /// runtime threads. The endpoint must match the current device identity.
-    pub(crate) fn on_owned_endpoint(
-        manager: Arc<TransportManager>,
-        registry: Arc<WanRegistry>,
-        endpoint: Endpoint,
-        runtime: Handle,
-    ) -> Result<Self, String> {
-        let plane = Self::from_runtime(manager, registry, PlaneRuntime::Shared(runtime));
-        if endpoint.id().as_bytes() != &plane.desk_key || endpoint.is_closed() {
-            return Err("shared endpoint does not match the current live device key".into());
-        }
-        let mut state = plane
-            .inner
-            .try_lock()
-            .map_err(|_| "new shared plane is busy")?;
-        state.endpoint = Some(endpoint);
-        state.shared_endpoint = true;
-        drop(state);
-        Ok(plane)
-    }
-
-    /// Consume through the serving host's endpoint without binding another one.
-    /// The registry must carry the same device identity as the endpoint.
-    /// `runtime` is the endpoint owner's runtime and must outlive the endpoint.
-    pub fn with_endpoint(mut self, endpoint: Endpoint, runtime: Handle) -> Result<Self, String> {
-        if endpoint.id().as_bytes() != &self.desk_key {
-            return Err("shared endpoint does not match the current device key".into());
-        }
-        self.rt.block_on(async {
-            let mut state = self.inner.lock().await;
-            if state.endpoint.is_some() || !state.robots.is_empty() {
-                return Err::<(), String>(
-                    "shared endpoint must be installed before any outgoing operation".into(),
-                );
-            }
-            state.endpoint = Some(endpoint);
-            state.shared_endpoint = true;
-            Ok(())
-        })?;
-        // Iroh connection drivers must survive local control/mirror retirement.
-        // A separate mirror runtime would strand their endpoint close events.
-        self.rt = PlaneRuntime::Shared(runtime);
-        Ok(self)
-    }
-
-    /// Delegate outbound mirrors to the serving process's owned endpoint.
-    /// This constructor never binds an endpoint in the consumer process.
-    pub fn new_shared(
-        manager: Arc<TransportManager>,
-        registry: Arc<WanRegistry>,
-        socket: std::path::PathBuf,
-    ) -> Result<Self, String> {
-        let shared_control = crate::shared_endpoint::SharedMirrorPlane::new(
-            socket,
-            manager.clone(),
-            registry.clone(),
-        );
-        let mut plane = Self::new(manager, registry)?;
-        plane.shared_control = Some(shared_control);
-        Ok(plane)
-    }
-
-    pub(crate) fn registry_owner(
-        &self,
-        proof: Option<Arc<cerulion_pairing::verify::OwnerCertificatePresentationWire>>,
-    ) -> Result<(), String> {
-        self.registry.replace_owner_certificate(proof)
-    }
-
-    /// Consume a persistent shared-control transport loss for registry retirement.
-    pub(crate) fn take_shared_transport_loss(&self) -> bool {
-        self.shared_control
-            .as_ref()
-            .is_some_and(|control| control.take_transport_loss())
-    }
-
-    pub(crate) fn shares_owned_endpoint(&self) -> bool {
-        self.shared_control.is_some()
-    }
-
-    pub(crate) fn synchronize_shared_endpoint(&self) -> Result<Vec<TopicKey>, String> {
-        self.synchronize_shared_endpoint_until(
-            Instant::now() + crate::shared_endpoint::CONTROL_TIMEOUT,
-        )
-    }
-
-    pub(crate) fn synchronize_shared_endpoint_until(
-        &self,
-        deadline: Instant,
-    ) -> Result<Vec<TopicKey>, String> {
-        self.shared_control
-            .as_ref()
-            .ok_or_else(|| "mirror plane does not share an owned endpoint".to_owned())?
-            .sync_until(deadline)
-    }
-
-    pub(crate) fn ensure_shared_mirror_until(
-        &self,
-        key: &TopicKey,
-        schema_hash: u64,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let control = self
-            .shared_control
-            .as_ref()
-            .ok_or_else(|| "mirror plane does not share an owned endpoint".to_owned())?;
-        if let DemandDecision::Deny { reason } = self.authorizer.authorize_demand(
-            &DemandSubject::Wan {
-                demander_key: self.desk_key,
-            },
-            &key.topic,
-        ) {
-            return Err(reason.to_string());
-        }
-        control.ensure_until(key, schema_hash, deadline)
-    }
-
-    pub(crate) fn ensure_mirror_until(
-        &self,
-        key: &TopicKey,
-        schema_hash: u64,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        if self.shares_owned_endpoint() {
-            return self.ensure_shared_mirror_until(key, schema_hash, deadline);
-        }
-        if Instant::now() >= deadline {
-            return Err("WAN mirror restoration deadline expired".into());
-        }
-        self.rt.block_on(async {
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                self.ensure_async(key, schema_hash),
-            )
-            .await
-            .map_err(|_| "WAN mirror restoration deadline expired".to_owned())?
         })
     }
 
@@ -520,13 +303,6 @@ impl IrohMirrorPlane {
     /// Account/key changes require a new plane and registry. The caller must also
     /// retire its mirror bookkeeping before installing that replacement.
     pub fn invalidate_account(&self) -> Result<(), String> {
-        if let Some(control) = &self.shared_control {
-            let cleanup_result = control.invalidate();
-            return self
-                .registry
-                .replace_owner_certificate(None)
-                .and(cleanup_result);
-        }
         let proof_result = self.registry.replace_owner_certificate(None);
         let cleanup_result = self.rt.block_on(async {
             let mut state = self.inner.lock().await;
@@ -539,20 +315,13 @@ impl IrohMirrorPlane {
                 for (topic, reader) in connection.readers {
                     reader.abort();
                     let _ = reader.await;
-                    retired.push(if robot.1 {
-                        TopicKey::observed(&robot.0, &topic)
-                    } else {
-                        TopicKey::new(&robot.0, &topic)
-                    });
+                    retired.push(TopicKey::new(&robot, &topic));
                 }
             }
             retired.sort();
             let mut cleanup_error = None;
             for key in retired {
-                if let Err(error) = self
-                    .manager
-                    .unregister_mirror_provenance(&key.local_topic())
-                {
+                if let Err(error) = self.manager.unregister_mirror_provenance(&key.topic) {
                     cleanup_error.get_or_insert_with(|| {
                         format!("could not remove retired WAN mirror provenance: {error}")
                     });
@@ -568,9 +337,7 @@ impl IrohMirrorPlane {
                 }
             }
             if let Some(endpoint) = state.endpoint.take() {
-                if !state.shared_endpoint {
-                    endpoint.close().await;
-                }
+                endpoint.close().await;
             }
             cleanup_error.map_or(Ok(()), Err)
         });
@@ -588,10 +355,6 @@ impl IrohMirrorPlane {
         &self,
         robots: HashMap<String, WanRobot>,
     ) -> Result<Vec<TopicKey>, String> {
-        if self.shares_owned_endpoint() {
-            self.registry.replace_membership(robots)?;
-            return self.synchronize_shared_endpoint();
-        }
         if robots
             .keys()
             .any(|robot| robot.is_empty() || robot.trim() != robot)
@@ -608,36 +371,27 @@ impl IrohMirrorPlane {
             let previous = self.registry.membership_snapshot()?;
             let mut changed: Vec<_> = previous
                 .iter()
-                .filter(|(robot, peer)| robots.get(*robot).is_none_or(|next| next.eid != peer.eid))
+                .filter(|(robot, peer)| robots.get(*robot) != Some(*peer))
                 .map(|(robot, _)| robot.clone())
                 .collect();
             changed.sort();
             let mut retired = Vec::new();
             for robot in &changed {
-                for observer in [false, true] {
-                    if let Some(connection) = state.robots.remove(&(robot.clone(), observer)) {
-                        connection
-                            .connection
-                            .close(0u32.into(), b"robot membership changed");
-                        for (topic, reader) in connection.readers {
-                            reader.abort();
-                            let _ = reader.await;
-                            retired.push(if observer {
-                                TopicKey::observed(robot, &topic)
-                            } else {
-                                TopicKey::new(robot, &topic)
-                            });
-                        }
+                if let Some(connection) = state.robots.remove(robot) {
+                    connection
+                        .connection
+                        .close(0u32.into(), b"robot membership changed");
+                    for (topic, reader) in connection.readers {
+                        reader.abort();
+                        let _ = reader.await;
+                        retired.push(TopicKey::new(robot, &topic));
                     }
                 }
             }
             retired.sort();
             let mut cleanup_error = None;
             for key in &retired {
-                if let Err(error) = self
-                    .manager
-                    .unregister_mirror_provenance(&key.local_topic())
-                {
+                if let Err(error) = self.manager.unregister_mirror_provenance(&key.topic) {
                     cleanup_error.get_or_insert_with(|| {
                         format!("could not remove retired WAN mirror provenance: {error}")
                     });
@@ -676,9 +430,6 @@ impl IrohMirrorPlane {
     /// Check TLS reachability only. No control request, enrollment or demand is
     /// sent. The total budget includes waiting for the plane and endpoint setup.
     pub fn probe_robot(&self, robot: &str, timeout: Duration) -> Result<RobotProbeOutcome, String> {
-        if let Some(control) = &self.shared_control {
-            return control.probe(robot, timeout);
-        }
         self.rt.block_on(async {
             match tokio::time::timeout(timeout, async {
                 let mut state = self.inner.lock().await;
@@ -719,62 +470,19 @@ impl IrohMirrorPlane {
     /// The total budget covers every phase, including waiting for the plane.
     /// Active topic readers keep their existing connection.
     pub fn query_catalog(&self, robot: &str, timeout: Duration) -> Result<CatalogReply, String> {
-        self.query_catalog_with_path(robot, timeout)
-            .map(|(catalog, _, _)| catalog)
-    }
-
-    /// Authorized catalog and the selected path that actually carried its reply.
-    pub fn query_catalog_with_path(
-        &self,
-        robot: &str,
-        timeout: Duration,
-    ) -> Result<
-        (
-            CatalogReply,
-            crate::account_access::RobotPath,
-            Option<std::net::SocketAddr>,
-        ),
-        String,
-    > {
-        if let Some(control) = &self.shared_control {
-            return control.catalog(robot, timeout);
-        }
         self.rt.block_on(async {
             tokio::time::timeout(timeout, async {
                 let mut state = self.inner.lock().await;
                 let endpoint = self.query_endpoint(&mut state).await?;
-                drop(state);
                 let mut connection = self.dial_robot(&endpoint, robot).await?;
                 let _close = CloseOnDrop::new(&connection.connection);
-                let catalog = self
-                    .fetch_catalog(
-                        &mut connection.control_send,
-                        &mut connection.control_recv,
-                        robot,
-                    )
-                    .await
-                    .map_err(|failure| failure.reason)?;
-                // Reachability and the persisted direct route must describe the
-                // same authenticated path snapshot, even while iroh migrates.
-                let paths = connection.connection.paths();
-                let (path, direct) = paths.iter().find(|path| path.is_selected()).map_or(
-                    (crate::account_access::RobotPath::Unknown, None),
-                    |path| {
-                        let route = if path.is_ip() {
-                            crate::account_access::RobotPath::Direct
-                        } else if path.is_relay() {
-                            crate::account_access::RobotPath::Relayed
-                        } else {
-                            crate::account_access::RobotPath::Unknown
-                        };
-                        let direct = match path.remote_addr() {
-                            cerulion_link::TransportAddr::Ip(address) => Some(*address),
-                            _ => None,
-                        };
-                        (route, direct)
-                    },
-                );
-                Ok((catalog, path, direct))
+                self.fetch_catalog(
+                    &mut connection.control_send,
+                    &mut connection.control_recv,
+                    robot,
+                )
+                .await
+                .map_err(|failure| failure.reason)
             })
             .await
             .map_err(|_| "robot catalog query exceeded its time budget".to_owned())?
@@ -790,9 +498,6 @@ impl IrohMirrorPlane {
         topic: &str,
         timeout: Duration,
     ) -> Result<SchemaReply, String> {
-        if let Some(control) = &self.shared_control {
-            return control.schema(robot, topic, timeout);
-        }
         self.rt.block_on(async {
             tokio::time::timeout(timeout, async {
                 let mut state = self.inner.lock().await;
@@ -1345,7 +1050,6 @@ impl IrohMirrorPlane {
             .robot_round_trip(
                 robot_conn,
                 &WireRequest::Demand {
-                    graph_ingress: !key.observer,
                     topic: key.topic.clone(),
                 },
             )
@@ -1424,7 +1128,7 @@ impl IrohMirrorPlane {
         //    the daemon never commits refcount+presence on a phantom mirror.
         //    The injector's existence IS the mirror's readiness.
         let injector = match self.manager.create_remote_ingress_injector(
-            &key.local_topic(),
+            &key.topic,
             schema_hash,
             MIRROR_MAX_SLICE_LEN,
         ) {
@@ -1455,7 +1159,7 @@ impl IrohMirrorPlane {
         //    only loses origin attribution; the required marker keeps it REMOTE).
         if let Err(e) = self
             .manager
-            .register_mirror_provenance(&key.local_topic(), &key.robot)
+            .register_mirror_provenance(&key.topic, &key.robot)
         {
             tracing::warn!(
                 robot = %key.robot, topic = %key.topic, error = %e,
@@ -1474,7 +1178,6 @@ impl IrohMirrorPlane {
             self.manager.clone(),
             key.robot.clone(),
             key.topic.clone(),
-            key.observer,
         ));
         robot_conn.readers.insert(key.topic.clone(), handle);
         tracing::info!(
@@ -1559,15 +1262,14 @@ impl IrohMirrorPlane {
         // desynced its framing — re-dial a fresh one).
         if st
             .robots
-            .get(&(key.robot.clone(), key.observer))
+            .get(&key.robot)
             .is_some_and(|rc| rc.control_poisoned)
         {
             tracing::warn!(
                 robot = %key.robot,
                 "cerulion-netd: dropping a poisoned iroh connection before re-dial"
             );
-            self.retire_robot_connection(&mut st, &key.robot, Some(key.observer))
-                .await?;
+            self.retire_robot_connection(&mut st, &key.robot).await?;
         }
 
         // Endpoint is Clone (Arc-backed); clone it out so the borrow of `st.endpoint`
@@ -1580,34 +1282,25 @@ impl IrohMirrorPlane {
                 e
             }
         };
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            st.robots.entry((key.robot.clone(), key.observer))
-        {
+        if !st.robots.contains_key(&key.robot) {
             let robot_conn = self.dial_robot(&endpoint, &key.robot).await?;
-            entry.insert(robot_conn);
+            st.robots.insert(key.robot.clone(), robot_conn);
         }
 
         let result = {
             let robot_conn = st
                 .robots
-                .get_mut(&(key.robot.clone(), key.observer))
+                .get_mut(&key.robot)
                 .expect("robot connection just inserted / already present");
-            let mut guard = DemandGuard {
-                connection: robot_conn,
-                completed: false,
-            };
-            let result = self.demand_topic(guard.connection, key, schema_hash).await;
-            guard.completed = true;
-            result
+            self.demand_topic(robot_conn, key, schema_hash).await
         };
         if result.is_err() {
             // A failed demand must leave NO orphaned connection: drop it when it is
             // poisoned (control desync) OR now-readerless (nothing to keep alive), so
             // the next demand re-dials cleanly rather than reusing a broken conn.
-            if let Some(rc) = st.robots.get(&(key.robot.clone(), key.observer)) {
+            if let Some(rc) = st.robots.get(&key.robot) {
                 if rc.control_poisoned || rc.readers.is_empty() {
-                    self.retire_robot_connection(&mut st, &key.robot, Some(key.observer))
-                        .await?;
+                    self.retire_robot_connection(&mut st, &key.robot).await?;
                 }
             }
         } else {
@@ -1650,9 +1343,6 @@ impl IrohMirrorPlane {
     /// Check a pinned demand without waiting behind another WAN operation.
     /// A busy state is an error, never evidence that its reader is absent.
     pub fn has_reader(&self, key: &TopicKey) -> Result<bool, String> {
-        if let Some(control) = &self.shared_control {
-            return control.has_reader(key);
-        }
         let state = self
             .inner
             .try_lock()
@@ -1660,17 +1350,14 @@ impl IrohMirrorPlane {
         if state.account_invalidated {
             return Err("WAN account changed; recreate the account plane before dialing".into());
         }
-        Ok(state
-            .robots
-            .get(&(key.robot.clone(), key.observer))
-            .is_some_and(|connection| {
-                !connection.control_poisoned
-                    && connection.connection.close_reason().is_none()
-                    && connection
-                        .readers
-                        .get(&key.topic)
-                        .is_some_and(|reader| !reader.is_finished())
-            }))
+        Ok(state.robots.get(&key.robot).is_some_and(|connection| {
+            !connection.control_poisoned
+                && connection.connection.close_reason().is_none()
+                && connection
+                    .readers
+                    .get(&key.topic)
+                    .is_some_and(|reader| !reader.is_finished())
+        }))
     }
 
     /// Retire one robot's current readers while preserving account membership.
@@ -1680,15 +1367,12 @@ impl IrohMirrorPlane {
     /// remain live. On cleanup failure, invalidate the whole account plane before
     /// creating a replacement; partial teardown cannot be rolled back.
     pub fn retire_robot(&self, robot: &str) -> Result<(), String> {
-        if let Some(control) = &self.shared_control {
-            return control.retire(robot);
-        }
         if robot.is_empty() || robot.trim() != robot {
             return Err("WAN retirement requires a nonempty canonical identifier".into());
         }
         self.rt.block_on(async {
             let mut state = self.inner.lock().await;
-            self.retire_robot_connection(&mut state, robot, None).await
+            self.retire_robot_connection(&mut state, robot).await
         })
     }
 
@@ -1699,35 +1383,21 @@ impl IrohMirrorPlane {
         &self,
         state: &mut IrohState,
         robot: &str,
-        only_observer: Option<bool>,
     ) -> Result<(), String> {
         let mut cleanup_error = None;
-        for observer in [false, true] {
-            if only_observer.is_some_and(|mode| mode != observer) {
-                continue;
-            }
-            if let Some(connection) = state.robots.remove(&(robot.into(), observer)) {
-                connection
-                    .connection
-                    .close(0u32.into(), b"robot connection retired");
-                let mut readers: Vec<_> = connection.readers.into_iter().collect();
-                readers.sort_by(|a, b| a.0.cmp(&b.0));
-                for (topic, reader) in readers {
-                    reader.abort();
-                    let _ = reader.await;
-                    let key = if observer {
-                        TopicKey::observed(robot, &topic)
-                    } else {
-                        TopicKey::new(robot, &topic)
-                    };
-                    if let Err(error) = self
-                        .manager
-                        .unregister_mirror_provenance(&key.local_topic())
-                    {
-                        cleanup_error.get_or_insert_with(|| {
-                            format!("could not remove retired WAN mirror provenance: {error}")
-                        });
-                    }
+        if let Some(connection) = state.robots.remove(robot) {
+            connection
+                .connection
+                .close(0u32.into(), b"robot connection retired");
+            let mut readers: Vec<_> = connection.readers.into_iter().collect();
+            readers.sort_by(|a, b| a.0.cmp(&b.0));
+            for (topic, reader) in readers {
+                reader.abort();
+                let _ = reader.await;
+                if let Err(error) = self.manager.unregister_mirror_provenance(&topic) {
+                    cleanup_error.get_or_insert_with(|| {
+                        format!("could not remove retired WAN mirror provenance: {error}")
+                    });
                 }
             }
         }
@@ -1758,27 +1428,19 @@ impl IrohMirrorPlane {
     /// The async body of `release_mirror`: abort the topic's reader (releasing its SHM
     /// slot), `Undemand` it on the robot, and drop the whole connection when the robot
     /// has no more demanded topics. Best-effort C0 provenance cleanup. Returns
-    /// [`MirrorRelease::Retired`] when removed or already absent. A missing reader
-    /// owns no local mirror; a shared release still refuses uncertain cleanup.
+    /// [`MirrorRelease::Retired`] on a genuine teardown, [`MirrorRelease::Lingering`]
+    /// only when the connection is unexpectedly missing (nothing to retire cleanly).
     async fn release_async(&self, key: &TopicKey) -> MirrorRelease {
         let mut st = self.inner.lock().await;
-        if !st.robots.contains_key(&(key.robot.clone(), key.observer)) {
+        if !st.robots.contains_key(&key.robot) {
             drop(st);
-            tracing::debug!(
+            tracing::error!(
                 robot = %key.robot,
                 topic = %key.topic,
-                "iroh reader already retired: no live robot connection"
+                "cerulion-netd: iroh release for a robot with no live WAN connection — the mirror \
+                 bridge state is inconsistent; LINGERING (reclaimed at idle self-exit)"
             );
-            return MirrorRelease::Retired;
-        }
-
-        if !st
-            .robots
-            .get(&(key.robot.clone(), key.observer))
-            .is_some_and(|connection| connection.readers.contains_key(&key.topic))
-        {
-            tracing::debug!(robot = %key.robot, topic = %key.topic, "iroh reader already retired: topic absent on live connection");
-            return MirrorRelease::Retired;
+            return MirrorRelease::Lingering;
         }
 
         // 1. Remove the reader from the map FIRST (so the reader task's death handler,
@@ -1786,7 +1448,7 @@ impl IrohMirrorPlane {
         //    Drop RUNS before we return (the SHM mirror slot is genuinely freed).
         let handle = st
             .robots
-            .get_mut(&(key.robot.clone(), key.observer))
+            .get_mut(&key.robot)
             .and_then(|rc| rc.readers.remove(&key.topic));
         if let Some(h) = handle {
             h.abort();
@@ -1797,7 +1459,7 @@ impl IrohMirrorPlane {
         //    when this robot has no more demanded topics.
         let robot_conn = st
             .robots
-            .get_mut(&(key.robot.clone(), key.observer))
+            .get_mut(&key.robot)
             .expect("connection present (checked above)");
         if let Err(e) = self.undemand_topic(robot_conn, &key.topic).await {
             tracing::warn!(
@@ -1808,7 +1470,7 @@ impl IrohMirrorPlane {
         }
         if robot_conn.readers.is_empty() {
             let _ = robot_conn.control_send.finish();
-            st.robots.remove(&(key.robot.clone(), key.observer));
+            st.robots.remove(&key.robot);
             tracing::info!(
                 robot = %key.robot,
                 "cerulion-netd: iroh WAN connection closed (no more demanded topics)"
@@ -1818,10 +1480,7 @@ impl IrohMirrorPlane {
         //    torn-down mirror into REMOTE. Keep ownership until cleanup finishes:
         //    a replacement may register the same topic after this guard drops.
         finish_retirement(st, || {
-            if let Err(e) = self
-                .manager
-                .unregister_mirror_provenance(&key.local_topic())
-            {
+            if let Err(e) = self.manager.unregister_mirror_provenance(&key.topic) {
                 tracing::warn!(
                     robot = %key.robot, topic = %key.topic, error = %e,
                     "cerulion-netd: iroh mirror torn down but could not remove its provenance"
@@ -1837,18 +1496,6 @@ impl IrohMirrorPlane {
     }
 }
 
-impl Drop for IrohMirrorPlane {
-    fn drop(&mut self) {
-        // Owned runtime drop aborts its tasks. Shared handles do not: explicitly
-        // retire readers so their injection slots cannot outlive this plane.
-        if self.shares_owned_endpoint() || matches!(&self.rt, PlaneRuntime::Shared(_)) {
-            if let Err(error) = self.invalidate_account() {
-                tracing::warn!(error = %error, "outbound mirror shutdown could not acknowledge retirement");
-            }
-        }
-    }
-}
-
 /// The supervising per-topic reader: drive the SHARED validated re-inject primitive
 /// ([`IngressInjector::reinject_raw`]) until the uni stream ends, then — ONLY on a
 /// natural exit (a release-abort cancels this future before this point) — fire the
@@ -1860,7 +1507,6 @@ async fn run_reinject_reader(
     manager: Arc<TransportManager>,
     robot: String,
     topic: String,
-    observer: bool,
 ) {
     loop {
         let frame = match read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN).await {
@@ -1885,7 +1531,7 @@ async fn run_reinject_reader(
     // this point. So this is an UNEXPECTED reader death. Free the SHM slot first, then
     // tear down the plane's state for this topic.
     drop(injector);
-    on_reader_death(inner, manager, robot, topic, observer).await;
+    on_reader_death(inner, manager, robot, topic).await;
 }
 
 /// Tear down the plane's state after an UNEXPECTED reader death (robot disconnect /
@@ -1898,13 +1544,12 @@ async fn on_reader_death(
     manager: Arc<TransportManager>,
     robot: String,
     topic: String,
-    observer: bool,
 ) {
     let Some(inner) = inner.upgrade() else {
         return; // the plane was dropped — nothing to tear down.
     };
     let mut st = inner.lock().await;
-    let Some(rc) = st.robots.get_mut(&(robot.clone(), observer)) else {
+    let Some(rc) = st.robots.get_mut(&robot) else {
         return;
     };
     // If release already removed this reader (the intentional-teardown race), no-op.
@@ -1919,14 +1564,10 @@ async fn on_reader_death(
          (the daemon registry is not healed automatically)"
     );
     if rc.readers.is_empty() {
-        st.robots.remove(&(robot.clone(), observer)); // drop closes the QUIC connection.
+        st.robots.remove(&robot); // drop closes the QUIC connection.
     }
     finish_retirement(st, || {
-        if let Err(e) = manager.unregister_mirror_provenance(&if observer {
-            TopicKey::observed(&robot, &topic).local_topic()
-        } else {
-            topic.clone()
-        }) {
+        if let Err(e) = manager.unregister_mirror_provenance(&topic) {
             tracing::warn!(
                 robot = %robot, topic = %topic, error = %e,
                 "cerulion-netd: could not remove provenance after an iroh reader death"
@@ -1947,10 +1588,6 @@ fn finish_retirement(state: tokio::sync::MutexGuard<'_, IrohState>, cleanup: imp
 mod cleanup_tests;
 
 impl MirrorPlane for IrohMirrorPlane {
-    fn local_channel(&self, key: &TopicKey) -> String {
-        key.local_topic()
-    }
-
     /// This plane has exactly one transport, so every key it serves crossed the
     /// internet plane.
     fn serving_plane(&self, _key: &TopicKey) -> Option<crate::protocol::ServingPlane> {
@@ -1958,18 +1595,6 @@ impl MirrorPlane for IrohMirrorPlane {
     }
 
     fn ensure_mirror(&self, key: &TopicKey, schema_hash: u64) -> Result<(), MirrorError> {
-        if self.shares_owned_endpoint() {
-            return self
-                .ensure_mirror_until(
-                    key,
-                    schema_hash,
-                    Instant::now() + crate::shared_endpoint::CONTROL_TIMEOUT,
-                )
-                .map_err(|reason| MirrorError::Iroh {
-                    key: key.clone(),
-                    reason,
-                });
-        }
         self.rt
             .block_on(self.ensure_async(key, schema_hash))
             .map_err(|reason| MirrorError::Iroh {
@@ -1979,9 +1604,6 @@ impl MirrorPlane for IrohMirrorPlane {
     }
 
     fn release_mirror(&self, key: &TopicKey) -> MirrorRelease {
-        if let Some(control) = &self.shared_control {
-            return control.release(key);
-        }
         self.rt.block_on(self.release_async(key))
     }
 }

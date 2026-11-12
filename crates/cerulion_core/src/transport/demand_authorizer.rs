@@ -256,8 +256,8 @@ pub const LAN_ACCESS_ENV: &str = "CERULION_LAN_ACCESS";
 ///
 /// The LAN plane carries no paired identity, so the choice is binary: serve every
 /// LAN peer ([`LanAccess::Open`]) or refuse them all and leave topic access to the
-/// paired remote plane ([`LanAccess::Paired`]). Every platform defaults to
-/// `Paired`; open LAN access requires an explicit selection.
+/// paired remote plane ([`LanAccess::Paired`]). Android devices default to
+/// `Paired`; every other platform defaults to `Open`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LanAccess {
@@ -269,9 +269,13 @@ pub enum LanAccess {
 }
 
 impl LanAccess {
-    /// The posture used when nothing selects one: `Paired` on every platform.
+    /// The posture used when nothing selects one: `Paired` on Android, else `Open`.
     pub const fn platform_default() -> Self {
-        LanAccess::Paired
+        if cfg!(target_os = "android") {
+            LanAccess::Paired
+        } else {
+            LanAccess::Open
+        }
     }
 
     /// Parse a posture value. An unset, empty or whitespace-only value selects
@@ -341,7 +345,6 @@ pub struct LanAccessAuthorizer {
     access: LanAccess,
     inner: std::sync::Arc<dyn DemandAuthorizer>,
     refusals: LanRefusalLatches,
-    run_scope: Option<std::sync::Weak<super::TransportManager>>,
 }
 
 impl LanAccessAuthorizer {
@@ -351,16 +354,7 @@ impl LanAccessAuthorizer {
             access,
             inner,
             refusals: LanRefusalLatches::default(),
-            run_scope: None,
         }
-    }
-
-    pub(crate) fn with_run_scope(
-        mut self,
-        scope: Option<std::sync::Weak<super::TransportManager>>,
-    ) -> Self {
-        self.run_scope = scope;
-        self
     }
 
     /// The posture this authorizer applies.
@@ -371,20 +365,6 @@ impl LanAccessAuthorizer {
 
 impl DemandAuthorizer for LanAccessAuthorizer {
     fn authorize_demand(&self, subject: &DemandSubject, topic: &str) -> DemandDecision {
-        // Synthetic catalog/schema resources are gated separately; concrete topics
-        // must also satisfy their producer's policy, whatever peer authorizer is installed.
-        if topic.starts_with('/') {
-            if let Some(scope) = &self.run_scope {
-                if !scope
-                    .upgrade()
-                    .is_some_and(|manager| manager.remote_topic_allowed(topic).unwrap_or(false))
-                {
-                    return DemandDecision::deny(
-                        "the producing run excludes this topic from network egress",
-                    );
-                }
-            }
-        }
         match (self.access, subject) {
             // hot-path-alloc-ok: a refused demand is a control-plane reply, never the
             // per-frame publish/receive path.
@@ -524,14 +504,18 @@ mod tests {
     }
 
     #[test]
-    fn lan_access_parses_both_postures_and_defaults_to_paired() {
+    fn lan_access_parses_both_postures_and_defaults_per_platform() {
         assert_eq!(LanAccess::parse(Some("open")), Ok(LanAccess::Open));
         assert_eq!(LanAccess::parse(Some(" PAIRED ")), Ok(LanAccess::Paired));
         assert_eq!(LanAccess::parse(Some("Open")), Ok(LanAccess::Open));
-        assert_eq!(LanAccess::parse(None), Ok(LanAccess::Paired));
-        assert_eq!(LanAccess::parse(Some("")), Ok(LanAccess::Paired));
-        assert_eq!(LanAccess::parse(Some("  ")), Ok(LanAccess::Paired));
-        assert_eq!(LanAccess::platform_default(), LanAccess::Paired);
+        let expected = if cfg!(target_os = "android") {
+            LanAccess::Paired
+        } else {
+            LanAccess::Open
+        };
+        assert_eq!(LanAccess::parse(None), Ok(expected));
+        assert_eq!(LanAccess::parse(Some("  ")), Ok(expected));
+        assert_eq!(LanAccess::platform_default(), expected);
         assert_eq!(LanAccess::Open.as_str(), "open");
         assert_eq!(LanAccess::Paired.as_str(), "paired");
     }
@@ -544,10 +528,10 @@ mod tests {
     }
 
     #[test]
-    fn lan_access_from_env_result_refuses_unpaired_access_when_unset() {
+    fn lan_access_from_env_result_uses_the_platform_default_when_unset() {
         assert_eq!(
             LanAccess::from_env_result(Err(std::env::VarError::NotPresent)),
-            LanAccess::Paired
+            LanAccess::platform_default()
         );
     }
 

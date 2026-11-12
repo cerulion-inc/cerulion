@@ -65,7 +65,6 @@ const CATALOG_PEEK_BUDGET: Duration = Duration::from_millis(750);
 /// [`Self::stop`] to also wait for the teardown: it joins the drain thread,
 /// so the SHM slot is released before it returns, and it reaps the writer.
 struct DemandedTopic {
-    graph_ingress: bool,
     channel: Arc<ForwardChannel>,
     drain: Option<JoinHandle<()>>,
     writer: task::JoinHandle<()>,
@@ -162,39 +161,8 @@ impl TapManager {
         connection: &Connection,
         topic: &str,
     ) -> Result<(), WireError> {
-        self.demand_with_qos(manager, connection, topic, None, false)
-            .await
-    }
-
-    /// Demand with the producer's resolved queue policy. A graph policy is
-    /// authoritative for imports; observers retain their best-effort queue.
-    pub async fn demand_with_qos(
-        &mut self,
-        manager: &Arc<TransportManager>,
-        connection: &Connection,
-        topic: &str,
-        qos: Option<&cerulion_core::EgressQos>,
-        graph_ingress: bool,
-    ) -> Result<(), WireError> {
-        if graph_ingress
-            && qos.is_some_and(|qos| {
-                qos.topic != topic || qos.reliability != cerulion_core::EgressReliability::Reliable
-            })
-        {
-            return Err(WireError::DemandFailed {
-                topic: topic.to_owned(),
-                reason: "authenticated wire ingress requires a matching reliable producer policy"
-                    .into(),
-            });
-        }
         if let Some(existing) = self.demanded.get(topic) {
             if existing.is_alive() {
-                if existing.graph_ingress != graph_ingress {
-                    return Err(WireError::DemandFailed {
-                        topic: topic.to_owned(),
-                        reason: "cannot change a retained stream's graph import mode".into(),
-                    });
-                }
                 return Ok(()); // idempotent: already tapped + streaming
             }
             // The topic's forward stream DIED (writer error). Reap the
@@ -214,35 +182,13 @@ impl TapManager {
         // Attach the listener-less tap (opens ONLY the data service; NEVER
         // creates it). A missing topic / exhausted introspection slot surfaces
         // here with an actionable message naming the topic.
-        crate::wire::wire_servable(manager, topic).map_err(|refusal| WireError::DemandFailed {
-            topic: topic.to_owned(),
-            reason: refusal.message(topic),
-        })?;
-        let tap = manager
-            .create_remote_data_only_subscriber(topic)
-            .map_err(|e| WireError::DemandFailed {
-                topic: topic.to_string(),
-                reason: e.to_string(),
-            })?;
-
-        // Principle #4: declared imports need a service that prevents a second
-        // writer joining after admission. Keep policy-unknown raw compatibility.
-        if graph_ingress
-            && (tap.publisher_count() != 1 || (qos.is_some() && tap.max_publishers() != 1))
-        {
-            return Err(WireError::DemandFailed {
-                topic: topic.to_owned(),
-                reason: "authenticated graph ingress requires exactly one live producer".into(),
-            });
-        }
-        let channel = Arc::new(if graph_ingress {
-            ForwardChannel::reliable(qos.and_then(|qos| qos.send_queue).unwrap_or_else(|| {
-                std::num::NonZeroUsize::new(tap.buffer_size())
-                    .expect("a live tap has a nonzero queue")
-            }))
-        } else {
-            ForwardChannel::new()
-        });
+        let tap =
+            manager
+                .create_data_only_subscriber(topic)
+                .map_err(|e| WireError::DemandFailed {
+                    topic: topic.to_string(),
+                    reason: e.to_string(),
+                })?;
 
         // Open the per-topic uni data stream (robot → desk) and lead it with a
         // JSON preamble naming the topic, so the desk correlates stream ↔ topic.
@@ -265,6 +211,7 @@ impl TapManager {
             })?;
 
         // Spawn the two halves bridged by the bounded drop-to-live channel.
+        let channel = Arc::new(ForwardChannel::new());
         let drain_channel = channel.clone();
         let drain_topic = topic.to_string();
         let drain = std::thread::Builder::new()
@@ -281,7 +228,6 @@ impl TapManager {
         self.demanded.insert(
             topic.to_string(),
             DemandedTopic {
-                graph_ingress,
                 channel,
                 drain: Some(drain),
                 writer,
@@ -317,7 +263,6 @@ impl TapManager {
                     topic: topic.clone(),
                     wan_forwarded: c.forwarded(),
                     wan_dropped: c.dropped(),
-                    wan_refused: d.channel.refuses_new().then(|| c.refused()),
                     frames_seen: c.frames_seen(),
                     hz: c.hz(),
                     stream_alive: d.is_alive(),
@@ -362,11 +307,6 @@ fn run_drain(mut tap: DataOnlySubscriber, channel: Arc<ForwardChannel>, topic: S
     // drain (the error cleared) re-arms so the next regime logs again.
     let mut error_regime_open = false;
     while !channel.is_stopped() {
-        if channel.refuses_new() && tap.publisher_count() != 1 {
-            tracing::warn!(topic = %topic, "authenticated graph ingress lost its single producer; stopping the stream");
-            channel.stop();
-            break;
-        }
         batch.clear();
         match tap.drain_owned(budget, &mut batch) {
             Ok(0) => {
@@ -383,11 +323,7 @@ fn run_drain(mut tap: DataOnlySubscriber, channel: Arc<ForwardChannel>, topic: S
                     let frame = sample.payload().to_vec();
                     drop(sample);
                     let outcome = channel.push(frame, wire_ts);
-                    log_push_outcome(
-                        &topic,
-                        outcome,
-                        channel.counters().dropped() + channel.counters().refused(),
-                    );
+                    log_push_outcome(&topic, outcome, channel.counters().dropped());
                 }
             }
             Err(e) => {
@@ -407,16 +343,19 @@ fn run_drain(mut tap: DataOnlySubscriber, channel: Arc<ForwardChannel>, topic: S
 
 /// The writer task body: pop queued frames and `write_frame` them on the topic's
 /// uni stream. It ALONE blocks on QUIC flow control — a stall fills the channel,
-/// which drops old observer frames or refuses new import frames. Each write
-/// completes before another begins, preserving framing cancel-safety.
+/// which drop-to-lives. Each `write_frame` runs to COMPLETION (never inside a
+/// `select!`) so the stream is never left mid-frame (framing cancel-safety).
 async fn run_writer(
     mut send: cerulion_link::SendStream,
     channel: Arc<ForwardChannel>,
     topic: String,
 ) {
+    let mut pending: Vec<Vec<u8>> = Vec::new();
     loop {
         channel.wait_writable(WRITER_BACKSTOP).await;
-        while let Some(frame) = channel.take_one() {
+        pending.clear();
+        channel.take_into(&mut pending);
+        for frame in pending.drain(..) {
             if let Err(e) = write_frame(&mut send, &frame).await {
                 // The uni stream died while the CONTROL connection may still be
                 // live (a QUIC stream reset / desk STOP_SENDING). Signal teardown
@@ -471,21 +410,6 @@ fn log_push_outcome(topic: &str, outcome: PushOutcome, wan_dropped: u64) {
             "cerulion_remoted: WAN forward recovered — queue draining again"
         ),
         PushOutcome::Queued { recovered: false } => {}
-        PushOutcome::RefusedNew { decision } => {
-            use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-            match decision {
-                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(
-                    topic = %topic,
-                    total_failures = wan_dropped,
-                    "reliable WAN queue is full; refusing the new frame and preserving queued frames"
-                ),
-                RegimeDecision::Suppressed { .. } => tracing::debug!(
-                    topic = %topic,
-                    total_failures = wan_dropped,
-                    "reliable WAN queue continues refusing new frames"
-                ),
-            }
-        }
     }
 }
 
@@ -504,13 +428,7 @@ pub fn catalog_peek_budget() -> Duration {
 /// cap), so N silent topics can never freeze the control stream for
 /// N×750ms. Blocking (poll + sleep) — the caller runs it under `spawn_blocking`.
 pub fn peek_schema_hash(manager: &TransportManager, topic: &str, deadline: Instant) -> Option<u64> {
-    crate::wire::wire_servable(manager, topic).ok()?;
-    // A missing topic has no header. Do not create and immediately destroy
-    // policy services merely to discover that its data service is absent.
-    if manager.data_service_missing(topic) {
-        return None;
-    }
-    let mut tap = manager.create_remote_data_only_subscriber(topic).ok()?;
+    let mut tap = manager.create_data_only_subscriber(topic).ok()?;
     let mut batch: Vec<OwnedInboundSample> = Vec::with_capacity(1);
     while Instant::now() < deadline {
         batch.clear();
@@ -555,7 +473,6 @@ mod tests {
         });
         let writer = task::spawn(std::future::pending::<()>());
         drop(DemandedTopic {
-            graph_ingress: false,
             channel,
             drain: Some(drain),
             writer,

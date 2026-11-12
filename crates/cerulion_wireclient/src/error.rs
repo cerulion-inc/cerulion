@@ -53,9 +53,8 @@ pub enum ConnectError {
 
     /// The robot REFUSED the wire plane (unpaired desk key / unclaimed robot /
     /// revoked account / missing `CAP_OBSERVE`). Carries the robot's own stated
-    /// reason; the desk exits non-zero. This is NOT a bug: the robot did not admit
-    /// this desk, and the reason says why (`docs/remote_plane.md` says how a desk
-    /// joins a robot's access list).
+    /// reason; the desk exits non-zero. This is NOT a bug — pair the desk with the
+    /// robot first (`cerulion pair <robot>`).
     ///
     /// The reason is PEER-CHOSEN text, so the desk-side constructor
     /// (`cerulion_connectd::worker::classify_catalog_reply`) passes it through

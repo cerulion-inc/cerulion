@@ -21,7 +21,6 @@ fn identity() -> RobotIdentity {
 
 fn record(run_id: u128, state: RunState) -> RunRecord {
     RunRecord {
-        remote_visible: true,
         run_id,
         supervisor_pid: 42,
         run_started_at_ns: 9,
@@ -95,7 +94,6 @@ fn the_document_carries_runs_nodes_and_a_sorted_catalog() {
         g.catalog.entries,
         vec![
             CatalogEntry {
-                egress_qos: None,
                 topic: "/a".into(),
                 schema_hash: None,
                 schema_name: None,
@@ -104,7 +102,6 @@ fn the_document_carries_runs_nodes_and_a_sorted_catalog() {
                 liveness: None,
             },
             CatalogEntry {
-                egress_qos: None,
                 topic: "/b".into(),
                 schema_hash: None,
                 schema_name: None,

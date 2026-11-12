@@ -141,9 +141,6 @@ fn run_cross_manager_flow(tag: &str) -> Vec<Received> {
             root_a.clone(),
         )
         .expect("init G");
-        g.network()
-            .expect("network fixture")
-            .set_lan_access(cerulion_core::LanAccess::Open);
         let plan = GatewayPlan {
             egress_policy: GatewayEgressPolicy::AllowAll,
             announce: vec![topic.clone()],
@@ -178,10 +175,6 @@ fn run_cross_manager_flow(tag: &str) -> Vec<Received> {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager B");
-    b_transport
-        .network()
-        .expect("network fixture")
-        .set_lan_access(cerulion_core::LanAccess::Open);
     let b_sub = b_transport.create_subscriber(&topic).expect("B subscriber");
     b_transport
         .register_ingress_topic(&topic, Vector3::SCHEMA_HASH, MaxSliceLen::const_new(256))

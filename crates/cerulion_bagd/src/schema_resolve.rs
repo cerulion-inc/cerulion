@@ -1761,7 +1761,6 @@ mod tests {
                 version: cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
                 robot: "go2".to_string(),
                 entries: vec![cerulion_core::CatalogEntry {
-                    egress_qos: None,
                     topic: self.topic.clone(),
                     schema_hash: None,
                     schema_name: Some("p/Late".to_string()),

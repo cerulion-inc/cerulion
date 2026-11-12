@@ -2359,7 +2359,6 @@ fn a_live_runs_registry_is_neither_recorded_nor_reported_as_a_gap() {
     let _run = cerulion_core::testing::publish_run_on_ix_config_json(
         &ix_json,
         cerulion_core::transport::run_registry::RunRecord {
-            remote_visible: true,
             run_id: 0x0981_0000_0000_0000_0000_0000_0000_0001,
             supervisor_pid: std::process::id(),
             run_started_at_ns: 1_753_000_000_000_000_000,

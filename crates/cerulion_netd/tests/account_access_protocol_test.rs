@@ -252,7 +252,6 @@ fn schema_catalog(entries: &[(&str, &str, Option<u64>)]) -> cerulion_core::Catal
         entries: entries
             .iter()
             .map(|(topic, name, hash)| cerulion_core::CatalogEntry {
-                egress_qos: None,
                 topic: (*topic).into(),
                 schema_hash: *hash,
                 schema_name: Some((*name).into()),

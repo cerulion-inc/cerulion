@@ -58,6 +58,7 @@ The events:
 | `resim_completed` | `cerulion bag play --resim` | `duration_bucket`, `exit_code`, `is_divergent` |
 | `ros2_bridge_started` | `cerulion ros2 attach`, when it hands its bridge graph to `graph run` (before that graph is checked; the `graph_run_started` and `graph_run_completed` pair that follows reports whether it ran) | none |
 | `connect_session_completed` | `cerulion connect` | `duration_bucket`, `exit_code` |
+| `pair_completed` | `cerulion pair` | `is_success` |
 | `vizd_started` | the vizd daemon, once at start | `os`, `arch` |
 | `vizd_heartbeat` | the vizd daemon, every 15 minutes | `uptime_minutes` |
 | `$create_alias` | a first login's own run, or, when that run sent nothing (the notice run, or a run under the network kill switch), the next run outside CI that sends (see below) | `alias`: the random id being joined to the account |

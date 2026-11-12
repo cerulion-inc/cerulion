@@ -113,49 +113,6 @@ fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[tokio::test]
-async fn signed_registration_accepts_the_precreated_serving_fence_without_replacing_it() {
-    let (_temporary, config, _bundle) = setup();
-    let dir = config.state_root.join(REMOTED_SUBDIR);
-    let fence_path = crate::serving_hold::fence_path(&config.state_root);
-    let fence = cerulion_netd::serving_hold::IdleFence::try_acquire(&fence_path)
-        .unwrap()
-        .unwrap();
-    assert!(
-        !dir.exists(),
-        "admission does not create provisioned robot state"
-    );
-    assert_eq!(
-        fs::metadata(fence_path.parent().unwrap()).unwrap().mode() & 0o777,
-        0o700
-    );
-    let inode = fs::metadata(&fence_path).unwrap().ino();
-    let result = provision(&config, NOW).unwrap();
-    assert_eq!(result.robot_id, ROBOT);
-    assert_eq!(result.owner_account, OWNER);
-    assert_eq!(
-        result.endpoint_id,
-        DeviceIdentity::from_seed(&SEED).public_key()
-    );
-    assert_eq!(fs::metadata(&fence_path).unwrap().ino(), inode);
-    assert!(crate::serving_hold::ServingHolds::open(&fence_path)
-        .unwrap()
-        .acquire(crate::serving_hold::HoldReason::Session)
-        .is_err());
-    drop(fence);
-    assert!(crate::serving_hold::ServingHolds::open(&fence_path)
-        .unwrap()
-        .acquire(crate::serving_hold::HoldReason::Session)
-        .is_ok());
-    let mac = fs::read(dir.join(TRUST_STORE_MAC_KEY_FILENAME)).unwrap();
-    assert_eq!(
-        TrustStore::load(dir.join(TRUST_STORE_FILENAME), &mac)
-            .unwrap()
-            .owner(),
-        Some(OWNER)
-    );
-}
-
-#[tokio::test]
 async fn signed_registration_publishes_claimed_v4_state_with_the_login_key() {
     let (_temporary, config, _bundle) = setup();
     let result = provision(&config, NOW).unwrap();
@@ -193,10 +150,6 @@ async fn signed_registration_publishes_claimed_v4_state_with_the_login_key() {
 #[tokio::test]
 async fn a_complete_restart_preserves_every_byte_after_registration_certificates_expire() {
     let (_temporary, config, _bundle) = setup();
-    let _holds = crate::serving_hold::ServingHolds::open(&crate::serving_hold::fence_path(
-        &config.state_root,
-    ))
-    .unwrap();
     let original = provision(&config, NOW).unwrap();
     let dir = config.state_root.join(REMOTED_SUBDIR);
     let before = snapshot(&dir);
@@ -214,10 +167,6 @@ async fn partial_or_corrupt_state_is_never_regenerated() {
         CHASSIS_SECRET_FILENAME,
     ] {
         let (_temporary, config, _bundle) = setup();
-        let _holds = crate::serving_hold::ServingHolds::open(&crate::serving_hold::fence_path(
-            &config.state_root,
-        ))
-        .unwrap();
         provision(&config, NOW).unwrap();
         let dir = config.state_root.join(REMOTED_SUBDIR);
         fs::remove_file(dir.join(missing)).unwrap();

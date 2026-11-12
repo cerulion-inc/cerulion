@@ -406,7 +406,7 @@ fn write_epoch_cache(artifact: &str, cache_path: &std::path::Path) -> CliResult<
 ///
 /// `robot_id` is the account service's id for the robot (what the HTTP fetch is keyed by).
 /// `robot_name` is the name THIS DESK knows the robot by — its `~/.cerulion/robots.toml`
-/// key, the desk's own pin, because that, and only that, is what both readers
+/// key, which `cerulion pair` pins — because that, and only that, is what both readers
 /// look the cache up under (a peer-reported name would let a dialed robot choose which
 /// artifact it is handed). The destination is resolved by
 /// [`resolve_epoch_cache_path`] — THE shared rule, so this write and every reader's

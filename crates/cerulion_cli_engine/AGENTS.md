@@ -1,45 +1,58 @@
-# cerulion_cli_engine
+# cerulion_cli_engine - agent notes
 
-Clap delegates here; tests never spawn processes. Writers hold `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` through check/write: UNIX flock shared with wsd, reentrant, others wait (one warn); elsewhere no-op.
-Reads: `acquire_read` (creates nothing; refuses same-thread re-entry); all
-refuse a symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
-tracked `.gitignore` when creating `.cerulion/`; migrate polls with
-`acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
-Ports: `graph_cmd::stage_declared_node`.
-## Rules
-- Engine enforces invariants; CLI checks are UX.
-- Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
-- Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
-- Paired graph producers need serving_authority; canonical ingress before GO retains pinned demands; refuse schema/QoS/writer mismatches.
-- Observers pin source/hash/channel; busy=unknown. Loss re-demands, graph rechecks identity. Epoch errors retain trust and route latches on reconnect.
-- Paired starts are quiet; Open warns for every plan using the daemon's posture.
-- `account_robot_access`: only netd opens WAN. Probes 4s/500ms per robot, no pair/demand; catalogs 4s, coalesce keys. LAN/account merge only on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps via `account_identity::pairing_account_id`. Login checks mapping/challenge/registration/leaf/key before writing; `device-chain.json` commits LAST.
-- `node build` uses Cargo's rustc/MSRV, no pin; load checks the frozen boundary, never compiler provenance.
-- Android libs: <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn; account TLS: system roots, no JVM.
-- Ports/triggers: only `node_metadata::parse_node_metadata`; INFO_END before INFO_START is fatal.
-- Pinned hashes: run `pinned_hashes`, copy into `topic_cmd.rs`; never hand-compute.
-- Completions: no hangs/spawns/network (`run_bounded`, `completions_test`).
-- Size ports before acceptance; unverifiable: `CliError::SchemaUnchecked`.
-  Un-carryable duplicate bearers refuse.
-- Rewrite `node modify` with `syn` spans, never `str::replace`. Raw INFO has PORT_SCHEMAS names and typed wire facts.
-- iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
+Clap delegates here; tests must not spawn processes.
+Every workspace-file writer (`node create/delete/modify`, `node stage`,
+`graph create/partition`, `graph run`'s auto-partition persist,
+`ros2 attach`'s consent batch, `ros2 migrate --write`, `schema create/delete`) holds
+`workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`, a kernel
+flock shared with `cerulion-wsd`) across check-and-write; nesting on one
+thread is reentrant, others wait (one `warn!`) - UNIX only; elsewhere a no-op.
+Reads use `acquire_read` (creates nothing; refuses a same-thread re-entry); all
+refuse a symlinked `.cerulion`. ONLY `acquire_and_track_gitignore` writes a
+TRACKED file (an EXISTING `.gitignore` on creating `.cerulion/`); migrate takes
+`acquire_interruptibly(root, interrupted)`, which polls and returns
+`AcquireError` (no `From`). Per-ROOT; `--workspace` is the COLCON root.
+Stage a node only via `graph_cmd::stage_declared_node` (declared ports).
+## Invariants
+- Enforce invariants at engine boundary; CLI checks are UX.
+- Account listing/viewer selection: `account_robot_access`; only netd opens WAN. Probes
+  share 4 s, 500 ms per robot, never pair or demand. LAN and account rows merge only on
+  robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps it
+  (`account_identity::pairing_account_id`). Login checks mapping, challenge,
+  registration, leaf and key before writing, and commits `device-chain.json` LAST.
+- `node build` uses Cargo compiler selection/MSRV; load checks the frozen boundary,
+  never compiler provenance.
+- Android: cdylib lookup prefers `<target>/<triple>/<profile>`, then `<target>/<profile>`;
+  `cerulion viz` refuses before connecting or spawning (`docs/android.md`).
+- `node_metadata::parse_node_metadata` is the sole port/trigger source; only `INFO_END`
+  before `INFO_START` is fatal.
+- Never hand-compute pinned schema hashes: run `pinned_hashes`, copy into `topic_cmd.rs`.
+- Completions never hang, spawn, or open the network (`run_bounded`, `completions_test`).
+- Port spellings are SIZED before acceptance; unverifiable = `CliError::SchemaUnchecked`,
+  never warn-and-accept. A duplicated identity refuses iff ANY bearer is un-carryable.
+- Rewrite `node modify` sources with `syn` spans, never `str::replace`.
+- Raw INFO retains PORT_SCHEMAS names; modifications preserve all typed wire facts.
+- Use prefix-free iceoryx2 prefixes: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
-- Interrupted waits check running; retry<=MAX_CONSECUTIVE_WAIT_ERRORS, never sleep-retry errors. Foreign SIGINT: child_signals (exec inherits ignore/blocks), self_exe excepted.
-- After `templates.rs` changes, regenerate its fixture at repo root:
+- Blocking waits check `running` after interrupted ERRORS and retry only within
+  `MAX_CONSECUTIVE_WAIT_ERRORS`; never sleep-retry an ERROR. FOREIGN children Cerulion SIGINTs go via `child_signals`
+  (SIG_IGN/blocks survive exec); self_exe excepted.
+- After changing `templates.rs`, regenerate its fixture from the repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
-## Dependencies
-Deps follow binary: checkout/exact registry pins.
-Checks: cli dossier §11.
-## Tests: lib env `test_env::env_lock`
+## Workspace dependency contract
+Dependencies follow the binary, never cwd: checkout paths or exact registry pins.
+See `docs/internals/cli.md` §11 for the contract and compiler checks.
+## Testing
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
   root; no bash-only construct in a `container:` run step lacking `shell: bash`.
 - Serial: `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`,
-  `topic_type_iox2_test` (last 3 share namespace), `account_robot_access_e2e_test` (env);
-  `pairing_*_parity_test` JSON oracles match the app byte-for-byte. Build
+  `topic_type_iox2_test` (last 3 share iox2 ns), `account_robot_access_e2e_test` (env);
+  the three `pairing_*_parity_test` JSON oracles stay byte-identical to the app's. Build
   `test_node_macro_{period,data_trigger}_cdylib` first.
 ## Gotchas
-- `proc_macro2::Literal::to_string()` keeps `100_000`, `100u64`, `0xff`; use
-  Use `parse_int_literal`/`syn::LitInt::base10_parse`.
-- Guard NaN, >2^53 widening and lengths.
-`docs/internals/cli.md`: topics/scope/starters/replay/completions/Python (§13)/graph run/profile/partition.
+- `proc_macro2::Literal::to_string()` preserves `100_000`, `100u64`, `0xff`; use
+  `parse_int_literal` or `syn::LitInt::base10_parse`.
+- Numeric checks have false-pass classes (NaN folds, >2^53 widening, length fields).
+Read `docs/internals/cli.md` before changing topics/local scope, starters,
+replay, completions, Python nodes (§13), or graph run/profile/partition.

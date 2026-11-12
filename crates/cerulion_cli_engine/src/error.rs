@@ -4,8 +4,6 @@
 /// CLI engine errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error("graph ingress producer identity changed during reconnect; restart the graph to resolve the source again")]
-    GraphIngressSourceChanged,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("YAML error: {0}")]
@@ -45,9 +43,6 @@ pub enum CliError {
     CdylibNotFound { node_type: String, reason: String },
     #[error("{0}")]
     Validation(String),
-    /// More than one observable source has the requested topic name.
-    #[error("{0}")]
-    AmbiguousTopic(String),
     /// The workspace lookup could not CHECK a spelling — a
     /// `schemas/…yaml` it could not read or parse, named in the message
     /// (`schemas/Foo.yaml (file stem) could not be parsed (YAML error: …)`).

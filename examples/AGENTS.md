@@ -1,8 +1,9 @@
 # examples: agent notes
 
-CLI workspaces: `basic_timer`, `obstacle_avoidance`, `camera_pipeline`, `perception`,
-`v4l2_camera`, `realsense`, `aspire_arm`, `go2`; each has its own manifest/lockfile.
-`moveit_hero` is the `rmw_cerulion` Docker gate.
+Seven user workspaces, run end to end via the `cerulion` verbs: `basic_timer`,
+`obstacle_avoidance` (the quickstart), `camera_pipeline`, `perception`, `v4l2_camera`,
+`realsense`, `aspire_arm`. `moveit_hero` is a Docker gate for `rmw_cerulion`, not a
+workspace; `go2`: the quadruped demo. Each is standalone (own manifest + lockfile).
 
 ## Shipped surface (gate: `check_public_surface.sh`)
 
@@ -22,9 +23,8 @@ CLI workspaces: `basic_timer`, `obstacle_avoidance`, `camera_pipeline`, `percept
   import of internals (`cerulion_core::...` beyond the prelude) needs a comment at the use
   site saying why the public surface cannot express it. The one exception is the
   protocol bridge (`examples/go2/nodes/dds_bridge` speaks CDR/DDS).
-- Go2 runbooks match shipped CLI help. Paired discovery needs account/pairing,
-  no LISTEN/address setup; keep egress/ingress scope. Label zenoh locators as open
-  LAN compatibility. Retain vendor DDS interface and hardware safety requirements.
+- Runbooks (`examples/go2/README.md`, `examples/go2/ROBOT-DAY.md`) must match the CURRENT CLI:
+  verify every command and flag against the shipped `cerulion` help; a removed flag fails the demo.
 - Same rules as `benches/`: a harness that RUNS an example spawns `cerulion graph run` as a
   SUBPROCESS (statically-linked transport singletons do not rendezvous in-process); a node
   crate's own `tests/` may build a runtime in-process over an isolated transport. Exact-pin
@@ -45,13 +45,13 @@ CLI workspaces: `basic_timer`, `obstacle_avoidance`, `camera_pipeline`, `percept
   the schema to the vendor docs: decoding stops.
 
 ## Publication checks
-- Go2 DDS clouds publish complete payloads or count drops; geometry stays consistent. Use
-  size-aware setters for variable payloads (`bridge_publish_test`). Raw routes retain local
-  scope through publisher lifetime and skip private egress registration.
+- Go2 DDS clouds publish complete payloads or count a dropped write; never trim data while
+  keeping the old geometry. Decoded variable-size payloads use the size-aware setter so a
+  small adaptive loan is not a false ceiling (`bridge_publish_test`).
 - Go2 TF fixed geometry and encoder buffers are built at construction and reused each tick;
   encoding stays in `go2_tf`, never in node-local byte offsets. A codec boundary may need
   owned memory: document each application copy apart from local SHM delivery.
-- Generated images fill payload loans directly: width, height, step, encoding and data
+- Generated-data examples fill payload loans directly: width, height, step, encoding and data
   length agree, every loaned byte is initialized, advertised outputs reach a subscriber. Label
   generated images and teaching detectors as synthetic; the perception twin keeps
   byte-identical `algorithm.rs`/`tests.rs` copies, differing from the detector in one constant.

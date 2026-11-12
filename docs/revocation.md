@@ -194,7 +194,7 @@ The writer anchors on the WELL-KNOWN desk key `~/.cerulion/desk.key` (the same f
 keeps all three in agreement.
 
 **Which `<robot>` keys the cache: the name the DESK knows the robot by**, the
-name pinned in `~/.cerulion/robots.toml` (whose name→eid binding the dial
+`~/.cerulion/robots.toml` name `cerulion pair` pins (and whose name→eid binding the dial
 then authenticates cryptographically), never the name the robot reports about itself in
 its catalog. A peer-reported key would let the dialed robot choose which cached artifact
 it is handed, e.g. another robot's signed epoch, whose revoked account/device ids are
@@ -205,7 +205,7 @@ netd is unaffected: its demand key is already the operator-configured WAN-regist
 
 The cache-LOCATION check runs FIRST, so a desk with no epochs directory at all reports
 `NoCacheDir` ("this desk holds nothing") rather than `UnverifiedRobotIdentity` (whose
-remediation is "pin the robot's name"); the reason must match the situation the operator is
+remediation is "pair the robot"); the reason must match the situation the operator is
 actually in. Two further `robots.toml` shapes also yield no desk-verified name, because
 both are worse than pushing nothing: a name starting with `-` (which the sibling binary's
 argument parser would read as a flag and abort the whole dial) and two names for DIFFERENT

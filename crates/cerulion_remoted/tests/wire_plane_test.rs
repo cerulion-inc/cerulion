@@ -265,7 +265,6 @@ async fn run_demand_e2e(tag: &str) -> (String, Vec<Vec<u8>>) {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -319,205 +318,6 @@ async fn wire_demand_is_deterministic() {
     let oracle = oracle_frames();
     assert_eq!(a, oracle, "run A == hand oracle");
     assert_eq!(b, oracle, "run B == hand oracle");
-}
-
-async fn graph_policy_case(
-    tag: &str,
-    graph_ingress: bool,
-    multi: bool,
-    best_effort: bool,
-    single_writer_multi: bool,
-    metadata_unknown: bool,
-) {
-    use cerulion_core::transport::{PublisherProvisioning, TopicServiceConfig};
-    use cerulion_core::{EgressQos, EgressReliability, SchemaServing};
-    let manager = test_manager(tag);
-    let topic = format!("/wire/{tag}/{}", unique_id());
-    let config = TopicServiceConfig::for_topology(
-        manager.default_topic_config(),
-        8,
-        0,
-        if multi || single_writer_multi {
-            PublisherProvisioning::Multi
-        } else {
-            PublisherProvisioning::SingleWriter
-        },
-        0,
-        0,
-    );
-    let _services = manager.precreate_topic_services(&topic, config).unwrap();
-    let mut first = manager
-        .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
-        .unwrap();
-    let mut second = multi.then(|| {
-        manager
-            .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
-            .unwrap()
-    });
-    let schemas = SchemaServing {
-        egress_qos: if metadata_unknown {
-            Vec::new()
-        } else {
-            vec![EgressQos {
-                topic: topic.clone(),
-                reliability: if best_effort {
-                    EgressReliability::BestEffort
-                } else {
-                    EgressReliability::Reliable
-                },
-                send_queue: std::num::NonZeroUsize::new(2),
-            }]
-        },
-        ..SchemaServing::default()
-    };
-    let daemon = disabled_endpoint([73; 32]).await;
-    let client = disabled_endpoint([74; 32]).await;
-    let authz = Arc::new(claimed_paired(*client.id().as_bytes()));
-    let plane = Arc::new(
-        WirePlane::with_manager("policy-robot", manager)
-            .with_in_process_schema_provider(Arc::new(move || schemas.clone())),
-    );
-    let address = loopback_addr(daemon.id(), &daemon.bound_sockets());
-    let serving = async {
-        let accepted = bounded("accept policy", accept_one(&daemon))
-            .await
-            .unwrap()
-            .unwrap();
-        handle_accepted_with_wire(accepted, authz, None, Some(plane)).await;
-    };
-    let consuming = async {
-        let connection = bounded("dial policy", dial(&client, address, alpn::WIRE))
-            .await
-            .unwrap();
-        let (mut send, mut recv) = open_control(&connection).await;
-        let reply = request(
-            &mut send,
-            &mut recv,
-            &WireRequest::Demand {
-                topic: topic.clone(),
-                graph_ingress,
-            },
-        )
-        .await;
-        if graph_ingress && !metadata_unknown {
-            let reason = if best_effort {
-                "authenticated wire ingress requires a matching reliable producer policy"
-            } else {
-                "authenticated graph ingress requires exactly one live producer"
-            };
-            assert_eq!(
-                reply,
-                WireResponse::Error {
-                    topic: Some(topic.clone()),
-                    message: format!("demand '{topic}' failed: {reason}"),
-                }
-            );
-            if let WireResponse::Status(status) =
-                request(&mut send, &mut recv, &WireRequest::Status).await
-            {
-                assert!(status.topics.is_empty(), "a refused import retains no tap");
-            } else {
-                panic!("status reply missing");
-            }
-            if single_writer_multi {
-                assert_eq!(
-                    request(
-                        &mut send,
-                        &mut recv,
-                        &WireRequest::Demand {
-                            topic: topic.clone(),
-                            graph_ingress: false,
-                        },
-                    )
-                    .await,
-                    WireResponse::DemandAccepted {
-                        topic: topic.clone()
-                    }
-                );
-                let oracle = oracle_frames();
-                first.publish_raw(&oracle[0]).unwrap();
-                let (actual_topic, delivered) = read_uni_frames(&connection, 1).await;
-                assert_eq!(actual_topic, topic);
-                assert_eq!(delivered, oracle[..1]);
-            }
-        } else {
-            assert_eq!(
-                reply,
-                WireResponse::DemandAccepted {
-                    topic: topic.clone()
-                }
-            );
-            let oracle = oracle_frames();
-            first.publish_raw(&oracle[0]).unwrap();
-            if let Some(second) = &mut second {
-                second.publish_raw(&oracle[1]).unwrap();
-            }
-            let (actual_topic, mut delivered) =
-                read_uni_frames(&connection, if multi { 2 } else { 1 }).await;
-            delivered.sort_by_key(|frame| WireHeader::read_from_buf(frame).unwrap().sequence);
-            assert_eq!(actual_topic, topic);
-            assert_eq!(
-                delivered,
-                oracle[..if multi { 2 } else { 1 }],
-                "every writer delivers its handwritten frame"
-            );
-            if !graph_ingress && !best_effort && !multi {
-                let changed = request(
-                    &mut send,
-                    &mut recv,
-                    &WireRequest::Demand {
-                        topic: topic.clone(),
-                        graph_ingress: true,
-                    },
-                )
-                .await;
-                assert_eq!(changed, WireResponse::Error {
-                    topic: Some(topic.clone()),
-                    message: format!("demand '{topic}' failed: cannot change a retained stream's graph import mode"),
-                });
-            }
-        }
-        let _ = send.finish();
-        drop(connection);
-    };
-    tokio::join!(serving, consuming);
-    bounded("close policy server", daemon.close()).await;
-    bounded("close policy client", client.close()).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_observer_best_effort_delivers() {
-    graph_policy_case("observer_best_effort", false, false, true, false, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_observer_multi_publisher_delivers_every_writer() {
-    graph_policy_case("observer_multi", false, true, false, false, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_import_best_effort_is_refused() {
-    graph_policy_case("graph_best_effort", true, false, true, false, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_import_multi_publisher_is_refused() {
-    graph_policy_case("graph_multi", true, true, false, false, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_import_multi_with_one_writer_is_refused_but_observer_delivers() {
-    graph_policy_case("graph_multi_one", true, false, false, true, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_unknown_raw_import_keeps_multi_one_writer_compatibility() {
-    graph_policy_case("graph_raw_multi_one", true, false, false, true, true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graph_policy_retained_observer_cannot_change_mode() {
-    graph_policy_case("observer_mode", false, false, false, false, false).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -672,7 +472,6 @@ async fn undemand_releases_the_slot() {
                 &mut send,
                 &mut recv,
                 &WireRequest::Demand {
-                    graph_ingress: false,
                     topic: topic_ref.clone(),
                 },
             )
@@ -844,7 +643,6 @@ async fn demand_nonexistent_topic_returns_actionable_error() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: missing_ref.clone(),
             },
         )
@@ -916,7 +714,6 @@ async fn status_counters_match_oracle() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -1144,7 +941,6 @@ async fn stalled_writer_undemand_completes_within_a_bound() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -1252,7 +1048,6 @@ async fn writer_death_releases_slot_status_dead_and_redemand_reattaches() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -1325,7 +1120,6 @@ async fn writer_death_releases_slot_status_dead_and_redemand_reattaches() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -1733,7 +1527,6 @@ async fn demand_gate_refuses_a_denied_topic_and_admits_others() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: denied_ref.clone(),
             },
         )
@@ -1758,7 +1551,6 @@ async fn demand_gate_refuses_a_denied_topic_and_admits_others() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: allowed_ref.clone(),
             },
         )
@@ -1874,7 +1666,6 @@ async fn mid_session_revoke_evicts_the_established_stream() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -1990,7 +1781,6 @@ async fn sweep_does_not_evict_an_authorized_stream() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -2156,7 +1946,6 @@ async fn stalled_control_stream_demander_is_still_evicted() {
             &mut send,
             &mut recv,
             &WireRequest::Demand {
-                graph_ingress: false,
                 topic: topic_ref.clone(),
             },
         )
@@ -2290,7 +2079,6 @@ async fn full_revoke_evicts_both_streams_and_closes_the_connection() {
                 &mut send,
                 &mut recv,
                 &WireRequest::Demand {
-                    graph_ingress: false,
                     topic: a_ref.clone()
                 }
             )
@@ -2307,7 +2095,6 @@ async fn full_revoke_evicts_both_streams_and_closes_the_connection() {
                 &mut send,
                 &mut recv,
                 &WireRequest::Demand {
-                    graph_ingress: false,
                     topic: b_ref.clone()
                 }
             )
@@ -2359,129 +2146,4 @@ async fn full_revoke_evicts_both_streams_and_closes_the_connection() {
     stop.store(true, Ordering::Relaxed);
     let _ = prod_a.join();
     let _ = prod_b.join();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn producer_exclusion_refuses_remote_catalog_schema_and_demand_but_declared_egress_flows() {
-    let manager = test_manager("gate");
-    let allowed_topic = format!("/wire/gate/allowed/{}", unique_id());
-    let denied_topic = format!("/wire/gate/denied/{}", unique_id());
-    // The allowed topic has a real producer (its demand streams); the denied one is
-    // refused BEFORE any tap, so it needs none.
-    let mut publisher = manager
-        .create_publisher_simple(&allowed_topic, MaxSliceLen::const_new(256))
-        .expect("producer");
-
-    let daemon = disabled_endpoint([211; 32]).await;
-    let client = disabled_endpoint([12; 32]).await;
-    let client_key = *client.id().as_bytes();
-    // Accept-admitted (paired CAP_OBSERVE); the per-topic DEMAND gate is a DenyTopic stub.
-    let authz = Arc::new(claimed_paired(client_key));
-    let _exclusion = manager
-        .exclude_remote_topic(&denied_topic)
-        .expect("local-only producer scope");
-    let _private_publisher = manager
-        .create_publisher_simple(&denied_topic, MaxSliceLen::const_new(256))
-        .expect("private live producer");
-    let plane = Arc::new(WirePlane::with_manager("robot-gate", manager.clone()));
-    let daemon_addr = loopback_addr(daemon.id(), &daemon.bound_sockets());
-
-    let daemon_ref = &daemon;
-    let client_ref = &client;
-    let allowed_ref = &allowed_topic;
-    let denied_ref = &denied_topic;
-
-    let daemon_fut = async move {
-        let accepted = bounded("accept_one", accept_one(daemon_ref))
-            .await
-            .expect("accept ok")
-            .expect("incoming");
-        handle_accepted_with_wire(accepted, authz, None, Some(plane)).await;
-    };
-
-    let client_fut = async move {
-        let conn = bounded("dial", dial(client_ref, daemon_addr, alpn::WIRE))
-            .await
-            .expect("dial wire");
-        let (mut send, mut recv) = open_control(&conn).await;
-
-        match request(
-            &mut send,
-            &mut recv,
-            &WireRequest::Schema {
-                topic: denied_ref.clone(),
-            },
-        )
-        .await
-        {
-            WireResponse::Error { message, .. } => {
-                assert!(message.contains("refused"), "{message}")
-            }
-            other => panic!("excluded schema leaked: {other:?}"),
-        }
-        match request(&mut send, &mut recv, &WireRequest::Catalog).await {
-            WireResponse::Catalog(reply) => {
-                assert!(!reply.entries.iter().any(|entry| entry.topic == *denied_ref))
-            }
-            other => panic!("catalog failed: {other:?}"),
-        }
-        // (a) the DENIED topic → a loud Error naming it (never a stream).
-        let denied_resp = request(
-            &mut send,
-            &mut recv,
-            &WireRequest::Demand {
-                graph_ingress: false,
-                topic: denied_ref.clone(),
-            },
-        )
-        .await;
-        match denied_resp {
-            WireResponse::Error { topic, message } => {
-                assert_eq!(
-                    topic.as_deref(),
-                    Some(denied_ref.as_str()),
-                    "the error names the denied topic"
-                );
-                assert!(
-                    message.contains("refused"),
-                    "the error is the gate refusal: {message}"
-                );
-            }
-            other => panic!("a denied topic must be refused, got {other:?}"),
-        }
-
-        // (b) SELECTIVITY / anti-tautology: a DIFFERENT topic is admitted + streams.
-        let allowed_resp = request(
-            &mut send,
-            &mut recv,
-            &WireRequest::Demand {
-                graph_ingress: false,
-                topic: allowed_ref.clone(),
-            },
-        )
-        .await;
-        assert_eq!(
-            allowed_resp,
-            WireResponse::DemandAccepted {
-                topic: allowed_ref.clone()
-            },
-            "an untargeted topic is admitted through the gate"
-        );
-        for frame in oracle_frames() {
-            publisher.publish_raw(&frame).expect("publish_raw");
-        }
-        let (stream_topic, frames) = read_uni_frames(&conn, 3).await;
-        assert_eq!(&stream_topic, allowed_ref, "the admitted topic streams");
-        assert_eq!(
-            frames,
-            oracle_frames(),
-            "the admitted stream is byte-identical to the hand oracle"
-        );
-
-        let _ = send.finish();
-        drop(conn);
-    };
-
-    tokio::join!(daemon_fut, client_fut);
-    assert!(manager.remote_access_refusals() >= 3);
 }

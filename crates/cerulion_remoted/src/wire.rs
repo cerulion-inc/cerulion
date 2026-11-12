@@ -45,67 +45,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
 use crate::tap::{peek_schema_hash, TapManager};
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SourceRefusal {
-    Mirror,
-    Reserved,
-    MarkerUnavailable(String),
-    Excluded(String),
-}
-
-impl SourceRefusal {
-    pub(crate) fn message(&self, topic: &str) -> String {
-        match self {
-            Self::Mirror => format!(
-                "'{topic}' is a network mirror of another robot; read it on its source robot"
-            ),
-            Self::Reserved => {
-                format!("'{topic}' is in Cerulion's reserved control-plane namespace")
-            }
-            Self::MarkerUnavailable(reason) => format!(
-                "could not verify the network mirror marker for '{topic}'; remote access is refused: {reason}"
-            ),
-            Self::Excluded(message) => message.clone(),
-        }
-    }
-}
-
-fn local_source(topic: &str, marker: Result<bool, String>) -> Result<(), SourceRefusal> {
-    if matches!(marker, Ok(true)) {
-        return Err(SourceRefusal::Mirror);
-    }
-    let prefix = cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX;
-    if topic == prefix
-        || topic
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-    {
-        return Err(SourceRefusal::Reserved);
-    }
-    marker.map_err(SourceRefusal::MarkerUnavailable)?;
-    Ok(())
-}
-
-/// Only a local source may be exported under this robot's authorization.
-pub(crate) fn wire_servable(manager: &TransportManager, topic: &str) -> Result<(), SourceRefusal> {
-    local_source(
-        topic,
-        manager
-            .is_network_mirror(topic)
-            .map_err(|error| error.to_string()),
-    )?;
-    if !manager
-        .remote_topic_allowed(topic)
-        .map_err(|error| SourceRefusal::Excluded(error.to_string()))?
-    {
-        return Err(SourceRefusal::Excluded(cerulion_core::TransportError::EgressScope {
-            topic: topic.to_owned(),
-            reason: "the producing run excludes this topic from network egress; remote access is refused".into(),
-        }.to_string()));
-    }
-    Ok(())
-}
 use crate::trust::TrustError;
 use crate::{AcceptDecision, PairingAuthorizer, RemotedClock, SharedTrust};
 
@@ -156,10 +95,6 @@ pub struct StreamPreamble {
     pub topic: String,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 /// A control-stream request (desk → robot), length-prefixed JSON. The `verb` tag
 /// dispatches; each verb is answered with a [`WireResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,9 +106,6 @@ pub enum WireRequest {
     Demand {
         /// The canonical absolute topic to stream.
         topic: String,
-        /// Canonical graph import; absent/false preserves observer queue semantics.
-        #[serde(default, skip_serializing_if = "is_false")]
-        graph_ingress: bool,
     },
     /// Drop the tap for `topic` (its uni stream ends). An un-demanded topic costs
     /// nothing.
@@ -276,9 +208,6 @@ pub struct StatusReply {
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicStatus {
-    /// Frames refused by a declared reliable queue; absent on a legacy source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wan_refused: Option<u64>,
     /// The canonical absolute topic name.
     pub topic: String,
     /// Frames written to QUIC.
@@ -589,9 +518,6 @@ impl WirePlane {
         topic: &str,
         taps: &mut TapManager,
     ) -> Result<SchemaReply, WireError> {
-        // Metadata has no data port to protect. Creating temporary policy
-        // services here races their final destruction with later policy reads.
-        // Header inspection owns its leases with its actual tap instead.
         let Some(source) = &self.local_schemas else {
             return Ok(self.serve_schema(topic));
         };
@@ -849,10 +775,7 @@ async fn handle_request(
                 },
             }
         }
-        WireRequest::Demand {
-            topic,
-            graph_ingress,
-        } => {
+        WireRequest::Demand { topic } => {
             // Per-topic demand authorization. The accept gate already admitted
             // this connection (paired CAP_OBSERVE); the demand authorizer adds per-topic
             // granularity — a topic the DEMANDER (the connection's authenticated remote
@@ -883,35 +806,7 @@ async fn handle_request(
                     }
                 }
             };
-            if let Err(refusal) = wire_servable(&manager, &topic) {
-                let message = refusal.message(&topic);
-                return WireResponse::Error {
-                    topic: Some(topic),
-                    message,
-                };
-            }
-            let schemas = match plane.local_schemas.as_ref().filter(|_| graph_ingress) {
-                Some(source) => match source.load(manager.iox_shm_identity()).await {
-                    Ok(schemas) => Some(schemas),
-                    Err(error) => {
-                        return WireResponse::Error {
-                            topic: Some(topic),
-                            message: error.to_string(),
-                        }
-                    }
-                },
-                None => None,
-            };
-            if let Some(refusal) = metadata_refusal(authorizer, connection, Some(&topic)) {
-                return refusal;
-            }
-            let qos = schemas
-                .as_ref()
-                .and_then(|schemas| schemas.egress_qos(&topic));
-            match taps
-                .demand_with_qos(&manager, connection, &topic, qos, graph_ingress)
-                .await
-            {
+            match taps.demand(&manager, connection, &topic).await {
                 Ok(()) => WireResponse::DemandAccepted { topic },
                 Err(e) => WireResponse::Error {
                     topic: Some(topic),
@@ -930,18 +825,6 @@ async fn handle_request(
             if let Some(refusal) = metadata_refusal(authorizer, connection, Some(&topic)) {
                 return refusal;
             }
-            let source = plane
-                .manager()
-                .map_err(|error| error.to_string())
-                .and_then(|manager| {
-                    wire_servable(&manager, &topic).map_err(|refusal| refusal.message(&topic))
-                });
-            if let Err(message) = source {
-                return WireResponse::Error {
-                    topic: Some(topic),
-                    message,
-                };
-            }
             let schema = plane.current_schema(&topic, taps).await;
             // The local provider and any header peek await work. Admission must
             // still hold when that metadata is about to leave the robot.
@@ -949,21 +832,7 @@ async fn handle_request(
                 return refusal;
             }
             match schema {
-                Ok(reply) => {
-                    match plane
-                        .manager()
-                        .map_err(|error| error.to_string())
-                        .and_then(|manager| {
-                            wire_servable(&manager, &topic)
-                                .map_err(|refusal| refusal.message(&topic))
-                        }) {
-                        Ok(()) => WireResponse::Schema(reply),
-                        Err(message) => WireResponse::Error {
-                            topic: Some(topic),
-                            message,
-                        },
-                    }
-                }
+                Ok(reply) => WireResponse::Schema(reply),
                 Err(error) => WireResponse::Error {
                     topic: Some(topic),
                     message: error.to_string(),
@@ -1057,14 +926,13 @@ async fn build_catalog(
     // Enumerate topics + peek the unknown ones off the async runtime, under a
     // whole-catalog time cap. `peeked` returns the freshly-observed hashes so we
     // can fold them into the per-connection cache below.
-    let peeked: Vec<(String, Option<u64>, Option<u32>)> = tokio::task::spawn_blocking(move || {
+    let peeked: Vec<(String, Option<u64>)> = tokio::task::spawn_blocking(move || {
         let topics = manager.list_topics().map_err(|e| e.to_string())?;
         // Hard stop for the SUM of this catalog's peeks (the DoS bound).
         let catalog_deadline = Instant::now() + CATALOG_TOTAL_PEEK_BUDGET;
         let per_topic = crate::tap::catalog_peek_budget();
-        let rows: Vec<(String, Option<u64>, Option<u32>)> = topics
+        let rows: Vec<(String, Option<u64>)> = topics
             .into_iter()
-            .filter(|topic| wire_servable(&manager, topic).is_ok())
             .map(|topic| {
                 let hash = match known.get(&topic) {
                     Some(h) => Some(*h),
@@ -1083,11 +951,10 @@ async fn build_catalog(
                         }
                     }
                 };
-                let producers = manager.topic_publisher_count_checked(&topic);
-                (topic, hash, producers)
+                (topic, hash)
             })
             .collect();
-        Ok::<Vec<(String, Option<u64>, Option<u32>)>, String>(rows)
+        Ok::<Vec<(String, Option<u64>)>, String>(rows)
     })
     .await
     .map_err(|e| WireError::Transport(format!("catalog assembly task join failed: {e}")))?
@@ -1105,7 +972,7 @@ async fn build_catalog(
     // the closest 2-variant fit.
     let entries: Vec<CatalogEntry> = peeked
         .into_iter()
-        .map(|(topic, hash, producer_count)| {
+        .map(|(topic, hash)| {
             if let Some(h) = hash {
                 taps.record_schema_hash(&topic, h);
             }
@@ -1114,15 +981,17 @@ async fn build_catalog(
                 None => None,
             };
             CatalogEntry {
-                egress_qos: schemas
-                    .as_ref()
-                    .and_then(|schemas| schemas.egress_qos(&topic))
-                    .cloned(),
                 topic,
                 schema_hash: hash,
                 schema_name,
                 provenance: CatalogProvenance::Runtime,
-                producer_count,
+                // The WAN/iroh remoted plane does not stamp the live
+                // producer count (the LAN gateway's `build_catalog_reply_from_bridge`
+                // probes it via `topic_publisher_count`). `None` degrades the desk to
+                // a rendering with no liveness affordance for a WAN-served
+                // catalog, exactly like an older robot. (The same probe could run
+                // here off the `taps` SHM handle.)
+                producer_count: None,
                 // Likewise, the WAN/iroh remoted plane runs no
                 // `TopicLivenessObserver` (that lives in the LAN gateway's drive
                 // loop). `None` is the UNKNOWN verdict — the desk renders a
@@ -1154,40 +1023,6 @@ mod tests {
     use super::*;
     use cerulion_core::transport::cerulion_q::SchemaEncoding;
 
-    #[test]
-    fn wire_servable_refuses_reserved_prefix_with_exact_boundaries() {
-        let manager = TransportManager::init_for_test(
-            cerulion_core::TransportConfig::default(),
-            cerulion_core::testing::iceoryx_test_config(),
-        )
-        .unwrap();
-        for topic in ["/__cerulion", "/__cerulion/observers/x/y"] {
-            assert_eq!(wire_servable(&manager, topic), Err(SourceRefusal::Reserved));
-            assert_eq!(
-                SourceRefusal::Reserved.message(topic),
-                format!("'{topic}' is in Cerulion's reserved control-plane namespace")
-            );
-        }
-        assert_eq!(wire_servable(&manager, "/__cerulionx"), Ok(()));
-    }
-
-    #[test]
-    fn source_refusals_distinguish_live_mirrors_reserved_names_and_marker_errors() {
-        let topic = "/__cerulion/observers/x/y";
-        assert_eq!(local_source(topic, Ok(true)), Err(SourceRefusal::Mirror));
-        assert_eq!(local_source(topic, Ok(false)), Err(SourceRefusal::Reserved));
-        assert_eq!(
-            local_source(topic, Err("marker unreadable".into())),
-            Err(SourceRefusal::Reserved)
-        );
-        let refusal = local_source("/local", Err("marker unreadable".into())).unwrap_err();
-        assert_eq!(
-            refusal,
-            SourceRefusal::MarkerUnavailable("marker unreadable".into())
-        );
-        assert_eq!(refusal.message("/local"), "could not verify the network mirror marker for '/local'; remote access is refused: marker unreadable");
-    }
-
     /// The control protocol round-trips through JSON with the documented `verb` /
     /// `reply` tags (hand oracle — the exact wire vocabulary).
     #[test]
@@ -1199,7 +1034,6 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&WireRequest::Demand {
-                graph_ingress: false,
                 topic: "/imu".to_string()
             })
             .unwrap(),
@@ -1218,7 +1052,6 @@ mod tests {
         for req in [
             WireRequest::Catalog,
             WireRequest::Demand {
-                graph_ingress: false,
                 topic: "/a".to_string(),
             },
             WireRequest::Undemand {

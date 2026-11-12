@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use cerulion_core::TransportManager;
 use cerulion_link::{
-    accept_frame_stream, read_frame, write_frame, Accepted, Connection, Endpoint, EndpointId,
-    IncomingAddr, LinkError, RelayUrl,
+    accept_frame_stream, accept_one, read_frame, write_frame, Accepted, Connection, Endpoint,
+    LinkError,
 };
 use cerulion_pairing::format::PublicKey;
 use cerulion_pairing::verify::TrustStore;
@@ -42,7 +42,7 @@ use crate::wire::WirePlane;
 /// Cap on the skeleton control-frame handshake (hello + reply are tiny).
 const MAX_HELLO_LEN: usize = 4096;
 
-/// Deadline for incoming TLS and, separately, the skeleton control-frame handshake
+/// Per-connection deadline for the whole skeleton control-frame handshake
 /// (accept the bidi stream + read the hello + write the decision + drain to
 /// EOF). A peer that completes the QUIC handshake then STALLS must not hold the
 /// spawned task + connection indefinitely (an unauthenticated resource-hold DoS
@@ -50,258 +50,11 @@ const MAX_HELLO_LEN: usize = 4096;
 /// generous for a hello+reply even over a relay; the ops and wire planes' protocols
 /// carry their own tighter budgets.
 ///
-/// At most 32 TLS handshakes are pending, and arrivals other than paired relay
-/// keys fill at most 24 of them. Unvalidated addresses are retried from half
-/// capacity. A paired relay key answers one Retry, which travels over the relay
-/// to the key's holder, before it takes a slot. Validated IPs and paired relay
-/// keys hold at most four slots each, unpaired relay arrivals share eight per
-/// URL and custom transports share four. Established connections have their own
-/// protocol deadlines.
+/// NOTE: this bounds each connection's HANDSHAKE, not the
+/// GLOBAL number of concurrent connections. A global concurrency cap (a bounded
+/// semaphore acquired before `spawn`, released on the handler's completion) is a
+/// defensible additional guard and is not implemented.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Bound unauthenticated work without serializing one peer ahead of safety ops.
-const MAX_PENDING_HANDSHAKES: usize = 32;
-/// Slots an arrival that is not a paired relay key may fill. The slots above
-/// it, up to [`MAX_PENDING_HANDSHAKES`], are a reserve only paired relay keys
-/// can take.
-const UNPAIRED_PENDING: usize = 24;
-const PER_SOURCE_PENDING: usize = 4;
-const PER_UNPAIRED_RELAY_PENDING: usize = 8;
-
-/// The admission cap that refused an arrival. Each cap has its own failure
-/// regime ([`AdmissionLatches`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Cap {
-    Global,
-    UnpairedShare,
-    Ip,
-    UnpairedRelay,
-    PairedRelay,
-    Custom,
-}
-
-impl Cap {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Global => "global",
-            Self::UnpairedShare => "unpaired_share",
-            Self::Ip => "ip",
-            Self::UnpairedRelay => "unpaired_relay",
-            Self::PairedRelay => "paired_relay",
-            Self::Custom => "custom",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
-    Admit,
-    /// Address validation under pressure: an unvalidated arrival once half the
-    /// slots are pending, below the unpaired share.
-    Retry,
-    /// An unvalidated arrival under a paired relay key. iroh reads that key from
-    /// the source address, which an IP datagram can forge, so the arrival takes
-    /// no slot until it returns the Retry token. The Retry goes out over the
-    /// relay, so only the key's holder receives it.
-    KeyRetry,
-    Refuse(Cap),
-}
-
-// Retry must engage before the unpaired share fills, and the share must leave
-// a reserve below the global cap.
-const _: () = assert!(
-    MAX_PENDING_HANDSHAKES / 2 < UNPAIRED_PENDING && UNPAIRED_PENDING < MAX_PENDING_HANDSHAKES
-);
-
-/// The global cap, the paired key Retry, the unpaired share (paired relay keys
-/// exempt), address Retry, then the per-IP cap. `ip_pending` is the count of
-/// the arrival's validated IP, zero for every other source.
-fn handshake_admission(
-    pending: usize,
-    ip_pending: usize,
-    validated: bool,
-    paired: bool,
-) -> Admission {
-    if pending >= MAX_PENDING_HANDSHAKES {
-        Admission::Refuse(Cap::Global)
-    } else if paired && !validated {
-        Admission::KeyRetry
-    } else if !paired && pending >= UNPAIRED_PENDING {
-        Admission::Refuse(Cap::UnpairedShare)
-    } else if !validated && pending >= MAX_PENDING_HANDSHAKES / 2 {
-        Admission::Retry
-    } else if validated && ip_pending >= PER_SOURCE_PENDING {
-        Admission::Refuse(Cap::Ip)
-    } else {
-        Admission::Admit
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SourceKey {
-    Ip(std::net::IpAddr),
-    UnpairedRelay(RelayUrl),
-    PairedRelay(EndpointId),
-    Custom,
-}
-
-fn handshake_source(
-    address: IncomingAddr,
-    validated: bool,
-    paired: impl Fn(&EndpointId) -> bool,
-) -> Option<SourceKey> {
-    match address {
-        IncomingAddr::Ip(address) => validated.then_some(SourceKey::Ip(address.ip())),
-        IncomingAddr::Relay { url, endpoint_id } => Some(if paired(&endpoint_id) {
-            SourceKey::PairedRelay(endpoint_id)
-        } else {
-            SourceKey::UnpairedRelay(url)
-        }),
-        IncomingAddr::Custom(_) => Some(SourceKey::Custom),
-        _ => Some(SourceKey::Custom),
-    }
-}
-
-impl SourceKey {
-    fn cap(&self) -> Cap {
-        match self {
-            Self::Ip(_) => Cap::Ip,
-            Self::UnpairedRelay(_) => Cap::UnpairedRelay,
-            Self::PairedRelay(_) => Cap::PairedRelay,
-            Self::Custom => Cap::Custom,
-        }
-    }
-
-    /// Pending handshakes this source may hold.
-    fn limit(&self) -> usize {
-        match self {
-            Self::UnpairedRelay(_) => PER_UNPAIRED_RELAY_PENDING,
-            Self::Ip(_) | Self::PairedRelay(_) | Self::Custom => PER_SOURCE_PENDING,
-        }
-    }
-}
-
-/// Pending handshakes already held by `source`. A paired relay key never reads
-/// the count of its relay URL.
-fn pending_from(sources: &indexmap::IndexMap<SourceKey, u8>, source: Option<&SourceKey>) -> usize {
-    source
-        .and_then(|key| sources.get(key))
-        .map_or(0, |count| usize::from(*count))
-}
-
-fn source_admission(
-    pending: usize,
-    pending_from_source: usize,
-    validated: bool,
-    source: Option<&SourceKey>,
-) -> Admission {
-    let ip_pending = if matches!(source, Some(SourceKey::Ip(_))) {
-        pending_from_source
-    } else {
-        0
-    };
-    let paired = matches!(source, Some(SourceKey::PairedRelay(_)));
-    match handshake_admission(pending, ip_pending, validated, paired) {
-        Admission::Admit => match source {
-            Some(
-                source @ (SourceKey::UnpairedRelay(_)
-                | SourceKey::PairedRelay(_)
-                | SourceKey::Custom),
-            ) if pending_from_source >= source.limit() => Admission::Refuse(source.cap()),
-            _ => Admission::Admit,
-        },
-        admission => admission,
-    }
-}
-
-/// Whether an admission or completion at `pending` closes the global,
-/// unpaired-share, address-retry and handshake-failure regimes: only below half
-/// capacity.
-fn shared_regimes_close(pending: usize) -> bool {
-    pending < MAX_PENDING_HANDSHAKES / 2
-}
-
-/// The refusal regimes an admitted arrival closes, given the pending counts
-/// before it. The shared regimes close only below half capacity, and the
-/// arrival's source-class regime only while every source of that class holds
-/// less than half its own limit, so arrivals that refill full buckets, from one
-/// source or several, never close the regime those buckets hold open.
-fn closed_regimes(
-    pending: usize,
-    source: Option<&SourceKey>,
-    sources: &indexmap::IndexMap<SourceKey, u8>,
-) -> [Option<Cap>; 3] {
-    let shared = shared_regimes_close(pending);
-    let class = source.map(SourceKey::cap).filter(|cap| {
-        sources
-            .iter()
-            .filter(|(key, _)| key.cap() == *cap)
-            .all(|(key, count)| usize::from(*count) < key.limit() / 2)
-    });
-    [
-        shared.then_some(Cap::Global),
-        shared.then_some(Cap::UnpairedShare),
-        class,
-    ]
-}
-
-/// One failure regime per admission cap, so one cap's refusals never close or
-/// swallow another's.
-#[derive(Default)]
-struct AdmissionLatches {
-    global: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-    unpaired_share: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-    ip: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-    unpaired_relay: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-    paired_relay: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-    custom: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-}
-
-impl AdmissionLatches {
-    fn latch(
-        &mut self,
-        cap: Cap,
-    ) -> &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch {
-        match cap {
-            Cap::Global => &mut self.global,
-            Cap::UnpairedShare => &mut self.unpaired_share,
-            Cap::Ip => &mut self.ip,
-            Cap::UnpairedRelay => &mut self.unpaired_relay,
-            Cap::PairedRelay => &mut self.paired_relay,
-            Cap::Custom => &mut self.custom,
-        }
-    }
-
-    fn refused(
-        &mut self,
-        cap: Cap,
-    ) -> cerulion_core::transport::failure_regime_latch::RegimeDecision {
-        self.latch(cap).on_failure()
-    }
-
-    fn admitted(&mut self, cap: Cap) -> Option<u64> {
-        self.latch(cap).on_success()
-    }
-
-    fn total(&mut self, cap: Cap) -> u64 {
-        self.latch(cap).total_failures()
-    }
-}
-
-fn release_handshake_source(
-    id: tokio::task::Id,
-    task_sources: &mut indexmap::IndexMap<tokio::task::Id, SourceKey>,
-    sources: &mut indexmap::IndexMap<SourceKey, u8>,
-) {
-    if let Some(source) = task_sources.shift_remove(&id) {
-        if let Some(count) = sources.get_mut(&source) {
-            *count -= 1;
-            if *count == 0 {
-                sources.shift_remove(&source);
-            }
-        }
-    }
-}
 
 /// Build the daemon from config and serve until `shutdown` resolves (or the
 /// endpoint closes). `shutdown` is dropped as soon as the accept loop stops,
@@ -439,46 +192,15 @@ pub(crate) async fn serve_core(
     // in flight ends when the planes stop.
     let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
     let rcpd_estop = ops_host.rcpd_estop();
-    let serving_holds = if server_name == DAEMON_SERVER_NAME {
-        let root = files
-            .beacon_facts_file
-            .parent()
-            .and_then(std::path::Path::parent)
-            .ok_or_else(|| RemotedError::Config("remote state has no parent directory".into()))?;
-        let path = crate::serving_hold::fence_path(root);
-        let holds = crate::serving_hold::ServingHolds::open(&path)
-            .map_err(|error| RemotedError::Ops(format!("opening remote serving hold: {error}")))?;
-        {
-            let lease = estop_lease.clone().ok_or_else(|| {
-                RemotedError::Config("owned daemon is missing its e-stop idle hold source".into())
-            })?;
-            holds
-                .register_source(Arc::new(move || lease.holds()))
-                .map_err(|error| RemotedError::Ops(format!("registering e-stop hold: {error}")))?;
-        }
-        if let Some(rcpd) = rcpd_estop.clone() {
-            holds
-                .register_source(Arc::new(move || rcpd.is_owing()))
-                .map_err(|error| {
-                    RemotedError::Ops(format!("registering owed delivery hold: {error}"))
-                })?;
-        }
-        Some(holds)
-    } else {
-        None
-    };
-    let ops = Arc::new(
-        OpsServing::for_host(
-            ops_host,
-            shared,
-            sessions,
-            access_clock.clone(),
-            &files.receipt_file,
-            files.log_root.clone(),
-            server_name,
-        )?
-        .with_serving_holds(serving_holds),
-    );
+    let ops = Arc::new(OpsServing::for_host(
+        ops_host,
+        shared,
+        sessions,
+        access_clock.clone(),
+        &files.receipt_file,
+        files.log_root.clone(),
+        server_name,
+    )?);
 
     // Install the SAME `PairingAuthorizer` as the wire plane's per-demand
     // authorization gate (this line is the wiring a daemon-level test pins). The serving
@@ -674,83 +396,15 @@ pub async fn serve_planes(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     let mut shutdown = Box::pin(shutdown);
-    let holds = ops.as_ref().and_then(|ops| ops.serving_holds()).cloned();
-    let mut refresh = tokio::time::interval(Duration::from_millis(100));
-    let mut refresh_failures =
-        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    let mut admission_failures =
-        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    let mut handshakes = tokio::task::JoinSet::<Result<Accepted, LinkError>>::new();
-    let mut handshake_admission_failures = AdmissionLatches::default();
-    let mut handshake_failures =
-        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    let mut retry_unavailable =
-        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    let mut handshake_retry_failures =
-        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    let mut sources = indexmap::IndexMap::<SourceKey, u8>::new();
-    let mut task_sources = indexmap::IndexMap::<tokio::task::Id, SourceKey>::new();
     let closed_on_its_own = loop {
         tokio::select! {
-            biased;
             _ = &mut shutdown => break false,
-            _ = refresh.tick() => {
-                if let Some(holds) = &holds {
-                    match holds.refresh() {
-                        Ok(()) => if let Some(suppressed) = refresh_failures.on_success() { tracing::info!(suppressed, "remote serving hold refresh recovered"); },
-                        Err(error) => {
-                            use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-                            match refresh_failures.on_failure() {
-                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::error!(error = %error, total_failures = refresh_failures.total_failures(), "remote serving hold refresh failed"),
-                                RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = refresh_failures.total_failures(), "remote serving hold refresh failed"),
-                            }
-                        }
-                    }
-                }
-            },
-            // join_next is cancellation-safe; a tick cannot lose a completed
-            // handshake. Deliver it before consuming another new arrival.
-            completed = handshakes.join_next_with_id(), if !handshakes.is_empty() => {
-                let accepted = match completed {
-                    Some(Ok((id, accepted))) => {
-                        release_handshake_source(id, &mut task_sources, &mut sources);
-                        accepted
-                    }
-                    Some(Err(error)) => {
-                        release_handshake_source(error.id(), &mut task_sources, &mut sources);
-                        tracing::error!(error = %error, "remote handshake worker failed; continuing to serve");
-                        continue;
-                    }
-                    None => continue,
-                };
+            accepted = accept_one(endpoint) => {
                 match accepted {
-                    Ok(a) => {
-                        // Below half capacity only, so completions interleaved
-                        // with a flood of failures cannot re-arm its loud line.
-                        if shared_regimes_close(handshakes.len()) {
-                            if let Some(suppressed) = handshake_failures.on_success() {
-                                tracing::info!(suppressed, "remote TLS handshake completion recovered");
-                            }
-                        }
-                        let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
-                            match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
-                                Ok(hold) => {
-                                    if let Some(suppressed) = admission_failures.on_success() {
-                                        tracing::info!(suppressed, "remote serving admission recovered");
-                                    }
-                                    hold
-                                },
-                                Err(error) => {
-                                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-                                    match admission_failures.on_failure() {
-                                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
-                                        RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
-                                    }
-                                    a.connection.close(0u32.into(), b"remote server is stopping");
-                                    continue;
-                                }
-                            }
-                        } else { None };
+                    // The endpoint's accept stream ended → the daemon is closing.
+                    // This is the ONLY per-accept signal that terminates the loop.
+                    Ok(None) => break true,
+                    Ok(Some(a)) => {
                         if let Some(pull) = &pull {
                             pull.note_accept(a.remote_id.as_bytes());
                         }
@@ -759,7 +413,6 @@ pub async fn serve_planes(
                         let wire = wire.clone();
                         let rcp = rcp.clone();
                         tokio::spawn(async move {
-                            let _hold = hold;
                             handle_accepted_planes(a, classify, ops, wire, rcp).await;
                         });
                     }
@@ -767,92 +420,18 @@ pub async fn serve_planes(
                     // sending a bogus ALPN, a TLS failure, a peer aborting
                     // mid-handshake). This is per-connection, NOT the endpoint
                     // closing — an unauthenticated peer must NEVER be able to
-                    // terminate the robot's always-on remote plane. Log through the
-                    // handshake failure latch and keep serving. Only the endpoint
-                    // accept stream ending below terminates serving; one failed
-                    // handshake cannot do that.
+                    // terminate the robot's always-on remote plane. Log loudly and
+                    // keep serving. `accept_one` returns `Ok(None)` (handled above)
+                    // when the endpoint itself is gone, so this arm never hot-loops.
                     Err(e) => {
-                        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-                        match handshake_failures.on_failure() {
-                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %e, total_failures = handshake_failures.total_failures(), "remote TLS handshake failed; continuing to serve"),
-                            RegimeDecision::Suppressed { .. } => tracing::debug!(error = %e, total_failures = handshake_failures.total_failures(), "remote TLS handshake failed; continuing to serve"),
-                        }
+                        tracing::warn!(
+                            error = %e,
+                            "cerulion_remoted: an inbound connection failed to complete its \
+                             handshake; dropping it and continuing to serve (the accept loop is \
+                             NOT terminated by one bad/unauthenticated peer)"
+                        );
                         continue;
                     }
-                }
-            }
-            // Endpoint::accept has not consumed an Incoming until it resolves;
-            // cancelling this wait on a refresh tick is safe. TLS completes in
-            // bounded independent workers so a stalled peer cannot block ops.
-            incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else { break true; };
-                let validated = incoming.remote_addr_validated();
-                let source = handshake_source(incoming.remote_addr(), validated, |id| {
-                    classify.is_paired_and_allowed(id.as_bytes())
-                });
-                let pending_from_source = pending_from(&sources, source.as_ref());
-                use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-                let admission = source_admission(handshakes.len(), pending_from_source, validated, source.as_ref());
-                match admission {
-                    Admission::Refuse(cap) => {
-                        match handshake_admission_failures.refused(cap) {
-                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(pending = handshakes.len(), cap = cap.as_str(), total_failures = handshake_admission_failures.total(cap), "remote handshake refused at its admission cap"),
-                            RegimeDecision::Suppressed { .. } => tracing::debug!(pending = handshakes.len(), cap = cap.as_str(), total_failures = handshake_admission_failures.total(cap), "remote handshake refused at its admission cap"),
-                        }
-                        incoming.refuse();
-                        continue;
-                    }
-                    Admission::Retry | Admission::KeyRetry => {
-                        // A paired key's Retry is its normal path, not pressure,
-                        // so only address retry feeds the retry latch.
-                        if admission == Admission::Retry {
-                            match handshake_retry_failures.on_failure() {
-                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::debug!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
-                                RegimeDecision::Suppressed { .. } => tracing::trace!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
-                            }
-                        }
-                        match incoming.retry() {
-                            Ok(()) => {
-                                if let Some(suppressed) = retry_unavailable.on_success() {
-                                    tracing::info!(suppressed, "remote handshake address retry became available");
-                                }
-                            }
-                            Err(error) => {
-                                match retry_unavailable.on_failure() {
-                                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, pending = handshakes.len(), total_failures = retry_unavailable.total_failures(), "remote handshake retry unavailable; refusing incoming connection"),
-                                    RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, pending = handshakes.len(), total_failures = retry_unavailable.total_failures(), "remote handshake retry unavailable; refusing incoming connection"),
-                                }
-                                error.into_incoming().refuse();
-                            }
-                        }
-                        continue;
-                    }
-                    Admission::Admit => {}
-                }
-                for cap in closed_regimes(handshakes.len(), source.as_ref(), &sources).into_iter().flatten() {
-                    if let Some(suppressed) = handshake_admission_failures.admitted(cap) {
-                        tracing::info!(suppressed, cap = cap.as_str(), "remote handshake admission recovered");
-                    }
-                }
-                if shared_regimes_close(handshakes.len()) {
-                    if let Some(suppressed) = handshake_retry_failures.on_success() {
-                        tracing::debug!(suppressed, "remote handshake address retry recovered");
-                    }
-                }
-                let task = handshakes.spawn(async move {
-                    let connection = tokio::time::timeout(HANDSHAKE_DEADLINE, async { incoming.await })
-                        .await
-                        .map_err(|error| LinkError::Accept(Box::new(error)))?
-                        .map_err(|error| LinkError::Accept(Box::new(error)))?;
-                    Ok(Accepted {
-                        remote_id: connection.remote_id(),
-                        alpn: connection.alpn().to_vec(),
-                        connection,
-                    })
-                });
-                if let Some(source) = source {
-                    *sources.entry(source.clone()).or_insert(0) += 1;
-                    task_sources.insert(task.id(), source);
                 }
             }
         }
@@ -861,7 +440,6 @@ pub async fn serve_planes(
     // learns the accept loop stopped even when a log write blocks; the binary
     // arms its hard-exit deadline then.
     drop(shutdown);
-    handshakes.shutdown().await;
     if closed_on_its_own {
         tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
     } else {
@@ -1216,445 +794,6 @@ pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, Remot
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn handshake_admission_reserves_capacity_at_every_boundary() {
-        for (pending, from_source, validated, paired, expected) in [
-            (0, 0, false, false, Admission::Admit),
-            (15, 0, false, false, Admission::Admit),
-            (16, 0, false, false, Admission::Retry),
-            (17, 0, false, false, Admission::Retry),
-            (23, 4, false, false, Admission::Retry),
-            (24, 0, false, false, Admission::Refuse(Cap::UnpairedShare)),
-            (31, 4, false, false, Admission::Refuse(Cap::UnpairedShare)),
-            (32, 0, false, false, Admission::Refuse(Cap::Global)),
-            (33, 0, false, false, Admission::Refuse(Cap::Global)),
-            (15, 4, false, false, Admission::Admit),
-            (0, 3, true, false, Admission::Admit),
-            (0, 4, true, false, Admission::Refuse(Cap::Ip)),
-            (0, 5, true, false, Admission::Refuse(Cap::Ip)),
-            (16, 3, true, false, Admission::Admit),
-            (23, 3, true, false, Admission::Admit),
-            (24, 0, true, false, Admission::Refuse(Cap::UnpairedShare)),
-            (31, 3, true, false, Admission::Refuse(Cap::UnpairedShare)),
-            (32, 0, true, false, Admission::Refuse(Cap::Global)),
-            (33, 0, true, false, Admission::Refuse(Cap::Global)),
-            (32, 4, true, false, Admission::Refuse(Cap::Global)),
-            (0, 0, false, true, Admission::KeyRetry),
-            (15, 0, false, true, Admission::KeyRetry),
-            (16, 0, false, true, Admission::KeyRetry),
-            (24, 0, false, true, Admission::KeyRetry),
-            (31, 0, false, true, Admission::KeyRetry),
-            (0, 0, true, true, Admission::Admit),
-            (15, 0, true, true, Admission::Admit),
-            (23, 0, true, true, Admission::Admit),
-            (24, 0, true, true, Admission::Admit),
-            (31, 0, true, true, Admission::Admit),
-            (32, 0, true, true, Admission::Refuse(Cap::Global)),
-            (32, 0, false, true, Admission::Refuse(Cap::Global)),
-            (33, 0, true, true, Admission::Refuse(Cap::Global)),
-        ] {
-            assert_eq!(
-                handshake_admission(pending, from_source, validated, paired),
-                expected,
-                "pending {pending}, from source {from_source}, validated {validated}, paired {paired}"
-            );
-        }
-    }
-
-    #[test]
-    fn validated_sources_cannot_claim_another_ips_bucket() {
-        let address = "127.0.0.1:1234".parse().unwrap();
-        assert_eq!(
-            handshake_source(IncomingAddr::Ip(address), false, |_| false),
-            None
-        );
-        let ip = handshake_source(IncomingAddr::Ip(address), true, |_| false).unwrap();
-        assert_eq!(ip, SourceKey::Ip("127.0.0.1".parse().unwrap()));
-        let relay = SourceKey::UnpairedRelay("https://relay.example.invalid".parse().unwrap());
-        for (source, bound, cap) in [
-            (&relay, 8, Cap::UnpairedRelay),
-            (&SourceKey::Custom, 4, Cap::Custom),
-            (&ip, 4, Cap::Ip),
-        ] {
-            assert_eq!(
-                source_admission(15, bound - 1, true, Some(source)),
-                Admission::Admit
-            );
-            assert_eq!(
-                source_admission(15, bound, true, Some(source)),
-                Admission::Refuse(cap)
-            );
-            assert_eq!(
-                source_admission(15, bound + 1, true, Some(source)),
-                Admission::Refuse(cap)
-            );
-        }
-        assert_eq!(source_admission(15, 100, false, None), Admission::Admit);
-        assert_eq!(source_admission(16, 0, false, None), Admission::Retry);
-        // The shared caps and Retry precede every per-source bucket.
-        for (pending, from_source, validated, source, expected) in [
-            (16, 8, false, &relay, Admission::Retry),
-            (24, 8, true, &relay, Admission::Refuse(Cap::UnpairedShare)),
-            (16, 4, true, &ip, Admission::Refuse(Cap::Ip)),
-            (23, 4, true, &ip, Admission::Refuse(Cap::Ip)),
-            (24, 4, true, &ip, Admission::Refuse(Cap::UnpairedShare)),
-            (32, 4, true, &ip, Admission::Refuse(Cap::Global)),
-            (
-                24,
-                4,
-                true,
-                &SourceKey::Custom,
-                Admission::Refuse(Cap::UnpairedShare),
-            ),
-        ] {
-            assert_eq!(
-                source_admission(pending, from_source, validated, Some(source)),
-                expected,
-                "pending {pending}, from source {from_source}, validated {validated}, {source:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn paired_relay_keys_are_independent_of_the_unpaired_url_bucket() {
-        let url: RelayUrl = "http://127.0.0.1:1234".parse().unwrap();
-        let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
-        let address = IncomingAddr::Relay {
-            url: url.clone(),
-            endpoint_id: key,
-        };
-        let paired = handshake_source(address.clone(), false, |id| *id == key).unwrap();
-        assert_eq!(paired, SourceKey::PairedRelay(key));
-        let unpaired = handshake_source(address, false, |_| false).unwrap();
-        assert_eq!(unpaired, SourceKey::UnpairedRelay(url));
-        // Eight stranger handshakes fill the URL bucket: the next stranger is
-        // refused, and the paired key on the same relay still reads zero.
-        let mut sources = indexmap::IndexMap::new();
-        sources.insert(unpaired.clone(), 8u8);
-        assert_eq!(pending_from(&sources, Some(&unpaired)), 8);
-        assert_eq!(pending_from(&sources, Some(&paired)), 0);
-        assert_eq!(pending_from(&sources, None), 0);
-        assert_eq!(
-            source_admission(
-                8,
-                pending_from(&sources, Some(&unpaired)),
-                false,
-                Some(&unpaired)
-            ),
-            Admission::Refuse(Cap::UnpairedRelay)
-        );
-        assert_eq!(
-            source_admission(
-                8,
-                pending_from(&sources, Some(&paired)),
-                true,
-                Some(&paired)
-            ),
-            Admission::Admit
-        );
-        // The reserve: at 24 pending every other source is refused, while a
-        // paired key is admitted until the global cap.
-        let ip = SourceKey::Ip("127.0.0.1".parse().unwrap());
-        for source in [&unpaired, &ip, &SourceKey::Custom] {
-            assert_eq!(
-                source_admission(24, 0, true, Some(source)),
-                Admission::Refuse(Cap::UnpairedShare)
-            );
-            assert_eq!(
-                source_admission(32, 0, true, Some(source)),
-                Admission::Refuse(Cap::Global)
-            );
-        }
-        assert_eq!(
-            source_admission(24, 0, false, None),
-            Admission::Refuse(Cap::UnpairedShare)
-        );
-        assert_eq!(
-            source_admission(24, 0, true, Some(&paired)),
-            Admission::Admit
-        );
-        assert_eq!(
-            source_admission(31, 3, true, Some(&paired)),
-            Admission::Admit
-        );
-        assert_eq!(
-            source_admission(31, 4, true, Some(&paired)),
-            Admission::Refuse(Cap::PairedRelay)
-        );
-        for (source, count, validated, expected) in [
-            (&unpaired, 7, false, Admission::Admit),
-            (&unpaired, 8, false, Admission::Refuse(Cap::UnpairedRelay)),
-            (&unpaired, 9, false, Admission::Refuse(Cap::UnpairedRelay)),
-            (&paired, 0, true, Admission::Admit),
-            (&paired, 3, true, Admission::Admit),
-            (&paired, 4, true, Admission::Refuse(Cap::PairedRelay)),
-            (&paired, 5, true, Admission::Refuse(Cap::PairedRelay)),
-            (&paired, 0, false, Admission::KeyRetry),
-            (&paired, 4, false, Admission::KeyRetry),
-        ] {
-            assert_eq!(
-                source_admission(8, count, validated, Some(source)),
-                expected,
-                "{source:?} at {count}, validated {validated}"
-            );
-        }
-        assert_eq!(
-            source_admission(16, 0, false, Some(&paired)),
-            Admission::KeyRetry
-        );
-        assert_eq!(
-            source_admission(16, 4, false, Some(&paired)),
-            Admission::KeyRetry
-        );
-        assert_eq!(
-            source_admission(32, 4, true, Some(&paired)),
-            Admission::Refuse(Cap::Global)
-        );
-        assert_eq!(
-            source_admission(16, 0, true, Some(&paired)),
-            Admission::Admit
-        );
-        assert_eq!(
-            source_admission(32, 0, true, Some(&paired)),
-            Admission::Refuse(Cap::Global)
-        );
-    }
-
-    /// An IP datagram whose source is a relay-mapped address reads as an
-    /// unvalidated relay arrival under the key that address maps to. However many such
-    /// arrivals come, at any pending count and any bucket count, none takes a
-    /// slot: each gets a Retry that only the key's holder receives.
-    #[test]
-    fn a_forged_relay_source_never_takes_a_paired_key_slot() {
-        let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
-        let forged = IncomingAddr::Relay {
-            url: "https://relay.example.invalid".parse().unwrap(),
-            endpoint_id: key,
-        };
-        let source = handshake_source(forged, false, |id| *id == key).unwrap();
-        assert_eq!(source, SourceKey::PairedRelay(key));
-        for pending in 0..=33 {
-            for from_source in 0..=5 {
-                let expected = if pending >= 32 {
-                    Admission::Refuse(Cap::Global)
-                } else {
-                    Admission::KeyRetry
-                };
-                assert_eq!(
-                    source_admission(pending, from_source, false, Some(&source)),
-                    expected,
-                    "pending {pending}, from source {from_source}"
-                );
-            }
-        }
-        // The same key, validated by the returned token, takes its bucket.
-        assert_eq!(
-            source_admission(0, 0, true, Some(&source)),
-            Admission::Admit
-        );
-        assert_eq!(
-            source_admission(0, 3, true, Some(&source)),
-            Admission::Admit
-        );
-        assert_eq!(
-            source_admission(0, 4, true, Some(&source)),
-            Admission::Refuse(Cap::PairedRelay)
-        );
-    }
-
-    #[test]
-    fn an_admission_closes_only_the_regimes_it_ends() {
-        let relay = SourceKey::UnpairedRelay("https://relay.example.invalid".parse().unwrap());
-        let other_relay =
-            SourceKey::UnpairedRelay("https://other.example.invalid".parse().unwrap());
-        let paired = SourceKey::PairedRelay(iroh::SecretKey::from_bytes(&[7; 32]).public());
-        let other_paired = SourceKey::PairedRelay(iroh::SecretKey::from_bytes(&[8; 32]).public());
-        let ip = SourceKey::Ip("127.0.0.1".parse().unwrap());
-        let other_ip = SourceKey::Ip("127.0.0.2".parse().unwrap());
-        let both = [Some(Cap::Global), Some(Cap::UnpairedShare)];
-        type Held<'a> = &'a [(&'a SourceKey, u8)];
-        type Row<'a> = (usize, Option<&'a SourceKey>, Held<'a>, [Option<Cap>; 3]);
-        let none: Held = &[];
-        let rows: &[Row] = &[
-            (0, None, none, [both[0], both[1], None]),
-            (15, None, none, [both[0], both[1], None]),
-            (16, None, none, [None, None, None]),
-            (
-                15,
-                Some(&relay),
-                &[(&relay, 3)],
-                [both[0], both[1], Some(Cap::UnpairedRelay)],
-            ),
-            (15, Some(&relay), &[(&relay, 4)], [both[0], both[1], None]),
-            (20, Some(&relay), &[(&relay, 7)], [None, None, None]),
-            (
-                20,
-                Some(&relay),
-                none,
-                [None, None, Some(Cap::UnpairedRelay)],
-            ),
-            (20, Some(&relay), &[(&other_relay, 4)], [None, None, None]),
-            (
-                20,
-                Some(&relay),
-                &[(&other_relay, 3)],
-                [None, None, Some(Cap::UnpairedRelay)],
-            ),
-            (
-                20,
-                Some(&paired),
-                &[(&paired, 1)],
-                [None, None, Some(Cap::PairedRelay)],
-            ),
-            (20, Some(&paired), &[(&paired, 2)], [None, None, None]),
-            (20, Some(&paired), &[(&other_paired, 2)], [None, None, None]),
-            (
-                20,
-                Some(&paired),
-                &[(&other_paired, 1)],
-                [None, None, Some(Cap::PairedRelay)],
-            ),
-            (0, Some(&ip), &[(&ip, 1)], [both[0], both[1], Some(Cap::Ip)]),
-            (0, Some(&ip), &[(&ip, 2)], [both[0], both[1], None]),
-            (0, Some(&ip), &[(&ip, 3)], [both[0], both[1], None]),
-            // Another IP still holding a full bucket keeps the IP regime open.
-            (0, Some(&ip), &[(&other_ip, 4)], [both[0], both[1], None]),
-            (
-                0,
-                Some(&ip),
-                &[(&other_ip, 1)],
-                [both[0], both[1], Some(Cap::Ip)],
-            ),
-            // Other classes never hold a class regime open.
-            (
-                0,
-                Some(&ip),
-                &[(&relay, 8), (&paired, 4)],
-                [both[0], both[1], Some(Cap::Ip)],
-            ),
-            (
-                0,
-                Some(&SourceKey::Custom),
-                &[(&SourceKey::Custom, 1)],
-                [both[0], both[1], Some(Cap::Custom)],
-            ),
-            (
-                0,
-                Some(&SourceKey::Custom),
-                &[(&SourceKey::Custom, 2)],
-                [both[0], both[1], None],
-            ),
-        ];
-        for (pending, source, held, expected) in rows {
-            let sources: indexmap::IndexMap<SourceKey, u8> = held
-                .iter()
-                .map(|(key, count)| ((*key).clone(), *count))
-                .collect();
-            assert_eq!(
-                closed_regimes(*pending, *source, &sources),
-                *expected,
-                "pending {pending}, source {source:?}, held {held:?}"
-            );
-        }
-        assert!(shared_regimes_close(15));
-        assert!(!shared_regimes_close(16));
-    }
-
-    #[test]
-    fn an_admitted_source_only_recovers_its_own_cap_regime() {
-        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-        let mut latches = AdmissionLatches::default();
-        // An admission with no open regime recovers nothing.
-        assert_eq!(latches.admitted(Cap::Global), None);
-        assert_eq!(latches.admitted(Cap::UnpairedShare), None);
-        for (cap, name) in [
-            (Cap::Global, "global"),
-            (Cap::UnpairedShare, "unpaired_share"),
-            (Cap::Ip, "ip"),
-            (Cap::UnpairedRelay, "unpaired_relay"),
-            (Cap::PairedRelay, "paired_relay"),
-            (Cap::Custom, "custom"),
-        ] {
-            assert_eq!(cap.as_str(), name);
-            assert_eq!(latches.refused(cap), RegimeDecision::Loud);
-            assert_eq!(
-                latches.refused(cap),
-                RegimeDecision::Suppressed { suppressed: 1 }
-            );
-        }
-        assert_eq!(latches.admitted(Cap::PairedRelay), Some(1));
-        assert_eq!(
-            latches.refused(Cap::UnpairedRelay),
-            RegimeDecision::Suppressed { suppressed: 2 }
-        );
-        assert_eq!(
-            latches.refused(Cap::Ip),
-            RegimeDecision::Suppressed { suppressed: 2 }
-        );
-        assert_eq!(
-            latches.refused(Cap::Global),
-            RegimeDecision::Suppressed { suppressed: 2 }
-        );
-        assert_eq!(
-            latches.refused(Cap::UnpairedShare),
-            RegimeDecision::Suppressed { suppressed: 2 }
-        );
-        assert_eq!(latches.admitted(Cap::UnpairedRelay), Some(2));
-        assert_eq!(latches.refused(Cap::UnpairedRelay), RegimeDecision::Loud);
-        assert_eq!(latches.refused(Cap::PairedRelay), RegimeDecision::Loud);
-        assert_eq!(latches.admitted(Cap::Global), Some(2));
-        assert_eq!(latches.admitted(Cap::Custom), Some(1));
-        for (cap, total) in [
-            (Cap::Global, 3),
-            (Cap::UnpairedShare, 3),
-            (Cap::Ip, 3),
-            (Cap::UnpairedRelay, 4),
-            (Cap::PairedRelay, 3),
-            (Cap::Custom, 2),
-        ] {
-            assert_eq!(latches.total(cap), total, "{cap:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn completed_and_failed_handshakes_release_source_counts() {
-        let source = SourceKey::Custom;
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut ids = indexmap::IndexMap::new();
-        let mut counts = indexmap::IndexMap::new();
-        let success = tasks.spawn(async { 1 });
-        let failure = tasks.spawn(async { panic!("handshake task failed") });
-        let pending = tasks.spawn(std::future::pending::<i32>());
-        for task in [&success, &failure, &pending] {
-            ids.insert(task.id(), source.clone());
-        }
-        counts.insert(source.clone(), 3);
-        pending.abort();
-        let mut successes = 0;
-        let mut failures = 0;
-        while let Some(result) = tasks.join_next_with_id().await {
-            let id = match result {
-                Ok((id, 1)) => {
-                    successes += 1;
-                    id
-                }
-                Ok(_) => panic!("unexpected handshake value"),
-                Err(error) => {
-                    failures += 1;
-                    error.id()
-                }
-            };
-            release_handshake_source(id, &mut ids, &mut counts);
-            assert_eq!(ids.len(), tasks.len());
-            assert_eq!(
-                counts.values().map(|n| usize::from(*n)).sum::<usize>(),
-                tasks.len()
-            );
-        }
-        assert_eq!((successes, failures), (1, 2));
-        assert!(ids.is_empty() && counts.is_empty());
-    }
 
     #[test]
     fn matching_store_device_key_is_accepted() {

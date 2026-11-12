@@ -96,8 +96,6 @@ struct BagdGuard {
     observed: std::cell::RefCell<Vec<ObservedProcess>>,
 }
 #[cfg(target_os = "linux")]
-const RECORDER_PROCESS_PATTERN: &str = "bagd --out (/[^[:space:]]*/)?recordings/apdemo_";
-#[cfg(target_os = "linux")]
 impl BagdGuard {
     fn new(supervisor_pid: u32) -> Self {
         Self {
@@ -149,15 +147,7 @@ impl BagdGuard {
                 {
                     continue; // never refresh a previously captured PID's identity
                 }
-                let bag_path = Path::new(bag);
-                let recording_dir = root.join("recordings");
-                let private_directory = bag_path.parent() == Some(Path::new("recordings"))
-                    || bag_path.parent() == Some(recording_dir.as_path());
-                let recorder_file = bag_path.file_name().and_then(|name| name.to_str());
-                if !private_directory
-                    || !recorder_file
-                        .is_some_and(|name| name.starts_with("apdemo_") && name.ends_with(".mcap"))
-                {
+                if !bag.starts_with("recordings/apdemo_") || !bag.ends_with(".mcap") {
                     continue;
                 }
                 let Some(identity) = process_identity(pid) else {
@@ -177,12 +167,8 @@ impl BagdGuard {
                 }
                 let command = String::from_utf8_lossy(&command.stdout);
                 let args: Vec<_> = command.split_whitespace().collect();
-                let absolute_bag = root.join(bag_path);
-                let absolute_bag = absolute_bag.to_string_lossy();
-                if args.windows(3).any(|args| {
-                    args == ["bagd", "--out", bag]
-                        || args == ["bagd", "--out", absolute_bag.as_ref()]
-                }) && process_identity(pid) == Some(identity)
+                if args.windows(3).any(|args| args == ["bagd", "--out", bag])
+                    && process_identity(pid) == Some(identity)
                 {
                     let mut observed = self.observed.borrow_mut();
                     if !observed.iter().any(|process| process.pid == pid) {
@@ -220,7 +206,7 @@ impl BagdGuard {
                     "-P",
                     &self.supervisor_pid.to_string(),
                     "-f",
-                    RECORDER_PROCESS_PATTERN,
+                    "bagd --out recordings/apdemo_",
                 ])
                 .output()
                 .map(|output| {
@@ -2128,21 +2114,6 @@ fn assert_two_node_ephemeral_run(terminal: bool) {
     drop(pty);
 
     let log = strip_ansi(&merged_log(&stdout_path, &stderr_path));
-    let displayed_bag = Path::new("recordings").join(bag.file_name().unwrap());
-    assert!(log
-        .lines()
-        .any(|line| { line == format!("recording written to {}", displayed_bag.display()) }));
-    assert!(log.lines().any(|line| {
-        line.contains("spawned bagd recorder")
-            && line.contains(&format!("bag={}", displayed_bag.display()))
-    }));
-    let opened_path_field = format!("path={}", displayed_bag.display());
-    assert!(log.lines().any(|line| {
-        line.contains("bagd opened bag file")
-            && line
-                .split_whitespace()
-                .any(|field| field == opened_path_field)
-    }));
     assert!(
         log.contains("graph running")
             && log.contains("nodes=2")
@@ -2492,79 +2463,6 @@ fn recorder_guard_preserves_logged_live_process_with_wrong_cwd_or_bag() {
             .wait_bounded(Duration::from_secs(5))
             .expect("stop surviving process");
         assert_eq!(status.signal(), Some(libc::SIGINT));
-        child.finish().assert_clean();
-    }
-}
-
-/// Absolute recorder argv remains discoverable through the live parent and
-/// private spawn log. A matching filename outside the private directory is
-/// insufficient even with the exact argv, cwd and a live group leader.
-#[test]
-#[serial]
-#[cfg(target_os = "linux")]
-fn recorder_guard_accepts_owned_absolute_paths_and_refuses_another_directory() {
-    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-    let root = tempfile::tempdir().unwrap();
-    let elsewhere = tempfile::tempdir().unwrap();
-    let root_path = std::fs::canonicalize(root.path()).unwrap();
-    let stdout = root.path().join("supervisor.stdout");
-    let stderr = root.path().join("supervisor.stderr");
-    for (private, live_parent, relative_log) in [
-        (true, true, false),
-        (true, false, false),
-        (false, false, false),
-        (true, false, true),
-        (false, false, true),
-    ] {
-        let directory = if private {
-            root_path.join("recordings")
-        } else {
-            elsewhere.path().join("recordings")
-        };
-        let bag = directory.join("apdemo_owned.mcap");
-        let bag = bag.to_str().unwrap();
-        let mut child = mp_support::ChildGuard::single_process(
-            Command::new("sleep")
-                .arg0(format!("bagd --out {bag}"))
-                .arg("60")
-                .current_dir(&root_path)
-                .process_group(0)
-                .spawn()
-                .expect("spawn owned recorder-named process"),
-        );
-        let pid = child.id();
-        let logged_bag = if relative_log {
-            "recordings/apdemo_owned.mcap"
-        } else {
-            bag
-        };
-        std::fs::write(
-            &stderr,
-            format!("spawned bagd recorder pid={pid} bag={logged_bag}\n"),
-        )
-        .unwrap();
-        let recorder = if live_parent {
-            BagdGuard::new(std::process::id())
-        } else {
-            BagdGuard::for_recording(0, &root_path, &stdout, &stderr)
-        };
-        if private {
-            assert_eq!(recorder.pids(), vec![pid], "owned absolute recorder");
-            drop(recorder);
-            let status = child
-                .wait_bounded(Duration::from_secs(5))
-                .expect("guard stops owned recorder");
-            assert_eq!(status.signal(), Some(libc::SIGKILL));
-        } else {
-            assert!(recorder.pids().is_empty(), "outside private recording dir");
-            drop(recorder);
-            assert!(child.try_wait_noting().unwrap().is_none());
-            send_sigint(pid);
-            let status = child
-                .wait_bounded(Duration::from_secs(5))
-                .expect("stop surviving owned process");
-            assert_eq!(status.signal(), Some(libc::SIGINT));
-        }
         child.finish().assert_clean();
     }
 }

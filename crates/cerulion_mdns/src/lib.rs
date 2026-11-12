@@ -583,51 +583,6 @@ impl Drop for MdnsAdvertiseGuard {
     }
 }
 
-/// Endpoint-key advertisements for direct iroh dialing; these are address hints,
-/// never ownership or pairing evidence. TLS still authenticates the pinned key.
-pub fn browse_iroh_peers(budget: std::time::Duration) -> Vec<(String, std::net::SocketAddr)> {
-    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
-        return Vec::new();
-    };
-    let Ok(receiver) = daemon.browse(CERULION_SERVICE_TYPE) else {
-        let _ = daemon.shutdown();
-        return Vec::new();
-    };
-    let deadline = std::time::Instant::now() + budget;
-    let mut peers = std::collections::BTreeSet::new();
-    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-        let Ok(event) = receiver.recv_timeout(remaining) else {
-            break;
-        };
-        if let mdns_sd::ServiceEvent::ServiceResolved(record) = event {
-            let Some(eid) = record
-                .get_property_val_str("eid")
-                .filter(|eid| is_valid_eid(eid))
-            else {
-                continue;
-            };
-            let Some(port) = record
-                .get_property_val_str("iroh_port")
-                .and_then(|port| port.parse::<u16>().ok())
-                .filter(|port| *port != 0)
-            else {
-                continue;
-            };
-            for address in record.addresses.iter().take(16) {
-                if peers.len() == 4096 {
-                    break;
-                }
-                peers.insert((
-                    eid.to_ascii_lowercase(),
-                    std::net::SocketAddr::new(address.to_ip_addr(), port),
-                ));
-            }
-        }
-    }
-    let _ = daemon.shutdown();
-    peers.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

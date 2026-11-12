@@ -363,7 +363,6 @@ mod tests {
 
     fn rec(run_id: u128, graph: &str, state: RunState) -> RunRecord {
         RunRecord {
-            remote_visible: true,
             run_id,
             supervisor_pid: 100 + run_id as u32,
             run_started_at_ns: 0,

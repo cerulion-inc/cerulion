@@ -1053,11 +1053,6 @@ pub struct BagdArgs {
     #[arg(long)]
     pub out: PathBuf,
 
-    /// Internal graph-recorder handoff: directory spelling for status only.
-    #[arg(long, hide = true)]
-    #[doc(hidden)]
-    pub status_display_dir: Option<PathBuf>,
-
     /// A topic to record by attaching to it while it is live (repeatable;
     /// spelled with its leading `/`). Mutually exclusive with `--topics-json`;
     /// exactly one of the two is required. The channel learns its wire schema
@@ -2296,7 +2291,6 @@ fn bagd_cli_run(args: BagdArgs) -> Result<(), Box<dyn std::error::Error>> {
     config.flush_interval = Duration::from_millis(args.flush_interval_ms);
     config.ready_file = args.ready_file;
     config.status_period = status_period;
-    config.status_display_dir = args.status_display_dir;
     config.schema_wait = Duration::from_millis(args.schema_wait_timeout_ms);
     // The caller's ARM-ORDERING guarantee, recorded verbatim — the
     // recorder never infers it (see the field's doc).
@@ -2687,9 +2681,6 @@ pub struct BagdConfig {
     /// Output bag path (the first file; rotation appends `.<k>` before the
     /// extension).
     pub out: PathBuf,
-    /// Optional presentation directory for `/bagd/status`, independent of file I/O.
-    #[doc(hidden)]
-    pub status_display_dir: Option<PathBuf>,
     /// Topics to tap (≥1).
     pub taps: Vec<TapSpec>,
     /// Scheduler-trace SHM ring names to drain (Tier-0 accepts N and drains
@@ -3307,7 +3298,6 @@ impl BagdConfig {
     pub fn new(out: impl Into<PathBuf>, taps: Vec<TapSpec>) -> Self {
         Self {
             out: out.into(),
-            status_display_dir: None,
             taps,
             rings: Vec::new(),
             state_rings: Vec::new(),
@@ -7204,8 +7194,6 @@ struct WriterInit {
     /// The first file path (`rotated_path(out, 0)`).
     path: PathBuf,
     out: PathBuf,
-    /// Presentation only; never used to open a file.
-    display_dir: Option<PathBuf>,
     size_cap_bytes: Option<u64>,
     chunk_max_bytes: usize,
     /// The channel descriptors the bag is created with (reused on rotation).
@@ -7274,8 +7262,6 @@ struct WriterCore {
     /// Rotation inputs (mirror [`BagdConfig`] / [`Recorder`] fields captured at
     /// spawn — the writer thread re-opens files without touching the drain).
     out: PathBuf,
-    /// Presentation only; retained for rotation logs.
-    display_dir: Option<PathBuf>,
     size_cap_bytes: Option<u64>,
     chunk_max_bytes: usize,
     created_topics: Vec<TopicSchema>,
@@ -7504,7 +7490,7 @@ impl WriterCore {
             writer.write_attachment(name, attachment_media_type(name), 0, 0, bytes)?;
         }
         writer.write_schema_catalog(&init.schema_catalog)?;
-        tracing::info!(path = %display_bag_path(Some(&init.path), init.display_dir.as_deref()), file_index = 0u32, "bagd opened bag file");
+        tracing::info!(path = %init.path.display(), file_index = 0u32, "bagd opened bag file");
         let ring_rank_bytes = init
             .rings
             .iter()
@@ -7522,7 +7508,6 @@ impl WriterCore {
         Ok(Self {
             writer,
             out: init.out,
-            display_dir: init.display_dir,
             size_cap_bytes: init.size_cap_bytes,
             chunk_max_bytes: init.chunk_max_bytes,
             created_topics: init.created_topics,
@@ -8662,7 +8647,7 @@ impl WriterCore {
         // post-launch issue alongside the size-cap flags this path no longer has
         // a user-facing way to reach — see `BagdConfig::size_cap_bytes`.
         prev.finalize()?;
-        tracing::info!(path = %display_bag_path(Some(&path), self.display_dir.as_deref()), file_index = self.file_index, "bagd opened bag file");
+        tracing::info!(path = %path.display(), file_index = self.file_index, "bagd opened bag file");
         self.bag_paths.push(path);
         Ok(())
     }
@@ -10228,51 +10213,6 @@ impl Drop for Recorder {
             } else {
                 tracing::debug!("bagd writer thread joined at Recorder drop (abnormal-exit path)");
             }
-        }
-    }
-}
-
-/// Format status and file-open logs using the caller's directory spelling.
-fn display_bag_path(path: Option<&Path>, display_dir: Option<&Path>) -> String {
-    let Some(path) = path else {
-        return String::new();
-    };
-    // hot-path-alloc-ok: metadata is formatted at the status cadence or file opening.
-    let displayed = display_dir.and_then(|dir| path.file_name().map(|name| dir.join(name)));
-    displayed.as_deref().unwrap_or(path).display().to_string()
-}
-
-#[cfg(test)]
-mod status_path_tests {
-    use super::*;
-
-    #[test]
-    fn status_paths_preserve_directory_spelling_without_changing_file_paths() {
-        let actual = Path::new("/work/recordings/demo.mcap");
-        for _ in 0..2 {
-            for (directory, expected) in [
-                (None, "/work/recordings/demo.mcap"),
-                (Some(Path::new("recordings")), "recordings/demo.mcap"),
-                (Some(Path::new("./recordings")), "./recordings/demo.mcap"),
-                (
-                    Some(Path::new("/chosen/recordings")),
-                    "/chosen/recordings/demo.mcap",
-                ),
-            ] {
-                assert_eq!(display_bag_path(Some(actual), directory), expected);
-            }
-            assert_eq!(display_bag_path(None, Some(Path::new("recordings"))), "");
-            assert_eq!(
-                display_bag_path(Some(Path::new("/")), Some(Path::new("recordings"))),
-                "/"
-            );
-            assert_eq!(
-                display_bag_path(
-                    Some(Path::new("/work/recordings/demo.1.mcap")),
-                    Some(Path::new("recordings"))
-                ),
-                "recordings/demo.1.mcap"
-            );
         }
     }
 }
@@ -14550,7 +14490,6 @@ impl Recorder {
         let init = WriterInit {
             path: first_path,
             out: self.cfg.out.clone(),
-            display_dir: self.cfg.status_display_dir.clone(),
             size_cap_bytes: self.cfg.size_cap_bytes,
             chunk_max_bytes: self.cfg.chunk_max_bytes,
             created_topics: topics,
@@ -15342,7 +15281,7 @@ impl Recorder {
             .collect();
         let mut payload = serde_json::json!({
             "state": state,
-            "bag_path": display_bag_path(self.bag_paths.last().map(PathBuf::as_path), self.cfg.status_display_dir.as_deref()),
+            "bag_path": self.bag_paths.last().map(|p| p.display().to_string()).unwrap_or_default(),
             "messages": self.messages,
             "bytes": self.bytes,
             "chunks": self.chunks,

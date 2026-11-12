@@ -261,9 +261,6 @@ fn rig(tag: &str, topics: &[&TopicSpec]) -> Rig {
             root.clone(),
         )
         .expect("init gateway G");
-        g.network()
-            .expect("network fixture")
-            .set_lan_access(cerulion_core::LanAccess::Open);
         match GatewayRuntime::new(g, plan.clone()) {
             Ok(gateway) => {
                 for t in topics {
@@ -302,7 +299,6 @@ impl Receiver {
             connect_endpoints: vec![locator],
             ..NetworkConfig::default()
         });
-        network.set_lan_access(cerulion_core::LanAccess::Open);
         let received = Arc::new(Mutex::new(Vec::new()));
         let warmed = Arc::new(AtomicBool::new(false));
         let session = network.session().expect("receiver session");

@@ -2053,10 +2053,6 @@ pub fn start_run_descriptor(spec: RunDescriptorSpec<'_>) -> CliResult<RunDescrip
     }
 
     let handle = match RunHandle::publish(RunRecord {
-        remote_visible: !matches!(
-            spec.network,
-            NetworkPostureLabel::Off | NetworkPostureLabel::Inert
-        ),
         run_id,
         supervisor_pid: std::process::id(),
         run_started_at_ns: spec.run_started_at_ns,

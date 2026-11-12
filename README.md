@@ -78,7 +78,7 @@ Cerulion combines [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) zero-c
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
 ```
 
-In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also sets up Rust for building nodes: a Rust 1.95 or newer that is already there is left as it is, and otherwise it installs current stable Rust through rustup. To remove it, run the same script with `sh -s -- --uninstall`.
+In fish, end the line with `&& source ~/.cerulion/env.fish` instead. The installer links `cerulion` into `~/.local/bin` and adds one line to each of your shell startup files, and the end of the line puts it on the PATH of the terminal you pasted it in, so sign in straight away with `cerulion login`: a robot or a headless box prints a short code to approve from any browser. It also installs the Rust compiler the release was built with. To remove it, run the same script with `sh -s -- --uninstall`.
 
 **Homebrew**
 
@@ -104,7 +104,7 @@ keyring=$(mktemp) &&
 
 The first line installs the three programs the second needs. The second is one chain, where every step runs only when the one before it succeeded, so a failed download, or a keyring holding any key other than the key the archive signs with, stops it before it writes a keyring file or a source list. The [APT distribution page](docs/packaging/apt.md) pins the same fingerprints in the same form, lists both during a key rotation, and carries a longer form of this recipe that names which step failed.
 
-Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once, which installs current stable Rust unless a Rust 1.95 or newer is already there, and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. On a terminal, `cerulion workspace create` and `cerulion node build` offer to install it when Rust 1.95 or newer is missing.
+Homebrew and the Debian package do not provision Rust. To build your own nodes, run `cerulion-install-rust` once and put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH.
 
 <details>
 <summary>Build the CLI from crates.io</summary>
@@ -119,7 +119,7 @@ The release installer places `cerulion-connectd` (the desk side of a remote conn
 
 Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use; the macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs: Jazzy on Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64: unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI but has not been run on a robot, and unlike the Jazzy package it is not installed in a clean container before release.
 
-Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Native node libraries use a stable ABI and can load across Rust compiler versions and CLI updates while boundary major 1 remains supported. Rebuild existing node libraries once with `cerulion node build <node>`. The [installation details](docs/install.md) cover the toolchain setup.
+Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Native node libraries use a stable ABI and can load across Rust compiler versions and CLI updates while boundary major 1 remains supported. Rebuild existing node libraries once with `cerulion node build <node>`. The [installation details](docs/install.md) cover the toolchain setup and workspace selection.
 
 ## How it fits together
 
@@ -130,7 +130,7 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 </picture>
 
 - **On the robot:** the scheduler derives dependency levels from your graph, waits on data and timers and executes ready nodes across process groups. Nodes exchange loaned shared-memory messages; capture records the data and execution context.
-- **Across machines:** account ownership (and any existing saved pairing) discovers authorized robots automatically. Iroh uses direct connections when possible, including on one LAN, and a relay when needed. The network daemon mirrors subscribed topics locally for your tools. Unpaired LAN access requires explicit open access.
+- **Across machines:** mDNS discovers nearby robots and LAN topics stream to your computer. Account ownership and grants authorize remote access over Iroh, using direct peer-to-peer connections when possible and a relay when needed. The network daemon mirrors subscribed topics locally for your tools.
 - **At your desk:** the CLI inspects, records and verifies the robot's data, and Cerulion MCP gives your coding agent tools for analyzing its recordings. A captured failure is a recording to inspect. Before re-running it, check `anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` attachment.
 
 Guides: [Execution](https://docs.cerulion.com/cerulion/execution-order) · [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-multi-process) · [Networking and remote robots](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots) · [Remote access](docs/remote_plane.md)
@@ -191,7 +191,7 @@ cerulion graph run obstacle_avoidance --release --record
 
 The graph declares no `process_groups:`, so `graph run` derives a layout of one process per node and runs it without asking, leaving the graph file unchanged. Add `--yes` to save that layout in the graph YAML (with a `.bak` backup), or run `cerulion graph partition obstacle_avoidance` to review it and save it interactively.
 
-Runs use paired access by default on every platform. Unpaired LAN peers cannot read topics or publish into graph ingress through the zenoh plane; paired desks use the authenticated remote plane. `CERULION_LAN_ACCESS=open` explicitly enables unauthenticated LAN access and prints a warning. Restart daemons from an older release when upgrading so they use the paired default too.
+By default a run is open to every machine on your LAN, so the CLI on another computer can find and read it: LAN peers are not authenticated and the default `tcp/` carrier is not encrypted. The log says so when the run starts. `--network off` turns off only this run's own gateway; while `cerulion-netd` serves the LAN, a LAN peer that names a live topic of any local run is still sent it. To refuse every LAN peer on this machine, set `CERULION_LAN_ACCESS=paired` in the environment of every Cerulion command and daemon, and restart a `cerulion-netd` that is already running.
 
 In a second terminal, watch the controller react:
 

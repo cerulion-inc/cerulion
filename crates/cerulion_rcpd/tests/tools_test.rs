@@ -28,7 +28,6 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Value};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-static REMOTE_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn unique(tag: &str) -> String {
     format!(
@@ -584,62 +583,6 @@ async fn the_state_resource_serves_the_newest_frame() {
     f.stop_graph();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn cached_private_state_is_counted_and_refused_after_its_producer_exits() {
-    let _counter_guard = REMOTE_COUNTER_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let prefix = unique("cached_private");
-    let loaded = manifest(dir.path(), &prefix);
-    let mgr = manager("cached_private");
-    let topic = format!("/{prefix}/state");
-    let scope = mgr.exclude_remote_topic(&topic).unwrap();
-    let journal = Journal::spawn(
-        Arc::clone(&mgr),
-        loaded.journal,
-        loaded.state,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .unwrap();
-    let mut private = mgr
-        .create_publisher_simple(&topic, MaxSliceLen::const_new(4096))
-        .unwrap();
-    let private_oracle = json!({"n": 11});
-    publish_json(&mut private, &private_oracle);
-    for _ in 0..200 {
-        if journal.state("arm").as_deref() == Some("{\"n\":11}") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(journal.state("arm").as_deref(), Some("{\"n\":11}"));
-    drop(private);
-    drop(scope);
-    drop(mgr.acquire_remote_topic_lease(&topic).unwrap());
-    let refused = mgr.remote_access_refusals();
-    assert!(journal.remote_state("arm").is_err());
-    assert_eq!(mgr.remote_access_refusals(), refused + 1);
-    assert_eq!(journal.remote_state("unknown").unwrap(), None);
-    let mut public = mgr
-        .create_publisher_simple(&topic, MaxSliceLen::const_new(4096))
-        .unwrap();
-    publish_json(&mut public, &json!({"n": 23}));
-    for _ in 0..200 {
-        if journal.state("arm").as_deref() == Some("{\"n\":23}") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(
-        journal.remote_state("arm").unwrap().as_deref(),
-        Some("{\"n\":23}")
-    );
-    drop(public);
-    assert_eq!(
-        journal.remote_state("arm").unwrap().as_deref(),
-        Some("{\"n\":23}")
-    );
-}
-
 #[test]
 fn the_audit_follows_rotation_and_catches_an_altered_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1121,50 +1064,4 @@ async fn an_estop_while_a_clear_waits_behind_a_call_is_not_cleared_by_it() {
         clears,
         pairs(&[(ESTOP_CLEAR_TOOL, "error:estop_overtaken")])
     );
-}
-
-#[tokio::test]
-async fn local_only_journal_refuses_remote_tools_but_delivers_local_calls_and_emergency_stop() {
-    let _counter_guard = REMOTE_COUNTER_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let prefix = unique("local_only");
-    let loaded = manifest(dir.path(), &prefix);
-    let mgr = manager("local_only");
-    let _scope = mgr
-        .exclude_remote_topic(&loaded.journal.calls_topic)
-        .unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let graph = spawn_graph(mgr.clone(), prefix, stop.clone());
-    let host = open_host(&mgr, &loaded, &dir.path().join("receipts/log.jsonl")).unwrap();
-    let args = json!({"q":[1.25,-2.5]}).as_object().unwrap().clone();
-    let before = mgr.remote_access_refusals();
-    let denied = cerulion_rcpd::caller::scope(
-        "iroh:peer".into(),
-        host.call("arm.step", Some(args.clone())),
-    )
-    .await;
-    assert_eq!(denied.is_error, Some(true));
-    assert!(denied.content[0]
-        .as_text()
-        .unwrap()
-        .text
-        .contains("local_only"));
-    assert!(mgr.remote_access_refusals() > before);
-    let local = host.call("arm.step", Some(args)).await;
-    assert_ne!(local.is_error, Some(true));
-    let stopped = cerulion_rcpd::caller::scope(
-        "iroh:peer".into(),
-        host.call(
-            ESTOP_TOOL,
-            Some(json!({"reason":"halt"}).as_object().unwrap().clone()),
-        ),
-    )
-    .await;
-    assert_ne!(stopped.is_error, Some(true));
-    stop.store(true, Ordering::Relaxed);
-    let delivered = graph.join().unwrap();
-    assert_eq!(delivered.len(), 2);
-    assert_eq!(delivered[0]["tool"], "arm.step");
-    assert_eq!(delivered[0]["args"], json!({"q":[1.25,-2.5]}));
-    assert_eq!(delivered[1]["tool"], ESTOP_TOOL);
 }

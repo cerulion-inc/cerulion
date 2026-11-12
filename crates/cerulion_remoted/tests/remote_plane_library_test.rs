@@ -257,7 +257,6 @@ fn register_topic(netd: &LocalNetd) {
         ingress: vec![],
     };
     let serving = SchemaServing {
-        egress_qos: Vec::new(),
         served_topics: vec![TOPIC.into()],
         topic_schemas: vec![TopicSchema {
             topic: TOPIC.into(),
@@ -385,7 +384,6 @@ async fn an_in_process_schema_source_names_the_catalog_and_serves_the_closure() 
     let source: SchemaSource = Arc::new(move || {
         counted.fetch_add(1, Ordering::SeqCst);
         SchemaServing {
-            egress_qos: Vec::new(),
             served_topics: vec![TOPIC.into()],
             topic_schemas: vec![TopicSchema {
                 topic: TOPIC.into(),

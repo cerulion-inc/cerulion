@@ -48,7 +48,6 @@ fn bind_listening_robot(robot: &str, base: u16) -> (NetworkManager, u16) {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
-        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             return (mgr, port);
         }

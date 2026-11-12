@@ -1,6 +1,7 @@
-# cerulion_cli
+# cerulion_cli - agent notes
 
-Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.md`; behavior lives there.
+Thin binary crate: clap parsing + dispatch + exit codes only. ALL command logic lives in
+`cerulion_cli_engine` - read that crate's AGENTS.md first; behavior changes go there.
 
 ## Invariants
 - `clap_complete::CompleteEnv::with_factory(families::cli_command).complete()` is the FIRST
@@ -9,11 +10,9 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
 - Never gate `Completions`, `Clean` or the `doctor` family behind `command_needs_identity` -
   a shell rc file and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
-- Serving uses netd require_serving_authority, including ROS 2 attach; graph gates producers only.
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.
-  Paired LAN skip: INFO.
 - Multi-value flags use exact `num_args = N`, never a range (clap's Append flattens repeats
   into one Vec). Length guards run BEFORE any positional access.
 - Optional-value flags (`--record`, `--run`) use `require_equals`: a bare flag takes its
@@ -25,8 +24,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   `Commands` variant (cli.md §14)
 - Create verbs (`node|graph|schema create`) complete nothing.
 
-## Tests
-- `network_gateway_e2e_test`: local switches/egress exclusion, independent open TCP peer, local and allowed delivery.
+## Testing
 - Wiring tests are binary-crate unit tests (no lib target): `cargo test -p cerulion_cli --bin cerulion`.
   They move cwd + `HOME` under a file-local mutex declared as the fixture's LAST field (Rust
   drops fields in declaration order).
@@ -51,9 +49,10 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
 - Signal tests assert exit code EXACTLY 0 (a signal kill is `code()==None`). Gateway-teardown
   tests also need the gateway's shutdown log line: a reap alone passes kill-on-drop too.
 - `mp_support::ChildGuard` has NO public field: `spawn_group_leader` if the child owns a
-  subtree, else `single_process`; reap/poll via `wait_bounded`/`try_wait_noting` to note live
-  workers; never cache an empty note from t=0. `Drop` only reports leaks: assertions call
-  `#[must_use]` `finish().assert_clean()`. The walk checks constructors/bare reaps; await GO
-  (`deployment live`) before a kill, else ABORT path.
+  subtree (workers, gateway, ros2 entry), else `single_process`; reap/poll via its METHODS
+  (`wait_bounded`, `try_wait_noting`) so it notes live workers first, and it never caches an
+  EMPTY note, so a poll at t=0 cannot freeze the verdict. `Drop` only REPORTS a leak; arms
+  that ASSERT call `#[must_use]` `finish().assert_clean()`. A walk enforces constructor shape
+  and flags bare reaps it can see; await GO (`deployment live`) before a kill, else ABORT path.
 
 Reference: docs/internals/cli.md (contracts, completion, verb families, test maps).

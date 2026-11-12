@@ -62,8 +62,6 @@ pub struct TopicKey {
     pub robot: String,
     /// The absolute canonical topic (leading `/`).
     pub topic: String,
-    /// Observer channels are isolated from canonical graph ingress.
-    pub observer: bool,
 }
 
 impl TopicKey {
@@ -73,28 +71,6 @@ impl TopicKey {
         Self {
             robot: robot.into().trim().to_string(),
             topic: canonical_topic(topic.as_ref()),
-            observer: false,
-        }
-    }
-    /// Build a source-qualified observer key without changing the wire topic.
-    pub fn observed(robot: impl Into<String>, topic: impl AsRef<str>) -> Self {
-        Self {
-            observer: true,
-            ..Self::new(robot, topic)
-        }
-    }
-
-    /// Deterministic internal channel. A name collision cannot share an injector:
-    /// distinct registry keys must independently acquire its single writer slot.
-    pub fn local_topic(&self) -> String {
-        if self.observer {
-            format!(
-                "/__cerulion/observers/{:016x}/{:016x}",
-                cerulion_core::wire::fnv1a_hash(self.robot.as_bytes()),
-                cerulion_core::wire::fnv1a_hash(self.topic.as_bytes())
-            )
-        } else {
-            self.topic.clone()
         }
     }
 }
@@ -273,8 +249,6 @@ pub struct DemandRegistry {
     /// Connection → the set of keys it currently holds (dedup: a connection holds
     /// a key at most once — the per-connection idempotency invariant).
     per_conn: HashMap<ConnId, BTreeSet<TopicKey>>,
-    /// Deduplicated loss notifications for holders, drained by their writer thread.
-    mirror_losses: HashMap<ConnId, BTreeSet<TopicKey>>,
     /// Connection → its canonical EGRESS topic set (the produced topics
     /// it registered for the shared gateway to announce + egress-on-demand). A
     /// connection has an entry here iff it holds ≥1 egress topic. Connection-close
@@ -322,7 +296,6 @@ impl DemandRegistry {
         Self {
             topics: BTreeMap::new(),
             per_conn: HashMap::new(),
-            mirror_losses: HashMap::new(),
             egress: HashMap::new(),
             egress_topics: BTreeMap::new(),
             egress_announced: BTreeSet::new(),
@@ -368,9 +341,7 @@ impl DemandRegistry {
         // topic can never be both egress-registered and demanded). No state change.
         // (Inlined direct-field access — disjoint from the `held` per_conn borrow; a
         // `&self` method call would conflict.)
-        if !key.observer
-            && (self.egress_topics.contains_key(&key.topic)
-                || self.egress_announced.contains(&key.topic))
+        if self.egress_topics.contains_key(&key.topic) || self.egress_announced.contains(&key.topic)
         {
             return DemandOutcome::EgressConflict {
                 topic: key.topic.clone(),
@@ -470,7 +441,6 @@ impl DemandRegistry {
     /// is released BEFORE `refresh_idle` here). Unknown / double disconnect is a no-op
     /// returning an empty outcome.
     pub fn disconnect(&mut self, conn: ConnId, now: Instant) -> DisconnectOutcome {
-        self.mirror_losses.remove(&conn);
         let Some(held) = self.per_conn.remove(&conn) else {
             return DisconnectOutcome::default();
         };
@@ -539,19 +509,10 @@ impl DemandRegistry {
             .filter(|key| self.topics.remove(*key).is_some())
             .cloned()
             .collect();
-        for (conn, held) in &mut self.per_conn {
-            let lost: BTreeSet<_> = held.intersection(keys).cloned().collect();
-            if !lost.is_empty() {
-                self.mirror_losses.entry(*conn).or_default().extend(lost);
-            }
+        for held in self.per_conn.values_mut() {
             held.retain(|key| !keys.contains(key));
         }
         Ok(removed)
-    }
-
-    /// Drain one holder's losses in canonical key order, without socket I/O.
-    pub fn take_mirror_losses(&mut self, conn: ConnId) -> BTreeSet<TopicKey> {
-        self.mirror_losses.remove(&conn).unwrap_or_default()
     }
 
     /// CLAIM a lingering key for teardown — atomically mark it `tearing`
@@ -723,7 +684,7 @@ impl DemandRegistry {
     fn demanded_topic_robot(&self, topic: &str) -> Option<String> {
         self.topics
             .keys()
-            .find(|k| !k.observer && k.topic == topic)
+            .find(|k| k.topic == topic)
             .map(|k| k.robot.clone())
     }
 
@@ -924,69 +885,6 @@ mod tests {
             reg.mark_mirror_present(k); // ensure succeeded
         }
         outcome
-    }
-
-    #[test]
-    fn mirror_loss_notifies_every_holder_once_in_sorted_order_and_purges_disconnects() {
-        fn run() -> Vec<BTreeSet<TopicKey>> {
-            let now = Instant::now();
-            let mut reg = DemandRegistry::new(now);
-            let a = reg.connect(now);
-            let b = reg.connect(now);
-            let idle = reg.connect(now);
-            let first = key("robot", "/a");
-            let second = key("robot", "/z");
-            let lingering = key("robot", "/unused");
-            for k in [&second, &first, &lingering] {
-                demand_and_ensure(&mut reg, a, k, HASH_A);
-            }
-            demand_and_ensure(&mut reg, b, &first, HASH_A);
-            reg.release(a, &lingering, now);
-            let selected = BTreeSet::from([second.clone(), first.clone(), lingering]);
-            reg.invalidate_mirrors(&selected).unwrap();
-            reg.invalidate_mirrors(&selected).unwrap();
-            let result = vec![
-                reg.take_mirror_losses(a),
-                reg.take_mirror_losses(b),
-                reg.take_mirror_losses(idle),
-                reg.take_mirror_losses(a),
-            ];
-            assert_eq!(
-                result,
-                vec![
-                    BTreeSet::from([first.clone(), second]),
-                    BTreeSet::from([first.clone()]),
-                    BTreeSet::new(),
-                    BTreeSet::new()
-                ]
-            );
-            demand_and_ensure(&mut reg, a, &first, HASH_A);
-            reg.invalidate_mirrors(&BTreeSet::from([first])).unwrap();
-            reg.disconnect(a, now);
-            assert!(reg.take_mirror_losses(a).is_empty());
-            result
-        }
-        assert_eq!(run(), run());
-    }
-
-    #[test]
-    fn busy_invalidation_queues_no_false_loss_before_the_reader_is_retired() {
-        let now = Instant::now();
-        let mut reg = DemandRegistry::new(now);
-        let conn = reg.connect(now);
-        let live = key("robot", "/live");
-        let dying = key("robot", "/dying");
-        demand_and_ensure(&mut reg, conn, &live, HASH_A);
-        demand_and_ensure(&mut reg, conn, &dying, HASH_A);
-        reg.release(conn, &dying, now);
-        assert!(reg.claim_tearing(&dying));
-        let keys = BTreeSet::from([live.clone(), dying.clone()]);
-        assert_eq!(reg.invalidate_mirrors(&keys), Err(vec![dying.clone()]));
-        assert!(reg.take_mirror_losses(conn).is_empty());
-        assert_eq!(reg.refcount(&live), 1);
-        reg.clear_tearing(&dying);
-        reg.invalidate_mirrors(&keys).unwrap();
-        assert_eq!(reg.take_mirror_losses(conn), BTreeSet::from([live]));
     }
 
     #[test]
@@ -1992,56 +1890,5 @@ mod tests {
             reg.is_busy(),
             "the egress term alone keeps netd busy (conn count aside)"
         );
-    }
-}
-
-#[cfg(test)]
-mod observer_tests {
-    use super::*;
-
-    #[test]
-    fn observers_share_one_source_and_never_compete_with_canonical_egress() {
-        let now = Instant::now();
-        let mut registry = DemandRegistry::new(now);
-        let first = registry.connect(now);
-        let second = registry.connect(now);
-        registry.register_egress(first, vec!["/foo".into()]);
-        let observed = TopicKey::observed("a", "foo");
-        assert_eq!(observed.topic, "/foo");
-        assert_eq!(
-            observed.local_topic(),
-            "/__cerulion/observers/af63dc4c8601ec8c/f9be0e9c9154425e"
-        );
-        assert_eq!(observed, TopicKey::observed(" a ", "/foo"));
-        assert_ne!(observed, TopicKey::new("a", "/foo"));
-        assert_ne!(
-            observed.local_topic(),
-            TopicKey::observed("b", "/foo").local_topic()
-        );
-        assert!(matches!(
-            registry.demand(first, observed.clone(), 7, now),
-            DemandOutcome::FirstDemand { refcount: 1 }
-        ));
-        registry.mark_mirror_present(&observed);
-        assert!(matches!(
-            registry.demand(second, observed.clone(), 7, now),
-            DemandOutcome::AlreadyMirrored { refcount: 2 }
-        ));
-        assert!(matches!(
-            registry.demand(second, observed.clone(), 9, now),
-            DemandOutcome::SchemaConflict { .. }
-        ));
-        assert!(matches!(
-            registry.demand(second, TopicKey::new("a", "/foo"), 7, now),
-            DemandOutcome::EgressConflict { .. }
-        ));
-        registry.disconnect(first, now);
-        assert_eq!(registry.snapshot(), vec![(observed.clone(), 1)]);
-        assert!(matches!(
-            registry.release(second, &observed, now),
-            ReleaseOutcome::LastRelease
-        ));
-        registry.retire(&observed);
-        assert!(registry.snapshot().is_empty());
     }
 }

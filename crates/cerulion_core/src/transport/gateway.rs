@@ -327,10 +327,6 @@ pub struct SchemaServing {
     /// only the current run's topics plus any registered later.
     #[serde(default)]
     pub served_topics: Vec<String>,
-    /// Resolved producer policies for authenticated graph ingress. Missing
-    /// entries are unverified; they do not imply a reliable wire queue.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub egress_qos: Vec<super::carrier::EgressQos>,
 }
 
 /// Live handles onto a RUNNING gateway's schema-serving maps — the
@@ -644,15 +640,6 @@ impl SchemaServing {
     /// replacement between a caller's boot-resolution and its merge dropped the
     /// caller's types back to `schema_name: None`).
     pub fn merge_from(&mut self, other: &Self) {
-        for policy in &other.egress_qos {
-            if !self
-                .egress_qos
-                .iter()
-                .any(|have| have.topic == policy.topic)
-            {
-                self.egress_qos.push(policy.clone());
-            }
-        }
         // A non-empty `served_topics` is EXPLICIT: folding another serving's
         // explicit list into an accumulator that only had implicit
         // (topic_schemas-derived) topics would silently drop the
@@ -1019,10 +1006,6 @@ impl GatewayRuntime {
             });
         }
 
-        manager
-            .network()
-            .expect("gateway network checked above")
-            .set_run_scope(Arc::downgrade(&manager));
         // 1. Install the egress posture FIRST (before the watch can flip a flag).
         match &plan.egress_policy {
             GatewayEgressPolicy::AllowAll => manager.bridge_manager().set_egress_allow_all()?,
@@ -1645,13 +1628,13 @@ impl GatewayRuntime {
                     // ~1 kHz drive pass while the observer only re-attaches once
                     // per 200 ms sweep.
                     self.liveness.release_own_tap(topic);
-                    let attached = self
-                        .manager
-                        .create_remote_data_only_subscriber(topic)
-                        .and_then(|tap| {
-                            self.open_egress_lane(topic, flag, tap.buffer_size())?;
-                            Ok(tap)
-                        });
+                    let attached =
+                        self.manager
+                            .create_data_only_subscriber(topic)
+                            .and_then(|tap| {
+                                self.open_egress_lane(topic, flag, tap.buffer_size())?;
+                                Ok(tap)
+                            });
                     match attached {
                         Ok(tap) => {
                             self.record_attach_success(topic);
@@ -1913,7 +1896,7 @@ impl GatewayRuntime {
     /// Drain the `/__cerulion/gateway_topics` control service and feed
     /// every VALID record through [`Self::register_runtime_topic`] (so the
     /// register + announce happen exactly as for a boot-plan topic), storing each
-    /// record's advertised `schema_hash` before publishing its catalog name (item 5).
+    /// record's advertised `schema_hash` in the topic→hash table (item 5).
     ///
     /// Robust by construction: malformed records are dropped inside
     /// [`RegistrationReader::drain`] (counted + warn-once there), and a record
@@ -1952,16 +1935,24 @@ impl GatewayRuntime {
         // calls; the emptied Vec keeps its capacity for the next pass.
         let records = std::mem::take(&mut self.reg_drain_buf);
         for record in &records {
-            match self.register_runtime_topic_with_hash(&record.topic, Some(record.schema_hash)) {
-                Ok(_newly) => {}
-                // Discriminate a genuine refusal (invalid name or producer exclusion)
-                // from a transient announcement failure of a legitimate
+            match self.register_runtime_topic(&record.topic) {
+                Ok(_newly) => {
+                    // Store the advertised hash (canonical-keyed) regardless of
+                    // new-vs-dup — an idempotent re-register may carry an updated
+                    // hash for the same topic.
+                    let canonical = canonical_topic(&record.topic).into_owned();
+                    self.reg_hashes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(canonical, record.schema_hash);
+                }
+                // Discriminate a genuine REFUSAL (InvalidTransportConfig —
+                // reserved/empty) from a transient ANNOUNCE failure of a legit
                 // topic. Only the former is "will NOT be announced or made
                 // demandable"; the latter retains the (grantable) flag and heals.
-                Err(
-                    e @ (TransportError::InvalidTransportConfig { .. }
-                    | TransportError::EgressScope { .. }),
-                ) => self.record_registration_rejected(&record.topic, &e),
+                Err(e @ TransportError::InvalidTransportConfig { .. }) => {
+                    self.record_registration_rejected(&record.topic, &e)
+                }
                 Err(e) => self.record_registration_deferred(&record.topic, &e),
             }
         }
@@ -2022,7 +2013,7 @@ impl GatewayRuntime {
     }
 
     /// Observable state (Principle #3): the `schema_hash` a producing process advertised
-    /// for a RUNTIME-registered `topic` (canonical-keyed), including a deferred announce, or `None` if the topic
+    /// for a RUNTIME-registered `topic` (canonical-keyed), or `None` if the topic
     /// was not runtime-registered via the control channel. Item 5: stored for
     /// future probe/diagnostics; egress forwards frames verbatim, so this never
     /// gates delivery.
@@ -2046,7 +2037,8 @@ impl GatewayRuntime {
     }
 
     /// Observable state (Principle #3): cumulative control records the gateway REFUSED to
-    /// apply (`register_runtime_topic` refused an invalid name or producer exclusion). Distinct from
+    /// apply (`register_runtime_topic` returned [`TransportError::InvalidTransportConfig`]
+    /// — e.g. a hostile reserved-name record on the wire). Distinct from
     /// [`Self::registration_announce_deferred_count`]: a rejected record is
     /// neither announced nor demand-grantable.
     pub fn registration_rejected_count(&self) -> u64 {
@@ -2315,8 +2307,6 @@ impl GatewayRuntime {
     ///   control-plane namespace ([`RESERVED_TOPIC_PREFIX`]) — refused LOUDLY,
     ///   naming the topic + reason (a control-plane service must never be
     ///   registered as robot egress) — or if `topic` is empty.
-    /// - [`TransportError::EgressScope`] when the producer excludes the topic,
-    ///   before its catalog name or hash is registered.
     /// - Whatever
     ///   [`TopicBridgeManager::register_topic`](super::bridge::TopicBridgeManager::register_topic)
     ///   / [`TransportManager::announce_egress_topic`] surface (a poisoned bridge
@@ -2328,15 +2318,6 @@ impl GatewayRuntime {
     ///   stays demand-grantable and a later call re-attempts the announce
     ///   (idempotent — it heals).
     pub fn register_runtime_topic(&self, topic: &str) -> TransportResult<bool> {
-        self.register_runtime_topic_with_hash(topic, None)
-    }
-
-    // hot-path-alloc-ok-fn: runtime registration is a cold control path.
-    fn register_runtime_topic_with_hash(
-        &self,
-        topic: &str,
-        schema_hash: Option<u64>,
-    ) -> TransportResult<bool> {
         if topic.is_empty() {
             return Err(TransportError::InvalidTransportConfig {
                 reason: "gateway runtime topic registration requires a non-empty topic name"
@@ -2356,9 +2337,6 @@ impl GatewayRuntime {
                 ),
             });
         }
-        // Hold producer admission through registration and announcement. An
-        // excluded topic must never acquire a catalog name or a schema hash.
-        let _scope = self.manager.acquire_remote_topic_lease(&canonical)?;
         // A genuinely-new registration iff the source of truth did not already
         // hold the flag (register_topic itself is idempotent).
         let newly = !self.manager.bridge_manager().is_registered(&canonical)?;
@@ -2366,29 +2344,7 @@ impl GatewayRuntime {
         // demand-grantable (the queryable + liveliness watch flip it). This
         // COMMITS before the announce, which is reachably fallible (zenoh session
         // open; liveliness declare).
-        // Publish the advertised hash before the flag becomes catalog-visible,
-        // under the same hash lock readers acquire after taking the bridge snapshot.
-        // Announcement may fail or block; catalog type identity is already complete.
-        if let Some(schema_hash) = schema_hash {
-            let mut hashes = self
-                .reg_hashes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let previous = hashes.insert(canonical.clone(), schema_hash);
-            if let Err(error) = self.manager.bridge_manager().register_topic(&canonical) {
-                match previous {
-                    Some(hash) => {
-                        hashes.insert(canonical.clone(), hash);
-                    }
-                    None => {
-                        hashes.remove(&canonical);
-                    }
-                }
-                return Err(error);
-            }
-        } else {
-            self.manager.bridge_manager().register_topic(&canonical)?;
-        }
+        self.manager.bridge_manager().register_topic(&canonical)?;
         // Discovery truth: announce it (hashless liveliness token; idempotent).
         // On announce failure the demand flag is ALREADY committed but the topic
         // is NOT on the network — a partial commit we make LOUD, never silent.
@@ -3045,7 +3001,6 @@ mod schema_serving_handles_tests {
             deps: vec![],
         };
         let serving = SchemaServing {
-            egress_qos: Vec::new(),
             topic_schemas: vec![
                 TopicSchema {
                     topic: "chatter".to_string(),
@@ -3228,7 +3183,6 @@ mod hosted_runs_tests {
                 crate::testing::iceoryx_test_config(),
             )
             .expect("init gateway manager");
-            manager.network().unwrap().set_lan_access(LanAccess::Open);
             match GatewayRuntime::new(Arc::clone(&manager), allow_all_plan()) {
                 Ok(gateway) => return (manager, gateway, port),
                 Err(e) => eprintln!("attempt {attempt}: gateway boot failed on port {port}: {e}"),
@@ -3265,7 +3219,6 @@ mod hosted_runs_tests {
             crate::testing::iceoryx_test_config(),
         )
         .expect("init gateway manager");
-        manager.network().unwrap().set_lan_access(LanAccess::Open);
         let hosted = manager
             .network()
             .expect("a configured network")

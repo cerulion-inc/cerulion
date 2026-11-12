@@ -291,34 +291,11 @@ impl Ros2Children {
         running: Arc<AtomicBool>,
         policy: PeerLossPolicy,
     ) -> CliResult<Self> {
-        Self::spawn_with_scope(
-            entries,
-            workspace_root,
-            graph,
-            running,
-            policy,
-            &cerulion_core::transport::egress_scope::RunTopicScope::Unrestricted,
-        )
-    }
-
-    pub(crate) fn spawn_with_scope(
-        entries: &[Ros2Entry],
-        workspace_root: &Path,
-        graph: &str,
-        running: Arc<AtomicBool>,
-        policy: PeerLossPolicy,
-        scope: &cerulion_core::transport::egress_scope::RunTopicScope,
-    ) -> CliResult<Self> {
         let set = Self::with_policy(graph, policy, running);
         if entries.is_empty() {
             return Ok(set);
         }
-        let mut env = stage_ros2_child_env()?;
-        env.push((
-            cerulion_core::transport::egress_scope::RUN_SCOPE_ENV.to_string(),
-            serde_json::to_string(scope)
-                .map_err(|error| CliError::Validation(error.to_string()))?,
-        ));
+        let env = stage_ros2_child_env()?;
         for entry in entries {
             let argv = spawn_argv(entry, workspace_root)?;
             let mut cmd = std::process::Command::new("ros2");
