@@ -846,6 +846,12 @@ Serving machines consume other robots through the same endpoint owned by
 kernel peer credentials and bounded framed requests. It validates the live
 device key and shared-memory namespace before dialing, then runs the existing
 wire demand and validated reinjection path. No wire publish verb is involved.
+Per-call metadata carries only its selected peer. Mutation requests carry that
+peer plus peers with acknowledged live readers, from one registry snapshot;
+removal still retires affected readers without coupling framing to account size.
+Graph ingress retains one epoch-refresh failure latch per route across reconnects.
+A refresh failure reports its cause and preserves saved authenticated trust;
+source selection, pin validation and wire authorization remain mandatory.
 Release retires the reader before acknowledgement; closing local control
 retires every mirror on that connection. Account fencing retires outbound
 sessions without closing the serving endpoint. The delivery and refusal pins

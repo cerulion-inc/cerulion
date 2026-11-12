@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Canonical graph demands. Observer reads use their separate private channels.
 
+use std::collections::BTreeMap;
 use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -110,6 +111,7 @@ fn open_session(
     registration: &Registration,
     expected: Option<&[Producer]>,
     cancelled: &impl Fn() -> bool,
+    epoch_failures: &mut BTreeMap<String, FailureRegimeLatch>,
 ) -> CliResult<Session> {
     check_cancelled(cancelled)?;
     let mut client = NetdClient::connect_or_spawn().map_err(network_error)?;
@@ -185,7 +187,12 @@ fn open_session(
     require_same_producers(expected, &producers)?;
     for producer in &producers {
         check_cancelled(cancelled)?;
-        catalogs.sync_selected_epoch(&producer.route)?;
+        report_epoch_refresh(
+            &registration.graph,
+            &producer.route,
+            catalogs.sync_selected_epoch(&producer.route),
+            epoch_failures,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = loop {
             check_cancelled(cancelled)?;
@@ -209,6 +216,36 @@ fn open_session(
         _catalogs: catalogs,
         producers,
     })
+}
+
+fn report_epoch_refresh(
+    graph: &str,
+    robot: &str,
+    result: CliResult<()>,
+    failures: &mut BTreeMap<String, FailureRegimeLatch>,
+) {
+    let latch = failures.entry(robot.to_owned()).or_default();
+    match result {
+        Ok(()) => {
+            if let Some(suppressed) = latch.on_success() {
+                tracing::info!(
+                    graph,
+                    robot,
+                    suppressed,
+                    total_failures = latch.total_failures(),
+                    "graph ingress revocation refresh recovered"
+                );
+            }
+        }
+        Err(error) => match latch.on_failure() {
+            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                tracing::warn!(graph, robot, error = %error, total_failures = latch.total_failures(), "graph ingress revocation refresh failed; continuing with saved authenticated trust");
+            }
+            RegimeDecision::Suppressed { .. } => {
+                tracing::debug!(graph, robot, error = %error, total_failures = latch.total_failures(), "graph ingress revocation refresh remains unavailable; saved authenticated trust is retained");
+            }
+        },
+    }
 }
 
 fn check_cancelled(cancelled: &impl Fn() -> bool) -> CliResult<()> {
@@ -235,6 +272,8 @@ struct Control {
     stopped: Mutex<bool>,
     wake: Condvar,
     fatal: Mutex<Option<String>>,
+    #[cfg(test)]
+    accepted_statuses: [std::sync::atomic::AtomicUsize; 2],
 }
 
 pub(super) struct PairedGraphNetwork {
@@ -266,18 +305,32 @@ impl PairedGraphNetwork {
             },
         };
         // Unsatisfied declarations fail startup; no warning-only fallback.
-        let session = open_session(&registration, None, &|| !running.load(Ordering::Acquire))?;
+        let mut epoch_failures = BTreeMap::new();
+        let session = open_session(
+            &registration,
+            None,
+            &|| !running.load(Ordering::Acquire),
+            &mut epoch_failures,
+        )?;
         let control = Arc::new(Control {
             stopped: Mutex::new(false),
             wake: Condvar::new(),
             fatal: Mutex::new(None),
+            #[cfg(test)]
+            accepted_statuses: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)),
         });
         let worker_control = control.clone();
         let worker = std::thread::Builder::new()
             .name("graph-network".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    watch_session(session, &registration, &worker_control, &running)
+                    watch_session(
+                        session,
+                        &registration,
+                        &worker_control,
+                        &running,
+                        epoch_failures,
+                    )
                 }));
                 if outcome.is_err() {
                     fail(
@@ -330,6 +383,7 @@ fn watch_session(
     registration: &Registration,
     control: &Control,
     running: &AtomicBool,
+    mut epoch_failures: BTreeMap<String, FailureRegimeLatch>,
 ) {
     let expected = session.producers.clone();
     let mut failures = FailureRegimeLatch::new();
@@ -372,6 +426,10 @@ fn watch_session(
                 status.robot_startup_error.as_deref(),
                 &mut registration_failures,
             );
+            // Advance only after the consumer accepted and reported this reply.
+            #[cfg(test)]
+            control.accepted_statuses[usize::from(status.robot_startup_error.is_none())]
+                .fetch_add(1, Ordering::Release);
         }
         if holding_error.is_none() && !lost {
             if let Err(error) = &status {
@@ -444,10 +502,15 @@ fn watch_session(
             );
             // Loss events and missing status rows both require re-demand. Always
             // revalidate the exact source key, schema and policy before reconnecting.
-            match open_session(registration, Some(&expected), &|| {
-                !running.load(Ordering::Acquire)
-                    || control.stopped.lock().map_or(true, |stopped| *stopped)
-            }) {
+            match open_session(
+                registration,
+                Some(&expected),
+                &|| {
+                    !running.load(Ordering::Acquire)
+                        || control.stopped.lock().map_or(true, |stopped| *stopped)
+                },
+                &mut epoch_failures,
+            ) {
                 Ok(reconnected) => {
                     session = reconnected;
                     Ok(())
@@ -491,13 +554,46 @@ mod tests {
     use cerulion_netd::account_access::{RobotPath, RobotPresence, RobotTrustSource};
 
     #[test]
+    #[tracing_test::traced_test]
+    fn epoch_refresh_failures_preserve_each_route_regime_until_recovery() {
+        let mut failures = BTreeMap::new();
+        for robot in ["first", "second"] {
+            for _ in 0..3 {
+                report_epoch_refresh(
+                    "import",
+                    robot,
+                    Err(CliError::Validation("account service unavailable".into())),
+                    &mut failures,
+                );
+            }
+        }
+        assert_eq!(failures["first"].total_failures(), 3);
+        assert_eq!(failures["second"].total_failures(), 3);
+        report_epoch_refresh("import", "first", Ok(()), &mut failures);
+        report_epoch_refresh("import", "first", Ok(()), &mut failures);
+        logs_assert(|lines: &[&str]| {
+            let warnings = cerulion_core::testing::count_at(lines, "WARN", "graph ingress revocation refresh failed; continuing with saved authenticated trust");
+            let recoveries = cerulion_core::testing::count_at(
+                lines,
+                "INFO",
+                "graph ingress revocation refresh recovered",
+            );
+            if warnings == 2 && recoveries == 1 {
+                Ok(())
+            } else {
+                Err(format!("expected one warning per route and one recovery, got {warnings} warnings and {recoveries} recoveries"))
+            }
+        });
+    }
+
+    #[test]
     fn paired_graph_watch_reports_registration_failure_once_then_recovers_on_stderr() {
         let _environment = crate::test_env::env_lock();
         const CHILD: &str = "CERULION_PAIRED_REGISTRATION_WARN_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["graph_cmd::authenticated_ingress::tests::paired_graph_watch_reports_registration_failure_once_then_recovers_on_stderr", "--exact", "--nocapture"])
-                .env(CHILD, "1").output().unwrap();
+                .env(CHILD, "1").env("RUST_LOG", "info").output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -527,7 +623,6 @@ mod tests {
         }
         struct StatusPlane {
             error: Mutex<Option<String>>,
-            probes: std::sync::atomic::AtomicUsize,
         }
         impl cerulion_netd::egress::EgressPlane for StatusPlane {
             fn register_egress(
@@ -545,7 +640,6 @@ mod tests {
             }
             fn robot_startup_error(&self) -> Option<String> {
                 let error = self.error.lock().unwrap().clone();
-                self.probes.fetch_add(1, Ordering::SeqCst);
                 error
             }
         }
@@ -576,7 +670,6 @@ mod tests {
             error: Mutex::new(Some(
                 "the robot state directory must be owner-only; run chmod 700 <dir>".into(),
             )),
-            probes: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut daemon = cerulion_netd::daemon::start_with_egress(
             socket.clone(),
@@ -607,27 +700,36 @@ mod tests {
             stopped: Mutex::new(false),
             wake: Condvar::new(),
             fatal: Mutex::new(None),
+            #[cfg(test)]
+            accepted_statuses: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)),
         });
         let running = Arc::new(AtomicBool::new(true));
         cerulion_core::init_logging(false, false);
         let worker_control = control.clone();
         let worker_running = running.clone();
         let watch = std::thread::spawn(move || {
-            watch_session(session, &registration, &worker_control, &worker_running)
+            watch_session(
+                session,
+                &registration,
+                &worker_control,
+                &worker_running,
+                BTreeMap::new(),
+            )
         });
-        let wait_for_probes = |count| {
+        let wait_for_statuses = |healthy: bool, count| {
+            let observed = &control.accepted_statuses[usize::from(healthy)];
             let deadline = Instant::now() + Duration::from_secs(6);
-            while plane.probes.load(Ordering::SeqCst) < count && Instant::now() < deadline {
+            while observed.load(Ordering::Acquire) < count && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert!(
-                plane.probes.load(Ordering::SeqCst) >= count,
-                "paired watcher stopped probing netd status"
+                observed.load(Ordering::Acquire) >= count,
+                "paired watcher stopped accepting netd status replies"
             );
         };
-        wait_for_probes(2);
+        wait_for_statuses(false, 2);
         *plane.error.lock().unwrap() = None;
-        wait_for_probes(4);
+        wait_for_statuses(true, 2);
         *control.stopped.lock().unwrap() = true;
         control.wake.notify_all();
         watch.join().unwrap();

@@ -187,6 +187,20 @@ fn cli(root: &Path, home: &Path, socket: &Path, stdout: &Path, stderr: &Path) ->
 
 #[test]
 fn paired_supervisor_delivers_remote_oracle_payload_and_releases_canonical_ingress() {
+    supervisor_delivery(None);
+}
+
+#[test]
+fn offline_account_supervisor_delivers_from_saved_trust_and_warns_once() {
+    supervisor_delivery(Some(false));
+}
+
+#[test]
+fn expired_session_supervisor_delivers_from_saved_trust_and_warns_once() {
+    supervisor_delivery(Some(true));
+}
+
+fn supervisor_delivery(expired_account: Option<bool>) {
     let topic = "/robot/source/vector";
     let source_manager = test_manager("supervisor_source");
     let (mut source, frames) = source_graph(&source_manager);
@@ -209,23 +223,75 @@ fn paired_supervisor_delivers_remote_oracle_payload_and_releases_canonical_ingre
         unique_secret(),
     );
     std::fs::write(home.path().join("desk.key"), desk_seed).unwrap();
-    std::fs::write(
-        home.path().join("robots.toml"),
-        format!("[robots]\npaired = \"{}\"\n", robot.eid),
-    )
-    .unwrap();
-    std::fs::write(home.path().join("auth.json"), br#"{"account_id":"offline","session_token":"","refresh_token":"","expires_at_ns":0,"logged_in_ever":true}"#).unwrap();
+    let route = if let Some(expired) = expired_account {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let expiry = if expired {
+            1
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+                + 600_000_000_000
+        };
+        std::fs::write(
+            home.path().join("auth.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "account_id": URL_SAFE_NO_PAD.encode(OWNER.0), "session_token":"saved-session",
+                "refresh_token":"saved-refresh", "expires_at_ns":expiry,"logged_in_ever":true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Saved public membership is bound to this account and this paired
+        // desk key. The real robot retains its authenticated device binding.
+        let saved = cerulion_netd::account_access::AccountSnapshot {
+            auth_account_id: URL_SAFE_NO_PAD.encode(OWNER.0),
+            pairing_account_id: OWNER.0,
+            device_key: public_of(&desk_seed),
+            owner_chain: None,
+            robots: vec![cerulion_netd::account_access::AccountRobot {
+                robot_id: [5; 32],
+                hostname: "supervisor".into(),
+                endpoint_key: Some(*robot.eid.as_bytes()),
+            }],
+        };
+        saved.validate().unwrap();
+        std::fs::write(
+            home.path().join("robot-directory.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        cerulion_netd::account_access::robot_route(&[5; 32])
+    } else {
+        std::fs::write(
+            home.path().join("robots.toml"),
+            format!("[robots]\npaired = \"{}\"\n", robot.eid),
+        )
+        .unwrap();
+        std::fs::write(home.path().join("auth.json"), br#"{"account_id":"offline","session_token":"","refresh_token":"","expires_at_ns":0,"logged_in_ever":true}"#).unwrap();
+        "paired".into()
+    };
     let controller = Arc::new(
         AccountWanController::new(
             manager.clone(),
-            one_robot_registry("paired", &robot, desk_seed),
+            if expired_account.is_some() {
+                WanRegistry::new(HashMap::new(), desk_seed, RelayConfig::Disabled)
+                    .with_account(Some(OWNER.0))
+            } else {
+                one_robot_registry(&route, &robot, desk_seed)
+            },
             Arc::new(AllowAllAuthorizer),
             AccountControllerConfig {
                 config_home: Some(home.path().into()),
                 network_enabled: true,
                 serving_gateway: false,
                 epoch_dir: None,
-                trusted_direct: HashMap::new(),
+                trusted_direct: if expired_account.is_some() {
+                    HashMap::from([(([5; 32], *robot.eid.as_bytes()), robot.addrs.clone())])
+                } else {
+                    HashMap::new()
+                },
             },
         )
         .unwrap(),
@@ -284,6 +350,9 @@ fn paired_supervisor_delivers_remote_oracle_payload_and_releases_canonical_ingre
     }
     assert!(delivered, "{}", std::fs::read_to_string(&stderr).unwrap());
     let log = std::fs::read_to_string(&stderr).unwrap();
+    if expired_account.is_some() {
+        assert_eq!(log.matches("graph ingress revocation refresh failed; continuing with saved authenticated trust").count(), 1, "{log}");
+    }
     assert!(
         log.contains("authenticated graph network demands are held"),
         "{log}"
