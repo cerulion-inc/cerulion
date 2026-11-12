@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Regression pin: the cdylib-local stderr tracing subscriber
-//! (`install_cdylib_stderr_tracing`, called from the macro-generated
-//! `cerulion_node_init`) makes node-side `tracing` events host-visible.
-//!
-//! # The bug this pins
-//!
-//! A cdylib statically links its OWN copy of `cerulion_core` + `tracing`, so its
-//! `tracing` global dispatcher is a distinct static from the host binary's. The
-//! host initializing ITS subscriber does nothing for the cdylib's static, so
-//! every `tracing::error!`/`warn!`/`info!` emitted by node-side code — including
-//! cerulion_core's loud-by-design `OutputProxy` discard error ("OutputProxy
-//! dropped without writing all declared variable fields; skipping publish") —
-//! dispatched to a no-op. Production dylib graphs ran silently broken. The
-//! stopgap installs an `fmt` subscriber (respecting the env-snapshot RUST_LOG)
-//! on the cdylib's own static at node init, so those events land on stderr.
+//! Regression pins for separate host and cdylib tracing dispatchers.
+//! Macro-generated nodes install a cdylib-local stderr subscriber for author
+//! events. The host emits output discard and recovery diagnostics through its
+//! own subscriber on stderr. Graph environment filters apply to node events;
+//! the host subscriber keeps its own filter.
 //!
 //! # Why a subprocess
 //!
@@ -23,14 +13,14 @@
 //! --ignored --nocapture`) as a child, pipes the CHILD's stderr, drives a
 //! 1-node (or 2-node) graph over real iceoryx2 (`build_for_test`) that loads the
 //! `test_node_discard_probe_cdylib` fixture, and asserts on the captured stderr.
-//! The child installs NO host subscriber and uses NO `#[traced_test]` — the pin
-//! is that the CDYLIB's own subscriber writes to the child process stderr.
+//! The child installs the host subscriber for host-owned output diagnostics.
+//! The cdylib subscriber routes the author's events to the same stderr channel.
 //!
 //! Oracle: the literal error/warn strings (NOT a self-compare). Test 1 FAILS
 //! without the subscriber (the black hole — nothing reaches stderr). Portable: runs on
 //! macOS AND Linux CI (no `cfg(linux)` gate).
 //!
-//! # The 8 pins
+//! # The pins
 //!
 //! 1. `RUST_LOG=info` surfaces the discard error EXACTLY ONCE across the firing
 //!    steps (the discard error is now FLOOD-LATCHED — first occurrence
@@ -38,13 +28,20 @@
 //!    filtered out at info) AND the user warn.
 //! 2. `RUST_LOG=off` suppresses the discard error, the user warn, AND the info
 //!    probe — the env-snapshot spec is genuinely applied (anti-tautology).
-//! 3. Absent `RUST_LOG` defaults to EXACTLY info-level visibility: discard
-//!    error + user warn + info probe present, debug probe ABSENT.
+//!    The positive anchor is the child's own completion line; a sibling arm under
+//!    `off,<fixture>=warn` anchors on the subscriber itself (the user warn
+//!    passes, everything else stays off).
+//! 3. Absent `RUST_LOG` defaults to EXACTLY info-level visibility for the
+//!    node's own code (`info,cerulion_core=warn`): discard error + user warn +
+//!    info probe present, debug probe ABSENT, and the framework's own teardown
+//!    `info!` line ABSENT (present under pin 1's explicit `info`).
 //! 4. `CER_DISCARD_MODE=healthy` (all fields written): NO discard error, user
 //!    warn still present — the error is tied to the unwritten-field condition.
 //! 5. TWO instances of one cdylib init twice without panic + exactly ONE
-//!    install breadcrumb (single-install semantics). Counted under an EXPLICIT
-//!    `RUST_LOG`, because the breadcrumb prints only when one is set.
+//!    parse-failure line and ONE install breadcrumb (single-install semantics),
+//!    counted under an UNPARSEABLE `RUST_LOG`: the parse-failure line prints
+//!    inside the `Once`, before the install, so a second install attempt would
+//!    print it twice.
 //! 6. An unparseable `RUST_LOG` falls back to "info" LOUDLY: the fallback
 //!    marker appears in the breadcrumb and the discard error stays visible.
 //! 7. `RUST_LOG=debug` shows the flood-latch's TWO levels: the loud
@@ -54,9 +51,12 @@
 //!    discard mode is fixed per run, so it never heals; recovery is pinned in
 //!    the pure `output_discard_latch_test.rs` oracle vectors.)
 //! 8. Absent `RUST_LOG` prints NO breadcrumb at all, while the node-side logs
-//!    still reach stderr (the positive anchor): the breadcrumb names an
-//!    effective filter only when the user supplied one, so a default run
-//!    carries no per-cdylib announcement line.
+//!    still reach stderr (the positive anchor), and so does a `RUST_LOG` that
+//!    parses (`info`, `warn`): the breadcrumb names the effective filter only
+//!    when it differs from what the user wrote, which is the unparseable
+//!    fallback of pin 6.
+//! 9. Graph `RUST_LOG=off` suppresses author events while a separately
+//!    configured host filter still admits its output discard diagnostic.
 //!
 //! # Running (needs the fixture built first; `#[serial]` — each parent test
 //! spawns a child that builds over the iceoryx2 SHM singleton)
@@ -89,6 +89,8 @@ use serial_test::serial;
 const ENV_CHILD: &str = "CER_TRACING_STOPGAP_CHILD";
 /// Number of fixture instances the child wires into its graph (default 1).
 const ENV_INSTANCES: &str = "CER_TRACING_STOPGAP_INSTANCES";
+/// Optional host-only filter, independent of the graph environment snapshot.
+const ENV_HOST_FILTER: &str = "CER_TRACING_STOPGAP_HOST_FILTER";
 /// Consumed by the FIXTURE (`test_node_discard_probe_cdylib`): "healthy" ⇒ write
 /// all variable fields (no discard error); anything else ⇒ leave fields unwritten.
 const ENV_DISCARD_MODE: &str = "CER_DISCARD_MODE";
@@ -128,6 +130,16 @@ const DEBUG_PROBE: &str = "discard probe debug probe";
 const BREADCRUMB: &str = "cerulion cdylib tracing: node-side logs -> stderr";
 /// The breadcrumb's filter description when an unparseable RUST_LOG fell back.
 const FALLBACK_MARKER: &str = "info (fallback: RUST_LOG spec unparseable)";
+/// The installer's parse-failure line for an unparseable RUST_LOG (prefix: the
+/// spec and the parser's error follow).
+const PARSE_FAILED: &str = "cerulion cdylib tracing: RUST_LOG spec";
+/// The child's own last stderr line, written after it stepped the probe graph:
+/// the positive anchor for an arm whose filter silences every node-side line.
+const CHILD_DONE: &str = "discard probe child stepped the graph";
+/// The framework's own teardown `info!` line, logged from the `cerulion_core`
+/// linked INTO the cdylib when the node's context drops: visible under an
+/// explicit `RUST_LOG=info`, below the default's `cerulion_core=warn`.
+const FRAMEWORK_INFO: &str = "producer reconciliation (per topic)";
 /// libtest / std panic prefix — its ABSENCE proves the two-instance init is clean.
 const PANIC_MARKER: &str = "panicked at";
 
@@ -236,6 +248,16 @@ fn subprocess_child_discard_probe() {
     if std::env::var(ENV_CHILD).as_deref() != Ok("1") {
         return;
     }
+    let filter = match std::env::var(ENV_HOST_FILTER) {
+        Ok(spec) => tracing_subscriber::EnvFilter::try_new(spec).expect("valid host-only filter"),
+        Err(_) => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+    };
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     let instances = std::env::var(ENV_INSTANCES)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -248,6 +270,7 @@ fn subprocess_child_discard_probe() {
         rt.step(STEP);
     }
     drop(rt);
+    eprintln!("{CHILD_DONE}");
     // Explicit clean exit so libtest's own stdout summary / late bookkeeping
     // cannot perturb the exit status the parent reads.
     std::process::exit(0);
@@ -264,6 +287,15 @@ struct ChildOutcome {
 /// exit (SIGKILL on timeout). `rust_log = None` REMOVES RUST_LOG from the child
 /// env (also clearing any the CI harness carries); `Some(v)` sets it.
 fn run_child(rust_log: Option<&str>, discard_mode: Option<&str>, instances: usize) -> ChildOutcome {
+    run_child_with_host_filter(rust_log, discard_mode, instances, None)
+}
+
+fn run_child_with_host_filter(
+    rust_log: Option<&str>,
+    discard_mode: Option<&str>,
+    instances: usize,
+    host_filter: Option<&str>,
+) -> ChildOutcome {
     assert_fixture_built();
 
     let exe = std::env::current_exe().expect("current_exe for child re-exec");
@@ -276,6 +308,11 @@ fn run_child(rust_log: Option<&str>, discard_mode: Option<&str>, instances: usiz
     ]);
     cmd.env(ENV_CHILD, "1");
     cmd.env(ENV_INSTANCES, instances.to_string());
+    if let Some(filter) = host_filter {
+        cmd.env(ENV_HOST_FILTER, filter);
+    } else {
+        cmd.env_remove(ENV_HOST_FILTER);
+    }
     match rust_log {
         Some(v) => {
             cmd.env("RUST_LOG", v);
@@ -345,9 +382,8 @@ fn run_child(rust_log: Option<&str>, discard_mode: Option<&str>, instances: usiz
 
 // --- Parent tests ----------------------------------------------------------
 
-/// THE regression guard: with RUST_LOG=info the cdylib subscriber routes the
-/// OutputProxy discard error AND the user warn to the process stderr. With
-/// no subscriber in the cdylib's tracing static, stderr carries neither.
+/// With RUST_LOG=info the host routes its output discard error to stderr,
+/// and the independent cdylib subscriber routes the author's warn there.
 ///
 /// The discard error is FLOOD-LATCHED. Under `info` it appears
 /// EXACTLY ONCE across the firing steps — the loud first-of-regime `error!`; the
@@ -400,6 +436,13 @@ fn discard_error_is_host_visible_on_stderr_with_rust_log_info() {
     assert!(
         out.stderr.contains(USER_WARN),
         "RUST_LOG=info must surface the node's own tick warn on stderr. stderr:\n{}",
+        out.stderr
+    );
+    // The positive control for the default arm's absence below: an explicit
+    // `info` reaches the framework's own target inside the cdylib.
+    assert!(
+        out.stderr.contains(FRAMEWORK_INFO),
+        "RUST_LOG=info must surface the framework's teardown info line. stderr:\n{}",
         out.stderr
     );
 }
@@ -460,19 +503,24 @@ fn debug_filter_shows_first_error_and_suppressed_debug_lines() {
 /// is genuinely applied to the cdylib subscriber — the apparatus is not just
 /// always-noisy. Neither the discard error nor the user warn appears.
 ///
-/// The breadcrumb is the POSITIVE anchor: `RUST_LOG` is SET here, so it fires
-/// on install regardless of the filter's level (`off` included), and this test
-/// cannot pass vacuously on a child that never loaded the cdylib (an
-/// all-negative body would go green on an empty stderr).
+/// The POSITIVE anchor is the child's completion line, written after it built
+/// the graph (which ran `cerulion_node_init`, and so the install) and stepped
+/// it, so this test cannot pass vacuously on a child that never loaded the
+/// cdylib (an all-negative body would go green on an empty stderr). The
+/// sibling arm below anchors on the subscriber itself.
 #[test]
 #[serial]
 fn rust_log_off_suppresses_node_side_logs() {
     let out = run_child(Some("off"), None, 1);
     assert!(out.success, "child must exit 0; stderr:\n{}", out.stderr);
     assert!(
-        out.stderr.contains(BREADCRUMB),
-        "the install breadcrumb must appear even under RUST_LOG=off (positive \
-         anchor: the child really loaded the cdylib and installed). stderr:\n{}",
+        out.stderr.contains(CHILD_DONE),
+        "positive anchor: the child built and stepped the probe graph. stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains(BREADCRUMB),
+        "a parseable RUST_LOG (`off` included) prints no breadcrumb. stderr:\n{}",
         out.stderr
     );
     assert!(
@@ -492,10 +540,44 @@ fn rust_log_off_suppresses_node_side_logs() {
     );
 }
 
-/// With RUST_LOG absent the cdylib subscriber defaults to EXACTLY "info": the
-/// discard error, user warn, and info probe are visible; the debug probe is NOT.
-/// A default mutated to "warn"/"error" loses the info probe; one mutated to
-/// "debug"/"trace" shows the debug probe.
+/// The `off` arm's sibling, anchored on the cdylib SUBSCRIBER rather than on
+/// the child: under `off,test_node_discard_probe_cdylib=warn` the fixture's own
+/// warn passes, so the subscriber is installed and applying the spec, while the
+/// runtime's discard error (target `cerulion_core`) and the fixture's info
+/// probe stay off.
+#[test]
+#[serial]
+fn rust_log_off_with_one_target_at_warn_shows_only_that_targets_warn() {
+    let out = run_child(Some("off,test_node_discard_probe_cdylib=warn"), None, 1);
+    assert!(out.success, "child must exit 0; stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains(USER_WARN),
+        "the fixture's warn passes its own `=warn` directive. stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains(DISCARD_ERROR),
+        "the runtime's target stays off. stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains(INFO_PROBE),
+        "an info line is below the fixture's `=warn`. stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains(BREADCRUMB),
+        "a parseable RUST_LOG prints no breadcrumb. stderr:\n{}",
+        out.stderr
+    );
+}
+
+/// With RUST_LOG absent the cdylib subscriber defaults to EXACTLY "info" for the
+/// node's own code (`info,cerulion_core=warn`): the discard error, user warn,
+/// and info probe are visible; the debug probe and the framework's own `info`
+/// line are NOT. A default mutated to "warn"/"error" loses the info probe; one
+/// mutated to "debug"/"trace" shows the debug probe; one that drops
+/// `cerulion_core=warn` shows the framework line.
 ///
 /// The debug-probe-ABSENT arm relies on the debug test profile: under release,
 /// `tracing`'s `release_max_level_info` would compile the debug probe out
@@ -529,6 +611,15 @@ fn rust_log_unset_defaults_to_info_and_shows_error() {
          default mutated to \"debug\"/\"trace\" fails here. stderr:\n{}",
         out.stderr
     );
+    // ...while the framework linked into the cdylib defaults to `warn`, so its
+    // teardown bookkeeping stays off a default run's stderr (the explicit-info
+    // arm above is the positive control).
+    assert!(
+        !out.stderr.contains(FRAMEWORK_INFO),
+        "absent RUST_LOG must keep the framework's info lines quiet \
+         (`info,cerulion_core=warn`). stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// Healthy control: writing ALL variable fields publishes cleanly — no discard
@@ -555,20 +646,19 @@ fn healthy_mode_emits_no_discard_error() {
 /// Single-install pin: TWO instances of the SAME cdylib in one graph each call
 /// `cerulion_node_init` (→ `install_cdylib_stderr_tracing`); the second install
 /// is a no-op via the `Once` guard. The graph builds + steps without panic, the
-/// discard error still surfaces, and EXACTLY ONE breadcrumb appears. The child
-/// runs under an EXPLICIT `RUST_LOG=info` on purpose: the breadcrumb prints
-/// only when a spec is set (pin 8 is the unset twin), so counting it needs one.
+/// discard error still surfaces, and the installer's two lines each appear
+/// EXACTLY ONCE.
 ///
-/// Scope of the `count() == 1` pin: it pins single-install SEMANTICS,
-/// not the `Once` symbol itself — with the `Once` deleted, the second call's
-/// `set_global_default` would fail (default already set) and emit no second
-/// breadcrumb, so the count stays 1. The `Once` additionally prevents that
-/// redundant second `EnvFilter` build + failed-install attempt; no stronger
-/// external observable distinguishes the two, so the behavioral half is the pin.
+/// The child runs under an UNPARSEABLE `RUST_LOG` on purpose. The parse-failure
+/// line prints inside the `Once`, BEFORE the install, so with the `Once`
+/// deleted the second call would print it a second time (and then fail
+/// `set_global_default` quietly): its count of one is the external observable
+/// of the guard itself. The breadcrumb, printed only by a successful install,
+/// stays at one either way, and pins that one subscriber was installed.
 #[test]
 #[serial]
 fn two_instances_from_one_cdylib_init_twice_without_panic() {
-    let out = run_child(Some("info"), None, 2);
+    let out = run_child(Some("foo=notalevel"), None, 2);
     assert!(out.success, "child must exit 0; stderr:\n{}", out.stderr);
     assert!(
         count_at(&out.stderr, "ERROR", DISCARD_ERROR) >= 1,
@@ -579,6 +669,13 @@ fn two_instances_from_one_cdylib_init_twice_without_panic() {
         !out.stderr.contains(PANIC_MARKER),
         "installing the cdylib subscriber twice must not panic (Once-guarded). \
          stderr:\n{}",
+        out.stderr
+    );
+    let parse_failures = out.stderr.matches(PARSE_FAILED).count();
+    assert_eq!(
+        parse_failures, 1,
+        "two inits of one cdylib must run the install body exactly once, got \
+         {parse_failures} parse-failure lines. stderr:\n{}",
         out.stderr
     );
     let breadcrumbs = out.stderr.matches(BREADCRUMB).count();
@@ -653,4 +750,83 @@ fn rust_log_unset_prints_no_breadcrumb() {
          {breadcrumbs}. stderr:\n{}",
         out.stderr
     );
+}
+
+/// The graph's off filter silences author events without changing the host filter.
+#[test]
+#[serial]
+fn graph_rust_log_off_does_not_silence_host_output_diagnostics() {
+    for _ in 0..2 {
+        let out = run_child_with_host_filter(
+            Some("off"),
+            None,
+            1,
+            Some("cerulion_core::transport::output_proxy=info"),
+        );
+        assert!(out.success, "child must exit 0; stderr: {}", out.stderr);
+        assert_eq!(count_at(&out.stderr, "ERROR", DISCARD_ERROR), 1);
+        assert!(!out.stderr.contains(USER_WARN));
+        assert!(!out.stderr.contains(INFO_PROBE));
+        assert!(!out.stderr.contains(DEBUG_PROBE));
+    }
+}
+
+#[test]
+#[serial]
+fn field_default_info_reaches_stderr_before_user_initialization() {
+    // Only an invalid filter emits the banner that anchors constructor ordering.
+    let out = run_child(Some("foo=notalevel"), Some("healthy"), 2);
+    assert!(out.success, "child must exit cleanly: {}", out.stderr);
+    assert_eq!(
+        count_at(&out.stderr, "INFO", "discard probe field default ran"),
+        2
+    );
+    assert_eq!(out.stderr.matches(BREADCRUMB).count(), 1);
+    let install = out.stderr.find(BREADCRUMB).unwrap();
+    let default = out.stderr.find("discard probe field default ran").unwrap();
+    assert!(
+        install < default,
+        "the subscriber is installed before field Defaults"
+    );
+    let valid = run_child(Some("info"), Some("healthy"), 2);
+    assert!(valid.success, "child must exit cleanly: {}", valid.stderr);
+    assert_eq!(
+        count_at(&valid.stderr, "INFO", "discard probe field default ran"),
+        2
+    );
+    assert!(!valid.stderr.contains(BREADCRUMB));
+    let off = run_child(Some("off"), Some("healthy"), 1);
+    assert!(off.success, "child must exit cleanly: {}", off.stderr);
+    assert!(!off.stderr.contains("discard probe field default ran"));
+}
+
+/// A `RUST_LOG` that PARSES prints no breadcrumb: the effective filter is the
+/// spec the user wrote, which the host's own logging reads too, so announcing
+/// it once per node library on every run only repeated it. `info` and `warn`
+/// are the two levels a user most often sets. Positive anchor: the fixture's
+/// user warn reaches stderr, so the subscriber installed and applied the spec.
+#[test]
+#[serial]
+fn rust_log_parseable_prints_no_breadcrumb() {
+    for spec in ["info", "warn"] {
+        let out = run_child(Some(spec), None, 1);
+        assert!(
+            out.success,
+            "RUST_LOG={spec}: child must exit 0; stderr:\n{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains(USER_WARN),
+            "RUST_LOG={spec}: positive anchor, the node's own warn reaches stderr. \
+             stderr:\n{}",
+            out.stderr
+        );
+        let breadcrumbs = out.stderr.matches(BREADCRUMB).count();
+        assert_eq!(
+            breadcrumbs, 0,
+            "RUST_LOG={spec} parses, so it must print NO install breadcrumb, got \
+             {breadcrumbs}. stderr:\n{}",
+            out.stderr
+        );
+    }
 }

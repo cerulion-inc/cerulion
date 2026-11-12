@@ -86,6 +86,8 @@ mod impl_macro;
 mod input_accumulate;
 mod param_attr;
 mod parse;
+mod plugin_codegen;
+mod plugin_impl;
 mod registry;
 mod state_derive;
 mod validate;

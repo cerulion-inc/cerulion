@@ -987,7 +987,7 @@ own binary.
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
-| `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over the untouched `graph create` scaffold takes no `.bak` and no warn, any other byte keeps both | no | none |
+| `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over a file byte-identical to the CLI's own `graph create` + `node stage` writes (default or `-n` prefix) takes no `.bak` and no warn, any byte the re-render does not reproduce keeps both | no | none |
 | `graph_partition_test.rs` | `graph partition` verb: cost-mode selection, consent ladder, replace-scoped validation | no | none |
 | `graph_run_preflight_test.rs` | `resolve_partition_intent` matrix, explicit save and ephemeral adoption, lenient-costs degrade, in-memory==written plan equality | no | none |
 | `network_run_gate_test.rs` | `resolve_run_network` decision matrix + gateway-port parse; the kill-switch scope text (`KILL_SWITCH_SCOPE`) on the LOCAL-ONLY notices of a run and on the fail-closed warns of a run and a query (env-mutating; file-local mutex inside) | no | none |
@@ -1017,7 +1017,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
-| `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
+| `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib); a resim on its private namespace delivers nothing to a live input or an egress tap on the shared one, two resims, the second on slot 1 while the test holds slot 0's lock, write byte-identical reports, and two resims in a row reuse slot 0, remove a leftover segment name planted on it and leave one namespace's files | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib` |
 | `tests/node_fatal_e2e_test.rs` | A node returning `NodeError::Fatal` on a temp workspace, `--single-process`: exact delivered frames, ONE fatal log line, `graph run` exit 3 (record and plain arms), `bag play --resim all --verify` exit 0 on the recording; a recorded `Logic` error keeps the node firing (a second failure is logged), exit 0 and the same two frames | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/node_fatal_mp_e2e_test.rs` | The same workspace on the multi-process default (Linux only, iceoryx2 2034 waiver on macOS): two workers, ONE fatal line, the worker's and the supervisor's `Error:` lines, exit 3, not degraded, no orphan; a `Logic` error keeps the node firing (a second failure is logged) and exits 0 | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, one rank per executor unit with its manifest, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
@@ -1142,9 +1142,10 @@ it with a no-replace hard link. Failed writes leave no partial final manifest;
 concurrent choices win. Clean up the staging file and propagate filesystem errors,
 including filesystems without hard-link support; never fall back to overwriting.
 
-`node build` probes PATH `rustc` only for an advisory warning. Cargo owns compiler
-selection, including environment and project configuration overrides. The built
-cdylib must match the host's full compiler fingerprint, checked at load before init.
+`node build` uses Cargo compiler selection through toolchain files and compiler
+overrides. Cargo enforces the workspace MSRV. Native loading checks the frozen
+boundary major, complete layout identity and capabilities; compiler provenance
+is diagnostic metadata and never a load refusal.
 
 ### Bundled starters
 
@@ -1314,7 +1315,7 @@ at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
    - `command`: `derived_verb::<YourCmd>()`, the family's one verb. The family never
      sees the root command, so it cannot change a built-in verb, a root argument or the
      root's help text.
-   - `log_class`: `OneShot` (quiet `warn` default) or `LongRunning` (`info`), per verb.
+   - `log_class`: `OneShot` or `QuietRuntime` (quiet `warn` default) or `LongRunning` (`info`), per verb.
    - `network_refusal`: the refusal of an invocation that would reach a robot or a
      daemon over the network while the kill switch in the `SwitchEnv` is engaged, built
      from the engine's own refusal so the text and exit code match; `None` for a verb

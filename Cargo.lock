@@ -479,7 +479,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -521,7 +521,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "event-listener",
  "futures-lite",
- "rustix 1.1.3",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -536,7 +536,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "futures-core",
  "futures-io",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
@@ -1397,7 +1397,7 @@ dependencies = [
  "proc-macro2",
  "regex",
  "reqwest",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -1455,6 +1455,7 @@ dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "codegen_fixture_msgs",
  "dirs",
@@ -1545,7 +1546,7 @@ name = "cerulion_hygiene"
 version = "2.0.0"
 dependencies = [
  "libc",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "toml",
@@ -1622,7 +1623,7 @@ dependencies = [
  "libc",
  "native_ros2_messages",
  "postcard",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "socket2 0.6.5",
@@ -1632,6 +1633,15 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "zenoh",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "libloading",
+ "stabby",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2365,7 +2375,7 @@ dependencies = [
  "crossterm_winapi",
  "document-features",
  "parking_lot",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "winapi 0.3.9",
 ]
 
@@ -2792,7 +2802,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3041,7 +3051,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3658,9 +3668,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "7e2da0694c15b44c6f68a6b05e0233617008c54080e31d6eb848d858a9c5b38d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -4605,7 +4615,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4987,9 +4997,9 @@ checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -5690,7 +5700,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6458,7 +6468,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -6749,7 +6759,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8233,15 +8243,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.3"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c9e247ccc180c1f61615433868c99f3de3ae256a30a43b49f67c2d9171f34"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
- "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "linux-raw-sys 0.12.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8309,7 +8319,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8523,7 +8533,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9074,6 +9084,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]
@@ -9284,8 +9295,8 @@ dependencies = [
  "fastrand",
  "getrandom 0.3.4",
  "once_cell",
- "rustix 1.1.3",
- "windows-sys 0.59.0",
+ "rustix 1.1.6",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9302,6 +9313,8 @@ name = "test_node_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+ "serde_json",
 ]
 
 [[package]]
@@ -9324,6 +9337,7 @@ name = "test_node_drain_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9380,6 +9394,7 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+ "trybuild",
 ]
 
 [[package]]
@@ -9602,6 +9617,7 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9609,6 +9625,16 @@ name = "test_node_snapshot_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_stable_abi_cross_compiler"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+ "stabby",
 ]
 
 [[package]]
@@ -9632,6 +9658,13 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_unknown_schema_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
 ]
 
 [[package]]
@@ -10184,7 +10217,7 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 0.1.10",
+ "cfg-if 1.0.4",
  "static_assertions",
 ]
 
@@ -10716,7 +10749,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

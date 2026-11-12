@@ -32,17 +32,16 @@
 //!
 //! # What crosses the FFI here
 //!
-//! Two additive export pairs, and this fixture needs BOTH:
+//! Host-owned snapshot and refill operations, and this fixture needs both:
 //!
-//! - `cerulion_node_{set_,}snapshot_inputs` — the per-step freeze of
-//!   `ctx_in`, i.e. the slot under test.
-//! - `cerulion_node_refill_trigger_input` — the between-fires refill
-//!   of `inp`, i.e. the burst itself.
+//! - The per-step freeze of `ctx_in`, the slot under test.
+//! - The between-fires refill of `inp`, the burst itself.
+//!
+//! The plugin reads the borrowed shared-memory slots through the host table.
 //!
 //! `out` carries BOTH values (`x` = the trigger frame, `y` = the context read),
 //! so a downstream sink recording `(x, y)` pairs is a complete oracle for what
-//! each fire observed — the counters-via-output pattern, since a cdylib's own
-//! state is unreachable from the host.
+//! each fire observed, without relying on private counters.
 
 #![deny(unused_imports)]
 // P12 (the project logging rule): library code never prints — it logs through

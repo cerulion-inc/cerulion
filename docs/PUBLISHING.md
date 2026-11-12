@@ -17,7 +17,8 @@ dev-dependencies are stripped by `cargo package`):
 | Crate | Internal normal/build deps |
 |---|---|
 | `cerulion_macros` | (none; external only: proc-macro2, quote, syn) |
-| `cerulion_core` | `cerulion_macros`, `cerulion_pairing` |
+| `cerulion_node_abi` | (none) |
+| `cerulion_core` | `cerulion_macros`, `cerulion_node_abi`, `cerulion_pairing` |
 | `native_ros2_messages` | `cerulion_core` (as dep **and** build-dep) |
 | `cerulion` | `cerulion_core`, `cerulion_macros`, `native_ros2_messages` |
 | `cerulion_dds` | (none; published DDS forks are external dependencies) |
@@ -40,7 +41,7 @@ dev-dependencies are stripped by `cargo package`):
 
 Publish in this order:
 
-1. **`cerulion_macros`**, **`cerulion_pairing`**, **`cerulion_discovery`**,
+1. **`cerulion_node_abi`**, **`cerulion_macros`**, **`cerulion_pairing`**, **`cerulion_discovery`**,
    **`cerulion_dds`**, **`cerulion_hygiene`**, **`cerulion_link`** and
    **`cerulion_telemetry`** (no internal dependency; independent of one another)
 2. **`cerulion_core`** and **`cerulion_mdns`**
@@ -156,7 +157,7 @@ Run from the workspace root, in order:
       `./tools/scripts/test_build_deb.sh` check the three lists; the install
       smoke of `release-artifacts.yml` checks the installed release.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
-      access for all twenty-one publishable crates listed above.
+      access for all twenty-two publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
       the new version before publishing the next crate in the order.
 
@@ -236,8 +237,8 @@ and runs in the `Lint` job.
 
 ## First publication: new-crate rate limit and partial publishes
 
-Eighteen of the twenty-one publishable crates exist on crates.io; `cerulion_telemetry`,
-`cerulion_android` and `cerulion_msgio` are new and are published for the first time with the
+Eighteen of the twenty-two publishable crates exist on crates.io; `cerulion_telemetry`,
+`cerulion_android`, `cerulion_msgio` and `cerulion_node_abi` are new and are published for the first time with the
 release that adds them. The umbrella `cerulion` crate's name already exists on crates.io (at
 `0.0.2`), so it is not a new crate name. The `0.1.0` release
 published eleven of them for the first time (`cerulion_bag`, `cerulion_bagd`,
