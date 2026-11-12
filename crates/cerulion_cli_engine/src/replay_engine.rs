@@ -11796,7 +11796,7 @@ fn latest_input_depth(info: &cerulion_core::graph::NodeInfo, input: &str) -> Opt
 /// (`NodeInfo::unifies_data_trigger` refuses them on policy), so they are
 /// [`replay_rederive::LatestDrain::Separate`]. Every other input reads through
 /// one subscriber only when its entry answers `NodeEntry::unifies_trigger_drain`
-/// (a node library through its unified drain export, a closure unless built
+/// (a stable node library through its host-owned unified drain, a closure unless built
 /// with `ClosureNodeEntry::with_unified_drain(false)`) and
 /// `CERULION_DRAIN_DISCIPLINE=separate` did not force two at the graph build.
 /// Such a bag records neither, and the replayed entry need not be the recorded
@@ -19065,7 +19065,7 @@ mod node_trigger_decl_tests {
     }
 
     /// An older bag's `drop_oldest` latest input, whose node read it through
-    /// two subscribers (a library without the unified drain export, an
+    /// two subscribers (an entry without unified drain capability, an
     /// opted-out closure, or the drain override), recorded a step that popped
     /// a frame an earlier read already took and fired nothing. Judged as one
     /// subscriber that step is a false finding; declared from what the bag

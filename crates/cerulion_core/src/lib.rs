@@ -84,6 +84,9 @@
 #[cfg(test)]
 mod abi_layout;
 
+/// Compiler-independent node plugin interface.
+pub use cerulion_node_abi as node_abi;
+
 // Lock-free, SHM-mappable counting barrier — the rendezvous
 // state machine for the cross-process DAG-level barrier. SHM page mapping,
 // doorbell wake, and scheduler integration are not wired yet; `pub`
@@ -179,9 +182,8 @@ pub mod posix_shm;
 pub mod prelude;
 pub mod read_outcome;
 pub mod replay_feed;
-// The rustc that compiled THIS copy of `cerulion_core`, compared across the
-// cdylib FFI boundary by `DylibNodeEntry::load` to catch a toolchain-skew
-// niche-encoding mismatch the ABI version cannot see. See the module doc.
+// Compiler provenance supports diagnostics and reproducible workspace defaults.
+// The stable node boundary is independent of this compiler fingerprint.
 pub mod rustc_fingerprint;
 #[allow(missing_docs)]
 pub mod scheduler;
@@ -317,10 +319,11 @@ pub mod wedge_page;
 #[allow(missing_docs)]
 pub mod wire;
 
-/// ABI version for cdylib node compatibility checking.
+/// ABI history version for node compatibility and diagnostics.
 ///
-/// Incremented when the cdylib entry point ABI changes. Dynamic libraries
-/// must export `cerulion_abi_version() -> u32` returning this exact value.
+/// Version 32 introduces stable boundary major 1. Native loading checks its
+/// complete frozen table identity, boundary major and capabilities; the compiler
+/// provenance and legacy version symbol do not govern stable compatibility.
 ///
 /// History:
 /// - v1: original handle-less ABI.
@@ -713,8 +716,9 @@ pub mod wire;
 ///   `ReplayReadViolation` and its kind) is reached through a crate-owned
 ///   `Arc` from that field, so those rows enter the `abi_layout` table at this
 ///   version too. `Scheduler::set_trigger_refill`'s closure return widens from
-///   `(u64, Option<u64>)` to `RefillOutcome`, which is host-side only: the
-///   cdylib FFI symbol `cerulion_node_refill_trigger_input` is untouched.
+///   `(u64, Option<u64>)` to `RefillOutcome`, which was host-side only at v26:
+///   the legacy refill export remained unchanged. Stable node libraries now
+///   use the host head operations.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
@@ -839,7 +843,9 @@ pub mod wire;
 ///   `BackpressureProbe` that holds it from 120 to 136.
 ///
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
-pub const CERULION_ABI_VERSION: u32 = 31;
+///
+/// Compiler-independent node table; legacy Rust boundaries require a rebuild.
+pub const CERULION_ABI_VERSION: u32 = 32;
 
 // Re-export commonly used types
 #[cfg(unix)]

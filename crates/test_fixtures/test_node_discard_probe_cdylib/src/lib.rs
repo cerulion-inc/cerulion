@@ -26,10 +26,9 @@
 //!
 //! - default (unset / any non-`healthy` value): writes ONLY the `data` variable
 //!   field, leaving `encoding` + `header` unwritten, so `OutputProxy::drop`
-//!   fires cerulion_core's loud discard error every tick ("OutputProxy dropped
-//!   without writing all declared variable fields; skipping publish"). This is
-//!   the black-hole regression the stopgap fixes — with no subscriber that
-//!   error dispatches to a no-op.
+//!   causes the host-owned proxy to count each discard and emit its error once
+//!   per failure regime. The host subscriber sends that diagnostic to stderr;
+//!   the cdylib-local subscriber independently emits the author's probe events.
 //! - `healthy`: writes all three variable fields → publishes normally, no
 //!   discard error (the control that proves the error is tied to the
 //!   unwritten-field condition, not to load/init).
@@ -53,12 +52,23 @@ fn discard_mode_is_healthy() -> bool {
     std::env::var("CER_DISCARD_MODE").as_deref() == Ok("healthy")
 }
 
+struct DefaultLogProbe;
+
+impl Default for DefaultLogProbe {
+    fn default() -> Self {
+        tracing::info!("discard probe field default ran");
+        Self
+    }
+}
+
 #[cerulion_node(period_ms = 10)]
 #[derive(Default)]
 struct DiscardProbe {
     #[output]
     image_out: Image,
     count: u32,
+    #[cerulion(reconstruct)]
+    _default_log: DefaultLogProbe,
 }
 
 #[cerulion_node_impl]

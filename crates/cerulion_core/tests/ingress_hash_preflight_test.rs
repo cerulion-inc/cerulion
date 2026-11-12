@@ -12,7 +12,7 @@
 //! A macro cdylib emits a per-input `schema_hash` in its info JSON, so its
 //! consumers resolve. The `0` sentinel is still reachable from a SHIPPED node
 //! form: a raw-FFI cdylib (or any legacy `"inputs":["name"]` strings-shape info
-//! JSON) carries no per-input hash at all. `test_node_snapshot_fail_cdylib` is
+//! JSON) carries no per-input hash at all. `test_node_unknown_schema_cdylib` is
 //! exactly that shape, so it drives the SAME resolver arm and the SAME operator-
 //! facing error a real graph hits.
 //!
@@ -27,7 +27,7 @@
 //!
 //! Build the fixture first:
 //! ```text
-//! cargo build -p test_node_snapshot_fail_cdylib
+//! cargo build -p test_node_unknown_schema_cdylib
 //! ```
 
 use cerulion_core::graph::node::InputMeta;
@@ -92,7 +92,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
 /// Load the raw-FFI fixture and return its parsed `NodeInfo`, keyed as the
 /// graph's `sink` node — the same map `graph run` builds from loaded cdylibs.
 fn entry_infos() -> IndexMap<String, NodeInfo> {
-    let path = cerulion_core::testing::find_fixture_cdylib("test_node_snapshot_fail_cdylib");
+    let path = cerulion_core::testing::find_fixture_cdylib("test_node_unknown_schema_cdylib");
     let node_entry = DylibNodeEntry::load(&path).expect("load raw-FFI fixture");
     let info = node_entry.info().expect("fixture info parses");
     let mut infos = IndexMap::new();

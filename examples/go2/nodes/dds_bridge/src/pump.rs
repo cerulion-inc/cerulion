@@ -118,6 +118,8 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::clock::Clock;
 use cerulion_core::codegen::CdrCodec;
+use cerulion_core::graph::node_plugin_abi::RawIngress;
+#[cfg(test)]
 use cerulion_core::transport::TransportManager;
 use cerulion_go2_dds::messages;
 use cerulion_go2_dds::participant::ParticipantConfig;
@@ -508,7 +510,7 @@ pub struct BridgePump {
     /// [`resolve_raw_transport`]: the cdylib static trap). Unused when the
     /// config has no raw mappings. `pub(crate)` so the lib.rs regression
     /// test can `Arc::ptr_eq` the carried manager through `build_pump`.
-    pub(crate) transport: Option<Arc<TransportManager>>,
+    pub(crate) transport: Option<RawIngress>,
     /// The SHARED shutdown coordinator. Cloned onto the node in
     /// `external_source` (BEFORE the pump is moved into the Blocking closure),
     /// so `DdsBridge::shutdown()` can signal + join the drain thread. Each
@@ -556,7 +558,7 @@ impl BridgePump {
     pub fn with_transport(
         cfg: BridgeConfig,
         queue: Arc<Mutex<SampleQueue>>,
-        transport: Arc<TransportManager>,
+        transport: RawIngress,
     ) -> Self {
         let mut pump = Self::new(cfg, queue);
         pump.transport = Some(transport);
@@ -849,27 +851,13 @@ async fn drain_from_stream<M, I, E, S>(
 // Raw-generic drains
 // ---------------------------------------------------------------------------
 
-/// Resolve the transport the raw routes publish on: the
-/// CONTEXT-CARRIED manager ONLY (extracted so the None arm's contract is
-/// hermetically pinned). There is deliberately NO `TransportManager::get()` /
-/// `get_or_init()` fallback: the bridge runs as a CDYLIB, which links its OWN
-/// copy of cerulion_core — its `INSTANCE` static is NEVER the host's (`get()`
-/// fails forever, so raw init would retry on backoff without end),
-/// and a `get_or_init()` would mint a SECOND manager on the DEFAULT
-/// SHM root, silently losing every raw route into the wrong namespace
-/// whenever the host runs a non-default config.
-fn resolve_raw_transport(
-    transport: Option<Arc<TransportManager>>,
-) -> Result<Arc<TransportManager>, String> {
+/// Resolve the context's raw-ingress factory without opening another session.
+/// Stable factories retain host services; native factories retain the manager.
+fn resolve_raw_transport(transport: Option<RawIngress>) -> Result<RawIngress, String> {
     transport.ok_or_else(|| {
-        "raw mappings need the HOST's TransportManager, but none was carried into this \
-         pump. The transport travels via NodeContext (the graph runtime injects \
-         it before init(); DdsBridge::init stores it; external_source hands it to \
-         BridgePump::with_transport) — a cdylib CANNOT resolve TransportManager::get(): \
-         it links its OWN copy of cerulion_core, whose INSTANCE static the host never \
-         initialized, and get_or_init() would mint a SECOND manager on the default SHM \
-         root (raw routes silently lost into the wrong namespace). Hand-rolled hosts: \
-         construct the pump via BridgePump::with_transport"
+        "raw mappings need a NodeContext raw-ingress factory; initialize the node \
+         before constructing BridgePump::with_transport. The factory retains host \
+         publisher services and the injected clock"
             .to_string()
     })
 }
@@ -879,7 +867,7 @@ fn resolve_raw_transport(
 fn build_raw_binding(
     node: &Node,
     dds_sub: &DdsSubscriber,
-    mgr: &Arc<TransportManager>,
+    mgr: &RawIngress,
     codec: &Arc<CdrCodec>,
     m: &TopicMapping,
 ) -> Result<(String, RawReader, RawIngressRoute), String> {
@@ -1058,7 +1046,7 @@ where
 /// the caller so `NodeEntry::shutdown()` can signal + join this thread.
 fn spawn_drain_thread(
     cfg: BridgeConfig,
-    transport: Option<Arc<TransportManager>>,
+    transport: Option<RawIngress>,
     queue: Arc<Mutex<SampleQueue>>,
     stats: Arc<PumpStats>,
 ) -> Result<(DrainHandle, DrainThreadStop), String> {
@@ -1125,7 +1113,7 @@ enum SubKind {
 #[allow(clippy::too_many_arguments)]
 fn drain_thread_main(
     cfg: BridgeConfig,
-    transport: Option<Arc<TransportManager>>,
+    transport: Option<RawIngress>,
     queue: Arc<Mutex<SampleQueue>>,
     pushed: Arc<AtomicBool>,
     stats: Arc<PumpStats>,
@@ -1176,7 +1164,7 @@ static INIT_PANIC_FOR_TEST: AtomicBool = AtomicBool::new(false);
 /// [`run_drain_thread_contained`]'s panic boundary.
 fn drain_thread_body(
     cfg: BridgeConfig,
-    transport: Option<Arc<TransportManager>>,
+    transport: Option<RawIngress>,
     queue: Arc<Mutex<SampleQueue>>,
     pushed: Arc<AtomicBool>,
     stats: Arc<PumpStats>,
@@ -1647,10 +1635,9 @@ mod tests {
         };
         for needle in [
             "NodeContext",
+            "raw-ingress factory",
             "BridgePump::with_transport",
-            "OWN copy of cerulion_core",
-            "SECOND manager",
-            "TransportManager::get()",
+            "injected clock",
         ] {
             assert!(err.contains(needle), "missing {needle:?} in: {err}");
         }
@@ -1659,9 +1646,10 @@ mod tests {
     #[test]
     fn resolve_raw_transport_some_returns_the_same_manager() {
         let mgr = raw_test_transport("resolve_some");
-        let resolved = resolve_raw_transport(Some(Arc::clone(&mgr))).expect("Some resolves");
+        let resolved = resolve_raw_transport(Some(RawIngress::native(Arc::clone(&mgr))))
+            .expect("Some resolves");
         assert!(
-            Arc::ptr_eq(&resolved, &mgr),
+            Arc::ptr_eq(&resolved.clock_arc(), &mgr.clock_arc()),
             "the carried manager is returned untouched (no re-resolution)"
         );
     }
@@ -1741,7 +1729,7 @@ mod tests {
         let codec = crate::generic::bridge_codec();
         let topic = format!("/pump726/{tag}/v3");
         let route = RawIngressRoute::open(
-            &mgr,
+            &RawIngress::native(Arc::clone(&mgr)),
             &codec,
             "geometry_msgs/Vector3",
             &topic,
@@ -1836,7 +1824,7 @@ mod tests {
         let codec = crate::generic::bridge_codec();
         let topic = "/pump904/trailing/v3";
         let mut route = RawIngressRoute::open(
-            &mgr,
+            &RawIngress::native(Arc::clone(&mgr)),
             &codec,
             "geometry_msgs/Vector3",
             topic,

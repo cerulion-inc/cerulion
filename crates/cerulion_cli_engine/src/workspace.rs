@@ -365,10 +365,10 @@ fn write_workspace_toolchain(
     for name in ["rust-toolchain", "rust-toolchain.toml"] {
         match std::fs::symlink_metadata(root.join(name)) {
             Ok(_) => {
-                tracing::warn!(
+                tracing::debug!(
                     rustc = release,
                     file = name,
-                    "existing workspace Rust toolchain retained; node builds must match the Cerulion compiler"
+                    "existing workspace Rust toolchain retained"
                 );
                 return Ok(());
             }
@@ -377,28 +377,28 @@ fn write_workspace_toolchain(
         }
     }
     let Some(manifest) = stable_toolchain_manifest(release) else {
-        tracing::warn!(
+        tracing::debug!(
             rustc = release,
-            "compiler is not a stable release; select the same compiler explicitly when building nodes"
+            "compiler has no reproducible stable toolchain pin; ambient selection retained"
         );
         return Ok(());
     };
     let compiler = match probe(release) {
         Ok(compiler) => compiler,
         Err(error) => {
-            tracing::warn!(
+            tracing::debug!(
                 rustc = release,
                 error = %error,
-                "could not verify the installed rustup compiler; select the Cerulion compiler explicitly when building nodes"
+                "could not verify an optional reproducible toolchain pin; ambient selection retained"
             );
             return Ok(());
         }
     };
     if !toolchain_fingerprint_matches(release, fingerprint, &compiler) {
-        tracing::warn!(
+        tracing::debug!(
             rustc = release,
             fingerprint,
-            "installed rustup compiler does not match Cerulion; ambient compiler selection retained"
+            "installed compiler does not match the optional reproducible toolchain pin; ambient selection retained"
         );
         return Ok(());
     }
