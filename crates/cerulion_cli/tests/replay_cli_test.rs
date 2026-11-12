@@ -1056,6 +1056,19 @@ fn subprocess_replay_of_flipped_bag_exits_1_with_regression_report() {
         stderr.contains("FRAME-CONTENT DIVERGENCE") && stderr.contains("byte-mismatch"),
         "the regression verdict names the divergence class on stderr: {stderr}"
     );
+    // The verdict line names the field and both values. Hand oracle: the
+    // fixture writes cmd.x = 0.0 (eight zero bytes); byte 0 XOR 0xFF is the
+    // bit pattern 0xff, which reads back as 1.26e-321. A Vector3 frame is the
+    // 40-byte header plus 24 payload bytes.
+    let topic = format!("/{prefix}/ticker/cmd");
+    let line = format!(
+        "  - {topic} [byte-mismatch]: frame 1 on '{topic}' differs at x: recorded 1.26e-321, \
+         replayed 0.0 (recorded 64 B, replayed 64 B)"
+    );
+    assert!(
+        stderr.lines().any(|l| l == line),
+        "the verdict names the field and both values ({line}); stderr: {stderr}"
+    );
 }
 
 /// **THE headline discriminator**: ONE divergent
@@ -1329,6 +1342,19 @@ fn subprocess_replay_of_nondeterministic_node_exits_1_with_regression() {
     assert!(
         stderr.contains(&format!("/{prefix}/ticker/cmd")),
         "the violation is on the node's topic: {stderr}"
+    );
+    // The field is named with both values. The values themselves are
+    // nondeterministic by design, so only the path and the two-value shape
+    // are pinned: the fixture mints new bits for cmd.x on every fire, from
+    // the first one on.
+    let head = format!("frame 0 on '/{prefix}/ticker/cmd' differs at x: recorded ");
+    let named = stderr
+        .lines()
+        .find_map(|l| l.split_once(head.as_str()).map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("the verdict names cmd.x ({head}); stderr: {stderr}"));
+    assert!(
+        named.contains(", replayed ") && named.ends_with(" (recorded 64 B, replayed 64 B)"),
+        "both values, then the frame sizes: {named}"
     );
 }
 
