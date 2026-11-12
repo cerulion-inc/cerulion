@@ -259,7 +259,7 @@ impl SafetyControllerNode {
 }
 ```
 
-Nodes can also be written in Python: `cerulion node create <type> --lang python --policy period_ms=<N>` writes one that `graph run`, recording and replay treat like a Rust node, as [Python](docs/python.md) describes.
+Nodes can also be written in Python: `cerulion node create <type> --lang python --policy period_ms=<N>` writes one that `graph run`, recording and replay treat like a Rust node. It needs the `cerulion` Python package and a `cerulion` CLI, both built from a Cerulion source checkout, as [Python](docs/python.md) describes.
 
 Here, `#[input(trigger)]` runs the controller when a scan arrives. The port deadlines make timing expectations observable through miss counters, alongside delivery-failure counts.
 
