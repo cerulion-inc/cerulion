@@ -3236,6 +3236,76 @@ pub struct Violation {
     pub detail: String,
 }
 
+/// What differs in a byte-mismatched frame, as the `--report` JSON carries
+/// it: one flat object whose `kind` says which keys hold a value (the
+/// byte-mismatch forms in `docs/bag.md`).
+///
+/// Hidden from the docs: the JSON is the contract; this is its carrier.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ByteDifference {
+    /// What the line names.
+    pub kind: DifferenceKind,
+    /// The field path (`field`), the header field (`header`, `schema_hash`)
+    /// or the framed field (`layout` in `field_framing`).
+    pub path: Option<String>,
+    /// The recorded value: a JSON number or bool where the value is one,
+    /// otherwise the text the line prints.
+    pub recorded: Option<DifferenceValue>,
+    /// The replayed value, as [`Self::recorded`].
+    pub replayed: Option<DifferenceValue>,
+    /// The first differing byte (`layout`, `undecoded`).
+    pub byte_offset: Option<usize>,
+    /// Where the byte sits (`layout`): `fixed_section_padding`,
+    /// `offset_table`, `field_framing`, `unused_variable_bytes` or
+    /// `trailing_bytes`.
+    pub region: Option<&'static str>,
+    /// Why the fields were not decoded (`undecoded`):
+    /// `recorded_frame_too_short`, `replayed_frame_too_short`,
+    /// `unknown_schema_hash`, `recorded_frame_undecodable` or
+    /// `replayed_frame_undecodable`.
+    pub reason: Option<&'static str>,
+    /// How many other values of the frame differ.
+    pub more: u64,
+}
+
+/// [`ByteDifference::kind`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferenceKind {
+    /// A message field value.
+    Field,
+    /// A wire-header field.
+    Header,
+    /// The frames carry different schemas.
+    SchemaHash,
+    /// Every value is equal; a framing byte differs.
+    Layout,
+    /// The fields were not decoded.
+    Undecoded,
+}
+
+/// One value of a [`ByteDifference`], serialized as the bare JSON value.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum DifferenceValue {
+    /// A `bool`.
+    Bool(bool),
+    /// A signed integer, exact.
+    Int(i64),
+    /// An unsigned integer, exact.
+    UInt(u64),
+    /// A finite `float32`, in its own shortest form.
+    Float32(f32),
+    /// A finite `float64`.
+    Float64(f64),
+    /// A string value, or the line's text for a value with no JSON number
+    /// form (`.nan`, `.inf`, a byte, a window of a long string).
+    Text(String),
+}
+
 /// The divergence classes. Two distinct "missing" classes, by design:
 /// a topic with ZERO replayed frames is [`Self::MissingTopic`]; a topic with
 /// FEWER replayed frames than recorded is [`Self::MissingMessages`].
@@ -3268,12 +3338,17 @@ pub enum ViolationClass {
         /// The 0-based frame index of the first differing frame.
         index: usize,
         /// The byte offset of the first differing byte (or the shorter length
-        /// when one frame is a prefix of the other).
+        /// when one frame is a prefix of the other). It can sit in another
+        /// field than `difference.path`: the path is the first differing
+        /// value in the schema's declaration order, the offset is byte order.
         first_diff_byte_offset: usize,
         /// The recorded frame's length.
         recorded_len: usize,
         /// The replayed frame's length.
         replayed_len: usize,
+        /// What differs in that frame: the entry the detail line is built
+        /// from (the byte-mismatch forms in `docs/bag.md`).
+        difference: ByteDifference,
     },
     /// The recording itself lost frames on this topic at RECORD time
     /// (the bag's `record_health.json` stamp reports `frames_lost > 0` or a
@@ -4557,6 +4632,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         clock,
         mut factories,
         schema_hashes,
+        verdict_schemas_dir,
         resume,
     } = build_replay_context(&config, nodes, || {
         resolve_resume(
@@ -4841,6 +4917,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // can run on BOTH exits of the loop below — the completed one and an
     // abort at rank k, which still owes the operator ranks 0..k's results.
     let mut acc = PassAccumulators::default();
+    // Every pass judges its byte divergences against ONE schema set, built
+    // the first time a stream diverges (a passing replay never builds it).
+    let verdict = VerdictDecoder::new(verdict_schemas_dir);
     let mut warned_partial_discard: std::collections::HashSet<Arc<str>> =
         std::collections::HashSet::new();
     let last_pass = plans.len().saturating_sub(1);
@@ -4935,6 +5014,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
+                verdict: &verdict,
                 rank_tables: &rank_tables,
                 rank_count,
                 node_rank: node_rank.as_ref(),
@@ -5495,7 +5575,7 @@ fn assemble_outcome(
                 .and_then(|c| c.reproduced.get(topic).copied())
                 .unwrap_or(0),
         );
-        let byte_violation = summary.and_then(|c| c.byte_violation);
+        let byte_violation = summary.and_then(|c| c.byte_violation.as_ref());
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
         let tolerance_violations = summary
             .map(|c| c.tolerance_violations.clone())
@@ -8537,6 +8617,9 @@ struct ReplayContext {
     factories: IndexMap<String, Box<dyn NodeEntry>>,
     /// The workspace schema hashes on the CLI path; `None` on the test seam.
     schema_hashes: Option<std::collections::HashMap<String, u64>>,
+    /// The workspace `schemas/` directory a byte-mismatch verdict decodes
+    /// with on the CLI path; `None` (the built-in set alone) on the test seam.
+    verdict_schemas_dir: Option<PathBuf>,
     resume: Option<ResumePlan>,
 }
 
@@ -8629,6 +8712,7 @@ fn build_replay_context(
                 clock,
                 factories,
                 schema_hashes: Some(schema_hashes),
+                verdict_schemas_dir: Some(workspace_root.join("schemas")),
                 resume,
             })
         }
@@ -8651,6 +8735,7 @@ fn build_replay_context(
                 clock,
                 factories,
                 schema_hashes: None,
+                verdict_schemas_dir: None,
                 resume,
             })
         }
@@ -8916,6 +9001,9 @@ struct PassInputs<'a> {
     catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     trace: &'a RecordedTrace,
     recorded_messages: &'a RecordedMessages,
+    /// The schema set each byte divergence is decoded with at the pass
+    /// harvest, built on first use and shared by every pass.
+    verdict: &'a VerdictDecoder,
     rank_tables: &'a [Vec<Arc<str>>],
     rank_count: usize,
     node_rank: Option<&'a std::collections::HashMap<Arc<str>, u32>>,
@@ -8981,10 +9069,11 @@ impl PassInputs<'_> {
 struct CaptureSummary {
     /// Frames replay produced on the topic — [`Capture::replayed_count`].
     replayed_count: usize,
-    /// The TOPIC-level first byte divergence — written by the single-stream
-    /// diff only. A partitioned topic leaves this `None` and reports per writer
-    /// in [`Self::partition_counts`]; see [`Self::any_byte_violation`].
-    byte_violation: Option<ByteViolation>,
+    /// The TOPIC-level first byte divergence, judged — written by the
+    /// single-stream diff only. A partitioned topic leaves this `None` and
+    /// reports per writer in [`Self::partition_counts`]; see
+    /// [`Self::any_byte_violation`].
+    byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
     /// The per-field tolerance violations, already rendered against the topic.
     tolerance_violations: Vec<Violation>,
     /// The per-WRITER count/byte inputs of a label-partitioned topic (`None` on
@@ -15991,16 +16080,28 @@ fn run_rank_pass(
     // [`CaptureSummary`]), so the capture subscriber ports die with the pass
     // that opened them instead of being carried — still attached, still being
     // filled by the transport — across every later rank's pass.
+    //
+    // A stream's first byte divergence is judged HERE, after the step loop:
+    // its frame pair is decoded to name the differing field, then dropped.
     let captures: IndexMap<String, CaptureSummary> = captures_owned
-        .iter()
+        .iter_mut()
         .map(|(topic, c)| {
+            let skip = CaptureTolerance::tolerated_fields(c.tolerance.as_ref());
+            let byte_violation = c
+                .byte_violation
+                .take()
+                .map(|v| judge_byte_violation(pass.verdict, &skip, v));
+            let partition_counts = c
+                .partitions
+                .as_mut()
+                .map(|p| p.counts(&mut |v| judge_byte_violation(pass.verdict, &skip, v)));
             (
                 topic.clone(),
                 CaptureSummary {
                     replayed_count: c.replayed_count,
-                    byte_violation: c.byte_violation,
+                    byte_violation,
                     tolerance_violations: c.tolerance_violations(topic),
-                    partition_counts: c.partition_counts(),
+                    partition_counts,
                 },
             )
         })
@@ -16927,16 +17028,77 @@ mod provisionable_depth_tests {
 /// the replayed frame is compared to its recorded twin the moment it is drained,
 /// then dropped — the replayed side is never accumulated). At most one per topic
 /// (comparison stops at the first differing frame, matching the batch diff).
-#[derive(Debug, Clone, Copy)]
+///
+/// It keeps a copy of BOTH frames of that one pair, so the pass harvest can
+/// name the field that differs ([`judge_byte_violation`]); every other frame
+/// is still dropped once compared.
+#[derive(Debug)]
 struct ByteViolation {
     /// 0-based frame index of the first differing frame.
     index: usize,
     /// Byte offset of the first differing byte (or the shorter length).
     first_diff_byte_offset: usize,
-    /// The recorded frame's length.
-    recorded_len: usize,
-    /// The replayed frame's length.
-    replayed_len: usize,
+    /// The recorded frame.
+    recorded: Box<[u8]>,
+    /// The replayed frame.
+    replayed: Box<[u8]>,
+    /// The tolerance plan's field decoder refused one of the two frames, so
+    /// its byte-exact remainder was not compared.
+    refusal: Option<crate::replay_value_diff::RemainderRefusal>,
+}
+
+/// Turn a stream's first divergence into its verdict: what differs in that
+/// frame pair. The frame copies are dropped here.
+///
+/// `skip` is the top-level fields a tolerance metric judges on this topic
+/// (the set the byte-exact remainder leaves out), so a tolerated field is
+/// never named in a byte mismatch.
+fn judge_byte_violation(
+    decoder: &VerdictDecoder,
+    skip: &[&str],
+    violation: ByteViolation,
+) -> crate::replay_value_diff::ByteVerdict {
+    let difference = crate::replay_value_diff::locate_difference(
+        || decoder.walker(),
+        &violation.recorded,
+        &violation.replayed,
+        violation.first_diff_byte_offset,
+        skip,
+        violation.refusal.as_ref(),
+    );
+    crate::replay_value_diff::ByteVerdict {
+        index: violation.index,
+        first_diff_byte_offset: violation.first_diff_byte_offset,
+        recorded_len: violation.recorded.len(),
+        replayed_len: violation.replayed.len(),
+        difference,
+    }
+}
+
+/// The schema set a byte-mismatch verdict decodes its frames with: the one
+/// `topic echo` decodes with (built-ins, then the workspace's `.msg` store
+/// and YAML schemas), built at most once per run and only when a stream
+/// diverged, so a passing replay never builds it.
+struct VerdictDecoder {
+    /// The workspace `schemas/` directory; `None` decodes with the built-in
+    /// set alone (the in-process test path, which has no workspace).
+    schemas_dir: Option<PathBuf>,
+    walker: std::sync::OnceLock<cerulion_core::codegen::FrameWalker>,
+}
+
+impl VerdictDecoder {
+    fn new(schemas_dir: Option<PathBuf>) -> Self {
+        Self {
+            schemas_dir,
+            walker: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn walker(&self) -> &cerulion_core::codegen::FrameWalker {
+        self.walker.get_or_init(|| {
+            crate::topic_cmd::local_walker_from_workspace(self.schemas_dir.as_deref())
+        })
+    }
 }
 
 // ===========================================================================
@@ -17077,11 +17239,11 @@ struct CaptureStream {
 }
 
 /// One partition's count/byte verdict inputs, for the violation assembly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PartitionCounts {
     recorded: usize,
     replayed: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
 }
 
 /// The label-partitioned diff state of ONE co-located multi-publisher topic.
@@ -17188,9 +17350,18 @@ impl CapturePartitioning {
         }
     }
 
-    /// Per writer, the count/byte verdict inputs.
-    fn counts(&self) -> BTreeMap<WriterKey, PartitionCounts> {
-        fold_partition_counts(&self.recorded_writers, &self.producible, &self.streams)
+    /// Per writer, the count/byte verdict inputs; each writer's first
+    /// divergence goes through `judge` (and its frame copies are dropped).
+    fn counts(
+        &mut self,
+        judge: &mut dyn FnMut(ByteViolation) -> crate::replay_value_diff::ByteVerdict,
+    ) -> BTreeMap<WriterKey, PartitionCounts> {
+        fold_partition_counts(
+            &self.recorded_writers,
+            &self.producible,
+            &mut self.streams,
+            judge,
+        )
     }
 }
 
@@ -17212,7 +17383,8 @@ impl CapturePartitioning {
 fn fold_partition_counts(
     recorded_writers: &[WriterKey],
     producible: &BTreeSet<WriterKey>,
-    streams: &BTreeMap<WriterKey, CaptureStream>,
+    streams: &mut BTreeMap<WriterKey, CaptureStream>,
+    judge: &mut dyn FnMut(ByteViolation) -> crate::replay_value_diff::ByteVerdict,
 ) -> BTreeMap<WriterKey, PartitionCounts> {
     let mut out: BTreeMap<WriterKey, PartitionCounts> = BTreeMap::new();
     for key in recorded_writers {
@@ -17227,14 +17399,14 @@ fn fold_partition_counts(
             })
             .recorded += 1;
     }
-    for (key, stream) in streams {
+    for (key, stream) in streams.iter_mut() {
         let entry = out.entry(key.clone()).or_insert(PartitionCounts {
             recorded: 0,
             replayed: 0,
             byte_violation: None,
         });
         entry.replayed = stream.replayed_count;
-        entry.byte_violation = stream.byte_violation;
+        entry.byte_violation = stream.byte_violation.take().map(&mut *judge);
     }
     out
 }
@@ -17423,9 +17595,18 @@ impl FieldMetric {
 /// so it stays byte-compared along with schema_hash, offset_table_count,
 /// sequence and timestamp_ns (any layout change that could move it also
 /// changes schema_hash). See [`CaptureTolerance::remainder_first_diff`].
-const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
+pub(crate) const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
 
 impl CaptureTolerance {
+    /// The top-level fields a tolerance metric judges on a topic — the
+    /// fields the byte-exact remainder leaves out, so a byte-mismatch line
+    /// never names one. Empty with no tolerance plan.
+    fn tolerated_fields(plan: Option<&Self>) -> Vec<&str> {
+        plan.map_or_else(Vec::new, |ct| {
+            ct.metrics.iter().map(|m| m.field.as_str()).collect()
+        })
+    }
+
     /// The offset of the first BYTE that differs between the recorded and
     /// replayed frames OUTSIDE every overridden field's span, or `None` when the
     /// non-tolerated bytes match. This is the byte-exact "remainder" — a
@@ -17438,9 +17619,18 @@ impl CaptureTolerance {
     /// override may change length) compares the header + fixed section (minus
     /// overridden fixed spans) + each non-overridden variable field's DATA span,
     /// ignoring the offset table + overridden fields.
-    fn remainder_first_diff(&mut self, rec: &[u8], rep: &[u8]) -> Option<usize> {
+    ///
+    /// The second half of the pair is set when the field decoder refused a
+    /// frame, so the remainder could not be compared field by field; the
+    /// offset is then the end of the header.
+    fn remainder_first_diff(
+        &mut self,
+        rec: &[u8],
+        rep: &[u8],
+    ) -> Option<(usize, Option<crate::replay_value_diff::RemainderRefusal>)> {
         if !self.has_variable_override {
-            return remainder_skip_ranges(rec, rep, &self.excluded_frame_ranges);
+            return remainder_skip_ranges(rec, rep, &self.excluded_frame_ranges)
+                .map(|offset| (offset, None));
         }
         // Structural (Case B): header compared FIELD-WISE, EXCLUDING the ONE
         // LENGTH-DERIVED header field. A tolerated variable field whose
@@ -17469,17 +17659,17 @@ impl CaptureTolerance {
                 continue;
             }
             if rec[i] != rep[i] {
-                return Some(i);
+                return Some((i, None));
             }
         }
         if rec.len() < hdr || rep.len() < hdr {
-            return Some(common_hdr); // a frame too short to hold the header.
+            return Some((common_hdr, None)); // a frame too short to hold the header.
         }
         // Fixed section (payload-relative 0..fixed_size), skipping overridden
         // fixed spans (their frame-coord ranges are in excluded_frame_ranges).
         let fixed_end = hdr + self.fixed_size;
         if rec.len() < fixed_end || rep.len() < fixed_end {
-            return Some(hdr.min(rec.len()).min(rep.len()));
+            return Some((hdr.min(rec.len()).min(rep.len()), None));
         }
         for i in hdr..fixed_end {
             if self
@@ -17490,7 +17680,7 @@ impl CaptureTolerance {
                 continue;
             }
             if rec[i] != rep[i] {
-                return Some(i);
+                return Some((i, None));
             }
         }
         // Each non-overridden variable field's DATA span, compared byte-exact.
@@ -17508,12 +17698,29 @@ impl CaptureTolerance {
                         let off = (0..common)
                             .find(|&i| rl.bytes[i] != pl.bytes[i])
                             .unwrap_or(common);
-                        return Some(base + off);
+                        return Some((base + off, None));
                     }
                 }
                 // A decode failure on either side is a structural difference
                 // (a corrupt frame the bounds-checked decoder refused).
-                _ => return Some(hdr),
+                (Err(e), _) => {
+                    return Some((
+                        hdr,
+                        Some(crate::replay_value_diff::RemainderRefusal {
+                            side: crate::replay_value_diff::Side::Recorded,
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
+                (_, Err(e)) => {
+                    return Some((
+                        hdr,
+                        Some(crate::replay_value_diff::RemainderRefusal {
+                            side: crate::replay_value_diff::Side::Replayed,
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
             }
         }
         None
@@ -17686,15 +17893,13 @@ impl Capture {
             None
         };
         if let Some(rec_frame) = rec_frame {
-            let mut byte_violation = self.byte_violation;
             diff_recorded_twin(
                 self.tolerance.as_mut(),
-                &mut byte_violation,
+                &mut self.byte_violation,
                 index,
                 rec_frame,
                 sample.payload(),
             );
-            self.byte_violation = byte_violation;
         }
         self.replayed_count += 1;
         Ok(())
@@ -17915,13 +18120,6 @@ impl Capture {
                 self.subscriber.topic()
             ),
         }))
-    }
-
-    /// Per WRITER, the count/byte verdict inputs of a partitioned
-    /// topic — `None` on every single-stream topic, where the topic-level
-    /// counts are the whole answer.
-    fn partition_counts(&self) -> Option<BTreeMap<WriterKey, PartitionCounts>> {
-        self.partitions.as_ref().map(CapturePartitioning::counts)
     }
 
     /// The [`ViolationClass::ToleranceExceeded`]
@@ -18417,17 +18615,21 @@ fn diff_recorded_twin(
             None
         }
     } else if want_byte {
-        frame_first_diff(DiffMetric::BitExact, rec_frame, rep_frame)
+        frame_first_diff(DiffMetric::BitExact, rec_frame, rep_frame).map(|offset| (offset, None))
     } else {
         None
     };
     if want_byte {
-        if let Some(offset) = remainder {
+        if let Some((offset, refusal)) = remainder {
             *byte_violation = Some(ByteViolation {
                 index,
                 first_diff_byte_offset: offset,
-                recorded_len: rec_frame.len(),
-                replayed_len: rep_frame.len(),
+                // hot-path-alloc-ok: once per diverging stream, at its first
+                // differing frame (`want_byte` is false after it); the pair is
+                // decoded at the pass harvest to name the differing field.
+                recorded: rec_frame.into(),
+                replayed: rep_frame.into(),
+                refusal,
             });
         }
     }
@@ -22930,7 +23132,7 @@ fn push_topic_violations(
     topic: &str,
     recorded_count: usize,
     replayed_count: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<&crate::replay_value_diff::ByteVerdict>,
     // Per WRITER, the count/byte inputs of a label-partitioned
     // topic. `None` — every single-writer topic, and every multi-publisher one
     // the capture could not fully attribute — reports exactly as an unpartitioned
@@ -22977,7 +23179,7 @@ fn push_topic_violations(
                 Some(writer),
                 counts.recorded,
                 counts.replayed,
-                counts.byte_violation,
+                counts.byte_violation.as_ref(),
                 violations,
             );
         }
@@ -23005,7 +23207,7 @@ fn push_stream_violations(
     writer: Option<&WriterKey>,
     recorded_count: usize,
     replayed_count: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<&crate::replay_value_diff::ByteVerdict>,
     violations: &mut Vec<Violation>,
 ) {
     // `""` on the single-stream path, so a single-writer topic's message
@@ -23034,8 +23236,8 @@ fn push_stream_violations(
     }
 
     // The byte-level divergence (first differing frame) was found in-loop during
-    // the incremental diff — append it, matching the batch diff which reported
-    // only the FIRST differing frame per topic.
+    // the incremental diff and judged at the pass harvest — append it, matching
+    // the batch diff which reported only the FIRST differing frame per topic.
     if let Some(bv) = byte_violation {
         violations.push(Violation {
             topic: topic.to_string(),
@@ -23044,11 +23246,9 @@ fn push_stream_violations(
                 first_diff_byte_offset: bv.first_diff_byte_offset,
                 recorded_len: bv.recorded_len,
                 replayed_len: bv.replayed_len,
+                difference: crate::replay_value_diff::report_entry(&bv.difference),
             },
-            detail: format!(
-                "frame {} differs at byte {} on '{topic}'{scope} (recorded {} B, replayed {} B)",
-                bv.index, bv.first_diff_byte_offset, bv.recorded_len, bv.replayed_len
-            ),
+            detail: crate::replay_value_diff::byte_mismatch_detail(topic, &scope, bv),
         });
     }
 }
@@ -32633,6 +32833,11 @@ mod capture_partition_tests {
             .collect()
     }
 
+    /// The judge of a fold whose streams never diverged.
+    fn no_divergence(_: ByteViolation) -> crate::replay_value_diff::ByteVerdict {
+        unreachable!("no stream in these folds diverged")
+    }
+
     /// The verdict inputs are the UNION of both sides: a writer the recording
     /// carries that replay never produced, and a writer replay produced that
     /// the recording never carried, must BOTH report.
@@ -32651,7 +32856,8 @@ mod capture_partition_tests {
         let got = fold_partition_counts(
             &recorded,
             &producible,
-            &streams(&[("alpha/out", 2), ("gamma/out", 1)]),
+            &mut streams(&[("alpha/out", 2), ("gamma/out", 1)]),
+            &mut no_divergence,
         );
         let recorded_only = got
             .get(&key("beta/out"))
@@ -32685,7 +32891,12 @@ mod capture_partition_tests {
         // This pass owns `left` only: `right` runs on another rank and is not
         // injected here.
         let producible: BTreeSet<WriterKey> = std::iter::once(key("left/bus")).collect();
-        let got = fold_partition_counts(&recorded, &producible, &streams(&[("left/bus", 2)]));
+        let got = fold_partition_counts(
+            &recorded,
+            &producible,
+            &mut streams(&[("left/bus", 2)]),
+            &mut no_divergence,
+        );
         assert_eq!(
             got.keys().cloned().collect::<Vec<_>>(),
             vec![key("left/bus")],
@@ -32700,7 +32911,8 @@ mod capture_partition_tests {
         let surprise = fold_partition_counts(
             &recorded,
             &producible,
-            &streams(&[("left/bus", 2), ("right/bus", 1)]),
+            &mut streams(&[("left/bus", 2), ("right/bus", 1)]),
+            &mut no_divergence,
         );
         let extra = surprise
             .get(&key("right/bus"))
@@ -32709,22 +32921,41 @@ mod capture_partition_tests {
     }
 
     /// The count/byte sentences NAME the writer on a partitioned topic and carry
-    /// no writer clause at all without one.
+    /// no writer clause at all without one; the byte line names the field and
+    /// both values either way.
     #[test]
     fn a_stream_violation_names_its_writer_only_when_it_has_one() {
-        let bv = ByteViolation {
+        use crate::replay_value_diff::{ByteVerdict, FrameDifference, Shown, ValueDifference};
+        let bv = ByteVerdict {
             index: 4,
-            first_diff_byte_offset: 37,
-            recorded_len: 56,
-            replayed_len: 56,
+            first_diff_byte_offset: 40,
+            recorded_len: 64,
+            replayed_len: 64,
+            difference: FrameDifference::Field {
+                value: ValueDifference {
+                    path: "x".to_string(),
+                    at: String::new(),
+                    recorded: Shown {
+                        text: "5.0".to_string(),
+                        json: DifferenceValue::Float64(5.0),
+                    },
+                    replayed: Shown {
+                        text: "6.0".to_string(),
+                        json: DifferenceValue::Float64(6.0),
+                    },
+                    note: String::new(),
+                },
+                more: 0,
+            },
         };
         let mut plain = Vec::new();
-        push_stream_violations("/mp/bus", None, 3, 2, Some(bv), &mut plain);
+        push_stream_violations("/mp/bus", None, 3, 2, Some(&bv), &mut plain);
         assert_eq!(
             plain.iter().map(|v| v.detail.clone()).collect::<Vec<_>>(),
             vec![
                 "recorded 3 frame(s), replay produced 2 on '/mp/bus'".to_string(),
-                "frame 4 differs at byte 37 on '/mp/bus' (recorded 56 B, replayed 56 B)"
+                "frame 4 on '/mp/bus' differs at x: recorded 5.0, replayed 6.0 (recorded 64 B, \
+                 replayed 64 B)"
                     .to_string(),
             ]
         );
@@ -32734,7 +32965,7 @@ mod capture_partition_tests {
             Some(&WriterKey::Named("beta/out".into())),
             3,
             2,
-            Some(bv),
+            Some(&bv),
             &mut named,
         );
         assert_eq!(
@@ -32742,8 +32973,8 @@ mod capture_partition_tests {
             vec![
                 "recorded 3 frame(s), replay produced 2 on '/mp/bus' from writer beta/out"
                     .to_string(),
-                "frame 4 differs at byte 37 on '/mp/bus' from writer beta/out (recorded 56 B, \
-                 replayed 56 B)"
+                "frame 4 on '/mp/bus' from writer beta/out differs at x: recorded 5.0, replayed \
+                 6.0 (recorded 64 B, replayed 64 B)"
                     .to_string(),
             ]
         );
@@ -32758,6 +32989,27 @@ mod capture_partition_tests {
                 .iter()
                 .map(|v| format!("{:?}", v.class))
                 .collect::<Vec<_>>()
+        );
+        // The report keeps the frame coordinates and gains the flat entry.
+        assert_eq!(
+            serde_json::to_value(&plain[1].class).expect("serializes"),
+            serde_json::json!({
+                "kind": "ByteMismatch",
+                "index": 4,
+                "first_diff_byte_offset": 40,
+                "recorded_len": 64,
+                "replayed_len": 64,
+                "difference": {
+                    "kind": "field",
+                    "path": "x",
+                    "recorded": 5.0,
+                    "replayed": 6.0,
+                    "byte_offset": null,
+                    "region": null,
+                    "reason": null,
+                    "more": 0,
+                },
+            })
         );
     }
 

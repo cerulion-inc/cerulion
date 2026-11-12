@@ -146,6 +146,11 @@ pub mod replay_cmd;
 // transport).
 #[cfg(unix)]
 pub mod replay_engine;
+// What a replay byte-mismatch line names: the first differing field of a
+// frame and its two values, in `topic echo`'s spelling. Pure; called by the
+// engine once per diverging stream after a pass. Unix-gated with its caller.
+#[cfg(unix)]
+pub(crate) mod replay_value_diff;
 // The `--record-out` sink of `bag play --resim`: the re-executed frames, written
 // to a fresh bag. Unix-gated with the engine that feeds it.
 #[cfg(unix)]
