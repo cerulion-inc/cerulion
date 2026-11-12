@@ -224,13 +224,15 @@ remove them before committing.
   (remoted's directory is `<state_root>/remoted`) and the granted length,
   counted on netd's monotonic clock from when it took the hold.
   `SERVING_HOLD_MIN_DAEMON_VERSION` is 12, so the client's per-verb gate tells
-  a user of an older daemon to upgrade it. A hold does not take
-  `serving.hold`: remoted shares that lock only for paired sessions, ops
-  calls outside the bootstrap surface, outbound readers and its own sources,
-  so a connection from a peer without paired authority never keeps the server
-  past the hold's deadline (`automatic_serving_test.rs` pins the reap with two
-  unpaired ops connections and a refused rcp connection held open, and the
-  wait for a paired session).
+  a user of an older daemon to upgrade it. `NetdClient::hold_serving` returns a
+  `ServingLease` that owns the connection; dropping it is the release, and its
+  `expires()` is measured from before the request, never later than netd's
+  deadline. A lease does not take `serving.hold`: remoted shares that lock
+  only for paired sessions, ops calls outside the bootstrap surface, outbound
+  readers and its own sources, so a connection from a peer without paired
+  authority never keeps the server past the hold's deadline
+  (`automatic_serving_test.rs` pins the reap with two unpaired ops connections
+  and a refused rcp connection held open, and the wait for a paired session).
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway
@@ -511,6 +513,7 @@ rung itself.
 | `crates/cerulion_netd/tests/cli_version_test.rs` | `--version`/`-V` over the REAL binary: the exact `cerulion-netd <version>` line on stdout, empty stderr, exit 0, with no daemon boot | no | daemon binary (built by cargo test) |
 | `crates/cerulion_netd/tests/client_e2e_test.rs` | `NetdClient` demand/release pairing, spawn-readiness wait (first-use line at `INFO`, one stall `WARN` past two seconds, none on a prompt boot), died-vs-booting discriminator, an auto-started daemon holding none of the consumer's pipes (a re-executed consumer process) and a failed start quoting its startup log, version trust downgrade at the call sites | no (env arms use a file-local mutex) | daemon binary via `CARGO_BIN_EXE` |
 | `crates/cerulion_netd/tests/client_egress_e2e_test.rs` | `register_egress` composed through client + daemon + production egress plane really egresses (no inert shipping) | no | none |
+| `crates/cerulion_netd/tests/automatic_serving_test.rs` | The real netd and remoted binaries: egress and `hold_serving` start one owned server; last release, a hold's own deadline, a shortening replacement or its connection close reaps it; network-off, unusable-root and no-authority refusals start nothing; e-stop and work guards block reap | a file-local mutex serializes its arms | `cargo build -p cerulion_remoted` |
 | `crates/cerulion_netd/tests/mirror_plane_iox2_test.rs` | Production `GatewayMirrorPlane` over real iceoryx2 + zenoh: ensure/release, provenance registered and removed, single-writer slot freed, full demand→release→re-demand cycle | no | none |
 | `crates/cerulion_netd/tests/mirror_restart_e2e_test.rs` | A held demand self-heals across a robot gateway restart, with no client re-demand needed | no | none |
 | `crates/cerulion_netd/tests/egress_plane_iox2_test.rs` | Embedded gateway boots on the first egress plan and grows at runtime; frames flow SHM→tap→zenoh→remote SHM byte-identical to a hand oracle | no | none |
