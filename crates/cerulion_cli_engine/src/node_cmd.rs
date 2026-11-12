@@ -1216,6 +1216,30 @@ pub fn node_build_with_progress(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
 ) -> CliResult<NodeBuildOutcome> {
+    node_build_with_cargo_dir(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        None,
+    )
+}
+
+/// [`node_build_with_progress`], running `cargo` from `cargo_dir` when it is
+/// `Some`: the Cargo home `bin` directory
+/// [`check_rust`](crate::rust_setup::check_rust) returns after it installed
+/// Rust there and `PATH` does not find it yet. That directory also goes first
+/// on cargo's `PATH`, so Cargo runs the `rustc` installed beside it. `None`
+/// runs the `cargo` on `PATH`.
+pub fn node_build_with_cargo_dir(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    cargo_dir: Option<&Path>,
+) -> CliResult<NodeBuildOutcome> {
     build_node(
         workspace_root,
         node_type,
@@ -1223,6 +1247,7 @@ pub fn node_build_with_progress(
         on_report,
         on_cargo_start,
         None,
+        cargo_dir,
     )
 }
 
@@ -1261,6 +1286,7 @@ pub fn node_build_streaming(
         on_report,
         on_cargo_start,
         Some((on_message, cancel)),
+        None,
     )
 }
 
@@ -1350,6 +1376,7 @@ fn build_node(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
     streaming: Option<StreamingBuild<'_>>,
+    cargo_dir: Option<&Path>,
 ) -> CliResult<NodeBuildOutcome> {
     let nodes_dir = workspace_root.join("nodes");
     let node_dir = nodes_dir.join(node_type);
@@ -1433,7 +1460,20 @@ fn build_node(
         warn_unsatisfied_deps(node_type, &tool);
     }
 
-    let mut cmd = std::process::Command::new("cargo");
+    // `check_rust` returns only a directory it already placed on a PATH, so
+    // the join cannot fail for it; a directory that cannot be joined runs the
+    // `cargo` on PATH, which fails with the not-found error below.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut cmd = match cargo_dir
+        .and_then(|dir| Some((dir, crate::rust_setup::path_with_front(dir, &path)?)))
+    {
+        Some((dir, path)) => {
+            let mut cmd = std::process::Command::new(dir.join("cargo"));
+            cmd.env("PATH", path);
+            cmd
+        }
+        None => std::process::Command::new("cargo"),
+    };
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
     if let Some(python) = &pyo3_python {
@@ -4816,6 +4856,54 @@ mod tests {
         );
         assert!(logs_contain("UNPROVEN"));
         assert!(!logs_contain("dependencies are missing"));
+    }
+
+    /// A build handed a Cargo home directory runs that directory's `cargo`,
+    /// with the directory first on its PATH so the `rustc` beside it wins.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_given_a_cargo_dir_runs_its_cargo_with_it_first_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        let node = root.join("nodes").join("probe_node");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(
+            node.join("Cargo.toml"),
+            "[package]\nname = \"probe_node\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let dir = tmp.path().join("cargo home").join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = tmp.path().join("record");
+        let cargo = dir.join("cargo");
+        std::fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$0\" \"${{PATH%%:*}}\" \"$*\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        node_build_with_cargo_dir(
+            &root,
+            "probe_node",
+            false,
+            &mut |_| {},
+            &mut |_| {},
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!(
+                "{}\n{}\nbuild -p probe_node\n",
+                cargo.display(),
+                dir.display()
+            )
+        );
     }
 
     /// The one spawn error worth a dedicated message: `cargo` itself is not

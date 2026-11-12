@@ -146,7 +146,7 @@ fn exe_name(name: &str) -> String {
 }
 
 #[cfg(unix)]
-fn is_executable_file(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable_file(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
@@ -155,7 +155,7 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable_file(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
