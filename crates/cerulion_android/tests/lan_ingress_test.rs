@@ -526,8 +526,9 @@ fn relay_for(topic: &str) -> &'static str {
     }
 }
 
-/// One run of [`RUNS`]. Under `paired` no frame reaches either relay and no
-/// ingress bridge exists. Under `open` the right-hash frames on the ingress
+/// One run of [`RUNS`]. Under `paired` declared imports are refused before
+/// startup; a graph without imports starts and refuses the peer's LAN data.
+/// No ingress bridge exists. Under `open` the right-hash frames on the ingress
 /// topic reach its relay, the wrong-hash ones are counted drops that never
 /// reach it, and nothing reaches the relay of the other topic. The desk is
 /// demanded the ingress topic only.
@@ -541,10 +542,34 @@ fn lan_run(
 ) {
     let paired = run == "paired";
     let config = if paired {
-        json!({
+        let declared = json!({
             "graph_yaml": graph_yaml("relay"),
             "listen": [format!("tcp/127.0.0.1:{port}")],
             "ingress": [ingress, other],
+        });
+        for _ in 0..2 {
+            let error = runtime
+                .start(&declared.to_string())
+                .expect_err("this embedded host cannot import authenticated graph inputs");
+            assert_eq!(error.code(), codes::INVALID_ARGUMENT);
+            assert_eq!(
+                error.to_string(),
+                "authenticated graph ingress is unavailable in this embedded host; use the explicit open LAN compatibility path"
+            );
+            assert_eq!(
+                runtime.status_handle().lock().unwrap().state,
+                RuntimeState::Failed
+            );
+            for topic in [ingress, other] {
+                assert!(!is_ingress_registered(topic));
+                assert!(ingress_stats(topic).is_none());
+            }
+            assert_eq!(demand_set_size(), 0);
+        }
+        // A paired run without imports still refuses unauthenticated LAN data.
+        json!({
+            "graph_yaml": graph_yaml("relay"),
+            "listen": [format!("tcp/127.0.0.1:{port}")],
         })
     } else {
         json!({

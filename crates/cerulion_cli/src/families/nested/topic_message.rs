@@ -31,8 +31,9 @@ enum TopicMessageAction {
     /// TYPE, waits up to `--wait-subscribers` seconds for a subscriber,
     /// publishes, and prints `published: topic=.. type=.. frames=..
     /// subscribers=..`. A field the message leaves out takes its `.msg`
-    /// default or zero. Unless `--local`, a `/`-rooted topic is also offered on the
-    /// LAN through cerulion-netd, so a remote subscriber can demand it.
+    /// default or zero. Unless `--local`, a `/`-rooted topic is also offered through
+    /// cerulion-netd under paired access by default; LAN peers only under
+    /// `CERULION_LAN_ACCESS=open`.
     /// Ctrl+C before the first frame exits 1.
     /// Exit 1 for a value that does not fit its field, 2 for a usage error
     /// or an unknown type.

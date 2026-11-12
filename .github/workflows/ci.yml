@@ -3224,12 +3224,14 @@ jobs:
       # explicitly, redundant-but-harmless). netd is excluded from default-members, so
       # the default-feature test steps above never build it — this step is its coverage.
       # Runs the netd lib/bin unit tests + the daemon/mirror/client integration tests +
-      # the loopback-iroh WAN-plane e2e (real iceoryx2 + loopback iroh, per-test SHM
-      # roots + per-test iroh identities ⇒ parallel-safe).
+      # the loopback-iroh WAN-plane e2e. CLI fixtures share the process-global
+      # manager, so this package runs one test at a time.
       # doc-pin: cerulion_netd::networking_doc_banner_test reads docs
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
-        run: cargo test -p cerulion_netd --features wan
+        run: |
+          cargo build -p cerulion_cli -p cerulion_remoted -p test_node_macro_data_trigger_cdylib
+          cargo test -p cerulion_netd --features wan -- --test-threads=1
       # The SKIP BRANCH of the gate above. A skipped step prints nothing of
       # its own, so the one line that says what the selection dropped lives
       # here, beside it, under the exact negation of its condition.
@@ -4095,7 +4097,9 @@ jobs:
       # so it gates on both runners.
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
-        run: cargo test -p cerulion_netd --features wan
+        run: |
+          cargo build -p cerulion_cli -p cerulion_remoted -p test_node_macro_data_trigger_cdylib
+          cargo test -p cerulion_netd --features wan -- --test-threads=1
       - name: selection marker, cerulion_netd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
         env:
@@ -4287,11 +4291,18 @@ jobs:
   # and its hosted plane test starts the process runtime, so its step uses one
   # thread. For the other packages that is a READ of the tests rather than an
   # assumption. `cerulion_remoted` is the only one of them that builds real
-  # iceoryx2 transports at all. One of its files, `tests/act_verbs_test.rs`,
-  # calls `TransportManager::get_or_init()`, the process-global manager on the
-  # default namespace; every test in it carries `#[serial]`, which takes one
-  # lock shared by the whole test binary, so no two of them run at once. Its
-  # other transport files mint ISOLATED per-test SHM roots via
+  # iceoryx2 transports at all. Its ops verbs reach
+  # `TransportManager::get_or_init()`, the process-global manager on the
+  # default namespace: the act verbs such as `topic-publish` take their remote
+  # lease there and `engage-estop` asks the flashback recorder through it, so
+  # a call that passes the verb's argument checks on a daemon host reaches
+  # that manager (`engage-estop` only while `CERULION_FLASHBACK` is not off).
+  # Two files also call it directly, `tests/act_verbs_test.rs` and
+  # `tests/rcp_forward_e2e_test.rs` (whose local-only e-stop test excludes
+  # topics and announces runs on the default namespace from a child process).
+  # Every test in both carries `#[serial]`, which takes one lock shared by the
+  # whole test binary, so no two tests of either binary run at once. The
+  # package's other test files build ISOLATED per-test SHM roots via
   # `TransportManager::init_for_test` (their own headers say "parallel-safe
   # without `#[serial]`"), which is the same property that lets the
   # `cerulion_connectd` step above run parallel.

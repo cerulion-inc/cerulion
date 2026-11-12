@@ -58,7 +58,7 @@ pub const WAN_ROBOTS_ENV: &str = "CERULION_NETD_WAN_ROBOTS";
 /// identity + the pairing key the robot access-lists). Unset ⇒ an EPHEMERAL desk
 /// key is generated — which an un-paired robot REFUSES (the iroh dial is refused
 /// LOUDLY at demand time), so a real WAN deployment points this at
-/// `~/.cerulion/desk.key` (the SAME key `cerulion pair` creates). Mirrors
+/// `~/.cerulion/desk.key` (the SAME key `cerulion login` creates). Mirrors
 /// `cerulion-connectd connect --key-file`.
 pub const DESK_KEY_ENV: &str = "CERULION_NETD_DESK_KEY";
 
@@ -410,7 +410,7 @@ impl WanRegistry {
     /// through the SHARED [`cerulion_wireclient::epoch::resolve_epoch_dir`]
     /// rule — the same rule, the same inputs, the same one-per-process breadcrumb as
     /// a boot-time resolution; only the TIMING differs.
-    fn epoch_dir(&self) -> Option<&Path> {
+    pub(crate) fn epoch_dir(&self) -> Option<&Path> {
         self.epoch_dir
             .get_or_init(|| {
                 let dir = self.desk_paths.as_ref().and_then(|inputs| {
@@ -878,6 +878,14 @@ impl DualMirrorPlane {
 }
 
 impl crate::mirror::MirrorPlane for DualMirrorPlane {
+    fn local_channel(&self, key: &TopicKey) -> String {
+        if matches!(pick_plane(key, &self.registry), Ok(Plane::Iroh)) {
+            key.local_topic()
+        } else {
+            key.topic.clone()
+        }
+    }
+
     /// The picker is pure over `(key, registry)` and this registry is fixed for the
     /// daemon's lifetime, so the plane it names here is the one that ensured the
     /// mirror, not a fresh guess: the same argument that lets `release_mirror`

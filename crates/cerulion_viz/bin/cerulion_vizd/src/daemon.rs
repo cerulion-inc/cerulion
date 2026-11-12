@@ -838,9 +838,18 @@ enum LayoutMode {
     Explicit,
 }
 
+struct RemoteDemandClaim {
+    robot: String,
+    local_channel: Option<String>,
+}
+
 /// The daemon's shared control state (poll thread + every controller thread).
 #[derive(Default)]
 struct DaemonState {
+    /// Serialize remote attach/rollback/detach without holding the poll-state lock.
+    remote_attaches: Arc<Mutex<()>>,
+    /// A demand claim becomes reusable only after its bounded plane call returns.
+    remote_demands: Arc<Mutex<()>>,
     /// The runtime taps.
     taps: TapManager,
     /// Per-attached-topic stats (keyed by absolute topic). A `detach` removes the
@@ -870,7 +879,7 @@ struct DaemonState {
     /// the entry (netd's refcount-0 teardown
     /// fires when the last consumer leaves). The demand is reserve-then-committed
     /// under this state lock so concurrent same-topic attaches demand exactly once.
-    demanded: BTreeMap<String, String>,
+    demanded: BTreeMap<String, RemoteDemandClaim>,
     /// A session-scoped PROVENANCE TOMBSTONE (topic → origin robot) recorded
     /// on every successful remote attach and — unlike [`Self::demanded`] — NEVER
     /// cleared on `detach`. When a remote topic is unchecked in Studio, the shared
@@ -1522,7 +1531,7 @@ struct Ctx {
     /// shared mirror from the one-per-computer `cerulion-netd` daemon (instead of
     /// opening vizd's own ingress on the zenoh session), and `detach` releases it.
     /// A DI seam ([`DemandPlane`]): production is [`NetdDemandPlane`] (one persistent
-    /// UDS connection for the daemon's lifetime); tests inject a counting spy.
+    /// holding connection per source); tests inject a counting spy.
     demand_plane: Arc<dyn DemandPlane>,
     /// The schema-resolution walker, SWAPPABLE (remote arm): a schema-less
     /// remote attach grows it with a robot-served type's closure. Reads take a
@@ -3108,6 +3117,16 @@ impl Ctx {
         if opened.is_empty() {
             return (0, Vec::new());
         }
+        let gate = remote_attach_gate(&self.state);
+        // Rollback must outwait an in-flight attach, not use a controller's
+        // three-second retry bound. The operation deadline covers a two-attempt
+        // netd constructor (20 s), catalog/schema/demand round trips (5 s each)
+        // and mirror visibility, while the poll-state mutex remains free.
+        let _operation =
+            match wait_remote_operation_until(&gate, Instant::now() + Duration::from_secs(45)) {
+                Ok(operation) => operation,
+                Err(error) => return (0, vec![error]),
+            };
         let mut removed_topics = Vec::new();
         let mut retained = Vec::new();
         {
@@ -4236,10 +4255,28 @@ impl Ctx {
         robot: String,
         schema: Option<String>,
     ) -> Response {
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return Response::error_retryable(Some(id), error, Some(topic), None),
+        };
         // Validate before a pinned built-in can bypass catalog/schema lookup.
         // Account identity routes must never become ordinary LAN robot names.
         if let Err(error) = cerulion_netd::account_access::parse_robot_route(&robot) {
             return Response::error(Some(id), error, Some(topic));
+        }
+
+        {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.taps.contains(&topic)
+                && st.demanded.get(&topic).map(|claim| claim.robot.as_str()) != Some(robot.as_str())
+            {
+                return Response::error(
+                    Some(id),
+                    format!("topic '{topic}' is already attached from another source; detach it before selecting robot '{robot}'"),
+                    Some(topic),
+                );
+            }
         }
 
         // Guardrail 5: entity-override stability, checked EARLY (before any
@@ -4301,15 +4338,15 @@ impl Ctx {
         //     per-computer network gateway) ONCE per topic per daemon lifetime,
         //     instead of opening vizd's OWN ingress on the zenoh session. netd owns
         //     the single mirror publisher + the zenoh demand token + the mirror
-        //     PROVENANCE, so two consumers of the same remote topic (vizd + a user
-        //     graph) share ONE mirror and the frame crosses the network ONCE.
+        //     PROVENANCE. LAN readers share the canonical mirror; WAN observers
+        //     share a private source channel, separately from graph ingress.
         //     Each UDS control connection runs on its OWN handler
         //     thread, so RESERVE-THEN-COMMIT closes the concurrent-attach TOCTOU:
         //     atomically CLAIM `(topic → robot)` under ONE state lock, then demand
         //     OUTSIDE the lock (a network call — never held under the state mutex).
-        //     Exactly one thread demands; a concurrent same-topic attach sees the
-        //     claim and SKIPS (idempotent — the tap step below reports
-        //     `already_attached`), and a re-attach after `detach` re-demands cleanly
+        //     Remote attach and detach transactions share an operation lock outside
+        //     the poll-state lock. A concurrent attach reuses a completed demand and
+        //     its returned channel; a re-attach after detach re-demands cleanly
         //     (netd's teardown freed the slot). A demand FAILURE rolls the claim
         //     back so a retry re-demands with no phantom claim left behind.
         let newly_demanded = match perform_remote_demand(
@@ -4331,10 +4368,26 @@ impl Ctx {
                 );
             }
         };
+        let channel = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.demanded
+                .get(&topic)
+                .and_then(|claim| claim.local_channel.clone())
+                .ok_or_else(|| "observer demand has no committed local channel".to_string())
+        };
+        let source_channel = match channel {
+            Ok(channel) => channel,
+            Err(error) => {
+                if newly_demanded {
+                    let _ = perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic);
+                }
+                return Response::error(Some(id), error, Some(topic));
+            }
+        };
         // On a FRESH demand, wait for netd's just-created mirror service to become
         // cross-process-visible before tapping it (netd is a separate process).
         if newly_demanded {
-            wait_for_mirror_service(&self.manager, &topic);
+            wait_for_mirror_service(&self.manager, &source_channel);
         }
 
         // 3. Tap the now-local mirror by the IDENTICAL local tap path, and report
@@ -4347,14 +4400,9 @@ impl Ctx {
         //    a `VoxelMap`, an H.264 CompressedImage a `VideoStream`).
         //    `route_key` was resolved at the top (the entity-stability check).
         let archetype = classify_schema(&schema_name);
-        // Attach under the lock, but DROP the guard before any rollback (the release
-        // re-locks `state`). Guardrail 5: the entity-stability decision RE-runs
-        // under this FINAL commit lock (the early check alone cannot close the
-        // concurrent-attach_remote race — two racers both saw route_key None; here one
-        // has committed its route_key, so the other sees the conflict). A conflict
-        // refuses WITHOUT releasing the demand (a Conflict ⟹ AlreadyAttached ⟹ a
-        // surviving attach whose `detach` releases the topic-keyed demand); only a TAP
-        // error rolls the demand back.
+        // Recheck entity/schema/source under the final state lock, then drop it
+        // before rollback. Existing remote taps retain their demand; fresh demands
+        // refused by a surviving local tap are released.
         let commit = {
             let mut st = self.state.lock().unwrap();
             match self
@@ -4371,9 +4419,10 @@ impl Ctx {
                 })
                 .and_then(|()| {
                     st.taps
-                        .attach(
+                        .attach_source(
                             &self.manager,
                             &topic,
+                            &source_channel,
                             entity_override.as_deref(),
                             // Desk-side mirror publishers provide wake notifications.
                             WakeMode::Listener,
@@ -4443,9 +4492,15 @@ impl Ctx {
         let (already, archetype) = match commit {
             RemoteCommit::Ok { already, archetype } => (already, archetype),
             RemoteCommit::Conflict(msg) => {
-                // Refuse WITHOUT releasing the demand: the surviving attach's `detach`
-                // releases the topic-keyed demand; releasing here would tear down a
-                // mirror still in use by the winner.
+                if newly_demanded {
+                    if let Err(error) =
+                        perform_remote_release(self.demand_plane.as_ref(), &self.state, &topic)
+                    {
+                        tracing::warn!(topic = %topic, robot = %robot, error = %error, "refused remote attach demand could not be released");
+                    }
+                }
+                // A re-attach retains the surviving remote tap's demand. A fresh
+                // rejected demand was released above because no remote tap owns it.
                 return Response::error(Some(id), msg, Some(topic));
             }
             RemoteCommit::TapErr(e) => {
@@ -4547,6 +4602,11 @@ impl Ctx {
     /// detach (the tap is already gone; the demand ages out when vizd's connection
     /// drops at worst).
     fn detach(&self, id: u64, topic: String) -> Response {
+        let gate = remote_attach_gate(&self.state);
+        let _operation = match wait_remote_operation(&gate) {
+            Ok(operation) => operation,
+            Err(error) => return Response::error_retryable(Some(id), error, Some(topic), None),
+        };
         let detached = {
             let mut st = self.state.lock().unwrap();
             if let Some(route) = st
@@ -5648,7 +5708,7 @@ enum RemoteCommit {
         already: bool,
         archetype: Option<ArchetypeKind>,
     },
-    /// A conflicting override — refuse, do NOT release the demand.
+    /// Refuse a conflicting source/override; retain only a surviving remote tap's demand.
     Conflict(String),
     /// The tap open failed — refuse AND release the demand (rollback).
     TapErr(String),
@@ -5857,6 +5917,14 @@ pub trait DemandPlane: Send + Sync {
     /// against `schema_hash`. Called ONCE per topic (the reserve-then-commit
     /// guarantees it). A `String` error is surfaced to the controller verbatim.
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String>;
+    /// Cold control heartbeat, separate from frame draining. Re-demand lost readers.
+    fn check_remote_readers(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Local channel provided by the observer demand. Legacy test planes remain canonical.
+    fn local_channel(&self, _robot: &str, topic: &str) -> Result<String, String> {
+        Ok(topic.into())
+    }
     /// Release a previously-demanded `(robot, topic)` (the `detach` early release).
     fn release(&self, robot: &str, topic: &str) -> Result<(), String>;
     /// Query `robot`'s topic CATALOG over netd's shared session (the
@@ -5959,15 +6027,29 @@ pub trait DemandPlane: Send + Sync {
     }
 }
 
-/// The production demand plane — ONE persistent [`NetdClient`]
-/// connection to `cerulion-netd` for the daemon's lifetime (spawning netd detached
-/// on the first demand if it is not running). Every vizd demand rides this ONE
-/// connection, so netd sees vizd as ONE consumer; dropping the plane (at daemon
-/// shutdown) closes the connection, releasing every remaining demand (the crash-safe
-/// refcount). The client is behind a `Mutex` (its `demand`/`release` take `&mut
-/// self`, and controller threads share it) and opened LAZILY on the first demand, so
-/// a viz daemon that only ever serves LOCAL attaches never connects to netd.
+struct SourceClient {
+    client: Mutex<Option<NetdClient>>,
+    retired: AtomicBool,
+}
+
+struct RemoteChannel {
+    source: Arc<SourceClient>,
+    local_topic: Option<String>,
+    last_timeout: Option<Instant>,
+    schema_hash: u64,
+    misses: u8,
+    next_retry: Instant,
+    delay: Duration,
+    failures: FailureRegimeLatch,
+}
+
+/// The production demand plane. Each source owns its holding connection, so a
+/// failed recovery closes only that source's demands. Catalog, schema and runs
+/// queries use a separate demand-free client. All connections are lazy; a daemon
+/// serving only local attaches opens none.
 pub struct NetdDemandPlane {
+    channels: Mutex<BTreeMap<(String, String), RemoteChannel>>,
+    probe_failures: Mutex<FailureRegimeLatch>,
     client: Mutex<Option<NetdClient>>,
     /// `Some(socket)` targets a SPECIFIC control socket (the e2e's in-process netd);
     /// `None` uses the well-known default path (production, first-consumer-spawns).
@@ -5980,6 +6062,8 @@ impl NetdDemandPlane {
     pub fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            channels: Mutex::new(BTreeMap::new()),
+            probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: None,
         }
     }
@@ -5989,6 +6073,8 @@ impl NetdDemandPlane {
     pub fn with_socket(socket: PathBuf) -> Self {
         Self {
             client: Mutex::new(None),
+            channels: Mutex::new(BTreeMap::new()),
+            probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: Some(socket),
         }
     }
@@ -6001,6 +6087,34 @@ impl NetdDemandPlane {
         f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
     ) -> Result<R, String> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        self.run_client(&mut guard, f)
+    }
+
+    /// Remove only this source generation before any cleanup I/O. A concurrent
+    /// attach may already have replaced the same logical key with a fresh client.
+    fn remove_source(
+        &self,
+        key: &(String, String),
+        source: &Arc<SourceClient>,
+    ) -> Option<RemoteChannel> {
+        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if !channels
+            .get(key)
+            .is_some_and(|channel| Arc::ptr_eq(&channel.source, source))
+        {
+            return None;
+        }
+        let channel = channels.remove(key)?;
+        source.retired.store(true, Ordering::Release);
+        Some(channel)
+    }
+
+    /// One source's holding client or the separate demand-free query client.
+    fn run_client<R>(
+        &self,
+        guard: &mut Option<NetdClient>,
+        f: impl FnOnce(&mut NetdClient) -> Result<R, ClientError>,
+    ) -> Result<R, String> {
         if guard.is_none() {
             let client = match &self.socket {
                 Some(sock) => NetdClient::connect_or_spawn_at(sock.clone()),
@@ -6010,19 +6124,14 @@ impl NetdDemandPlane {
         }
         let client = guard.as_mut().expect("just connected");
         match f(client) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                // A CONNECTION-level error (broken pipe / a protocol desync — e.g.
-                // netd exited or was killed) leaves the client unusable, so DROP it:
-                // the NEXT demand reconnects (re-spawning netd if needed), instead of
-                // this long-lived daemon's demand plane staying permanently wedged on
-                // a dead socket (the crash-recovery model — netd is
-                // recovery-stateless). A `Netd(response)` error is a VALID refusal
-                // (schema conflict, …) — the connection is fine, so keep it.
-                if should_drop_client_on_error(&e) {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                // A framing failure closes only this source (or a demand-free
+                // query). A correlated refusal keeps its prior holding client.
+                if should_drop_client_on_error(&error) {
                     *guard = None;
                 }
-                Err(e.to_string())
+                Err(error.to_string())
             }
         }
     }
@@ -6035,16 +6144,334 @@ impl Default for NetdDemandPlane {
 }
 
 impl DemandPlane for NetdDemandPlane {
+    fn check_remote_readers(&self) -> Result<(), String> {
+        let mut held: Vec<_> = self
+            .channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(key, channel)| {
+                Some((
+                    key.clone(),
+                    channel.local_topic.clone()?,
+                    channel.schema_hash,
+                    channel.source.clone(),
+                    channel.last_timeout,
+                ))
+            })
+            .collect();
+        if held.is_empty() {
+            return Ok(());
+        }
+        // Stable ordering preserves canonical key order for ties. Untimed sources
+        // precede timed-out ones; oldest timeouts go first so offline peers rotate.
+        held.sort_by_key(|row| row.4);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let status = match &self.socket {
+            Some(socket) => NetdClient::connect_existing_at_until(socket.clone(), deadline),
+            None => NetdClient::connect_existing_until(deadline),
+        }
+        .and_then(|mut probe| probe.status_until(deadline));
+        if let Err(error) = &status {
+            let mut latch = self
+                .probe_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match latch.on_failure() {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                    tracing::debug!(error = %error, total_failures = latch.total_failures(), "netd busy during visualization status probe")
+                }
+                RegimeDecision::Suppressed { suppressed } => {
+                    tracing::debug!(suppressed, "visualization status probe remains busy")
+                }
+            }
+        } else {
+            let mut latch = self
+                .probe_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(suppressed) = latch.on_success() {
+                tracing::debug!(suppressed, "visualization status probe recovered");
+            }
+        }
+        let absent = matches!(&status, Err(ClientError::Connect { source, .. })
+            if matches!(source.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused));
+        if status.is_err() && !absent {
+            // Busy passes preserve pushed losses. An absent listener permits
+            // polling dead holding sockets and spawning a replacement daemon.
+            return Ok(());
+        }
+        let status = status.ok();
+        let mut errors = Vec::new();
+        for (key, expected_channel, hash, source, _) in held {
+            // Never wait for another caller's source operation, or hold the map
+            // over transport I/O. Retirement is recorded before release waits.
+            let mut client = match source.client.try_lock() {
+                Ok(client) => client,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+            };
+            if source.retired.load(Ordering::Acquire) {
+                continue;
+            }
+            let lost = match client.as_mut() {
+                Some(holding) => match holding.poll_pushed_losses() {
+                    Ok(()) => holding
+                        .take_mirror_losses()
+                        .iter()
+                        .any(|loss| loss.robot == key.0 && loss.topic == key.1),
+                    Err(_) => {
+                        *client = None;
+                        true
+                    }
+                },
+                None => true,
+            };
+            {
+                let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(channel) = channels
+                    .get_mut(&key)
+                    .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                else {
+                    continue;
+                };
+                if channel.local_topic.as_deref() != Some(&expected_channel)
+                    || channel.schema_hash != hash
+                {
+                    continue;
+                }
+                if !lost {
+                    let Some(status) = &status else {
+                        continue;
+                    };
+                    let present = status.demands.iter().any(|row| {
+                        row.robot == key.0
+                            && row.topic == key.1
+                            && row.refcount > 0
+                            && row.local_topic.as_deref().unwrap_or(&row.topic) == expected_channel
+                    });
+                    if present {
+                        channel.misses = 0;
+                        channel.delay = Duration::from_secs(1);
+                        channel.next_retry = Instant::now();
+                        channel.last_timeout = None;
+                        if let Some(suppressed) = channel.failures.on_success() {
+                            tracing::info!(robot = %key.0, topic = %key.1, suppressed, "visualization reader recovered");
+                        }
+                        continue;
+                    }
+                    channel.misses = channel.misses.saturating_add(1);
+                    if channel.misses < 2 {
+                        continue;
+                    }
+                }
+                if Instant::now() < channel.next_retry {
+                    continue;
+                }
+                channel.next_retry = Instant::now() + channel.delay;
+                channel.delay = (channel.delay * 2).min(Duration::from_secs(30));
+            }
+            if source.retired.load(Ordering::Acquire) {
+                continue;
+            }
+            let (robot, topic) = &key;
+            let result = self.run_client(&mut client, |client| client.observe(robot, topic, hash));
+            let connection_lost = result.is_err() && client.is_none();
+            if source.retired.load(Ordering::Acquire) {
+                // Detach owns this source and will release its client as soon as
+                // this guard drops. A late reply cannot commit a replacement.
+                if connection_lost {
+                    break;
+                }
+                continue;
+            }
+            match result {
+                Ok(reply) if reply.local_topic == expected_channel => {
+                    let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(channel) = channels
+                        .get_mut(&key)
+                        .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                    {
+                        channel.misses = 0;
+                        channel.delay = Duration::from_secs(1);
+                        channel.next_retry = Instant::now();
+                        channel.last_timeout = None;
+                        if let Some(suppressed) = channel.failures.on_success() {
+                            tracing::info!(robot = %robot, topic = %topic, suppressed, "visualization reader recovered");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    if self.remove_source(&key, &source).is_none() {
+                        continue;
+                    }
+                    let cleanup =
+                        self.run_client(&mut client, |client| client.unobserve(robot, topic));
+                    errors.push(match cleanup {
+                        Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                        Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+                    });
+                }
+                Err(error) => {
+                    let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(channel) = channels
+                        .get_mut(&key)
+                        .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                    {
+                        if connection_lost {
+                            channel.last_timeout = Some(Instant::now());
+                        }
+                        match channel.failures.on_failure() {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                                tracing::warn!(robot = %robot, topic = %topic, error = %error, total_failures = channel.failures.total_failures(), "visualization reader re-demand failed")
+                            }
+                            RegimeDecision::Suppressed { suppressed } => {
+                                tracing::debug!(robot = %robot, topic = %topic, suppressed, "visualization reader re-demand still failing")
+                            }
+                        }
+                    }
+                    errors.push(format!(
+                        "remote mirror lost for robot '{robot}' topic '{topic}': {error}"
+                    ));
+                    // netd may still own its registry lock after this client
+                    // timed out. Do not send a sibling into that stalled dial.
+                    if connection_lost {
+                        break;
+                    }
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     fn demand(&self, robot: &str, topic: &str, schema_hash: u64) -> Result<(), String> {
-        self.with_client(|c| c.demand(robot, topic, schema_hash).map(|_| ()))
+        let key = (robot.into(), topic.into());
+        let source = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            match channels.entry(key.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.get().source.clone(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let source = Arc::new(SourceClient {
+                        client: Mutex::new(None),
+                        retired: AtomicBool::new(false),
+                    });
+                    entry.insert(RemoteChannel {
+                        source: source.clone(),
+                        local_topic: None,
+                        last_timeout: None,
+                        schema_hash,
+                        misses: 0,
+                        next_retry: Instant::now(),
+                        delay: Duration::from_secs(1),
+                        failures: FailureRegimeLatch::new(),
+                    });
+                    source
+                }
+            }
+        };
+        let mut client = source.client.lock().unwrap_or_else(|e| e.into_inner());
+        if source.retired.load(Ordering::Acquire) {
+            return Err(format!("remote observer for robot '{robot}' topic '{topic}' was canceled before its demand completed"));
+        }
+        let reply = match self.run_client(&mut client, |client| {
+            client.observe(robot, topic, schema_hash)
+        }) {
+            Ok(reply) => reply,
+            Err(error) => {
+                let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(channel) = channels
+                    .get_mut(&key)
+                    .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+                {
+                    // A concurrent attach may have initialized this generation
+                    // before its creator acquired the source lock. Retire only
+                    // an uninitialized demand, never that caller's live reader.
+                    if channel.local_topic.is_none() {
+                        channels.remove(&key);
+                        source.retired.store(true, Ordering::Release);
+                        *client = None;
+                    } else if client.is_none() {
+                        channel.last_timeout = Some(Instant::now());
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let conflict = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(channel) = channels
+                .get_mut(&key)
+                .filter(|channel| Arc::ptr_eq(&channel.source, &source))
+            else {
+                // Release already removed the recovery intent. Closing the client
+                // also retires a demand that completed after that cancellation.
+                *client = None;
+                return Err(format!("remote observer for robot '{robot}' topic '{topic}' was canceled before its demand completed"));
+            };
+            let conflict = channel
+                .local_topic
+                .as_ref()
+                .is_some_and(|topic| topic != &reply.local_topic)
+                || channel.schema_hash != schema_hash;
+            if !conflict {
+                channel.local_topic = Some(reply.local_topic);
+                channel.last_timeout = None;
+            }
+            conflict
+        };
+        if conflict {
+            self.remove_source(&key, &source);
+            let cleanup = self.run_client(&mut client, |client| client.unobserve(robot, topic));
+            return Err(match cleanup {
+                Ok(_) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; detach and attach again"),
+                Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
+            });
+        }
+        Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {
-        self.with_client(|c| c.release(robot, topic).map(|_| ()))
+        let channel = {
+            let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+            let channel = channels.remove(&(robot.into(), topic.into()));
+            if let Some(channel) = &channel {
+                channel.source.retired.store(true, Ordering::Release);
+            }
+            channel
+        };
+        let Some(channel) = channel else {
+            return Ok(());
+        };
+        let mut client = channel
+            .source
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = match client.as_mut() {
+            Some(client) => client
+                .unobserve(robot, topic)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => Err("source holding connection is unavailable".into()),
+        };
+        result.map_err(|error| {
+            format!("cannot release remote observer for robot '{robot}' topic '{topic}': {error}")
+        })
+    }
+    fn local_channel(&self, robot: &str, topic: &str) -> Result<String, String> {
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(robot.into(), topic.into()))
+            .and_then(|channel| channel.local_topic.clone())
+            .ok_or_else(|| "observer demand has no local channel".into())
     }
     fn query_catalog(&self, robot: &str) -> Result<Vec<CatalogReply>, String> {
-        // Route the catalog GET through the ONE persistent netd connection (netd runs
-        // it over the machine's ONE zenoh session). A connection-level error drops the
-        // client so the next call reconnects (`with_client`); the caller falls back.
+        // Query on the demand-free client. A failure cannot release source holds;
+        // netd still routes through the machine's single network session.
         self.with_client(|c| c.query_catalog(Some(robot)))
     }
 
@@ -6059,10 +6486,8 @@ impl DemandPlane for NetdDemandPlane {
         self.with_client(|c| c.query_catalog_with_discovery(Some(robot)))
     }
     fn query_catalog_all(&self) -> Result<Vec<CatalogReply>, String> {
-        // The LAN-wide gather — `query_catalog(None)` harvests every
-        // announcing robot over the SAME one persistent netd connection. A
-        // connection-level error drops the client (`with_client`) so the next call
-        // reconnects; `discover` degrades to local-only on the returned `Err`.
+        // The LAN-wide gather uses the demand-free query connection. A transport
+        // failure reconnects this query client and preserves every held source.
         self.with_client(|c| c.query_catalog(None))
     }
 
@@ -6076,7 +6501,7 @@ impl DemandPlane for NetdDemandPlane {
         self.with_client(|c| c.query_schema(Some(robot), requested))
     }
 
-    /// The REAL runs gather, over the ONE persistent netd connection.
+    /// The REAL runs gather, over the demand-free query connection.
     ///
     /// `query_runs_with_discovery` is netd's NON-looping verb — one round trip, and
     /// the client mutex is taken and DROPPED inside `with_client`. There is
@@ -6840,6 +7265,12 @@ fn perform_remote_demand(
     topic: &str,
     schema_hash: u64,
 ) -> Result<bool, String> {
+    let gate = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_demands
+        .clone();
+    let _operation = wait_remote_operation(&gate)?;
     use std::collections::btree_map::Entry;
     // Decide under the lock via the ENTRY API (one topic = ONE origin robot — the
     // decision). A plain `insert` would OVERWRITE the stored robot on a
@@ -6847,24 +7278,27 @@ fn perform_remote_demand(
     // would release the WRONG (robot, topic) and leak the real one. The entry API
     // makes each case explicit:
     // - Vacant → claim it here, demand OUTSIDE the lock (rolled back on failure).
-    // - Occupied, SAME robot → idempotent no-op (keep the value, never re-insert).
+    // - Occupied, SAME robot → reuse only after the in-flight demand gate opens.
     // - Occupied, DIFFERENT robot → LOUD refusal: no claim change, no demand, no
     //   release (a pure refusal that leaks nothing).
     {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         match st.demanded.entry(topic.to_string()) {
             Entry::Vacant(v) => {
-                v.insert(robot.to_string()); // claimed; demand below (outside the lock).
+                v.insert(RemoteDemandClaim {
+                    robot: robot.into(),
+                    local_channel: None,
+                });
             }
             Entry::Occupied(o) => {
-                if o.get() == robot {
-                    return Ok(false); // same robot — idempotent (re-attach / concurrent).
+                if o.get().robot == robot {
+                    return Ok(false); // same robot, with its channel already committed.
                 }
                 return Err(format!(
                     "topic '{topic}' is already mirrored from robot '{}' — one data source = one \
                      topic, so it cannot ALSO be demanded from robot '{robot}'; detach '{topic}' \
                      first if you meant to re-point it to a different robot",
-                    o.get()
+                    o.get().robot
                 ));
             }
         }
@@ -6876,6 +7310,27 @@ fn perform_remote_demand(
         st.demanded.remove(topic);
         return Err(e);
     }
+    let channel = match plane.local_channel(robot, topic) {
+        Ok(channel) => channel,
+        Err(error) => {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .demanded
+                .remove(topic);
+            if let Err(release) = plane.release(robot, topic) {
+                return Err(format!("{error}; demand rollback failed: {release}"));
+            }
+            return Err(error);
+        }
+    };
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .demanded
+        .get_mut(topic)
+        .expect("claim owner retains its demand")
+        .local_channel = Some(channel);
     Ok(true)
 }
 
@@ -6889,14 +7344,52 @@ fn perform_remote_release(
     state: &Mutex<DaemonState>,
     topic: &str,
 ) -> Result<bool, String> {
+    let gate = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_demands
+        .clone();
+    let _operation = wait_remote_operation(&gate)?;
     let robot = {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.demanded.remove(topic)
     };
     match robot {
-        Some(robot) => plane.release(&robot, topic).map(|_| true),
+        Some(claim) => plane.release(&claim.robot, topic).map(|_| true),
         None => Ok(false),
     }
+}
+
+fn wait_remote_operation(gate: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    wait_remote_operation_until(gate, Instant::now() + Duration::from_secs(3))
+}
+
+fn wait_remote_operation_until(
+    gate: &Mutex<()>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    loop {
+        match gate.try_lock() {
+            Ok(operation) => return Ok(operation),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "remote attachment is still in progress; retry after it completes".into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn remote_attach_gate(state: &Mutex<DaemonState>) -> Arc<Mutex<()>> {
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_attaches
+        .clone()
 }
 
 /// How long to wait for a freshly-demanded mirror's `{topic}/data`
@@ -7283,6 +7776,8 @@ pub struct RunningDaemon {
     /// The catalog-change forwarder thread (`None` when it could not be
     /// spawned — the daemon runs without pushes rather than failing to start).
     events_handle: Option<JoinHandle<()>>,
+    /// Cold mirror recovery worker; never blocks the frame drain.
+    demand_health_handle: Option<JoinHandle<()>>,
     /// The event hub, for observability (Principle #3) and the e2e.
     events: Arc<crate::events::EventHub>,
     /// The controller read-loop iteration counter (Principle #3) — see
@@ -7826,6 +8321,9 @@ impl RunningDaemon {
         if let Some(h) = self.events_handle.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.demand_health_handle.take() {
+            let _ = h.join();
+        }
         let handles = std::mem::take(&mut *self.conns.lock().unwrap());
         for h in handles {
             let _ = h.join();
@@ -8073,6 +8571,38 @@ pub fn start_on_socket(
         }
     };
 
+    let demand_health_handle = {
+        let plane = Arc::clone(&ctx.demand_plane);
+        let sd = Arc::clone(&shutdown);
+        match std::thread::Builder::new().name("viz-demand-health".into()).spawn(move || {
+            use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
+            let mut failures = FailureRegimeLatch::default();
+            while !sd.load(Ordering::Acquire) {
+                match plane.check_remote_readers() {
+                    Ok(()) => { if let Some(suppressed) = failures.on_success() {
+                        tracing::info!(suppressed, total_failures = failures.total_failures(), "remote visualization readers recovered");
+                    } }
+                    Err(error) => match failures.on_failure() {
+                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = failures.total_failures(), "remote visualization reader recovery failed"),
+                        RegimeDecision::Suppressed { .. } => {}
+                    }
+                }
+                for _ in 0..10 {
+                    if sd.load(Ordering::Acquire) { break; }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                worker_control.close(); shutdown.store(true, Ordering::SeqCst);
+                let _ = accept_handle.join(); let _ = poll_handle.join();
+                if let Some(handle) = events_handle { let _ = handle.join(); }
+                return Err(error);
+            }
+        }
+    };
+
     tracing::info!(socket = %socket_path.display(), "cerulion-vizd listening (NDJSON control protocol)");
     Ok(RunningDaemon {
         #[cfg(test)]
@@ -8081,6 +8611,7 @@ pub fn start_on_socket(
         accept_handle: Some(accept_handle),
         poll_handle: Some(poll_handle),
         events_handle,
+        demand_health_handle,
         events: Arc::clone(&ctx.events),
         conn_loop_iterations: Arc::clone(&ctx.conn_loop_iterations),
         poll_period_ns: Arc::clone(&ctx.poll_period_ns),
@@ -10624,6 +11155,20 @@ mod tests {
                     ctx.attach(1, topic.into(), None),
                     Response::Attach(_)
                 ));
+                let before = spy.demand_count();
+                let refused = ctx.attach_remote(
+                    2,
+                    topic.into(),
+                    None,
+                    "robot".into(),
+                    Some("std_msgs/String".into()),
+                );
+                let Response::Error(error) = refused else {
+                    panic!("local source change must refuse");
+                };
+                assert!(error.error.contains("another source"));
+                assert_eq!(spy.demand_count(), before);
+                assert!(spy.release_keys().is_empty());
                 perform_remote_demand(spy.as_ref(), &ctx.state, "robot", topic, 0).unwrap();
             }
             if with_model {
@@ -10657,10 +11202,49 @@ mod tests {
                 panic!("{response:?}")
             };
             assert!(detached.detached);
-            assert_eq!(
-                ctx.rollback_compose_attaches(&["/rollback".into()]),
-                (1, vec![])
-            );
+            if with_model {
+                assert_eq!(
+                    ctx.rollback_compose_attaches(&["/rollback".into()]),
+                    (1, vec![])
+                );
+            } else {
+                // A real schema-less attach holds the gate while its catalog
+                // request is pending. Cleanup must survive the controller's
+                // three-second retry bound, then remove the tap and its demand.
+                let (entered, entering) = std::sync::mpsc::channel();
+                let (finish, finishing) = std::sync::mpsc::channel();
+                *spy.catalog_wait.lock().unwrap() = Some((entered, finishing));
+                let metadata = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        ctx.attach_remote(5, "/metadata".into(), None, "other".into(), None)
+                    })
+                };
+                entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (completed, completing) = std::sync::mpsc::channel();
+                let cleanup = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = ctx.rollback_compose_attaches(&["/rollback".into()]);
+                        completed.send(result).unwrap();
+                    })
+                };
+                assert!(matches!(
+                    completing.recv_timeout(Duration::from_millis(3_200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert!(spy
+                    .release_keys()
+                    .iter()
+                    .all(|(_, topic)| topic != "/rollback"));
+                finish.send(()).unwrap();
+                assert_eq!(
+                    completing.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    (1, vec![])
+                );
+                cleanup.join().unwrap();
+                assert!(matches!(metadata.join().unwrap(), Response::Error(_)));
+            }
             assert_eq!(
                 spy.release_keys(),
                 vec![
@@ -10837,6 +11421,7 @@ mod tests {
         /// When set, the query methods return `Err` (netd-unreachable) so
         /// the caller's transient-session fallback path is exercised.
         fail_query: std::sync::atomic::AtomicBool,
+        catalog_wait: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
     impl SpyDemandPlane {
         fn set_fail_demand(&self, fail: bool) {
@@ -10877,6 +11462,13 @@ mod tests {
             Ok(())
         }
         fn query_catalog(&self, _robot: &str) -> Result<Vec<CatalogReply>, String> {
+            let wait = self.catalog_wait.lock().unwrap().take();
+            if let Some((entered, finish)) = wait {
+                entered.send(()).unwrap();
+                finish
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+            }
             if self.fail_query.load(Ordering::SeqCst) {
                 return Err("spy: netd unreachable".to_string());
             }
@@ -10907,6 +11499,7 @@ mod tests {
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(7),
                 schema_name: schema_name.map(str::to_string),
@@ -10955,6 +11548,7 @@ mod tests {
             entries: entries
                 .iter()
                 .map(|(topic, schema_name)| CatalogEntry {
+                    egress_qos: None,
                     topic: topic.to_string(),
                     schema_hash: Some(7),
                     schema_name: schema_name.map(str::to_string),
@@ -11065,6 +11659,7 @@ mod tests {
             robot: "go2".to_string(),
             entries: vec![
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/utlidar/cloud".to_string(),
                     schema_hash: Some(1),
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -11073,6 +11668,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/uslam/cloud_map".to_string(),
                     schema_hash: None,
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -11081,6 +11677,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/legacy".to_string(),
                     schema_hash: None,
                     schema_name: None,
@@ -11132,6 +11729,7 @@ mod tests {
         use cerulion_core::{CatalogProvenance, LivenessState, TopicLiveness, TopicRateEstimate};
         use std::collections::BTreeSet;
         let entry = |topic: &str, liveness: Option<TopicLiveness>| CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: Some(1),
             schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -12284,6 +12882,7 @@ mod tests {
             version: 1,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(1),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -12477,6 +13076,7 @@ mod tests {
             version: 1,
             robot: robot.to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: topic.to_string(),
                 schema_hash: Some(1),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -13630,6 +14230,143 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_reattach_cannot_read_or_release_an_unfinished_demand() {
+        struct BlockingPlane {
+            entered: std::sync::mpsc::Sender<()>,
+            finish: Mutex<std::sync::mpsc::Receiver<()>>,
+            ready: AtomicBool,
+            releases: AtomicU64,
+        }
+        impl DemandPlane for BlockingPlane {
+            fn query_catalog(&self, _: &str) -> Result<Vec<CatalogReply>, String> {
+                Err("catalog is outside this demand fixture".into())
+            }
+            fn query_catalog_all(&self) -> Result<Vec<CatalogReply>, String> {
+                Err("catalog is outside this demand fixture".into())
+            }
+            fn query_schema(&self, _: &str, _: &str) -> Result<Vec<SchemaReply>, String> {
+                Err("schema is outside this demand fixture".into())
+            }
+            fn demand(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+                self.entered.send(()).unwrap();
+                self.finish
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                self.ready.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release(&self, _: &str, _: &str) -> Result<(), String> {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn local_channel(&self, _: &str, _: &str) -> Result<String, String> {
+                if self.ready.load(Ordering::SeqCst) {
+                    Ok("/__cerulion/observers/oracle".into())
+                } else {
+                    Err("unfinished observer channel".into())
+                }
+            }
+        }
+        for _ in 0..2 {
+            let (entered, entry) = std::sync::mpsc::channel();
+            let (finish, ending) = std::sync::mpsc::channel();
+            let plane = Arc::new(BlockingPlane {
+                entered,
+                finish: Mutex::new(ending),
+                ready: AtomicBool::new(false),
+                releases: AtomicU64::new(0),
+            });
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let first = {
+                let plane = plane.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let fresh = perform_remote_demand(plane.as_ref(), &state, "robot", "/state", 7)
+                        .unwrap();
+                    (fresh, plane.local_channel("robot", "/state").unwrap())
+                })
+            };
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(state
+                .lock()
+                .unwrap()
+                .demanded
+                .get("/state")
+                .unwrap()
+                .local_channel
+                .is_none());
+            let (completed, done) = std::sync::mpsc::channel();
+            let second = {
+                let plane = plane.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let fresh = perform_remote_demand(plane.as_ref(), &state, "robot", "/state", 7)
+                        .unwrap();
+                    let channel = plane.local_channel("robot", "/state").unwrap();
+                    completed.send(()).unwrap();
+                    (fresh, channel)
+                })
+            };
+            assert!(matches!(
+                done.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            finish.send(()).unwrap();
+            assert_eq!(
+                first.join().unwrap(),
+                (true, "/__cerulion/observers/oracle".into())
+            );
+            assert_eq!(
+                second.join().unwrap(),
+                (false, "/__cerulion/observers/oracle".into())
+            );
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .demanded
+                    .get("/state")
+                    .unwrap()
+                    .local_channel
+                    .as_deref(),
+                Some("/__cerulion/observers/oracle")
+            );
+            assert_eq!(plane.releases.load(Ordering::SeqCst), 0);
+            assert!(perform_remote_release(plane.as_ref(), &state, "/state").unwrap());
+            assert_eq!(plane.releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn an_inflight_demand_timeout_keeps_the_owners_claim_and_does_not_release() {
+        let spy = SpyDemandPlane::default();
+        let state = Mutex::new(DaemonState::default());
+        state.lock().unwrap().demanded.insert(
+            "/state".into(),
+            RemoteDemandClaim {
+                robot: "owner".into(),
+                local_channel: None,
+            },
+        );
+        let gate = state.lock().unwrap().remote_demands.clone();
+        let _owner = gate.lock().unwrap();
+        let started = Instant::now();
+        let error = perform_remote_demand(&spy, &state, "owner", "/state", 7).unwrap_err();
+        assert_eq!(
+            error,
+            "remote attachment is still in progress; retry after it completes"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(spy.demand_count(), 0);
+        assert!(spy.release_keys().is_empty());
+        let st = state.lock().unwrap();
+        assert_eq!(st.demanded["/state"].robot, "owner");
+        assert!(st.demanded["/state"].local_channel.is_none());
+    }
+
+    #[test]
     fn concurrent_demand_of_same_topic_demands_exactly_once() {
         // THE TOCTOU pin: N controller
         // threads race to attach the SAME remote topic, each on its own handler
@@ -13678,7 +14415,7 @@ mod tests {
                     .unwrap()
                     .demanded
                     .get(topic)
-                    .map(String::as_str),
+                    .map(|claim| claim.robot.as_str()),
                 Some("go2"),
                 "the winning claim records the (topic → robot) demand"
             );
@@ -15040,6 +15777,7 @@ mod monitor_snapshot_tests {
             entries: entries
                 .iter()
                 .map(|(topic, liveness)| CatalogEntry {
+                    egress_qos: None,
                     topic: (*topic).to_string(),
                     schema_hash: None,
                     schema_name: None,

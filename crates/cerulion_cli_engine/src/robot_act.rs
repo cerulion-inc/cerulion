@@ -67,8 +67,8 @@ fn call_robot_verb_under(
     let eid = crate::connect_cmd::resolve_eid_with(Some(robot), None, &robots)?;
     let key = crate::connect_cmd::default_connect_key_file()?.ok_or_else(|| {
         VerbError::Usage(format!(
-            "this machine has no paired device key, so robot '{robot}' would refuse it: pair \
-             first with `cerulion pair {robot}`"
+            "this machine has no device key, so robot '{robot}' would refuse it: sign in \
+             first with `cerulion login`, which creates it"
         ))
     })?;
     let bin = crate::connect_cmd::resolve_connectd_bin()?;
@@ -98,7 +98,7 @@ fn call_robot_verb_under(
 
 /// The refusal of an act-verb call while `network` (the `CERULION_NETWORK`
 /// value, `None` = unset) engages the kill-switch, under the run and query
-/// parse that `cerulion pair` and `cerulion viz --robot` use
+/// parse that `cerulion viz --robot` uses
 /// ([`crate::graph_cmd::network_env_kill_from`]): `off` after trimming,
 /// ASCII case-insensitively, engages it, any other non-empty value fails
 /// closed and engages it too, and an empty or whitespace-only value is

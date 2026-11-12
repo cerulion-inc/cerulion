@@ -96,7 +96,7 @@
 3 crates/cerulion_cli_engine/src/wedge_alarm.rs
 1 crates/cerulion_cli_engine/src/workspace.rs
 39 crates/cerulion_cli_engine/src/workspace_lock.rs
-6 crates/cerulion_connectd/src/main.rs
+5 crates/cerulion_connectd/src/main.rs
 2 crates/cerulion_connectd/src/pair.rs
 5 crates/cerulion_connectd/src/schema.rs
 9 crates/cerulion_connectd/src/worker.rs
@@ -190,7 +190,7 @@
 8 crates/cerulion_macros/src/state_derive.rs
 7 crates/cerulion_macros/src/validate.rs
 5 crates/cerulion_mdns/src/lib.rs
-9 crates/cerulion_netd/src/beacon.rs
+8 crates/cerulion_netd/src/beacon.rs
 11 crates/cerulion_netd/src/catalog_events.rs
 16 crates/cerulion_netd/src/client.rs
 2 crates/cerulion_netd/src/convergence.rs
@@ -198,7 +198,7 @@
 2 crates/cerulion_netd/src/discovery_fold.rs
 7 crates/cerulion_netd/src/egress.rs
 1 crates/cerulion_netd/src/health.rs
-11 crates/cerulion_netd/src/iroh_plane.rs
+10 crates/cerulion_netd/src/iroh_plane.rs
 9 crates/cerulion_netd/src/main.rs
 9 crates/cerulion_netd/src/mirror.rs
 3 crates/cerulion_netd/src/net.rs

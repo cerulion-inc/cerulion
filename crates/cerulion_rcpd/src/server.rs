@@ -87,8 +87,8 @@ fn graph_resource() -> Resource {
         .with_mime_type(GRAPH_MIME)
 }
 
-/// The [`CALLER_HEADER`] of the HTTP request behind `context`. `None` when
-/// the request carries none (or did not arrive over HTTP).
+/// The remote caller behind `context`: its validated header, or socket provenance
+/// for a direct non-loopback HTTP connection. Local requests return `None`.
 ///
 /// # Errors
 ///
@@ -96,7 +96,16 @@ fn graph_resource() -> Resource {
 /// [`crate::caller::valid_caller`].
 fn remote_caller(context: &RequestContext<RoleServer>) -> Result<Option<String>, ErrorData> {
     match context.extensions.get::<hyper::http::request::Parts>() {
-        Some(parts) => caller_from_headers(&parts.headers),
+        Some(parts) => {
+            let named = caller_from_headers(&parts.headers)?;
+            Ok(named.or_else(|| {
+                parts
+                    .extensions
+                    .get::<crate::http::HttpPeer>()
+                    .filter(|peer| !peer.0.ip().is_loopback())
+                    .map(|_| "http:remote".to_string())
+            }))
+        }
         None => Ok(None),
     }
 }
@@ -145,17 +154,23 @@ impl ServerHandler for RcpServer {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
+        let remote = remote_caller(&context)?.is_some();
         let mut resources = vec![graph_resource()];
-        resources.extend(self.state.iter().map(|entry| {
-            Resource::new(
-                format!("{STATE_URI_PREFIX}{}", entry.name),
-                entry.name.clone(),
-            )
-            .with_description(format!("The newest frame on {}", entry.topic))
-            .with_mime_type(GRAPH_MIME)
-        }));
+        resources.extend(
+            self.state
+                .iter()
+                .filter(|entry| !remote || self.feed.remote_topic_scope(&entry.topic).is_ok())
+                .map(|entry| {
+                    Resource::new(
+                        format!("{STATE_URI_PREFIX}{}", entry.name),
+                        entry.name.clone(),
+                    )
+                    .with_description(format!("The newest frame on {}", entry.topic))
+                    .with_mime_type(GRAPH_MIME)
+                }),
+        );
         Ok(ListResourcesResult::with_all_items(resources))
     }
 
@@ -190,15 +205,38 @@ impl ServerHandler for RcpServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        let remote = remote_caller(&context)?.is_some();
         if let Some(name) = request.uri.strip_prefix(STATE_URI_PREFIX) {
             let known = self.state.iter().any(|entry| entry.name == name);
             let host = self.tools.as_ref().filter(|_| known);
             let Some(host) = host else {
                 return Err(unknown_resource(&request.uri));
             };
-            let Some(text) = host.journal().state(name) else {
+            let _scope = if remote {
+                let topic = &self
+                    .state
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .expect("known state checked above")
+                    .topic;
+                Some(
+                    self.feed
+                        .remote_topic_scope(topic)
+                        .map_err(|error| ErrorData::invalid_params(error, None))?,
+                )
+            } else {
+                None
+            };
+            let text = if remote {
+                host.journal()
+                    .remote_state(name)
+                    .map_err(|error| ErrorData::invalid_params(error, None))?
+            } else {
+                host.journal().state(name)
+            };
+            let Some(text) = text else {
                 return Err(ErrorData::resource_not_found(
                     "no frame seen on this state topic yet",
                     Some(serde_json::json!({ "uri": request.uri })),
@@ -214,12 +252,19 @@ impl ServerHandler for RcpServer {
         if request.uri != GRAPH_URI {
             return Err(unknown_resource(&request.uri));
         }
-        let snapshot = self.feed.current();
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            snapshot.json.clone(),
-            GRAPH_URI,
-        )
-        .with_mime_type(GRAPH_MIME)])
+        let json = if remote {
+            let feed = self.feed.clone();
+            tokio::task::spawn_blocking(move || feed.remote_snapshot())
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+                .map_err(|error| ErrorData::invalid_params(error, None))?
+                .json
+        } else {
+            self.feed.current().json.clone()
+        };
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(json, GRAPH_URI).with_mime_type(GRAPH_MIME)
+        ])
         .into())
     }
 

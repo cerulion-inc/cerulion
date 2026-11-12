@@ -90,6 +90,7 @@ fn make_wire_frame(schema_hash: u64, seq: u32, timestamp_ns: u64, payload: &[u8]
 #[test]
 fn test_zenoh_session_closes_on_drop() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session creation should succeed");
     let session_id = session.zid();
     assert!(mgr.is_active());
@@ -100,6 +101,7 @@ fn test_zenoh_session_closes_on_drop() {
 #[test]
 fn test_zenoh_session_created_lazily() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     assert!(
         !mgr.is_active(),
         "session should not exist before first access"
@@ -111,6 +113,7 @@ fn test_zenoh_session_created_lazily() {
 #[test]
 fn test_zenoh_session_idempotent() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let s1 = mgr.session().expect("first call should succeed");
     let s2 = mgr.session().expect("second call should succeed");
     assert_eq!(s1.zid(), s2.zid());
@@ -133,6 +136,7 @@ fn test_zenoh_session_client_mode_requires_peer() {
         ..Default::default()
     };
     let mgr = NetworkManager::new(config);
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let err = mgr
         .session()
         .expect_err("client mode with no peers should fail");
@@ -146,7 +150,9 @@ fn test_zenoh_session_client_mode_requires_peer() {
 #[test]
 fn test_separate_managers_isolated_sessions() {
     let mgr1 = NetworkManager::new(NetworkConfig::default());
+    mgr1.set_lan_access(cerulion_core::LanAccess::Open);
     let mgr2 = NetworkManager::new(NetworkConfig::default());
+    mgr2.set_lan_access(cerulion_core::LanAccess::Open);
     let s1 = mgr1.session().expect("session 1");
     let s2 = mgr2.session().expect("session 2");
     assert_ne!(
@@ -163,6 +169,7 @@ fn test_separate_managers_isolated_sessions() {
 #[test]
 fn test_network_task_starts_on_demand() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     assert!(!mgr.is_task_running());
     assert_eq!(mgr.network_subscriber_count(), 0);
 
@@ -175,6 +182,7 @@ fn test_network_task_starts_on_demand() {
 #[test]
 fn test_network_task_stops_when_idle() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.add_network_subscriber(test_bridge_mgr())
         .expect("add first");
     mgr.add_network_subscriber(test_bridge_mgr())
@@ -194,6 +202,7 @@ fn test_network_task_stops_when_idle() {
 #[test]
 fn test_network_task_restarts_after_stop() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.add_network_subscriber(test_bridge_mgr()).expect("add");
     assert!(mgr.is_task_running());
     mgr.remove_network_subscriber();
@@ -209,6 +218,7 @@ fn test_network_task_restarts_after_stop() {
 #[test]
 fn test_add_subscriber_creates_session() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     assert!(!mgr.is_active());
     mgr.add_network_subscriber(test_bridge_mgr())
         .expect("add subscriber");
@@ -219,6 +229,7 @@ fn test_add_subscriber_creates_session() {
 #[test]
 fn test_remove_subscriber_underflow_safe() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.remove_network_subscriber();
     assert_eq!(mgr.network_subscriber_count(), 0);
 }
@@ -226,6 +237,7 @@ fn test_remove_subscriber_underflow_safe() {
 #[test]
 fn test_drop_stops_running_task() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.add_network_subscriber(test_bridge_mgr()).expect("add");
     assert!(mgr.is_task_running());
     drop(mgr);
@@ -246,6 +258,7 @@ fn test_drop_stops_running_task() {
 /// loopback subscriber received.
 fn zenoh_roundtrip(topic: &str, frame: Vec<u8>) -> Vec<u8> {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session");
     let zenoh_sub = session
         .declare_subscriber(NetworkManager::data_key(topic))
@@ -343,6 +356,7 @@ fn test_publish_to_network_accepts_exact_header_boundary() {
 
     // One byte short of the boundary is refused by the outbound guard.
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let err = mgr
         .publish_to_network("/test/raw/boundary_short", vec![0u8; WireHeader::SIZE - 1])
         .expect_err("31 bytes cannot hold the wire header");
@@ -355,6 +369,7 @@ fn test_publish_to_network_accepts_exact_header_boundary() {
 #[test]
 fn test_publish_to_network_wire_data_too_small() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     // `publish_to_network` takes the OWNED frame Vec.
     let err = mgr
         .publish_to_network("bad/topic", vec![0u8; 10])
@@ -373,6 +388,7 @@ fn test_publish_to_network_wire_data_too_small() {
 #[test]
 fn test_liveliness_token_created() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session should open");
 
     let token = TopicToken::declare(session, "/live/sensor/lidar").expect("declare");
@@ -403,6 +419,7 @@ fn test_bare_namespace_token_does_not_become_phantom_topic() {
     // reject it instead of pushing a phantom empty-name topic into the
     // user-visible list.
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session should open");
     let _foreign = session
         .liveliness()
@@ -419,6 +436,7 @@ fn test_bare_namespace_token_does_not_become_phantom_topic() {
 #[test]
 fn test_liveliness_token_removed_on_drop() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session should open");
 
     let token = TopicToken::declare(session, "/live/temp/topic").unwrap();
@@ -435,6 +453,7 @@ fn test_liveliness_token_removed_on_drop() {
 #[test]
 fn test_query_live_topics_empty_network() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session");
     let topics = query_live_topics(session).expect("query");
     assert!(
@@ -455,6 +474,7 @@ fn test_query_live_topics_empty_network() {
 #[test]
 fn test_network_publish_receive_roundtrip() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session");
     // Canonical leading-slash topic — the live zenoh
     // round-trip pins that canonical names form valid key expressions.
@@ -492,6 +512,7 @@ fn test_network_publish_receive_roundtrip() {
 #[test]
 fn test_publish_sequential_ordering() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let session = mgr.session().expect("session");
 
     let zenoh_sub = session
@@ -579,6 +600,7 @@ fn throwaway_publisher(topic: &str) -> cerulion_core::CerulionPublisher {
 #[test]
 fn test_register_ingress_rejects_empty_topic() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let pubr = throwaway_publisher(&unique_topic("ingress_empty"));
     let err = mgr
         .register_ingress("", 0x1, pubr)
@@ -592,6 +614,7 @@ fn test_register_ingress_rejects_empty_topic() {
 #[test]
 fn test_register_ingress_rejects_double_register() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     let topic = unique_topic("ingress_dup");
 
     let pub_a = throwaway_publisher(&topic);
@@ -615,6 +638,7 @@ fn test_register_ingress_rejects_double_register() {
 #[test]
 fn test_ingress_counts_valid_schema_mismatch_and_decode_errors() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     // Canonical (leading-slash) topic — production graph topics always are.
     let topic = format!("/{}", unique_topic("ingress_counters"));
     let expected_hash = 0xABCD_1234_5678_9AB0u64;
@@ -667,5 +691,6 @@ fn test_ingress_counts_valid_schema_mismatch_and_decode_errors() {
 #[test]
 fn test_ingress_stats_none_for_unregistered_topic() {
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     assert!(mgr.ingress_stats("/never/registered").is_none());
 }

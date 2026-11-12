@@ -60,7 +60,7 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
     native.set_transport(Arc::clone(&manager));
     let host = HostContext::new(native, Vec::new(), env, 4)
         .unwrap()
-        .with_raw_publisher_budget(2)
+        .with_raw_publisher_budget(4)
         .unwrap();
     let context = ContextHandle {
         value: register_context(host).unwrap(),
@@ -77,62 +77,78 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
     let plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
     let native_factory = RawIngress::native(Arc::clone(&manager));
     let plugin_factory = plugin.raw_ingress().unwrap();
-    for (factory, topic) in [
-        (&native_factory, "abi/raw/sdk/native"),
-        (&plugin_factory, "abi/raw/sdk/plugin"),
-    ] {
-        let mut publisher = factory
-            .create_publisher(
-                topic,
-                Vector3::SCHEMA_HASH,
-                MaxSliceLen::try_new(64).unwrap(),
-                FullQueueSend::Discard,
-            )
-            .unwrap();
-        let mut receiver = manager.create_subscriber(topic).unwrap();
-        let mut frame = [0u8; 64];
-        let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 41, 123);
-        header.total_size = 64;
-        header.offset_table_offset = 64;
-        header.write_to_buf(&mut frame);
-        let payload = [7.0f64, -2.25, 0.5];
-        for (index, value) in payload.iter().enumerate() {
-            frame[40 + index * 8..48 + index * 8].copy_from_slice(&value.to_le_bytes());
-        }
-        assert!(publisher.publish_raw(&frame[..39]).is_err());
-        assert!(receiver
-            .view_raw_expecting(Vector3::SCHEMA_HASH)
-            .unwrap()
-            .is_none());
-        header.offset_table_offset = 0;
-        header.write_to_buf(&mut frame);
-        let malformed = publisher.publish_raw(&frame).unwrap_err();
-        assert_eq!(
-            cerulion_core::graph::node_plugin_abi::diagnostic_reason(&malformed),
-            "raw frame has an invalid offset table"
-        );
-        assert!(receiver
-            .view_raw_expecting(Vector3::SCHEMA_HASH)
-            .unwrap()
-            .is_none());
-        header.offset_table_offset = 64;
-        let scripted = factory.clock_arc();
-        for timestamp in [123_u64, 456] {
-            clock.set(timestamp);
-            assert_eq!(scripted.now_ns(), timestamp);
-            header.timestamp_ns = scripted.now_ns();
+    for _ in 0..2 {
+        for (factory, topic) in [
+            (&native_factory, "abi/raw/sdk/native"),
+            (&plugin_factory, "abi/raw/sdk/plugin"),
+        ] {
+            let run_scope = manager.exclude_remote_topic(topic).unwrap();
+            let mut publisher = factory
+                .create_publisher(
+                    topic,
+                    Vector3::SCHEMA_HASH,
+                    MaxSliceLen::try_new(64).unwrap(),
+                    FullQueueSend::Discard,
+                )
+                .unwrap();
+            let mut receiver = manager.create_subscriber(topic).unwrap();
+            drop(run_scope);
+            assert!(
+                manager.acquire_remote_topic_lease(topic).is_err(),
+                "raw publisher must retain private scope after the run ends"
+            );
+            publisher.register_egress().unwrap();
+            assert_eq!(manager.dynamic_egress_record_hash_for_test(topic), None);
+            let mut frame = [0u8; 64];
+            let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 41, 123);
+            header.total_size = 64;
+            header.offset_table_offset = 64;
             header.write_to_buf(&mut frame);
-            assert_eq!(publisher.publish_raw(&frame).unwrap(), 1);
-            let received = receiver
+            let payload = [7.0f64, -2.25, 0.5];
+            for (index, value) in payload.iter().enumerate() {
+                frame[40 + index * 8..48 + index * 8].copy_from_slice(&value.to_le_bytes());
+            }
+            assert!(publisher.publish_raw(&frame[..39]).is_err());
+            assert!(receiver
                 .view_raw_expecting(Vector3::SCHEMA_HASH)
                 .unwrap()
-                .expect("SHM downstream frame");
-            assert_eq!(&received[..], &frame);
-            assert_eq!(received.header().sequence, 41);
-            assert_eq!(received.header().timestamp_ns, timestamp);
-            assert_eq!(&received[40..48], &7.0f64.to_le_bytes());
-            assert_eq!(&received[48..56], &(-2.25f64).to_le_bytes());
-            assert_eq!(&received[56..64], &0.5f64.to_le_bytes());
+                .is_none());
+            header.offset_table_offset = 0;
+            header.write_to_buf(&mut frame);
+            let malformed = publisher.publish_raw(&frame).unwrap_err();
+            assert_eq!(
+                cerulion_core::graph::node_plugin_abi::diagnostic_reason(&malformed),
+                "raw frame has an invalid offset table"
+            );
+            assert!(receiver
+                .view_raw_expecting(Vector3::SCHEMA_HASH)
+                .unwrap()
+                .is_none());
+            header.offset_table_offset = 64;
+            let scripted = factory.clock_arc();
+            for timestamp in [123_u64, 456] {
+                clock.set(timestamp);
+                assert_eq!(scripted.now_ns(), timestamp);
+                header.timestamp_ns = scripted.now_ns();
+                header.write_to_buf(&mut frame);
+                assert_eq!(publisher.publish_raw(&frame).unwrap(), 1);
+                let received = receiver
+                    .view_raw_expecting(Vector3::SCHEMA_HASH)
+                    .unwrap()
+                    .expect("SHM downstream frame");
+                assert_eq!(&received[..], &frame);
+                assert_eq!(received.header().sequence, 41);
+                assert_eq!(received.header().timestamp_ns, timestamp);
+                assert_eq!(&received[40..48], &7.0f64.to_le_bytes());
+                assert_eq!(&received[48..56], &(-2.25f64).to_le_bytes());
+                assert_eq!(&received[56..64], &0.5f64.to_le_bytes());
+            }
+            drop(receiver);
+            drop(publisher);
+            assert!(
+                manager.remote_topic_allowed(topic).unwrap(),
+                "destroyed raw port must release its private scope while the host remains live"
+            );
         }
     }
     assert!(!client.has_failure());

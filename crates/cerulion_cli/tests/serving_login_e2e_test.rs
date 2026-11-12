@@ -7,7 +7,8 @@ use std::process::{Command, Output, Stdio};
 mod serving_login_support;
 
 const REFUSAL: &str = "serving the network requires a prior login; run `cerulion login`";
-const GRAPH: &str = "name: serving\nprefix: serving\nnodes:\n- id: absent\n  type: absent\n  inputs: []\n  outputs: []\n";
+const GRAPH: &str = "name: serving\nprefix: serving\nnodes:\n- id: absent\n  type: absent\n  inputs: []\n  outputs:\n  - name: out\n    schema: std_msgs/String\n";
+const PRODUCER_FREE: &str = "name: serving\nprefix: serving\nnodes:\n- id: absent\n  type: absent\n  inputs: []\n  outputs: []\n";
 
 fn workspace(root: &Path) {
     std::fs::create_dir_all(root.join("graphs")).unwrap();
@@ -54,7 +55,10 @@ fn graph_serving_refuses_without_login_and_preserves_yaml() {
         "--single-process",
         "--no-validate",
     ];
-    for network in ["", "network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n"] {
+    for network in [
+        "",
+        "network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n  egress: [/serving/absent/out]\n",
+    ] {
         let yaml = format!("{GRAPH}{network}");
         std::fs::write(root.path().join("graphs/serving.yaml"), &yaml).unwrap();
         let out = run(root.path(), &home, &args, false);
@@ -68,6 +72,51 @@ fn graph_serving_refuses_without_login_and_preserves_yaml() {
             yaml
         );
         assert!(!root.path().join(".cerulion/runs").exists());
+    }
+}
+
+#[test]
+fn producer_free_graph_passes_the_serving_gate_without_a_login_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    workspace(root.path());
+    let home = root.path().join("never-logged-in");
+    for network in ["", "network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n"] {
+        let yaml = format!("{PRODUCER_FREE}{network}");
+        std::fs::write(root.path().join("graphs/serving.yaml"), &yaml).unwrap();
+        let error = stderr(&run(
+            root.path(),
+            &home,
+            &[
+                "graph",
+                "run",
+                "serving",
+                "--single-process",
+                "--no-validate",
+            ],
+            false,
+        ));
+        assert!(!error.contains(REFUSAL), "{error}");
+        assert!(
+            error.contains("cdylib for node 'absent' not found"),
+            "{error}"
+        );
+        let entries = std::fs::read_dir(&home)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("runs")],
+            "authentication and enrollment state must stay absent; only run history is permitted"
+        );
+        assert!(home.join("runs").is_dir());
+        assert_eq!(std::fs::read_dir(home.join("runs")).unwrap().count(), 0);
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
+            yaml
+        );
     }
 }
 
