@@ -349,6 +349,7 @@ impl NetdClient {
             poisoned: false,
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
+            mirror_busy_failures: super::FailureRegimeLatch::new(),
         };
         let result = (|| {
             let line = read_line(&mut client.reader, deadline, MAX_HELLO_BYTES)

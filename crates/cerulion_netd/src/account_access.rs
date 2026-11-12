@@ -43,11 +43,12 @@ pub fn is_transient_busy(message: &str) -> bool {
     message == CONTROLLER_BUSY || message == IDENTITY_BUSY
 }
 
-/// How long a first-use caller waits one of those out before reporting it.
+/// How long directory installation waits one of those out before reporting it.
 ///
-/// It is at least as long as the daemon is willing to stay busy, so a client
-/// never gives up on a condition the daemon still considers normal; the
+/// It is at least as long as the daemon is willing to stay busy, so the
+/// installer never gives up on a condition the daemon still considers normal; the
 /// controller asserts that relationship against its own grace at compile time.
+/// Mirror acquisition has a separate attempt and time bound in the client.
 pub const TRANSIENT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Reserved identity route carried through existing robot-string fields.

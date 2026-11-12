@@ -2328,6 +2328,9 @@ If a held remote mirror cannot be restored within a transition's five-second
 budget, netd names its robot and topic. CLI observers re-demand their pinned
 source and schema, or exit with a named error if recovery fails. Graph imports revalidate their pinned producer before
 reconnecting; visualization re-demands its pinned source and schema. Status checks use separate connections, so a busy daemon does not release healthy readers. Visualization retries each lost source with backoff independently.
+Initial reads and re-demands automatically retry transient controller or login-store
+contention on the same connection with a short bounded backoff. If contention
+persists, the command reports the daemon's refusal.
 
 Remote schema reads use current producer registrations, including a registration
 that arrives after the reader connects. A schema lookup without topic data

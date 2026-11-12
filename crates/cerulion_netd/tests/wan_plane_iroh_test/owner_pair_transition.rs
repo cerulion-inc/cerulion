@@ -624,6 +624,8 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
     struct StalledPlane {
         controller: Arc<AccountWanController>,
         started: std::sync::mpsc::SyncSender<()>,
+        healthy_attempts: std::sync::atomic::AtomicUsize,
+        healthy_ensure_attempts: std::sync::atomic::AtomicUsize,
     }
     impl MirrorPlane for StalledPlane {
         fn prepare_demand(
@@ -631,9 +633,22 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
             key: &TopicKey,
             registry: &mut cerulion_netd::registry::DemandRegistry,
         ) -> Result<(), String> {
+            if key.topic == "/wan/healthy"
+                && self.healthy_attempts.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                return Err(cerulion_netd::account_access::CONTROLLER_BUSY.into());
+            }
             self.controller.prepare_demand(key, registry)
         }
         fn ensure_mirror(&self, key: &TopicKey, hash: u64) -> Result<(), MirrorError> {
+            if key.topic == "/wan/healthy"
+                && self.healthy_ensure_attempts.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                return Err(MirrorError::Iroh {
+                    key: key.clone(),
+                    reason: cerulion_netd::account_access::IDENTITY_BUSY.into(),
+                });
+            }
             if key.topic == "/wan/stall" {
                 self.started.send(()).unwrap();
                 std::thread::sleep(Duration::from_secs(6));
@@ -660,21 +675,22 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
     desk.install(login.snapshot(&[(ROBOT, &robot)]));
     let socket = desk._directory.path().join("stall.sock");
     let (started, ready) = std::sync::mpsc::sync_channel(1);
-    let mut daemon = cerulion_netd::start(
-        socket.clone(),
-        Arc::new(StalledPlane {
-            controller: desk.controller.clone(),
-            started,
-        }),
-        NetdConfig::default(),
-    )
-    .unwrap();
+    let plane = Arc::new(StalledPlane {
+        controller: desk.controller.clone(),
+        started,
+        healthy_attempts: std::sync::atomic::AtomicUsize::new(0),
+        healthy_ensure_attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut daemon =
+        cerulion_netd::start(socket.clone(), plane.clone(), NetdConfig::default()).unwrap();
     let mut holding = NetdClient::connect_existing_at(socket.clone()).unwrap();
     let route = robot_route(&ROBOT.0);
     let channel = holding
         .observe(&route, "/wan/healthy", ORACLE_SCHEMA_HASH)
         .unwrap()
         .local_topic;
+    assert!(plane.healthy_attempts.load(Ordering::SeqCst) >= 3);
+    assert!(plane.healthy_ensure_attempts.load(Ordering::SeqCst) >= 3);
     let mut tap = desk.manager.create_data_only_subscriber(&channel).unwrap();
     let mut sequence = read_after(&mut tap, None).0;
     let worker = std::thread::spawn(move || {
