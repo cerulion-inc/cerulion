@@ -51,6 +51,7 @@
 //! | [`mod@format`] | Cert / grant / epoch types + canonical deterministic signing bytes + serde |
 //! | [`mod@verify`] | Robot-side chain verifier + access list + MAC'd, anti-rollback trust store |
 //! | [`mod@pake`]   | CPace ceremony state machine (bounded attempts, TTL, code-burn) |
+//! | [`mod@pair_code`] | The robot-local request and result lines that arm a code pairing, and the policy it is armed under |
 //! | [`mod@pop`]    | Proof-of-possession gesture: sign/verify a device-key challenge |
 //! | [`mod@client`] | Device-side key seam, cert carry, and pairing driver |
 //! | [`mod@team`]   | Team X.509 leaf and CA profile, trust bundle, status list, anti-rollback decisions |
@@ -69,6 +70,7 @@ mod crypto;
 mod error;
 pub mod format;
 pub mod identity;
+pub mod pair_code;
 pub mod pake;
 pub mod pop;
 pub mod team;
