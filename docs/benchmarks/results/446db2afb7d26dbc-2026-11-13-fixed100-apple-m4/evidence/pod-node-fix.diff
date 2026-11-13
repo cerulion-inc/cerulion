@@ -1,0 +1,72 @@
+diff --git a/benches/latency/workspace/nodes/pod_latency_node/src/lib.rs b/benches/latency/workspace/nodes/pod_latency_node/src/lib.rs
+index 1bedf991f..8df2db995 100644
+--- a/benches/latency/workspace/nodes/pod_latency_node/src/lib.rs
++++ b/benches/latency/workspace/nodes/pod_latency_node/src/lib.rs
+@@ -38,0 +39,4 @@ pub struct PodLatencyNode {
++/// A sentinel no environment value can equal (NUL is not permitted in an env
++/// string), so "absent" and "present but empty" are told apart.
++const PAYLOAD_SIZE_UNSET: &str = "\u{0}unset";
++
+@@ -49,6 +53,2 @@ pub struct PodLatencyNode {
+-fn payload_size_from_env(node: &str, ctx: &NodeContext) -> Result<usize, NodeError> {
+-    // A sentinel no environment value can equal (NUL is not permitted in
+-    // an env string), so "absent" and "present but empty" are told apart.
+-    const UNSET: &str = "\u{0}unset";
+-    let raw = ctx.env_str("CER_BENCH_PAYLOAD_SIZE", UNSET);
+-    if raw == UNSET {
++fn payload_size_from_env(node: &str, raw: &str) -> Result<usize, NodeError> {
++    if raw == PAYLOAD_SIZE_UNSET {
+@@ -72 +72,4 @@ impl PodLatencyNode {
+-        self.payload_size = payload_size_from_env("pod_latency_node", _ctx)?;
++        self.payload_size = payload_size_from_env(
++            "pod_latency_node",
++            &_ctx.env_str("CER_BENCH_PAYLOAD_SIZE", PAYLOAD_SIZE_UNSET),
++        )?;
+diff --git a/benches/latency/workspace/nodes/pod_ping_node/src/lib.rs b/benches/latency/workspace/nodes/pod_ping_node/src/lib.rs
+index fe64375ed..8c5faf08b 100644
+--- a/benches/latency/workspace/nodes/pod_ping_node/src/lib.rs
++++ b/benches/latency/workspace/nodes/pod_ping_node/src/lib.rs
+@@ -81,0 +82,4 @@ pub struct PodPingNode {
++/// A sentinel no environment value can equal (NUL is not permitted in an env
++/// string), so "absent" and "present but empty" are told apart.
++const PAYLOAD_SIZE_UNSET: &str = "\u{0}unset";
++
+@@ -92,6 +96,2 @@ pub struct PodPingNode {
+-fn payload_size_from_env(node: &str, ctx: &NodeContext) -> Result<usize, NodeError> {
+-    // A sentinel no environment value can equal (NUL is not permitted in
+-    // an env string), so "absent" and "present but empty" are told apart.
+-    const UNSET: &str = "\u{0}unset";
+-    let raw = ctx.env_str("CER_BENCH_PAYLOAD_SIZE", UNSET);
+-    if raw == UNSET {
++fn payload_size_from_env(node: &str, raw: &str) -> Result<usize, NodeError> {
++    if raw == PAYLOAD_SIZE_UNSET {
+@@ -113 +113,4 @@ impl PodPingNode {
+-        self.payload_size = payload_size_from_env("pod_ping_node", ctx)?;
++        self.payload_size = payload_size_from_env(
++            "pod_ping_node",
++            &ctx.env_str("CER_BENCH_PAYLOAD_SIZE", PAYLOAD_SIZE_UNSET),
++        )?;
+diff --git a/benches/latency/workspace/nodes/pod_pong_node/src/lib.rs b/benches/latency/workspace/nodes/pod_pong_node/src/lib.rs
+index 517190bd6..a6d3203a8 100644
+--- a/benches/latency/workspace/nodes/pod_pong_node/src/lib.rs
++++ b/benches/latency/workspace/nodes/pod_pong_node/src/lib.rs
+@@ -37,0 +38,4 @@ pub struct PodPongNode {
++/// A sentinel no environment value can equal (NUL is not permitted in an env
++/// string), so "absent" and "present but empty" are told apart.
++const PAYLOAD_SIZE_UNSET: &str = "\u{0}unset";
++
+@@ -48,6 +52,2 @@ pub struct PodPongNode {
+-fn payload_size_from_env(node: &str, ctx: &NodeContext) -> Result<usize, NodeError> {
+-    // A sentinel no environment value can equal (NUL is not permitted in
+-    // an env string), so "absent" and "present but empty" are told apart.
+-    const UNSET: &str = "\u{0}unset";
+-    let raw = ctx.env_str("CER_BENCH_PAYLOAD_SIZE", UNSET);
+-    if raw == UNSET {
++fn payload_size_from_env(node: &str, raw: &str) -> Result<usize, NodeError> {
++    if raw == PAYLOAD_SIZE_UNSET {
+@@ -69 +69,4 @@ impl PodPongNode {
+-        self.payload_size = payload_size_from_env("pod_pong_node", ctx)?;
++        self.payload_size = payload_size_from_env(
++            "pod_pong_node",
++            &ctx.env_str("CER_BENCH_PAYLOAD_SIZE", PAYLOAD_SIZE_UNSET),
++        )?;

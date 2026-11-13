@@ -36,6 +36,10 @@ pub struct PodLatencyNode {
     ticked: bool,
 }
 
+/// A sentinel no environment value can equal (NUL is not permitted in an env
+/// string), so "absent" and "present but empty" are told apart.
+const PAYLOAD_SIZE_UNSET: &str = "\u{0}unset";
+
 /// The sweep-point size, read so that a PRESENT but unparseable value is a
 /// refusal rather than a silent 64.
 ///
@@ -46,12 +50,8 @@ pub struct PodLatencyNode {
 /// guard exists to make exactly that impossible, so it must not have a
 /// door through its own input. An ABSENT var still means 64 (the pinned
 /// sweep's first size, and what the build script bakes unset).
-fn payload_size_from_env(node: &str, ctx: &NodeContext) -> Result<usize, NodeError> {
-    // A sentinel no environment value can equal (NUL is not permitted in
-    // an env string), so "absent" and "present but empty" are told apart.
-    const UNSET: &str = "\u{0}unset";
-    let raw = ctx.env_str("CER_BENCH_PAYLOAD_SIZE", UNSET);
-    if raw == UNSET {
+fn payload_size_from_env(node: &str, raw: &str) -> Result<usize, NodeError> {
+    if raw == PAYLOAD_SIZE_UNSET {
         return Ok(64);
     }
     raw.parse::<usize>().map_err(|_| NodeError::InvalidInput {
@@ -69,7 +69,10 @@ impl PodLatencyNode {
     fn init(&mut self, _ctx: &mut NodeContext) -> Result<(), NodeError> {
         self.target_samples = _ctx.env("CER_BENCH_TARGET_SAMPLES", 10_000);
         self.warmup = _ctx.env("CER_BENCH_WARMUP", 1_000);
-        self.payload_size = payload_size_from_env("pod_latency_node", _ctx)?;
+        self.payload_size = payload_size_from_env(
+            "pod_latency_node",
+            &_ctx.env_str("CER_BENCH_PAYLOAD_SIZE", PAYLOAD_SIZE_UNSET),
+        )?;
         // Baked-size mislabel guard — see pod_ping_node.
         if PODPAYLOAD_WIRE_SIZE != self.payload_size {
             return Err(NodeError::Logic(format!(

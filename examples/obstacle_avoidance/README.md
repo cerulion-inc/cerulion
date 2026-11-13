@@ -23,7 +23,9 @@ Polling the same scan on a `period_ms` timer leaves the edge out of the DAG:
 both nodes share one level. Split across processes under the free-run default,
 nothing then orders that edge: which scan a tick pairs with is decided by OS
 scheduling, and two live runs of the graph can pair differently. The
-`CERULION_EXECUTION_MODE=lockstep` opt-out orders the live pairing instead. A
+deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out orders the live pairing
+instead; the supported fixes are the `#[input(trigger)]` edge this example
+declares, or keeping both nodes in one rank as described below. A
 `--record` bag re-executes under either mode: every cross-rank edge is served
 from the recorded frames, so a replay reproduces the pairing its run took
 rather than re-deriving it.
@@ -32,10 +34,11 @@ When `cerulion graph run` splits the two nodes into one process per node (the
 default partition), the two ranks FREE-RUN: no cross-process barrier is
 created, so the ranks are not stepped against each other, and each one is
 deterministic on its own recorded boundary stream rather than against the
-other's. The `CERULION_EXECUTION_MODE=lockstep` opt-out adds the shared
-level-boundary barrier, the mode that does order the publish before the read
-across a process split. Co-locating both nodes in one `process_groups:` group,
-or running `--single-process`, keeps the edge inside one rank instead. See
+other's. The deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out adds the
+shared level-boundary barrier, the mode that does order the publish before the
+read across a process split. Co-locating both nodes in one `process_groups:`
+group, or running `--single-process`, keeps the edge inside one rank instead while that process runs as one executor unit (no `graphs/obstacle_avoidance.costs.yaml` profile and no `isolate: true` node; `cerulion graph plan obstacle_avoidance` shows the units);
+these are the supported fixes. See
 "Scope of the data guarantee" in `docs/multi_process.md`.
 
 This example is a standalone workspace: run its commands from inside this
