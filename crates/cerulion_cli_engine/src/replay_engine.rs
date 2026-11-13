@@ -4740,7 +4740,6 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             coordination == CoordinationMode::Lockstep,
             fed,
         ),
-        coordination == CoordinationMode::Lockstep,
         &best_effort_reason,
     );
 
@@ -16514,30 +16513,62 @@ fn re_executed_output_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) ->
         .collect()
 }
 
-/// What a replay does with each driver topic ([`TopicClasses::driver`]),
-/// decided from the graph and the pass layout before the first pass. Each
-/// list is in graph order.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct DriverTopicFeeds {
-    /// Read by nodes this replay feeds the recorded frames to.
-    fed: Vec<String>,
-    /// Not fed to a node that reads it: every driver topic of a lockstep
-    /// replay, which never fires the drivers, and, on a free-run pass that
-    /// injects no in-rank topic (not FED), one a node reads in a rank where a
-    /// driver of the topic runs.
-    unfed: Vec<String>,
-    /// Of a free-run replay, read by no node in the graph: neither fed nor
-    /// compared.
-    unread: Vec<String>,
+/// The topics `graph`'s nodes in `drivers` write, resolved under its prefix.
+/// A driver publishes nothing in a replay, so a node of the same pass reads its
+/// frames of these topics only when the pass feeds them from the bag.
+fn driver_written_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) -> BTreeSet<String> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| drivers.contains(&n.id))
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(|o| cerulion_core::graph::resolve_output_topic(&graph.prefix, &n.id, o))
+        })
+        .collect()
+}
+
+/// What a replay does with the topics the graph's `external` (driver) nodes
+/// write, alone ([`TopicClasses::driver`]) or beside other nodes
+/// ([`TopicClasses::driver_shared`]), decided from the graph and the pass
+/// layout before the first pass. Each topic list is in graph order.
+#[derive(Debug, PartialEq, Eq)]
+enum DriverTopicFeeds {
+    /// A lockstep replay decides its own fires and installs no recorded one,
+    /// so it fires no driver and feeds no node a driver's recorded frame.
+    Lockstep {
+        /// Every driver node ([`TopicClasses::driver_nodes`]), in id order.
+        /// Empty when the graph has no driver, and then nothing is logged.
+        drivers: Vec<String>,
+        /// Every topic a driver writes, alone or beside other nodes. Empty
+        /// when no driver declares an output.
+        topics: Vec<String>,
+    },
+    /// A free-run replay.
+    FreeRun {
+        /// Written by drivers alone and read by nodes this replay feeds the
+        /// recorded frames to.
+        fed: Vec<String>,
+        /// Written by a driver, alone or beside other nodes, and read in a
+        /// rank where a driver of the topic runs, by a pass that is not FED:
+        /// such a pass injects no in-rank topic, so the reader gets none of
+        /// the driver's recorded frames.
+        unfed: Vec<String>,
+        /// Written by drivers alone and read by no node in the graph: neither
+        /// fed nor compared. A shared topic is never here, since its other
+        /// writers' frames are still compared.
+        unread: Vec<String>,
+    },
 }
 
 /// Sort every driver topic into [`DriverTopicFeeds`]. PURE: the graph, the
 /// rank plans and the two run facts decide it.
 ///
 /// A FED pass feeds every read from the bag; a free-run pass that is not fed
-/// injects only the cross-rank edges (`pass_topics`), so a reader beside the
-/// driver gets nothing; a lockstep pass decides its own fires and installs no
-/// recorded one, so nothing fires a driver at all.
+/// injects only the cross-rank edges (`pass_topics`), so a reader beside a
+/// driver of the topic gets none of its frames; a lockstep pass decides its
+/// own fires and installs no recorded one, so nothing fires a driver at all.
 fn plan_driver_topic_feeds(
     config: &GraphConfig,
     classes: &TopicClasses,
@@ -16545,73 +16576,115 @@ fn plan_driver_topic_feeds(
     lockstep: bool,
     fed: bool,
 ) -> DriverTopicFeeds {
+    let driver_topics = classes
+        .produced
+        .iter()
+        .filter(|t| classes.driver.contains(t) || classes.driver_shared.contains(t));
+    if lockstep {
+        return DriverTopicFeeds::Lockstep {
+            drivers: classes.driver_nodes.iter().cloned().collect(),
+            topics: driver_topics.cloned().collect(),
+        };
+    }
     let consumed = graph_consumed_topics(config);
-    let mut feeds = DriverTopicFeeds::default();
-    for topic in &classes.driver {
-        if lockstep {
-            feeds.unfed.push(topic.clone());
-            continue;
-        }
+    // Per rank: the topics its drivers write, and the topics it reads.
+    let ranks: Vec<(BTreeSet<String>, BTreeSet<String>)> = plans
+        .iter()
+        .map(|plan| {
+            (
+                driver_written_topics(plan.subgraph(), &classes.driver_nodes),
+                rank_consumed_topics(plan),
+            )
+        })
+        .collect();
+    let (mut fed_topics, mut unfed, mut unread) = (Vec::new(), Vec::new(), Vec::new());
+    for topic in driver_topics {
+        let shared = classes.driver_shared.contains(topic);
         if !consumed.contains(topic) {
-            feeds.unread.push(topic.clone());
+            if !shared {
+                unread.push(topic.clone());
+            }
             continue;
         }
-        let read_beside_its_driver = plans.iter().any(|plan| {
-            plan.produced().contains(topic) && rank_consumed_topics(plan).contains(topic)
-        });
+        let read_beside_its_driver = ranks
+            .iter()
+            .any(|(written, read)| written.contains(topic) && read.contains(topic));
         if !fed && read_beside_its_driver {
-            feeds.unfed.push(topic.clone());
-        } else {
-            feeds.fed.push(topic.clone());
+            unfed.push(topic.clone());
+        } else if !shared {
+            fed_topics.push(topic.clone());
         }
     }
-    feeds
+    DriverTopicFeeds::FreeRun {
+        fed: fed_topics,
+        unfed,
+        unread,
+    }
 }
 
 /// Log [`DriverTopicFeeds`]: one line per list, never one per topic.
 ///
 /// The fed list is INFO, since an input is not a topic the verdict claims to
-/// check and every graph with a camera has one. The other two are WARN, the
-/// same rule as the unmodelled topics: a reader not fed its recorded frames
-/// cannot reproduce its outputs, and a driver topic nobody reads is covered by
-/// no verdict at all. `best_effort_reason` says why a free-run pass is not
+/// check and every graph with a camera has one. The others are WARN, the same
+/// rule as the unmodelled topics: a lockstep replay of a graph with a driver
+/// cannot reproduce its schedule, a reader not fed its recorded frames cannot
+/// reproduce its outputs, and a driver topic nobody reads is covered by no
+/// verdict at all. The lockstep line names the drivers, and their topics when
+/// they declare any. `best_effort_reason` says why a free-run pass is not
 /// fed.
-fn log_driver_topic_feeds(feeds: &DriverTopicFeeds, lockstep: bool, best_effort_reason: &str) {
-    if !feeds.fed.is_empty() {
-        tracing::info!(
-            driver_topics = feeds.fed.len(),
-            topics = %feeds.fed.join(", "),
-            "replay: the outputs of the external (driver) nodes are recorded inputs, fed to \
-             their consumers from the bag and neither re-produced nor compared"
-        );
-    }
-    if !feeds.unfed.is_empty() {
-        if lockstep {
+fn log_driver_topic_feeds(feeds: &DriverTopicFeeds, best_effort_reason: &str) {
+    let (fed, unfed, unread) = match feeds {
+        DriverTopicFeeds::Lockstep { drivers, .. } if drivers.is_empty() => return,
+        DriverTopicFeeds::Lockstep { drivers, topics } if topics.is_empty() => {
             tracing::warn!(
-                driver_topics = feeds.unfed.len(),
-                topics = %feeds.unfed.join(", "),
+                driver_nodes = drivers.len(),
+                node_ids = %drivers.join(", "),
+                "replay: this recording is lockstep, so a resim never fires its external \
+                 (driver) nodes and the schedule cannot reproduce: record a graph with a \
+                 driver under the multi-process default, without `--single-process` and \
+                 without CERULION_EXECUTION_MODE=lockstep"
+            );
+            return;
+        }
+        DriverTopicFeeds::Lockstep { drivers, topics } => {
+            tracing::warn!(
+                driver_nodes = drivers.len(),
+                node_ids = %drivers.join(", "),
+                driver_topics = topics.len(),
+                topics = %topics.join(", "),
                 "replay: this recording is lockstep, so a resim neither fires its external \
                  (driver) nodes nor feeds their recorded frames to the nodes that read them, \
                  and the schedule and those nodes' outputs cannot reproduce: record a graph \
                  with a driver under the multi-process default, without `--single-process` \
                  and without CERULION_EXECUTION_MODE=lockstep"
             );
-        } else {
-            tracing::warn!(
-                driver_topics = feeds.unfed.len(),
-                topics = %feeds.unfed.join(", "),
-                reason = %best_effort_reason,
-                "replay: this resim does not feed these external (driver) topics to the nodes \
-                 that read them in the driver's own process or executor unit, so those nodes \
-                 cannot reproduce their recorded outputs: a `--verify` resim of a recording \
-                 whose reads name their frames feeds them"
-            );
+            return;
         }
+        DriverTopicFeeds::FreeRun { fed, unfed, unread } => (fed, unfed, unread),
+    };
+    if !fed.is_empty() {
+        tracing::info!(
+            driver_topics = fed.len(),
+            topics = %fed.join(", "),
+            "replay: the outputs of the external (driver) nodes are recorded inputs, fed to \
+             their consumers from the bag and neither re-produced nor compared"
+        );
     }
-    if !feeds.unread.is_empty() {
+    if !unfed.is_empty() {
         tracing::warn!(
-            driver_topics = feeds.unread.len(),
-            topics = %feeds.unread.join(", "),
+            driver_topics = unfed.len(),
+            topics = %unfed.join(", "),
+            reason = %best_effort_reason,
+            "replay: this resim does not feed the frames the external (driver) nodes \
+             recorded on these topics to the nodes that read them in a driver's own process \
+             or executor unit, so those nodes cannot reproduce their recorded outputs: a \
+             `--verify` resim of a recording whose reads name their frames feeds them"
+        );
+    }
+    if !unread.is_empty() {
+        tracing::warn!(
+            driver_topics = unread.len(),
+            topics = %unread.join(", "),
             "replay: no node in the graph reads these external (driver) topics, so they are \
              recorded inputs that are neither fed nor compared: nothing in this replay \
              verifies them"
@@ -19783,8 +19856,9 @@ mod restored_sync_heads_tests {
 mod driver_topic_tests {
     use super::{
         build_rank_plans, classify_topics, driver_output_topics, driver_shared_topics,
-        external_node_ids, plan_driver_topic_feeds, re_executed_output_topics, CoordinationMode,
-        DriverTopicFeeds, NodeEntry, RecordedMessages, TopicClasses,
+        driver_written_topics, external_node_ids, log_driver_topic_feeds, plan_driver_topic_feeds,
+        re_executed_output_topics, CoordinationMode, DriverTopicFeeds, NodeEntry, RecordedMessages,
+        TopicClasses,
     };
     use crate::replay_rank::RankBoundarySummary;
     use cerulion_core::graph::node::{ClosureNodeEntry, MacroPolicy, NodeInfo};
@@ -19814,7 +19888,7 @@ mod driver_topic_tests {
          \x20     - name: brightness\n\
          \x20       schema: std_msgs/Float32\n";
 
-    /// One topic written by a driver and by an ordinary node.
+    /// One topic written by a driver and by an ordinary node, read by a sink.
     const SHARED_BUS: &str = "prefix: rig\n\
          multi_publisher_topics:\n\
          \x20 - /rig/bus\n\
@@ -19830,7 +19904,41 @@ mod driver_topic_tests {
          \x20   outputs:\n\
          \x20     - name: out\n\
          \x20       schema: std_msgs/Float32\n\
+         \x20       topic: /rig/bus\n\
+         \x20 - id: sink\n\
+         \x20   type: sink\n\
+         \x20   inputs:\n\
+         \x20     - name: inp\n\
+         \x20       source: /rig/bus\n";
+
+    /// The shared bus with no node reading it.
+    const UNREAD_SHARED_BUS: &str = "prefix: rig\n\
+         multi_publisher_topics:\n\
+         \x20 - /rig/bus\n\
+         nodes:\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n\
+         \x20   outputs:\n\
+         \x20     - name: out\n\
+         \x20       schema: std_msgs/Float32\n\
+         \x20       topic: /rig/bus\n\
+         \x20 - id: timer\n\
+         \x20   type: timer\n\
+         \x20   outputs:\n\
+         \x20     - name: out\n\
+         \x20       schema: std_msgs/Float32\n\
          \x20       topic: /rig/bus\n";
+
+    /// A driver that declares no output, beside a timer.
+    const OUTPUTLESS_DRIVER: &str = "prefix: rig\n\
+         nodes:\n\
+         \x20 - id: door\n\
+         \x20   type: door\n\
+         \x20 - id: timer\n\
+         \x20   type: timer\n\
+         \x20   outputs:\n\
+         \x20     - name: tick\n\
+         \x20       schema: std_msgs/Float32\n";
 
     fn ids(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| (*n).to_string()).collect()
@@ -19943,12 +20051,12 @@ mod driver_topic_tests {
         );
     }
 
-    fn camera_classes(config: &cerulion_core::graph::GraphConfig) -> TopicClasses {
+    fn classes_of(config: &cerulion_core::graph::GraphConfig, drivers: &[&str]) -> TopicClasses {
         let recorded = RecordedMessages::from_owned_frames(IndexMap::new());
-        classify_topics(config, &recorded, None, &ids(&["cam"])).expect("nothing is recorded")
+        classify_topics(config, &recorded, None, &ids(drivers)).expect("nothing is recorded")
     }
 
-    fn camera_plans(
+    fn rank_plans(
         config: &cerulion_core::graph::GraphConfig,
         coordination: CoordinationMode,
         ranks: &[&[&str]],
@@ -19963,71 +20071,237 @@ mod driver_topic_tests {
         build_rank_plans(coordination, config, &tables, &summaries).expect("the graph plans")
     }
 
-    fn feeds(fed: &[&str], unfed: &[&str], unread: &[&str]) -> DriverTopicFeeds {
-        let v = |l: &[&str]| l.iter().map(|t| (*t).to_string()).collect();
-        DriverTopicFeeds {
-            fed: v(fed),
-            unfed: v(unfed),
-            unread: v(unread),
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    fn free_run(fed: &[&str], unfed: &[&str], unread: &[&str]) -> DriverTopicFeeds {
+        DriverTopicFeeds::FreeRun {
+            fed: strings(fed),
+            unfed: strings(unfed),
+            unread: strings(unread),
+        }
+    }
+
+    fn lockstep(drivers: &[&str], topics: &[&str]) -> DriverTopicFeeds {
+        DriverTopicFeeds::Lockstep {
+            drivers: strings(drivers),
+            topics: strings(topics),
         }
     }
 
     /// Which driver topics a replay feeds, per layout and mode: a fed pass
-    /// feeds every read, a pass that is not fed only a reader in another rank,
-    /// a lockstep replay none, and a driver topic no node reads is neither fed
-    /// nor compared on any layout.
+    /// feeds every read, a pass that is not fed only a reader in another rank
+    /// than a driver of the topic, a lockstep replay none, naming every driver
+    /// and every topic one writes, and a topic only drivers write that no node
+    /// reads is neither fed nor compared on any layout. A topic a driver
+    /// shares is compared over its other writers, so it is never fed or
+    /// unread, read or not, only unfed beside its driver.
     #[test]
     fn a_driver_topic_is_fed_only_where_the_pass_feeds_its_reader() {
-        let config = parse_graph(CAMERA).expect("the camera graph parses");
-        let classes = camera_classes(&config);
-        let one = camera_plans(&config, CoordinationMode::FreeRun, &[&["cam", "meter"]]);
-        let two = camera_plans(&config, CoordinationMode::FreeRun, &[&["cam"], &["meter"]]);
-        let lock = camera_plans(&config, CoordinationMode::Lockstep, &[&["cam", "meter"]]);
+        let camera = parse_graph(CAMERA).expect("the camera graph parses");
+        let bus = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        let unread_bus = parse_graph(UNREAD_SHARED_BUS).expect("the unread bus graph parses");
+        let door = parse_graph(OUTPUTLESS_DRIVER).expect("the outputless driver graph parses");
         let image = "/rig/cam/image";
         let info = "/rig/cam/info";
-        for (layout, plans, lockstep, fed, want) in [
+        let shared = "/rig/bus";
+        let free = CoordinationMode::FreeRun;
+        let lock = CoordinationMode::Lockstep;
+        let one_cam: &[&[&str]] = &[&["cam", "meter"]];
+        let two_cam: &[&[&str]] = &[&["cam"], &["meter"]];
+        let one_bus: &[&[&str]] = &[&["cam", "timer", "sink"]];
+        let two_bus: &[&[&str]] = &[&["cam"], &["timer", "sink"]];
+        let one_unread_bus: &[&[&str]] = &[&["cam", "timer"]];
+        let one_door: &[&[&str]] = &[&["door", "timer"]];
+        for (layout, config, drivers, coordination, ranks, fed, want) in [
             (
-                "one rank, fed",
-                &one,
-                false,
+                "camera, one rank, fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
                 true,
-                feeds(&[image], &[], &[info]),
+                free_run(&[image], &[], &[info]),
             ),
             (
-                "one rank, not fed",
-                &one,
+                "camera, one rank, not fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
                 false,
-                false,
-                feeds(&[], &[image], &[info]),
+                free_run(&[], &[image], &[info]),
             ),
             (
-                "two ranks, fed",
-                &two,
-                false,
+                "camera, two ranks, fed",
+                &camera,
+                &["cam"][..],
+                free,
+                two_cam,
                 true,
-                feeds(&[image], &[], &[info]),
+                free_run(&[image], &[], &[info]),
             ),
             (
-                "two ranks, not fed",
-                &two,
+                "camera, two ranks, not fed",
+                &camera,
+                &["cam"][..],
+                free,
+                two_cam,
                 false,
-                false,
-                feeds(&[image], &[], &[info]),
+                free_run(&[image], &[], &[info]),
             ),
             (
-                "lockstep",
-                &lock,
+                "camera, lockstep",
+                &camera,
+                &["cam"][..],
+                lock,
+                one_cam,
+                false,
+                lockstep(&["cam"], &[image, info]),
+            ),
+            (
+                "shared bus, one rank, fed",
+                &bus,
+                &["cam"][..],
+                free,
+                one_bus,
                 true,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "shared bus, one rank, not fed",
+                &bus,
+                &["cam"][..],
+                free,
+                one_bus,
                 false,
-                feeds(&[], &[image, info], &[]),
+                free_run(&[], &[shared], &[]),
+            ),
+            (
+                "shared bus, the driver alone in its rank, not fed",
+                &bus,
+                &["cam"][..],
+                free,
+                two_bus,
+                false,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "shared bus, lockstep",
+                &bus,
+                &["cam"][..],
+                lock,
+                one_bus,
+                false,
+                lockstep(&["cam"], &[shared]),
+            ),
+            (
+                "shared bus no node reads, not fed",
+                &unread_bus,
+                &["cam"][..],
+                free,
+                one_unread_bus,
+                false,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "shared bus no node reads, lockstep",
+                &unread_bus,
+                &["cam"][..],
+                lock,
+                one_unread_bus,
+                false,
+                lockstep(&["cam"], &[shared]),
+            ),
+            (
+                "outputless driver, free run",
+                &door,
+                &["door"][..],
+                free,
+                one_door,
+                false,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "outputless driver, lockstep",
+                &door,
+                &["door"][..],
+                lock,
+                one_door,
+                false,
+                lockstep(&["door"], &[]),
+            ),
+            (
+                "no driver, lockstep",
+                &camera,
+                &[][..],
+                lock,
+                one_cam,
+                false,
+                lockstep(&[], &[]),
             ),
         ] {
+            let classes = classes_of(config, drivers);
+            let plans = rank_plans(config, coordination, ranks);
             assert_eq!(
-                plan_driver_topic_feeds(&config, &classes, plans, lockstep, fed),
+                plan_driver_topic_feeds(config, &classes, &plans, lock == coordination, fed),
                 want,
                 "{layout}"
             );
         }
+    }
+
+    /// The topics a pass's drivers write, a shared one included; none
+    /// without a driver.
+    #[test]
+    fn the_driver_written_topics_are_every_output_of_a_driver() {
+        let bus = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        assert_eq!(
+            driver_written_topics(&bus, &ids(&["cam"])),
+            ids(&["/rig/bus"])
+        );
+        assert!(driver_written_topics(&bus, &ids(&["sink"])).is_empty());
+        let camera = parse_graph(CAMERA).expect("the camera graph parses");
+        assert_eq!(
+            driver_written_topics(&camera, &ids(&["cam"])),
+            ids(&["/rig/cam/image", "/rig/cam/info"])
+        );
+        assert!(driver_written_topics(&camera, &ids(&[])).is_empty());
+    }
+
+    /// A lockstep replay of a graph whose driver declares no output still
+    /// warns once, naming the driver and the remedy; a lockstep replay
+    /// without a driver logs nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_lockstep_driver_without_outputs_is_named_by_its_node_id() {
+        log_driver_topic_feeds(&lockstep(&[], &[]), "");
+        assert!(
+            !logs_contain("this recording is lockstep"),
+            "no driver, no line"
+        );
+        log_driver_topic_feeds(&lockstep(&["door"], &[]), "");
+        logs_assert(|lines: &[&str]| {
+            let hits: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("this recording is lockstep"))
+                .collect();
+            match hits.as_slice() {
+                [line]
+                    if line.contains("WARN")
+                        && line.contains("node_ids=door")
+                        && !line.contains("topics=")
+                        && line.contains("without `--single-process`") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected exactly ONE WARN line naming the driver and the remedy, got \
+                     {other:?}"
+                )),
+            }
+        });
     }
 
     /// A driver topic a node consumes stays GRAPH-PRODUCED: it is not the

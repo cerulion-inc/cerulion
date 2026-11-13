@@ -196,13 +196,16 @@ Rules that must not drift:
   (`TopicClasses::driver_shared`) stays captured: `build_capture_partitionings` leaves the
   driver's writer out of `producible`, and the topic-level count is the partitions' sum; an
   unpartitioned one keeps the whole recorded count and fails. A metadata read that fails
-  keeps the node's topics compared. `plan_driver_topic_feeds` sorts the driver topics into
-  fed (INFO), unfed and unread (one WARN each); a LOCKSTEP pass decides its own fires, so
-  nothing fires the driver and every driver topic is unfed, and a free-run pass that is not
-  fed injects no in-rank topic, so a reader beside the driver is unfed. A `0/0` tally with a
-  driver warns that nothing was compared. Pinned by `driver_topic_tests` and the
-  driver-graph arms of `replay_engine_test.rs` (the `drv_*` fixtures); `docs/bag.md` states
-  the user-facing rules.
+  keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
+  LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
+  driver node and every topic one writes, shared ones included, and still fires for a
+  driver with no output. A free-run plan sorts the topics into fed (INFO), unfed and unread
+  (one WARN each): a pass that is not fed injects no in-rank topic, so a topic a node reads
+  in a rank running one of its driver writers is unfed, a shared one too, while fed and
+  unread hold only the topics drivers alone write (a shared topic is compared over its
+  other writers). A `0/0` tally with a driver warns that nothing was compared. Pinned by
+  `driver_topic_tests` and the driver-graph arms of `replay_engine_test.rs` (the `drv_*`
+  fixtures); `docs/bag.md` states the user-facing rules.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.

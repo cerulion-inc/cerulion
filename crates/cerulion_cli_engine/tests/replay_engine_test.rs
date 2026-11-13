@@ -44515,7 +44515,7 @@ fn a_neutral_resim_beside_the_driver_warns_that_it_does_not_feed_the_reader() {
     logs_assert(|lines: &[&str]| {
         let hits: Vec<&&str> = lines
             .iter()
-            .filter(|l| l.contains("does not feed these external (driver) topics"))
+            .filter(|l| l.contains("does not feed the frames the external (driver) nodes"))
             .collect();
         match hits.as_slice() {
             [line]
@@ -44527,6 +44527,120 @@ fn a_neutral_resim_beside_the_driver_warns_that_it_does_not_feed_the_reader() {
             }
             other => Err(format!(
                 "expected exactly ONE WARN line naming {DRV_IMAGE} and the reason, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// A lockstep recording of the shared-bus graph, whose camera writes only the
+/// `multi_publisher_topics` topic, diverges at exit 6 like any lockstep
+/// recording with a driver, and its one lockstep WARN names the camera, the
+/// shared topic and the remedy.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_lockstep_recording_of_a_driver_on_a_shared_topic_warns_naming_it() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_bus_lockstep.mcap");
+    ri_bag(
+        &live.rec,
+        &bag,
+        production_recorder_json(replay_engine::CoordinationMode::Lockstep),
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        || drv_bus_factories(false, 2.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the lockstep replay runs");
+    assert!(!outcome.passed);
+    assert_eq!(
+        resim_exit(&outcome, true),
+        6,
+        "the schedule divergence wins"
+    );
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the camera's recorded fires are not replayed");
+    assert_eq!(
+        divergence.recorded.as_ref().map(|f| f.node_id.as_str()),
+        Some("w1"),
+        "the first divergence is the camera's first recorded fire: {}",
+        divergence.detail
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("this recording is lockstep"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("WARN")
+                    && line.contains("node_ids=w1")
+                    && line.contains(DRV_BUS)
+                    && line.contains("without `--single-process`") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE WARN line naming w1, {DRV_BUS} and the remedy, got \
+                 {other:?}"
+            )),
+        }
+    });
+}
+
+/// A neutral `--resim all` of the single-process shared-bus bag feeds the
+/// sink none of the camera's frames, since a resim without `--verify` injects
+/// no in-rank topic: the sink reads only the period writer's frames, and one
+/// WARN names the shared topic and the reason.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_neutral_resim_beside_a_driver_on_a_shared_topic_warns_that_it_does_not_feed_it() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_bus_single.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        || drv_bus_factories(false, 2.0),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("the neutral resim runs");
+    assert_eq!(
+        resim_exit(&outcome, false),
+        0,
+        "a neutral run makes no verdict"
+    );
+    let sink_reads = ri_by_consumer(&replayed)
+        .remove(&DRV_BUS_SINK.to_bits())
+        .unwrap_or_default();
+    assert!(
+        !sink_reads.is_empty(),
+        "PREMISE: the sink read the writer's frames"
+    );
+    assert!(
+        sink_reads.iter().all(|(x, _, _)| f64::from_bits(*x) == 2.0),
+        "the sink read only the period writer's frames, none of the camera's: {sink_reads:?}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("does not feed the frames the external (driver) nodes"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("WARN")
+                    && line.contains(DRV_BUS)
+                    && line.contains("without --verify") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE WARN line naming {DRV_BUS} and the reason, got {other:?}"
             )),
         }
     });

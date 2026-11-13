@@ -53,9 +53,9 @@ warns that it does not feed the rest. A lockstep recording
 (`CERULION_EXECUTION_MODE=lockstep`, or `--single-process --record` of a graph
 that is one executor unit) is not supported for a graph with a driver: its
 resim does not fire the driver or feed the nodes that read it, so a warning
-names the driver topics and `--verify` reports a schedule divergence at the
-driver's first recorded fire (exit 6); record such a graph with the
-multi-process default. Re-simulating a `ros2 attach` bag on a desk with
+names the drivers and the topics they write and `--verify` reports a schedule
+divergence at the driver's first recorded fire (exit 6); record such a graph
+with the multi-process default. Re-simulating a `ros2 attach` bag on a desk with
 no DDS robot produces **no output**: its `dds_bridge` node is a driver with no
 DDS inputs. Use plain playback to view an attached ROS 2 recording without the
 robot.
