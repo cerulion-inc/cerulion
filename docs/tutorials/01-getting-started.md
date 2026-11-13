@@ -903,19 +903,19 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
+# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.5
 y: 0.0
 z: 0.0
 ---
-# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
+# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
 z: 0.0
 ---
-# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
@@ -1051,7 +1051,7 @@ frames: 774 across 2 topic(s); span 38.600s
 
 TOPIC                                       FRAMES   MAX BYTES  SCHEMA
 /demo/lidar_sensor/scan                        387        1361  sensor_msgs/LaserScan
-/demo/safety_controller/cmd_vel                387          56  geometry_msgs/Vector3
+/demo/safety_controller/cmd_vel                387          64  geometry_msgs/Vector3
 ...
 ```
 

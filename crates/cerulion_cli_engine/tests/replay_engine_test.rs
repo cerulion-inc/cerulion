@@ -2697,6 +2697,8 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
             "path": "x",
             "recorded": 103.00000000000362,
             "replayed": 103.0,
+            "field_byte": null,
+            "field_char": null,
             "byte_offset": null,
             "region": null,
             "reason": null,
@@ -5023,6 +5025,8 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
             "path": null,
             "recorded": null,
             "replayed": null,
+            "field_byte": null,
+            "field_char": null,
             "byte_offset": 64,
             "region": "trailing_bytes",
             "reason": null,
@@ -13043,6 +13047,8 @@ fn an_aborted_verify_warns_the_data_violation_its_completed_rank_found() {
             "path": "x",
             "recorded": 3.0000000000001132,
             "replayed": 3.0,
+            "field_byte": null,
+            "field_char": null,
             "byte_offset": null,
             "region": null,
             "reason": null,
@@ -27999,8 +28005,10 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         violations: vec![Violation {
             topic: "/vocab/relay/out".to_string(),
             class: ViolationClass::ByteMismatch {
+                // timestamp_ns is header bytes 24..32; 7 and 9 first differ
+                // at its low byte.
                 index: 0,
-                first_diff_byte_offset: 32,
+                first_diff_byte_offset: 24,
                 recorded_len: 56,
                 replayed_len: 56,
                 difference: synthetic_difference(),
@@ -43740,6 +43748,8 @@ fn synthetic_difference() -> ByteDifference {
         path: Some("timestamp_ns".to_string()),
         recorded: Some(DifferenceValue::UInt(7)),
         replayed: Some(DifferenceValue::UInt(9)),
+        field_byte: None,
+        field_char: None,
         byte_offset: None,
         region: None,
         reason: None,

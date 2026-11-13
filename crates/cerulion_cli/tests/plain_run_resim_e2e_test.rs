@@ -1839,9 +1839,8 @@ fn a_capture_taken_off_a_plain_run_is_a_bag_bag_play_resim_accepts() {
     // frame 43 differs at byte 20 …          (byte 20 IS the sequence field)
     // ```
     //
-    // (The byte-offset form of that line; the verdict now names the header
-    // field itself: `frame 43 on '…/ticker/cmd' differs in the wire header at
-    // sequence`.)
+    // (A byte-mismatch line names that header field in its wire-header form,
+    // `differs in the wire header at sequence`.)
     //
     // — 0 of 2 topics matched, on a capture the same command had just accepted.
     // So a `--verify` leg here would not be a stronger plain-run assertion; it

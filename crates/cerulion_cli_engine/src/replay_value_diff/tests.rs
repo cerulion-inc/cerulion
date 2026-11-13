@@ -8,7 +8,7 @@
 
 use std::sync::OnceLock;
 
-use cerulion_core::dynamic::{yaml_to_message, FrameWalker, WireHeader};
+use cerulion_core::dynamic::{yaml_to_message, FieldDef, FrameWalker, NamedValue, WireHeader};
 use cerulion_core::wire::StepTag;
 
 use super::*;
@@ -144,6 +144,8 @@ fn a_vector3_x_change_names_x_and_both_values() {
             path: Some("x".to_string()),
             recorded: Some(DifferenceValue::Float64(0.3)),
             replayed: Some(DifferenceValue::Float64(0.25)),
+            field_byte: None,
+            field_char: None,
             byte_offset: None,
             region: None,
             reason: None,
@@ -341,6 +343,20 @@ fn bools_print_their_word_and_a_byte_past_one_shows_its_bits() {
             DifferenceValue::Text("true (0x02)".to_string())
         )
     );
+
+    // Against a false the byte 2 still carries its byte, so the report keeps
+    // the 2 a plain `true` would lose.
+    let zero = widths(&w, "");
+    assert_eq!(zero[72], 0);
+    let value = first_value(&w, &zero, &two);
+    assert_eq!(value.recorded, shown("false", DifferenceValue::Bool(false)));
+    assert_eq!(
+        value.replayed,
+        shown(
+            "true (0x02)",
+            DifferenceValue::Text("true (0x02)".to_string())
+        )
+    );
 }
 
 /// Floats print their own shortest form (`0.1` for a float32 0.1), the
@@ -462,6 +478,11 @@ fn long_strings_print_a_window_around_the_first_difference() {
             window('Y')
         )
     );
+    let entry = report_entry(&locate(&w, &rec, &rep));
+    assert_eq!(
+        (entry.recorded, entry.field_byte, entry.field_char),
+        (Some(DifferenceValue::Text(window('X'))), None, Some(120))
+    );
 }
 
 /// A string side that is not UTF-8 says so with its length.
@@ -500,6 +521,22 @@ fn a_fixed_string_differing_past_its_nul_names_the_byte() {
         line(&w, &rec, &rep),
         "frame 0 on '/t' differs at name: recorded \"abc\", replayed \"abc\" (bytes differ past \
          the NUL at field byte 5) (recorded 48 B, replayed 48 B)"
+    );
+    // The report carries the byte too: its two values are the same text.
+    let entry = report_entry(&locate(&w, &rec, &rep));
+    assert_eq!(
+        (
+            entry.recorded,
+            entry.replayed,
+            entry.field_byte,
+            entry.field_char
+        ),
+        (
+            Some(DifferenceValue::Text("abc".to_string())),
+            Some(DifferenceValue::Text("abc".to_string())),
+            Some(5),
+            None
+        )
     );
 }
 
@@ -540,10 +577,9 @@ fn an_array_element_is_named_by_its_index() {
         first_value(&w, &base, &ranges),
         ValueDifference {
             path: "ranges[1]".to_string(),
-            at: String::new(),
+            within: None,
             recorded: shown("2.0", DifferenceValue::Float32(2.0)),
             replayed: shown("2.5", DifferenceValue::Float32(2.5)),
-            note: String::new(),
         }
     );
     let data = arrays(&w, "[1.0, 2.0, 3.0]", "[7, 9]", "[-1, 2]", "[\"a\", \"b\"]");
@@ -616,6 +652,15 @@ fn a_bool_array_element_byte_past_one_shows_its_bits() {
     assert_eq!(value.path, "flags[0]");
     assert_eq!(value.recorded.text, "true (0x01)");
     assert_eq!(value.replayed.text, "true (0x02)");
+    // `flags[1]` is a false; a byte 2 there reads `true (0x02)` against it.
+    let mut rep = rec.clone();
+    rep[at + 1] = 2;
+    let value = first_value(&w, &rec, &rep);
+    assert_eq!(value.path, "flags[1]");
+    assert_eq!(
+        (value.recorded.text.as_str(), value.replayed.text.as_str()),
+        ("false", "true (0x02)")
+    );
 }
 
 /// Arrays of messages recurse per element: `poses[2].position.x` in a
@@ -696,6 +741,12 @@ fn an_opaque_array_compares_as_bytes() {
         "frame 0 on '/t' differs at points, byte 12 of its opaque bytes: recorded 0x4c, replayed \
          0x4d (recorded 73 B, replayed 73 B)"
     );
+    assert_eq!(
+        serde_json::to_value(report_entry(&locate(&w, &rec, &rep))).expect("serializes"),
+        serde_json::json!({"kind": "field", "path": "points", "recorded": "0x4c",
+            "replayed": "0x4d", "field_byte": 12, "field_char": null, "byte_offset": null,
+            "region": null, "reason": null, "more": 0})
+    );
     // One side canonical (one whole point), the other not: the raw bytes.
     let (rec, rep) = (blob(0, 24), blob(0, 25));
     let value = first_value(&w, &rec, &rep);
@@ -729,6 +780,228 @@ fn an_empty_nested_blob_compares_as_zero_values() {
     assert_eq!(value.replayed, shown("5", DifferenceValue::Int(5)));
 }
 
+/// A fixed array of fixed strings (`string_fixed[4]`, three of them; the
+/// YAML type grammar cannot spell it, so the schema is built here): an
+/// element is named by its index, and an element whose text is equal but
+/// whose bytes differ past its NUL is named with that byte.
+#[test]
+fn a_fixed_array_of_fixed_strings_names_its_element() {
+    let mut tags = MessageSchema::new("Tags");
+    tags.add_field(FieldDef::new(
+        "tags",
+        FieldType::FixedArray {
+            element_type: Box::new(FieldType::StringFixed(4)),
+            length: 3,
+        },
+    ));
+    let mut schemas = crate::schema_cmd::parse_builtin_schemas();
+    schemas.push(tags);
+    let w = FrameWalker::new(schemas).0;
+    let hash = hash_of(&w, "Tags");
+    // The 12 fixed bytes: "ab", then `middle`, then `last`, 4 bytes each.
+    let tagged = |middle: &[u8; 4], last: &[u8; 4]| {
+        let mut payload = b"ab\0\0".to_vec();
+        payload.extend_from_slice(middle);
+        payload.extend_from_slice(last);
+        raw_frame(hash, 12, 0, &payload)
+    };
+    let rec = tagged(b"cd\0\0", b"ef\0\0");
+    assert_eq!(
+        line(&w, &rec, &tagged(b"cx\0\0", b"ef\0\0")),
+        "frame 0 on '/t' differs at tags[1]: recorded \"cd\", replayed \"cx\" (recorded 52 B, \
+         replayed 52 B)"
+    );
+    // tags[2]'s byte 3 is payload 11, frame byte 51.
+    let rep = tagged(b"cd\0\0", b"ef\0z");
+    assert_eq!(first_diff(&rec, &rep), 51);
+    assert_eq!(
+        line(&w, &rec, &rep),
+        "frame 0 on '/t' differs at tags[2]: recorded \"ef\", replayed \"ef\" (bytes differ past \
+         the NUL at field byte 3) (recorded 52 B, replayed 52 B)"
+    );
+}
+
+/// An array of messages whose two sides differ in length names the array
+/// with both lengths, then counts what differs in the common prefix.
+#[test]
+fn an_array_of_messages_of_different_lengths_names_both_lengths() {
+    let w = builtin();
+    let poses = |xs: &[&str]| {
+        let mut yaml =
+            String::from("header:\n  stamp: {sec: 0, nanosec: 0}\n  frame_id: \"map\"\nposes:\n");
+        for x in xs {
+            yaml.push_str(&format!(
+                "  - position: {{x: {x}, y: 0.0, z: 0.0}}\n    orientation: {{x: 0.0, y: 0.0, \
+                 z: 0.0, w: 1.0}}\n"
+            ));
+        }
+        frame(w, "geometry_msgs/PoseArray", &yaml)
+    };
+    let (rec, rep) = (poses(&["1.0", "2.0"]), poses(&["1.5", "2.0", "3.0"]));
+    match locate(w, &rec, &rep) {
+        FrameDifference::Field { value, more } => {
+            assert_eq!(value.path, "poses");
+            assert_eq!(
+                value.recorded,
+                shown(
+                    "2 element(s)",
+                    DifferenceValue::Text("2 element(s)".to_string())
+                )
+            );
+            assert_eq!(value.replayed.text, "3 element(s)");
+            // poses[0].position.x differs in the common prefix.
+            assert_eq!(more, 1);
+        }
+        other => panic!("expected a field difference, got {other:?}"),
+    }
+}
+
+/// Two strings that are not UTF-8 on either side, of one length, name the
+/// first byte that differs.
+#[test]
+fn two_strings_that_are_not_utf8_name_the_differing_byte() {
+    let w = walker_with(WIDTHS);
+    let base = widths(&w, "s: \"abc\"");
+    // The 40-byte header, the 48-byte fixed section, s's 8-byte entry, then
+    // "abc": 99 bytes, `b` at frame byte 97.
+    assert_eq!(base.len(), 99);
+    assert_eq!(base[97], b'b');
+    let (mut rec, mut rep) = (base.clone(), base);
+    rec[97] = 0xff;
+    rep[97] = 0xfe;
+    assert_eq!(
+        line(&w, &rec, &rep),
+        "frame 0 on '/t' differs at s, byte 1 of its bytes: recorded 0xff, replayed 0xfe \
+         (recorded 99 B, replayed 99 B)"
+    );
+    let entry = report_entry(&locate(&w, &rec, &rep));
+    assert_eq!(
+        (entry.recorded, entry.field_byte),
+        (Some(DifferenceValue::Text("0xff".to_string())), Some(1))
+    );
+}
+
+const POINTS_IN_A_MESSAGE: &str = "\
+schemas:
+  PtsInner:
+    fields:
+      geometry_msgs/Point[] pts: {}
+  PtsOuter:
+    fields:
+      PtsInner h: {}
+";
+
+/// A zero-default value against one of another shape: an empty `h` blob on
+/// one side, and on the other an `h` whose `pts` is a 25-byte opaque blob.
+/// Neither side has bytes to compare against the other's.
+#[test]
+fn a_zero_value_against_a_value_of_another_shape_names_both() {
+    let w = walker_with(POINTS_IN_A_MESSAGE);
+    let hash = hash_of(&w, "PtsOuter");
+    // `h`'s entry (0, 0): the empty blob.
+    let empty = raw_frame(hash, 0, 1, &[0u8; 8]);
+    // `h`'s entry (8, 33), then h: its own entry (8, 25) and 25 zero bytes.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&8u32.to_le_bytes());
+    payload.extend_from_slice(&33u32.to_le_bytes());
+    payload.extend_from_slice(&8u32.to_le_bytes());
+    payload.extend_from_slice(&25u32.to_le_bytes());
+    payload.extend_from_slice(&[0u8; 25]);
+    let opaque = raw_frame(hash, 0, 1, &payload);
+    assert_eq!(
+        line(&w, &empty, &opaque),
+        "frame 0 on '/t' differs at h.pts: recorded the zero value, replayed a value of another \
+         shape (recorded 48 B, replayed 81 B)"
+    );
+}
+
+/// A zero-default message's fixed array reads as zeros: an empty `h` blob
+/// against an `h` whose `v` is `[0.0, 0.0, 1.5]` names `h.v[2]`.
+#[test]
+fn a_zero_default_fixed_array_compares_as_zeros() {
+    let w = walker_with(
+        "schemas:\n  Vec3s:\n    fields:\n      float64[3] v: {}\n      string s: {}\n  \
+         VecHolder:\n    fields:\n      Vec3s h: {}\n",
+    );
+    let rec = raw_frame(hash_of(&w, "VecHolder"), 0, 1, &[0u8; 8]);
+    let rep = frame(&w, "VecHolder", "h: {v: [0.0, 0.0, 1.5], s: \"\"}\n");
+    assert_eq!(
+        first_value(&w, &rec, &rep),
+        ValueDifference {
+            path: "h.v[2]".to_string(),
+            within: None,
+            recorded: shown("0.0", DifferenceValue::Float64(0.0)),
+            replayed: shown("1.5", DifferenceValue::Float64(1.5)),
+        }
+    );
+}
+
+/// An array of a message the schema set cannot resolve is opaque to the
+/// walker, and compares as its bytes: counted behind a differing value, and
+/// named by its byte when it is the only difference.
+#[test]
+fn an_array_of_an_unresolvable_message_compares_as_bytes() {
+    let w = walker_with(
+        "schemas:\n  Crate:\n    fields:\n      float64 v: {}\n      Unknown[] xs: {}\n",
+    );
+    let hash = hash_of(&w, "Crate");
+    // v (8 B), xs's entry (16, 4), then xs's 4 bytes: 60-byte frames.
+    let crate_frame = |v: f64, xs: [u8; 4]| {
+        let mut payload = v.to_le_bytes().to_vec();
+        payload.extend_from_slice(&16u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&xs);
+        raw_frame(hash, 8, 1, &payload)
+    };
+    let rec = crate_frame(1.0, [1, 2, 3, 4]);
+    assert_eq!(
+        line(&w, &rec, &crate_frame(2.0, [1, 2, 9, 4])),
+        "frame 0 on '/t' differs at v: recorded 1.0, replayed 2.0; 1 more value(s) differ \
+         (recorded 60 B, replayed 60 B)"
+    );
+    assert_eq!(
+        line(&w, &rec, &crate_frame(1.0, [1, 2, 9, 4])),
+        "frame 0 on '/t' differs at xs, byte 2 of its opaque bytes: recorded 0x03, replayed 0x09 \
+         (recorded 60 B, replayed 60 B)"
+    );
+}
+
+/// A nested message of a schema the set cannot resolve: the walker refuses
+/// a frame holding one, so only hand-built values reach this arm, and they
+/// compare as values of no known shape.
+#[test]
+fn a_nested_message_of_an_unresolvable_schema_compares_by_shape() {
+    let w = walker_with("schemas:\n  Wrapper:\n    fields:\n      Unknown u: {}\n");
+    let schema = w.schema_for_name("Wrapper").expect("fixture");
+    let wrapper = |x: f64| FrameValue {
+        schema_name: "Wrapper".to_string(),
+        fields: vec![NamedValue {
+            name: "u".to_string(),
+            value: FrameValueKind::Nested(Box::new(FrameValue {
+                schema_name: "Unknown".to_string(),
+                fields: vec![NamedValue {
+                    name: "x".to_string(),
+                    value: FrameValueKind::F64(x),
+                }],
+            })),
+        }],
+    };
+    assert_eq!(
+        diff_frame_values(&w, schema, &wrapper(1.0), &wrapper(1.0), &[]),
+        FrameValueDiff::default()
+    );
+    let found = diff_frame_values(&w, schema, &wrapper(1.0), &wrapper(2.0), &[]);
+    let value = found.first.expect("u differs");
+    assert_eq!(
+        (
+            value.path.as_str(),
+            value.recorded.text.as_str(),
+            value.replayed.text.as_str()
+        ),
+        ("u", "a value of another shape", "a value of another shape")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Counting and the tolerance skip list
 // ---------------------------------------------------------------------------
@@ -743,7 +1016,7 @@ fn the_rest_of_the_differing_values_are_counted() {
     let rv = w.walk_by_hash(&a).expect("decodes");
     let pv = w.walk_by_hash(&a).expect("decodes");
     assert_eq!(
-        diff_frame_values(&w, schema, &rv, &pv, &[]).expect("diffs"),
+        diff_frame_values(&w, schema, &rv, &pv, &[]),
         FrameValueDiff::default()
     );
 
@@ -798,10 +1071,10 @@ fn a_tolerated_field_is_skipped() {
         w.walk_by_hash(&rec).expect("decodes"),
         w.walk_by_hash(&rep).expect("decodes"),
     );
-    let found = diff_frame_values(w, schema, &rv, &pv, &["x"]).expect("diffs");
+    let found = diff_frame_values(w, schema, &rv, &pv, &["x"]);
     assert_eq!(found.first.map(|v| v.path), Some("y".to_string()));
     assert_eq!(found.more, 0);
-    let found = diff_frame_values(w, schema, &rv, &pv, &["x", "y"]).expect("diffs");
+    let found = diff_frame_values(w, schema, &rv, &pv, &["x", "y"]);
     assert_eq!(found, FrameValueDiff::default());
 }
 
@@ -836,6 +1109,8 @@ fn a_header_field_is_named_ahead_of_the_payload() {
             "path": "sequence",
             "recorded": 44,
             "replayed": 43,
+            "field_byte": null,
+            "field_char": null,
             "byte_offset": null,
             "region": null,
             "reason": null,
@@ -901,6 +1176,36 @@ fn total_size_alone_is_named() {
     );
 }
 
+/// The offset table's two header fields are named like the others:
+/// `offset_table_offset` (frame bytes 12..16) is 40 + 24 = 64 on a
+/// `Vector3`, and `offset_table_count` (16..20) is 0.
+#[test]
+fn the_offset_table_header_fields_are_named() {
+    let w = builtin();
+    let rec = frame(w, "geometry_msgs/Vector3", "x: 1.0\ny: 0.0\nz: 0.0\n");
+    assert_eq!(rec[12..20], [64, 0, 0, 0, 0, 0, 0, 0]);
+    let mut moved = rec.clone();
+    put_u32(&mut moved, 12, 99);
+    assert_eq!(
+        line(w, &rec, &moved),
+        "frame 0 on '/t' differs in the wire header at offset_table_offset: recorded 64, \
+         replayed 99 (recorded 64 B, replayed 64 B)"
+    );
+    let mut counted = rec.clone();
+    put_u32(&mut counted, 16, 5);
+    assert_eq!(
+        line(w, &rec, &counted),
+        "frame 0 on '/t' differs in the wire header at offset_table_count: recorded 0, replayed \
+         5 (recorded 64 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(report_entry(&locate(w, &rec, &counted))).expect("serializes"),
+        serde_json::json!({"kind": "header", "path": "offset_table_count", "recorded": 0,
+            "replayed": 5, "field_byte": null, "field_char": null, "byte_offset": null,
+            "region": null, "reason": null, "more": 0})
+    );
+}
+
 /// Different schema hashes are named and nothing is decoded: the schema set
 /// is never even built.
 #[test]
@@ -962,12 +1267,122 @@ fn bytes_past_the_last_field() {
             path: None,
             recorded: None,
             replayed: None,
+            field_byte: None,
+            field_char: None,
             byte_offset: Some(64),
             region: Some("trailing_bytes"),
             reason: None,
             more: 0,
         }
     );
+}
+
+/// A tolerated `x` drifted within its bound, and the recorded frame carries
+/// four trailing bytes with its `total_size` patched to 68: the diff
+/// reports byte 8 (`total_size`), and the byte the line names is past the
+/// last field, never one of x's (frame bytes 40..48).
+#[test]
+fn a_tolerated_field_is_never_named_as_framing() {
+    let w = builtin();
+    let rep = frame(w, "geometry_msgs/Vector3", "x: 1.0\ny: 0.0\nz: 0.0\n");
+    let mut rec = frame(w, "geometry_msgs/Vector3", "x: 1.05\ny: 0.0\nz: 0.0\n");
+    rec.extend_from_slice(&[1, 2, 3, 4]);
+    put_u32(&mut rec, 8, 68);
+    let verdict = ByteVerdict {
+        index: 3,
+        first_diff_byte_offset: 8,
+        recorded_len: 68,
+        replayed_len: 64,
+        difference: locate_difference(|| w, &rec, &rep, 8, &["x"], None),
+    };
+    assert_eq!(
+        byte_mismatch_detail("/sr/source/out", "", &verdict),
+        "frame 3 on '/sr/source/out' differs at byte 64, in bytes past the last field; every \
+         field value is equal (recorded 68 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(report_entry(&verdict.difference)).expect("serializes"),
+        serde_json::json!({"kind": "layout", "path": null, "recorded": null, "replayed": null,
+            "field_byte": null, "field_char": null, "byte_offset": 64,
+            "region": "trailing_bytes", "reason": null, "more": 0})
+    );
+}
+
+/// The same tolerated drift between frames of one length whose replayed
+/// `total_size` reads 99: no other byte differs outside x, so the line
+/// names `total_size`.
+#[test]
+fn a_tolerated_field_leaves_total_size_to_be_named() {
+    let w = builtin();
+    let rec = frame(w, "geometry_msgs/Vector3", "x: 1.0\ny: 0.0\nz: 0.0\n");
+    let mut rep = frame(w, "geometry_msgs/Vector3", "x: 1.05\ny: 0.0\nz: 0.0\n");
+    put_u32(&mut rep, 8, 99);
+    let verdict = ByteVerdict {
+        index: 0,
+        first_diff_byte_offset: 8,
+        recorded_len: 64,
+        replayed_len: 64,
+        difference: locate_difference(|| w, &rec, &rep, 8, &["x"], None),
+    };
+    assert_eq!(
+        byte_mismatch_detail("/t", "", &verdict),
+        "frame 0 on '/t' differs in the wire header at total_size: recorded 64, replayed 99 \
+         (recorded 64 B, replayed 64 B)"
+    );
+}
+
+const PADDED: &str = "\
+schemas:
+  Inner:
+    fields:
+      uint8 a: {}
+      float64 b: {}
+  Outer:
+    fields:
+      Inner inner: {}
+      Inner[2] arr: {}
+";
+
+/// Padding inside an inlined nested message, and inside an element of a
+/// fixed array of them, is fixed-section padding; a value there is a value.
+/// Inner is `a` @0, 7 padding bytes, `b` @8 (16 B); Outer is `inner` @0 and
+/// `arr` @16 (48 B).
+#[test]
+fn padding_inside_an_inlined_message_is_padding() {
+    let w = walker_with(PADDED);
+    let rec = frame(
+        &w,
+        "Outer",
+        "inner: {a: 1, b: 2.0}\narr:\n  - {a: 3, b: 4.0}\n  - {a: 5, b: 6.0}\n",
+    );
+    assert_eq!(rec.len(), 88);
+    let region = |at: usize| {
+        let mut rep = rec.clone();
+        assert_eq!(rep[at], 0, "byte {at} is padding");
+        rep[at] = 0x55;
+        locate(&w, &rec, &rep)
+    };
+    // inner's padding byte 3: payload 3, frame byte 43.
+    assert_eq!(
+        region(43),
+        FrameDifference::Layout {
+            byte_offset: 43,
+            region: LayoutRegion::FixedSectionPadding,
+        }
+    );
+    // arr[1] starts at payload 32; its padding byte 3 is frame byte 75.
+    assert_eq!(
+        region(75),
+        FrameDifference::Layout {
+            byte_offset: 75,
+            region: LayoutRegion::FixedSectionPadding,
+        }
+    );
+    // arr[1].a is frame byte 72.
+    let mut rep = rec.clone();
+    assert_eq!(rep[72], 5);
+    rep[72] = 6;
+    assert_eq!(first_value(&w, &rec, &rep).path, "arr[1].a");
 }
 
 /// Padding in the fixed section, the offset table, the gap between two
@@ -1119,26 +1534,48 @@ fn a_frame_the_walker_refuses_is_not_decoded_with_its_reason() {
 }
 
 /// The tolerance decoder refused a frame and nothing decoded here differs:
-/// the refusal is the reason.
+/// the refusal is the reason, named as that decoder's, at a byte that
+/// differs outside the tolerated fields.
 #[test]
 fn a_tolerance_decoder_refusal_is_the_reason_when_no_value_differs() {
     let w = builtin();
     let rec = frame(w, "geometry_msgs/Vector3", "x: 1.0\ny: 0.0\nz: 0.0\n");
-    let rep = rec.clone();
-    let refusal = RemainderRefusal {
-        side: Side::Recorded,
-        error: "frame is 3 bytes, shorter than the 40-byte wire header".to_string(),
+    let refusal = |side| RemainderRefusal {
+        side,
+        error: "corrupt".to_string(),
     };
+    // Identical frames: no byte differs, so the remainder's own offset (the
+    // end of the header) stands.
     assert_eq!(
-        locate_difference(|| w, &rec, &rep, 40, &[], Some(&refusal)),
+        locate_difference(|| w, &rec, &rec, 40, &[], Some(&refusal(Side::Recorded))),
         FrameDifference::Undecoded {
             byte_offset: 40,
-            reason: UndecodedReason::Undecodable {
+            reason: UndecodedReason::ToleranceRefused {
                 side: Side::Recorded,
-                schema: "geometry_msgs/Vector3".to_string(),
-                error: "frame is 3 bytes, shorter than the 40-byte wire header".to_string(),
+                error: "corrupt".to_string(),
             },
         }
+    );
+    // x (frame bytes 40..48) is tolerated and drifted; four trailing bytes
+    // follow the replayed frame's last field. The byte named is 64, never one
+    // of x's.
+    let mut rep = frame(w, "geometry_msgs/Vector3", "x: 1.5\ny: 0.0\nz: 0.0\n");
+    rep.extend_from_slice(&[9, 9, 9, 9]);
+    let verdict = ByteVerdict {
+        index: 0,
+        first_diff_byte_offset: 40,
+        recorded_len: 64,
+        replayed_len: 68,
+        difference: locate_difference(|| w, &rec, &rep, 40, &["x"], Some(&refusal(Side::Replayed))),
+    };
+    assert_eq!(
+        byte_mismatch_detail("/t", "", &verdict),
+        "frame 0 on '/t' differs at byte 64, not decoded because the --tolerance decoder \
+         refused the replayed frame: corrupt (recorded 64 B, replayed 68 B)"
+    );
+    assert_eq!(
+        report_entry(&verdict.difference).reason,
+        Some("replayed_frame_undecodable")
     );
 }
 
@@ -1151,38 +1588,98 @@ fn a_tolerance_decoder_refusal_is_the_reason_when_no_value_differs() {
 #[test]
 fn every_arm_renders_its_line_and_report_entry() {
     let text = |s: &str| DifferenceValue::Text(s.to_string());
+    let field = |path: &str, within, recorded, replayed, more| FrameDifference::Field {
+        value: ValueDifference {
+            path: path.to_string(),
+            within,
+            recorded,
+            replayed,
+        },
+        more,
+    };
     let cases: Vec<(FrameDifference, &str, serde_json::Value)> = vec![
         (
-            FrameDifference::Field {
-                value: ValueDifference {
-                    path: "x".to_string(),
-                    at: String::new(),
-                    recorded: shown("5.0", DifferenceValue::Float64(5.0)),
-                    replayed: shown("6.0", DifferenceValue::Float64(6.0)),
-                    note: String::new(),
-                },
-                more: 0,
-            },
+            field(
+                "x",
+                None,
+                shown("5.0", DifferenceValue::Float64(5.0)),
+                shown("6.0", DifferenceValue::Float64(6.0)),
+                0,
+            ),
             "differs at x: recorded 5.0, replayed 6.0",
             serde_json::json!({"kind": "field", "path": "x", "recorded": 5.0, "replayed": 6.0,
-                "byte_offset": null, "region": null, "reason": null, "more": 0}),
+                "field_byte": null, "field_char": null, "byte_offset": null, "region": null,
+                "reason": null, "more": 0}),
         ),
         (
-            FrameDifference::Field {
-                value: ValueDifference {
-                    path: "ranges".to_string(),
-                    at: String::new(),
-                    recorded: shown("360 element(s)", text("360 element(s)")),
-                    replayed: shown("361 element(s)", text("361 element(s)")),
-                    note: String::new(),
-                },
-                more: 4,
-            },
+            field(
+                "ranges",
+                None,
+                shown("360 element(s)", text("360 element(s)")),
+                shown("361 element(s)", text("361 element(s)")),
+                4,
+            ),
             "differs at ranges: recorded 360 element(s), replayed 361 element(s); 4 more \
              value(s) differ",
             serde_json::json!({"kind": "field", "path": "ranges", "recorded": "360 element(s)",
-                "replayed": "361 element(s)", "byte_offset": null, "region": null,
-                "reason": null, "more": 4}),
+                "replayed": "361 element(s)", "field_byte": null, "field_char": null,
+                "byte_offset": null, "region": null, "reason": null, "more": 4}),
+        ),
+        (
+            field(
+                "note",
+                Some(Within::Char(120)),
+                shown("...\"ab\"... (300 chars)", text("...\"ab\"... (300 chars)")),
+                shown("...\"ac\"... (300 chars)", text("...\"ac\"... (300 chars)")),
+                0,
+            ),
+            "differs at note from char 120: recorded ...\"ab\"... (300 chars), replayed \
+             ...\"ac\"... (300 chars)",
+            serde_json::json!({"kind": "field", "path": "note",
+                "recorded": "...\"ab\"... (300 chars)", "replayed": "...\"ac\"... (300 chars)",
+                "field_byte": null, "field_char": 120, "byte_offset": null, "region": null,
+                "reason": null, "more": 0}),
+        ),
+        (
+            field(
+                "points",
+                Some(Within::OpaqueByte(12)),
+                shown("0x4c", text("0x4c")),
+                shown("0x4d", text("0x4d")),
+                0,
+            ),
+            "differs at points, byte 12 of its opaque bytes: recorded 0x4c, replayed 0x4d",
+            serde_json::json!({"kind": "field", "path": "points", "recorded": "0x4c",
+                "replayed": "0x4d", "field_byte": 12, "field_char": null, "byte_offset": null,
+                "region": null, "reason": null, "more": 0}),
+        ),
+        (
+            field(
+                "s",
+                Some(Within::Byte(1)),
+                shown("0xff", text("0xff")),
+                shown("0xfe", text("0xfe")),
+                2,
+            ),
+            "differs at s, byte 1 of its bytes: recorded 0xff, replayed 0xfe; 2 more value(s) \
+             differ",
+            serde_json::json!({"kind": "field", "path": "s", "recorded": "0xff",
+                "replayed": "0xfe", "field_byte": 1, "field_char": null, "byte_offset": null,
+                "region": null, "reason": null, "more": 2}),
+        ),
+        (
+            field(
+                "name",
+                Some(Within::PastNul(5)),
+                shown("\"abc\"", text("abc")),
+                shown("\"abc\"", text("abc")),
+                0,
+            ),
+            "differs at name: recorded \"abc\", replayed \"abc\" (bytes differ past the NUL at \
+             field byte 5)",
+            serde_json::json!({"kind": "field", "path": "name", "recorded": "abc",
+                "replayed": "abc", "field_byte": 5, "field_char": null, "byte_offset": null,
+                "region": null, "reason": null, "more": 0}),
         ),
         (
             FrameDifference::Header {
@@ -1193,8 +1690,8 @@ fn every_arm_renders_its_line_and_report_entry() {
             },
             "differs in the wire header at step_tag: recorded rank 1 step 2, replayed untagged",
             serde_json::json!({"kind": "header", "path": "step_tag", "recorded": "rank 1 step 2",
-                "replayed": "untagged", "byte_offset": null, "region": null, "reason": null,
-                "more": 0}),
+                "replayed": "untagged", "field_byte": null, "field_char": null,
+                "byte_offset": null, "region": null, "reason": null, "more": 0}),
         ),
         (
             FrameDifference::SchemaHash {
@@ -1205,7 +1702,8 @@ fn every_arm_renders_its_line_and_report_entry() {
              0x0000000000000def; fields not compared, the frames carry different schemas",
             serde_json::json!({"kind": "schema_hash", "path": "schema_hash",
                 "recorded": "0x0000000000000abc", "replayed": "0x0000000000000def",
-                "byte_offset": null, "region": null, "reason": null, "more": 0}),
+                "field_byte": null, "field_char": null, "byte_offset": null, "region": null,
+                "reason": null, "more": 0}),
         ),
         (
             FrameDifference::Layout {
@@ -1214,7 +1712,8 @@ fn every_arm_renders_its_line_and_report_entry() {
             },
             "differs at byte 43, in the fixed-section padding; every field value is equal",
             serde_json::json!({"kind": "layout", "path": null, "recorded": null, "replayed": null,
-                "byte_offset": 43, "region": "fixed_section_padding", "reason": null, "more": 0}),
+                "field_byte": null, "field_char": null, "byte_offset": 43,
+                "region": "fixed_section_padding", "reason": null, "more": 0}),
         ),
         (
             FrameDifference::Layout {
@@ -1223,7 +1722,8 @@ fn every_arm_renders_its_line_and_report_entry() {
             },
             "differs at byte 40, in the offset table; every field value is equal",
             serde_json::json!({"kind": "layout", "path": null, "recorded": null, "replayed": null,
-                "byte_offset": 40, "region": "offset_table", "reason": null, "more": 0}),
+                "field_byte": null, "field_char": null, "byte_offset": 40,
+                "region": "offset_table", "reason": null, "more": 0}),
         ),
         (
             FrameDifference::Layout {
@@ -1234,7 +1734,8 @@ fn every_arm_renders_its_line_and_report_entry() {
             },
             "differs at byte 67, in the framing of h; every field value is equal",
             serde_json::json!({"kind": "layout", "path": "h", "recorded": null, "replayed": null,
-                "byte_offset": 67, "region": "field_framing", "reason": null, "more": 0}),
+                "field_byte": null, "field_char": null, "byte_offset": 67,
+                "region": "field_framing", "reason": null, "more": 0}),
         ),
         (
             FrameDifference::Layout {
@@ -1244,8 +1745,18 @@ fn every_arm_renders_its_line_and_report_entry() {
             "differs at byte 60, in unused bytes between variable fields; every field value is \
              equal",
             serde_json::json!({"kind": "layout", "path": null, "recorded": null, "replayed": null,
-                "byte_offset": 60, "region": "unused_variable_bytes", "reason": null,
-                "more": 0}),
+                "field_byte": null, "field_char": null, "byte_offset": 60,
+                "region": "unused_variable_bytes", "reason": null, "more": 0}),
+        ),
+        (
+            FrameDifference::Layout {
+                byte_offset: 64,
+                region: LayoutRegion::TrailingBytes,
+            },
+            "differs at byte 64, in bytes past the last field; every field value is equal",
+            serde_json::json!({"kind": "layout", "path": null, "recorded": null, "replayed": null,
+                "field_byte": null, "field_char": null, "byte_offset": 64,
+                "region": "trailing_bytes", "reason": null, "more": 0}),
         ),
         (
             FrameDifference::Undecoded {
@@ -1258,8 +1769,22 @@ fn every_arm_renders_its_line_and_report_entry() {
             "differs at byte 12, not decoded because the recorded frame is 12 B, shorter than \
              the 40-byte wire header",
             serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
-                "replayed": null, "byte_offset": 12, "region": null,
-                "reason": "recorded_frame_too_short", "more": 0}),
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 12,
+                "region": null, "reason": "recorded_frame_too_short", "more": 0}),
+        ),
+        (
+            FrameDifference::Undecoded {
+                byte_offset: 40,
+                reason: UndecodedReason::FrameTooShort {
+                    side: Side::Replayed,
+                    len: 3,
+                },
+            },
+            "differs at byte 40, not decoded because the replayed frame is 3 B, shorter than \
+             the 40-byte wire header",
+            serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 40,
+                "region": null, "reason": "replayed_frame_too_short", "more": 0}),
         ),
         (
             FrameDifference::Undecoded {
@@ -1269,8 +1794,23 @@ fn every_arm_renders_its_line_and_report_entry() {
             "differs at byte 40, not decoded because no schema in this workspace or the \
              built-in set has the frame's schema hash 0x0000000000000005",
             serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
-                "replayed": null, "byte_offset": 40, "region": null,
-                "reason": "unknown_schema_hash", "more": 0}),
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 40,
+                "region": null, "reason": "unknown_schema_hash", "more": 0}),
+        ),
+        (
+            FrameDifference::Undecoded {
+                byte_offset: 44,
+                reason: UndecodedReason::Undecodable {
+                    side: Side::Recorded,
+                    schema: "sensor_msgs/LaserScan".to_string(),
+                    error: "bad entry".to_string(),
+                },
+            },
+            "differs at byte 44, not decoded because the recorded frame does not decode as \
+             sensor_msgs/LaserScan: bad entry",
+            serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 44,
+                "region": null, "reason": "recorded_frame_undecodable", "more": 0}),
         ),
         (
             FrameDifference::Undecoded {
@@ -1284,8 +1824,36 @@ fn every_arm_renders_its_line_and_report_entry() {
             "differs at byte 44, not decoded because the replayed frame does not decode as \
              sensor_msgs/LaserScan: bad entry",
             serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
-                "replayed": null, "byte_offset": 44, "region": null,
-                "reason": "replayed_frame_undecodable", "more": 0}),
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 44,
+                "region": null, "reason": "replayed_frame_undecodable", "more": 0}),
+        ),
+        (
+            FrameDifference::Undecoded {
+                byte_offset: 52,
+                reason: UndecodedReason::ToleranceRefused {
+                    side: Side::Recorded,
+                    error: "corrupt".to_string(),
+                },
+            },
+            "differs at byte 52, not decoded because the --tolerance decoder refused the \
+             recorded frame: corrupt",
+            serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 52,
+                "region": null, "reason": "recorded_frame_undecodable", "more": 0}),
+        ),
+        (
+            FrameDifference::Undecoded {
+                byte_offset: 52,
+                reason: UndecodedReason::ToleranceRefused {
+                    side: Side::Replayed,
+                    error: "corrupt".to_string(),
+                },
+            },
+            "differs at byte 52, not decoded because the --tolerance decoder refused the \
+             replayed frame: corrupt",
+            serde_json::json!({"kind": "undecoded", "path": null, "recorded": null,
+                "replayed": null, "field_byte": null, "field_char": null, "byte_offset": 52,
+                "region": null, "reason": "replayed_frame_undecodable", "more": 0}),
         ),
     ];
     for (difference, middle, json) in cases {
@@ -1322,6 +1890,8 @@ fn a_float32_value_reaches_the_report_in_its_own_shortest_form() {
         path: Some("j".to_string()),
         recorded: Some(DifferenceValue::Float32(0.1)),
         replayed: Some(DifferenceValue::Float32(-0.0)),
+        field_byte: None,
+        field_char: None,
         byte_offset: None,
         region: None,
         reason: None,
@@ -1330,7 +1900,8 @@ fn a_float32_value_reaches_the_report_in_its_own_shortest_form() {
     assert_eq!(
         serde_json::to_string(&entry).expect("serializes"),
         "{\"kind\":\"field\",\"path\":\"j\",\"recorded\":0.1,\"replayed\":-0.0,\
-         \"byte_offset\":null,\"region\":null,\"reason\":null,\"more\":0}"
+         \"field_byte\":null,\"field_char\":null,\"byte_offset\":null,\"region\":null,\
+         \"reason\":null,\"more\":0}"
     );
 }
 
@@ -1392,7 +1963,7 @@ fn values_and_paths_stay_bounded() {
         &widths(&w, &format!("s: \"{}\"", big('x'))),
         &widths(&w, &format!("s: \"{}\"", big('y'))),
     );
-    assert_eq!(value.at, format!(" from char {}", 1 << 20));
+    assert_eq!(value.within, Some(Within::Char(1 << 20)));
     assert!(
         value.recorded.text.len() < 300,
         "{}",

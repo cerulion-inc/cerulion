@@ -3249,11 +3249,19 @@ pub struct ByteDifference {
     /// The field path (`field`), the header field (`header`, `schema_hash`)
     /// or the framed field (`layout` in `field_framing`).
     pub path: Option<String>,
-    /// The recorded value: a JSON number or bool where the value is one,
-    /// otherwise the text the line prints.
+    /// The recorded value: a JSON number or bool where the value is one; a
+    /// string value is the string itself; otherwise the text the line
+    /// prints.
     pub recorded: Option<DifferenceValue>,
     /// The replayed value, as [`Self::recorded`].
     pub replayed: Option<DifferenceValue>,
+    /// The differing byte inside the field (`field`): of a value compared as
+    /// opaque bytes, of a string that is not UTF-8, or of a `string_fixed`
+    /// whose text is equal (its two values are then the same text).
+    pub field_byte: Option<usize>,
+    /// The first differing character of a string longer than 64 characters
+    /// (`field`).
+    pub field_char: Option<usize>,
     /// The first differing byte (`layout`, `undecoded`).
     pub byte_offset: Option<usize>,
     /// Where the byte sits (`layout`): `fixed_section_padding`,
@@ -3346,8 +3354,10 @@ pub enum ViolationClass {
         recorded_len: usize,
         /// The replayed frame's length.
         replayed_len: usize,
-        /// What differs in that frame: the entry the detail line is built
-        /// from (the byte-mismatch forms in `docs/bag.md`).
+        /// What differs in that frame, from the same comparison the detail
+        /// line renders (the byte-mismatch forms in `docs/bag.md`). Hidden
+        /// with its type: the JSON is the contract.
+        #[doc(hidden)]
         difference: ByteDifference,
     },
     /// The recording itself lost frames on this topic at RECORD time
@@ -9069,7 +9079,7 @@ impl PassInputs<'_> {
 struct CaptureSummary {
     /// Frames replay produced on the topic — [`Capture::replayed_count`].
     replayed_count: usize,
-    /// The TOPIC-level first byte divergence, judged — written by the
+    /// The TOPIC-level first byte divergence, judged: written by the
     /// single-stream diff only. A partitioned topic leaves this `None` and
     /// reports per writer in [`Self::partition_counts`]; see
     /// [`Self::any_byte_violation`].
@@ -17727,6 +17737,84 @@ impl CaptureTolerance {
     }
 }
 
+#[cfg(test)]
+mod remainder_refusal_tests {
+    use super::*;
+    use crate::replay_value_diff::{RemainderRefusal, Side};
+
+    const TOPIC: &str = "/rt/arm/out";
+
+    /// A `sensor_msgs/JointState` topic whose `position` (a variable
+    /// `float64[]`) a `max_abs` metric judges: the remainder takes the
+    /// structural path and locates `header`, `name`, `velocity` and `effort`
+    /// itself.
+    fn joint_state_plan() -> CaptureTolerance {
+        let config = cerulion_core::graph::parse_graph(&format!(
+            "name: rt\nprefix: rt\nnodes:\n\
+             \x20 - id: arm\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: sensor_msgs/JointState\n        topic: {TOPIC}\n"
+        ))
+        .expect("fixture graph parses");
+        let root = tempfile::tempdir().expect("a workspace directory");
+        let registry =
+            crate::replay_field_registry::FieldRegistry::from_graph(&config, root.path());
+        let spec = crate::tolerance::ToleranceSpec::parse(&format!(
+            "topics:\n  {TOPIC}:\n    fields:\n      position:\n        kind: max_abs\n        \
+             threshold: 0.1\n"
+        ))
+        .expect("fixture tolerance parses");
+        let plan = build_capture_tolerance(&CompiledTolerance { spec, registry }, TOPIC)
+            .expect("position is judged by a metric");
+        assert!(plan.has_variable_override, "a variable field is tolerated");
+        plan
+    }
+
+    /// A JointState frame, and the same frame with `header`'s offset-table
+    /// entry (the first of five, frame bytes 40..48) claiming 10000 bytes.
+    fn frames() -> (Vec<u8>, Vec<u8>) {
+        let walker = crate::topic_cmd::local_walker_from_workspace(None);
+        let good = cerulion_core::dynamic::yaml_to_message(
+            &walker,
+            "sensor_msgs/JointState",
+            b"header: {stamp: {sec: 0, nanosec: 0}, frame_id: \"base\"}\nname: [\"j1\"]\n\
+              position: [1.0]\nvelocity: [0.0]\neffort: [0.0]\n",
+            7,
+        )
+        .expect("fixture YAML encodes");
+        // header's data starts right after the 40-byte table.
+        assert_eq!(good[40..44], 40u32.to_le_bytes());
+        let mut bad = good.clone();
+        bad[44..48].copy_from_slice(&10_000u32.to_le_bytes());
+        (good, bad)
+    }
+
+    /// The side the field decoder refused is the side the refusal names, and
+    /// the offset is the end of the wire header.
+    #[test]
+    fn a_refused_frame_is_named_by_its_side() {
+        let mut plan = joint_state_plan();
+        let (good, bad) = frames();
+        let refused = |got: Option<(usize, Option<RemainderRefusal>)>, side: Side| {
+            let (offset, refusal) = got.expect("a refused frame is a difference");
+            let refusal = refusal.expect("the decoder refused a frame");
+            assert_eq!((offset, refusal.side), (WireHeader::SIZE, side));
+            assert!(
+                refusal
+                    .error
+                    .starts_with("variable field 'header' offset-table entry [40, 10040) exceeds"),
+                "{}",
+                refusal.error
+            );
+        };
+        refused(plan.remainder_first_diff(&bad, &good), Side::Recorded);
+        refused(plan.remainder_first_diff(&good, &bad), Side::Replayed);
+        // Both refused: the recorded side is the one named.
+        refused(plan.remainder_first_diff(&bad, &bad), Side::Recorded);
+        // Neither refused and nothing differs.
+        assert_eq!(plan.remainder_first_diff(&good, &good), None);
+    }
+}
+
 /// Byte-compare two frames skipping the given FRAME-coordinate `[start, end)`
 /// ranges (the overridden fixed fields). Returns the first differing byte offset
 /// outside every skip range, or `None` when equal. A length difference reports
@@ -23236,7 +23324,7 @@ fn push_stream_violations(
     }
 
     // The byte-level divergence (first differing frame) was found in-loop during
-    // the incremental diff and judged at the pass harvest — append it, matching
+    // the incremental diff and judged at the pass harvest; append it, matching
     // the batch diff which reported only the FIRST differing frame per topic.
     if let Some(bv) = byte_violation {
         violations.push(Violation {
@@ -32934,7 +33022,7 @@ mod capture_partition_tests {
             difference: FrameDifference::Field {
                 value: ValueDifference {
                     path: "x".to_string(),
-                    at: String::new(),
+                    within: None,
                     recorded: Shown {
                         text: "5.0".to_string(),
                         json: DifferenceValue::Float64(5.0),
@@ -32943,7 +33031,6 @@ mod capture_partition_tests {
                         text: "6.0".to_string(),
                         json: DifferenceValue::Float64(6.0),
                     },
-                    note: String::new(),
                 },
                 more: 0,
             },
@@ -33004,6 +33091,8 @@ mod capture_partition_tests {
                     "path": "x",
                     "recorded": 5.0,
                     "replayed": 6.0,
+                    "field_byte": null,
+                    "field_char": null,
                     "byte_offset": null,
                     "region": null,
                     "reason": null,

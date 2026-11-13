@@ -166,7 +166,7 @@ If Cerulion is useful to you, a star helps other robotics engineers find it.
 Cerulion re-executes the graph with recorded inputs and execution context, then compares the covered outputs against the recording. A pass means the changed code produces the same covered outputs on those recorded inputs, and each recording you keep adds another case to check against.
 
 - Exit **0**: compared frames match.
-- Exit **1**: output data diverged, and the verdict names the topic, the first field that differs and both values.
+- Exit **1**: output data diverged, and the verdict names the topic and what differs (for a changed value, the first field that differs and both values).
 - Exit **6**: the execution schedule diverged.
 - Exits **2 through 5**: verification could not complete, and the error says why.
 

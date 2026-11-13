@@ -21,6 +21,10 @@
 //!    of the frame it sits in, or `total_size` itself when no other byte
 //!    differs.
 //!
+//! A field a `--tolerance` metric judges is left out of every step: its
+//! value is not compared, and a byte step 6 or 7 reports is never one of a
+//! tolerated fixed field's bytes.
+//!
 //! Every other differing value of the frame is counted, never named. Values
 //! use the YAML form's scalar spellings ([`cerulion_core::dynamic`]'s hidden
 //! `yaml_format_f64` / `yaml_format_f32` / `yaml_quote_within`), the same
@@ -92,14 +96,48 @@ impl Shown {
 pub(crate) struct ValueDifference {
     /// The field path (`linear.x`, `ranges[12]`, `poses[2].position.x`).
     pub(crate) path: String,
-    /// Where inside the field, for a field compared in parts: ` from char
-    /// 120` (a long string), `, byte 12 of its opaque bytes`.
-    pub(crate) at: String,
+    /// Where inside the field the values differ, for a field compared in
+    /// parts; `None` for a value compared whole.
+    pub(crate) within: Option<Within>,
     pub(crate) recorded: Shown,
     pub(crate) replayed: Shown,
-    /// A clause after the two values (` (bytes differ past the NUL at field
-    /// byte 5)`), empty for most values.
-    pub(crate) note: String,
+}
+
+/// Where inside one field its first difference is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Within {
+    /// The first differing character of a string longer than
+    /// [`STRING_WINDOW`] characters: the line adds ` from char <d>`.
+    Char(usize),
+    /// Byte `k` of a value compared as opaque bytes: `, byte <k> of its
+    /// opaque bytes`.
+    OpaqueByte(usize),
+    /// Byte `k` of a string that is not UTF-8 on either side: `, byte <k> of
+    /// its bytes`.
+    Byte(usize),
+    /// Byte `k` of a `string_fixed[n]` whose text is equal, past its NUL:
+    /// ` (bytes differ past the NUL at field byte <k>)` after the values.
+    PastNul(usize),
+}
+
+impl Within {
+    /// The clause after the path.
+    fn after_path(self) -> String {
+        match self {
+            Self::Char(d) => format!(" from char {d}"),
+            Self::OpaqueByte(k) => format!(", byte {k} of its opaque bytes"),
+            Self::Byte(k) => format!(", byte {k} of its bytes"),
+            Self::PastNul(_) => String::new(),
+        }
+    }
+
+    /// The clause after the two values.
+    fn after_values(self) -> String {
+        match self {
+            Self::PastNul(k) => format!(" (bytes differ past the NUL at field byte {k})"),
+            Self::Char(_) | Self::OpaqueByte(_) | Self::Byte(_) => String::new(),
+        }
+    }
 }
 
 /// What [`diff_frame_values`] found: the first differing value in
@@ -240,6 +278,9 @@ pub(crate) enum UndecodedReason {
         schema: String,
         error: String,
     },
+    /// The `--tolerance` field decoder refused the frame, so the bytes a
+    /// tolerance leaves byte-exact were not compared field by field.
+    ToleranceRefused { side: Side, error: String },
 }
 
 impl UndecodedReason {
@@ -261,9 +302,15 @@ impl UndecodedReason {
                 "the {} frame does not decode as {schema}: {error}",
                 side.word()
             ),
+            Self::ToleranceRefused { side, error } => format!(
+                "the --tolerance decoder refused the {} frame: {error}",
+                side.word()
+            ),
         }
     }
 
+    /// The report's `reason`: the side's frame does not decode, whichever
+    /// decoder refused it.
     fn tag(&self) -> &'static str {
         match self {
             Self::FrameTooShort {
@@ -278,8 +325,16 @@ impl UndecodedReason {
             Self::Undecodable {
                 side: Side::Recorded,
                 ..
+            }
+            | Self::ToleranceRefused {
+                side: Side::Recorded,
+                ..
             } => "recorded_frame_undecodable",
             Self::Undecodable {
+                side: Side::Replayed,
+                ..
+            }
+            | Self::ToleranceRefused {
                 side: Side::Replayed,
                 ..
             } => "replayed_frame_undecodable",
@@ -353,10 +408,10 @@ pub(crate) fn byte_mismatch_detail(topic: &str, scope: &str, verdict: &ByteVerdi
             out,
             "at {}{}: recorded {}, replayed {}{}{}",
             value.path,
-            value.at,
+            value.within.map_or_else(String::new, Within::after_path),
             value.recorded.text,
             value.replayed.text,
-            value.note,
+            value.within.map_or_else(String::new, Within::after_values),
             more_clause(*more)
         ),
         FrameDifference::Header {
@@ -410,6 +465,8 @@ pub(crate) fn report_entry(difference: &FrameDifference) -> ByteDifference {
         path: None,
         recorded: None,
         replayed: None,
+        field_byte: None,
+        field_char: None,
         byte_offset: None,
         region: None,
         reason: None,
@@ -420,6 +477,14 @@ pub(crate) fn report_entry(difference: &FrameDifference) -> ByteDifference {
             path: Some(value.path.clone()),
             recorded: Some(value.recorded.json.clone()),
             replayed: Some(value.replayed.json.clone()),
+            field_byte: match value.within {
+                Some(Within::OpaqueByte(k) | Within::Byte(k) | Within::PastNul(k)) => Some(k),
+                Some(Within::Char(_)) | None => None,
+            },
+            field_char: match value.within {
+                Some(Within::Char(d)) => Some(d),
+                Some(Within::OpaqueByte(_) | Within::Byte(_) | Within::PastNul(_)) | None => None,
+            },
             more: *more,
             ..empty(DifferenceKind::Field)
         },
@@ -471,8 +536,9 @@ pub(crate) fn report_entry(difference: &FrameDifference) -> ByteDifference {
 /// with the same `schema_hash`. `first_diff_byte_offset` is the diff's own
 /// first differing byte (under a tolerance, outside the tolerated spans).
 /// `skip` names the top-level fields a tolerance metric judges: they are
-/// never compared here. `refusal` is the tolerance decoder's refusal of
-/// either frame, reported when nothing decoded here differs.
+/// never compared here, and a byte the line reports is never one of a
+/// tolerated fixed field's bytes. `refusal` is the tolerance decoder's
+/// refusal of either frame, reported when nothing decoded here differs.
 pub(crate) fn locate_difference<'w>(
     walker: impl FnOnce() -> &'w FrameWalker,
     recorded: &[u8],
@@ -530,10 +596,7 @@ pub(crate) fn locate_difference<'w>(
         .into_iter()
         .filter(|f| f.differs(&rec_header, &rep_header))
         .collect();
-    let values = match diff_frame_values(walker, schema, &rec_value, &rep_value, skip) {
-        Ok(values) => values,
-        Err(error) => return refused(Side::Recorded, error),
-    };
+    let values = diff_frame_values(walker, schema, &rec_value, &rep_value, skip);
     if let Some(&field) = headers.first() {
         return FrameDifference::Header {
             field,
@@ -548,11 +611,29 @@ pub(crate) fn locate_difference<'w>(
             more: values.more,
         };
     }
+    // The frame bytes of the fixed fields a tolerance metric judges. The
+    // diff's own offset already lies outside them; a byte this function finds
+    // itself must too.
+    let tolerated: Vec<std::ops::Range<usize>> = layout
+        .fixed_fields
+        .iter()
+        .filter(|f| skip.contains(&f.name.as_str()))
+        .map(|f| WireHeader::SIZE + f.offset..WireHeader::SIZE + f.offset + f.size)
+        .collect();
     if let Some(r) = refusal {
-        return refused(r.side, r.error.clone());
+        // The diff's offset on a refusal is the end of the header, which
+        // need not differ: name a byte that does where there is one.
+        return FrameDifference::Undecoded {
+            byte_offset: first_diff_outside(recorded, replayed, &tolerated)
+                .unwrap_or(first_diff_byte_offset),
+            reason: UndecodedReason::ToleranceRefused {
+                side: r.side,
+                error: r.error.clone(),
+            },
+        };
     }
     let offset = if HEADER_LENGTH_DERIVED_BYTES.contains(&first_diff_byte_offset) {
-        first_diff_outside_total_size(recorded, replayed)
+        first_diff_outside(recorded, replayed, &tolerated)
     } else {
         Some(first_diff_byte_offset)
     };
@@ -572,17 +653,17 @@ pub(crate) fn locate_difference<'w>(
                 Spot::PastNul { path, text, k } => FrameDifference::Field {
                     value: ValueDifference {
                         path,
-                        at: String::new(),
+                        within: Some(Within::PastNul(k)),
                         recorded: text.clone(),
                         replayed: text,
-                        note: format!(" (bytes differ past the NUL at field byte {k})"),
                     },
                     more: 0,
                 },
             }
         }
         // Only `total_size` differs (every other header byte was compared
-        // above), so it is what the line names.
+        // above, and the tolerated bytes are judged by their metric), so it
+        // is what the line names.
         _ => FrameDifference::Header {
             field: HeaderField::TotalSize,
             recorded: HeaderField::TotalSize.shown(&rec_header),
@@ -592,12 +673,17 @@ pub(crate) fn locate_difference<'w>(
     }
 }
 
-/// The first differing byte outside `total_size`, or the shorter length when
-/// one frame is a prefix of the other there.
-fn first_diff_outside_total_size(recorded: &[u8], replayed: &[u8]) -> Option<usize> {
+/// The first differing byte outside `total_size` and the `tolerated` spans,
+/// or the shorter length when one frame is a prefix of the other there.
+fn first_diff_outside(
+    recorded: &[u8],
+    replayed: &[u8],
+    tolerated: &[std::ops::Range<usize>],
+) -> Option<usize> {
     let common = recorded.len().min(replayed.len());
     (0..common)
         .filter(|i| !HEADER_LENGTH_DERIVED_BYTES.contains(i))
+        .filter(|i| !tolerated.iter().any(|span| span.contains(i)))
         .find(|&i| recorded[i] != replayed[i])
         .or_else(|| (recorded.len() != replayed.len()).then_some(common))
 }
@@ -746,22 +832,23 @@ fn past_nul(bytes: &[u8], n: usize, k: usize, path: String) -> Spot {
 /// Compare two decoded frames of `schema` value by value, in declaration
 /// order, leaving out the top-level fields in `skip`.
 ///
-/// `Err` carries the walker's refusal of a nested reference it could not
-/// resolve (the walk of the same frames would have refused first).
+/// An array of messages whose schema the set cannot resolve compares by its
+/// bytes, as the walker reads it (opaque); a single such message, a frame
+/// the walker refuses, compares as a value of unknown shape.
 pub(crate) fn diff_frame_values(
     walker: &FrameWalker,
     schema: &MessageSchema,
     recorded: &FrameValue<'_>,
     replayed: &FrameValue<'_>,
     skip: &[&str],
-) -> Result<FrameValueDiff, String> {
+) -> FrameValueDiff {
     let mut diff = Differ {
         walker,
         path: String::new(),
         found: FrameValueDiff::default(),
     };
-    diff.message(schema, Some(recorded), Some(replayed), skip)?;
-    Ok(diff.found)
+    diff.message(schema, Some(recorded), Some(replayed), skip);
+    diff.found
 }
 
 /// One scalar value in its own type.
@@ -808,6 +895,8 @@ impl Scalar<'_> {
         }
     }
 
+    /// The value's own text; a [`Self::BoolByte`] reads `true` here and gets
+    /// its byte in [`scalar_pair`].
     fn shown(&self) -> Shown {
         let finite_f64 = |v: f64| {
             if v.is_finite() {
@@ -1041,18 +1130,17 @@ struct Differ<'w> {
 
 impl<'w> Differ<'w> {
     /// Count one differing value; `make` builds it only for the first.
-    fn hit(&mut self, make: impl FnOnce() -> (String, Shown, Shown)) {
+    fn hit(&mut self, make: impl FnOnce() -> (Option<Within>, Shown, Shown)) {
         if self.found.first.is_some() {
             self.found.more += 1;
             return;
         }
-        let (at, recorded, replayed) = make();
+        let (within, recorded, replayed) = make();
         self.found.first = Some(ValueDifference {
             path: capped_path(&self.path),
-            at,
+            within,
             recorded,
             replayed,
-            note: String::new(),
         });
     }
 
@@ -1064,10 +1152,10 @@ impl<'w> Differ<'w> {
         recorded: Option<&FrameValue<'_>>,
         replayed: Option<&FrameValue<'_>>,
         skip: &[&str],
-    ) -> Result<(), String> {
+    ) {
         let (recorded, replayed) = (present(schema, recorded), present(schema, replayed));
         if recorded.is_none() && replayed.is_none() {
-            return Ok(());
+            return;
         }
         let parent = schema.package.as_deref();
         for field in &schema.fields {
@@ -1078,10 +1166,9 @@ impl<'w> Differ<'w> {
             let rep = replayed.and_then(|v| v.field(&field.name));
             let mark = self.path.len();
             push_field(&mut self.path, &field.name);
-            self.value(&field.field_type, rec, rep, parent)?;
+            self.value(&field.field_type, rec, rep, parent);
             self.path.truncate(mark);
         }
-        Ok(())
     }
 
     fn value(
@@ -1090,71 +1177,53 @@ impl<'w> Differ<'w> {
         recorded: Option<&FrameValueKind<'_>>,
         replayed: Option<&FrameValueKind<'_>>,
         parent: Option<&str>,
-    ) -> Result<(), String> {
+    ) {
         match ft {
             FieldType::Nested {
                 schema_name,
                 package,
                 ..
             } => {
-                let (layout, target) = self.nested_target(schema_name, package, parent)?;
+                // The walker refuses a frame holding a nested message it
+                // cannot resolve, so a value here has no schema to compare
+                // by: compared as a value of unknown shape.
+                let Some((layout, target)) =
+                    self.walker.nested_target(schema_name, package, parent)
+                else {
+                    self.mismatched_kinds(recorded, replayed);
+                    return;
+                };
                 if target.fields.is_empty() {
-                    return Ok(());
+                    return;
                 }
                 match (
                     nested_value(layout, recorded),
                     nested_value(layout, replayed),
                 ) {
                     (Ok(rec), Ok(rep)) => self.message(target, rec, rep, &[]),
-                    _ => {
-                        self.mismatched_kinds(recorded, replayed);
-                        Ok(())
-                    }
+                    _ => self.mismatched_kinds(recorded, replayed),
                 }
             }
             FieldType::DynamicArray { element_type }
             | FieldType::FixedArray { element_type, .. }
                 if matches!(element_type.as_ref(), FieldType::Nested { .. }) =>
             {
-                self.message_array(ft, element_type, recorded, replayed, parent)
+                self.message_array(ft, element_type, recorded, replayed, parent);
             }
-            _ => {
-                match (inline(ft, recorded), inline(ft, replayed)) {
-                    (Some(Inline::Scalar(a)), Some(Inline::Scalar(b))) => {
-                        if !a.same(&b) {
-                            self.hit(|| scalar_pair(a, b));
-                        }
+            _ => match (inline(ft, recorded), inline(ft, replayed)) {
+                (Some(Inline::Scalar(a)), Some(Inline::Scalar(b))) => {
+                    if !a.same(&b) {
+                        self.hit(|| scalar_pair(a, b));
                     }
-                    (Some(Inline::Seq(a)), Some(Inline::Seq(b))) => self.seq(a, b),
-                    (Some(Inline::Raw(a)), Some(Inline::Raw(b))) => self.raw(a, b),
-                    // One side decoded to elements and the other did not,
-                    // or the two decoded to different shapes: compared by
-                    // their bytes where both have bytes.
-                    _ => self.mismatched_kinds(recorded, replayed),
                 }
-                Ok(())
-            }
+                (Some(Inline::Seq(a)), Some(Inline::Seq(b))) => self.seq(a, b),
+                (Some(Inline::Raw(a)), Some(Inline::Raw(b))) => self.raw(a, b),
+                // One side decoded to elements and the other did not, or the
+                // two decoded to different shapes: compared by their bytes
+                // where both have bytes.
+                _ => self.mismatched_kinds(recorded, replayed),
+            },
         }
-    }
-
-    fn nested_target(
-        &self,
-        schema_name: &str,
-        package: &Option<String>,
-        parent: Option<&str>,
-    ) -> Result<(&'w WireLayout, &'w MessageSchema), String> {
-        self.walker
-            .nested_target(schema_name, package, parent)
-            .ok_or_else(|| {
-                let target = match package {
-                    Some(p) => format!("{p}/{schema_name}"),
-                    None => schema_name.to_string(),
-                };
-                format!(
-                    "nested field '{}' references unresolvable schema '{target}'",
-                    self.path
-                )
-            })
     }
 
     /// Two values of different kinds: counted and named by their bytes
@@ -1176,7 +1245,7 @@ impl<'w> Differ<'w> {
                         Some(_) => "a value of another shape".to_string(),
                     })
                 };
-                (String::new(), describe(recorded), describe(replayed))
+                (None, describe(recorded), describe(replayed))
             }),
         }
     }
@@ -1188,23 +1257,28 @@ impl<'w> Differ<'w> {
         recorded: Option<&FrameValueKind<'_>>,
         replayed: Option<&FrameValueKind<'_>>,
         parent: Option<&str>,
-    ) -> Result<(), String> {
+    ) {
         let FieldType::Nested {
             schema_name,
             package,
             ..
         } = element_type
         else {
-            return Ok(());
+            return;
         };
-        let (layout, target) = self.nested_target(schema_name, package, parent)?;
+        // The walker reads an array of messages it cannot resolve as opaque
+        // bytes; it compares as those bytes here too.
+        let Some((layout, target)) = self.walker.nested_target(schema_name, package, parent) else {
+            self.mismatched_kinds(recorded, replayed);
+            return;
+        };
         // A fixed array of zero-size messages carries no bytes.
         if matches!(ft, FieldType::FixedArray { .. }) && zero_size(layout) {
-            return Ok(());
+            return;
         }
         let (Some(rec), Some(rep)) = (messages(ft, recorded), messages(ft, replayed)) else {
             self.mismatched_kinds(recorded, replayed);
-            return Ok(());
+            return;
         };
         let (
             Messages::Decoded {
@@ -1222,10 +1296,10 @@ impl<'w> Differ<'w> {
             // An array not in the canonical element framing on either side
             // compares as its raw bytes.
             self.mismatched_kinds(recorded, replayed);
-            return Ok(());
+            return;
         };
         if rec_len != rep_len {
-            self.hit(|| (String::new(), count_shown(rec_len), count_shown(rep_len)));
+            self.hit(|| (None, count_shown(rec_len), count_shown(rep_len)));
         }
         for i in 0..rec_len.min(rep_len) {
             let mark = self.path.len();
@@ -1234,18 +1308,17 @@ impl<'w> Differ<'w> {
                 message_element(rec_elems, rec_zero, i),
                 message_element(rep_elems, rep_zero, i),
             ) {
-                (Ok(a), Ok(b)) => self.message(target, a, b, &[])?,
+                (Ok(a), Ok(b)) => self.message(target, a, b, &[]),
                 _ => self.mismatched_kinds(rec_elems.get(i), rep_elems.get(i)),
             }
             self.path.truncate(mark);
         }
-        Ok(())
     }
 
     fn seq(&mut self, recorded: Seq<'_, '_>, replayed: Seq<'_, '_>) {
         let (rec_len, rep_len) = (recorded.len(), replayed.len());
         if rec_len != rep_len {
-            self.hit(|| (String::new(), count_shown(rec_len), count_shown(rep_len)));
+            self.hit(|| (None, count_shown(rec_len), count_shown(rep_len)));
         }
         for i in 0..rec_len.min(rep_len) {
             let (a, b) = (recorded.get(i), replayed.get(i));
@@ -1265,7 +1338,7 @@ impl<'w> Differ<'w> {
             let (a, b) = (recorded.len(), replayed.len());
             self.hit(|| {
                 (
-                    String::new(),
+                    None,
                     Shown::text(format!("{a} opaque byte(s)")),
                     Shown::text(format!("{b} opaque byte(s)")),
                 )
@@ -1274,7 +1347,7 @@ impl<'w> Differ<'w> {
             let (a, b) = (recorded[k], replayed[k]);
             self.hit(|| {
                 (
-                    format!(", byte {k} of its opaque bytes"),
+                    Some(Within::OpaqueByte(k)),
                     Shown::text(format!("0x{a:02x}")),
                     Shown::text(format!("0x{b:02x}")),
                 )
@@ -1371,15 +1444,16 @@ fn raw_bytes<'a>(kind: Option<&FrameValueKind<'a>>) -> Option<&'a [u8]> {
 }
 
 /// The two texts of a differing scalar pair, and where inside the value
-/// they start. A pair whose text is the same gets each side's wire bits; a
-/// long string pair prints a window around its first difference.
-fn scalar_pair(recorded: Scalar<'_>, replayed: Scalar<'_>) -> (String, Shown, Shown) {
+/// they differ. A pair whose text is the same gets each side's wire bits, a
+/// `bool` byte other than 0 or 1 always gets its own, and a long string pair
+/// prints a window around its first difference.
+fn scalar_pair(recorded: Scalar<'_>, replayed: Scalar<'_>) -> (Option<Within>, Shown, Shown) {
     match (recorded, replayed) {
         (Scalar::Str(a), Scalar::Str(b)) => return string_pair(a, b),
         (Scalar::NotUtf8(a), Scalar::NotUtf8(b)) if a.len() == b.len() => {
             let k = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(0);
             return (
-                format!(", byte {k} of its bytes"),
+                Some(Within::Byte(k)),
                 Shown::text(format!("0x{:02x}", a[k])),
                 Shown::text(format!("0x{:02x}", b[k])),
             );
@@ -1387,26 +1461,24 @@ fn scalar_pair(recorded: Scalar<'_>, replayed: Scalar<'_>) -> (String, Shown, Sh
         _ => {}
     }
     let (mut a, mut b) = (recorded.shown(), replayed.shown());
-    if a.text == b.text {
-        if let (Some(x), Some(y)) = (recorded.bits(), replayed.bits()) {
-            a = Shown::text(format!("{} ({x})", a.text));
-            b = Shown::text(format!("{} ({y})", b.text));
+    let same_text = a.text == b.text && recorded.bits().is_some() && replayed.bits().is_some();
+    for (shown, scalar) in [(&mut a, recorded), (&mut b, replayed)] {
+        if same_text || matches!(scalar, Scalar::BoolByte(_)) {
+            if let Some(bits) = scalar.bits() {
+                *shown = Shown::text(format!("{} ({bits})", shown.text));
+            }
         }
     }
-    (String::new(), a, b)
+    (None, a, b)
 }
 
 /// Two differing strings: whole when both are at most [`STRING_WINDOW`]
 /// characters, otherwise a window of each starting [`STRING_LEAD`]
 /// characters before the first differing character.
-fn string_pair(recorded: &str, replayed: &str) -> (String, Shown, Shown) {
+fn string_pair(recorded: &str, replayed: &str) -> (Option<Within>, Shown, Shown) {
     let (rec_chars, rep_chars) = (recorded.chars().count(), replayed.chars().count());
     if rec_chars <= STRING_WINDOW && rep_chars <= STRING_WINDOW {
-        return (
-            String::new(),
-            whole_string(recorded),
-            whole_string(replayed),
-        );
+        return (None, whole_string(recorded), whole_string(replayed));
     }
     let first = recorded
         .chars()
@@ -1428,7 +1500,7 @@ fn string_pair(recorded: &str, replayed: &str) -> (String, Shown, Shown) {
         ))
     };
     (
-        format!(" from char {first}"),
+        Some(Within::Char(first)),
         window(recorded, rec_chars),
         window(replayed, rep_chars),
     )
