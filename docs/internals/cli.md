@@ -184,6 +184,19 @@ Rules that must not drift:
   `prepare_recording_inputs` seam), never a copy of the on-disk graph file. The same
   renderer writes the run directory's `graph.yaml`, so run dir and bag agree by
   construction; changing one means checking the other.
+- **A driver's outputs are recorded inputs**: `classify_topics` names every produced topic
+  whose every in-graph writer declares `MacroPolicy::External` (`external_node_ids`, read
+  off the candidates' `info()`) in `TopicClasses::driver`. A resim never queries
+  `external_source()`, so the driver fires as recorded with no device and publishes
+  nothing. Its topics stay in `produced` for every derivation about what the graph writes
+  (the consistency checks, a cross-rank injector, the read gate) and leave only the capture
+  (`pass_topics`) and the diff (`assemble_outcome`), where a record-health-lossy driver
+  topic is still a per-topic `RecordSideTapLoss`. A metadata read that fails keeps the
+  node's topics compared. Pinned by `driver_topic_tests` and the driver-graph arms of
+  `replay_engine_test.rs` (the `drv_*` fixtures). Not covered: a LOCKSTEP pass decides its
+  own fires, so nothing fires the driver, and a driver topic consumed in the driver's own
+  rank is neither fed (lockstep and non-verify passes inject no in-rank topic) nor
+  injectable (the driver holds its single-writer publisher); `docs/bag.md` states it.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.

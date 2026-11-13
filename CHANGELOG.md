@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `cerulion bag play --resim all --verify` of a free-run recording (the multi-process default) whose graph has an `external` (driver) node, such as the camera of `examples/v4l2_camera`, no longer fails with `missing-topic` on every topic the driver publishes. A resim never calls a driver's `external_source()`, so the driver has no device and publishes nothing; its outputs are now recorded inputs, fed from the bag to the nodes that read them, whose own topics are compared, and the verdict's topic tally no longer counts them. A driver topic still fails the run when the bag lost its frames: a record-health stamp that counts lost frames on it is a `record-side-tap-loss` violation on that topic (exit 1), and a replay that feeds reads by their recorded identity refuses a read of a frame the bag does not hold (exit 2, `read_identity_frame_missing`). A lockstep recording of a graph with a driver is not supported by a resim (see `docs/bag.md`).
+
 ## [2.0.0] - 2026-11-12
 
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. This release changes the command line in ways existing scripts notice, including paired LAN access by default on every platform, the output of `cerulion topic echo` and how `cerulion graph run` runs a graph by default (see Changed), so it is a major version. The lower-level Rust API of `cerulion_core` is not covered by SemVer yet, and neither are the library crates behind the command line and the daemons (`cerulion_cli_engine`, `cerulion_wsd`, `cerulion_netd` and `cerulion_bagd`) or the bag library `cerulion_bag`. This release changes public items in each of them, so Rust code that calls them directly may need edits. Prebuilt node cdylibs are a separate matter: every one must be rebuilt for node ABI 32 (see Changed).

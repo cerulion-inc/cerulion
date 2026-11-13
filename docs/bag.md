@@ -42,10 +42,21 @@ opens a robot's own command channel in `init`) still does so during a resim,
 so run a resim of such a node only where its devices are safe to drive or
 disconnected.
 
-Re-simulation re-injects only external-source topics and recomputes everything
-else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
-**no output**: its `dds_bridge` node still needs its external DDS inputs. Use
-plain playback to view an attached ROS 2 recording without the robot.
+Re-simulation re-injects only the recorded inputs and recomputes everything
+else. The recorded inputs are the external-source topics and the outputs of
+`external` (driver) nodes: a resim never calls a driver's `external_source()`,
+so the driver has no device to read, and the bag feeds its recorded frames to
+the nodes that read them. Of a free-run recording (the multi-process default),
+a `--verify` resim feeds every such read, and a resim without `--verify` feeds
+the nodes that ran in another process or executor unit than the driver. A
+lockstep recording (`CERULION_EXECUTION_MODE=lockstep`, or `--single-process
+--record` of a graph that is one executor unit) is not supported for a graph
+with a driver: its resim does not fire the driver or feed the nodes that read
+it, so `--verify` reports a divergence; record such a graph with the
+multi-process default. Re-simulating a `ros2 attach` bag on a desk with
+no DDS robot produces **no output**: its `dds_bridge` node is a driver with no
+DDS inputs. Use plain playback to view an attached ROS 2 recording without the
+robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
 what makes it deterministic: a replay matches the live run. Together those two properties mean
 `--resim` cannot drive a viewer.
@@ -72,6 +83,15 @@ and the topics it credited:
 ```
 replay PASS: <bag> (<N> tick(s) replayed, <P>/<M> topic(s) matched byte-for-byte and were credited)
 ```
+
+`<M>` counts the topics the re-executed nodes publish. A driver's outputs are
+recorded inputs and are not compared: the nodes that read them are fed the
+recorded frames, and those nodes' own topics are. A driver topic still fails
+the run when the bag lost its frames: a record-health stamp that counts lost
+frames on it makes it a `record-side-tap-loss` violation, counted in `<M>`
+(exit 1), and a replay that feeds reads by their recorded identity (see "Read
+identity" below) refuses a recorded read of a frame the bag does not hold
+(exit 2, `read_identity_frame_missing`).
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,
