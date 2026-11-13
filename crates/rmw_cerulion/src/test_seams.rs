@@ -12,6 +12,7 @@
 //! held, so an armed seam can never leak into a sibling test (the guard
 //! disarms on drop, unwind included).
 
+use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 static PANIC_AFTER_PUBLISHER_TRANSPORT_CREATE: AtomicBool = AtomicBool::new(false);
@@ -112,6 +113,68 @@ pub(crate) fn maybe_trigger_guard_between_probe_and_consume() {
         // and the swap above makes this a once-only fire.
         unsafe { (*(p as *const crate::runtime::GuardConditionState)).trigger() };
         GUARD_RACE_TRIGGERS_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Publish-before-park seam: ONE publish lands after `rmw_wait`'s entry
+// probe found nothing and before its park starts, the window a publisher
+// on another thread or process can land in at any time.
+// ---------------------------------------------------------------------
+
+static PUBLISH_BEFORE_PARK_PUBLISHER: AtomicUsize = AtomicUsize::new(0);
+static PUBLISH_BEFORE_PARK_MESSAGE: AtomicUsize = AtomicUsize::new(0);
+static PUBLISHES_BEFORE_PARK_FIRED: AtomicU64 = AtomicU64::new(0);
+
+/// RAII arm of the publish-before-park seam: while held, the FIRST park of an
+/// `rmw_wait` call is preceded by one `rmw_publish` of `message` on
+/// `publisher`, issued from inside the wait after its entry probe
+/// (self-clearing: it fires once).
+#[must_use = "the seam is armed only while the guard is held"]
+pub struct PublishBeforeParkGuard(());
+
+impl PublishBeforeParkGuard {
+    /// Arm the seam. `publisher` and `message` (a message of the publisher's
+    /// type) must outlive the returned guard.
+    pub fn arm(publisher: *const crate::ffi::rmw_publisher_t, message: *const c_void) -> Self {
+        PUBLISH_BEFORE_PARK_MESSAGE.store(message as usize, Ordering::SeqCst);
+        PUBLISH_BEFORE_PARK_PUBLISHER.store(publisher as usize, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for PublishBeforeParkGuard {
+    fn drop(&mut self) {
+        PUBLISH_BEFORE_PARK_PUBLISHER.store(0, Ordering::SeqCst);
+        PUBLISH_BEFORE_PARK_MESSAGE.store(0, Ordering::SeqCst);
+    }
+}
+
+/// How many publishes the publish-before-park seam has issued that returned
+/// `RMW_RET_OK` in this process.
+pub fn publishes_before_park_fired() -> u64 {
+    PUBLISHES_BEFORE_PARK_FIRED.load(Ordering::SeqCst)
+}
+
+/// The seam itself, called by `rmw_wait` right before a park block. A no-op
+/// unless armed; fires ONCE per arming.
+pub(crate) fn maybe_publish_before_park() {
+    let p = PUBLISH_BEFORE_PARK_PUBLISHER.swap(0, Ordering::SeqCst);
+    if p == 0 {
+        return;
+    }
+    let m = PUBLISH_BEFORE_PARK_MESSAGE.load(Ordering::SeqCst);
+    // SAFETY: the armer guarantees both pointees outlive the RAII guard, and
+    // the swap above makes this a once-only fire.
+    let ret = unsafe {
+        crate::rmw_publish(
+            p as *const crate::ffi::rmw_publisher_t,
+            m as *const c_void,
+            std::ptr::null_mut(),
+        )
+    };
+    if ret == crate::ffi::RMW_RET_OK {
+        PUBLISHES_BEFORE_PARK_FIRED.fetch_add(1, Ordering::SeqCst);
     }
 }
 

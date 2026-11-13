@@ -221,7 +221,7 @@ The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion'
 
 ![Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.](docs/media/platform-rtt.svg)
 
-The Apple M4 row predates the macOS data wake change, which [macOS two-process data wake](docs/PERFORMANCE.md#macos-two-process-data-wake) measures.
+The Apple M4 row is measured on Cerulion 2.0.0 under macOS 27.2.1, a later build than the x86-64 and Jetson rows, in which a multi-process consumer wakes on the publish. [macOS two-process data wake](docs/PERFORMANCE.md#macos-two-process-data-wake) measures that change on its own, before and after, on an Apple M3 Max.
 
 Source measurements, build provenance and configuration receipts are in [the benchmark results](docs/benchmarks/results/). Lines show p50 and bands extend to p99. Both figures show round trips.
 
