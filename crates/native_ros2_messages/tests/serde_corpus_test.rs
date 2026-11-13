@@ -331,9 +331,9 @@ fn a_direct_large_array_snapshot_round_trips_to_a_hand_built_value() {
     assert_eq!(recovered.pose.position.y, 2.0);
     assert_eq!(recovered.pose.position.z, 3.0);
     assert_eq!(recovered.pose.orientation.w, 1.0);
-    for index in 0..36 {
+    for (index, value) in recovered.covariance.iter().enumerate() {
         assert_eq!(
-            recovered.covariance[index],
+            *value,
             (index as f64) * 0.125 - 3.0,
             "covariance element {index} did not survive the round trip"
         );
