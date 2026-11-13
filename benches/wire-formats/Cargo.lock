@@ -262,6 +262,7 @@ version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "dirs",
  "iceoryx2",
@@ -313,6 +314,15 @@ dependencies = [
  "quote",
  "syn",
  "toml_edit",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "libloading",
+ "stabby",
+ "thiserror",
 ]
 
 [[package]]
@@ -2994,6 +3004,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]

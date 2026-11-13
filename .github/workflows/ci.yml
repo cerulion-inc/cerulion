@@ -1933,6 +1933,57 @@ jobs:
             cargo-examples-${{ runner.os }}-main-
             cargo-examples-${{ runner.os }}-
 
+      # Every committed Cargo.lock outside the root workspace (each example,
+      # each bench, the Python wheel, the Android sample runtime) must match
+      # its manifest. These workspaces take the root crates as path
+      # dependencies, so a dependency change under crates/ reaches them too:
+      # a stale lockfile is rewritten by the first `cargo build` a user runs
+      # (a modified file in `git status`) and refused by `cargo build --locked`.
+      # `cargo metadata --locked` resolves without building and fails when the
+      # lockfile would change.
+      #
+      # A WALK over the tracked lockfiles, not a hand list, so a new
+      # standalone workspace is covered the day its lockfile lands. It runs
+      # BEFORE any build step in this job: a build without --locked rewrites a
+      # stale lockfile in the checkout, and a check after it would pass on the
+      # rewritten file. Every lockfile is checked before the step fails, so one
+      # stale lockfile does not hide the others.
+      #
+      # To refresh one, run `cargo metadata --format-version 1 --manifest-path
+      # <dir>/Cargo.toml > /dev/null` from the repo root. That is not a
+      # minimal edit: it adds every crate the manifests now require at its
+      # newest compatible version, and where a path crate's dependencies
+      # changed it can re-point a dependency edge of a crate already locked.
+      # Read its diff before committing; the `examples` entry in
+      # docs/internals/ci-and-gates.md says which changes to keep.
+      - name: Check every standalone workspace lockfile (--locked)
+        run: |
+          set -uo pipefail
+          fail=0
+          checked=0
+          while IFS= read -r lock; do
+            [ "$lock" = "Cargo.lock" ] && continue
+            manifest="$(dirname "$lock")/Cargo.toml"
+            echo "::group::cargo metadata --locked ${manifest}"
+            if ! cargo metadata --locked --format-version 1 --manifest-path "$manifest" > /dev/null; then
+              echo "::error file=${lock}::${lock} does not match ${manifest}. Refresh it with: cargo metadata --format-version 1 --manifest-path ${manifest} > /dev/null, which adds each newly required crate at its newest compatible version and can re-point edges of crates already locked; review the diff as the examples entry in docs/internals/ci-and-gates.md describes before committing"
+              fail=1
+            fi
+            echo "::endgroup::"
+            checked=$((checked + 1))
+          done < <(git ls-files -- '*Cargo.lock' | sort)
+          # A walk that matched nothing would be a silent green. The floor is
+          # the exact number of standalone lockfiles in the tree (three under
+          # benches, eight examples, the Python wheel, the Android sample
+          # runtime), so losing any one of them trips it. Raise it in the
+          # commit that adds a lockfile.
+          if [ "$checked" -lt 13 ]; then
+            echo "::error::only ${checked} standalone lockfile(s) were checked: the walk is not reaching them"
+            exit 1
+          fi
+          echo "checked ${checked} standalone lockfile(s)"
+          exit $fail
+
       # Each example is its OWN workspace with its OWN lockfile + target dir
       # (isolated workspaces resolve fresh), so check them one at a time from
       # inside each directory. Two kinds of directory are skipped on purpose:
