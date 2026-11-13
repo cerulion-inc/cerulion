@@ -251,8 +251,10 @@ fn armed_err(expires: &str) -> String {
         "Pairing code: 48213907\n\
          It pairs one desk and expires at {expires} UTC (in 10 minutes). All desks share 3 \
          tries.\n\
+         On the desk, run `cerulion pair --eid {}` and type the code.\n\
          Waiting for a desk. Ctrl-C stops waiting; the code keeps working until it is used or \
-         expires.\n"
+         expires.\n",
+        eid()
     )
 }
 

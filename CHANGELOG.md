@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `cerulion pair --start` makes a pairing code on a robot: it asks `cerulion-netd` to serve the robot, shows an 8-digit code that pairs one desk within 10 minutes with 3 tries every desk shares, and waits until a desk pairs, the tries are used up or the code expires. A newer start replaces the code, Ctrl-C leaves it working, and the exit code says how it ended (0 paired, 1 refused on the robot, 2 expired or replaced, 3 a daemon could not be reached or stopped, 4 used up, 130 interrupted). It is refused with exit 1 under `CERULION_NETWORK`. Unix only.
+- `cerulion pair` is listed in `cerulion --help` and offered by `cerulion <TAB>` again and runs the desk side of code pairing with the code `cerulion pair --start` shows on the robot: `cerulion pair --eid <eid>`, plus `--addr <robot-ip>:<port>` when the desk has no internet. Its exit codes are 0 paired, 1 a usage or config error or a `CERULION_NETWORK` refusal, 2 the robot refused, 3 unreachable, 4 wrong code or tries used up and 130 interrupted.
 
 ## [2.0.0] - 2026-11-11
 

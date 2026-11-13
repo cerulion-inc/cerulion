@@ -342,21 +342,6 @@ const DECLARED_SITES: &[Declared] = &[
                  count is EXACT; lowering it is the intended motion",
     },
     Declared {
-        path: "cerulion_cli_engine/src/pair_cmd.rs",
-        interpolation: 3,
-        pass_through: 0,
-        messages: &[
-            "cerulion pair: did NOT complete (exit {code}) — the robot di#1f3842af",
-            "cerulion pair: paired OK (no robot name to pin — reconnect w#dd58f874",
-            "cerulion pair: paired OK, but pinning ~/.cerulion/robots.tom#da40070f",
-        ],
-        reason: "DEBT (CLI operator surface): lines splicing a runtime \
-                 value into the message. Not migrated — several \
-                 are matched by real-binary e2e oracles (`--peer-loss is ignored`,\
-                 `could not be acquired`), so each rewrite needs a paired test edit. The\
-                 count is EXACT; lowering it is the intended motion",
-    },
-    Declared {
         path: "cerulion_cli_engine/src/replay_engine.rs",
         interpolation: 1,
         pass_through: 0,

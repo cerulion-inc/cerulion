@@ -17,8 +17,8 @@
 //!
 //! A positional ROBOT name resolves via the `name = "<eid>"` pins in
 //! `~/.cerulion/robots.toml`, so a pinned robot's name just works here with no
-//! flags. No `cerulion` verb writes the file while `cerulion pair` is a hidden
-//! stub: it holds hand-written pins and any an earlier pairing wrote.
+//! flags. `cerulion pair <robot>` writes a pin on a successful pairing; the
+//! file also holds hand-written pins.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

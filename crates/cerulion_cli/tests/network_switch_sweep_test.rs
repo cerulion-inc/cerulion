@@ -433,10 +433,10 @@ fn assert_no_sign_in(what: &str, run: &Run) {
     assert_no_sign_in_text(what, &run.stderr, &run.stderr);
 }
 
-/// [`assert_no_sign_in`] for a row whose own output `own` names a sign-in
-/// marker (the hidden `pair` stub's refusal points at `cerulion login`):
-/// `own` is taken out of stderr once, so any sign-in text beside it still
-/// fails. A row whose own text names no marker is checked whole.
+/// [`assert_no_sign_in`] for a row whose own output `own` may name a sign-in
+/// marker (a refusal that points at `cerulion login`): `own` is taken out of
+/// stderr once, so any sign-in text beside it still fails. A row whose own
+/// text names no marker is checked whole.
 fn assert_no_sign_in_beside(what: &str, run: &Run, own: &str) {
     let own_lower = own.to_lowercase();
     if SIGN_IN_MARKERS.iter().any(|m| own_lower.contains(m)) {

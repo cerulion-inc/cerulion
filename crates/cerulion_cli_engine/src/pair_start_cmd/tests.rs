@@ -162,6 +162,10 @@ fn times_and_counts_are_rendered_in_words() {
     assert_eq!(count_words(1, "try", "tries"), "1 try");
     assert_eq!(count_words(3, "try", "tries"), "3 tries");
     assert_eq!(HOLD_TTL_S, 790);
+    // The numbers `cerulion help pair` states for the robot side.
+    assert_eq!(cerulion_pairing::pair_code::CODE_LEN, 8);
+    assert_eq!(cerulion_pairing::pair_code::PAIR_CODE_TRIES, 3);
+    assert_eq!(PAIR_CODE_WINDOW.as_secs(), 600);
     assert_eq!(RELEAVE_AFTER, ms(2000));
 }
 
@@ -1294,6 +1298,8 @@ fn the_success_transcript_is_byte_exact_and_identical_on_two_runs() {
              Pairing code: 48213907\n\
              It pairs one desk and expires at 22:23 UTC (in 10 minutes). All desks share 3 \
              tries.\n\
+             On the desk, run `cerulion pair --eid {eid}` and type the code. Add `--addr \
+             <robot-ip>:41234` when the desk has no internet.\n\
              Waiting for a desk. Ctrl-C stops waiting; the code keeps working until it is used \
              or expires.\n\
              Paired with desk lab-desk (account {account}). The code is used up.\n"
@@ -1968,13 +1974,45 @@ fn every_command_a_text_names_is_listed() {
     for text in every_text() {
         for (i, span) in text.split('`').enumerate() {
             if i % 2 == 1 && span.starts_with("cerulion ") {
-                named.insert(span.to_string());
+                // The robot's endpoint id is filled in at run time.
+                named.insert(span.replace(&eid_hex(), "<eid>"));
             }
         }
     }
     let listed: std::collections::BTreeSet<String> =
         COMMANDS_NAMED.iter().map(|s| s.to_string()).collect();
     assert_eq!(named, listed);
+}
+
+#[test]
+fn the_desk_hint_names_the_endpoint_and_the_port_when_known() {
+    let eid = eid_hex();
+    assert_eq!(
+        desk_hint_line(&[0xE1; 32], Some(41234)),
+        format!(
+            "On the desk, run `cerulion pair --eid {eid}` and type the code. Add `--addr \
+             <robot-ip>:41234` when the desk has no internet."
+        )
+    );
+    assert_eq!(
+        desk_hint_line(&[0xE1; 32], None),
+        format!("On the desk, run `cerulion pair --eid {eid}` and type the code.")
+    );
+    let lines: Vec<String> = armed_report(CODE, &FACTS, None)
+        .stderr
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            code_line(CODE),
+            expiry_line(&FACTS),
+            desk_hint_line(&FACTS.endpoint_id, None),
+            WAITING_FOR_DESK_LINE.to_string(),
+        ],
+        "the hint goes between the expiry and the waiting lines"
+    );
 }
 
 #[test]
