@@ -120,7 +120,9 @@ divides one quantity by another gets a meaningless number.
 ### Free run against lockstep
 
 A multi-process run free-runs by default; `CERULION_EXECUTION_MODE=lockstep`
-opts out. The table compares the two on the same build and the same machine:
+opts out into barrier lockstep. That opt-out is deprecated and outside Semantic
+Versioning, so a minor release may change or remove it. The table compares the
+two on the same build and the same machine:
 the multi-process cell (two processes), main `4ff3326d06` with the latency
 ping change from `bbf276489b` applied, on an x86-64 Linux machine (Ubuntu
 22.04, kernel 6.8, performance governor), STOCK posture, recorder ON, fixed
