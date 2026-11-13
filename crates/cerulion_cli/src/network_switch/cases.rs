@@ -76,6 +76,10 @@ pub(crate) enum By {
     Flag,
 }
 
+const PAIR_START: &[&str] = &[
+    "Error: cerulion pair --start makes this robot serve pairing over the network, which ",
+    " disables; unset CERULION_NETWORK to start code pairing",
+];
 const ROBOT_PUB: &[&str] = &[
     "Error: --robot bench-arm reaches the robot over the network, which ",
     " disables; unset CERULION_NETWORK to call its topic-publish verb (without --robot the \
@@ -407,6 +411,16 @@ pub(crate) static CASES: &[Case] = &[
         expect: Expect::Runs {
             code: 2,
             says: "`cerulion ros attach` has moved",
+        },
+    },
+    // `pair --start` makes this robot serve pairing over the network.
+    Case {
+        verb: &["pair"],
+        argv: &["pair", "--start"],
+        expect: Expect::Refused {
+            code: 1,
+            says: PAIR_START,
+            by: By::Network,
         },
     },
     // The hidden `pair` stub reaches no robot: it refuses every spelling

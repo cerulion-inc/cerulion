@@ -430,15 +430,25 @@ pub enum Commands {
     // stub above: every spelling, `--help` and the old flags included,
     // reaches the refusal rather than a help page or a clap parse error.
     // (`cerulion help pair` still renders the doc comment above.)
+    //
+    // `--start` alone, first, runs the robot side of code pairing
+    // (`cerulion_cli_engine::pair_start_cmd`); it is hidden like the verb. A
+    // word before it goes to the swallowing positional (the stub's refusal),
+    // and a word after it is a usage error.
     #[command(hide = true, disable_help_flag = true)]
     Pair {
+        /// On the robot: make a pairing code for one desk. Takes no other
+        /// argument.
+        #[arg(long, hide = true)]
+        start: bool,
         /// Swallows whatever followed (`go2 --code ...`, `--help` included) so
         /// the user sees the refusal, never a clap parse error.
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
             hide = true,
-            value_name = "ARGS"
+            value_name = "ARGS",
+            conflicts_with = "start"
         )]
         args: Vec<String>,
     },
@@ -611,10 +621,11 @@ pub enum Commands {
 ///   (`cerulion=warn`) so their command output isn't interleaved with
 ///   lifecycle breadcrumbs.
 /// - `QuietRuntime`: the runtime verbs whose terminal output IS their result,
-///   `graph run` (with its hidden `run-worker` processes) and `bag play`. These
-///   default QUIET (`cerulion=warn`) too, so a run prints that it is running,
-///   its recording path and any warning, and a verification prints its
-///   verdict, with no lifecycle bookkeeping around them.
+///   `graph run` (with its hidden `run-worker` processes), `bag play` and
+///   `pair --start`. These default QUIET (`cerulion=warn`) too, so a run
+///   prints that it is running, its recording path and any warning, a
+///   verification prints its verdict and a pairing code its lines, with no
+///   lifecycle bookkeeping around them.
 /// - `LongRunning`: verbs whose lifecycle lines are the operator's window into
 ///   a loop or daemon (`graph profile`, `node run`, `bag record`, `ros2 attach`,
 ///   `viz`, `connect`, and the hidden `run-gateway`). These keep the
@@ -706,6 +717,11 @@ impl Commands {
                 | Ros2Action::Launch { .. } => LongRunning,
                 Ros2Action::Migrate { .. } => OneShot,
             },
+            // `pair --start` waits on the robot until its pairing code ends,
+            // and its lines are what it prints: quiet like `graph run`, so a
+            // lifecycle line (netd's first-use start) cannot interleave with
+            // them.
+            Commands::Pair { start: true, .. } => QuietRuntime,
             // The removed-`ros`-family stub and the hidden `pair` stub never
             // run anything: `main` intercepts both above the login gate and
             // prints their refusal before `init_logging` matters. Classified
@@ -2452,10 +2468,78 @@ mod pair_dispatch_tests {
                 )
             });
             match cli.command {
-                Commands::Pair { args } => {
+                Commands::Pair { args, start } => {
                     assert_eq!(args, expected, "`{}`", argv.join(" "));
+                    assert!(!start, "`{}`", argv.join(" "));
                 }
                 _ => panic!("expected the Commands::Pair stub"),
+            }
+        }
+    }
+
+    /// `pair --start` alone selects the robot side; a word after it is a
+    /// usage error, and a word before it keeps `--start` inside the stub's
+    /// swallowed words.
+    #[test]
+    fn pair_start_parses_alone_and_refuses_any_other_word() {
+        let cli = Cli::try_parse_from(["cerulion", "pair", "--start"]).unwrap();
+        match cli.command {
+            Commands::Pair { start, args } => {
+                assert!(start);
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Commands::Pair"),
+        }
+        for argv in [
+            vec!["cerulion", "pair", "--start", "go2"],
+            vec!["cerulion", "pair", "--start", "--help"],
+            vec!["cerulion", "pair", "--start", "--eid", "ab"],
+        ] {
+            let err = match Cli::try_parse_from(&argv) {
+                Ok(_) => panic!("`{}` must not parse", argv.join(" ")),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "`{}`",
+                argv.join(" ")
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
+        let cli = Cli::try_parse_from(["cerulion", "pair", "go2", "--start"]).unwrap();
+        match cli.command {
+            Commands::Pair { start, args } => {
+                assert!(!start);
+                assert_eq!(args, ["go2", "--start"]);
+            }
+            _ => panic!("expected Commands::Pair"),
+        }
+    }
+
+    /// The robot side defaults quiet, the stub one-shot.
+    #[test]
+    fn pair_start_defaults_quiet_and_the_stub_one_shot() {
+        let class = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.log_verb_class();
+        assert_eq!(
+            class(&["cerulion", "pair", "--start"]),
+            VerbLogClass::QuietRuntime
+        );
+        assert_eq!(class(&["cerulion", "pair", "go2"]), VerbLogClass::OneShot);
+    }
+
+    /// Every command a `pair --start` text names parses, and none of them is
+    /// the stub.
+    #[test]
+    fn every_command_pair_start_names_parses() {
+        for named in cerulion_cli_engine::pair_start_cmd::COMMANDS_NAMED {
+            let argv: Vec<&str> = named.split(' ').collect();
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("`{named}` does not parse: {e}"));
+            match cli.command {
+                Commands::Pair { start, .. } => assert!(start, "`{named}` is the stub"),
+                Commands::Login => {}
+                _ => panic!("`{named}` parses as an unexpected verb"),
             }
         }
     }
@@ -2477,6 +2561,7 @@ mod pair_dispatch_tests {
         );
         assert!(text.contains("cerulion login"), "{text}");
         assert!(!text.contains("--code"), "{text}");
+        assert!(!text.contains("--start"), "{text}");
     }
 
     /// `pair` is hidden: `cerulion --help` lists no `pair` row. Completion is

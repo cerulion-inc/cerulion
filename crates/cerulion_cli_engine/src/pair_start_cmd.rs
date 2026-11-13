@@ -25,9 +25,11 @@
 //!    [`PROBE_EVERY`] until the code's end ([`Outcome`]).
 //!
 //! A result that is gone never ends a run: it is another writer's removal or
-//! the daemon's own after a write that failed. Everything in this module is
-//! pure: [`Machine::next_step`] decides from what the runner observed
-//! ([`Observation`]), and the texts are rendered from fields.
+//! the daemon's own after a write that failed. The decisions and the texts
+//! are pure: [`Machine::next_step`] decides from what the runner observed
+//! ([`Observation`]), and the texts are rendered from fields. On Unix,
+//! [`run`] is the runner: it does the file operations each step asks for,
+//! holds serving through a [`ServingHost`] and lives in a [`StartEnv`].
 
 use std::path::Path;
 use std::time::Duration;
@@ -1247,8 +1249,24 @@ impl Machine {
     }
 }
 
+/// The remoted state subdirectory of the robot state root
+/// (`cerulion_remoted::config::REMOTED_SUBDIR`).
+#[cfg(unix)]
+const REMOTED_SUBDIR: &str = "remoted";
+
+#[cfg(unix)]
+mod handoff;
+#[cfg(unix)]
+mod netd;
+#[cfg(unix)]
+mod run;
+
 #[cfg(unix)]
 pub use hold::{hold_refusal, HoldRefusal};
+#[cfg(unix)]
+pub use netd::{resolve_state_root, NetdServing, ProcessEnv, PROBE_DEADLINE};
+#[cfg(unix)]
+pub use run::{run, HeldServing, ServingHost, StartEnv};
 
 #[cfg(unix)]
 mod hold {

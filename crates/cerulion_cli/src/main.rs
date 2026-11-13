@@ -25,6 +25,11 @@ mod cfg_symmetry_tests;
 // so a behavioural test would have to operate on the real `/tmp`.
 #[cfg(test)]
 mod clean_diagnostic_tests;
+// Pins that each `cerulion pair` dispatch function and the signal handler
+// carry their own `///` doc. A source walk because a function inserted under
+// another's doc block takes that doc, and no lint sees it in a binary.
+#[cfg(test)]
+mod fn_doc_tests;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -62,6 +67,11 @@ const ROS_VERB_MOVED_MSG: &str = "`cerulion ros attach` has moved: the verb is n
 /// comment instead), and pinned byte-for-byte by
 /// `tests/local_scope_e2e_test.rs`.
 const PAIR_UNAVAILABLE_MSG: &str = "code pairing is not available in this release; robots on your account are reached by signing in with `cerulion login`";
+
+/// The refusal of `cerulion pair --start` on a platform without the robot
+/// daemons.
+#[cfg(not(unix))]
+const UNIX_ONLY_MSG: &str = "`cerulion pair --start` is Unix-only: the robot side of code pairing runs through cerulion-netd and cerulion-remoted, which do not build on this platform";
 
 fn main() -> ExitCode {
     // The shell completion hook, FIRST — before any other statement.
@@ -239,7 +249,9 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
     // The hidden `cerulion pair` stub: refused HERE for the same reasons and
     // with the same code. It reaches no robot and no daemon, so the kill
     // switch has nothing to refuse and the login gate nothing to protect.
-    if matches!(cli.command, Commands::Pair { .. }) {
+    // `pair --start` is not the stub: it serves the network, so it meets the
+    // kill switch and the login gate below.
+    if matches!(cli.command, Commands::Pair { start: false, .. }) {
         eprintln!("Error: {PAIR_UNAVAILABLE_MSG}");
         return ExitCode::from(2);
     }
@@ -366,6 +378,14 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
             );
             return ExitCode::from(code);
         }
+    }
+
+    // `cerulion pair --start` makes a pairing code on the robot and waits for
+    // its end; it owns the exit-code contract the generic dispatch cannot
+    // express (0 paired, 1 refused here, 2 ended unused, 3 a daemon could not
+    // be reached or stopped, 4 used up, 130 interrupted).
+    if let Commands::Pair { start: true, .. } = cli.command {
+        return pair_start_exit_code();
     }
 
     // `cerulion connect` SPAWNS the `cerulion-connectd` sibling
@@ -2383,6 +2403,9 @@ fn run(cli: Cli) -> CliResult<()> {
         Commands::Ros { .. } => Err(cerulion_cli_engine::error::CliError::Validation(
             ROS_VERB_MOVED_MSG.to_string(),
         )),
+        Commands::Pair { start: true, .. } => {
+            unreachable!("`pair --start` is dispatched by `dispatch` before run()")
+        }
         // The hidden `cerulion pair` stub: the same belt-and-braces as `ros`.
         Commands::Pair { .. } => Err(cerulion_cli_engine::error::CliError::Validation(
             PAIR_UNAVAILABLE_MSG.to_string(),
@@ -3771,7 +3794,8 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
 /// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
 /// refusals `main` performs before the gate call (a moved verb, the hidden
 /// `pair` stub, a malformed resim invocation). You do not have to
-/// prove who you are to be told a command line is wrong.
+/// prove who you are to be told a command line is wrong. `pair --start` is not
+/// the stub and is gated.
 ///
 /// The exemptions are:
 ///
@@ -3827,10 +3851,13 @@ fn command_needs_identity(command: &Commands) -> bool {
 /// `CERULION_NETWORK`, and under `CERULION_NETD_NETWORK` or
 /// `CERULION_VIZD_NETWORK` at `off` too; `connect` (a warning, exit 0) when
 /// `--network` or `CERULION_NETWORK` is exactly `off`, the value its helper
-/// reads. Every other verb is not refused here: it runs as without the
-/// switch, or does not run through `dispatch`. The match names every
-/// top-level verb, so a new one is decided here before it compiles; a new
-/// subverb of a verb below needs its row in `network_switch/cases.rs`.
+/// reads; `topic info`, `echo` and `hz` with `--robot` (exit 2) under
+/// `CERULION_NETWORK`, and under `CERULION_NETD_NETWORK` at `off`;
+/// `pair --start` (exit 1) under the run and query parse of
+/// `CERULION_NETWORK`. Every other verb is not refused here: it runs as
+/// without the switch, or does not run through `dispatch`. The match names
+/// every top-level verb, so a new one is decided here before it compiles; a
+/// new subverb of a verb below needs its row in `network_switch/cases.rs`.
 fn command_network_refusal(
     command: &Commands,
     switch: &network_switch::SwitchEnv,
@@ -3862,6 +3889,17 @@ fn command_network_refusal(
             }
             TopicAction::List { .. } => None,
         },
+        // `pair --start` makes the robot serve pairing over the network.
+        Commands::Pair { start: true, .. } => {
+            cerulion_cli_engine::pair_start_cmd::network_refusal_from(switch.network.clone()).map(
+                |refusal| {
+                    NetworkRefusal::error(
+                        refusal,
+                        cerulion_cli_engine::pair_start_cmd::EXIT_REFUSED,
+                    )
+                },
+            )
+        }
         // Dispatched before this check (`main`'s internal workers, `bagd`,
         // the `ros` and `pair` stubs), or not refused under the switch: the
         // runs and queries go
@@ -3975,6 +4013,38 @@ fn setup_ctrlc_handler() -> CliResult<Arc<AtomicBool>> {
         ))
     })?;
     Ok(running)
+}
+
+/// `cerulion pair --start`: one pairing code made on this robot and followed
+/// to its end (`cerulion_cli_engine::pair_start_cmd::run`), its exit code
+/// forwarded. Ctrl-C and SIGTERM stop the wait and leave the code working.
+#[cfg(unix)]
+fn pair_start_exit_code() -> ExitCode {
+    let running = match setup_ctrlc_handler() {
+        Ok(running) => running,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let root = cerulion_cli_engine::pair_start_cmd::resolve_state_root();
+    let mut host = cerulion_cli_engine::pair_start_cmd::NetdServing::default();
+    let mut env = cerulion_cli_engine::pair_start_cmd::ProcessEnv::new(running);
+    let code = cerulion_cli_engine::pair_start_cmd::run(
+        root.as_deref(),
+        &mut host,
+        &mut env,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    );
+    ExitCode::from(code)
+}
+
+/// `cerulion pair --start` where the robot daemons do not build.
+#[cfg(not(unix))]
+fn pair_start_exit_code() -> ExitCode {
+    eprintln!("Error: {UNIX_ONLY_MSG}");
+    ExitCode::from(cerulion_cli_engine::pair_start_cmd::EXIT_REFUSED)
 }
 
 fn init_logging(verbose: bool, quiet_default: bool) {
