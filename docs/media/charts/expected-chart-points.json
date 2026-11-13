@@ -842,8 +842,8 @@
         },
         {
           "label": "mac split",
-          "source_csv": "docs/benchmarks/results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/results_cerulion_workspace_split_chrt0.csv",
-          "source_sha256": "9cfc90f7091edd4ff077f8b1a67dcea8356e412c25de1a58652e92e5a983cc1a",
+          "source_csv": "docs/benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/results_cerulion_workspace_split_chrt0.csv",
+          "source_sha256": "f24707fe3d13d529a2c9605a6af32f5c57e16623eca36dfb6dc5655e606c465c",
           "metric_columns": [
             "round_trip_p50_ns",
             "round_trip_p99_ns"
@@ -851,80 +851,80 @@
           "points": [
             {
               "payload_bytes": 64,
-              "p50_ns": 88479,
-              "p99_ns": 142167,
+              "p50_ns": 9083,
+              "p99_ns": 29042,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 256,
-              "p50_ns": 89229,
-              "p99_ns": 140541,
+              "p50_ns": 9209,
+              "p99_ns": 30791,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 1024,
-              "p50_ns": 89375,
-              "p99_ns": 139875,
+              "p50_ns": 9750,
+              "p99_ns": 37333,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 4096,
-              "p50_ns": 89416,
-              "p99_ns": 139541,
+              "p50_ns": 9167,
+              "p99_ns": 33045,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 16384,
-              "p50_ns": 87062,
-              "p99_ns": 140125,
+              "p50_ns": 9708,
+              "p99_ns": 23585,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 65536,
-              "p50_ns": 87375,
-              "p99_ns": 140375,
+              "p50_ns": 9833,
+              "p99_ns": 32000,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 262144,
-              "p50_ns": 87937,
-              "p99_ns": 140875,
+              "p50_ns": 9042,
+              "p99_ns": 23962,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 1048576,
-              "p50_ns": 87854,
-              "p99_ns": 140917,
+              "p50_ns": 9709,
+              "p99_ns": 31667,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 4194304,
-              "p50_ns": 92896,
-              "p99_ns": 139458,
+              "p50_ns": 9583,
+              "p99_ns": 26585,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 16777216,
-              "p50_ns": 89770,
-              "p99_ns": 138417,
+              "p50_ns": 9541,
+              "p99_ns": 31793,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
@@ -933,8 +933,8 @@
         },
         {
           "label": "mac mono",
-          "source_csv": "docs/benchmarks/results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/results_cerulion_workspace_mono_chrt0.csv",
-          "source_sha256": "929cc691a20aa8c27a4558054c9f6eb7b20575087c6799aa2f6ee9029700407c",
+          "source_csv": "docs/benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/results_cerulion_workspace_mono_chrt0.csv",
+          "source_sha256": "0030bce8498a0cdadf135ada45e4a36dfca7641262426702da0d7e5f3caa7fe6",
           "metric_columns": [
             "round_trip_p50_ns",
             "round_trip_p99_ns"
@@ -942,80 +942,80 @@
           "points": [
             {
               "payload_bytes": 64,
-              "p50_ns": 3458,
-              "p99_ns": 19125,
+              "p50_ns": 3750,
+              "p99_ns": 16917,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 256,
-              "p50_ns": 3458,
-              "p99_ns": 13333,
+              "p50_ns": 3667,
+              "p99_ns": 14958,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 1024,
-              "p50_ns": 3458,
-              "p99_ns": 11750,
+              "p50_ns": 3750,
+              "p99_ns": 21833,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 4096,
-              "p50_ns": 3375,
-              "p99_ns": 7792,
+              "p50_ns": 3625,
+              "p99_ns": 12000,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 16384,
-              "p50_ns": 3458,
-              "p99_ns": 11834,
+              "p50_ns": 3625,
+              "p99_ns": 11625,
               "samples": 10000,
               "repetitions": 5,
-              "achieved_rate_hz": "mixed"
+              "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 65536,
-              "p50_ns": 3375,
-              "p99_ns": 7459,
+              "p50_ns": 3625,
+              "p99_ns": 11041,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 262144,
-              "p50_ns": 3375,
-              "p99_ns": 21416,
+              "p50_ns": 3708,
+              "p99_ns": 20418,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 1048576,
-              "p50_ns": 3458,
-              "p99_ns": 20541,
+              "p50_ns": 3625,
+              "p99_ns": 21375,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 4194304,
-              "p50_ns": 3584,
-              "p99_ns": 10750,
+              "p50_ns": 3833,
+              "p99_ns": 12625,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
             },
             {
               "payload_bytes": 16777216,
-              "p50_ns": 3750,
-              "p99_ns": 10042,
+              "p50_ns": 3833,
+              "p99_ns": 21667,
               "samples": 10000,
               "repetitions": 5,
               "achieved_rate_hz": "100"
