@@ -188,18 +188,19 @@ Rules that must not drift:
   applies the bag's `env.json`: its nodes read the replay shell's environment, and
   `replay_engine::compare_env_against` compares the two (no `env.json`, no comparison). One
   pure rule, `env_reader`, names the variables that can change the re-execution
-  (`CERULION_`, `IOX2_`, `LD_`, `DYLD_`, `PYTHON`, minus every name the recorder's secret
-  marker rule marks); such a variable set only at replay is `Added`. The terminal text has
-  one source, `render_env_divergence_lines` (a `WARNING:` per such variable, then one
-  `NOTE:` counting the rest, with no value or hash), printed by the verdict and, through
-  `ResimReport::env_lines`, by both arms of the neutral summary. The engine logs each
-  divergence once (`log_env_divergences`, after the report write): an `info!` for every
-  divergence on a run that returns its outcome, and a `warn!` for a loud one on a run that
-  returns an error instead (a rank aborts, or a passing run's `--report` cannot be written),
-  where the CLI prints only that error (the others stay `info!`). At the quiet default each
-  divergence shows once; with `-v` a loud one also shows as its `info!` line, as a
-  violation does. The `--report` entry's `read_by` is derived from the name by the same
-  rule.
+  (`CERULION_`, `IOX2_`, `LD_`, `DYLD_`, `PYTHON`, plus the exact name `CARGO_TARGET_DIR`,
+  which `graph_cmd::cdylib_target_base` reads to pick the node library build directory,
+  minus every name the recorder's secret marker rule marks); such a variable set only at
+  replay is `Added`. The terminal text has one source, `render_env_divergence_lines` (a
+  `WARNING:` per such variable, then one `NOTE:` counting the rest, with no value or hash),
+  printed by the verdict and, through `ResimReport::env_lines`, by both arms of the neutral
+  summary. The engine logs each divergence once (`log_env_divergences`, after the report
+  write): an `info!` for every divergence on a run that returns its outcome, and a `warn!`
+  for a loud one on a run that returns an error instead (a rank aborts, or a passing run's
+  `--report` cannot be written), where the CLI prints only that error (the others stay
+  `info!`). At the quiet default each divergence shows once; with `-v` a loud one also
+  shows as its `info!` line, as a violation does. The `--report` entry's `read_by` is
+  derived from the name by the same rule.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.

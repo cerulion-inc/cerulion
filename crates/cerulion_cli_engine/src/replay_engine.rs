@@ -3390,7 +3390,7 @@ pub enum EnvDivergenceKind {
     HashChanged,
     /// The replay env sets a variable that can change the re-execution (a
     /// `CERULION_`, `IOX2_`, `LD_`, `DYLD_` or `PYTHON` name that does not mark
-    /// a secret) and the bag did not record it.
+    /// a secret, or `CARGO_TARGET_DIR`) and the bag did not record it.
     Added,
 }
 
@@ -3425,13 +3425,19 @@ enum EnvReader {
     DynamicLinker,
     /// The Python interpreter that runs Python nodes (`PYTHON`).
     Python,
+    /// Cerulion's node library lookup, which picks the build directory every
+    /// node library loads from (`CARGO_TARGET_DIR`,
+    /// [`crate::graph_cmd::cdylib_target_base`]).
+    NodeLibraryLookup,
 }
 
 impl EnvReader {
-    /// The `--report` JSON's `read_by` value and the log field's value.
+    /// The `--report` JSON's `read_by` value and the log field's value. It
+    /// names the program that reads the variable, so both Cerulion readers
+    /// are `cerulion`; [`Self::reason`] says what each reads it for.
     fn label(self) -> &'static str {
         match self {
-            Self::Cerulion => "cerulion",
+            Self::Cerulion | Self::NodeLibraryLookup => "cerulion",
             Self::DynamicLinker => "dynamic_linker",
             Self::Python => "python",
         }
@@ -3453,26 +3459,31 @@ impl EnvReader {
                 "The Python interpreter that runs Python nodes reads it, so it can change the \
                  re-execution."
             }
+            Self::NodeLibraryLookup => {
+                "Cerulion reads it to choose the build directory it loads each node library \
+                 from, so it can change the re-execution."
+            }
         }
     }
 }
 
-/// The reader whose settings namespace `name` is in, or `None` for a name in
-/// none of them or one that marks a secret.
+/// The reader whose settings namespace `name` is in, or that reads `name`
+/// itself (`CARGO_TARGET_DIR`), or `None` for any other name or one that marks
+/// a secret.
 ///
 /// Loud means the name is in a namespace the re-execution itself, or a
 /// runtime it starts, reads its settings from: Cerulion and its shared-memory
 /// transport (`CERULION_`, `IOX2_`), the dynamic linker that maps every node
 /// library (`LD_`, `DYLD_`), and the Python interpreter that runs Python nodes
-/// (`PYTHON`). The rule is by namespace, not by a list of every read: the
-/// engine also reads `CARGO_TARGET_DIR`, which picks the directory a node
-/// library is loaded from, and that name is not loud. Every other variable
-/// (the shell's, the session's, `PATH`, `HOME`, locale, `RUST_LOG`, library
-/// knobs such as `OMP_NUM_THREADS`) is counted with the rest; it matters when
-/// code in a node reads it, which the replay cannot see. A name that marks a
-/// secret is never loud: credentials authenticate a session and do not decide
-/// what a re-execution computes. The secret rule is the recorder's own, so the
-/// two agree on every name. Case-sensitive, like Unix names. Pure.
+/// (`PYTHON`). One exact name outside those namespaces is loud too:
+/// `CARGO_TARGET_DIR`, which Cerulion reads to pick the build directory every
+/// node library loads from. Every other variable (the shell's, the session's,
+/// `PATH`, `HOME`, locale, `RUST_LOG`, library knobs such as
+/// `OMP_NUM_THREADS`) is counted with the rest; it matters when code in a node
+/// reads it, which the replay cannot see. A name that marks a secret is never
+/// loud: credentials authenticate a session and do not decide what a
+/// re-execution computes. The secret rule is the recorder's own, so the two
+/// agree on every name. Case-sensitive, like Unix names. Pure.
 fn env_reader(name: &str) -> Option<EnvReader> {
     if crate::graph_cmd::env_name_marks_a_secret(name) {
         None
@@ -3482,6 +3493,8 @@ fn env_reader(name: &str) -> Option<EnvReader> {
         Some(EnvReader::DynamicLinker)
     } else if name.starts_with("PYTHON") {
         Some(EnvReader::Python)
+    } else if name == "CARGO_TARGET_DIR" {
+        Some(EnvReader::NodeLibraryLookup)
     } else {
         None
     }
@@ -26853,6 +26866,7 @@ mod env_divergence_tests {
             ("DYLD_FALLBACK_LIBRARY_PATH", EnvReader::DynamicLinker),
             ("PYTHONPATH", EnvReader::Python),
             ("PYTHONHASHSEED", EnvReader::Python),
+            ("CARGO_TARGET_DIR", EnvReader::NodeLibraryLookup),
         ];
         for (name, reader) in table {
             assert_eq!(env_reader(name), Some(reader), "{name}");
@@ -26877,6 +26891,11 @@ mod env_divergence_tests {
             "OPENBLAS_NUM_THREADS",
             "LDFLAGS",
             "LD",
+            "CARGO_HOME",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_TARGET_DIRS",
+            "CARGO_TARGET",
+            "cargo_target_dir",
             "CERULION",
             "IOX2",
             "DYLD",
@@ -27280,6 +27299,28 @@ mod env_divergence_tests {
                  recording. The Python interpreter that runs Python nodes reads it, so it can \
                  change the re-execution.",
             ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::ValueChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::HashChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CARGO_TARGET_DIR was set in the recording and is \
+                 not set now. Cerulion reads it to choose the build directory it loads each node \
+                 library from, so it can change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Added,
+                CARGO_TARGET_DIR_ADDED,
+            ),
         ];
         for (name, kind, expected) in table {
             assert_eq!(
@@ -27287,6 +27328,145 @@ mod env_divergence_tests {
                 vec![expected.to_string()]
             );
         }
+    }
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` whose value or hash differs,
+    /// hand-written.
+    const CARGO_TARGET_DIR_CHANGED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR has a different value than in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` set only at replay,
+    /// hand-written.
+    const CARGO_TARGET_DIR_ADDED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR is set now and was not set in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    #[test]
+    fn a_changed_cargo_target_dir_is_reported_loud_on_its_own_line() {
+        // A plain recorded value (`--record-env all`) the replay shell changed,
+        // beside one differing shell variable the NOTE counts. FNV-1a 64 of "a"
+        // is the published vector af63dc4c8601ec8c, and of "foobar"
+        // 85944171f73967e8.
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[("CARGO_TARGET_DIR", b"/build/replay"), ("SHLVL", b"foobar")]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(
+            project(&divergences),
+            vec![
+                row(
+                    "CARGO_TARGET_DIR",
+                    "ValueChanged",
+                    "variable 'CARGO_TARGET_DIR' value changed since recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "SHLVL",
+                    "HashChanged",
+                    "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)",
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string(), NOTE_ONE.to_string()]
+        );
+
+        // The default recorder hashes the value: a changed hash is just as loud.
+        let env = br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let divergences =
+            compare_env_against(Some(env), &current(&[("CARGO_TARGET_DIR", b"foobar")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "HashChanged",
+                "redacted variable 'CARGO_TARGET_DIR' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string()]
+        );
+
+        // Set only in the replay shell: Added, though the name is in no loud
+        // namespace.
+        let divergences =
+            compare_env_against(Some(b"{}"), &current(&[("CARGO_TARGET_DIR", b"/build/x")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "Added",
+                "variable 'CARGO_TARGET_DIR' is set at replay but absent from the recording",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_ADDED.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_cargo_target_dir_equal_to_the_recording_is_silent() {
+        // FNV-1a 64 of "a" is the published vector af63dc4c8601ec8c.
+        let now = current(&[("CARGO_TARGET_DIR", b"a")]);
+        for env in [
+            &br#"{"CARGO_TARGET_DIR": "a"}"#[..],
+            &br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#[..],
+            &br#"{"CARGO_TARGET_DIR": null}"#[..],
+        ] {
+            let divergences = compare_env_against(Some(env), &now);
+            assert!(divergences.is_empty(), "{divergences:?}");
+            assert!(render_env_divergence_lines(&divergences).is_empty());
+        }
+        // Unset on both sides: nothing to compare.
+        assert!(compare_env_against(Some(b"{}"), &current(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_cargo_target_dir_lines_are_identical_across_runs_and_insertion_orders() {
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let pairs: [(&str, &[u8]); 3] = [
+            ("SHLVL", b"foobar"),
+            ("CARGO_TARGET_DIR", b"/build/replay"),
+            ("LD_PRELOAD", b"/x.so"),
+        ];
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let first = compare_env_against(Some(env), &current(&pairs));
+        let second = compare_env_against(Some(env), &current(&pairs));
+        let other_order = compare_env_against(Some(env), &current(&reversed_pairs));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+        let lines = render_env_divergence_lines(&first);
+        assert_eq!(lines, render_env_divergence_lines(&second));
+        assert_eq!(lines, render_env_divergence_lines(&other_order));
+        assert_eq!(
+            lines,
+            vec![
+                CARGO_TARGET_DIR_CHANGED.to_string(),
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                NOTE_ONE.to_string(),
+            ]
+        );
     }
 
     #[test]
