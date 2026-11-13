@@ -223,7 +223,7 @@ async fn late_registration_serves_exact_nested_closure_and_names_builtin_wire_ha
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn different_shared_memory_namespace_refuses_catalog_and_schema() {
     let netd = LocalNetd::start();
-    let other_namespace = manager(false);
+    let (_root, other_namespace) = manager(false);
     assert_ne!(
         netd.manager.iox_shm_identity(),
         other_namespace.iox_shm_identity()
@@ -485,12 +485,8 @@ async fn malformed_oversized_and_silent_local_sources_fail_closed_and_close_thei
             assert_closed(&mut reader);
         });
         let endpoint = disabled_endpoint([80 + index as u8; 32]).await;
-        let robot = Robot::start(
-            manager(false),
-            path,
-            &[PublicKey(*endpoint.id().as_bytes())],
-        )
-        .await;
+        let (_root, manager) = manager(false);
+        let robot = Robot::start(manager, path, &[PublicKey(*endpoint.id().as_bytes())]).await;
         let mut desk = Desk::connect(&endpoint, &robot).await;
         assert_source_error(desk.request(&schema_request(TOPIC)).await, "local schema");
         bounded(

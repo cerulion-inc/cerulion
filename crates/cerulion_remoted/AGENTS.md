@@ -41,6 +41,11 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - Same-user outbound shares endpoint/runtime/node; pre-dial key/namespace gate. Metadata per-call; validation refusals keep readers/idle fence; cleanup errors fence control. Retire only outbound.
 
 ## Tests
+- `local_schema_provider_test` uses `-- --test-threads=1` and one private iceoryx2
+  root per process via `cerulion_core::testing::IsolatedRoot`. Refcounted holders
+  remove the directory after transport teardown and recreate it for later tests.
+  Short per-manager prefixes keep namespaces distinct within the 108-byte
+  listener socket-path budget. The library-host tests share this fixture.
 - `wire_plane_test` uses `-- --test-threads=1`: parallel tests at the macOS
   256-file soft limit hit iceoryx service/port errors.
 - Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct

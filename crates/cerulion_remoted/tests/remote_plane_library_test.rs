@@ -351,7 +351,7 @@ async fn a_library_host_serves_the_catalog_through_the_injected_control_socket()
 async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_error() {
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
-    let manager = fixture::manager(false);
+    let (_iox_root, manager) = fixture::manager(false);
     let absent = root.path().join("no-daemon.sock");
     let keys = MemoryKeys::new(ROBOT_SEED);
     let bound = RemotePlane::new(root.path(), ROBOT, absent, RelayConfig::Disabled)
@@ -376,7 +376,7 @@ async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_e
 async fn an_in_process_schema_source_names_the_catalog_and_serves_the_closure() {
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
-    let manager = fixture::manager(false);
+    let (_iox_root, manager) = fixture::manager(false);
     let _publisher = manager
         .create_publisher_simple(TOPIC, MaxSliceLen::const_new(256))
         .unwrap();

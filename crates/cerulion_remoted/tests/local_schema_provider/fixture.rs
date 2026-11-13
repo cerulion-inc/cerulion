@@ -3,12 +3,13 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::common::{
     bounded, disabled_endpoint, loopback_addr, pk, sk, wide, OWNER, ROBOT_ID, T_NOW,
 };
+use cerulion_core::testing::IsolatedRoot;
 use cerulion_core::transport::network::NetworkConfig;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
@@ -27,19 +28,48 @@ use cerulion_remoted::{
     handle_accepted_with_wire, DeviceAccountIndex, PairingAuthorizer, RemotedClock, SharedTrust,
     WirePlane, WireRequest, WireResponse,
 };
+use iceoryx2::prelude::{FileName, SemanticString};
 use tokio::task::{JoinHandle, JoinSet};
 
 pub const ROBOT_NAME: &str = "schema-robot";
 
-pub fn manager(network: bool) -> Arc<TransportManager> {
+static ROOT: OnceLock<IsolatedRoot> = OnceLock::new();
+static LIVE_USES: Mutex<usize> = Mutex::new(0);
+
+pub struct RootUse;
+
+impl RootUse {
+    fn acquire() -> Self {
+        let mut live = LIVE_USES.lock().unwrap_or_else(|error| error.into_inner());
+        let root = ROOT.get_or_init(|| IsolatedRoot::mint("s"));
+        std::fs::create_dir_all(&root.root).unwrap();
+        *live += 1;
+        Self
+    }
+}
+
+impl Drop for RootUse {
+    fn drop(&mut self) {
+        let mut live = LIVE_USES.lock().unwrap_or_else(|error| error.into_inner());
+        *live -= 1;
+        if *live == 0 {
+            std::fs::remove_dir_all(&ROOT.get().unwrap().root).unwrap();
+        }
+    }
+}
+
+pub fn manager(network: bool) -> (RootUse, Arc<TransportManager>) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    TransportManager::init_for_test(
+    let root = RootUse::acquire();
+    let isolated = ROOT.get().unwrap();
+    let mut iox_config = isolated.config();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    // Listener socket paths include the root, prefix and ID within a 108-byte budget.
+    let prefix = format!("{}{n}_", isolated.prefix);
+    iox_config.global.prefix = FileName::new(prefix.as_bytes()).unwrap();
+    let manager = TransportManager::init_for_test(
         TransportConfig {
-            node_name: format!(
-                "schema_{}_{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ),
+            node_name: format!("schema_{}_{}", std::process::id(), n),
             network: network.then(|| NetworkConfig {
                 listen_endpoints: vec!["tcp/127.0.0.1:0".into()],
                 robot_identity: Some(ROBOT_NAME.into()),
@@ -47,9 +77,10 @@ pub fn manager(network: bool) -> Arc<TransportManager> {
             }),
             ..Default::default()
         },
-        cerulion_core::testing::iceoryx_test_config(),
+        iox_config,
     )
-    .unwrap()
+    .unwrap();
+    (root, manager)
 }
 
 struct NoRemoteQueries;
@@ -79,10 +110,11 @@ pub struct LocalNetd {
     pub plane: Arc<GatewayEgressPlane>,
     daemon: RunningNetd,
     _directory: tempfile::TempDir,
+    _root: RootUse,
 }
 impl LocalNetd {
     pub fn start() -> Self {
-        let manager = manager(true);
+        let (root, manager) = manager(true);
         let plane = Arc::new(GatewayEgressPlane::new_without_mdns_for_test(
             manager.clone(),
         ));
@@ -103,6 +135,7 @@ impl LocalNetd {
             plane,
             daemon,
             _directory: directory,
+            _root: root,
         }
     }
     pub fn client(&self) -> NetdClient {
