@@ -274,6 +274,7 @@ fn register_topic(netd: &LocalNetd) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_library_host_serves_the_catalog_through_the_injected_control_socket() {
+    let _root = fixture::RootUse::acquire();
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
     let netd = LocalNetd::start();
@@ -349,6 +350,7 @@ async fn a_library_host_serves_the_catalog_through_the_injected_control_socket()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_error() {
+    let _root = fixture::RootUse::acquire();
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
     let (_iox_root, manager) = fixture::manager(false);
@@ -374,6 +376,7 @@ async fn a_control_socket_with_no_daemon_refuses_the_catalog_with_the_provider_e
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_process_schema_source_names_the_catalog_and_serves_the_closure() {
+    let _root = fixture::RootUse::acquire();
     let root = tempfile::tempdir().unwrap();
     provision(root.path(), public(ROBOT_SEED));
     let (_iox_root, manager) = fixture::manager(false);

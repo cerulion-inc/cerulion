@@ -120,6 +120,7 @@ fn frame(hash: u64) -> [u8; WireHeader::SIZE] {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_registration_serves_exact_nested_closure_and_names_builtin_wire_hash() {
+    let _root = fixture::RootUse::acquire();
     let netd = LocalNetd::start();
     let endpoint = disabled_endpoint([72; 32]).await;
     let robot = Robot::start(
@@ -222,6 +223,7 @@ async fn late_registration_serves_exact_nested_closure_and_names_builtin_wire_ha
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn different_shared_memory_namespace_refuses_catalog_and_schema() {
+    let _root = fixture::RootUse::acquire();
     let netd = LocalNetd::start();
     let (_root, other_namespace) = manager(false);
     assert_ne!(
@@ -285,6 +287,7 @@ fn assert_closed(reader: &mut BufReader<std::os::unix::net::UnixStream>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_metadata_only_schema_read_does_not_create_temporary_policy_services() {
+    let _root = fixture::RootUse::acquire();
     use iceoryx2::prelude::CallbackProgression;
     use iceoryx2::service::Service;
 
@@ -369,6 +372,7 @@ async fn a_metadata_only_schema_read_does_not_create_temporary_policy_services()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_changed_while_the_local_provider_is_awaited_refuses_the_pending_schema() {
+    let _root = fixture::RootUse::acquire();
     for mirror in [false, true] {
         let netd = LocalNetd::start();
         let mut registration = netd.client();
@@ -463,6 +467,7 @@ async fn privacy_changed_while_the_local_provider_is_awaited_refuses_the_pending
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_oversized_and_silent_local_sources_fail_closed_and_close_their_sockets() {
+    let _root = fixture::RootUse::acquire();
     for (index, kind) in ["malformed", "oversized", "silent"].into_iter().enumerate() {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let path = directory.path().join("netd.sock");
@@ -503,6 +508,7 @@ async fn malformed_oversized_and_silent_local_sources_fail_closed_and_close_thei
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revocation_while_local_provider_is_awaited_refuses_the_pending_schema() {
+    let _root = fixture::RootUse::acquire();
     let netd = LocalNetd::start();
     let mut registration = netd.client();
     registration

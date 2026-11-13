@@ -36,10 +36,12 @@ pub const ROBOT_NAME: &str = "schema-robot";
 static ROOT: OnceLock<IsolatedRoot> = OnceLock::new();
 static LIVE_USES: Mutex<usize> = Mutex::new(0);
 
+// Bind first in each test so every transport handle drops before the last holder
+// removes the process's root. Later tests recreate the same directory on acquire.
 pub struct RootUse;
 
 impl RootUse {
-    fn acquire() -> Self {
+    pub fn acquire() -> Self {
         let mut live = LIVE_USES.lock().unwrap_or_else(|error| error.into_inner());
         let root = ROOT.get_or_init(|| IsolatedRoot::mint("s"));
         std::fs::create_dir_all(&root.root).unwrap();
