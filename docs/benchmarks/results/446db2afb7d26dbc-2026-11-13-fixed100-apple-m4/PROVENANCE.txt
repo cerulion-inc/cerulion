@@ -1,0 +1,129 @@
+APPLE M4 PLATFORM CAMPAIGN, MACOS 27.2.1, FIXED100
+
+Build:   main f34b950f9814564557f5b73f3f7dcc0d9330b8cb (Cerulion 2.0.0, the
+         v2.0.0 tag plus two commits: 7678020ec moves the hickory DNS crates
+         to 0.26.3 in Cargo.lock, and f34b950f9 changes cerulion_vizd, which
+         neither cerulion nor cerulion-netd links), with the latency pod node
+         change committed on top as 27a091784b5e03ca6d29fcf1d9c853f16c642fb2,
+         the run.json git_sha. That commit is not on main. It changes only the
+         three pod node crates of the latency workspace (3 files, 30 lines
+         added and 21 removed: evidence/pod-node-fix.diff is
+         git diff -U0 f34b950f9 27a091784). The pod nodes are built with the
+         latency workspace but are not on the variable-class graphs
+         (rtt_bench, rtt_bench_split) these cells run.
+         cerulion-netd was built from the same checkout with
+         cargo build --release -p cerulion_netd --bin cerulion-netd, because
+         the harness at that sha builds only the CLI and a 2.0.0 serving run
+         spawns netd beside it. cerulion-remoted and cerulion-connectd were
+         not built.
+         cerulion binary sha256 cd0911047b6af249b0c1233f11e84792253a3be4f7f4fe967e914bb707c5dc5a
+         cerulion-netd sha256 1ae17a7ccb1b64a125db62ca91cf3d2aaa0b0731c78ccd57dbd1079947dd7b00
+         rustc 1.98.1 (48a229cea 2026-09-01)
+Dirty:   invocation 0 reads git_dirty: false (a clean tree at its start).
+         Invocations 1 to 11 read true. The only tracked change is
+         benches/latency/workspace/Cargo.lock gaining the cerulion_node_abi
+         package and stabby's libloading dependency, which the committed
+         lockfile does not list and the build added
+         (evidence/workspace-cargo-lock.diff). The run's own output directory
+         also sat untracked inside the checkout, under
+         benches/latency/results/, and `git status --porcelain`, which
+         bench.py reads, counts untracked files, so from invocation 1 on that
+         directory alone reads dirty.
+Measured: 2026-11-13, 00:22:17Z to 01:05:41Z UTC, invocations 2 to 11, which
+         hold every kept sample. This package is named by that UTC date, like
+         the other packages. The harness named the run directory on the
+         measuring machine 446db2afb7d26dbc-2026-11-12-fixed100, by the
+         machine's local date (UTC-08:00) when invocation 0 started.
+Machine: Apple M4 laptop (Mac16,12), 10 cores, 24 GB, macOS 27.2.1 arm64
+         (Darwin 27.2.0), 24 MHz timebase (41.667 ns per tick), machine hash
+         446db2afb7d26dbc. It is the laptop of
+         0b7bc3994f78e232-2026-09-17-fixed100-apple-m4, measured then under
+         macOS 26. On macOS the hash covers only the Darwin kernel release
+         (25.6.0 then, 27.2.0 now) because the CPU fields it hashes are not
+         readable there, so the two prefixes differ.
+Shape:   cerulion_workspace_split_chrt0 is two worker processes, free run,
+         CERULION_EXECUTION_MODE unset. cerulion_workspace_mono_chrt0 is one
+         process. fixed100, chrt 0, msg-class variable, recorder ON at the
+         shipped default, k=5 x 2000 samples per size per leg, both legs once
+         in each rep.
+         Every other setting was the shipped default except
+         CERULION_CPU_DMA_LOCK=1, which the logs show was ignored on macOS.
+         CER_BENCH_DMA_LOCK was unset, so the harness exported
+         CERULION_CPU_DMA_LOCK=1 to every leg, and run.json reads
+         dma_lock_posture "tuned" in all 12 invocations. The lock does
+         nothing outside Linux: "CPU C-state cap requested but unsupported on
+         this OS (Linux-only); ignoring" is in 50 of 50 split logs (100 lines,
+         one per worker process) and 50 of 50 mono logs. No cap was taken, so
+         the rows are stock in effect, which is what the chart's STOCK label
+         says. The macOS 26 package ran with CER_BENCH_DMA_LOCK=0.
+         The machine was signed in to a Cerulion account, and the legs serve
+         the network by default. cerulion-remoted was not built beside
+         cerulion-netd, so automatic robot registration failed and retried in
+         every cell: 50 of 50 logs per leg read "automatic robot registration
+         failed" with "no executable cerulion-remoted beside netd", and the
+         failure count reaches 10 in every log. Remote access was off for
+         this campaign.
+         No raw iceoryx2 cell was run:
+         0b7bc3994f78e232-2026-09-17-fixed100-apple-m4 records why the raw
+         iceoryx2 fixed100 cell does not hold 100 Hz on macOS. No zenoh or
+         ROS 2 cell was run.
+
+Run history: run.json carries all 12 invocations.
+  Invocations 0 and 1 are two rep 1 split attempts recorded as fail:
+  2026-11-12T21:07:35Z to 21:13:23Z UTC (348 s) and 2026-11-13T00:16:52Z to
+  00:17:01Z UTC (9 s). Each wrote the same leg log, which the rep 1 split
+  re-run later overwrote, so the run does not record why either failed.
+  Beyond their two run.json records, no file from either attempt is in this
+  package or behind its figures: every .bin sample, .rate sidecar and run log
+  of the run has a modification time inside invocations 2 to 11, in the
+  invocation of its own rep and leg. cerulion-netd was built after the second
+  attempt, before the re-run. Invocation 2 is the kept rep 1 split.
+  Invocations 3 to 11 are rep 1 mono and reps 2 to 5 of both legs, all ok.
+
+Witnesses (every per-size run log, ANSI-stripped before every match, 50 logs
+per leg. The logs are not shipped. recorder_state.json carries the per-log
+recorder and mode fields.)
+  recorder ON, both legs: "flashback: holding a rolling window for this run"
+    in 50 of 50 logs per leg, the window-recorder decision window=
+    "own_recorder" in 50 of 50, "Flashback capture plane ARMED" in 50 of 50,
+    the recorder-off line in 0 and "--no-rings" in 0.
+  recorder absorbance, both legs: 50 of 50 logs per leg carry the run-end
+    warn "recording carried taps that COULD NOT ABSORB this run's own drain
+    stalls", naming the /rtt_bench/ping/ping_out and /rtt_bench/pong/echo_out
+    taps (depth 3, budgeted, against the 5 to 11 frames the measured stall
+    tail needs). The recorder's completion line reads frames_lost=0 in 100
+    of 100 logs, with loss_counting_basis="prefix_invisible": loss before a
+    tap's first drained frame is not counted. "the BYTE CEILING is the
+    binding limit" is in 15 of 50 logs per leg (1 MiB, 4 MiB and 16 MiB, in
+    every rep).
+  free run, split: execution_mode=FreeRun workers=2 stamped in 50 of 50
+    logs, "free-run deployment: no shared barrier is created" in 50 of 50,
+    build_path=FreeRunTraced on 100 of 100 worker lines, doorbell=true and
+    barrier=false on 100 of 100 wait-policy lines. execution_mode=Lockstep,
+    the lockstep gating quantum and the INERT warn are in 0 of 50.
+  data wake, split, per process group (park telemetry at worker exit):
+    g2 holds pong and latency, the cross-process consumers. Its wait policy
+      reads data_wake=true in 50 of 50 logs. 105,000 doorbell wakes of
+      105,010 park entries, 0 timeout wakes. In each of the 50 cells it has
+      2,100 doorbell wakes, one per round trip (the latency node reads
+      received=2100 measured=2100), and 0 timeout wakes.
+    g1 holds ping, paced by its own 100 Hz timer. Its wait policy reads
+      data_wake=false in 50 of 50 logs. 105,847 park entries, all timeout
+      wakes: the producer's pacing, not a missed data wake.
+  samples: "dumped 2000 samples" in 50 of 50 logs per leg.
+
+Rate:    every .rate sidecar in this package reads 100 (100 of 100).
+
+Scrub applied to run.json: the uname node field reads box-arm64 in all 12
+invocations, the label the macOS 26 package of the same laptop uses. No
+other field is changed.
+
+CSV: the data rows are compile_csv.py's output byte for byte. The leading "#"
+schema-note lines use the ASCII form the other packages ship.
+
+Evidence: evidence/pod-node-fix.diff (the pod node commit against its main
+parent, changed lines only, no context lines) and
+evidence/workspace-cargo-lock.diff (the working-tree change behind git_dirty,
+taken on the measuring machine).
+
+No .bin samples and no run logs are in this package.

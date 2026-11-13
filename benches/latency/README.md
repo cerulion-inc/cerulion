@@ -665,7 +665,7 @@ about.
 |---|---|---|
 | box-x86 | x86-64 Linux workstation (WAITPKG) | **Primary.** The full sweep runs here; committed baselines and results come from this machine. |
 | box-jetson | aarch64 Jetson Orin (WFE) | Cerulion-vs-Cerulion platform lines; published as [`9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx`](../../docs/benchmarks/results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/). |
-| mac | Apple Silicon macOS | Cerulion-vs-Cerulion platform lines, published as [`0b7bc3994f78e232-2026-09-17-fixed100-apple-m4`](../../docs/benchmarks/results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/), plus dev smoke. chrt-on and `no_shm` cells are skipped here by design, and with no CPU governor to pin a macOS sweep carries no governor receipt, so it stays a platform package and is never mixed into the cross-stack comparison. |
+| mac | Apple Silicon macOS | Cerulion-vs-Cerulion platform lines, published as [`446db2afb7d26dbc-2026-11-13-fixed100-apple-m4`](../../docs/benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/), plus dev smoke. chrt-on and `no_shm` cells are skipped here by design, and with no CPU governor to pin a macOS sweep carries no governor receipt, so it stays a platform package and is never mixed into the cross-stack comparison. |
 
 The first column is a short label for the machine, not a host name; each
 published package records its own capture alias and machine hash in
