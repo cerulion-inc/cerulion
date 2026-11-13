@@ -919,6 +919,7 @@ fn record_uniform_with_read_log_and_feed(
         16,
         true,
         Some(feed),
+        &[],
     )
 }
 
@@ -971,11 +972,16 @@ fn record_reference_impl(
         subscriber_buffer,
         read_log,
         None,
+        &[],
     )
 }
 
 /// [`record_reference_impl`] with `in_step_feed`, which parks one drive's
-/// publisher where a node can reach it ([`InStepFeed`]).
+/// publisher where a node can reach it ([`InStepFeed`]), and `drivers`, the
+/// `external` nodes the run fires before every step, as their device's wake
+/// does live.
+// Every argument is one independent knob of the reference run.
+#[allow(clippy::too_many_arguments)]
 fn record_reference_impl_fed(
     graph_yaml: &str,
     make_factories: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
@@ -984,6 +990,7 @@ fn record_reference_impl_fed(
     subscriber_buffer: usize,
     read_log: bool,
     in_step_feed: Option<&InStepFeed>,
+    drivers: &[&str],
 ) -> Recording {
     let config = cerulion_core::graph::parse_graph(graph_yaml).expect("reference graph parses");
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
@@ -1083,6 +1090,11 @@ fn record_reference_impl_fed(
                 proxy.x = *value;
                 drop(proxy); // publish
             }
+        }
+        for id in drivers {
+            runtime
+                .trigger_external(id)
+                .unwrap_or_else(|e| panic!("reference driver {id} must fire: {e}"));
         }
         runtime.step(Duration::from_millis(*delta_ms));
         // The per-step STEP_BOUNDARY record: the step's ADVANCED clock (what
@@ -41608,6 +41620,28 @@ fn ri_replay_reporting(
     feed_index_budget: Option<u64>,
     report_path: Option<std::path::PathBuf>,
 ) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_stamped(
+        bag,
+        make,
+        purpose,
+        duration_bound_ns,
+        feed_index_budget,
+        report_path,
+        RecordHealthReport::Absent,
+    )
+}
+
+/// [`ri_replay_reporting`] of a bag whose record-health stamp reads
+/// `record_health`.
+fn ri_replay_stamped(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+    report_path: Option<std::path::PathBuf>,
+    record_health: RecordHealthReport,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
     ri_take();
     let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(bag);
     let clock = Arc::new(VirtualClock::new());
@@ -41629,7 +41663,7 @@ fn ri_replay_reporting(
         recorded_messages,
         env_json,
         recorder,
-        record_health: RecordHealthReport::Absent,
+        record_health,
         duration_bound_ns,
         feed_index_budget,
         report_path,
@@ -43616,4 +43650,453 @@ fn the_oracle_catches_writer_runs_on_a_multi_writer_edge() {
         );
         assert!(caught, "{name}: the read log caught no divergence");
     }
+}
+
+// ===========================================================================
+// External (driver) nodes: their outputs are recorded inputs
+// ===========================================================================
+//
+// A driver reads a device only the live run has. The reference run builds the
+// camera below CONNECTED, so every wake publishes the device's next reading;
+// a replay builds it with no device, the way a camera node finds no open fd at
+// replay, so its tick publishes nothing. Every frame carries the device id in
+// `x` (one writer per topic, which is what the read-identity bag writers read
+// `x` as), the reading's index `k` in `y`, and a value in `z`: the device's k-th
+// reading is the hand oracle `z = 3k + 2`, and the meter publishes
+// `z * gain + 1`, so every recorded and replayed value below is checked against
+// arithmetic, never against another run.
+
+/// The tag the camera logs each reading it publishes under.
+const DRV_CAMERA: f64 = 6.0;
+/// The tag the meter logs each frame it reads under.
+const DRV_METER: f64 = 7.0;
+/// The recorded meter's gain.
+const DRV_GAIN: f64 = 10.0;
+/// The camera device's id, in every frame's `x`.
+const DRV_DEVICE: f64 = 1.0;
+/// The camera's output topic.
+const DRV_IMAGE: &str = "/drv/cam/image";
+/// The meter's output topic.
+const DRV_BRIGHTNESS: &str = "/drv/meter/brightness";
+
+/// A camera driver: an `external` node fired by its device.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvCameraNode {
+    #[output]
+    image: Vector3,
+    /// The device is attached: true in the live run only.
+    connected: bool,
+    /// Readings published so far.
+    frames: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvCameraNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        if !self.connected {
+            // No device: nothing to dequeue, and an output a tick never
+            // writes is never published.
+            return Ok(());
+        }
+        self.frames += 1.0;
+        let k = self.frames;
+        let reading = 3.0 * k + 2.0;
+        self.image.x = DRV_DEVICE;
+        self.image.y = k;
+        self.image.z = reading;
+        ri_log(DRV_CAMERA, DRV_DEVICE, k, reading);
+        Ok(())
+    }
+}
+
+/// A data-triggered meter over the camera's frames.
+#[cerulion_node]
+#[derive(Default)]
+struct DrvMeterNode {
+    #[input(trigger)]
+    image: Vector3,
+    #[output]
+    brightness: Vector3,
+    gain: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvMeterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let x = self.image.x;
+        let y = self.image.y;
+        let z = self.image.z;
+        ri_log(DRV_METER, x, y, z);
+        self.brightness.x = x;
+        self.brightness.y = y;
+        self.brightness.z = z * self.gain + 1.0;
+        Ok(())
+    }
+}
+
+/// The camera feeding the meter: the shape of `examples/v4l2_camera`.
+fn drv_yaml() -> &'static str {
+    "name: drv\nprefix: drv\nnodes:\n\
+     \x20 - id: cam\n    type: drv_camera_node\n    outputs:\n      - name: image\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: cam/image\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn drv_factories(connected: bool, gain: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "cam",
+            Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live run: the camera's device is attached.
+fn drv_live_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_factories(true, DRV_GAIN)
+}
+
+/// The replayed candidate: the same nodes, and no device.
+fn drv_replay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_factories(false, DRV_GAIN)
+}
+
+/// A candidate whose meter changed its gain.
+fn drv_changed_meter_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_factories(false, DRV_GAIN + 1.0)
+}
+
+/// A Vector3 wire frame's `(x, y, z)`.
+fn drv_xyz(frame: &[u8]) -> (f64, f64, f64) {
+    let payload = &frame[WireHeader::SIZE..];
+    let at = |i: usize| f64::from_le_bytes(payload[i * 8..i * 8 + 8].try_into().unwrap());
+    (at(0), at(1), at(2))
+}
+
+/// The live run, its camera fired before every step as its device wakes it,
+/// anchored to the hand oracle: the camera published reading k = 1..=N with
+/// `z = 3k + 2`, the meter read each in order and published `z = 30k + 21`.
+fn drv_record() -> RiLive {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_yaml(),
+        drv_live_factories,
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["cam"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let image = &live.rec.messages[DRV_IMAGE];
+    assert!(
+        image.len() >= RI_MIN_READS,
+        "PREMISE: the camera published every wake: {} frames",
+        image.len()
+    );
+    for (i, f) in image.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 3.0 * k + 2.0),
+            "recorded camera frame {i}"
+        );
+    }
+    let brightness = &live.rec.messages[DRV_BRIGHTNESS];
+    assert!(
+        brightness.len() >= RI_MIN_READS,
+        "PREMISE: the meter published: {} frames",
+        brightness.len()
+    );
+    for (i, f) in brightness.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 30.0 * k + 21.0),
+            "recorded meter frame {i}"
+        );
+    }
+    let meter_reads: Vec<(f64, f64, f64)> = ri_by_consumer(&live.reads)
+        .remove(&DRV_METER.to_bits())
+        .unwrap_or_default()
+        .iter()
+        .map(|(x, y, z)| (f64::from_bits(*x), f64::from_bits(*y), f64::from_bits(*z)))
+        .collect();
+    let want: Vec<(f64, f64, f64)> = (1..=brightness.len())
+        .map(|k| (DRV_DEVICE, k as f64, 3.0 * k as f64 + 2.0))
+        .collect();
+    assert_eq!(
+        meter_reads, want,
+        "the live meter read every reading in order"
+    );
+    live
+}
+
+/// The camera and the meter in one process (`--single-process`): a
+/// single-rank free-run bag.
+fn drv_single_rank_bag(live: &RiLive, dir: &std::path::Path) -> std::path::PathBuf {
+    let bag = dir.join("drv_single.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    bag
+}
+
+/// One process per node, the `graph run` default: the meter on rank 1.
+fn drv_two_rank_bag(live: &RiLive, dir: &std::path::Path) -> std::path::PathBuf {
+    let bag = dir.join("drv_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "meter");
+    bag
+}
+
+/// A `--verify` replay of a driver graph passes with exit 0: the meter is fed
+/// the camera's recorded frames by read identity, reproduces its recorded
+/// readings byte for byte and is the one topic checked and credited. The
+/// camera's topic is a recorded input, so no `missing-topic` is reported
+/// although the replayed camera, with no device, published nothing. Both
+/// process layouts.
+#[test]
+#[serial]
+fn a_verify_of_a_driver_graph_feeds_the_driver_frames_and_passes() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let meter_reads = ri_by_consumer(&live.reads)[&DRV_METER.to_bits()].len();
+    for (layout, bag) in [
+        ("single-rank", drv_single_rank_bag(&live, dir.path())),
+        ("two-rank", drv_two_rank_bag(&live, dir.path())),
+    ] {
+        let (outcome, replayed) = ri_replay(
+            &bag,
+            drv_replay_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: no violation, the camera's topic least of all: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}: the replay passes");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}: exit 0");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked and credited"
+        );
+        assert_eq!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::Fed {
+                reads: meter_reads,
+                frames: meter_reads
+            },
+            "{layout}: each meter read was fed the one camera frame it read live"
+        );
+        let compared = ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: {e}"));
+        assert_eq!(compared, meter_reads, "{layout}");
+        assert!(
+            !ri_by_consumer(&replayed).contains_key(&DRV_CAMERA.to_bits()),
+            "{layout}: the replayed camera had no device and published nothing"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        let pass_line = format!(
+            "replay PASS: {} ({} tick(s) replayed, 1/1 topic(s) matched byte-for-byte and were \
+             credited)",
+            bag.display(),
+            outcome.ticks_replayed
+        );
+        assert!(
+            verdict.lines().any(|l| l == pass_line),
+            "{layout}: the PASS line: {verdict}"
+        );
+        assert!(!verdict.contains("missing-topic"), "{layout}: {verdict}");
+    }
+}
+
+/// A candidate whose meter changed fails with exit 1, naming the meter's
+/// topic as a byte mismatch and nothing about the camera's.
+#[test]
+#[serial]
+fn a_changed_meter_in_a_driver_graph_exits_1_naming_its_topic() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    for (layout, bag) in [
+        ("single-rank", drv_single_rank_bag(&live, dir.path())),
+        ("two-rank", drv_two_rank_bag(&live, dir.path())),
+    ] {
+        let (outcome, _) = ri_replay(
+            &bag,
+            drv_changed_meter_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(!outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 1, "{layout}: exit 1");
+        let named: Vec<(&str, &ViolationClass)> = outcome
+            .violations
+            .iter()
+            .map(|v| (v.topic.as_str(), &v.class))
+            .collect();
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(DRV_BRIGHTNESS, ViolationClass::ByteMismatch { .. })]
+            ),
+            "{layout}: exactly the meter's byte mismatch: {named:?}"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert!(
+            verdict.contains(&format!("  - {DRV_BRIGHTNESS} [byte-mismatch]: ")),
+            "{layout}: {verdict}"
+        );
+        assert!(!verdict.contains(DRV_IMAGE), "{layout}: {verdict}");
+    }
+}
+
+/// A bag whose record-health stamp says the recorder lost camera frames still
+/// fails with exit 1, naming the camera's topic: its input stream is not the
+/// one the live meter read.
+#[test]
+#[serial]
+fn a_driver_topic_stamped_lossy_still_fails_naming_it() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        health_stamp(&[(DRV_IMAGE, 2, 1, false, false)], 0),
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    assert_sole_tap_loss(&outcome, DRV_IMAGE, 2, 1, false);
+    assert_eq!(resim_exit(&outcome, true), 1);
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 1),
+        "the lossy camera topic is checked and failed, the meter's passed"
+    );
+}
+
+/// A bag that lost a camera frame the meter read is refused with exit 2,
+/// naming the meter's read and the lost frame: the replay never feeds it
+/// another frame in its place.
+#[test]
+#[serial]
+fn a_driver_bag_missing_a_frame_the_meter_read_is_refused_naming_it() {
+    let mut live = drv_record();
+    // Reading k = 11, a frame the live meter read (it read every one).
+    let lost = live.rec.messages[DRV_IMAGE].remove(10);
+    assert_eq!(
+        drv_xyz(&lost),
+        (DRV_DEVICE, 11.0, 35.0),
+        "PREMISE: reading k = 11 is 3k + 2"
+    );
+    let lost_seq = WireHeader::read_from_buf(&lost)
+        .expect("a camera frame carries a wire header")
+        .sequence;
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let (outcome, _) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a read of a frame the bag lost is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_frame_missing",
+        "node 'meter'",
+        "input 'image'",
+        &format!("topic '{DRV_IMAGE}'"),
+        &format!("sequence {lost_seq}: "),
+        "the recorder lost it",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// Two replays of one driver bag are identical: the same `--report` bytes and
+/// the same reads, element for element.
+#[test]
+#[serial]
+fn a_verify_of_a_driver_graph_is_deterministic() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let mut runs = Vec::new();
+    for run in 0..2 {
+        let report = dir.path().join(format!("drv_report_{run}.json"));
+        let (outcome, replayed) = ri_replay_reporting(
+            &bag,
+            drv_replay_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("run {run}: {e}"));
+        assert!(outcome.passed, "run {run}: {:?}", outcome.violations);
+        runs.push((
+            std::fs::read(&report).expect("the report is written"),
+            replayed,
+        ));
+    }
+    assert!(!runs[0].1.is_empty(), "PREMISE: the meter read");
+    assert_eq!(runs[0].0, runs[1].0, "byte-identical reports");
+    assert_eq!(runs[0].1, runs[1].1, "identical reads");
+}
+
+/// A neutral `--resim all` of the two-rank bag feeds the meter through the
+/// injector on its cross-rank edge, since a resim without `--verify` feeds no
+/// read by identity: the camera's topic is still the meter's input there, and
+/// the meter still reproduces its readings.
+#[test]
+#[serial]
+fn a_neutral_resim_of_a_driver_graph_injects_the_driver_frames_across_ranks() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("the neutral resim runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::BestEffort { .. }
+        ),
+        "PREMISE: a neutral resim feeds no read by identity: {:?}",
+        outcome.read_identity
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 1));
+    ri_judge(&live.reads, &replayed, &[DRV_METER]).expect("the meter's reads are the live ones");
 }
