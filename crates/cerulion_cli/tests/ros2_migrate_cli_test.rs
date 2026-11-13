@@ -14,7 +14,8 @@
 //! tempdir and mutates only the CHILD's environment.
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -64,11 +65,6 @@ fn git(ws: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim_end().to_string()
-}
-
-fn write_executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// A synthetic colcon ws + git repo + a stub engine emitting the canned
@@ -145,12 +141,12 @@ fn make_fixture(colcon_exit: i32) -> Fixture {
     let bin_dir = root.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let tool = bin_dir.join("stub-migrate-engine");
-    write_executable(
+    fresh_executable::install_script(
         &tool,
         &format!("#!/bin/sh\ncat '{}'\n", analysis_file.display()),
     );
     let colcon_log = root.join("colcon.argv");
-    write_executable(
+    fresh_executable::install_script(
         &bin_dir.join("colcon"),
         &format!(
             "#!/bin/sh\necho \"$@\" > '{}'\nexit {}\n",
@@ -863,7 +859,7 @@ fn make_pausing_fixture(tus: usize) -> (Fixture, EngineSeams) {
         started: root.join("engine.started"),
         go: root.join("engine.go"),
     };
-    write_executable(
+    fresh_executable::install_script(
         &fx.tool,
         &format!(
             "#!/bin/sh\ntrap 'exit 130' INT\necho x >> '{}'\n: > '{}'\ni=0\nwhile [ ! -e '{}' ] && [ \"$i\" -lt 400 ]; do sleep 0.05; i=$((i+1)); done\ncat '{}'\n",

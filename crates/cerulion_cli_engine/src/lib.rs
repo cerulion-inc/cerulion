@@ -320,6 +320,11 @@ pub mod viz_cmd;
 pub mod wedge_alarm;
 pub mod workspace;
 
+/// Shell scripts a test writes and runs at once, guarded against ETXTBSY. The
+/// `tests/*.rs` binaries that need it compile the same file by `#[path]`.
+#[cfg(all(test, unix))]
+mod fresh_executable;
+
 /// The ONE crate-wide lock serializing every env-mutating
 /// **lib** test in `cerulion_cli_engine`.
 ///

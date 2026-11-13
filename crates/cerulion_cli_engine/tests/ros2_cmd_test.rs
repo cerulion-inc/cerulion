@@ -16,6 +16,10 @@
 //! {69, 127} contract over the shipped `cerulion`) lives in
 //! `cerulion_cli/tests/ros2_run_e2e_test.rs`.
 
+#[cfg(unix)]
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 
 use cerulion_cli_engine::error::CliError;
@@ -4245,15 +4249,12 @@ fn the_plan_records_the_identity_of_every_file_it_hands_the_child() {
 
 // ── Spawn-based env application (unix fixture script) ───────────────────────
 
-/// Write an executable shell script into `dir` and return its path.
+/// Write an executable shell script into `dir` and return its path once it
+/// can be executed.
 #[cfg(unix)]
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, body).expect("write script");
-    let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("chmod");
+    fresh_executable::install_script(&path, body);
     path
 }
 

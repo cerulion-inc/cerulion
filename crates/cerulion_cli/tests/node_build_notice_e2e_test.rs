@@ -21,6 +21,9 @@
 //! message (`cargo` not on `PATH`) is a pure mapping in the engine, and only
 //! a spawned binary can show the spawn error still reaches it.
 
+#[cfg(unix)]
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -245,10 +248,8 @@ fn node_build_off_a_terminal_names_the_rust_install_command_and_never_asks() {
 /// PATH that holds nothing else.
 #[cfg(unix)]
 fn stub(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path.parent().expect("a stub has a parent")).expect("stub dir");
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write a stub");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod a stub");
+    fresh_executable::install_script(path, &format!("#!/bin/sh\n{body}\n"));
 }
 
 /// One hand-built machine for [`node_build_off_a_terminal_names_what_each_machine_needs`].
