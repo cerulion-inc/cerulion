@@ -6,17 +6,18 @@
 //! *One data source = one topic.* A remote robot's topic must NEVER present as a
 //! second LOCAL topic just because the desk mirrors it into local SHM. When a
 //! desk process re-injects a remote topic, its local SHM channel need not have
-//! the canonical wire topic's name. Source-qualified topic and visualization
-//! observers use `/__cerulion/observers/{robot_hash}/{topic_hash}` channels;
-//! wire/2 and graph ingress retain the canonical topic name. This registry is
-//! the OUT-OF-BAND provenance channel that attributes BOTH kinds of local
+//! the canonical wire topic's name. WAN topic and visualization observers use
+//! source-qualified `/__cerulion/observers/{robot_hash}/{topic_hash}` channels;
+//! LAN observers, wire/2 ingress and graph ingress retain the canonical topic
+//! name. This registry is the OUT-OF-BAND provenance channel that attributes
+//! BOTH kinds of local
 //! channel to their origin robot. Each record carries the actual local channel
 //! name, so `topic list` (and Studio) can fold mirrors out of LOCAL topics
 //! without changing the canonical wire topic or frame bytes (Principle #7).
-//! For `/utlidar/robot_odom`, an observer subscribes to its source-qualified
+//! For `/utlidar/robot_odom`, a WAN observer subscribes to its source-qualified
 //! local channel; canonical ingress remains at `/utlidar/robot_odom`.
-//! `topic list` hides observer channels unless `--all` is set, then marks them
-//! `[internal]` alongside their origin attribution and streaming marker.
+//! `topic list` hides source-qualified channels unless `--all` is set, then
+//! marks them `[internal]` alongside their origin attribution and streaming marker.
 //!
 //! # The control service
 //!
@@ -246,9 +247,10 @@ pub const MAX_MIRROR_RECORD_LEN: usize =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorRecord {
     /// The actual (leading-slash) local SHM channel: a source-qualified
-    /// `/__cerulion/observers/` channel for observers, or the canonical topic
-    /// for wire/2 and graph ingress. Stored verbatim (NOT canonicalized) so it
-    /// equals `topic list`'s `/data`-stripped service name; `origin_robot`
+    /// `/__cerulion/observers/` channel for WAN observers, or the canonical topic
+    /// for LAN observers, wire/2 ingress and graph ingress. Stored verbatim
+    /// (NOT canonicalized) so it equals `topic list`'s `/data`-stripped service
+    /// name; `origin_robot`
     /// attributes either kind to its source.
     pub topic: String,
     /// The origin robot identity the mirror is attributed to (its hostname /
@@ -268,8 +270,9 @@ pub struct MirrorRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorStreamRow {
     /// The actual local channel, exactly as the local enumeration named it:
-    /// source-qualified under `/__cerulion/observers/` for observers, canonical
-    /// for wire/2 and graph ingress. `robot` attributes either kind to its source.
+    /// source-qualified under `/__cerulion/observers/` for WAN observers, canonical
+    /// for LAN observers, wire/2 ingress and graph ingress. `robot` attributes
+    /// either kind to its source.
     pub topic: String,
     /// The origin robot identity the mirror is attributed to.
     pub robot: String,
