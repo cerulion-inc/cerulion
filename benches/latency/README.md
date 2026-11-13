@@ -270,7 +270,9 @@ leg **declares** them instead of inheriting them:
   runner) until the park-wake fix lands. The `mono` leg passes `--single-process`
   (exactly one flag) to measure the single-process opt-in.
 - **Permissive networking by default.** Every real-clock live
-  run spawns a network gateway process (the robot's zenoh session). The
+  run spawns a network gateway process (the robot's zenoh session): the
+  `cerulion-netd` binary beside `cerulion`, which the workspace and
+  cross-host runners build in the same cargo invocation as the CLI. The
   gateway is a separate process that parks at zero demand and is not part
   of the measured SHM chain, and it is what every flagless user runs
   with, so NEITHER leg suppresses it (the
@@ -500,7 +502,8 @@ the baseline means).
 
 `workspace/run_workspace.sh` reads `CERULION` and runs whatever it names,
 defaulting to `<repo>/target/release/cerulion`. It rebuilds that DEFAULT
-path before running, so the rebuild protects the default and nothing
+path before running, together with the `cerulion-netd` gateway beside it
+(one cargo invocation), so the rebuild protects the default and nothing
 else, and an exported override survives it untouched. A campaign measured
 through a binary built from other code, while the run manifest records
 this checkout's SHA, is a mislabeled result rather than a failed one, so
@@ -546,14 +549,16 @@ name. Each guard matches the tool that actually reads the variable.)
 | **undatable** (no `git`, a sparse checkout, a source dated in the future) | **runs**, with a loud `proceeding UNVERIFIED` warning on stderr; refusing would block a campaign over a transient failure |
 | **stale**, older than the newest source in `cerulion_cli`'s member closure | **refused** (exit 1), naming how far behind |
 | **foreign**, built from another tree (its depfile says so, or it is outside every target dir this checkout writes) | **refused** (exit 1) |
+| accepted, but the **`cerulion-netd`** it would spawn (`CERULION_NETD_BIN` when set, else the daemon beside it) is missing, not executable, stale against the daemon's own member closure, or foreign | **refused** (exit 1), naming the paths it looked at: every leg serves the network, so `graph run` spawns that daemon and a CLI-only build fails each leg before its first sample. An undatable daemon runs with the same `proceeding UNVERIFIED` warning |
 | **whitespace-only** | **refused**: the shell does *not* treat it as unset, so the runner would take the spaces literally and abort on `[ ! -x ]` after its rebuild |
-| a **relative** path | **refused**: this process and the runner do not share a working directory, so it could name two different files |
+| a **relative** path, or a relative `CERULION_NETD_BIN` | **refused**: this process and the runner do not share a working directory, so it could name two different files |
 | a path ending in a **separator**, not a file, or not **executable** | **refused** |
 | under `workspace/target/debug` | **refused**: the runner `rm -rf`s that directory (its freshest-wins guard) before running `$CERULION` |
 
 Every refusal names the remedy: `unset CERULION`, or
-`cargo build -p cerulion_cli --release`. A **direct** `bash
-workspace/run_workspace.sh <leg>` invocation does not go through
+`cargo build -p cerulion_cli -p cerulion_netd --release`, which builds
+the CLI and the daemon it spawns in one invocation, as the runner does.
+A **direct** `bash workspace/run_workspace.sh <leg>` invocation does not go through
 `bench.py` and is not covered, and is **not a supported entry point**
 (see above): the policy is not duplicated in shell, it is declined there.
 
