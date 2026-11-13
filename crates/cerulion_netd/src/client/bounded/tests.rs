@@ -35,11 +35,13 @@ fn join_helper<T>(helper: std::thread::JoinHandle<T>) -> T {
     }
 }
 
-/// A busy-mirror clock the test drives. It starts at the real instant it is
-/// installed and moves only when the retry loop sleeps, each sleep waking
-/// `late` after the delay asked for. Round trips take no scripted time, and
-/// the budget's end, also their I/O deadline, is never earlier than the
-/// install instant plus the whole budget.
+/// A busy-mirror clock the test drives. It starts `HANG_BOUND` after the real
+/// instant it is installed and moves only when the retry loop sleeps, each
+/// sleep waking `late` after the delay asked for. Round trips take no scripted
+/// time, and the loop compares scripted instants only with each other, so the
+/// schedule does not depend on how fast the host runs. The budget's end, also
+/// the retry round trips' real I/O deadline, is never earlier than the install
+/// instant plus `HANG_BOUND` plus the whole budget.
 struct ScriptedClock {
     start: Instant,
     slept: Duration,
@@ -69,7 +71,7 @@ fn scripted_sleep(delay: Duration) {
 /// Runs `client`'s busy-mirror retries on a fresh scripted clock.
 fn script_retry_clock(client: &mut NetdClient, late: Duration) {
     SCRIPTED_CLOCK.set(Some(ScriptedClock {
-        start: Instant::now(),
+        start: Instant::now() + HANG_BOUND,
         slept: Duration::ZERO,
         late,
         requested: Vec::new(),
@@ -114,8 +116,9 @@ fn client_and_peer() -> (NetdClient, UnixStream) {
 }
 
 // Hand-written control replies; one socket proves retries retain the held key.
-// A test whose script runs the retry budget out drives it with
-// `script_retry_clock`; the others end well inside it on the real clock.
+// Every test whose script sends a transient refusal drives the retry budget
+// with `script_retry_clock`; a non-transient refusal is never retried and
+// never reads the budget.
 fn busy_mirror_peer(
     messages: Vec<&'static str>,
     persistent: bool,
@@ -196,11 +199,13 @@ fn busy_mirror_observe_and_demand_retry_then_acknowledge_on_the_same_connection(
                 false,
             );
             client.demand("arm", "/held", 7).unwrap();
+            script_retry_clock(&mut client, Duration::ZERO);
             let result = if observer {
                 client.observe("arm", "/topic", 7).map(|reply| reply.demand)
             } else {
                 client.demand("arm", "/topic", 7)
             };
+            assert_eq!(scripted_sleeps(), [23, 47].map(Duration::from_millis));
             assert!(client.release("arm", "/held").unwrap().last_release);
             drop(client);
             let counts = join_helper(worker);
@@ -284,7 +289,9 @@ fn busy_mirror_wrapped_ensure_refusals_retry_without_matching_another_source() {
     for _ in 0..2 {
         let (mut client, worker) = busy_mirror_peer(vec![wrapped], false);
         client.demand("arm", "/held", 7).unwrap();
+        script_retry_clock(&mut client, Duration::ZERO);
         let reply = client.observe("arm", "/topic", 7).unwrap();
+        assert_eq!(scripted_sleeps(), [Duration::from_millis(23)]);
         assert_eq!(reply.local_topic, "/topic");
         assert!(client.release("arm", "/held").unwrap().last_release);
         drop(client);

@@ -189,7 +189,8 @@ const MIRROR_BUSY_DELAYS: [Duration; 7] = [
 /// The clock the busy-mirror retry budget is read from and its backoffs sleep
 /// on. Every constructor installs [`MirrorBusyClock::MONOTONIC`]. The budget's
 /// end is also the retry round trips' I/O deadline, which `bounded_round_trip`
-/// measures on the monotonic clock.
+/// measures on the monotonic clock, so a clock whose `now` runs behind the
+/// monotonic one shortens that deadline.
 #[derive(Debug, Clone, Copy)]
 struct MirrorBusyClock {
     now: fn() -> Instant,
