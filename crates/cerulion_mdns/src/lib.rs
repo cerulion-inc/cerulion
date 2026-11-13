@@ -58,7 +58,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod browse;
 pub use browse::{browse_rung, browse_rung_report, instance_from_fullname, BrowseRungReport};
@@ -174,11 +174,16 @@ struct BeaconFactsOnDisk {
 /// `<state-root>/remoted/beacon_facts.json`. Automatic startup and this reader
 /// share the per-user root resolver; an explicit deployment override wins.
 fn beacon_facts_path() -> Option<PathBuf> {
-    Some(
-        cerulion_discovery::robot_state::resolve()?
-            .join(REMOTED_STATE_SUBDIR)
-            .join(BEACON_FACTS_FILENAME),
-    )
+    Some(facts_file_under(
+        &cerulion_discovery::robot_state::resolve()?
+    ))
+}
+
+/// The beacon-facts file under the robot state root `state_root`.
+fn facts_file_under(state_root: &Path) -> PathBuf {
+    state_root
+        .join(REMOTED_STATE_SUBDIR)
+        .join(BEACON_FACTS_FILENAME)
 }
 
 /// Load remoted's PUBLIC beacon facts, if present. An ABSENT file → `None`
@@ -205,6 +210,22 @@ fn read_beacon_facts() -> Result<Option<BeaconTxtFacts>, MdnsError> {
     let Some(path) = beacon_facts_path() else {
         return Ok(None);
     };
+    read_facts_file(path)
+}
+
+/// Read remoted's public beacon facts under the robot state root
+/// `state_root`, from `<state_root>/remoted/beacon_facts.json`: `Ok(None)` when
+/// the file is absent or does not parse (a malformed file is logged at debug),
+/// and an error when it is present but cannot be read.
+///
+/// # Errors
+///
+/// [`MdnsError::FactsRead`] naming the file and the read error.
+pub fn read_beacon_facts_at(state_root: &Path) -> Result<Option<BeaconTxtFacts>, MdnsError> {
+    read_facts_file(facts_file_under(state_root))
+}
+
+fn read_facts_file(path: PathBuf) -> Result<Option<BeaconTxtFacts>, MdnsError> {
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(parse_beacon_facts(&text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1184,6 +1205,38 @@ mod tests {
         assert_eq!(
             beacon_facts_path(),
             Some(dir.path().join("robot-state/remoted/beacon_facts.json"))
+        );
+    }
+
+    #[test]
+    fn read_beacon_facts_at_reads_the_facts_under_the_given_state_root() {
+        // No environment is read: the root is the caller's.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_beacon_facts_at(dir.path()).unwrap(), None);
+        std::fs::create_dir(dir.path().join("remoted")).unwrap();
+        assert_eq!(read_beacon_facts_at(dir.path()).unwrap(), None);
+        let eid = "ab".repeat(32);
+        std::fs::write(
+            dir.path().join("remoted/beacon_facts.json"),
+            format!(r#"{{"version":1,"eid":"{eid}","iroh_port":41234,"claimable":"0"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            read_beacon_facts_at(dir.path()).unwrap(),
+            Some(BeaconTxtFacts {
+                eid: Some(eid),
+                iroh_port: Some(41234),
+                claimable: Some("0".to_string()),
+            })
+        );
+        std::fs::write(dir.path().join("remoted/beacon_facts.json"), "{").unwrap();
+        assert_eq!(read_beacon_facts_at(dir.path()).unwrap(), None);
+        // A file that is there but cannot be read: a directory at its name.
+        let facts = dir.path().join("remoted/beacon_facts.json");
+        std::fs::remove_file(&facts).unwrap();
+        std::fs::create_dir(&facts).unwrap();
+        assert!(
+            matches!(read_beacon_facts_at(dir.path()), Err(MdnsError::FactsRead { path, .. }) if path == facts)
         );
     }
 

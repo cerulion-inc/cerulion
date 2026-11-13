@@ -26,14 +26,24 @@
 //! meantime, unarmed and unanswered. A writer cannot see when the removal ran,
 //! so when its request is gone and no result naming its nonce appears within
 //! two [`POLL_INTERVAL`]s, it leaves the request once more. Leaving it again
-//! does no harm: a request the daemon refused is refused again, and one it
-//! armed is armed again, its window counted from the new arm. A request the
+//! does no harm: a request the daemon refused is refused again, and one whose
+//! code is still armed arms nothing: the daemon writes that code's state
+//! again, so its window and its failed tries stand. A request the
 //! daemon could not read or parse has no nonce the daemon knows, so its
 //! `refused` result carries `-` for the nonce: a writer that removed the result
 //! before it left its request, and has read no result naming its nonce since,
 //! takes such a result, written after, as its answer. A writer that read a
 //! result naming its nonce reads a later result naming another nonce, or `-`,
 //! as its code replaced by a request claimed after its own.
+//!
+//! Writers that overlap would make a `-` answer ambiguous, so each writer
+//! holds an exclusive lock on [`WRITER_LOCK_FILE`] in the same directory from
+//! the removal of the result until it reads a result naming its nonce, or a
+//! `-` answer, and then releases it: a later writer replaces the code, and the
+//! earlier writer reads that as a result naming another nonce. The lock file
+//! is opened without following a symbolic link, created owner-only when it is
+//! missing, never truncated and never removed; its name is not a file of the
+//! handoff, so a starting daemon leaves it.
 //!
 //! Both files are one line of printable ASCII ending in a single `\n`, at most
 //! [`MAX_FILE_BYTES`] bytes, with fields separated by single spaces and an
@@ -112,6 +122,9 @@ pub const RESULT_STAGING_FILE: &str = ".pair-code.result.tmp";
 /// The start of the name of a writer's staging file for [`REQUEST_FILE`]; the
 /// writer adds a part of its own, such as its process id and `.tmp`.
 pub const REQUEST_STAGING_PREFIX: &str = ".pair-code.request.";
+/// The file a writer holds an exclusive lock on while it waits for the answer
+/// to its request (see the module docs); not a file of the handoff.
+pub const WRITER_LOCK_FILE: &str = "pair-start.lock";
 /// How often the serving daemon looks for a request. While claims work, a
 /// request waits about this long before its code is armed.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -287,25 +300,23 @@ impl PairCodeStatus {
 /// What a robot-side step shows for a request refused as
 /// [`PairCodeRefusal::Unreadable`], whichever check the read or the removal
 /// failed.
-pub const REFUSED_UNREADABLE: &str = "the robot's daemon could not read the pairing code \
-                                      request, or remove it once read: write the request again \
-                                      as the user the daemon runs as, as a regular file of at \
-                                      most 512 bytes with no other hard link, in the remoted \
-                                      state directory; the file and the directory must be owned \
-                                      by that user, owner-only and not symbolic links";
+pub const REFUSED_UNREADABLE: &str = "cerulion-remoted could not read the pairing code request, \
+                                      or remove it once read: run `cerulion pair --start` as the \
+                                      user cerulion-netd runs as, and keep the remoted directory \
+                                      of the robot state owned by that user and owner-only";
 /// What a robot-side step shows for a request refused as
 /// [`PairCodeRefusal::Malformed`].
-pub const REFUSED_MALFORMED: &str = "the robot's daemon refused the pairing code request: it \
-                                     is not a well-formed request of the version this daemon \
-                                     reads";
+pub const REFUSED_MALFORMED: &str = "cerulion-remoted refused the pairing code request: it is \
+                                     not a well-formed request of the version this daemon reads; \
+                                     use cerulion and cerulion-remoted from the same release";
 /// What a robot-side step shows for a request refused as
 /// [`PairCodeRefusal::Unconfirmed`].
 pub const REFUSED_UNCONFIRMED: &str = "the robot's daemon did not arm the pairing code: it \
                                        could not write the result that confirms it";
 /// What a robot-side step shows for a code withdrawn as
 /// [`PairCodeRefusal::Stopping`].
-pub const REFUSED_STOPPING: &str = "the robot's daemon stopped before a desk paired with the \
-                                    pairing code; the code no longer works";
+pub const REFUSED_STOPPING: &str = "cerulion-remoted stopped while the code was armed, so the \
+                                    code no longer works";
 
 /// Why a result is `refused`: its reason token and the text a robot-side step
 /// shows for it.
@@ -1135,17 +1146,16 @@ mod tests {
             (
                 PairCodeRefusal::Unreadable,
                 "unreadable",
-                "the robot's daemon could not read the pairing code request, or remove it \
-                 once read: write the request again as the user the daemon runs as, as a \
-                 regular file of at most 512 bytes with no other hard link, in the remoted \
-                 state directory; the file and the directory must be owned by that user, \
-                 owner-only and not symbolic links",
+                "cerulion-remoted could not read the pairing code request, or remove it once \
+                 read: run `cerulion pair --start` as the user cerulion-netd runs as, and keep \
+                 the remoted directory of the robot state owned by that user and owner-only",
             ),
             (
                 PairCodeRefusal::Malformed,
                 "malformed",
-                "the robot's daemon refused the pairing code request: it is not a \
-                 well-formed request of the version this daemon reads",
+                "cerulion-remoted refused the pairing code request: it is not a well-formed \
+                 request of the version this daemon reads; use cerulion and cerulion-remoted \
+                 from the same release",
             ),
             (
                 PairCodeRefusal::Unconfirmed,
@@ -1156,8 +1166,8 @@ mod tests {
             (
                 PairCodeRefusal::Stopping,
                 "stopping",
-                "the robot's daemon stopped before a desk paired with the pairing code; the \
-                 code no longer works",
+                "cerulion-remoted stopped while the code was armed, so the code no longer \
+                 works",
             ),
         ];
         for (refusal, token, text) in cases {
@@ -1165,8 +1175,10 @@ mod tests {
             assert_eq!(PairCodeRefusal::parse(token), Some(refusal));
             assert_eq!(refusal.text(), text, "{token}");
         }
-        // The unreadable text names the size bound the read checks.
-        assert!(REFUSED_UNREADABLE.contains(&format!("at most {MAX_FILE_BYTES} bytes")));
+        // The unreadable text names the robot-side step to run again, and the
+        // malformed one the release match that makes a request well formed.
+        assert!(REFUSED_UNREADABLE.contains("`cerulion pair --start`"));
+        assert!(REFUSED_MALFORMED.contains("same release"));
         for token in [
             "",
             "-",
@@ -1695,9 +1707,12 @@ mod tests {
             "epoch.pending",
             ".epoch.pending.tmp",
             "trust_store",
+            WRITER_LOCK_FILE,
             "",
         ] {
             assert!(!is_handoff_file(name), "{name}");
         }
+        // The writers' lock is the one name a starting daemon must leave.
+        assert_eq!(WRITER_LOCK_FILE, "pair-start.lock");
     }
 }
