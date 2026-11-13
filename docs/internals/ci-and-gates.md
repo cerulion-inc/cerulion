@@ -568,7 +568,8 @@ direction: they SKIP test steps. Four rules bound them.
 * THE SELECTION IS WIDER THAN CARGO. `pkgs` is the reverse cargo dependency closure over
   normal, build and dev edges UNIONED with the observation edges in
   `tools/ci/observation_edges.tsv`: a test that reads another package's tree, walks the
-  repository, or loads an artifact another package builds reaches it without a manifest
+  repository, loads an artifact another package builds, or runs a binary another package
+  builds (named beside its own through `with_file_name`) reaches it without a manifest
   edge. That table is derived from the sources by
   `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
   and on a stale one. A read the walk cannot place on one package, an unattributable literal or

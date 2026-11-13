@@ -47,8 +47,8 @@ use std::time::Duration;
 use cerud::client::OpsClient;
 use cerud::error::CerudError;
 use cerulion_link::{
-    alpn, build_endpoint, dial, direct_addr, open_frame_stream, EndpointAddr, EndpointConfig,
-    EndpointId, QuicOpsStream, RelayConfig,
+    alpn, build_endpoint, dial, direct_addr, open_frame_stream, Endpoint, EndpointAddr,
+    EndpointConfig, EndpointId, QuicOpsStream, RelayConfig,
 };
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PublicKey};
@@ -101,6 +101,9 @@ pub enum PairError {
     Refused(String),
     /// The pairing code was wrong / attempts exhausted — [`EXIT_CODE_MISMATCH`].
     CodeMismatch(String),
+    /// The interrupt [`run_pair`] watches resolved before the ceremony
+    /// completed: not paired. Maps to [`EXIT_INTERRUPTED`].
+    Interrupted,
 }
 
 impl PairError {
@@ -111,6 +114,7 @@ impl PairError {
             PairError::Unreachable(_) => EXIT_UNREACHABLE,
             PairError::Refused(_) => EXIT_REFUSED,
             PairError::CodeMismatch(_) => EXIT_CODE_MISMATCH,
+            PairError::Interrupted => EXIT_INTERRUPTED,
         }
     }
 }
@@ -122,6 +126,7 @@ impl std::fmt::Display for PairError {
             PairError::Unreachable(m) => write!(f, "could not reach the robot: {m}"),
             PairError::Refused(m) => write!(f, "the robot refused pairing: {m}"),
             PairError::CodeMismatch(m) => write!(f, "wrong pairing code: {m}"),
+            PairError::Interrupted => f.write_str("interrupted before completion; not paired"),
         }
     }
 }
@@ -184,20 +189,60 @@ pub struct PairOutcome {
 
 // ── the ceremony ─────────────────────────────────────────────────────────────
 
-/// Run the desk-side CPace pairing ceremony against the robot's ops plane.
+/// How long a run waits for its endpoint close once the interrupt resolved.
+/// The close queues each open connection's close at once and then waits for
+/// those connections to drain; past this bound the run stops waiting, so its
+/// exit stays prompt.
+const INTERRUPTED_CLOSE_LIMIT: Duration = Duration::from_millis(500);
+
+/// How a run's wait for its endpoint close ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseWait {
+    /// The run waited until the close drained, and no interrupt resolved.
+    UntilDrained,
+    /// The interrupt resolved, before the ceremony ended or during the close,
+    /// so the wait was bounded to [`INTERRUPTED_CLOSE_LIMIT`].
+    Bounded,
+}
+
+/// The result a run returns once its wait for the endpoint close ended: the
+/// ceremony's own result, however the wait ended. An interrupt that resolved
+/// before the ceremony ended made that result [`PairError::Interrupted`]; one
+/// that resolved during the close only bounded the wait, so a ceremony that
+/// paired returns paired, and a wrong code or a refusal keeps its exit code.
+/// Pure, table-tested.
+fn result_after_close<T>(ceremony: Result<T, PairError>, wait: CloseWait) -> Result<T, PairError> {
+    match wait {
+        CloseWait::UntilDrained | CloseWait::Bounded => ceremony,
+    }
+}
+
+/// Run the desk-side CPace pairing ceremony against the robot's ops plane,
+/// watching `interrupt`.
 ///
 /// Binds the desk endpoint on the `cerulion/ops/1` ALPN, dials the robot, and —
 /// on a blocking task (the sync `OpsClient` must not run on an async worker) —
 /// drives `code-pair-start` → `code-pair-finish`. Every step is bounded by
-/// `config.timeout`; on a desk-side timeout the connection is dropped to unblock
-/// the parked read.
+/// `config.timeout`; on a desk-side timeout the connection is closed, which
+/// fails the parked read. Once it is bound, the endpoint is closed before this
+/// returns, on every path: the close queues each open connection's close at
+/// once and waits for those connections to drain. An `interrupt` that resolves
+/// before the ceremony ends makes the run [`PairError::Interrupted`]. One that
+/// resolves during the wait for the close only bounds that wait, and the run
+/// returns the ceremony's own result (`result_after_close`): paired, a wrong
+/// code or a refusal. Once the interrupt resolved, the wait is bounded to
+/// 500 ms (`INTERRUPTED_CLOSE_LIMIT`).
 // Logging-rule exception (Principle 12): the two `println!`s below are not logging — they are this
 // process's OUTPUT PROTOCOL. `pairing:` and `paired:` are machine-parseable
 // state lines on STDOUT that a Studio driver reads; routing them through
 // `tracing` would put them on stderr, behind RUST_LOG, and break every parser.
 // The human-readable narration of the same steps DOES go through `tracing`.
 #[allow(clippy::print_stdout)]
-pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
+pub async fn run_pair(
+    config: PairConfig,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> Result<PairOutcome, PairError> {
+    let mut interrupt = std::pin::pin!(interrupt);
     // The desk identity: its public half is the CPace initiator key AND the key
     // the robot access-lists. The self-account default derives from it.
     let desk_identity = DeviceIdentity::from_seed(&config.desk_seed);
@@ -218,13 +263,18 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
     );
 
     // 1. Bind the desk endpoint on the OPS ALPN (the desk never accepts).
-    let endpoint = build_endpoint(
+    let bind = build_endpoint(
         EndpointConfig::new(config.desk_seed)
             .with_alpns(vec![alpn::OPS.to_vec()])
             .with_relay(config.relay.clone()),
-    )
-    .await
-    .map_err(|e| PairError::Unreachable(format!("binding the desk endpoint failed: {e}")))?;
+    );
+    let endpoint = tokio::select! {
+        bound = bind => bound.map_err(|e| {
+            PairError::Unreachable(format!("binding the desk endpoint failed: {e}"))
+        })?,
+        // No endpoint is bound yet, so no connection is left to close.
+        () = &mut interrupt => return Err(PairError::Interrupted),
+    };
     tracing::info!(
         desk_id = %endpoint.id(),
         robot = %config.robot_eid,
@@ -232,6 +282,69 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
         "cerulion pair: desk endpoint bound; dialing robot ops ALPN"
     );
 
+    // Closing the endpoint sends the robot this connection's close, so the
+    // robot's ops session ends now and not at its idle timeout: a code-pairing
+    // try this desk left pending is counted failed when that session ends.
+    // `biased` polls the ceremony first, so a ceremony that has its result
+    // keeps it when the interrupt is ready at the same poll.
+    let ceremony = tokio::select! {
+        biased;
+        paired = dial_and_pair(&endpoint, &config, desk_pubkey, account) => paired,
+        () = &mut interrupt => Err(PairError::Interrupted),
+    };
+    let close = endpoint.close();
+    tokio::pin!(close);
+    let wait = if matches!(ceremony, Err(PairError::Interrupted)) {
+        // The interrupt resolved, so it is not watched again.
+        CloseWait::Bounded
+    } else {
+        tokio::select! {
+            biased;
+            () = &mut close => CloseWait::UntilDrained,
+            () = &mut interrupt => CloseWait::Bounded,
+        }
+    };
+    if wait == CloseWait::Bounded
+        && tokio::time::timeout(INTERRUPTED_CLOSE_LIMIT, &mut close)
+            .await
+            .is_err()
+    {
+        tracing::debug!(
+            "cerulion pair: stopped waiting for the endpoint close after the interrupt"
+        );
+    }
+    let (account_hex, source) = result_after_close(ceremony, wait)?;
+    // The `paired:` state line (STDOUT, machine-parseable: the terminal success
+    // signal a Studio driver parses, redundant with exit 0). The account echoed is
+    // the robot's, which equals the one we sent.
+    println!(
+        "{}",
+        paired_line(
+            &config.robot_display,
+            &hex::encode(config.robot_eid.as_bytes()),
+            &account_hex
+        )
+    );
+    tracing::info!(
+        robot = %config.robot_display,
+        source = %source,
+        "cerulion pair: paired successfully; the robot now trusts this desk"
+    );
+    Ok(PairOutcome {
+        account_hex,
+        source,
+        desk_eid_hex,
+    })
+}
+
+/// Dial the robot from `endpoint` and run the ceremony on one ops connection:
+/// the account the robot paired and how, on success.
+async fn dial_and_pair(
+    endpoint: &Endpoint,
+    config: &PairConfig,
+    desk_pubkey: PublicKey,
+    account: AccountId,
+) -> Result<(String, String), PairError> {
     // 2. The peer address (LAN direct-dial when addrs are given, else bare eid).
     let peer: EndpointAddr = if config.direct_addrs.is_empty() {
         EndpointAddr::new(config.robot_eid)
@@ -243,7 +356,7 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
     let connection = bounded(
         config.timeout,
         "dialing the robot",
-        dial(&endpoint, peer, alpn::OPS),
+        dial(endpoint, peer, alpn::OPS),
     )
     .await?
     .map_err(|e| PairError::Unreachable(format!("dial failed: {e}")))?;
@@ -257,7 +370,7 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
 
     // 4. Run the SYNC ceremony on a blocking task (the `OpsClient` + `QuicOpsStream`
     //    panic if their Read/Write runs on an async worker thread). Bound it: on a
-    //    desk-side timeout, DROP the connection to unblock the parked read, then
+    //    desk-side timeout, CLOSE the connection to fail the parked read, then
     //    reap the task.
     let robot_pubkey = PublicKey(*config.robot_eid.as_bytes());
     let code = config.code.clone();
@@ -279,8 +392,10 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
         joined = &mut ceremony => joined
             .map_err(|e| PairError::Unreachable(format!("the ceremony task failed: {e}")))?,
         _ = tokio::time::sleep(config.timeout) => {
-            // Unblock the parked blocking read by closing the connection, then reap.
-            drop(connection);
+            // The stream halves the blocking task holds keep the connection
+            // open past a drop of this handle; the close fails the parked
+            // read, so the reap returns.
+            connection.close(0u32.into(), b"");
             let _ = (&mut ceremony).await;
             return Err(PairError::Unreachable(format!(
                 "the pairing ceremony timed out after {:?}",
@@ -291,28 +406,7 @@ pub async fn run_pair(config: PairConfig) -> Result<PairOutcome, PairError> {
     // Keep the connection alive until the ceremony finished.
     drop(connection);
 
-    let (account_hex, source) = result?;
-    // The `paired:` state line (STDOUT, machine-parseable — the terminal success
-    // signal a Studio driver parses, redundant with exit 0). The account echoed is
-    // the robot's, which equals the one we sent.
-    println!(
-        "{}",
-        paired_line(
-            &config.robot_display,
-            &hex::encode(config.robot_eid.as_bytes()),
-            &account_hex
-        )
-    );
-    tracing::info!(
-        robot = %config.robot_display,
-        source = %source,
-        "cerulion pair: paired successfully; the robot now trusts this desk"
-    );
-    Ok(PairOutcome {
-        account_hex,
-        source,
-        desk_eid_hex,
-    })
+    result
 }
 
 /// Await `fut` with a desk-side timeout, mapping an elapsed timeout to a
@@ -653,6 +747,77 @@ mod tests {
         );
         // The interrupt code is the Unix Ctrl-C convention (128 + SIGINT).
         assert_eq!(EXIT_INTERRUPTED, 130);
+        assert_eq!(PairError::Interrupted.exit_code(), EXIT_INTERRUPTED);
+    }
+
+    /// Hand-written table: the ceremony's result and how the wait for the
+    /// endpoint close ended, then the exit code and text the run returns. An
+    /// interrupt during the close never turns a ceremony that ended into an
+    /// interrupted run.
+    #[test]
+    fn the_ceremony_result_stands_however_the_close_wait_ends() {
+        type Returned = Result<&'static str, (u8, &'static str)>;
+        let cases: [(Result<&'static str, PairError>, CloseWait, Returned); 12] = [
+            (Ok("paired"), CloseWait::UntilDrained, Ok("paired")),
+            (Ok("paired"), CloseWait::Bounded, Ok("paired")),
+            (
+                Err(PairError::CodeMismatch("m".into())),
+                CloseWait::UntilDrained,
+                Err((4, "wrong pairing code: m")),
+            ),
+            (
+                Err(PairError::CodeMismatch("m".into())),
+                CloseWait::Bounded,
+                Err((4, "wrong pairing code: m")),
+            ),
+            (
+                Err(PairError::Refused("r".into())),
+                CloseWait::UntilDrained,
+                Err((2, "the robot refused pairing: r")),
+            ),
+            (
+                Err(PairError::Refused("r".into())),
+                CloseWait::Bounded,
+                Err((2, "the robot refused pairing: r")),
+            ),
+            (
+                Err(PairError::Unreachable("u".into())),
+                CloseWait::UntilDrained,
+                Err((3, "could not reach the robot: u")),
+            ),
+            (
+                Err(PairError::Unreachable("u".into())),
+                CloseWait::Bounded,
+                Err((3, "could not reach the robot: u")),
+            ),
+            (
+                Err(PairError::Usage("x".into())),
+                CloseWait::UntilDrained,
+                Err((1, "pairing usage error: x")),
+            ),
+            (
+                Err(PairError::Usage("x".into())),
+                CloseWait::Bounded,
+                Err((1, "pairing usage error: x")),
+            ),
+            (
+                Err(PairError::Interrupted),
+                CloseWait::Bounded,
+                Err((130, "interrupted before completion; not paired")),
+            ),
+            (
+                Err(PairError::Interrupted),
+                CloseWait::UntilDrained,
+                Err((130, "interrupted before completion; not paired")),
+            ),
+        ];
+        for (ceremony, wait, want) in cases {
+            let row = format!("{ceremony:?} {wait:?}");
+            let got =
+                result_after_close(ceremony, wait).map_err(|e| (e.exit_code(), e.to_string()));
+            let want = want.map_err(|(code, text)| (code, text.to_string()));
+            assert_eq!(got, want, "{row}");
+        }
     }
 
     #[test]

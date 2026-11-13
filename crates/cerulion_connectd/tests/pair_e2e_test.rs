@@ -15,6 +15,14 @@
 //! - a WRONG code is a distinct `PairError::CodeMismatch` (detected structurally
 //!   desk-side) and writes NO row;
 //! - a robot with NO armed code is a `PairError::Refused` and writes NO row;
+//! - a robot that accepts the ops stream and never answers holds the ceremony
+//!   until the desk-side timeout, a `PairError::Unreachable` naming it, and
+//!   sees the desk close the connection;
+//! - a desk interrupted while the robot holds its try is a
+//!   `PairError::Interrupted`, and the robot counts that try failed within
+//!   [`TRY_END_LIMIT`] of letting its held step go, with no row written;
+//! - a desk whose ceremony paired, interrupted while it waits for its
+//!   endpoint close, still returns paired, the robot's row on disk;
 //! - each refusal the robot's code-pairing store answers maps to its desk exit
 //!   class: every try failed is a code mismatch; a used code, a throttled try,
 //!   every try taken by a desk still pairing, an expired window, no armed code
@@ -23,15 +31,21 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use cerulion_connectd::pair::{run_pair, PairConfig, PairError};
 
-use cerulion_link::{build_endpoint, Endpoint, EndpointConfig, RelayConfig};
+use cerulion_link::{
+    accept_frame_stream, accept_one, build_endpoint, ConnectionError, Endpoint, EndpointConfig,
+    RelayConfig,
+};
 
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, RootSet};
+use cerulion_pairing::pair_code::PairCodeStatus;
 use cerulion_pairing::pake::CeremonyConfig;
 use cerulion_pairing::verify::{PairingSource, TrustStore};
 
@@ -44,6 +58,15 @@ use cerulion_remoted::{
 // ── constants ─────────────────────────────────────────────────────────────────
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+/// The desk-side timeout of the run a silent robot holds.
+const CEREMONY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the robot may take to count an interrupted desk's pending try
+/// failed once its held `code-pair-start` is let go. A desk that closed its
+/// endpoint before `run_pair` returned has closed the connection the robot's
+/// ops session for it reads, so that session ends, and the try is counted,
+/// as the step's reply fails; a connection the desk only dropped ends at the
+/// robot at its 30 s QUIC idle timeout, past this bound.
+const TRY_END_LIMIT: Duration = Duration::from_secs(5);
 const T_NOW: u64 = 1_000_000_000_000;
 const CHASSIS: &[u8] = b"pair-e2e-chassis-secret-not-serial-derived";
 const MAC_KEY: &[u8] = b"pair-e2e-firmware-mac-key";
@@ -209,7 +232,11 @@ async fn correct_code_establishes_a_code_paired_row_for_the_desk_key() {
 
     let desk_seed = [9u8; 32];
     let outcome = with_serving(&r, &robot_ep, async {
-        run_pair(pair_config(&robot_ep, desk_seed, CODE)).await
+        run_pair(
+            pair_config(&robot_ep, desk_seed, CODE),
+            std::future::pending(),
+        )
+        .await
     })
     .await;
 
@@ -248,7 +275,11 @@ async fn wrong_code_is_a_code_mismatch_and_writes_no_row() {
 
     let desk_seed = [11u8; 32];
     let result = with_serving(&r, &robot_ep, async {
-        run_pair(pair_config(&robot_ep, desk_seed, "WRONG-CODE")).await
+        run_pair(
+            pair_config(&robot_ep, desk_seed, "WRONG-CODE"),
+            std::future::pending(),
+        )
+        .await
     })
     .await;
 
@@ -275,7 +306,11 @@ async fn no_armed_code_is_refused_and_writes_no_row() {
 
     let desk_seed = [13u8; 32];
     let result = with_serving(&r, &robot_ep, async {
-        run_pair(pair_config(&robot_ep, desk_seed, "ANY-CODE")).await
+        run_pair(
+            pair_config(&robot_ep, desk_seed, "ANY-CODE"),
+            std::future::pending(),
+        )
+        .await
     })
     .await;
 
@@ -294,6 +329,190 @@ async fn no_armed_code_is_refused_and_writes_no_row() {
         store.account_access(&account, 0).is_none(),
         "no row without an armed code"
     );
+}
+
+/// A robot that accepts the desk's ops stream and never answers holds the
+/// ceremony on its blocking read. At the desk-side timeout the desk closes
+/// the connection, which fails that read: `run_pair` returns the timeout as
+/// unreachable, and the robot sees the desk's close with code 0 and no
+/// reason. A connection the desk only dropped would stay open, its stream
+/// halves held by the parked read and both endpoints sending keep-alives, so
+/// the run would not return within [`STEP_TIMEOUT`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceremony_timeout_closes_the_connection_and_is_unreachable() {
+    let robot_ep = disabled_endpoint([203; 32]).await;
+    let mut config = pair_config(&robot_ep, [15u8; 32], "ANY-CODE");
+    config.timeout = CEREMONY_TIMEOUT;
+    let silent_robot = async {
+        let accepted = accept_one(&robot_ep)
+            .await
+            .expect("accept the desk's connection")
+            .expect("the robot endpoint is open");
+        let streams = accept_frame_stream(&accepted.connection)
+            .await
+            .expect("accept the desk's ops stream");
+        let closed = accepted.connection.closed().await;
+        drop(streams);
+        closed
+    };
+    let (result, closed) = bounded("the timed-out ceremony and its close", async {
+        tokio::join!(run_pair(config, std::future::pending()), silent_robot)
+    })
+    .await;
+    robot_ep.close().await;
+
+    match result {
+        Err(PairError::Unreachable(msg)) => {
+            assert_eq!(msg, "the pairing ceremony timed out after 5s");
+        }
+        other => panic!("a silent robot must time the ceremony out, got {other:?}"),
+    }
+    match closed {
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(close.error_code.into_inner(), 0);
+            assert!(close.reason.is_empty(), "{close:?}");
+        }
+        other => panic!("the robot must see the desk close the connection, got {other:?}"),
+    }
+}
+
+/// A desk interrupted while the robot holds its try closes its endpoint
+/// before `run_pair` returns [`PairError::Interrupted`]. The robot's admitted
+/// `code-pair-start` is held before its CPace step until then, so the
+/// interrupt lands while the desk waits on the robot's reply. Let go, the step
+/// leaves the try pending, the robot's ops session for the desk ends on the
+/// closed connection, and the try is counted failed within
+/// [`TRY_END_LIMIT`]. The code was right and no row is written: the desk's
+/// ceremony ended with its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_desk_closes_and_the_robot_counts_its_pending_try_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot_ep = disabled_endpoint([204; 32]).await;
+    let r = build_robot(dir.path(), *robot_ep.id().as_bytes());
+    const CODE: &str = "RIGHT-CODE";
+    r.sessions
+        .arm(CODE, CeremonyConfig::new(3, 60_000_000_000).unwrap());
+    let held = r.sessions.hold_next_build_for_test();
+    let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
+    let desk_seed = [16u8; 32];
+
+    let (result, counted) = with_serving(&r, &robot_ep, async {
+        let desk = run_pair(pair_config(&robot_ep, desk_seed, CODE), async move {
+            let _ = interrupted.await;
+        });
+        let robot = async move {
+            let (reached, held) =
+                tokio::task::spawn_blocking(move || (held.reached_within(STEP_TIMEOUT), held))
+                    .await
+                    .expect("the hold watch ends");
+            assert!(reached, "the desk's code-pair-start reached the held step");
+            let _ = interrupt.send(());
+            held
+        };
+        let (result, held) =
+            bounded("the interrupted run", async { tokio::join!(desk, robot) }).await;
+        held.release();
+        let counted = tokio::time::timeout(TRY_END_LIMIT, async {
+            loop {
+                match r.sessions.snapshot() {
+                    Some(code) if code.failed > 0 => return code,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| r.sessions.snapshot());
+        (result, counted)
+    })
+    .await;
+    robot_ep.close().await;
+
+    assert!(matches!(result, Err(PairError::Interrupted)), "{result:?}");
+    let code = counted.unwrap_or_else(|at_the_limit| {
+        panic!(
+            "the robot did not count the interrupted desk's try failed within \
+             {TRY_END_LIMIT:?}: {at_the_limit:?}"
+        )
+    });
+    assert_eq!((code.failed, code.tries), (1, 3), "{code:?}");
+    let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
+    assert!(
+        store
+            .account_access(&AccountId(desk_pubkey(desk_seed)), 0)
+            .is_none(),
+        "an interrupted desk writes no row"
+    );
+}
+
+/// A desk whose ceremony paired, interrupted while it waits for its
+/// endpoint close, returns paired. The interrupt resolves on the first poll
+/// that finds the robot's code paired and arranges no wake of its own. The
+/// robot serves on a task of its own, so the run is polled only on wakes of
+/// its own futures: while the ceremony runs on its blocking task, only when
+/// that task ends, and then it polls the ceremony before the interrupt. The
+/// robot pairs the code before it answers `code-pair-finish`, so the
+/// interrupt is first polled with the code paired in the wait for the close,
+/// which waits on the robot's answer to the close. The run polled the
+/// interrupt to its end, returns the desk key's own account, and the robot's
+/// code-paired row is on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_during_the_close_of_a_paired_desk_returns_paired() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot_ep = disabled_endpoint([205; 32]).await;
+    let r = build_robot(dir.path(), *robot_ep.id().as_bytes());
+    const CODE: &str = "RIGHT-CODE";
+    r.sessions.arm(CODE, CeremonyConfig::default());
+    let desk_seed = [17u8; 32];
+    let resolved = Arc::new(AtomicBool::new(false));
+    let interrupt = {
+        let sessions = r.sessions.clone();
+        let resolved = resolved.clone();
+        std::future::poll_fn(move |_| {
+            let paired = sessions
+                .snapshot()
+                .is_some_and(|code| code.state.status() == PairCodeStatus::Paired);
+            if paired {
+                resolved.store(true, Ordering::SeqCst);
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    };
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn({
+        let endpoint = robot_ep.clone();
+        let classify = r.classify.clone();
+        let ops = r.ops.clone();
+        async move {
+            let _ = cerulion_remoted::serve(&endpoint, classify, Some(ops), async {
+                let _ = stopped.await;
+            })
+            .await;
+        }
+    });
+
+    let result = run_pair(pair_config(&robot_ep, desk_seed, CODE), interrupt).await;
+    let _ = stop.send(());
+    bounded("the robot's serving", serving)
+        .await
+        .expect("the robot's serving task ends");
+    robot_ep.close().await;
+
+    let outcome = result.expect("a paired desk interrupted during its close returns paired");
+    assert!(
+        resolved.load(Ordering::SeqCst),
+        "the run polled the interrupt to its end"
+    );
+    let desk_pk = desk_pubkey(desk_seed);
+    assert_eq!(outcome.account_hex, hex::encode(desk_pk));
+    assert_eq!(outcome.source, "code_paired");
+    let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
+    let row = store
+        .account_access(&AccountId(desk_pk), 0)
+        .expect("desk row on disk");
+    assert_eq!(row.source, PairingSource::CodePaired);
 }
 
 #[test]
