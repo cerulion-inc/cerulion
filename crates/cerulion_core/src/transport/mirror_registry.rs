@@ -5,16 +5,18 @@
 //!
 //! *One data source = one topic.* A remote robot's topic must NEVER present as a
 //! second LOCAL topic just because the desk mirrors it into local SHM. When a
-//! desk process re-injects a remote topic (vizd's `attach_remote`, `topic echo`'s
-//! auto-ingress, connectd's iroh re-inject engine), the mirror lands as a
-//! plain canonical-named iceoryx2 `{topic}/data` service — indistinguishable from
-//! a genuinely-local topic by `cerulion topic list`, which enumerates `*/data`
-//! services. This registry is the OUT-OF-BAND provenance channel that lets
-//! `topic list` (and Studio) fold each mirrored topic back into the REMOTE
-//! section, attributed to its origin robot, with a streaming marker — WITHOUT
-//! touching the wire name (the frame stays byte-identical, Principle #7;
-//! a consumer subscribing to `/utlidar/robot_odom` still finds the mirror at that
-//! exact name — "remote = local" for zero-copy transparency).
+//! desk process re-injects a remote topic, its local SHM channel need not have
+//! the canonical wire topic's name. Source-qualified topic and visualization
+//! observers use `/__cerulion/observers/{robot_hash}/{topic_hash}` channels;
+//! wire/2 and graph ingress retain the canonical topic name. This registry is
+//! the OUT-OF-BAND provenance channel that attributes BOTH kinds of local
+//! channel to their origin robot. Each record carries the actual local channel
+//! name, so `topic list` (and Studio) can fold mirrors out of LOCAL topics
+//! without changing the canonical wire topic or frame bytes (Principle #7).
+//! For `/utlidar/robot_odom`, an observer subscribes to its source-qualified
+//! local channel; canonical ingress remains at `/utlidar/robot_odom`.
+//! `topic list` hides observer channels unless `--all` is set, then marks them
+//! `[internal]` alongside their origin attribution and streaming marker.
 //!
 //! # The control service
 //!
@@ -225,7 +227,7 @@ const MIRROR_VERSION: u8 = 2;
 pub const MIRROR_HEADER_LEN: usize = 2 + 1 + 8 + 2 + 2;
 
 /// The maximum registrable topic length (bytes). Far above any realistic
-/// canonical topic name; bounds the record size.
+/// local channel name; bounds the record size.
 pub const MAX_MIRROR_TOPIC_LEN: usize = 512;
 
 /// The maximum origin-robot identity length (bytes). Far above any
@@ -243,9 +245,11 @@ pub const MAX_MIRROR_RECORD_LEN: usize =
 /// used only by the gather's completeness gate, deliberately NOT surfaced here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorRecord {
-    /// The (leading-slash) topic the process mirrors into local SHM — stored
-    /// verbatim (NOT canonicalized) so it equals `topic list`'s `/data`-stripped
-    /// service name.
+    /// The actual (leading-slash) local SHM channel: a source-qualified
+    /// `/__cerulion/observers/` channel for observers, or the canonical topic
+    /// for wire/2 and graph ingress. Stored verbatim (NOT canonicalized) so it
+    /// equals `topic list`'s `/data`-stripped service name; `origin_robot`
+    /// attributes either kind to its source.
     pub topic: String,
     /// The origin robot identity the mirror is attributed to (its hostname /
     /// `CERULION_ROBOT_IDENTITY`). Rendered VERBATIM only after
@@ -263,7 +267,9 @@ pub struct MirrorRecord {
 /// does so in `topic_cmd`; the vizd wire hands it to Studio as a JSON string).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorStreamRow {
-    /// The mirrored topic, exactly as the local enumeration named it.
+    /// The actual local channel, exactly as the local enumeration named it:
+    /// source-qualified under `/__cerulion/observers/` for observers, canonical
+    /// for wire/2 and graph ingress. `robot` attributes either kind to its source.
     pub topic: String,
     /// The origin robot identity the mirror is attributed to.
     pub robot: String,
