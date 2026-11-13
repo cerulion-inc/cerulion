@@ -171,6 +171,10 @@ device, so the camera's `image` topic is a recorded input and the one topic
 compared is the meter's `brightness`. A recording that lost camera frames
 still fails: replay never feeds the meter a frame other than the one it read.
 
+Verify a recording made in the default multi-process layout. A
+`--single-process` recording of this graph is lockstep, which a resim of a
+graph with a driver does not support: it warns, and `--verify` exits 6.
+
 ## Verify the nodes
 
 The format, payload and requeue rules of the camera node and the luma

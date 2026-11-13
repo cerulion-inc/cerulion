@@ -48,11 +48,13 @@ else. The recorded inputs are the external-source topics and the outputs of
 so the driver has no device to read, and the bag feeds its recorded frames to
 the nodes that read them. Of a free-run recording (the multi-process default),
 a `--verify` resim feeds every such read, and a resim without `--verify` feeds
-the nodes that ran in another process or executor unit than the driver. A
-lockstep recording (`CERULION_EXECUTION_MODE=lockstep`, or `--single-process
---record` of a graph that is one executor unit) is not supported for a graph
-with a driver: its resim does not fire the driver or feed the nodes that read
-it, so `--verify` reports a divergence; record such a graph with the
+the nodes that ran in another process or executor unit than the driver and
+warns that it does not feed the rest. A lockstep recording
+(`CERULION_EXECUTION_MODE=lockstep`, or `--single-process --record` of a graph
+that is one executor unit) is not supported for a graph with a driver: its
+resim does not fire the driver or feed the nodes that read it, so a warning
+names the driver topics and `--verify` reports a schedule divergence at the
+driver's first recorded fire (exit 6); record such a graph with the
 multi-process default. Re-simulating a `ros2 attach` bag on a desk with
 no DDS robot produces **no output**: its `dds_bridge` node is a driver with no
 DDS inputs. Use plain playback to view an attached ROS 2 recording without the
@@ -92,6 +94,14 @@ frames on it makes it a `record-side-tap-loss` violation, counted in `<M>`
 (exit 1), and a replay that feeds reads by their recorded identity (see "Read
 identity" below) refuses a recorded read of a frame the bag does not hold
 (exit 2, `read_identity_frame_missing`).
+
+A graph whose produced topics are all driver outputs, such as a capture-only
+graph, has nothing to re-compute: its `--verify` passes with `0/0`, and a
+warning says that no topic was compared. A driver topic no node reads is
+neither fed nor compared, and a warning names it. On a `multi_publisher_topics`
+topic a driver shares with other nodes, the other writers' frames are compared
+and the driver's are not, when the bag attributes every frame of the topic to
+its writer; a replay of a bag that cannot fails on that topic.
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,

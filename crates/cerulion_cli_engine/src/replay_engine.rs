@@ -47,7 +47,9 @@
 //!   re-produce the frames. Its consumers are fed the recorded frames (a fed
 //!   read's private feed, or an injector on a cross-rank edge), and the topic
 //!   is neither captured nor diffed. A record-side-lossy one is still a
-//!   violation on its own topic.
+//!   violation on its own topic. A `multi_publisher_topics` topic a driver
+//!   shares with other nodes stays GRAPH-PRODUCED, diffed over the other
+//!   writers' frames when the bag attributes each frame to its writer.
 //! - EXTERNAL (consumed in-graph, no in-graph producer: the
 //!   absolute `source:` class) — the recorded frames are re-INJECTED byte-exact
 //!   so the downstream graph sees the same inputs it saw live.
@@ -723,8 +725,8 @@ pub struct ReplayOutcome {
     /// breakdown is [`Self::rank_execution`].
     pub ticks_replayed: usize,
     /// The number of graph-produced topics the diff considered (had at least one
-    /// recorded or replayed frame). An external (driver) node's output is a
-    /// recorded input, fed and not compared, so it counts only when the
+    /// recorded or replayed frame). A topic only external (driver) nodes write
+    /// is a recorded input and not compared, so it counts only when the
     /// record-health stamp marks it lossy (a record-side-tap-loss violation).
     pub topics_checked: usize,
     /// The subset of [`Self::topics_checked`] that matched byte-for-byte AND was
@@ -4637,18 +4639,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         coverage.as_ref(),
         &external_node_ids(&factories),
     )?;
-    // A driver's outputs are this replay's INPUTS: the bag feeds them to their
-    // consumers, whose own outputs are compared. INFO, not the WARN below: an
-    // input is not a topic the verdict claims to check, the same as an external
-    // topic, and every graph with a camera or a serial reader has one.
-    if !classes.driver.is_empty() {
-        tracing::info!(
-            driver_topics = classes.driver.len(),
-            topics = %classes.driver.join(", "),
-            "replay: the outputs of the external (driver) nodes are recorded inputs, fed to \
-             their consumers from the bag and neither re-produced nor compared"
-        );
-    }
+    // What the replay does with the driver topics is logged once the rank
+    // plans exist (`log_driver_topic_feeds`): whether a reader is fed depends
+    // on which rank it runs in.
     // ONE loud line for the whole skipped set, never one per topic and
     // never one per frame (the log-flood class). WARN, not info: a
     // replay verdict is a claim about how much of the recording was checked,
@@ -4739,6 +4732,17 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     //     rank's clock, which it then skips). Root cause first — the same
     //     precedence the exit codes use.
     let plans = build_rank_plans(coordination, &config, &rank_tables, &boundary_summaries)?;
+    log_driver_topic_feeds(
+        &plan_driver_topic_feeds(
+            &config,
+            &classes,
+            &plans,
+            coordination == CoordinationMode::Lockstep,
+            fed,
+        ),
+        coordination == CoordinationMode::Lockstep,
+        &best_effort_reason,
+    );
 
     // What this bag DECLARES its resume covers — or the
     // range a multi-rank lockstep bag DERIVES (rank 0's last boundary target;
@@ -4976,6 +4980,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 bag_side: &bag_side,
                 node_info_notes,
                 config: &config,
+                driver_nodes: &classes.driver_nodes,
                 record_out: record_out.clone(),
             };
             // A resume judges a param the recording names and this build no
@@ -5181,6 +5186,25 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         drop(transport);
         drop(clock);
         return Err(e);
+    }
+    // A driver graph that compared nothing (every frame the graph produced a
+    // driver's) reads `0/0`, and a `--verify` of it passes. WARN, the same
+    // rule as the unmodelled topics: a verdict that covers less of the bag
+    // than its reader assumes says so at the default log level.
+    let driver_written: Vec<&str> = classes
+        .driver
+        .iter()
+        .chain(&classes.driver_shared)
+        .map(String::as_str)
+        .collect();
+    if !driver_written.is_empty() && outcome.topics_checked == 0 {
+        tracing::warn!(
+            driver_topics = driver_written.len(),
+            topics = %driver_written.join(", "),
+            "replay: no topic was compared against the recording: the frames the external \
+             (driver) nodes publish are recorded inputs, which are never compared, and no \
+             other writer recorded or replayed a frame"
+        );
     }
     persist_report(report_path.as_deref(), &outcome)?;
     // A bag that could not be finished is reported on the outcome, not raised
@@ -5400,7 +5424,14 @@ fn assemble_outcome(
             Some(nr) => {
                 let mut m: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
                     std::collections::HashMap::new();
-                for node in &config.nodes {
+                // A driver re-produces nothing, so it owns no topic here: the
+                // abort rule and the tail tolerance below read only the ranks
+                // whose pass captured the topic (`pass_topics`).
+                for node in config
+                    .nodes
+                    .iter()
+                    .filter(|n| !classes.driver_nodes.contains(&n.id))
+                {
                     if let Some(&rank) = nr.get(node.id.as_str()) {
                         for output in &node.outputs {
                             let t = cerulion_core::graph::resolve_output_topic(
@@ -5476,8 +5507,8 @@ fn assemble_outcome(
         // the judged-topic set and `rank_execution` cannot disagree. The rule
         // is keyed on that RUN FACT rather than on "a summary is present":
         // the two are equivalent BY CONSTRUCTION today — a completed pass
-        // opens a capture for every produced topic it owns but a driver
-        // topic, which the arm below skips (the graph
+        // opens a capture for every produced topic it owns but one only its
+        // drivers write, which no capture would see a frame of (the graph
         // pre-creates every owned topic's service at build, so an inert
         // producer's tap opens and harvests zero frames) and a tap that
         // cannot be opened ABORTS the pass as a harness failure rather than
@@ -5524,6 +5555,18 @@ fn assemble_outcome(
         );
         let byte_violation = summary.and_then(|c| c.byte_violation);
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
+        // A topic a driver shares with re-executed writers is judged per
+        // writer over the re-executed writers' partitions only
+        // (`build_capture_partitionings`), so its topic-level count is theirs
+        // too: the driver's recorded frames are inputs nothing re-produces.
+        // Unpartitioned, the bag cannot say which frames are the driver's, and
+        // the whole recorded count stands.
+        let recorded_count = match &partition_counts {
+            Some(parts) if classes.driver_shared.contains(topic) => {
+                parts.values().map(|c| c.recorded).sum()
+            }
+            _ => recorded_count,
+        };
         let tolerance_violations = summary
             .map(|c| c.tolerance_violations.clone())
             .unwrap_or_default();
@@ -5549,11 +5592,13 @@ fn assemble_outcome(
             });
             continue; // NOT counted in topics_passed (it is a violation).
         }
-        // A driver topic is a recorded input: the bag fed its frames to its
-        // consumers, whose own topics this loop judges, and nothing re-produced
-        // it, so there is nothing to compare and `topics_checked` does not count
-        // it. Its record-side loss is attributed by the arm above, on its own
-        // topic, so a bag that lost driver frames still fails.
+        // A driver topic is a recorded input: nothing re-produced it, so there
+        // is nothing to compare and `topics_checked` does not count it; the
+        // topics of the nodes that read it are judged here, and whether those
+        // nodes were fed its frames is logged up front
+        // (`log_driver_topic_feeds`). Its record-side loss is attributed by the
+        // arm above, on its own topic, so a bag that lost driver frames still
+        // fails.
         if classes.driver.contains(topic) {
             continue;
         }
@@ -8985,6 +9030,9 @@ struct PassInputs<'a> {
     /// The whole-graph config — `multi_publisher_topics` is a graph-level
     /// declaration, not a subgraph one.
     config: &'a GraphConfig,
+    /// The graph's `external` (driver) nodes ([`TopicClasses::driver_nodes`]):
+    /// writers a shared topic's partitioned diff leaves out.
+    driver_nodes: &'a BTreeSet<String>,
     /// The `--record-out` sink, if one was asked for.
     record_out: Option<Arc<crate::resim_record_out::RecordOut>>,
 }
@@ -14244,7 +14292,8 @@ fn plan_pass_verification(
 /// The topic sets one pass works over, derived from its plan alone.
 struct PassTopics {
     /// The graph-produced topics this rank produces and the pass captures, in
-    /// graph order: every one but a driver topic ([`TopicClasses::driver`]).
+    /// graph order: every one a member other than a driver
+    /// ([`TopicClasses::driver_nodes`]) writes.
     produced: Vec<String>,
     /// The topics this rank consumes and another rank (or no graph node)
     /// produces: what the pass injects from the bag.
@@ -14265,13 +14314,13 @@ struct PassTopics {
 /// lists rather than out of the plan's sorted sets, so a whole-graph (lockstep)
 /// plan keeps the graph's own order exactly.
 fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool, fed: bool) -> PassTopics {
-    // A driver topic opens no capture: its frames are recorded inputs, and
-    // the driver re-executed here has no device to read.
+    // A topic only this rank's drivers write opens no capture: its frames are
+    // recorded inputs, and a driver re-executed here has no device to read.
+    let re_executed = re_executed_output_topics(plan.subgraph(), &classes.driver_nodes);
     let produced: Vec<String> = classes
         .produced
         .iter()
-        .filter(|t| plan.produced().contains(*t))
-        .filter(|t| !classes.driver.contains(*t))
+        .filter(|t| plan.produced().contains(*t) && re_executed.contains(*t))
         .cloned()
         .collect();
     // A FED pass injects nothing: every consumed topic, external and
@@ -14625,6 +14674,7 @@ fn run_rank_pass(
         pass.skipped_prefix,
         pass.trailing_frames,
         plan.members(),
+        pass.driver_nodes,
         &injectors,
     )?;
     let mut captures_owned = open_captures(
@@ -16232,6 +16282,14 @@ struct TopicClasses {
     /// consistency checks, a cross-rank injector, the read gate) still keeps
     /// them in `produced`; only the capture and the diff leave them out.
     driver: Vec<String>,
+    /// The `produced` topics a driver writes beside at least one other node (a
+    /// `multi_publisher_topics` topic), in graph order: captured and diffed
+    /// over the other writers' frames only (`build_capture_partitionings`).
+    driver_shared: Vec<String>,
+    /// The graph's `external` (driver) nodes ([`external_node_ids`]). A pass
+    /// captures only a topic one of its other members writes, and a driver's
+    /// own frames leave a shared topic's partitioned diff.
+    driver_nodes: BTreeSet<String>,
     /// External topics (consumed in-graph, no in-graph producer) — injected.
     external: Vec<String>,
     /// Recorded topics the graph neither produces nor consumes, which
@@ -16364,10 +16422,11 @@ fn classify_topics(
         });
     }
 
-    let driver = driver_output_topics(config, external_nodes);
     Ok(TopicClasses {
         produced,
-        driver,
+        driver: driver_output_topics(config, external_nodes),
+        driver_shared: driver_shared_topics(config, external_nodes),
+        driver_nodes: external_nodes.clone(),
         external,
         unmodelled,
     })
@@ -16396,27 +16455,168 @@ fn external_node_ids(factories: &IndexMap<String, Box<dyn NodeEntry>>) -> BTreeS
         .collect()
 }
 
-/// The graph-produced topics whose EVERY in-graph writer is in
-/// `external_nodes`, in graph order, deduplicated.
-///
-/// One non-driver writer keeps a topic re-executed: a `multi_publisher_topics`
-/// topic shared by a driver and an ordinary node is still captured and diffed,
-/// so its re-executed writer is still verified.
-fn driver_output_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>) -> Vec<String> {
-    let mut every_writer_external: IndexMap<String, bool> = IndexMap::new();
+/// Per graph-produced topic, in graph order, deduplicated: does a node in
+/// `external_nodes` write it, and does any other node?
+fn driver_writer_census(
+    config: &GraphConfig,
+    external_nodes: &BTreeSet<String>,
+) -> IndexMap<String, (bool, bool)> {
+    let mut census: IndexMap<String, (bool, bool)> = IndexMap::new();
     for node in &config.nodes {
         let external = external_nodes.contains(&node.id);
         for output in &node.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output);
-            let all = every_writer_external.entry(topic).or_insert(true);
-            *all &= external;
+            let (driver, other) = census.entry(topic).or_insert((false, false));
+            *driver |= external;
+            *other |= !external;
         }
     }
-    every_writer_external
+    census
+}
+
+/// The graph-produced topics whose EVERY in-graph writer is in
+/// `external_nodes`, in graph order, deduplicated.
+///
+/// One non-driver writer keeps a topic re-executed: a `multi_publisher_topics`
+/// topic shared by a driver and an ordinary node is still captured and diffed
+/// ([`driver_shared_topics`]), over its re-executed writers' frames.
+fn driver_output_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>) -> Vec<String> {
+    driver_writer_census(config, external_nodes)
         .into_iter()
-        .filter_map(|(topic, all)| all.then_some(topic))
+        .filter_map(|(topic, (driver, other))| (driver && !other).then_some(topic))
         .collect()
+}
+
+/// The graph-produced topics a node in `external_nodes` writes beside at
+/// least one other node, in graph order, deduplicated.
+fn driver_shared_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>) -> Vec<String> {
+    driver_writer_census(config, external_nodes)
+        .into_iter()
+        .filter_map(|(topic, (driver, other))| (driver && other).then_some(topic))
+        .collect()
+}
+
+/// The topics `graph`'s nodes other than `drivers` write, resolved under its
+/// prefix: what a pass over `graph` re-produces. A driver publishes nothing in
+/// a replay, so a topic only a pass's drivers write gives its capture nothing
+/// to see.
+fn re_executed_output_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) -> BTreeSet<String> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| !drivers.contains(&n.id))
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(|o| cerulion_core::graph::resolve_output_topic(&graph.prefix, &n.id, o))
+        })
+        .collect()
+}
+
+/// What a replay does with each driver topic ([`TopicClasses::driver`]),
+/// decided from the graph and the pass layout before the first pass. Each
+/// list is in graph order.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DriverTopicFeeds {
+    /// Read by nodes this replay feeds the recorded frames to.
+    fed: Vec<String>,
+    /// Not fed to a node that reads it: every driver topic of a lockstep
+    /// replay, which never fires the drivers, and, on a free-run pass that
+    /// injects no in-rank topic (not FED), one a node reads in a rank where a
+    /// driver of the topic runs.
+    unfed: Vec<String>,
+    /// Of a free-run replay, read by no node in the graph: neither fed nor
+    /// compared.
+    unread: Vec<String>,
+}
+
+/// Sort every driver topic into [`DriverTopicFeeds`]. PURE: the graph, the
+/// rank plans and the two run facts decide it.
+///
+/// A FED pass feeds every read from the bag; a free-run pass that is not fed
+/// injects only the cross-rank edges (`pass_topics`), so a reader beside the
+/// driver gets nothing; a lockstep pass decides its own fires and installs no
+/// recorded one, so nothing fires a driver at all.
+fn plan_driver_topic_feeds(
+    config: &GraphConfig,
+    classes: &TopicClasses,
+    plans: &[RankPlan],
+    lockstep: bool,
+    fed: bool,
+) -> DriverTopicFeeds {
+    let consumed = graph_consumed_topics(config);
+    let mut feeds = DriverTopicFeeds::default();
+    for topic in &classes.driver {
+        if lockstep {
+            feeds.unfed.push(topic.clone());
+            continue;
+        }
+        if !consumed.contains(topic) {
+            feeds.unread.push(topic.clone());
+            continue;
+        }
+        let read_beside_its_driver = plans.iter().any(|plan| {
+            plan.produced().contains(topic) && rank_consumed_topics(plan).contains(topic)
+        });
+        if !fed && read_beside_its_driver {
+            feeds.unfed.push(topic.clone());
+        } else {
+            feeds.fed.push(topic.clone());
+        }
+    }
+    feeds
+}
+
+/// Log [`DriverTopicFeeds`]: one line per list, never one per topic.
+///
+/// The fed list is INFO, since an input is not a topic the verdict claims to
+/// check and every graph with a camera has one. The other two are WARN, the
+/// same rule as the unmodelled topics: a reader not fed its recorded frames
+/// cannot reproduce its outputs, and a driver topic nobody reads is covered by
+/// no verdict at all. `best_effort_reason` says why a free-run pass is not
+/// fed.
+fn log_driver_topic_feeds(feeds: &DriverTopicFeeds, lockstep: bool, best_effort_reason: &str) {
+    if !feeds.fed.is_empty() {
+        tracing::info!(
+            driver_topics = feeds.fed.len(),
+            topics = %feeds.fed.join(", "),
+            "replay: the outputs of the external (driver) nodes are recorded inputs, fed to \
+             their consumers from the bag and neither re-produced nor compared"
+        );
+    }
+    if !feeds.unfed.is_empty() {
+        if lockstep {
+            tracing::warn!(
+                driver_topics = feeds.unfed.len(),
+                topics = %feeds.unfed.join(", "),
+                "replay: this recording is lockstep, so a resim neither fires its external \
+                 (driver) nodes nor feeds their recorded frames to the nodes that read them, \
+                 and the schedule and those nodes' outputs cannot reproduce: record a graph \
+                 with a driver under the multi-process default, without `--single-process` \
+                 and without CERULION_EXECUTION_MODE=lockstep"
+            );
+        } else {
+            tracing::warn!(
+                driver_topics = feeds.unfed.len(),
+                topics = %feeds.unfed.join(", "),
+                reason = %best_effort_reason,
+                "replay: this resim does not feed these external (driver) topics to the nodes \
+                 that read them in the driver's own process or executor unit, so those nodes \
+                 cannot reproduce their recorded outputs: a `--verify` resim of a recording \
+                 whose reads name their frames feeds them"
+            );
+        }
+    }
+    if !feeds.unread.is_empty() {
+        tracing::warn!(
+            driver_topics = feeds.unread.len(),
+            topics = %feeds.unread.join(", "),
+            "replay: no node in the graph reads these external (driver) topics, so they are \
+             recorded inputs that are neither fed nor compared: nothing in this replay \
+             verifies them"
+        );
+    }
 }
 
 // ===========================================================================
@@ -17204,8 +17404,9 @@ struct CapturePartitioning {
     /// unattributed frame is never partitioned in the first place.
     recorded_writers: Vec<WriterKey>,
     /// The writers THIS PASS can put on the wire — the ones it
-    /// produces LIVE (members of its rank) plus, where the topic is injected
-    /// here, the single foreign writer the injector re-publishes.
+    /// produces LIVE (members of its rank but its `external` drivers, which
+    /// publish nothing in a replay) plus, where the topic is injected here, the
+    /// single foreign writer the injector re-publishes.
     ///
     /// A SPLIT `multi_publisher_topics:` topic is written by several ranks, and
     /// a pass reproduces only what it owns or injects: a writer that is neither
@@ -18236,6 +18437,10 @@ fn build_capture_partitionings(
     // LOCAL (published live, and so nameable from this run's publisher table)
     // and which are FOREIGN (re-published by the injector).
     members: &[String],
+    // The graph's `external` (driver) nodes. A local driver publishes nothing
+    // in a replay, so its recorded frames are inputs and its partition is not
+    // one this pass can reproduce.
+    drivers: &BTreeSet<String>,
     // This pass's injectors, for the id of the publisher that
     // stands in for a split topic's foreign writer.
     injectors: &IndexMap<String, Injector>,
@@ -18265,7 +18470,11 @@ fn build_capture_partitionings(
     let mut producible_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (topic, writers) in &candidates {
         let (mine, foreign) = split_local_and_foreign(writers, &local);
-        let mut producible: BTreeSet<String> = mine.into_iter().map(|w| w.label.clone()).collect();
+        let mut producible: BTreeSet<String> = mine
+            .into_iter()
+            .filter(|w| !drivers.contains(&w.node_id))
+            .map(|w| w.label.clone())
+            .collect();
         match (injectors.get(topic), foreign.as_slice()) {
             (_, []) => {}
             (None, _) => {
@@ -19573,13 +19782,17 @@ mod restored_sync_heads_tests {
 #[cfg(test)]
 mod driver_topic_tests {
     use super::{
-        classify_topics, driver_output_topics, external_node_ids, NodeEntry, RecordedMessages,
+        build_rank_plans, classify_topics, driver_output_topics, driver_shared_topics,
+        external_node_ids, plan_driver_topic_feeds, re_executed_output_topics, CoordinationMode,
+        DriverTopicFeeds, NodeEntry, RecordedMessages, TopicClasses,
     };
+    use crate::replay_rank::RankBoundarySummary;
     use cerulion_core::graph::node::{ClosureNodeEntry, MacroPolicy, NodeInfo};
     use cerulion_core::graph::parse_graph;
     use cerulion_core::{TransportError, TransportResult};
     use indexmap::IndexMap;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     /// A camera driver feeding a meter; the meter's output is the only topic
     /// a node re-computes.
@@ -19698,9 +19911,123 @@ mod driver_topic_tests {
         let config = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
         assert!(driver_output_topics(&config, &ids(&["cam"])).is_empty());
         assert_eq!(
+            driver_shared_topics(&config, &ids(&["cam"])),
+            vec!["/rig/bus".to_string()],
+            "the bus is shared by the driver and the timer"
+        );
+        assert_eq!(
+            re_executed_output_topics(&config, &ids(&["cam"])),
+            ids(&["/rig/bus"]),
+            "the timer re-produces the bus"
+        );
+        assert_eq!(
             driver_output_topics(&config, &ids(&["cam", "timer"])),
             vec!["/rig/bus".to_string()]
         );
+        assert!(driver_shared_topics(&config, &ids(&["cam", "timer"])).is_empty());
+        assert!(re_executed_output_topics(&config, &ids(&["cam", "timer"])).is_empty());
+        assert!(driver_shared_topics(&config, &ids(&[])).is_empty());
+    }
+
+    /// A pass over the camera graph re-produces the meter's topic only.
+    #[test]
+    fn a_pass_re_produces_only_the_topics_its_other_nodes_write() {
+        let config = parse_graph(CAMERA).expect("the camera graph parses");
+        assert_eq!(
+            re_executed_output_topics(&config, &ids(&["cam"])),
+            ids(&["/rig/meter/brightness"])
+        );
+        assert_eq!(
+            re_executed_output_topics(&config, &ids(&[])),
+            ids(&["/rig/cam/image", "/rig/cam/info", "/rig/meter/brightness"])
+        );
+    }
+
+    fn camera_classes(config: &cerulion_core::graph::GraphConfig) -> TopicClasses {
+        let recorded = RecordedMessages::from_owned_frames(IndexMap::new());
+        classify_topics(config, &recorded, None, &ids(&["cam"])).expect("nothing is recorded")
+    }
+
+    fn camera_plans(
+        config: &cerulion_core::graph::GraphConfig,
+        coordination: CoordinationMode,
+        ranks: &[&[&str]],
+    ) -> Vec<crate::replay_rank::RankPlan> {
+        let tables: Vec<Vec<Arc<str>>> = ranks
+            .iter()
+            .map(|r| r.iter().map(|id| Arc::from(*id)).collect())
+            .collect();
+        let summaries: Vec<RankBoundarySummary> = (0..ranks.len() as u32)
+            .map(|rank| RankBoundarySummary::new(rank, 0, 9, 1_000))
+            .collect();
+        build_rank_plans(coordination, config, &tables, &summaries).expect("the graph plans")
+    }
+
+    fn feeds(fed: &[&str], unfed: &[&str], unread: &[&str]) -> DriverTopicFeeds {
+        let v = |l: &[&str]| l.iter().map(|t| (*t).to_string()).collect();
+        DriverTopicFeeds {
+            fed: v(fed),
+            unfed: v(unfed),
+            unread: v(unread),
+        }
+    }
+
+    /// Which driver topics a replay feeds, per layout and mode: a fed pass
+    /// feeds every read, a pass that is not fed only a reader in another rank,
+    /// a lockstep replay none, and a driver topic no node reads is neither fed
+    /// nor compared on any layout.
+    #[test]
+    fn a_driver_topic_is_fed_only_where_the_pass_feeds_its_reader() {
+        let config = parse_graph(CAMERA).expect("the camera graph parses");
+        let classes = camera_classes(&config);
+        let one = camera_plans(&config, CoordinationMode::FreeRun, &[&["cam", "meter"]]);
+        let two = camera_plans(&config, CoordinationMode::FreeRun, &[&["cam"], &["meter"]]);
+        let lock = camera_plans(&config, CoordinationMode::Lockstep, &[&["cam", "meter"]]);
+        let image = "/rig/cam/image";
+        let info = "/rig/cam/info";
+        for (layout, plans, lockstep, fed, want) in [
+            (
+                "one rank, fed",
+                &one,
+                false,
+                true,
+                feeds(&[image], &[], &[info]),
+            ),
+            (
+                "one rank, not fed",
+                &one,
+                false,
+                false,
+                feeds(&[], &[image], &[info]),
+            ),
+            (
+                "two ranks, fed",
+                &two,
+                false,
+                true,
+                feeds(&[image], &[], &[info]),
+            ),
+            (
+                "two ranks, not fed",
+                &two,
+                false,
+                false,
+                feeds(&[image], &[], &[info]),
+            ),
+            (
+                "lockstep",
+                &lock,
+                true,
+                false,
+                feeds(&[], &[image, info], &[]),
+            ),
+        ] {
+            assert_eq!(
+                plan_driver_topic_feeds(&config, &classes, plans, lockstep, fed),
+                want,
+                "{layout}"
+            );
+        }
     }
 
     /// A driver topic a node consumes stays GRAPH-PRODUCED: it is not the
@@ -19730,6 +20057,12 @@ mod driver_topic_tests {
             classes.driver,
             vec!["/rig/cam/image".to_string(), "/rig/cam/info".to_string()]
         );
+        assert!(
+            classes.driver_shared.is_empty(),
+            "{:?}",
+            classes.driver_shared
+        );
+        assert_eq!(classes.driver_nodes, ids(&["cam"]));
         assert!(classes.external.is_empty(), "{:?}", classes.external);
         assert!(classes.unmodelled.is_empty(), "{:?}", classes.unmodelled);
     }

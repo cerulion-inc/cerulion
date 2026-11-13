@@ -1187,7 +1187,7 @@ fire reads its own set's trigger members.
 fn external_source(&mut self) -> ExternalSource { ... }
 ```
 
-`external_source()` is queried **once** at live-loop startup (after `init()`), on the **LIVE path only**, never during a replay (`cerulion bag play --resim`). The wake is record-only: it changes *when* a step runs, never *what* fires, so replay stays byte-identical to live. A replay of a free-run recording (the multi-process default) fires the driver as recorded but gives it no device, so it feeds the driver's recorded output frames to the nodes that read them: they are recorded inputs, and `--verify` compares the outputs of the nodes that read them, never the driver's own. A lockstep recording of a graph with a driver is not supported by a resim (see `docs/bag.md`). `ExternalSource` (re-exported in the prelude) has three variants:
+`external_source()` is queried **once** at live-loop startup (after `init()`), on the **LIVE path only**, never during a replay (`cerulion bag play --resim`). The wake is record-only: it changes *when* a step runs, never *what* fires, so replay stays byte-identical to live. A replay of a free-run recording (the multi-process default) fires the driver as recorded but gives it no device, so it feeds the driver's recorded output frames to the nodes that read them: they are recorded inputs, and `--verify` compares the outputs of the nodes that read them, never the driver's own. A lockstep recording of a graph with a driver is not supported by a resim, which warns and names the remedy (see `docs/bag.md`). `ExternalSource` (re-exported in the prelude) has three variants:
 
 | Variant | Meaning |
 |---|---|

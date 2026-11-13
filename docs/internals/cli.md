@@ -190,13 +190,19 @@ Rules that must not drift:
   `external_source()`, so the driver fires as recorded with no device and publishes
   nothing. Its topics stay in `produced` for every derivation about what the graph writes
   (the consistency checks, a cross-rank injector, the read gate) and leave only the capture
-  (`pass_topics`) and the diff (`assemble_outcome`), where a record-health-lossy driver
-  topic is still a per-topic `RecordSideTapLoss`. A metadata read that fails keeps the
-  node's topics compared. Pinned by `driver_topic_tests` and the driver-graph arms of
-  `replay_engine_test.rs` (the `drv_*` fixtures). Not covered: a LOCKSTEP pass decides its
-  own fires, so nothing fires the driver, and a driver topic consumed in the driver's own
-  rank is neither fed (lockstep and non-verify passes inject no in-rank topic) nor
-  injectable (the driver holds its single-writer publisher); `docs/bag.md` states it.
+  (`pass_topics` captures a topic only where a member other than a driver writes it) and the
+  diff (`assemble_outcome`), where a record-health-lossy driver topic is still a per-topic
+  `RecordSideTapLoss`. A `multi_publisher_topics` topic a driver shares with other nodes
+  (`TopicClasses::driver_shared`) stays captured: `build_capture_partitionings` leaves the
+  driver's writer out of `producible`, and the topic-level count is the partitions' sum; an
+  unpartitioned one keeps the whole recorded count and fails. A metadata read that fails
+  keeps the node's topics compared. `plan_driver_topic_feeds` sorts the driver topics into
+  fed (INFO), unfed and unread (one WARN each); a LOCKSTEP pass decides its own fires, so
+  nothing fires the driver and every driver topic is unfed, and a free-run pass that is not
+  fed injects no in-rank topic, so a reader beside the driver is unfed. A `0/0` tally with a
+  driver warns that nothing was compared. Pinned by `driver_topic_tests` and the
+  driver-graph arms of `replay_engine_test.rs` (the `drv_*` fixtures); `docs/bag.md` states
+  the user-facing rules.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.
