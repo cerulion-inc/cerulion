@@ -1150,6 +1150,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk |
+| `crates/cerulion_connectd/tests/connect_interrupt_e2e_test.rs` | The real `cerulion-connectd connect` and the real `cerulion connect`, streaming from a test robot with stdin a pipe held open: SIGINT to the helper, a closed stdin, and SIGINT or SIGTERM to `cerulion connect` each end the run with exit 0 within 2 s, with the robot's catalog on stdout. The `cerulion connect` arms need `cargo build -p cerulion_cli` first, which puts `cerulion` beside `cerulion-connectd` |
 | `cerulion_wireclient` in-module tests | Dial-config parsers, epoch push decisions + cache-path pins, reply classification |
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |
 | `crates/cerulion_ops_proto/tests/wire_golden_test.rs` | Every `cerulion/ops/1` message type encodes to, and decodes from, a golden frame built from JSON text |
