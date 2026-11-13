@@ -51,6 +51,14 @@ env:
   # emptied rather than left holding archives nothing will replace.
   CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
   CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
+  # CARGO BUILD-DIR LAYOUT, the same variable and value as ci.yml's `env`
+  # block, whose comment says what it does. Here it keeps the build-script
+  # output where gate.sh's bindgen check reads it,
+  # `target/release/build/rmw_cerulion-<hash>/out/bindings.rs`: cargo 1.100
+  # otherwise writes it to `target/release/build/rmw_cerulion/<hash>/out/`.
+  # The aarch64 Foxy job runs the gate in its own `docker run` and passes the
+  # variable in with `-e`.
+  __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
 
 permissions:
   contents: read
@@ -249,6 +257,7 @@ jobs:
             --platform linux/arm64 \
             --shm-size=1g \
             -e CARGO_TERM_COLOR=never \
+            -e __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT \
             -e RCLPY_TIMEOUT=2400 \
             -e RCLCPP_PAIR_SECS=120 \
             -e RMW_GATE_SKIP_SERIAL_SUITE=1 \

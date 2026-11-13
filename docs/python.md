@@ -12,6 +12,12 @@ pip install maturin
 cd crates/cerulion_py && RUSTUP_TOOLCHAIN=1.95.0 maturin develop --release
 ```
 
+A Python node also needs a `cerulion` CLI built from the same checkout:
+
+```bash
+cargo install --path crates/cerulion_cli
+```
+
 ## Writing nodes in Python
 
 Python-authored nodes are standalone node `cdylib` libraries built against the current node ABI. The CLI creates
