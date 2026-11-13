@@ -3378,6 +3378,10 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_cli", "cerulion_hygiene", "crate-path"),
     ("cerulion_cli", "cerulion_telemetry", "crate-path"),
     ("cerulion_cli", "cerulion_viz", "crate-path"),
+    // fresh_executable_test's COPIES table reads each crate's copy of the helper by path.
+    ("cerulion_cli", "cerulion_cli_engine", "crate-path"),
+    ("cerulion_cli", "cerulion_netd", "crate-path"),
+    ("cerulion_cli", "cerulion_wsd", "crate-path"),
     // ros2_run_e2e_test names the preload the launcher injects,
     // `libcerulion_heaphook.so`, which is the artifact cerulion_heaphook builds.
     ("cerulion_cli", "cerulion_heaphook", "dlopen"),
