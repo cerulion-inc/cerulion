@@ -995,7 +995,7 @@ echo "Rebuilding cerulion binary + workspace cdylibs (release) for iceoryx2 pari
 # there: the leg fails before its first sample. One invocation builds the
 # pair the way the release does. bench.py names a missing or stale daemon,
 # beside a CERULION override or named by CERULION_NETD_BIN, before any cell
-# runs.
+# runs; a CERULION_NETD_BIN naming the daemon this build writes is exempt.
 if ! ( cd "$REPO_ROOT" && cargo build -p cerulion_cli -p cerulion_netd --release ); then
     echo "!!! pre-sweep cerulion_cli + cerulion_netd rebuild failed, aborting (would run stale binaries)" >&2
     exit 1

@@ -9429,6 +9429,8 @@ def check_cerulion_override_is_documented() -> int:
         ("the daemon beside the override", "cerulion-netd"),
         ("the explicit daemon checked on every path",
          "unset, empty and the default path included"),
+        ("the runner's own daemon build output is exempt",
+         "unless it names the runner's own build output"),
         ("the stale-daemon relink", bench.NETD_RELINK_CMD),
         ("the uncovered direct invocation", "does not go through"),
     ):
@@ -15161,6 +15163,10 @@ def check_cerulion_binary_freshness() -> int:
                 outside_netd = Path(td) / "elsewhere" / bench.NETD_BIN_NAME
                 release_netd = release.parent / bench.NETD_BIN_NAME
                 nowhere_netd = Path(td) / "nowhere" / bench.NETD_BIN_NAME
+                # In tree but NOT the runner's build output, so a row naming
+                # it is decided by the classifier, never by the exemption
+                # `release_netd` takes.
+                intree_netd = debug.parent / "deps" / bench.NETD_BIN_NAME
 
                 def netd_row(env_value, netd_ns, netd_mode, netd_floor):
                     _touch_ns(debug, floor + HOUR)
@@ -15189,6 +15195,7 @@ def check_cerulion_binary_freshness() -> int:
                 try:
                     _touch_ns(outside_netd, floor + HOUR)
                     _touch_ns(release_netd, floor + HOUR)
+                    _touch_ns(intree_netd, floor + HOUR)
                     for label, env_value, netd_ns, netd_mode, netd_floor, \
                             want, needles in (
                         ("a fresh daemon beside it", None, floor + HOUR,
@@ -15222,7 +15229,7 @@ def check_cerulion_binary_freshness() -> int:
                          "refused", (str(nowhere_netd),)),
                         ("CERULION_NETD_BIN naming a fresh in-tree daemon "
                          "while none sits beside the CLI",
-                         str(release_netd), None, None, floor, "accepted",
+                         str(intree_netd), None, None, floor, "accepted",
                          ()),
                         # Empty is unset: the CLI filters it out.
                         ("an EMPTY CERULION_NETD_BIN", "", floor + HOUR,
@@ -15244,6 +15251,25 @@ def check_cerulion_binary_freshness() -> int:
                                       f"{label} must say {needle!r}, got "
                                       f"{text!r}]")
                                 errors += 1
+                    # The runner's own build output, beside an ACCEPTED
+                    # override: run_workspace.sh builds it before any leg
+                    # spawns it, whatever CERULION names, so neither an
+                    # unbuilt nor a stale one may be refused.
+                    for state, netd_state_ns in (("NOT BUILT YET", None),
+                                                 ("STALE", floor - 2 * HOUR)):
+                        if release_netd.exists():
+                            release_netd.unlink()
+                        if netd_state_ns is not None:
+                            _touch_ns(release_netd, netd_state_ns)
+                        got, text = netd_row(str(release_netd), floor + HOUR,
+                                             0o755, floor)
+                        if got != "accepted":
+                            print(f"FAIL  [netd beside the override: "
+                                  f"CERULION_NETD_BIN at the runner's build "
+                                  f"output, {state}, must be accepted, got "
+                                  f"{got}: {text!r}]")
+                            errors += 1
+                    _touch_ns(release_netd, floor + HOUR)
                     # The ladder's ORDER for a symlinked override, by hand:
                     # the running binary is the path as executed on macOS
                     # and the resolved one on Linux, then the resolved
@@ -15277,12 +15303,35 @@ def check_cerulion_binary_freshness() -> int:
                     # (raw and through a symlinked prefix): the runner
                     # rebuilds its default pair, but the CLI spawns a set
                     # CERULION_NETD_BIN exclusively, so that rebuild never
-                    # reaches the daemon the run uses. Driven through
-                    # run_workspace_leg with cleanup_iceoryx() raising, so a
-                    # row that is refused is refused BEFORE the SHM sweep,
-                    # and the fresh control proves the sweep is reachable.
+                    # reaches the daemon the run uses unless it names the
+                    # runner's own build output, which is exempt missing or
+                    # stale. Driven through run_workspace_leg with
+                    # cleanup_iceoryx() raising, so a row that is refused is
+                    # refused BEFORE the SHM sweep, and the fresh control
+                    # proves the sweep is reachable.
                     stale_netd = tree / "target" / "release" / "deps" / \
                         bench.NETD_BIN_NAME
+                    alias_netd = alias_release.parent / bench.NETD_BIN_NAME
+                    # A rebuild output that is a SYMLINK to a foreign
+                    # daemon, and another symlink elsewhere ending at that
+                    # daemon: resolving the build output's final component
+                    # would exempt the second, which the CLI spawns as is.
+                    foreign_link = Path(td) / "links" / bench.NETD_BIN_NAME
+                    foreign_link.parent.mkdir(exist_ok=True)
+                    if foreign_link.exists() or foreign_link.is_symlink():
+                        foreign_link.unlink()
+                    foreign_link.symlink_to(outside_netd)
+
+                    def release_netd_as(state):
+                        # Unlink first: `_touch_ns` writes THROUGH a symlink.
+                        if release_netd.exists() or release_netd.is_symlink():
+                            release_netd.unlink()
+                        if state == "fresh":
+                            _touch_ns(release_netd, floor + HOUR)
+                        elif state == "stale":
+                            _touch_ns(release_netd, floor - 2 * HOUR)
+                        elif state == "foreign link":
+                            release_netd.symlink_to(outside_netd)
                     swept_at = []
 
                     def sweep_reached():
@@ -15298,7 +15347,7 @@ def check_cerulion_binary_freshness() -> int:
                         else which_now(n, *a, **k))
                     bench.netd_source_floor_ns = lambda: floor
                     try:
-                        _touch_ns(release_netd, floor + HOUR)
+                        _touch_ns(intree_netd, floor + HOUR)
                         _touch_ns(stale_netd, floor - 2 * HOUR)
                         if nowhere_netd.exists():
                             nowhere_netd.unlink()
@@ -15321,23 +15370,51 @@ def check_cerulion_binary_freshness() -> int:
                                 ("CERULION at the default path via a "
                                  "symlinked prefix", str(alias_release)),
                             ):
-                                for netd_label, netd_value, want, needles in (
+                                for netd_label, netd_value, built, want, \
+                                        needles in (
                                     ("a RELATIVE CERULION_NETD_BIN",
-                                     "target/release/cerulion-netd",
+                                     "target/release/cerulion-netd", "fresh",
                                      "refused", ("relative path",
                                                  f"unset {bench.NETD_BIN_ENV}")),
                                     ("a MISSING CERULION_NETD_BIN",
-                                     str(nowhere_netd), "refused",
+                                     str(nowhere_netd), "fresh", "refused",
                                      (str(nowhere_netd), "first sample",
                                       bench.CLI_REBUILD_CMD,
                                       f"unset {bench.NETD_BIN_ENV}")),
                                     ("a STALE CERULION_NETD_BIN",
-                                     str(stale_netd), "refused",
+                                     str(stale_netd), "fresh", "refused",
                                      ("7200 s older", bench.NETD_RELINK_CMD,
                                       f"unset {bench.NETD_BIN_ENV}")),
                                     ("a fresh in-tree CERULION_NETD_BIN",
-                                     str(release_netd), "swept", ()),
+                                     str(intree_netd), "fresh", "swept", ()),
+                                    # The file the runner's paired build
+                                    # writes before any leg spawns it: naming
+                                    # it is the same ask as not setting it.
+                                    ("CERULION_NETD_BIN at the runner's "
+                                     "build output, NOT BUILT YET",
+                                     str(release_netd), "absent", "swept", ()),
+                                    ("CERULION_NETD_BIN at the runner's "
+                                     "build output, STALE",
+                                     str(release_netd), "stale", "swept", ()),
+                                    ("CERULION_NETD_BIN at the runner's "
+                                     "build output via a symlinked prefix, "
+                                     "NOT BUILT YET",
+                                     str(alias_netd), "absent", "swept", ()),
+                                    ("a symlink elsewhere ending at the "
+                                     "foreign daemon the build output links "
+                                     "to", str(foreign_link), "foreign link",
+                                     "refused", ("not this checkout",
+                                                 f"unset {bench.NETD_BIN_ENV}")),
+                                    # The CLI execs the value verbatim, and
+                                    # a trailing separator is ENOTDIR there
+                                    # while pathlib compares it equal.
+                                    ("CERULION_NETD_BIN at the runner's "
+                                     "build output with a trailing "
+                                     "separator", str(release_netd) + "/",
+                                     "absent", "refused",
+                                     ("names no executable",)),
                                 ):
+                                    release_netd_as(built)
                                     if cli_value is None:
                                         os.environ.pop(bench.CERULION_BIN_ENV,
                                                        None)
@@ -15374,11 +15451,55 @@ def check_cerulion_binary_freshness() -> int:
                                                   f"say {needle!r}, got "
                                                   f"{text!r}]")
                                             errors += 1
+                            # The build output is CARGO's target dir, not
+                            # `<repo>/target`: under a CARGO_TARGET_DIR the
+                            # paired build writes there, and the repo's own
+                            # target/release is written by nothing.
+                            shared = Path(td) / "shared-target"
+                            os.environ.pop(bench.CERULION_BIN_ENV, None)
+                            release_netd_as("absent")
+                            try:
+                                os.environ["CARGO_TARGET_DIR"] = str(shared)
+                                for ctd_label, ctd_value, want in (
+                                    ("the CARGO_TARGET_DIR build output",
+                                     shared / "release" / bench.NETD_BIN_NAME,
+                                     "swept"),
+                                    ("<repo>/target/release, which that "
+                                     "build does not write", release_netd,
+                                     "refused"),
+                                ):
+                                    os.environ[bench.NETD_BIN_ENV] = \
+                                        str(ctd_value)
+                                    del swept_at[:]
+                                    try:
+                                        with contextlib.redirect_stdout(
+                                                io.StringIO()), \
+                                                contextlib.redirect_stderr(
+                                                    io.StringIO()):
+                                            bench.run_workspace_leg(
+                                                "iox2", 0, "quiescent", leg_raw,
+                                                leg_raw / "_logs", [64])
+                                        got, text = "ran", ""
+                                    except _CaptureProceeded:
+                                        got, text = "swept", ""
+                                    except SystemExit as e:
+                                        got, text = "refused", str(e.code)
+                                    if got != want:
+                                        print(f"FAIL  [netd without an "
+                                              f"override: CERULION unset, "
+                                              f"CARGO_TARGET_DIR set, an "
+                                              f"unbuilt CERULION_NETD_BIN at "
+                                              f"{ctd_label} must be {want}, "
+                                              f"got {got}: {text!r}]")
+                                        errors += 1
+                            finally:
+                                os.environ.pop("CARGO_TARGET_DIR", None)
                     finally:
                         bench.cleanup_iceoryx = saved_sweep
                         bench.WORKSPACE_DIR = saved_ws_dir
                         bench.shutil.which = which_now
                         os.environ.pop(bench.NETD_BIN_ENV, None)
+                        release_netd_as("fresh")
                 finally:
                     bench.netd_source_floor_ns = lambda: floor
                     _touch_ns(debug_netd, floor + HOUR)

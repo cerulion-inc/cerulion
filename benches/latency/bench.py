@@ -2909,7 +2909,9 @@ def refuse_foreign_cerulion_override(subcommand: str) -> None:
     questions (`refuse_unusable_netd`). A set CERULION_NETD_BIN is asked
     them on EVERY path, CERULION unset, empty or the runner's default path
     included: the CLI spawns that file exclusively, so the runner's rebuild
-    of the default pair does not protect it.
+    of the default pair does not protect it, unless it names the runner's
+    own build output (`<cargo target dir>/release/cerulion-netd`), which
+    that rebuild writes.
 
     SCOPE: this covers every path bench.py drives (the workspace,
     full and smoke subcommands, and run_workspace_leg itself). A DIRECT
@@ -3167,6 +3169,38 @@ def netd_candidates_for(cli: Path) -> List[Path]:
     return [named] if resolved == named else [named, resolved]
 
 
+def _names_the_runner_netd(explicit: str) -> bool:
+    """Does CERULION_NETD_BIN name the daemon run_workspace.sh's own
+    `cargo build -p cerulion_cli -p cerulion_netd --release` writes?
+
+    That build writes `cargo_target_dir()/release/cerulion-netd`, under any
+    CARGO_TARGET_DIR, before any leg runs, so naming that file is the same
+    ask as leaving the variable unset with the default pair in place. It is
+    compared RAW, then with the daemon's PARENT resolved and the name
+    re-attached, as the CLI's default-path exemption does: a symlinked
+    checkout prefix still matches, and a rebuild output that is itself a
+    symlink to a foreign daemon does not lend its exemption to another
+    symlink ending at that daemon.
+
+    Only an absolute value without a trailing separator can match. A
+    relative one is resolved from a working directory the runner does not
+    share, and the CLI execs the value verbatim, so a trailing separator
+    fails with ENOTDIR where pathlib would compare it equal."""
+    if explicit.endswith(("/", os.sep)):
+        return False
+    candidate = Path(explicit)
+    if not candidate.is_absolute():
+        return False
+    built = cargo_target_dir() / "release" / NETD_BIN_NAME
+    if candidate == built:
+        return True
+    try:
+        return candidate.resolve() == built.parent.resolve() / built.name
+    except (OSError, RuntimeError):
+        # No evidence either way: the ordinary checks decide.
+        return False
+
+
 def refuse_unusable_netd(cli: Optional[Path], raw: Optional[str],
                          subcommand: str) -> None:
     """Refuse when the `cerulion-netd` a workspace run would spawn is
@@ -3184,7 +3218,9 @@ def refuse_unusable_netd(cli: Optional[Path], raw: Optional[str],
     With None only an explicit CERULION_NETD_BIN is asked: run_workspace.sh
     rebuilds the pair at its default path, but the CLI spawns a set
     CERULION_NETD_BIN EXCLUSIVELY, whichever binary runs, so that rebuild
-    never reaches the daemon the run uses. Unset, the default pair stands.
+    never reaches the daemon the run uses unless it names the runner's own
+    build output (`_names_the_runner_netd`), which is exempt whatever
+    CERULION is. Unset, the default pair stands.
 
     Dated against the daemon's OWN closure (`netd_source_floor_ns`): cargo
     relinks it only when something it links changed, so the CLI's floor
@@ -3194,6 +3230,13 @@ def refuse_unusable_netd(cli: Optional[Path], raw: Optional[str],
     forces that relink."""
     explicit = os.environ.get(NETD_BIN_ENV, "")
     if cli is None and not explicit:
+        return
+    # Asked ABOVE the relative, missing and stale checks, as the CLI's own
+    # default-path exemption is: run_workspace.sh builds this file before
+    # any leg spawns it, so naming it is the same ask as leaving the
+    # variable unset, where the default daemon is not refused missing or
+    # stale either.
+    if explicit and _names_the_runner_netd(explicit):
         return
     if explicit and not Path(explicit).is_absolute():
         raise SystemExit(
