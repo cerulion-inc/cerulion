@@ -60,6 +60,7 @@ fn ext_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn No
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/ext/cam".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -256,6 +257,7 @@ fn topic_override_publishes_under_absolute_name_with_single_writer() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "/tf".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -412,6 +414,7 @@ fn declared_ingress_precreates_full_consumer_capacity_and_delivers_oracle_bytes(
                     depth: 48,
                     backpressure: BackpressurePolicy::DropOldest,
                     expect_within_ms: None,
+                    accumulate: false,
                     consume: InputConsume::Fifo,
                 }],
                 vec![],

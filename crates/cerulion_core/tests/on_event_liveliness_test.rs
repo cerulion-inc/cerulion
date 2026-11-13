@@ -150,6 +150,7 @@ fn liveliness_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -357,6 +358,7 @@ fn dual_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

@@ -280,6 +280,7 @@ fn chain_graph(
                     name: "inp".to_string(),
                     // relay triggers on the source's output topic.
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vector3_output("out")],
             },
@@ -293,6 +294,7 @@ fn chain_graph(
                     name: "inp".to_string(),
                     // sink triggers on relay's output topic.
                     source: "relay/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

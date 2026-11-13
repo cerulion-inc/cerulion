@@ -93,6 +93,7 @@ fn sample_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -121,8 +122,8 @@ fn run_sample_graph(steps: usize) -> u64 {
     // installs ONLY the read-gate — the other two policies' machinery must
     // stay dormant on it. Dormancy of `drop_oldest_count` is type-enforced
     // by the single `BackpressureProbe` slot; `block_fires_deferred_count`
-    // stays dormant for a different reason — a sample edge makes the topic
-    // non-all-block, so no producer defer edge is ever wired. These asserts
+    // stays dormant for a different reason: the topic has no `block`
+    // consumer, so no producer defer edge is ever wired. These asserts
     // pin both behaviorally for every caller of this helper.
     assert_eq!(
         handle.backpressure_drop_oldest_count("inp"),

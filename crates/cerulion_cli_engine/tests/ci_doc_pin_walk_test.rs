@@ -292,6 +292,10 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["examples"],
         &[],
     ),
+    // The crate's own unit tests: `src/graph/config.rs` joins the networking
+    // and user API pages onto the manifest directory to check that they name
+    // every key a network egress entry accepts.
+    ("cerulion_core", "cerulion_core", &["docs"], &[]),
     // The test map it gates, held in a const and joined onto the root.
     (
         "cerulion_core",
@@ -1312,14 +1316,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 86 where the root manifest's `members` array lists 85: the extra one is the
+/// 87 where the root manifest's `members` array lists 86: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 86;
+const WORKSPACE_MEMBER_COUNT: usize = 87;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.

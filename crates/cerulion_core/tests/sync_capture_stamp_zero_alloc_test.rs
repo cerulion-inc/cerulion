@@ -105,6 +105,7 @@ fn fusion_graph(
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     };
     let mut info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
@@ -170,10 +171,12 @@ fn fusion_graph(
                 InputDef {
                     name: "cam".to_string(),
                     source: TOPIC_CAM.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "lidar".to_string(),
                     source: TOPIC_LIDAR.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],

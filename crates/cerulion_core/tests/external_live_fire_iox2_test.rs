@@ -272,6 +272,7 @@ fn producer_consumer_parts(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1080,6 +1081,7 @@ fn zero_external_bindings_zero_cost() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -2893,6 +2895,7 @@ mod eventfd_arm {
                     inputs: vec![InputDef {
                         name: "inp".to_string(),
                         source: "producer/out".to_string(),
+                        ..Default::default()
                     }],
                     outputs: vec![],
                 },

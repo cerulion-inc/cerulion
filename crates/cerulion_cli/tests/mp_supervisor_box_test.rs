@@ -182,6 +182,7 @@ fn build_graph_config() -> GraphConfig {
     let input = |source: &str| InputDef {
         name: "inp".to_string(),
         source: source.to_string(),
+        ..Default::default()
     };
     GraphConfig {
         level_assignments: None,

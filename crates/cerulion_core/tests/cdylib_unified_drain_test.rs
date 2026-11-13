@@ -151,6 +151,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
                 inputs: vec![InputDef {
                     name: "trigger_in".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "cmd".to_string(),
@@ -169,6 +170,7 @@ fn run_cdylib_chain(prefix: &str) -> (bool, usize, Vec<u64>) {
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "fwd/cmd".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -363,6 +365,7 @@ fn run_drain_fail_graph(prefix: &str) -> (bool, usize, u64, u64) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

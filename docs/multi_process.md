@@ -69,24 +69,31 @@ recording's per-edge read log offline).
   another worker cannot see. A SPLIT edge instead carries that mirror in shared
   memory, a **cross-process credit word** the supervisor mints per edge, and
   is then lossless across the boundary. One is minted for exactly the shape it
-  can describe: a topic with **exactly one in-graph producer** and **no
-  non-`block` consumers**. Every other split `block` edge is still refused
-  PRE-SPAWN (a multi-producer topic, because the word counts one producer's
-  outstanding frames; a MIXED topic, because its `block` consumers degrade to
-  `drop_oldest` and there is no lossless defer left to credit), and the refusal
-  names which bar it hit. The derived partition still co-locates every `block`
-  topic's WHOLE FLOW automatically (crossing a boundary costs a real hop
-  whether or not it is correct): its producers, its `block` consumers, and (on
-  a MIXED topic) the non-`block` siblings, without which the co-located worker
-  reads its flow as all-`block` and installs a defer `--single-process`
-  degrades (shown in `graph partition`'s consent preview). One residual is
+  can describe: a topic with **exactly one in-graph producer**, one word per
+  `block` consumer in another process. A split multi-producer `block` edge is
+  still refused PRE-SPAWN (the word counts one producer's outstanding frames),
+  and so is a split `block` input that sets `block_timeout_ms` (see
+  [The per-edge credit word](#the-per-edge-credit-word)); each refusal names
+  the bar. The topic's non-`block` consumers hold no
+  word and may sit in any group. A `block` consumer, split or not, defers the
+  producer's whole node, so wherever those `drop_oldest` and `sample(N)`
+  consumers sit they receive frames at the pace the `block` consumers allow.
+  The worker that runs the producer logs one load-time warning per such
+  topic, naming the consumers of every group, from the list the supervisor
+  derives from the whole graph (see
+  [Mixed topics](user-api.md#mixed-topics-each-block-consumer-holds-its-own-slot)).
+  The derived partition still co-locates every
+  `block` topic's WHOLE FLOW automatically (crossing a boundary costs a real
+  hop): its producers and all its consumers (shown in `graph partition`'s
+  consent preview). When a `block` consumer's worker dies, the supervisor
+  releases that consumer's slot and the producer resumes. One residual is
   worth knowing: on a
   `multi_publisher_topics:`-listed topic the credit word counts IN-GRAPH
   publishes only, so an out-of-graph writer can fill the consumer's queue
   without raising `outstanding`; the defer then arrives late and the queue can
   evict. That is a property of `block` on a listed topic, co-located or split.
-  A consumer drain that removes more frames than `outstanding` counts warns
-  `block credit drain removed frames its word never counted`, naming the
+  A consumer drain that removes more frames than its credit word has queued
+  warns `block credit drain removed frames its word never counted`, naming the
   topic, at the start of a run of such drains, so the outside writer shows in
   the log; while a run lasts, the drain that takes the running total to each
   power of ten warns a different line,
@@ -518,7 +525,8 @@ never the fire set/order.
 A `block` edge is lossless because the producer reads the consumer's `outstanding` counter
 before it fires. Split the two across process groups and that read is gone, so such
 a split is accepted only for a **creditable** edge
-(exactly one in-graph producer, no non-`block` consumers), which gets a shared word to
+(exactly one in-graph producer; the topic's non-`block` consumers hold no word and do
+not count) whose `block` input sets no `block_timeout_ms`, which gets a shared word to
 read instead.
 
 **One word per EDGE, not per topic.** The identity is
@@ -576,19 +584,22 @@ an edge that is not there.
 ### Reading a credit-death warn
 
 Under `--peer-loss continue` the survivors keep running when a worker dies. If the dead rank
-was a credited edge's CONSUMER, the producer is now gating on a mirror nobody will drain, so
-the supervisor says so. The head is a `warn!` (emitted by `CreditDeathWatch` in `graph_cmd.rs`) with these fields:
+was a credited edge's CONSUMER, the supervisor releases that consumer's slot (its word only;
+every other consumer of the topic keeps its own) and the producer resumes. The head is a
+`warn!` (emitted by `CreditDeathWatch` in `graph_cmd.rs`) with these fields:
 
 ```
-group  node_id  topic  consumer_input  dead_rank
+group  node_id  topic  consumer_input  producer  reason  slot_released  dead_rank
 deferred_producer_ranks  deferred_producer_groups  total_failures
 ```
 
 Read it as: **`topic` + `consumer_input`** identify the edge; **`dead_rank` / `group`** say who
-died; **`deferred_producer_groups`** names the groups whose producers are now stuck on it (real
-group names, one per producer rank, not the batch; a rank whose group cannot be resolved
-renders `<rank N>` rather than being dropped);
-**`total_failures`** is a running, unconditional count that recovery never resets.
+died; **`producer`** names the edge's producer nodes; **`reason`** is `consumer_died`;
+**`slot_released`** is `true` when this report released the slot; **`deferred_producer_groups`**
+names the groups of the producers the dead consumer had been holding (real group names, one
+per producer rank, not the batch; a rank whose group cannot be resolved renders `<rank N>`
+rather than being dropped); **`total_failures`** is a running, unconditional count that
+recovery never resets.
 
 It is flood-latched on the shared `FailureRegimeLatch`: one loud head, `debug!` repeats,
 and a `warn!` re-announcement at each decade of the running total. If a
@@ -647,10 +658,14 @@ second at 1 kHz, about a minute and a half at 10 Hz. That is acceptable because 
 is permanent: a stalled consumer does not resume on its own, so the warn is
 late, never wrong.
 
-This is the second never-silent carrier for the wedge class, and it covers what the first
-cannot. The supervisor's `CreditDeathWatch` above reports a consumer whose PROCESS DIED; this
-reports one that is alive and idle. Between them both halves of a permanently-deferred
-producer are named.
+This warn only reports. `block_timeout_ms` cannot bound it on a split edge: the supervisor
+refuses the key, before any worker starts, on every edge it mints a credit word for, naming the
+edge and both process groups or executor units. The producer and the consumer fire on different
+threads there, so after a timeout release a read and a publish can interleave and the shared
+word can count a frame that is gone, or miss one and let a frame published after the release be
+evicted. To bound how long an alive-but-idle consumer can hold its producer, put both nodes in
+one process group (or run `--single-process`) and set the key there. A consumer whose PROCESS
+DIED needs no timeout: the supervisor's `CreditDeathWatch` above releases its slot.
 
 Pinned end to end over REAL processes by `crates/cerulion_cli/tests/credit_death_e2e_test.rs`: the
 loud head and its fields, the ABSENCE of a repeat, the retraction, the free-run `groups=`. The
@@ -821,8 +836,9 @@ each driven to its own recorded boundary targets:
   WOULD read cross-rank occupancy at instants nothing records, so an
   independently re-derived schedule could legally differ from the recorded one
   and report a fire-schedule divergence on a candidate that changed nothing.
-  (Such a bag CAN exist: plan time admits a creditable split,
-  so `graph run --record` of one produces a bag carrying a cross-process
+  (Such a bag CAN exist: plan time admits a creditable split whose `block`
+  input sets no `block_timeout_ms`, so `graph run --record` of one produces
+  a bag carrying a cross-process
   `block` edge. Replay does not accept it: `replay_engine` builds no
   credited-edge set, so the consumer's rank sees a producer-less `block` topic
   and refuses at exit 5.) In replay that

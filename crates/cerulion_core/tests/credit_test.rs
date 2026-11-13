@@ -45,8 +45,10 @@
 
 use cerulion_core::credit::{
     credit_edge_id, credit_shm_name, credit_wake_word_primitive_available, CreditShared,
-    MappedCredit, ParkedEdgeGuard, ProducerSlot, CREDIT_BYTES, PARKED_MASK_BITS,
+    CreditWord, Drained, MappedCredit, ParkedEdgeGuard, ProducerSlot, CREDIT_BYTES,
+    PARKED_MASK_BITS,
 };
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -85,7 +87,7 @@ fn await_until(budget: Duration, what: &str, mut cond: impl FnMut() -> bool) {
 /// offsets are not reachable).
 #[test]
 fn the_mapped_layout_is_pinned() {
-    assert_eq!(std::mem::size_of::<CreditShared>(), 24);
+    assert_eq!(std::mem::size_of::<CreditShared>(), 32);
     assert!(std::mem::align_of::<CreditShared>() >= 8);
     assert_eq!(
         CREDIT_BYTES, 64,
@@ -622,6 +624,234 @@ fn a_second_claim_before_publishing_over_fills_the_word_under_the_chunk_2_fence(
          assertion flipping is the SIGNAL that the extension landed."
     );
     assert!(credit.is_full(), "and it reads full either way");
+}
+
+// --------------------------------------------------------- the take-back ----
+
+/// `(outstanding, forgiven)`: the two counts a word's gate and its forgiven
+/// backlog read.
+fn counts(word: &CreditShared) -> (u64, u64) {
+    (word.outstanding(), word.forgiven())
+}
+
+/// A failed send's take-back on a LOCAL word restores the forgiven backlog
+/// its count clamped, so the drains that follow pay exactly the forgiven
+/// frames and a frame published after them stays counted.
+///
+/// Oracle, by hand, on a depth-2 word with one connection, as `(outstanding,
+/// forgiven)`: frames A and B are counted (2, 0) and the timeout release
+/// forgives both (0, 2). Frame C's count assumes C's push evicts A and clamps
+/// the backlog to the room beside it (1, 1). C's send reaches no queue and
+/// the take-back puts back what the count replaced (0, 2). The drain of A pays
+/// one forgiven frame (0, 1), frame D is counted (1, 1), the drain of B pays
+/// the last forgiven frame and leaves D counted (1, 0), and the drain of D
+/// pays nothing and clips nothing (0, 0). A take-back that only subtracted the
+/// queued count would leave (0, 1): the drain of B would then take D's count,
+/// the word would read (0, 0) with D queued, and the drain of D would clip.
+#[test]
+fn the_undo_on_a_local_word_restores_the_backlog_the_count_clamped() {
+    let w = CreditWord::local(2);
+    assert_eq!(w.record_published(), 1, "frame A");
+    assert_eq!(w.record_published(), 2, "frame B");
+    assert_eq!(w.forgive_outstanding(), 2, "the release forgives A and B");
+    assert_eq!(counts(&w), (0, 2));
+    let undo = w
+        .record_published_with_undo()
+        .expect("an armed slot counts frame C");
+    assert_eq!(
+        counts(&w),
+        (1, 1),
+        "C's count clamps the backlog to the room beside it"
+    );
+    assert_eq!(w.record_unpublished(undo), 0, "C reached no queue");
+    assert_eq!(
+        counts(&w),
+        (0, 2),
+        "the take-back restores the backlog with the queued count"
+    );
+    assert_eq!(
+        w.record_drained(1),
+        Drained {
+            paid: 1,
+            clipped: 0
+        },
+        "the drain of A"
+    );
+    assert_eq!(counts(&w), (0, 1));
+    assert_eq!(w.record_published(), 1, "frame D");
+    assert_eq!(counts(&w), (1, 1));
+    assert_eq!(
+        w.record_drained(1),
+        Drained {
+            paid: 1,
+            clipped: 0
+        },
+        "the drain of B pays the last forgiven frame"
+    );
+    assert_eq!(counts(&w), (1, 0), "D is still counted");
+    assert_eq!(
+        w.record_drained(1),
+        Drained {
+            paid: 0,
+            clipped: 0
+        },
+        "the drain of D"
+    );
+    assert_eq!(counts(&w), (0, 0));
+}
+
+/// The limit of counting before the send: on a word that keeps a forgiven
+/// backlog and whose drain can run between a publish's count and its queue
+/// push, the count under-counts, and a frame the word counted is evicted.
+/// This pins the failure as it is.
+///
+/// A model queue of capacity 2 that evicts its oldest frame on overflow
+/// stands in for the consumer's iceoryx2 queue, and the word runs on one
+/// thread in the order two threads would interleave. Oracle, by hand, as
+/// `(outstanding, forgiven)`: the queue holds forgiven frames [A, B] (0, 2).
+/// Frame C's count clamps the backlog for the eviction it expects from C's
+/// push (1, 1). The consumer drains A before that push, which pays the backlog
+/// (1, 0). The push of C finds room, [B, C], and the drain of B takes C's
+/// count (0, 0) with C queued. Two more publishes are admitted and the second
+/// evicts C.
+///
+/// Graph load refuses `block_timeout_ms`, the only source of a backlog, on a
+/// split edge, whose consumer drains in another process
+/// (`block_slot_release_iox2_test::block_timeout_on_a_split_edge_is_refused_at_the_consumers_build`,
+/// `cerulion_cli_engine`'s
+/// `multiprocess::block_timeout_on_an_edge_the_mint_credits_is_refused_before_spawn`
+/// and
+/// `graph_levels_test::a_split_block_edge_with_a_timeout_reads_invalid_with_the_run_refusal`),
+/// and on a topic with several producers
+/// (`topology::block_timeout_is_refused_on_a_topic_with_several_producers`).
+/// So only a local word with one producer keeps a backlog, and that word's
+/// producer and consumer fire one at a time on one thread: no drain falls
+/// between a count and its push.
+#[test]
+fn counting_before_send_on_a_shared_backlog_word_under_counts() {
+    const CAPACITY: usize = 2;
+    /// Push `frame`, evicting the oldest frame of a full queue, and return
+    /// the evicted frame.
+    fn push(queue: &mut VecDeque<char>, frame: char) -> Option<char> {
+        let evicted = if queue.len() == CAPACITY {
+            queue.pop_front()
+        } else {
+            None
+        };
+        queue.push_back(frame);
+        evicted
+    }
+    let w = CreditWord::local(2);
+    let mut queue = VecDeque::new();
+    for frame in ['A', 'B'] {
+        w.record_published();
+        assert_eq!(push(&mut queue, frame), None, "frame {frame} fits");
+    }
+    assert_eq!(w.forgive_outstanding(), 2, "the release forgives A and B");
+    assert_eq!(counts(&w), (0, 2));
+
+    w.record_published();
+    assert_eq!(
+        counts(&w),
+        (1, 1),
+        "C's count clamps the backlog for the eviction it expects"
+    );
+    assert_eq!(queue.pop_front(), Some('A'), "the consumer pops A first");
+    assert_eq!(
+        w.record_drained(1),
+        Drained {
+            paid: 1,
+            clipped: 0
+        },
+        "the drain of A pays the backlog"
+    );
+    assert_eq!(counts(&w), (1, 0));
+    assert_eq!(push(&mut queue, 'C'), None, "C's push finds room");
+    assert_eq!(queue.pop_front(), Some('B'));
+    assert_eq!(
+        w.record_drained(1),
+        Drained {
+            paid: 0,
+            clipped: 0
+        },
+        "the drain of B takes C's count"
+    );
+    assert_eq!(queue, VecDeque::from(['C']));
+    assert_eq!(
+        counts(&w),
+        (0, 0),
+        "the word under-counts: C is queued and counted nowhere"
+    );
+
+    let mut evicted = Vec::new();
+    for frame in ['D', 'E'] {
+        assert!(w.try_claim(), "frame {frame} is admitted");
+        w.record_published();
+        evicted.extend(push(&mut queue, frame));
+    }
+    assert_eq!(evicted, vec!['C'], "E's push evicts C, a counted frame");
+    assert_eq!(queue, VecDeque::from(['D', 'E']));
+    assert_eq!(counts(&w), (2, 0));
+}
+
+/// A take-back after another writer moved the word subtracts one queued
+/// frame, saturating at 0. A cross-process word's consumer drains in another
+/// process, so its word can move between a publish's count and the
+/// take-back, and such a word holds no forgiven backlog.
+///
+/// Oracle, by hand, on a depth-4 word mapped twice, the producer's mapping and
+/// the consumer's: two frames are counted (2) and a third frame's count reads
+/// 3; the consumer drains one of the first two (2); the third frame's send
+/// reaches no queue and its take-back leaves 1. Then, on the word at 0: a count
+/// reads 1, the consumer's drain of one frame takes the word to 0 first, and
+/// the take-back leaves 0, not `u32::MAX`, so the producer is admitted.
+#[test]
+fn a_take_back_after_another_writer_moved_the_word_subtracts_one_frame() {
+    let ns = test_ns("undo_moved");
+    let id = edge_id();
+    let _owner = MappedCredit::create_owned(&ns, &id, 4).unwrap();
+    let producer = MappedCredit::open_unowned(&ns, &id).expect("the producer's mapping");
+    let consumer = MappedCredit::open_unowned(&ns, &id).expect("the consumer's mapping");
+
+    assert_eq!(producer.record_published_n(2), 2);
+    let undo = producer
+        .record_published_with_undo()
+        .expect("an armed slot counts the third frame");
+    assert_eq!(consumer.outstanding(), 3);
+    assert_eq!(
+        consumer.record_drained(1),
+        Drained::default(),
+        "the consumer drains a counted frame"
+    );
+    assert_eq!(
+        producer.record_unpublished(undo),
+        1,
+        "3, less the drain, less the take-back"
+    );
+    assert_eq!(counts(&consumer), (1, 0));
+    assert_eq!(consumer.record_drained(1), Drained::default());
+    assert_eq!(consumer.outstanding(), 0);
+
+    let undo = producer
+        .record_published_with_undo()
+        .expect("an armed slot counts the frame");
+    assert_eq!(consumer.outstanding(), 1);
+    assert_eq!(
+        consumer.record_drained(1),
+        Drained::default(),
+        "the consumer's drain takes the count first"
+    );
+    assert_eq!(
+        producer.record_unpublished(undo),
+        0,
+        "a take-back on a word at 0"
+    );
+    assert_eq!(
+        consumer.outstanding(),
+        0,
+        "leaves the word at 0, never u32::MAX"
+    );
+    assert!(producer.try_claim(), "so the producer is admitted");
 }
 
 // ------------------------------------------------------------ the park -----

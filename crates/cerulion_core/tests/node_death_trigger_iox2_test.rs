@@ -531,6 +531,7 @@ fn a_node_that_dies_on_its_last_input_is_still_captured() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "source/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

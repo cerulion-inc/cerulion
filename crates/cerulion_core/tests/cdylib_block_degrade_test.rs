@@ -1,38 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Cdylib-parity third pass — bp-block-degrade: the MIXED-topic block-degrade
-//! contract (`backpressure_block_iox2_test.rs`'s
-//! `mixed_block_dropoldest_producer_not_deferred`), proven through the
-//! LOADED `test_node_macro_depth_cdylib` fixture.
+//! Cdylib parity for a `block` input on a MIXED topic
+//! (`backpressure_block_iox2_test.rs`'s
+//! `mixed_block_dropoldest_block_consumer_still_defers`), through the LOADED
+//! `test_node_macro_depth_cdylib` fixture.
 //!
-//! No NEW fixture: `test_node_macro_depth_cdylib`'s `inp` field
-//! (`#[input(backpressure = block, depth = 32)]`, `external` + `HostDriven`,
-//! never triggered by `cdylib_depth_ffi_test.rs`'s plateau test) is the
-//! natural candidate — reused as-is. The degrade contract is purely a
-//! BUILD-TIME topology property (`GraphTopology::build`'s per-topic
-//! `is_all_block()` check across ALL declared consumer backpressure
-//! policies), so neither consumer needs to ever be triggered — mirroring the
-//! in-process crib, which never calls `trigger_external` on either sibling.
+//! The fixture's `inp` field is `#[input(backpressure = block, depth = 32)]`,
+//! `external` + `HostDriven`, and never triggered here. An in-process
+//! `drop_oldest` sibling reads the same topic, so the topic is mixed.
 //!
 //! # Topology
 //!
 //! `DegradeBlockProducer` (in-process, `period_ms = 10`) publishes `out`
-//! (shared by BOTH consumers — the mixedness under test) and `aux_out`
-//! (dedicated, so the depth cdylib's `aux` input keeps its own non-mixed
-//! topic, matching `cdylib_depth_ffi_test.rs`'s wiring convention).
+//! (shared by BOTH consumers) and `aux_out` (the depth cdylib's `aux` input).
 //!
 //! - `depth_consumer` (the cdylib): `inp` <- `producer/out` (block, depth
 //!   32), `aux` <- `producer/aux_out` (sample(7)). NEVER triggered.
 //! - `dropper` (in-process): `inp` <- `producer/out` (drop_oldest, depth 2).
-//!   NEVER triggered. Its mere presence on the SAME topic as `depth_consumer`
-//!   makes that topic mixed.
 //!
 //! # Oracle
 //!
-//! On a mixed topic the block consumer degrades (no defer edge installed):
-//! the producer fires at its UN-pressured rate (exactly once per 10ms step,
-//! matching `mixed_block_dropoldest_producer_not_deferred`'s pin) and the
-//! degraded consumer's `backpressure_block_fires_deferred_count("inp")`
-//! stays exactly 0.
+//! The cdylib's block input holds its own credit slot whatever the sibling
+//! declares: the producer fires exactly 32 times (the depth) and every later
+//! step is a block defer on the cdylib consumer's `inp`.
 //!
 //! # Build requirement + serial
 //!
@@ -51,9 +40,11 @@ use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
 
-/// Producer period; also the step delta, so `fire_count == STEPS` is the
-/// un-pressured (never-deferred) oracle.
+/// Producer period; also the step delta. The producer would fire once per
+/// step unpressured.
 const STEPS: usize = 50;
+/// The fixture's declared depth on `inp`.
+const DEPTH: u64 = 32;
 
 fn find_cdylib(crate_name: &str) -> std::path::PathBuf {
     cerulion_core::testing::find_fixture_cdylib(crate_name)
@@ -147,10 +138,12 @@ fn run_degrade() -> (u64, u64) {
                     InputDef {
                         name: "inp".to_string(),
                         source: "producer/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "aux".to_string(),
                         source: "producer/aux_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
@@ -164,6 +157,7 @@ fn run_degrade() -> (u64, u64) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -204,19 +198,17 @@ fn run_degrade() -> (u64, u64) {
 
 #[test]
 #[serial]
-fn dylib_block_input_degrades_on_mixed_topic_producer_not_deferred() {
+fn dylib_block_input_on_a_mixed_topic_defers_the_producer() {
     let (producer_fires, deferred) = run_degrade();
     assert_eq!(
-        producer_fires, STEPS as u64,
-        "producer must fire at the un-pressured rate on a mixed topic (the \
-         dylib's block consumer degrades to drop_oldest, no defer edge \
-         installed) — got {producer_fires}"
+        producer_fires, DEPTH,
+        "the dylib's block input defers the producer at its depth on a mixed topic \
+         got {producer_fires}"
     );
     assert_eq!(
-        deferred, 0,
-        "the degraded (mixed-topic) dylib block consumer must observe ZERO \
-         block defers — its declared block policy was downgraded across the \
-         FFI just as it is in-process (got {deferred})"
+        deferred,
+        STEPS as u64 - DEPTH,
+        "every step after the slot filled is a block defer (got {deferred})"
     );
 }
 
@@ -227,17 +219,13 @@ fn dylib_block_input_degrades_on_mixed_topic_producer_not_deferred() {
 )]
 #[test]
 #[serial]
-fn dylib_block_degrade_is_deterministic() {
+fn dylib_block_on_a_mixed_topic_is_deterministic() {
     let a = run_degrade();
     let b = run_degrade();
     assert_eq!(
         a, b,
-        "two runs of the mixed-topic degrade must be byte-identical \
+        "two runs of the mixed-topic graph must be byte-identical \
          (VirtualClock, no wall-clock). a={a:?} b={b:?}"
     );
-    assert_eq!(
-        a.0, STEPS as u64,
-        "the deterministic run must un-pressured-fire"
-    );
-    assert_eq!(a.1, 0, "the deterministic run must show zero defers");
+    assert_eq!(a.0, DEPTH, "the deterministic run plateaus at the depth");
 }

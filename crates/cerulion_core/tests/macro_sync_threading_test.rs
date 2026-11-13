@@ -134,10 +134,12 @@ fn macro_sync_with_two_yaml_wired_inputs_builds_successfully() {
                     InputDef {
                         name: "cam".to_string(),
                         source: "producer/cam_out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "imu".to_string(),
                         source: "producer/imu_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 // The cdylib declares `fused`; the build refuses a declared

@@ -31,7 +31,7 @@
 //! across runs (Principle #5: graph is the source of truth; Principle #7:
 //! replay = live).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -97,11 +97,15 @@ pub struct ConsumerEdge {
     /// The input's declared queue depth (`#[input(depth = N)]`), or
     /// [`DEFAULT_CONSUMER_DEPTH`] for non-macro consumers.
     pub depth: usize,
+    /// The graph's `block_timeout_ms` for this input, if it declares one.
+    pub block_timeout_ms: Option<u64>,
 }
 
 /// The set of `(topic, consumer node, consumer input)` edges a
 /// build carries a CROSS-PROCESS CREDIT WORD for — the one exemption
-/// [`GraphTopology::validate`]'s producer-less-`block` arm honours.
+/// [`GraphTopology::validate`]'s producer-less-`block` arm honours, and the
+/// edges on which it refuses `block_timeout_ms`. Each edge keeps the producer
+/// node ids its binding names, for that refusal's text.
 ///
 /// # Why a newtype rather than a bare `HashSet<(&str, &str, &str)>`
 ///
@@ -123,7 +127,7 @@ pub struct ConsumerEdge {
 /// really did `open_unowned` a shared page for.
 #[derive(Debug, Default)]
 pub struct CreditedEdges<'a> {
-    edges: HashSet<(&'a str, &'a str, &'a str)>,
+    edges: HashMap<(&'a str, &'a str, &'a str), &'a [String]>,
 }
 
 impl<'a> CreditedEdges<'a> {
@@ -131,7 +135,7 @@ impl<'a> CreditedEdges<'a> {
     /// ordinary producer-less rule. The single-process default.
     pub fn none() -> Self {
         Self {
-            edges: HashSet::new(),
+            edges: HashMap::new(),
         }
     }
 
@@ -147,9 +151,12 @@ impl<'a> CreditedEdges<'a> {
                 .filter(|b| b.word.is_mapped())
                 .map(|b| {
                     (
-                        b.topic.as_str(),
-                        b.consumer_node.as_str(),
-                        b.consumer_input.as_str(),
+                        (
+                            b.topic.as_str(),
+                            b.consumer_node.as_str(),
+                            b.consumer_input.as_str(),
+                        ),
+                        b.producer_nodes.as_slice(),
                     )
                 })
                 .collect(),
@@ -158,7 +165,13 @@ impl<'a> CreditedEdges<'a> {
 
     /// Is this `(topic, node, input)` edge credited?
     pub(crate) fn contains(&self, topic: &str, node: &str, input: &str) -> bool {
-        self.edges.contains(&(topic, node, input))
+        self.edges.contains_key(&(topic, node, input))
+    }
+
+    /// The producer node ids the binding of this `(topic, node, input)` edge
+    /// names, or `None` when the edge is not credited.
+    pub(crate) fn producers(&self, topic: &str, node: &str, input: &str) -> Option<&'a [String]> {
+        self.edges.get(&(topic, node, input)).copied()
     }
 }
 
@@ -204,52 +217,16 @@ pub enum CreditBar {
     /// counts ONE producer's outstanding frames, so two writers would each
     /// spend the other's credit. Always `>= 2`.
     MultipleProducers(usize),
-    /// The topic carries BOTH `block` consumer(s) and non-`block` sibling(s),
-    /// so the `block` ones are degraded to `drop_oldest` and there is no
-    /// lossless defer left to credit. Carries the siblings — at least one, by
-    /// construction — because they are the nodes the operator has to move.
-    ///
-    /// Both halves are load-bearing: a topic with siblings but NO `block`
-    /// consumer is [`CreditBar::NoBlockConsumer`], not this.
-    MixedTopic { first: String, rest: Vec<String> },
     /// One producer and NO `block` consumer — either the topic has no
     /// consumers at all, or only non-`block` ones. Either way there is no
     /// defer to credit.
     ///
     /// Unreachable from a `block_colocation_seeds` seed (which requires a
-    /// `block` consumer), reachable on any other flow. Distinct from
-    /// [`CreditBar::MixedTopic`], which means the topic has `block` consumers
-    /// AND non-`block` siblings, so the `block` ones are degraded — a claim
-    /// that is only true when such consumers exist.
+    /// `block` consumer), reachable on any other flow.
     NoBlockConsumer,
 }
 
-impl CreditBar {
-    /// The non-`block` consumers this bar blames, in graph order. Empty for
-    /// every variant but [`CreditBar::MixedTopic`], which always names ≥ 1.
-    pub fn siblings(&self) -> Vec<&str> {
-        match self {
-            Self::MixedTopic { first, rest } => std::iter::once(first.as_str())
-                .chain(rest.iter().map(String::as_str))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-}
-
 impl TopicFlow {
-    /// True when the topic has ≥1 consumer and EVERY consumer is `block`.
-    /// Only an all-`block` topic is eligible for producer pre-fire defer:
-    /// deferring would otherwise starve a non-`block` sibling (decision K),
-    /// so a mixed topic degrades its `block` consumers to `drop_oldest`.
-    pub fn is_all_block(&self) -> bool {
-        !self.consumers.is_empty()
-            && self
-                .consumers
-                .iter()
-                .all(|c| matches!(c.policy, BackpressurePolicy::Block))
-    }
-
     /// Why this topic's `block` edges cannot carry a
     /// cross-process credit word — `None` means they CAN.
     ///
@@ -277,45 +254,24 @@ impl TopicFlow {
     /// # The variants are the operator's diagnosis
     ///
     /// The refusal has to say WHICH bar it hit, because "a split `block` edge
-    /// cannot be honoured" is not true of every split: some run. `MixedTopic`
-    /// carries the siblings it names so the message can point at the node the
-    /// operator has to move, rather than a second field that must be kept in
-    /// agreement with this decision.
+    /// cannot be honoured" is not true of every split: some run.
     ///
     /// The rank half of the mint's condition (`producer_rank !=
     /// consumer_rank`) is NOT here: it is a property of the partition, not of
     /// the flow, and each caller already has it — the validator as its
     /// `pg == cg` arm, the mint as its rank lookup.
     ///
-    /// Pure; allocates only when it is naming siblings.
+    /// Pure; allocates nothing.
     pub fn credit_bar(&self) -> Option<CreditBar> {
         match self.producers.len() {
             // Nothing to defer, and `validate` already refuses `block` here
             // with its own specific message.
             0 => Some(CreditBar::NoInGraphProducer),
-            1 => {
-                // ASKED FIRST, and the order is the correctness point: a topic
-                // with one producer, NO `block` consumer and one or more
-                // `drop_oldest` ones is not "mixed" in any sense the refusal
-                // could act on — there is nothing to degrade and nothing to
-                // defer. Reporting `MixedTopic` there renders a sentence about
-                // "its `block` consumers" that names consumers which do not
-                // exist.
-                if !self.has_block_consumer() {
-                    return Some(CreditBar::NoBlockConsumer);
-                }
-                let mut siblings = self
-                    .consumers
-                    .iter()
-                    .filter(|c| !matches!(c.policy, BackpressurePolicy::Block))
-                    .map(|c| format!("{}.{}", c.node_id, c.input));
-                // `None` here means every consumer is `block`, and the guard
-                // above proved there is at least one: THE creditable shape.
-                siblings.next().map(|first| CreditBar::MixedTopic {
-                    first,
-                    rest: siblings.collect(),
-                })
-            }
+            // One producer: creditable iff some consumer holds a `block`
+            // slot. Non-`block` consumers of the topic hold none and do not
+            // matter here.
+            1 if !self.has_block_consumer() => Some(CreditBar::NoBlockConsumer),
+            1 => None,
             // `> 1` by construction; a credit word counts ONE producer's
             // outstanding frames, so two writers would each spend the other's.
             n => Some(CreditBar::MultipleProducers(n)),
@@ -326,9 +282,9 @@ impl TopicFlow {
     /// credit word? Defined AS `credit_bar().is_none()`, so the predicate and
     /// the reason cannot disagree — it is one function, not two that agree.
     ///
-    /// Equivalent to `producers.len() == 1 && is_all_block()`, which is the
-    /// condition the mint is written in terms of; the equivalence is pinned
-    /// over the whole shape space rather than left to inspection.
+    /// Equivalent to `producers.len() == 1 && has_block_consumer()`; the
+    /// equivalence is pinned over the whole shape space rather than left to
+    /// inspection.
     pub fn is_creditable(&self) -> bool {
         self.credit_bar().is_none()
     }
@@ -369,11 +325,122 @@ impl TopicFlow {
             .any(|c| matches!(c.policy, BackpressurePolicy::Block))
     }
 
+    /// Do this topic's `block` consumers hold its in-graph producers? True
+    /// when the topic has an in-graph producer and at least one `block`
+    /// consumer, whatever its other consumers declare: every in-graph producer
+    /// then carries each `block` consumer's slot in its pre-fire check.
+    ///
+    /// The one rule for that set: the runtime wires the producers' slots by
+    /// it, replay's re-derivation reads by it which producers a fire can be
+    /// held on, and the derived partition and the executor units keep such a
+    /// topic's producers and consumers together by it.
+    pub fn holds_its_producers(&self) -> bool {
+        !self.producers.is_empty() && self.has_block_consumer()
+    }
+
     /// Sum of every consumer's declared depth — the lower bound on the
     /// iceoryx2 publisher pool's slot count for this topic (before history +
     /// loan headroom).
     pub fn sum_consumer_depths(&self) -> usize {
         self.consumers.iter().map(|c| c.depth).sum()
+    }
+
+    /// The load-time warning for a topic whose `block` consumers pace its
+    /// `drop_oldest` and `sample(N)` consumers, or `None` unless the topic has
+    /// an in-graph producer, at least one `block` consumer and at least one
+    /// consumer of another policy.
+    ///
+    /// `block` consumers are listed smallest depth first; at one depth, one
+    /// with no `block_timeout_ms` (never released) first, then the longest
+    /// timeout; ties keep graph order. The paced consumers keep graph order.
+    // hot-path-alloc-ok-fn: cold: graph build, once per topic, before the first step
+    pub fn paced_topic_warning(&self) -> Option<PacedTopicWarning> {
+        let mut blocks: Vec<&ConsumerEdge> = self
+            .consumers
+            .iter()
+            .filter(|c| matches!(c.policy, BackpressurePolicy::Block))
+            .collect();
+        let paced: Vec<String> = self
+            .consumers
+            .iter()
+            .filter_map(|c| match c.policy {
+                BackpressurePolicy::Block => None,
+                BackpressurePolicy::DropOldest => {
+                    Some(format!("{}.{} (drop_oldest)", c.node_id, c.input))
+                }
+                BackpressurePolicy::Sample(ms) => {
+                    Some(format!("{}.{} (sample({ms}))", c.node_id, c.input))
+                }
+            })
+            .collect();
+        if self.producers.is_empty() || blocks.is_empty() || paced.is_empty() {
+            return None;
+        }
+        blocks.sort_by_key(|c| {
+            (
+                c.depth,
+                c.block_timeout_ms.is_some(),
+                std::cmp::Reverse(c.block_timeout_ms),
+            )
+        });
+        let block_consumers = blocks
+            .iter()
+            .map(|c| match c.block_timeout_ms {
+                Some(ms) => format!(
+                    "{}.{} (depth {}, block_timeout_ms {ms})",
+                    c.node_id, c.input, c.depth
+                ),
+                None => format!("{}.{} (depth {})", c.node_id, c.input, c.depth),
+            })
+            .collect();
+        Some(PacedTopicWarning {
+            topic: self.topic.clone(),
+            producer_nodes: self.producers.clone(),
+            block_consumers,
+            paced_consumers: paced,
+        })
+    }
+}
+
+/// One topic whose `block` consumers pace its `drop_oldest` and `sample(N)`
+/// consumers: the producer node defers while any `block` consumer's queue is
+/// full, so the others receive frames at the pace the `block` consumers allow.
+/// Built by [`TopicFlow::paced_topic_warning`] and logged once per build by
+/// [`Self::log`].
+///
+/// A multi-process supervisor builds these from the whole graph and hands each
+/// worker the ones whose producer node it builds, so a consumer in another
+/// process group is named too.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PacedTopicWarning {
+    /// The resolved absolute topic.
+    pub topic: String,
+    /// The topic's in-graph producer node ids.
+    pub producer_nodes: Vec<String>,
+    /// Each `block` consumer as `node.input (depth N)` or
+    /// `node.input (depth N, block_timeout_ms M)`, slowest declared first.
+    pub block_consumers: Vec<String>,
+    /// Each `drop_oldest` and `sample(N)` consumer as `node.input (drop_oldest)`
+    /// or `node.input (sample(N))`, in graph order.
+    pub paced_consumers: Vec<String>,
+}
+
+impl PacedTopicWarning {
+    /// Log this warning at `warn!`, naming `graph`.
+    // hot-path-alloc-ok-fn: cold: graph build, once per paced topic
+    pub fn log(&self, graph: &str) {
+        tracing::warn!(
+            graph = %graph,
+            topic = %self.topic,
+            producer_nodes = %self.producer_nodes.join(", "),
+            block_consumers = %self.block_consumers.join(", "),
+            paced_consumers = %self.paced_consumers.join(", "),
+            "mixed `block` topic: its `drop_oldest` and `sample(N)` consumers receive frames at \
+             the pace its `block` consumers allow, because the producer node defers while any \
+             `block` consumer's queue is full and a deferred node publishes on none of its \
+             outputs. `block_consumers` lists the slowest declared first"
+        );
     }
 }
 
@@ -512,10 +579,11 @@ impl GraphTopology {
             }
             for input in &node_def.inputs {
                 let topic = resolve_source(&config.prefix, &input.source);
-                let (policy, depth) = info
+                let declared = info
                     .and_then(|i| i.input_meta().iter().find(|m| m.name == input.name))
                     .map(|m| (m.backpressure, m.depth))
                     .unwrap_or((BackpressurePolicy::default(), DEFAULT_CONSUMER_DEPTH));
+                let (policy, depth) = effective_input_policy(input, declared);
                 let flow = topics.entry(topic.clone()).or_insert_with(|| TopicFlow {
                     topic: topic.clone(),
                     producers: Vec::new(),
@@ -526,9 +594,11 @@ impl GraphTopology {
                     input: input.name.clone(),
                     policy,
                     depth,
+                    block_timeout_ms: input.block_timeout_ms,
                 });
             }
         }
+        refuse_block_on_network_edges(config, &topics)?;
 
         Ok(Self {
             topics,
@@ -701,8 +771,8 @@ impl GraphTopology {
                              you are reading this from a multi-process WORKER, the \
                              partition split the producer away from this consumer and the \
                              plan carried no cross-process credit word for the edge — one \
-                             is minted only for a topic with exactly ONE in-graph producer \
-                             and NO non-`block` consumers. Put them in ONE \
+                             is minted only for a topic with exactly ONE in-graph \
+                             producer. Put them in ONE \
                              `process_groups:` group, or run `--single-process` — never \
                              switch to drop_oldest for that, it silently loses data (the \
                              derived partition co-locates `block` edges automatically)",
@@ -712,7 +782,127 @@ impl GraphTopology {
                 }
             }
         }
-        Ok(())
+        for flow in self.topics.values() {
+            for c in &flow.consumers {
+                match c.block_timeout_ms {
+                    Some(_) if !matches!(c.policy, BackpressurePolicy::Block) => {
+                        return Err(TransportError::GraphError {
+                            reason: format!(
+                                "input '{}.{}' on topic '{}' sets `block_timeout_ms` but its \
+                                 backpressure is {:?}, not `block`: only a `block` consumer \
+                                 holds its producer, so there is nothing to time out. Set \
+                                 `backpressure: block` on the input or remove the key",
+                                c.node_id, c.input, flow.topic, c.policy
+                            ),
+                        });
+                    }
+                    Some(0) => {
+                        return Err(TransportError::GraphError {
+                            reason: format!(
+                                "input '{}.{}' on topic '{}' sets `block_timeout_ms: 0`, which \
+                                 would release the slot on every full reading, so `block` \
+                                 would never hold the producer. Use a positive timeout, or \
+                                 `backpressure: drop_oldest`",
+                                c.node_id, c.input, flow.topic
+                            ),
+                        });
+                    }
+                    Some(_)
+                        if (flow.producers.len() > 1
+                            || self.multi_publisher_topics.contains(&flow.topic))
+                            && !crate::oracle_mutant::active(
+                                "block_shared_timeout_refusal_off",
+                            ) =>
+                    {
+                        return Err(TransportError::GraphError {
+                            reason: shared_topic_timeout_refusal(
+                                flow,
+                                c,
+                                self.multi_publisher_topics.contains(&flow.topic),
+                            ),
+                        });
+                    }
+                    // A credited edge counts on its cross-process word
+                    // (`credited` is the token the wiring loop skips by), so
+                    // its producer fires on another thread.
+                    Some(_) if !crate::oracle_mutant::active("block_split_timeout_refusal_off") => {
+                        if let Some(producers) =
+                            credited.producers(&flow.topic, &c.node_id, &c.input)
+                        {
+                            return Err(TransportError::GraphError {
+                                reason: split_edge_timeout_refusal(
+                                    &flow.topic,
+                                    &c.node_id,
+                                    &c.input,
+                                    producers,
+                                    "this process",
+                                    "another process",
+                                ),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.refuse_block_cycles()
+    }
+
+    /// Refuse a ring of `block` edges.
+    ///
+    /// A `block` edge holds its producer while the consumer's queue is full,
+    /// and a deferred node does not tick, so it drains none of its own inputs.
+    /// Around a ring every node can be holding the one before it, and then no
+    /// node of the ring ever ticks again. A self edge (a node reading its own
+    /// output with `block`) is the one-node ring.
+    ///
+    /// Only `block` edges count: a `drop_oldest` or `sample(N)` edge anywhere
+    /// in the ring never holds its producer, so it breaks the ring.
+    pub fn refuse_block_cycles(&self) -> TransportResult<()> {
+        let index: HashMap<&str, usize> = self
+            .node_order
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        let mut names: Vec<(&str, &str, &str, &str)> = Vec::new();
+        for flow in self.topics.values() {
+            for c in &flow.consumers {
+                if !matches!(c.policy, BackpressurePolicy::Block) {
+                    continue;
+                }
+                let Some(&to) = index.get(c.node_id.as_str()) else {
+                    continue;
+                };
+                for p in &flow.producers {
+                    let Some(&from) = index.get(p.as_str()) else {
+                        continue;
+                    };
+                    edges.push((from, to));
+                    names.push((p.as_str(), flow.topic.as_str(), &c.node_id, &c.input));
+                }
+            }
+        }
+        let Some(ring) = block_cycle(self.node_order.len(), &edges) else {
+            return Ok(());
+        };
+        let rendered: Vec<String> = ring
+            .iter()
+            .map(|&e| {
+                let (p, t, c, i) = names[e];
+                format!("{p} -> {c}.{i} (topic '{t}')")
+            })
+            .collect();
+        Err(TransportError::GraphError {
+            reason: format!(
+                "a ring of `block` edges: {}. Each edge holds its producer while its \
+                 consumer's queue is full, and a held node drains none of its own inputs, so \
+                 every node of the ring can end up held by the one before it and none ever \
+                 ticks again. Make one edge of the ring `drop_oldest` (or `sample(N)`)",
+                rendered.join(", ")
+            ),
+        })
     }
 
     /// Look up a topic's flow (producers + consumers).
@@ -723,6 +913,15 @@ impl GraphTopology {
     /// Iterate every topic's flow, in deterministic graph order.
     pub fn topics(&self) -> impl Iterator<Item = &TopicFlow> {
         self.topics.values()
+    }
+
+    /// Every topic's [`TopicFlow::paced_topic_warning`], in graph order.
+    // hot-path-alloc-ok-fn: cold: graph build, once per build
+    pub fn paced_topic_warnings(&self) -> Vec<PacedTopicWarning> {
+        self.topics
+            .values()
+            .filter_map(TopicFlow::paced_topic_warning)
+            .collect()
     }
 
     /// The in-graph producer node ids for `topic` (empty when the topic is
@@ -2163,6 +2362,299 @@ impl std::fmt::Display for CycleError {
 
 impl std::error::Error for CycleError {}
 
+/// The `(policy, depth)` an input runs with: the graph's `backpressure:` and
+/// `depth:` keys where present, the node's declared values otherwise.
+pub fn effective_input_policy(
+    input: &crate::graph::config::InputDef,
+    declared: (BackpressurePolicy, usize),
+) -> (BackpressurePolicy, usize) {
+    use crate::graph::config::InputBackpressure;
+    let policy = match input.backpressure {
+        Some(InputBackpressure::Block) => BackpressurePolicy::Block,
+        Some(InputBackpressure::DropOldest) => BackpressurePolicy::DropOldest,
+        None => declared.0,
+    };
+    (policy, input.depth.unwrap_or(declared.1))
+}
+
+/// Write the graph's per-input `backpressure:` and `depth:` keys into each
+/// node's input metadata, so every reader of [`NodeInfo::input_meta`] sees the
+/// policy and depth the input runs with.
+///
+/// A key on an input the node declares no metadata for is refused under
+/// [`MissingInputMeta::Refuse`] (the runtime's view, read from the loaded
+/// node) and skipped under [`MissingInputMeta::Skip`] (a view parsed from
+/// source, which may not see every port). Idempotent.
+pub fn apply_input_backpressure_overrides(
+    config: &GraphConfig,
+    entry_infos: &mut IndexMap<String, NodeInfo>,
+    missing: MissingInputMeta,
+) -> TransportResult<()> {
+    for node_def in config.native_nodes() {
+        for input in &node_def.inputs {
+            if input.backpressure.is_none() && input.depth.is_none() {
+                continue;
+            }
+            let Some(info) = entry_infos.get_mut(&node_def.id) else {
+                continue;
+            };
+            let Some(meta) = info
+                .input_meta_mut()
+                .iter_mut()
+                .find(|m| m.name == input.name)
+            else {
+                if missing == MissingInputMeta::Skip {
+                    continue;
+                }
+                return Err(TransportError::GraphError {
+                    reason: format!(
+                        "input '{}.{}' sets `backpressure:` or `depth:` in the graph, but node \
+                         '{}' declares no input metadata for '{}' (no `#[input(...)]` port of \
+                         that name), so there is no declared port to apply them to",
+                        node_def.id, input.name, node_def.id, input.name
+                    ),
+                });
+            };
+            if meta.accumulate && !crate::oracle_mutant::active("block_accumulate_refusal_off") {
+                if input.backpressure == Some(crate::graph::config::InputBackpressure::Block) {
+                    return Err(TransportError::GraphError {
+                        reason: format!(
+                            "input '{}.{}' sets `backpressure: block` in the graph, but the node \
+                             declares it `#[input(accumulate)]`. `#[input(accumulate)]` cannot \
+                             be combined with `backpressure = block`: an accumulate input drops \
+                             its oldest frames at the cap, while `block` paces the producer \
+                             instead.",
+                            node_def.id, input.name
+                        ),
+                    });
+                }
+                if input.depth.is_some() {
+                    return Err(TransportError::GraphError {
+                        reason: format!(
+                            "input '{}.{}' sets `depth:` in the graph, but the node declares it \
+                             `#[input(accumulate)]`. `#[input(accumulate)]` takes `cap = N`, not \
+                             `depth`: the cap is the input's queue depth.",
+                            node_def.id, input.name
+                        ),
+                    });
+                }
+            }
+            let (policy, depth) = effective_input_policy(input, (meta.backpressure, meta.depth));
+            meta.backpressure = policy;
+            meta.depth = depth;
+        }
+    }
+    Ok(())
+}
+
+/// What [`apply_input_backpressure_overrides`] does with a key on an input
+/// that has no metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingInputMeta {
+    /// Refuse the graph, naming the input.
+    Refuse,
+    /// Leave the input as it is.
+    Skip,
+}
+
+/// The refusal of `block_timeout_ms` on the `block` input
+/// `consumer_node.consumer_input` of `topic` when the edge counts on a credit
+/// word shared with `producers` in another process or executor unit: the
+/// input runs in `consumer_place` and its producer in `producer_place`.
+///
+/// A timeout release forgives the slot's counted frames, and the word then
+/// tells which later drains pay those frames and which publishes evict them
+/// from its counts alone. That is exact only while the producer and the
+/// consumer fire one at a time on one thread. A publish counts its frame
+/// before sending it, and the count takes the forgiven backlog down by the
+/// frame it expects the send to evict from a full queue; a drain records a
+/// pop after making it. Across threads a pop the count could not see (one
+/// not yet recorded, or one landing between the count and the send) leaves
+/// room, so the send evicts nothing: the slot misses a frame and lets the
+/// queue evict a frame published after the release. The multi-process
+/// supervisor calls this with both sides' process group or executor unit; a
+/// worker, which sees only its own subgraph, with "this process" and
+/// "another process".
+// hot-path-alloc-ok-fn: cold: graph build, once per refused edge
+pub fn split_edge_timeout_refusal(
+    topic: &str,
+    consumer_node: &str,
+    consumer_input: &str,
+    producers: &[String],
+    consumer_place: &str,
+    producer_place: &str,
+) -> String {
+    let named = producers
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let producer = match producers {
+        [] => "its producer".to_string(),
+        [_] => format!("its producer {named}"),
+        _ => format!("its producers {named}"),
+    };
+    format!(
+        "input '{consumer_node}.{consumer_input}' on topic '{topic}' sets `block_timeout_ms`, \
+         but the input runs in {consumer_place} and {producer} in {producer_place}, so the two \
+         fire on different threads and count the edge on one shared credit word. A timeout \
+         release keeps that count exact only when the producer and the consumer fire one at a \
+         time on one thread: here a read and a publish can interleave after a release, so the \
+         slot can count a frame that is gone and hold the producer with nothing queued, or miss \
+         one and let a frame published after the release be evicted. Put both nodes in ONE \
+         `process_groups:` group, or run `--single-process`, to keep the timeout; or remove \
+         `block_timeout_ms`, and the slot is still released when the consumer stops for good \
+         (a fatal error or its process dying)"
+    )
+}
+
+/// The refusal of `block_timeout_ms` on the `block` edge `c` of a topic that
+/// has more than one in-graph producer or is listed in
+/// `multi_publisher_topics:` (`listed`).
+///
+/// A timeout release forgives the slot's counted frames, and a later publish
+/// that overflows the consumer's queue evicts a forgiven frame. The word
+/// bounds those evictions by `depth` times the topic's in-graph producers,
+/// which is exact on one connection. Each producer's connection is its own
+/// queue of `depth` frames, so with several connections one connection can
+/// evict while the bound sees room, and a publisher outside the graph opens a
+/// connection the word does not count. The forgiven count then stays above the
+/// frames really queued and the slot reads full with nothing to drain. A
+/// release when the consumer stops for good marks the slot released and never
+/// forgives, so it is not refused.
+// hot-path-alloc-ok-fn: cold: graph build, once per refused edge
+fn shared_topic_timeout_refusal(flow: &TopicFlow, c: &ConsumerEdge, listed: bool) -> String {
+    let mut why: Vec<String> = Vec::new();
+    match flow.producers.as_slice() {
+        [] => {}
+        [one] => why.push(format!("has 1 in-graph producer ('{one}')")),
+        many => why.push(format!(
+            "has {} in-graph producers ({})",
+            many.len(),
+            many.iter()
+                .map(|p| format!("'{p}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+    if listed {
+        why.push(
+            "is listed in `multi_publisher_topics:`, which lets publishers outside the graph \
+             write it"
+                .to_string(),
+        );
+    }
+    format!(
+        "input '{}.{}' on topic '{}' sets `block_timeout_ms`, but the topic {}. A timeout \
+         release keeps an exact count only on a topic with one producer: each producer's \
+         connection is its own queue, so on this topic a release can leave the slot's count \
+         high and release a consumer that keeps up again and again. Keep one producer on the \
+         topic and take it out of `multi_publisher_topics:`; or remove `block_timeout_ms`, and \
+         the slot is still released when the consumer stops for good (a fatal error or \
+         its process dying)",
+        c.node_id,
+        c.input,
+        flow.topic,
+        why.join(" and ")
+    )
+}
+
+/// Refuse `block` on an input the network feeds.
+///
+/// A topic in `network.ingress` is published on another host and arrives
+/// through the network gateway, which never blocks (zenoh puts drop under
+/// congestion), so no credit can reach the producer.
+fn refuse_block_on_network_edges(
+    config: &GraphConfig,
+    topics: &IndexMap<String, TopicFlow>,
+) -> TransportResult<()> {
+    let Some(network) = config.network.as_ref() else {
+        return Ok(());
+    };
+    for topic in &network.ingress {
+        let Some(flow) = topics.get(topic) else {
+            continue;
+        };
+        if let Some(c) = flow
+            .consumers
+            .iter()
+            .find(|c| matches!(c.policy, BackpressurePolicy::Block))
+        {
+            return Err(TransportError::GraphError {
+                reason: format!(
+                    "`block` input '{}.{}' reads topic '{}', which `network.ingress` brings in \
+                     from another host. Network transport never blocks, so no credit reaches \
+                     the remote producer and `block` cannot hold it. Use `drop_oldest` or \
+                     `sample(N)` on this input",
+                    c.node_id, c.input, topic
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The edges (indices into `edges`) of the first ring found among `edges`
+/// over nodes `0..node_count`, or `None` when they form no ring. A self edge
+/// is a ring of one.
+///
+/// Iterative three-colour depth-first search; nodes are walked in index order
+/// and each node's edges in `edges` order, so the ring named is the same on
+/// every run.
+pub fn block_cycle(node_count: usize, edges: &[(usize, usize)]) -> Option<Vec<usize>> {
+    if crate::oracle_mutant::active("block_cycle_off") {
+        return None;
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        New,
+        Open,
+        Done,
+    }
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    for (i, &(from, to)) in edges.iter().enumerate() {
+        if from < node_count && to < node_count {
+            out[from].push(i);
+        }
+    }
+    let mut mark = vec![Mark::New; node_count];
+    for root in 0..node_count {
+        if mark[root] != Mark::New {
+            continue;
+        }
+        // (node, next out-edge position, edge that entered node)
+        let mut stack: Vec<(usize, usize, Option<usize>)> = vec![(root, 0, None)];
+        mark[root] = Mark::Open;
+        while let Some(&mut (node, ref mut pos, _)) = stack.last_mut() {
+            if let Some(&edge) = out[node].get(*pos) {
+                *pos += 1;
+                let next = edges[edge].1;
+                match mark[next] {
+                    Mark::Open => {
+                        let start = stack
+                            .iter()
+                            .position(|&(n, _, _)| n == next)
+                            .expect("an Open node is on the stack");
+                        let mut ring: Vec<usize> =
+                            stack[start + 1..].iter().filter_map(|f| f.2).collect();
+                        ring.push(edge);
+                        return Some(ring);
+                    }
+                    Mark::New => {
+                        mark[next] = Mark::Open;
+                        stack.push((next, 0, Some(edge)));
+                    }
+                    Mark::Done => {}
+                }
+            } else {
+                mark[node] = Mark::Done;
+                stack.pop();
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2177,6 +2669,7 @@ mod tests {
             depth,
             backpressure: policy,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }
     }
@@ -2193,6 +2686,7 @@ mod tests {
                 .map(|(name, source)| InputDef {
                     name: name.to_string(),
                     source: source.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             outputs: outputs
@@ -2254,13 +2748,198 @@ mod tests {
         assert_eq!(flow.consumers[0].node_id, "dst");
         assert_eq!(flow.consumers[0].policy, BackpressurePolicy::Block);
         assert_eq!(flow.consumers[0].depth, 4);
-        assert!(flow.is_all_block());
         assert!(flow.has_block_consumer());
+        assert!(flow.holds_its_producers());
         assert_eq!(flow.sum_consumer_depths(), 4);
     }
 
     #[test]
-    fn mixed_consumers_are_not_all_block() {
+    fn block_cycle_finds_rings_and_only_rings() {
+        // 0 -> 1 -> 2 -> 0 is a ring; the edges named are exactly its three.
+        let ring = [(0, 1), (1, 2), (2, 0)];
+        assert_eq!(block_cycle(3, &ring), Some(vec![0, 1, 2]));
+        // A self edge is a ring of one.
+        assert_eq!(block_cycle(2, &[(0, 1), (1, 1)]), Some(vec![1]));
+        // A diamond has two paths to one node but no ring.
+        assert_eq!(block_cycle(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]), None);
+        // A chain, and no edges at all.
+        assert_eq!(block_cycle(3, &[(0, 1), (1, 2)]), None);
+        assert_eq!(block_cycle(3, &[]), None);
+        // A ring reached late from a tree.
+        let late = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 2)];
+        assert_eq!(block_cycle(5, &late), Some(vec![2, 3, 4]));
+    }
+
+    fn ring_config(policy_b: BackpressurePolicy) -> (GraphConfig, IndexMap<String, NodeInfo>) {
+        let cfg = config(
+            "p",
+            vec![
+                node("a", &[("in", "b/out")], &["out"]),
+                node("b", &[("in", "a/out")], &["out"]),
+            ],
+        );
+        let infos = infos(vec![
+            ("a", vec![input_meta("in", BackpressurePolicy::Block, 2)]),
+            ("b", vec![input_meta("in", policy_b, 2)]),
+        ]);
+        (cfg, infos)
+    }
+
+    #[test]
+    fn validate_refuses_a_ring_of_block_edges_by_name() {
+        let (cfg, infos) = ring_config(BackpressurePolicy::Block);
+        let topo = GraphTopology::build(&cfg, &infos).expect("build");
+        let err = topo.validate().expect_err("a block ring must be refused");
+        let text = err.to_string();
+        assert!(text.contains("a ring of `block` edges"), "{text}");
+        assert!(
+            text.contains("a -> b.in") && text.contains("b -> a.in"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn one_non_block_edge_breaks_the_ring() {
+        let (cfg, infos) = ring_config(BackpressurePolicy::DropOldest);
+        let topo = GraphTopology::build(&cfg, &infos).expect("build");
+        topo.validate()
+            .expect("a ring with a drop_oldest edge is legal");
+    }
+
+    #[test]
+    fn the_graph_keys_win_over_the_declared_policy() {
+        use crate::graph::config::InputBackpressure;
+        let mut cfg = config(
+            "p",
+            vec![
+                node("src", &[], &["out"]),
+                node("dst", &[("in", "src/out")], &[]),
+            ],
+        );
+        cfg.nodes[1].inputs[0].backpressure = Some(InputBackpressure::Block);
+        cfg.nodes[1].inputs[0].depth = Some(5);
+        cfg.nodes[1].inputs[0].block_timeout_ms = Some(40);
+        let mut infos = infos(vec![
+            ("src", vec![]),
+            (
+                "dst",
+                vec![input_meta("in", BackpressurePolicy::DropOldest, 2)],
+            ),
+        ]);
+        let topo = GraphTopology::build(&cfg, &infos).expect("build");
+        let c = &topo.topic("/p/src/out").unwrap().consumers[0];
+        assert_eq!(
+            (c.policy, c.depth, c.block_timeout_ms),
+            (BackpressurePolicy::Block, 5, Some(40))
+        );
+        topo.validate().expect("valid");
+        apply_input_backpressure_overrides(&cfg, &mut infos, MissingInputMeta::Refuse)
+            .expect("apply");
+        let m = &infos["dst"].input_meta()[0];
+        assert_eq!((m.backpressure, m.depth), (BackpressurePolicy::Block, 5));
+        // An input with no metadata: refused or skipped by mode.
+        let mut bare = cfg.clone();
+        bare.nodes[1].inputs[0].name = "other".to_string();
+        let mut infos2 = infos.clone();
+        assert!(
+            apply_input_backpressure_overrides(&bare, &mut infos2, MissingInputMeta::Refuse)
+                .is_err()
+        );
+        apply_input_backpressure_overrides(&bare, &mut infos2, MissingInputMeta::Skip)
+            .expect("skip mode leaves it");
+    }
+
+    #[test]
+    fn block_timeout_needs_block_and_a_positive_value() {
+        let mut cfg = config(
+            "p",
+            vec![
+                node("src", &[], &["out"]),
+                node("dst", &[("in", "src/out")], &[]),
+            ],
+        );
+        cfg.nodes[1].inputs[0].block_timeout_ms = Some(10);
+        let drop_oldest = infos(vec![
+            ("src", vec![]),
+            (
+                "dst",
+                vec![input_meta("in", BackpressurePolicy::DropOldest, 2)],
+            ),
+        ]);
+        let err = GraphTopology::build(&cfg, &drop_oldest)
+            .unwrap()
+            .validate()
+            .expect_err("timeout without block");
+        assert!(err.to_string().contains("not `block`"), "{err}");
+        cfg.nodes[1].inputs[0].block_timeout_ms = Some(0);
+        let block = infos(vec![
+            ("src", vec![]),
+            ("dst", vec![input_meta("in", BackpressurePolicy::Block, 2)]),
+        ]);
+        let err = GraphTopology::build(&cfg, &block)
+            .unwrap()
+            .validate()
+            .expect_err("timeout 0");
+        assert!(err.to_string().contains("block_timeout_ms: 0"), "{err}");
+    }
+
+    /// `block_timeout_ms` on a `block` edge of a topic with two in-graph
+    /// producers, or of a listed topic with one, is refused by name; the same
+    /// edge without the key, and the key on a topic with one unlisted
+    /// producer, validate.
+    #[test]
+    fn block_timeout_is_refused_on_a_topic_with_several_producers() {
+        let shared = |producers: &[&str], listed: bool, timeout: Option<u64>| {
+            let mut nodes: Vec<NodeDef> =
+                producers.iter().map(|p| node(p, &[], &["out"])).collect();
+            nodes.push(node("dst", &[("in", "/p/shared")], &[]));
+            let mut cfg = config("p", nodes);
+            for n in cfg.nodes.iter_mut().take(producers.len()) {
+                n.outputs[0].topic = Some("/p/shared".to_string());
+            }
+            if listed {
+                cfg.multi_publisher_topics = vec!["/p/shared".to_string()];
+            }
+            cfg.nodes[producers.len()].inputs[0].block_timeout_ms = timeout;
+            let mut entries: Vec<(&str, Vec<InputMeta>)> =
+                producers.iter().map(|p| (*p, vec![])).collect();
+            entries.push(("dst", vec![input_meta("in", BackpressurePolicy::Block, 2)]));
+            GraphTopology::build(&cfg, &infos(entries))
+                .expect("build")
+                .validate()
+        };
+        let tail = "A timeout release keeps an exact count only on a topic with one producer: \
+             each producer's connection is its own queue, so on this topic a release can leave \
+             the slot's count high and release a consumer that keeps up again and again. Keep \
+             one producer on the topic and take it out of `multi_publisher_topics:`; or remove \
+             `block_timeout_ms`, and the slot is still released when the consumer stops for good \
+             (a fatal error or its process dying)";
+        let listing = "is listed in `multi_publisher_topics:`, which lets publishers outside \
+             the graph write it";
+        let err = shared(&["a", "b"], true, Some(50)).expect_err("two producers");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Graph validation error: input 'dst.in' on topic '/p/shared' sets \
+                 `block_timeout_ms`, but the topic has 2 in-graph producers ('a', 'b') and \
+                 {listing}. {tail}"
+            )
+        );
+        let err = shared(&["a"], true, Some(50)).expect_err("a listed topic");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Graph validation error: input 'dst.in' on topic '/p/shared' sets \
+                 `block_timeout_ms`, but the topic has 1 in-graph producer ('a') and \
+                 {listing}. {tail}"
+            )
+        );
+        shared(&["a", "b"], true, None).expect("no timeout: the death release still holds");
+        shared(&["a"], false, Some(50)).expect("one unlisted producer keeps its timeout");
+    }
+
+    #[test]
+    fn a_block_consumer_holds_the_producer_of_a_mixed_topic() {
         let cfg = config(
             "p",
             vec![
@@ -2281,8 +2960,8 @@ mod tests {
         let flow = topo.topic("/p/src/out").unwrap();
         assert!(flow.has_block_consumer());
         assert!(
-            !flow.is_all_block(),
-            "mixed block+drop_oldest is NOT all-block"
+            flow.holds_its_producers(),
+            "a block consumer holds the producer whatever its drop_oldest sibling declares"
         );
         assert_eq!(flow.sum_consumer_depths(), 12);
     }

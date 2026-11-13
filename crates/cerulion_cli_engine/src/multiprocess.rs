@@ -235,6 +235,12 @@ pub struct CreditEdgePlan {
     pub producer_ranks: Vec<usize>,
     /// The rank owning the consumer.
     pub consumer_rank: usize,
+    /// The producer node id(s), for the release event's attribution and the
+    /// worker's refusal of `block_timeout_ms` on the bound input. An entry
+    /// carries no `block_timeout_ms`: a cross-process word is never forgiven
+    /// ([`refuse_split_edge_timeouts`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_nodes: Vec<String>,
 }
 
 /// Mint the deployment's [`CreditEdgePlan`] set — one entry per
@@ -253,10 +259,9 @@ pub struct CreditEdgePlan {
 ///   deliberately does not build. Minting one anyway would hand a producer a
 ///   claim another producer can consume between the read and the publish, i.e.
 ///   silent overshoot on an edge declared LOSSLESS (Principle #6).
-/// * **every consumer on the topic is `block`.** A mixed topic already degrades
-///   its `block` consumers to `drop_oldest` (deferring the producer would
-///   starve the non-block sibling), so a word there would describe an
-///   occupancy nothing gates on.
+/// * **the consumer is `block`.** One entry per `block` consumer: each holds
+///   its own slot. The topic's `drop_oldest` and `sample(N)` consumers hold
+///   none and get no entry.
 /// * **the producer's rank differs from the consumer's.** A co-located edge
 ///   keeps its process-local word: zero syscalls, zero `/dev/shm` objects, and
 ///   the identical arithmetic.
@@ -302,7 +307,12 @@ pub fn credit_edges_for(
         let Some(&producer_rank) = node_rank.get(flow.producers[0].as_str()) else {
             continue;
         };
-        for edge in &flow.consumers {
+        for edge in flow.consumers.iter().filter(|c| {
+            matches!(
+                c.policy,
+                cerulion_core::graph::node::BackpressurePolicy::Block
+            )
+        }) {
             let Some(&consumer_rank) = node_rank.get(edge.node_id.as_str()) else {
                 continue;
             };
@@ -333,10 +343,137 @@ pub fn credit_edges_for(
                 depth,
                 producer_ranks: vec![producer_rank],
                 consumer_rank,
+                producer_nodes: flow.producers.clone(),
             });
         }
     }
     Ok(out)
+}
+
+/// Each node's rank in `plan`: the rank of the worker whose subgraph runs it.
+///
+/// The ONE node->rank map of a deployment, built from the workers that will
+/// actually be spawned, so the mint ([`credit_edges_for`]), the
+/// reconciliation and the spawn cannot disagree about who owns what.
+pub fn node_ranks(plan: &DeploymentPlan) -> std::collections::HashMap<&str, usize> {
+    plan.workers
+        .iter()
+        .flat_map(|w| w.subgraph.nodes.iter().map(|n| (n.id.as_str(), w.rank)))
+        .collect()
+}
+
+/// Refuse `block_timeout_ms` on every edge the mint gave a cross-process
+/// credit word.
+///
+/// `minted` is [`credit_edges_for`]'s result for `topo` over
+/// [`node_ranks`]`(plan)`: exactly the edges the supervisor creates a mapped
+/// word for, and the only ones a worker wraps as
+/// [`cerulion_core::credit::CreditWord::mapped`]. Every other `block` edge
+/// counts on a process-local word, whose producer and consumer fire one at a
+/// time on one thread (a process's executor units keep a `block` topic's
+/// producers and consumers in one unit). On a minted edge they fire on
+/// different threads, where a timeout release cannot keep the count exact
+/// ([`cerulion_core::graph::topology::split_edge_timeout_refusal`]), so the
+/// key is refused before any worker spawns, naming the edge and each side's
+/// process group, or executor unit and its host. The worker refuses the same
+/// key on a bound input by the same word kind, and a binding carries no
+/// timeout, so a cross-process word is never forgiven.
+pub fn refuse_split_edge_timeouts(
+    topo: &cerulion_core::graph::GraphTopology,
+    minted: &[CreditEdgePlan],
+    plan: &DeploymentPlan,
+) -> Result<(), String> {
+    let place = |rank: usize| -> String {
+        match plan.workers.iter().find(|w| w.rank == rank) {
+            Some(w) => match &w.host {
+                Some(host) => format!("executor unit '{}' of process group '{host}'", w.group),
+                None => format!("process group '{}'", w.group),
+            },
+            None => format!("<rank {rank}>"),
+        }
+    };
+    for e in minted {
+        let refusal =
+            split_edge_timeout_verdict(topo, &e.topic, &e.consumer_node, &e.consumer_input, || {
+                let producer_place = e
+                    .producer_ranks
+                    .iter()
+                    .map(|&r| place(r))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (place(e.consumer_rank), producer_place)
+            });
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+    }
+    Ok(())
+}
+
+/// The refusal [`refuse_split_edge_timeouts`] gives the split `block` edge
+/// `edge` of a partition, naming each side by its process group, or `None`
+/// when the edge's input sets no `block_timeout_ms`.
+///
+/// `edge` is one of [`cerulion_core::graph::creditable_split_block_edges`]:
+/// a creditable edge whose producer and consumer the partition puts in
+/// different groups, which is an edge the mint gives a cross-process word. A
+/// group's executor units keep a `block` flow in one unit, so the run refuses
+/// exactly these edges, naming an executor unit where the supervisor plans a
+/// side's group as several units. `graph levels` and `graph partition` read
+/// the verdict here, before any rank is planned, and `graph run` before it
+/// announces an accepted split edge.
+pub(crate) fn split_edge_timeout_refusal_in_groups(
+    topo: &cerulion_core::graph::GraphTopology,
+    edge: &cerulion_core::graph::CreditableSplitEdge,
+) -> Option<String> {
+    split_edge_timeout_verdict(
+        topo,
+        &edge.topic,
+        &edge.consumer_node,
+        &edge.consumer_input,
+        || {
+            (
+                format!("process group '{}'", edge.consumer_group),
+                format!("process group '{}'", edge.producer_group),
+            )
+        },
+    )
+}
+
+/// The refusal of `block_timeout_ms` on the split `block` edge
+/// `consumer_node.consumer_input` of `topic`, or `None` when `topo` gives
+/// that input no `block_timeout_ms`.
+///
+/// The one check behind [`refuse_split_edge_timeouts`] and
+/// [`split_edge_timeout_refusal_in_groups`]: both read the key off `topo`'s
+/// consumer edge and render [`cerulion_core::graph::topology::split_edge_timeout_refusal`]
+/// with the topic's in-graph producers. `places` returns where the consumer
+/// and then the producer run, and is called only for an edge that sets the
+/// key.
+fn split_edge_timeout_verdict(
+    topo: &cerulion_core::graph::GraphTopology,
+    topic: &str,
+    consumer_node: &str,
+    consumer_input: &str,
+    places: impl FnOnce() -> (String, String),
+) -> Option<String> {
+    if cerulion_core::oracle_mutant::active("block_split_timeout_refusal_off") {
+        return None;
+    }
+    let flow = topo.topic(topic)?;
+    flow.consumers
+        .iter()
+        .find(|c| c.node_id == consumer_node && c.input == consumer_input)?
+        .block_timeout_ms?;
+    let (consumer_place, producer_place) = places();
+    Some(cerulion_core::graph::topology::split_edge_timeout_refusal(
+        topic,
+        consumer_node,
+        consumer_input,
+        &flow.producers,
+        &consumer_place,
+        &producer_place,
+    ))
 }
 
 /// The slot `dead_rank` occupies on `edge`, or `None` if it is not
@@ -570,7 +707,7 @@ pub(crate) fn reconcile_credit_edges(
 /// building anything — while the mint reads the LOADED cdylibs, because the
 /// credit word must stamp the depth the run will really enforce. Both are the
 /// right input for their own job, and a STALE cdylib makes them disagree about
-/// a topic's `is_all_block()`.
+/// which of a topic's consumers are `block`.
 ///
 /// Neither direction is safe to let through, and neither is loud on its own:
 /// an edge accepted but not minted dies in the consumer's worker blaming an
@@ -941,6 +1078,15 @@ pub struct WorkerPlan {
     /// `block` edge representable, independent of how the ranks coordinate).
     #[serde(default)]
     pub credit_edges: Vec<CreditEdgePlan>,
+    /// The paced-topic warnings this worker logs at its build: one per topic
+    /// whose producer node is in this worker's subgraph and which has, in the
+    /// WHOLE graph, at least one `block` consumer and at least one
+    /// `drop_oldest` or `sample(N)` consumer. The supervisor derives them from
+    /// its loaded full-graph topology, so a consumer in another process group
+    /// is named. The worker logs exactly this list, not its own subgraph's
+    /// view. `#[serde(default)]`: a plan file without the key carries none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paced_topic_warnings: Vec<cerulion_core::graph::PacedTopicWarning>,
     /// Multi-process recording: the trace-ring tag this worker
     /// creates its scheduler-trace ring under
     /// (`cerulion_core::trace_ring::TraceRingOwner::create`), set by the
@@ -2249,6 +2395,10 @@ pub fn plan_deployment(
             // topology in the credit-wiring commit; the pure planner holds no
             // `NodeInfo`s and cannot see a `block` policy, so it mints none.
             credit_edges: Vec::new(),
+            // Derived by the supervisor from the loaded full-graph topology
+            // (`graph_cmd::stamp_paced_topic_warnings`); the pure planner
+            // cannot see a `block` policy, so it derives none.
+            paced_topic_warnings: Vec::new(),
             // The supervisor stamps the recording-ring tag
             // post-plan when `--record` is active; the pure planner
             // leaves it None (not recording).
@@ -3027,6 +3177,7 @@ mod tests {
                 .map(|(name, source)| InputDef {
                     name: name.to_string(),
                     source: source.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             outputs: outputs
@@ -3070,6 +3221,7 @@ mod tests {
             depth,
             backpressure: cerulion_core::graph::node::BackpressurePolicy::Block,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }
     }
@@ -3083,6 +3235,7 @@ mod tests {
             depth: 4,
             backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }
     }
@@ -3141,6 +3294,217 @@ mod tests {
         }
     }
 
+    /// A process that hosts several executor units keeps a `block` edge inside
+    /// one of them, and a `block` edge to another process gets its credit word
+    /// between that unit's rank and the other process's.
+    ///
+    /// `host` runs `src`, its `block` consumer `near`, and `iso`, which
+    /// declares `isolate: true` and so takes a unit of its own; `remote` runs
+    /// `far`, a second `block` consumer of the same topic. The supervisor
+    /// reports a dead host as every one of its units, so the death of `remote`
+    /// releases `far`'s slot, and the death of `host` (both units) only
+    /// clears the dead producer's parked bit.
+    #[test]
+    fn a_host_of_several_units_keeps_its_block_edge_in_one_unit_and_credits_the_split_one() {
+        use cerulion_core::graph::node::MacroPolicy;
+        let mut iso = node("iso", &[], &["beat"]);
+        iso.isolate = Some(true);
+        let mut config = config_with(vec![
+            node("src", &[], &["out"]),
+            node("near", &[("gate", "src/out")], &[]),
+            iso,
+            node("far", &[("gate", "src/out")], &[]),
+        ]);
+        config.process_groups = groups(&[("host", &["src", "near", "iso"]), ("remote", &["far"])]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        for id in ["src", "iso"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![], vec![])
+                    .with_policy(MacroPolicy::Period { period_ms: 10 }),
+            );
+        }
+        for id in ["near", "far"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![block_meta("gate", 2)], vec![]).with_policy(
+                    MacroPolicy::DataTrigger {
+                        input_name: "gate".to_string(),
+                    },
+                ),
+            );
+        }
+
+        let units = plan_executor_units(&config, &infos, ExecutionMode::FreeRun, true, None)
+            .expect("plan the executor units");
+        let host_units: Vec<Vec<String>> = units.plan.units["host"]
+            .iter()
+            .map(|u| u.nodes.clone())
+            .collect();
+        assert_eq!(
+            host_units,
+            vec![
+                vec!["src".to_string(), "near".to_string()],
+                vec!["iso".to_string()]
+            ],
+            "the block edge src -> near stays in one unit and iso runs in its own"
+        );
+        assert_eq!(units.plan.units["remote"].len(), 1);
+
+        let levels = levels_for(
+            &units.config,
+            &[("near", "/p/src/out"), ("far", "/p/src/out")],
+        );
+        let mut plan = plan_deployment(&units.config, &levels, None, "units").expect("plan");
+        stamp_hosts(&mut plan, &units.plan.hosts);
+        let rank_of = |node_id: &str| -> usize {
+            plan.workers
+                .iter()
+                .find(|w| w.subgraph.nodes.iter().any(|n| n.id == node_id))
+                .map(|w| w.rank)
+                .unwrap_or_else(|| panic!("no worker runs {node_id}"))
+        };
+        assert_eq!(rank_of("src"), rank_of("near"), "one rank for the unit");
+        assert_ne!(rank_of("src"), rank_of("iso"), "iso's unit is its own rank");
+        let node_rank: std::collections::HashMap<&str, usize> = plan
+            .workers
+            .iter()
+            .flat_map(|w| w.subgraph.nodes.iter().map(|n| (n.id.as_str(), w.rank)))
+            .collect();
+        let topo = GraphTopology::build(&units.config, &infos).expect("topology");
+        let edges = credit_edges_for(&topo, &node_rank).expect("mint");
+        assert_eq!(
+            shape_edges(&edges),
+            vec![(
+                "/p/src/out".to_string(),
+                "far".to_string(),
+                "gate".to_string(),
+                2,
+                vec![rank_of("src")],
+                rank_of("far")
+            )],
+            "only the split edge gets a credit word; near keeps its unit's local word"
+        );
+
+        // The supervisor's dead batch for a host is every unit it hosts.
+        let host_ranks = |host: &str| -> Vec<u32> {
+            host_spawn_order(&plan)
+                .into_iter()
+                .find(|(h, _)| h == host)
+                .map(|(_, idxs)| idxs.iter().map(|&i| plan.workers[i].rank as u32).collect())
+                .unwrap_or_else(|| panic!("no spawn entry for {host}"))
+        };
+        assert_eq!(
+            host_ranks("host").len(),
+            2,
+            "host is one process of two units"
+        );
+        let none = std::collections::BTreeSet::new();
+        let remote_dead = credit_death_actions(&edges, &host_ranks("remote"), &none);
+        assert_eq!(remote_dead.len(), 1);
+        assert_eq!(
+            remote_dead[0].role,
+            CreditDeathRole::Consumer {
+                deferred_producers: vec![rank_of("src")]
+            },
+            "the remote consumer's death is a consumer death on far's edge, which the \
+             supervisor answers by releasing that slot"
+        );
+        let host_dead = credit_death_actions(&edges, &host_ranks("host"), &none);
+        assert_eq!(host_dead.len(), 1);
+        assert!(
+            matches!(host_dead[0].role, CreditDeathRole::Producer { .. }),
+            "the host's death is the producer's on far's edge: no slot is released"
+        );
+    }
+
+    /// The executor units the units arm above plans, with `block_timeout_ms:
+    /// 50` on each of `timed` (of `near` and `far`): the topology over the
+    /// unit groups, and the deployment plan with each unit's host stamped.
+    fn units_with_timeouts(timed: &[&str]) -> (GraphTopology, DeploymentPlan) {
+        use cerulion_core::graph::node::MacroPolicy;
+        let mut iso = node("iso", &[], &["beat"]);
+        iso.isolate = Some(true);
+        let mut config = config_with(vec![
+            node("src", &[], &["out"]),
+            node("near", &[("gate", "src/out")], &[]),
+            iso,
+            node("far", &[("gate", "src/out")], &[]),
+        ]);
+        for n in config
+            .nodes
+            .iter_mut()
+            .filter(|n| timed.contains(&n.id.as_str()))
+        {
+            n.inputs[0].block_timeout_ms = Some(50);
+        }
+        config.process_groups = groups(&[("host", &["src", "near", "iso"]), ("remote", &["far"])]);
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        for id in ["src", "iso"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![], vec![])
+                    .with_policy(MacroPolicy::Period { period_ms: 10 }),
+            );
+        }
+        for id in ["near", "far"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![block_meta("gate", 2)], vec![]).with_policy(
+                    MacroPolicy::DataTrigger {
+                        input_name: "gate".to_string(),
+                    },
+                ),
+            );
+        }
+        let units = plan_executor_units(&config, &infos, ExecutionMode::FreeRun, true, None)
+            .expect("plan the executor units");
+        let levels = levels_for(
+            &units.config,
+            &[("near", "/p/src/out"), ("far", "/p/src/out")],
+        );
+        let mut plan = plan_deployment(&units.config, &levels, None, "units").expect("plan");
+        stamp_hosts(&mut plan, &units.plan.hosts);
+        let topo = GraphTopology::build(&units.config, &infos).expect("topology");
+        (topo, plan)
+    }
+
+    /// The refusal reads the mint's result, and the mint compares ranks, so a
+    /// unit of a process that hosts several units is named as that unit:
+    /// `far`'s timeout is refused naming `src`'s unit and its host. `near`'s
+    /// timeout, on the edge the `block` coupling keeps inside `src`'s unit, is
+    /// kept: only `far`'s edge is minted.
+    #[test]
+    fn block_timeout_on_an_edge_from_an_executor_unit_names_the_unit() {
+        let (topo, plan) = units_with_timeouts(&["far"]);
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        assert_eq!(
+            refuse_split_edge_timeouts(&topo, &edges, &plan),
+            Err(split_timeout_refusal(
+                "far",
+                "src",
+                "process group 'remote'",
+                "executor unit 'host.src' of process group 'host'"
+            ))
+        );
+
+        let (topo, plan) = units_with_timeouts(&["near"]);
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        assert_eq!(
+            edges
+                .iter()
+                .map(|e| e.consumer_node.as_str())
+                .collect::<Vec<_>>(),
+            vec!["far"],
+            "only the split edge is minted; near keeps its unit's local word"
+        );
+        assert_eq!(
+            refuse_split_edge_timeouts(&topo, &edges, &plan),
+            Ok(()),
+            "a timeout on the edge inside one unit is kept"
+        );
+    }
+
     /// THE oracle: a single-producer, all-`block` flow split across two ranks
     /// mints exactly one entry, carrying the LOADED topology's depth.
     #[test]
@@ -3173,11 +3537,127 @@ mod tests {
         );
     }
 
-    /// A MIXED topic (one `block` consumer, one `drop_oldest` sibling) mints
-    /// NOTHING even when split: the `block` consumer there already degrades to
-    /// `drop_oldest`, so a word would describe an occupancy nothing gates on.
+    /// The supervisor's refusal of `block_timeout_ms` on the input
+    /// `{consumer}.gate` of `/p/{producer}/out`, the input running in
+    /// `consumer_place` and its producer in `producer_place`.
+    fn split_timeout_refusal(
+        consumer: &str,
+        producer: &str,
+        consumer_place: &str,
+        producer_place: &str,
+    ) -> String {
+        format!(
+            "input '{consumer}.gate' on topic '/p/{producer}/out' sets `block_timeout_ms`, but \
+             the input runs in {consumer_place} and its producer '{producer}' in \
+             {producer_place}, so the two fire on different threads and count the edge on one \
+             shared credit word. A timeout release keeps that count exact only when the \
+             producer and the consumer fire one at a time on one thread: here a read and a \
+             publish can interleave after a release, so the slot can count a frame that is gone \
+             and hold the producer with nothing queued, or miss one and let a frame published \
+             after the release be evicted. Put both nodes in ONE `process_groups:` group, or \
+             run `--single-process`, to keep the timeout; or remove `block_timeout_ms`, and the \
+             slot is still released when the consumer stops for good (a fatal error or \
+             its process dying)"
+        )
+    }
+
+    /// `prod -> sink.gate` (`block`, depth 2) with `timeout` as the input's
+    /// `block_timeout_ms`, planned over `groups`: the topology and the
+    /// deployment plan the supervisor mints from.
+    fn two_node_plan(
+        timeout: Option<u64>,
+        groups: IndexMap<String, Vec<String>>,
+    ) -> (GraphTopology, DeploymentPlan) {
+        let mut config = config_with(vec![
+            node("prod", &[], &["out"]),
+            node("sink", &[("gate", "prod/out")], &[]),
+        ]);
+        config.nodes[1].inputs[0].block_timeout_ms = timeout;
+        config.process_groups = groups;
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("prod".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        infos.insert(
+            "sink".to_string(),
+            NodeInfo::with_meta(vec![block_meta("gate", 2)], vec![]),
+        );
+        let levels = levels_for(&config, &[("sink", "/p/prod/out")]);
+        let plan = plan_deployment(&config, &levels, None, "split").expect("plan");
+        let topo = GraphTopology::build(&config, &infos).expect("topology");
+        (topo, plan)
+    }
+
+    /// `block_timeout_ms` on a `block` edge the mint gives a cross-process
+    /// credit word is refused before any worker spawns, naming the edge and
+    /// both process groups. The same edge in one group mints nothing and keeps
+    /// the key (its word is local), and the split edge without the key is
+    /// minted and kept.
     #[test]
-    fn a_split_mixed_topic_mints_nothing() {
+    fn block_timeout_on_an_edge_the_mint_credits_is_refused_before_spawn() {
+        let split = || groups(&[("cam", &["prod"]), ("plan", &["sink"])]);
+        let (topo, plan) = two_node_plan(Some(50), split());
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        assert_eq!(edges.len(), 1, "the split edge is minted");
+        assert_eq!(
+            refuse_split_edge_timeouts(&topo, &edges, &plan),
+            Err(split_timeout_refusal(
+                "sink",
+                "prod",
+                "process group 'plan'",
+                "process group 'cam'"
+            ))
+        );
+
+        let (topo, plan) = two_node_plan(Some(50), groups(&[("all", &["prod", "sink"])]));
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        assert!(edges.is_empty(), "a co-located edge mints no word");
+        assert_eq!(refuse_split_edge_timeouts(&topo, &edges, &plan), Ok(()));
+
+        let (topo, plan) = two_node_plan(None, split());
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(refuse_split_edge_timeouts(&topo, &edges, &plan), Ok(()));
+    }
+
+    /// The verdict `graph levels` and `graph partition` read for a split edge
+    /// of a partition is the supervisor's refusal of that edge, word for word,
+    /// when each group runs as one process; the same edge without the key
+    /// gets none.
+    #[test]
+    fn a_partition_split_edge_with_a_timeout_reads_the_supervisors_refusal() {
+        let split = || groups(&[("cam", &["prod"]), ("plan", &["sink"])]);
+        let edge = cerulion_core::graph::CreditableSplitEdge {
+            topic: "/p/prod/out".to_string(),
+            consumer_node: "sink".to_string(),
+            consumer_input: "gate".to_string(),
+            producer_group: "cam".to_string(),
+            consumer_group: "plan".to_string(),
+        };
+        let (topo, plan) = two_node_plan(Some(50), split());
+        let edges = credit_edges_for(&topo, &node_ranks(&plan)).expect("mint");
+        let refusal = split_timeout_refusal(
+            "sink",
+            "prod",
+            "process group 'plan'",
+            "process group 'cam'",
+        );
+        assert_eq!(
+            split_edge_timeout_refusal_in_groups(&topo, &edge),
+            Some(refusal.clone())
+        );
+        assert_eq!(
+            refuse_split_edge_timeouts(&topo, &edges, &plan),
+            Err(refusal)
+        );
+
+        let (topo, _) = two_node_plan(None, split());
+        assert_eq!(split_edge_timeout_refusal_in_groups(&topo, &edge), None);
+    }
+
+    /// A split MIXED topic (one `block` consumer, one `drop_oldest` sibling)
+    /// mints exactly one word: the `block` consumer's. The sibling holds no
+    /// slot.
+    #[test]
+    fn a_split_mixed_topic_mints_one_word_for_the_block_consumer() {
         let config = config_with(vec![
             node("prod", &[], &["out"]),
             node("sink", &[("gate", "prod/out")], &[]),
@@ -3196,11 +3676,15 @@ mod tests {
         let topo = GraphTopology::build(&config, &infos).expect("topology");
         let edges = credit_edges_for(&topo, &ranks(&[("prod", 0), ("sink", 1), ("other", 1)]))
             .expect("mint");
-        assert!(
-            edges.is_empty(),
-            "a mixed topic's `block` consumer degrades to drop_oldest; crediting it would \
-             describe an occupancy nothing gates on, got {edges:?}"
+        assert_eq!(edges.len(), 1, "one word, the block consumer's: {edges:?}");
+        assert_eq!(
+            (
+                edges[0].consumer_node.as_str(),
+                edges[0].consumer_input.as_str()
+            ),
+            ("sink", "gate")
         );
+        assert_eq!(edges[0].producer_nodes, vec!["prod".to_string()]);
     }
 
     /// A MULTI-PRODUCER flow mints NOTHING even when split — the single-producer scope
@@ -3486,6 +3970,7 @@ mod tests {
             depth: 4,
             producer_ranks: producers.to_vec(),
             consumer_rank,
+            producer_nodes: Vec::new(),
         }
     }
 
@@ -3805,6 +4290,7 @@ mod tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         let a = edge("/a", "sink_a");
         let b = edge("/b", "sink_b");
@@ -3893,6 +4379,7 @@ mod tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         let accepted = vec![edge("/z"), edge("/a"), edge("/m")];
         let one = credit_edge_drift_refusal("g", &accepted, &[]).unwrap();
@@ -3917,6 +4404,7 @@ mod tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         assert_eq!(render_credit_edge_list(&[]), "");
         assert_eq!(
@@ -4069,9 +4557,9 @@ mod tests {
             "the refused split must mint nothing"
         );
 
-        // ---- (f) MIXED topic: refused, and nothing minted. Same producer,
-        // same `block` consumer, one extra `drop_oldest` sibling — so the ONLY
-        // difference from (a) is the conjunct both halves key on.
+        // ---- (f) MIXED topic: accepted, and the `block` consumer's edge is
+        // minted. Same producer, same `block` consumer, one extra
+        // `drop_oldest` sibling, which holds no slot.
         let mixed_config = config_with(vec![
             node("prod", &[], &["out"]),
             node("sink", &[("gate", "prod/out")], &[]),
@@ -4087,13 +4575,16 @@ mod tests {
         mixed_edges.insert("lossy", "/p/prod/out");
         let mixed_split = groups(&[("front", &["prod", "lossy"]), ("back", &["sink"])]);
         validate_partition(&mixed_split, &mixed_config, &mixed_infos, &mixed_edges)
-            .expect_err("a MIXED topic's split `block` edge is not creditable");
+            .expect("a MIXED topic's split `block` edge is creditable");
         let mixed_topo = GraphTopology::build(&mixed_config, &mixed_infos).expect("topology");
-        assert!(
-            credit_edges_for(&mixed_topo, &ranks_from(&mixed_split))
-                .expect("mint")
-                .is_empty(),
-            "the refused split must mint nothing"
+        let minted = credit_edges_for(&mixed_topo, &ranks_from(&mixed_split)).expect("mint");
+        assert_eq!(
+            minted
+                .iter()
+                .map(|e| (e.consumer_node.as_str(), e.consumer_input.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("sink", "gate")],
+            "exactly the block consumer's edge is minted"
         );
     }
 
@@ -4648,10 +5139,12 @@ mod tests {
         by_hand.nodes[4].inputs.push(InputDef {
             name: "by_hand".to_string(),
             source: "/p/n0/out".to_string(),
+            ..Default::default()
         });
         by_hand.nodes[4].inputs.push(InputDef {
             name: "cam".to_string(),
             source: "/ext/cam".to_string(),
+            ..Default::default()
         });
         let members = vec!["n2".to_string(), "n3".to_string(), "n4".to_string()];
         assert_eq!(
@@ -4727,10 +5220,12 @@ mod tests {
                     InputDef {
                         name: "cam".to_string(),
                         source: "/ext/cam".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "tf".to_string(),
                         source: "/tf".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: Vec::new(),
@@ -5848,6 +6343,7 @@ mod tests {
                 .map(|(name, source)| InputDef {
                     name: name.to_string(),
                     source: source.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             outputs: out_topic
@@ -5898,6 +6394,7 @@ mod tests {
                         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                         backpressure: cerulion_core::graph::node::BackpressurePolicy::default(),
                         expect_within_ms: None,
+                        accumulate: false,
                         consume: Default::default(),
                     })
                     .collect();
@@ -7314,6 +7811,7 @@ mod tests {
                             .map(|(_, _, policy)| *policy)
                             .unwrap_or_default(),
                         expect_within_ms: None,
+                        accumulate: false,
                         consume: Default::default(),
                     })
                     .collect();

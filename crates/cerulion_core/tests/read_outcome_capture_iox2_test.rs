@@ -587,6 +587,7 @@ fn two_node_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -865,6 +866,7 @@ fn sink_def(id: &str, inputs: &[(&str, &str)]) -> NodeDef {
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: vec![],
@@ -2278,6 +2280,7 @@ fn run_relay_capture(tag: &str, record: bool, steps: u64) -> RelayCapture {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![relay_out.clone()],
             },
@@ -4083,6 +4086,7 @@ fn relay_def(id: &str, input: &str, source: &str, topic: Option<&str>) -> NodeDe
         inputs: vec![InputDef {
             name: input.to_string(),
             source: source.to_string(),
+            ..Default::default()
         }],
         outputs: vec![OutputDef {
             name: "out".to_string(),
@@ -4776,6 +4780,7 @@ fn a_serial_gated_producer_does_not_count_toward_the_shared_pair() {
                     depth: 8,
                     backpressure: BackpressurePolicy::DropOldest,
                     expect_within_ms: None,
+                    accumulate: false,
                     consume: Default::default(),
                 }],
                 vec![OutputMeta::new(
@@ -6366,6 +6371,7 @@ fn wave_graph(
                     .map(|name| InputDef {
                         name: (*name).to_string(),
                         source: source.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 outputs: vec![],
@@ -6448,6 +6454,7 @@ fn a_closure_node_that_cannot_freeze_is_sized_for_one_record_per_fire() {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }],
         Vec::new(),
@@ -6501,6 +6508,7 @@ fn a_closure_period_burst_stages_no_marker_at_its_derived_capacity() {
             depth: 1,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }],
         Vec::new(),

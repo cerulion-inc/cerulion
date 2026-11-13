@@ -1336,7 +1336,8 @@ fn assert_no_shm_left(sup_pid: u32, ns: &str, edge_id: &str) {
 }
 
 /// THE headline: a real CONSUMER death on a real creditable split edge
-/// produces exactly one loud head, naming the producer it stranded.
+/// releases that consumer's credit slot and produces exactly one loud head
+/// naming the edge, the reason and the release.
 ///
 /// This is the arm the whole file exists for. The in-process pins prove the reporter
 /// is correct and that both `Continue` arms call it; only this proves a genuine
@@ -1344,7 +1345,7 @@ fn assert_no_shm_left(sup_pid: u32, ns: &str, edge_id: &str) {
 /// join pass and the group resolution.
 #[test]
 #[serial]
-fn c7_a_real_consumer_death_strands_its_producer_loudly() {
+fn c7_a_real_consumer_death_releases_its_slot_loudly() {
     let tmp = tempfile::tempdir().unwrap();
     let _iox2_root = build_creditable_split_workspace(tmp.path(), "cdcons");
     // DEBUG on the reporter's own target, so the once-per-regime contract is
@@ -1472,20 +1473,17 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
         merged(&stdout_path, &stderr_path)
     );
 
-    // (b) AND the producer is now genuinely HELD. With its consumer dead nothing
-    // drains the word, so the producer fills the window and stops at the bar —
-    // and, nothing being able to drain it, `is_full` is STABLE once reached,
-    // which is why it is safe to wait for. The complementary "not full before the
-    // kill" is deliberately NOT asserted: a healthy edge transiently reaches the
-    // bar between drains, so that negative would flake.
+    // (b) AND the dead consumer's slot is RELEASED: the supervisor gave up
+    // this word only, so the producer no longer waits on it. A released slot is
+    // never full and no longer counts publishes, so this is stable once reached.
     wait_for_credit(
         &word,
         Duration::from_secs(30),
-        "is_full (producer held)",
-        // NO baseline: nothing drains once the consumer is dead, so a wake_seq
-        // delta would be zero by design here and must not be read as a fault.
+        "is_released and not full (producer released)",
+        // NO baseline: the release itself rings the wake word once and nothing
+        // drains afterwards.
         None,
-        |c| c.is_full(),
+        |c| c.is_released() && !c.is_full(),
     );
 
     send_signal(sup_pid, libc::SIGINT);
@@ -1543,6 +1541,8 @@ fn c7_a_real_consumer_death_strands_its_producer_loudly() {
         // batch-keyed lookup would produce.
         ("deferred_producer_groups", "p0"),
         ("total_failures", "1"),
+        ("reason", "\"consumer_died\""),
+        ("slot_released", "true"),
     ] {
         assert!(
             has_field(head, k, v),

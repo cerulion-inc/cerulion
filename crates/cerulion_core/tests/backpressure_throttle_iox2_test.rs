@@ -93,6 +93,7 @@ fn throttle_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "upstream/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

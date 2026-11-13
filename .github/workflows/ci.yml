@@ -2602,6 +2602,7 @@ jobs:
       # read a tree outside their own crate. The set is derived from the test
       # sources by `ci_doc_pin_walk_test`, which fails on a missing or a stale
       # line, so a path-to-step map cannot lose one of these binaries.
+      # doc-pin: cerulion_core::cerulion_core reads docs
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
       # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks

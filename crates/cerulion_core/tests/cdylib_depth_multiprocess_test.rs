@@ -133,10 +133,12 @@ fn dylib_declared_depth_survives_into_multiprocess_provisioning_harvest() {
                     InputDef {
                         name: "inp".to_string(),
                         source: "producer/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "aux".to_string(),
                         source: "producer/aux_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

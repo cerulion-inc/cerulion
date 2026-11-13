@@ -104,6 +104,7 @@ fn graph_halves_deliver() -> Vec<Vec<u8>> {
                 depth: 48,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
                 consume: InputConsume::Fifo,
             }],
             vec![],

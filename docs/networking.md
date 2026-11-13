@@ -509,7 +509,7 @@ network:
 | `mode: disabled` | The block is parsed but INERT: it falls through to the PERMISSIVE default (no strict restriction). This is also the meaning of an omitted `mode:`. Declaring `egress`/`ingress` under `disabled` is a graph-load error (the lists would silently do nothing). |
 | `connect` | Zenoh locators to dial, used verbatim (no scouting added). Repeatable. |
 | `listen` | Zenoh locators to bind locally, used verbatim (no bind ladder). Repeatable. |
-| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external, send_queue}` map (see "Carriers and per-topic reliability"). |
+| `egress` | The per-graph export SCOPE (a SAFETY filter, not authorization). Each must be produced by an in-graph node, or be marked `external: true` when a process outside the graph publishes it (see "Topics published outside the graph"); only these leave the machine. WHO may demand them is decided by the account/pairing grant, not this list. An entry is a topic name or a `{topic, reliability, external, send_queue, backpressure}` map (see "Carriers and per-topic reliability"). `backpressure` is accepted only as `drop_oldest`, which is what egress always does; `block` is refused, because a network put never blocks. |
 | `ingress` | Topics this graph imports. Each must NOT have an in-graph producer. |
 | `tls` | Certificate files for `quic/` and `tls/` locators (see below). |
 

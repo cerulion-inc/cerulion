@@ -253,8 +253,9 @@ ASSERT on the partial order the read log does record (credit conservation must
 hold under SOME legal interleave). Loud on violation, never a gate.
 
 **Scope.** A bag can carry a cross-process `block` edge: plan time accepts a
-CREDITABLE split (one in-graph producer, no non-`block` consumers), the
-supervisor mints the edge a cross-process credit word, and `graph run --record`
+CREDITABLE split (exactly one in-graph producer, one word per split `block`
+consumer) whose split `block` input sets no `block_timeout_ms`, the supervisor
+mints the edge a cross-process credit word, and `graph run --record`
 of that deployment writes one.
 
 **Replay REFUSES that bag, at exit 5.** `replay_engine` builds each rank's

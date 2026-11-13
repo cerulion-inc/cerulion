@@ -146,6 +146,7 @@ fn expect_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -379,6 +380,7 @@ fn promise_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

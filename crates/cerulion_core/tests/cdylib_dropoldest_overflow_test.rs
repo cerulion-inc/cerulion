@@ -154,6 +154,7 @@ fn run_sweep() -> SweepResult {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -166,6 +167,7 @@ fn run_sweep() -> SweepResult {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "consumer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
