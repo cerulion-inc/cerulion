@@ -2638,6 +2638,112 @@ fn a_recreated_publisher_re_rings_the_parked_wait() {
     }
 }
 
+/// A publish that lands after the wait's entry probe found nothing and
+/// before its park starts rings a LIVE bell: the park must return on that
+/// ring at its first check, and the stale-bell reconcile must not re-map the
+/// page. The seam issues the publish from inside `rmw_wait` at exactly that
+/// point, so the order is fixed rather than raced (a publisher on another
+/// thread or process can land there on any call). A park that measured the
+/// ring against seqs read when the park starts would count the ring as
+/// already seen, take the frame through the fd behind a bell that looks
+/// silent, and re-map a page nobody replaced: `fd_wakes` 1,
+/// `park_bell_reopens` 1, no doorbell wake. Off Linux no park runs, so the
+/// seam has no park to precede and the wait times out with nothing sent.
+#[test]
+#[serial]
+fn a_publish_between_the_entry_probe_and_the_park_rings_the_park_and_keeps_the_bell() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    // Park FORCED on (see the park pin above).
+    let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevPb{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_pb_{suffix}"));
+        let topic = CString::new(format!("/rmw_wev/pb/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!publisher.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+        let data = &*((*ws).data as *const WaitSetData);
+
+        let msg = CPoint {
+            x: 7.0,
+            y: 1.5,
+            z: -1.5,
+        };
+        let fired_before = test_seams::publishes_before_park_fired();
+        let parks_before = data.park_blocks.load(Ordering::Relaxed);
+        let bell_before = data.park_wakes_doorbell.load(Ordering::Relaxed);
+        let fd_before = data.fd_wakes.load(Ordering::Relaxed);
+        let reopens_before = data.park_bell_reopens.load(Ordering::Relaxed);
+        let timeout = if cfg!(target_os = "linux") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(200)
+        };
+        let (ret, ready) = {
+            let _seam = test_seams::PublishBeforeParkGuard::arm(
+                publisher,
+                &msg as *const CPoint as *const c_void,
+            );
+            wait_on_sub((*subscription).data, ws, timeout)
+        };
+        let fired = test_seams::publishes_before_park_fired() - fired_before;
+        let parks = data.park_blocks.load(Ordering::Relaxed) - parks_before;
+        let bell_wakes = data.park_wakes_doorbell.load(Ordering::Relaxed) - bell_before;
+        let fd_wakes = data.fd_wakes.load(Ordering::Relaxed) - fd_before;
+        let reopens = data.park_bell_reopens.load(Ordering::Relaxed) - reopens_before;
+        eprintln!(
+            "publish before park: fired={fired} parks={parks} bell_wakes={bell_wakes} \
+             fd_wakes={fd_wakes} reopens={reopens}"
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                fired, 1,
+                "the seam must have published inside the wait, before its park \
+                 (else this pin proves nothing)"
+            );
+            assert_eq!(ret, RMW_RET_OK, "the publish must wake the wait");
+            assert!(ready);
+            assert_eq!(parks, 1, "one park, the call's first block");
+            assert_eq!(
+                bell_wakes, 1,
+                "the ring landed after the entry read, so the park returns on it"
+            );
+            assert_eq!(fd_wakes, 0, "the frame never waits for the fd path");
+            assert_eq!(reopens, 0, "a live bell is never re-mapped");
+            let mut out = CPoint::default();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    subscription,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            assert!(taken);
+            assert_eq!(out, msg);
+        } else {
+            assert_eq!(fired, 0, "off Linux no park runs for the seam to precede");
+            assert_eq!(ret, ffi::RMW_RET_TIMEOUT);
+            assert!(!ready);
+            assert_eq!(parks, 0);
+            assert_eq!(reopens, 0);
+        }
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
 /// Wake-cost pin on a stock-executor-shaped set — ONE subscription plus
 /// TWO guard conditions plus SIX services (rclcpp's parameter services):
 /// per hop (a publish waking a blocked wait) the wait may DRAIN at most 3
