@@ -1038,6 +1038,7 @@ classification live as unit tests inside `tolerance_metrics.rs` /
 | `src/families/mod.rs` (unit tests) | The verb-family registry with a test-only family: one registration puts it in help, completion and dispatch with its own log class; `route` applies the class, runs the gate only for a family that needs an identity and returns a refusal without running the family; duplicate names, a shadowed built-in name, alias or `help`, a taken family alias, an unknown listing anchor, every wrong `augment` and a rewritten root help are each refused; run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 | `tests/network_switch_sweep_test.rs` | Every row of `src/network_switch/cases.rs` it can spawn (the `ros2` pass-throughs and the internal processes are not spawned, and their rows name why), over the real binary on a never-signed-in home, with the account service, the telemetry host and the relay at a listener that records each connection: a refused row on a pseudo-terminal exits with its own refusal, prints no sign-in text and connects to none of the three (and without the switch meets the gate); a gated row shows that the gate runs and that no usage event is sent, and does not run the verb; an ungated row runs; the listener sees only those three, not mDNS, DDS or zenoh traffic; the local forms of `topic pub`, `topic snapshot` and `service call` run on a signed-in home; each sign-in row (the gate's sign-in at a terminal, `login`, `logout`, `account devices list` and `revoke`) still reaches the account service under the switch and sends no usage event | yes (the iceoryx2 rows, `#[serial]`) | none |
 | `tests/pair_start_cli_test.rs` | `pair --start` over the real binary on a signed-in home where no `cerulion-netd` can start: a `CERULION_NETD_BIN` that names no file and, with it unset, a binary with no `cerulion-netd` beside it each exit 3 with the hand-written line (never netd's own text), nothing on stdout and no robot state made | no (own temp dirs) | none |
+| `tests/pair_interrupt_e2e_test.rs` | `cerulion pair` over the real binary and the real `cerulion-connectd pair` it spawns, with stdin a pipe held open and no code written: SIGINT and SIGTERM sent to `cerulion` alone after the helper's desk key line each end the run with exit 130 within 2 s (inside the 5 s grace before the helper is killed and the run exits 137), with nothing on stdout | no (own temp dirs) | `cerulion_connectd` (its binary beside `cerulion`) |
 | `src/network_switch/tests.rs` | The table names every verb of the command tree (hidden ones too) and every `--robot` form; each row's in-process decision under every spelling of `CERULION_NETWORK` (and the daemon switches for `viz --robot`); a refusal is given before the gate; telemetry's view of the switch, where `--local` counts on `graph run` and `node run` only and every other verb with `--local` is named; the sign-in rows are allowed under the switch; the CLI's run and query parse and `cerulion_telemetry::kill_switch` agree on every sample; the `--help` of each of the six switch flags says what the switch covers; run via `cargo test -p cerulion_cli --bin cerulion` | no | none |
 | `src/main.rs` (`viz_reused_daemon_switch_note_tests`) | `cerulion viz` prints its note only when it reuses a running `cerulion-vizd` under the switch, and the note names telemetry and `cerulion telemetry off`; run via `cargo test -p cerulion_cli --bin cerulion viz_reused` | no | none |
 | `tests/completions_cli_test.rs` | Zero-stderr completion protocol under a hostile env (trace-level logging, dead daemon socket); bare separator-delimited candidates only | no | none |
@@ -1228,14 +1229,12 @@ from the engine function the verb's own path refuses with, so its text and exit 
 are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
 `service call`, and `rcp` (exit 2), and `viz --robot` (exit 1). The `rcp`
 family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
-does. The hidden `pair` stub never reaches this check: `dispatch` answers it
-beside the removed `ros` family, above the switch and the gate, with
-`PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling but `pair --start`, because
-the desk side of code pairing is not offered; its table row is `Expect::Runs`.
-`pair --start`, the robot side, serves the network: it is refused here through
-`pair_start_cmd::network_refusal_from` with exit 1 (`Expect::Refused`, by
-`CERULION_NETWORK` under the run and query parse) and meets the gate when not
-refused. `connect` prints a
+does. `pair` has a row for each side, both `Expect::Refused` with exit 1 by
+`CERULION_NETWORK` under the run and query parse: the desk side through
+`pair_cmd::network_refusal_from`, before its mDNS lookup and its helper, and
+`pair --start`, the robot side, through `pair_start_cmd::network_refusal_from`,
+before it asks netd to serve. Both meet the gate when not refused. `connect`
+prints a
 `warning:` line of its own and exits 0, as its helper does, on the exact value `off`
 the helper reads, without resolving the robot or spawning the helper. A refusal now
 comes before the verb's other argument checks; `viz --robot` with no TOPIC is the one

@@ -275,15 +275,23 @@ which is correct: the operator is gone.
 
 Robots on your account are reached by signing in with `cerulion login` on the
 desk: the robot adds the desk to its access list the first time the desk's
-network daemon reads one of its topics. Code pairing is not available in this
-release.
+network daemon reads one of its topics.
+
+A desk pairs with a robot by code in two steps. On the robot, `cerulion pair
+--start` asks `cerulion-netd` to serve the robot and shows an 8-digit code and
+the robot's endpoint id; the code pairs one desk within 10 minutes, every desk
+shares its 3 tries, and the robot admits one try every 2 s. On the desk,
+`cerulion pair --eid <eid>` takes the code at its prompt; add
+`--addr <robot-ip>:<port>` (the port is on the robot's `pair-code:` line) when
+the desk has no internet. A newer `cerulion pair --start` replaces the code,
+and Ctrl-C on the robot stops waiting while the code keeps working.
 
 On the LAN, an established pairing reaches the robot with no cloud anywhere in
 the connect path: a direct iroh dial to the robot address you give
 (`--addr ip:port`), with the relay disabled (`--relay-disabled`), and offline
 verification against the durable access list. The robot's mDNS record carries
-its endpoint id (`eid=`); it does not supply a dial address, so an offline
-connect needs `--addr`. Established pairings do not expire (a
+its endpoint id (`eid=`), which `cerulion pair` reads for a robot named on the
+LAN; it does not supply a dial address, so an offline connect needs `--addr`. Established pairings do not expire (a
 time-boxed guest grant from the owner is the exception), last until revoked
 (see [`docs/revocation.md`](revocation.md)), and never re-run the certificate
 chain per connect; the access row is the truth.

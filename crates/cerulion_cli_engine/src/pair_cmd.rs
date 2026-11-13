@@ -3,15 +3,15 @@
 //!
 //! `cerulion pair <robot>` pairs THIS desk with a robot: it runs the CPace
 //! code-pairing ceremony over the robot's ops plane so the robot access-lists the
-//! desk's device key, then pins `name → eid` into `~/.cerulion/robots.toml` so
-//! `cerulion connect <robot>` afterwards works with no flags. Like `cerulion
+//! desk's device key, then, when `<robot>` is a name, pins `name → eid` into
+//! `~/.cerulion/robots.toml` so `cerulion connect <robot>` afterwards works with
+//! no flags (an eid, by `--eid` or as `<robot>`, pins nothing). Like `cerulion
 //! connect`, the `cerulion` CLI stays iroh-free: it RESOLVES the robot eid + the
 //! desk key path, builds the exact `cerulion-connectd pair` argv, and SPAWNS that
 //! iroh-linking sibling (which owns the dial + the ceremony).
 //!
-//! No `cerulion` verb calls this module in this release: no robot-side verb
-//! arms a pairing code, so `cerulion pair` is a hidden stub that refuses
-//! every invocation with exit 2 before reaching it.
+//! The code the desk types is made on the robot by `cerulion pair --start`
+//! ([`crate::pair_start_cmd`]), which prints it with the robot's endpoint id.
 //!
 //! This module is PURE + oracle-tested for the load-bearing seams: the
 //! [`resolve_pair_target_with`] eid/name ladder, the [`build_pair_argv`] byte
@@ -48,7 +48,8 @@ pub struct PairArgs {
     /// The positional ROBOT: a 64-char-hex eid, OR a name resolved via mDNS
     /// `eid=` / `~/.cerulion/robots.toml`. Omit when using `--eid`.
     pub robot: Option<String>,
-    /// The explicit `--eid` (overrides a positional; no name is pinned).
+    /// The explicit `--eid`, in place of a positional (ROBOT and `--eid`
+    /// together are refused); no name is pinned.
     pub eid: Option<String>,
     /// Direct `ip:port` addresses (`--addr`, repeatable).
     pub addrs: Vec<String>,
@@ -181,7 +182,8 @@ pub fn resolve_pair_target_with(
         }
         (None, None) => Err(CliError::Validation(
             "specify a robot: a positional name/eid or `--eid <64-hex>` (see \
-             `cerulion pair --help`)"
+             `cerulion pair --help`); on the robot, `cerulion pair --start` makes a pairing \
+             code"
                 .to_string(),
         )),
     }
@@ -529,7 +531,7 @@ fn finalize_pairing(
         tracing::warn!(
             exit_code = code,
             eid = %eid,
-            "cerulion pair: did NOT complete (exit {code}) — the robot did not confirm pairing; \
+            "cerulion pair: did NOT complete; the robot did not confirm pairing, so \
              ~/.cerulion/robots.toml was NOT pinned"
         );
         return;
@@ -541,14 +543,14 @@ fn finalize_pairing(
                 error = %e,
                 name = %name,
                 eid = %eid,
-                "cerulion pair: paired OK, but pinning ~/.cerulion/robots.toml failed — \
-                 `cerulion connect {name}` may not resolve; connect with `--eid {eid}` meanwhile"
+                "cerulion pair: paired OK, but pinning ~/.cerulion/robots.toml failed, so \
+                 `cerulion connect <name>` may not resolve; connect with `--eid <eid>` meanwhile"
             ),
         },
         None => tracing::info!(
             eid = %eid,
-            "cerulion pair: paired OK (no robot name to pin — reconnect with \
-             `cerulion connect --eid {eid}`)"
+            "cerulion pair: paired OK with no robot name to pin; reconnect with \
+             `cerulion connect --eid <eid>`"
         ),
     }
 }
@@ -650,6 +652,11 @@ mod tests {
         // Neither → missing-target error.
         let e = resolve_pair_target_with(None, None, no_mdns, &r).unwrap_err();
         assert!(e.to_string().contains("specify a robot"), "err: {e}");
+        assert!(
+            e.to_string()
+                .ends_with("; on the robot, `cerulion pair --start` makes a pairing code"),
+            "err names the robot side: {e}"
+        );
     }
 
     /// No case asymmetry between rungs: an uppercase positional,
@@ -1066,6 +1073,191 @@ enabled = true
             pinned_line("go2", "deadbeef"),
             "pinned: name=go2 eid=deadbeef"
         );
+    }
+
+    /// The phrases that state the condition a name pin carries: only a ROBOT
+    /// given as a name is pinned.
+    const PIN_CONDITIONS: [&str; 4] = [
+        "is a name",
+        "nothing is pinned",
+        "once a name is pinned",
+        "cerulion pair <name>",
+    ];
+
+    /// Whether `lower` has a word starting with `stem` (no letter right before
+    /// it) and, with `whole`, ending with it too (no letter right after it).
+    fn has_word(lower: &str, stem: &str, whole: bool) -> bool {
+        lower.match_indices(stem).any(|(i, _)| {
+            let before = lower[..i].chars().next_back();
+            let after = lower[i + stem.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphabetic())
+                && !(whole && after.is_some_and(|c| c.is_alphabetic()))
+        })
+    }
+
+    /// The pin claims in a markdown `text`, and the ones that leave out the
+    /// condition. A table row is its own block, the rest split at blank lines;
+    /// a block is whitespace-joined and split into sentences at `. `, `! ` and
+    /// `? `. A sentence is about pairing when it names `cerulion pair` or the
+    /// word `pairing`. It claims the pin with a word starting `pin` beside
+    /// `name` or `robots.toml`, or `robots.toml` beside `writes` or `records`.
+    /// A claim states the condition with one of [`PIN_CONDITIONS`].
+    fn pin_claims(text: &str) -> (usize, Vec<String>) {
+        let mut blocks: Vec<String> = Vec::new();
+        let mut prose: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            let row = line.trim_start().starts_with('|');
+            if line.trim().is_empty() || row {
+                if !prose.is_empty() {
+                    blocks.push(prose.join(" "));
+                    prose.clear();
+                }
+                if row {
+                    blocks.push(line.to_string());
+                }
+            } else {
+                prose.push(line);
+            }
+        }
+        if !prose.is_empty() {
+            blocks.push(prose.join(" "));
+        }
+        let (mut claims, mut unconditional) = (0, Vec::new());
+        for block in blocks {
+            let block = block.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut start = 0;
+            let mut sentences = Vec::new();
+            for (i, c) in block.char_indices() {
+                if matches!(c, '.' | '!' | '?') && block.as_bytes().get(i + 1) == Some(&b' ') {
+                    sentences.push(block[start..=i].trim());
+                    start = i + 1;
+                }
+            }
+            sentences.push(block[start..].trim());
+            for sentence in sentences {
+                let lower = sentence.to_lowercase();
+                let about_pairing =
+                    lower.contains("cerulion pair") || has_word(&lower, "pairing", true);
+                let claim = (has_word(&lower, "pin", false)
+                    && (lower.contains("name") || lower.contains("robots.toml")))
+                    || (lower.contains("robots.toml")
+                        && (lower.contains("writes") || lower.contains("records")));
+                if !(about_pairing && claim) {
+                    continue;
+                }
+                claims += 1;
+                if !PIN_CONDITIONS.iter().any(|c| lower.contains(c)) {
+                    unconditional.push(sentence.to_string());
+                }
+            }
+        }
+        (claims, unconditional)
+    }
+
+    /// The sweep's reading, against hand-written text: an unconditional claim
+    /// is caught in hard-wrapped prose and in a table row; a conditional claim
+    /// is counted and passes; a pairing sentence that is not about the name
+    /// pin and a pin sentence that is not about pairing are not claims.
+    #[test]
+    fn the_pin_claim_sweep_tells_a_conditional_claim_from_an_unconditional_one() {
+        let text = "Pairing writes the robot's name\n\
+                    pin, so `cerulion connect <name>` works afterwards. When `ROBOT` is a name,\n\
+                    pairing pins it.\n\
+                    \n\
+                    | `x` | STDOUT carries `pairing: robot=<name>` and `pinned: name=<name>`. |\n\
+                    | `y` | On pairing, once a name is pinned, `pinned: name=<name>`. |\n\
+                    \n\
+                    The pairing loop is pinned over loopback by `pair_e2e_test.rs`. A desk\n\
+                    with no pinned name for the robot it dialed pushes nothing. Robots in\n\
+                    `robots.toml`, which `cerulion pair` writes, complete.\n";
+        let (claims, unconditional) = pin_claims(text);
+        assert_eq!(
+            unconditional,
+            [
+                "Pairing writes the robot's name pin, so `cerulion connect <name>` works \
+                 afterwards.",
+                "| `x` | STDOUT carries `pairing: robot=<name>` and `pinned: name=<name>`.",
+                "Robots in `robots.toml`, which `cerulion pair` writes, complete.",
+            ]
+        );
+        assert_eq!(claims, 5, "the 3 above plus 2 that state the condition");
+    }
+
+    /// Every page under `docs/` that says `cerulion pair` pins a robot's name
+    /// says only a ROBOT given as a name is pinned: `--eid` and a hex ROBOT
+    /// resolve to no name, so a desk paired that way has no
+    /// `cerulion connect <name>`. The `cerulion pair` row of `user-api.md`
+    /// also names the connect command for that desk and when `pinned:` prints.
+    #[test]
+    fn every_docs_sentence_on_the_name_pin_says_only_a_robot_name_is_pinned() {
+        let r = robots(&[("go2", HEX64)]);
+        let name = |robot, eid| {
+            resolve_pair_target_with(robot, eid, |_: &str| None, &r)
+                .unwrap()
+                .name
+        };
+        assert_eq!(name(Some("go2"), None).as_deref(), Some("go2"));
+        assert_eq!(name(None, Some(HEX64)), None);
+        assert_eq!(name(Some(HEX64), None), None);
+
+        fn markdown_pages(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    markdown_pages(&path, out);
+                } else if path.extension().is_some_and(|x| x == "md") {
+                    out.push(path);
+                }
+            }
+        }
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let mut pages = Vec::new();
+        markdown_pages(&docs, &mut pages);
+        pages.sort();
+        let mut unconditional = Vec::new();
+        let mut claims_by_page = BTreeMap::new();
+        for page in &pages {
+            let text = std::fs::read_to_string(page)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", page.display()));
+            let (claims, bad) = pin_claims(&text);
+            let shown = page.strip_prefix(&docs).unwrap().display().to_string();
+            unconditional.extend(bad.into_iter().map(|s| format!("docs/{shown}: {s}")));
+            claims_by_page.insert(shown, claims);
+        }
+        for page in ["user-api.md", "cli_completions.md", "revocation.md"] {
+            assert!(
+                claims_by_page.get(page).is_some_and(|n| *n > 0),
+                "docs/{page} carries no sentence on the name pin, so this sweep reads nothing \
+                 there; update the page list or the claim words"
+            );
+        }
+        assert!(
+            unconditional.is_empty(),
+            "these sentences say `cerulion pair` pins the robot's name without the condition: \
+             only a ROBOT given as a name is pinned, and `--eid` or a hex ROBOT pins nothing:\n\n{}",
+            unconditional.join("\n\n")
+        );
+
+        let user_api = std::fs::read_to_string(docs.join("user-api.md")).unwrap();
+        let rows: Vec<&str> = user_api
+            .lines()
+            .filter(|line| line.starts_with("| `cerulion pair [ROBOT]"))
+            .collect();
+        let [row] = rows.as_slice() else {
+            panic!(
+                "docs/user-api.md must carry EXACTLY ONE `cerulion pair [ROBOT]` row; found {}",
+                rows.len()
+            );
+        };
+        for needle in [
+            "nothing is pinned, so connect with `cerulion connect --eid <eid>`",
+            "once a name is pinned, `pinned: name=<name> eid=<hex>`",
+            "with no name, `robot=` carries the endpoint id",
+        ] {
+            assert!(row.contains(needle), "{needle:?} in the row:\n{row}");
+        }
     }
 
     /// The `--code` security warn fires ONLY when a code is passed via the flag

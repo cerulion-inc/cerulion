@@ -413,44 +413,121 @@ pub enum Commands {
         #[arg(long)]
         network: Option<String>,
     },
-    /// Code pairing is not available in this release.
+    /// Pair a desk with a robot; on the robot, --start makes the pairing code.
     ///
-    /// Robots on your account are reached by signing in with `cerulion login`.
+    /// Runs the code-pairing ceremony with the robot, so the robot adds this
+    /// desk's device key to its access list. When ROBOT is a name, it then
+    /// pins that name and the robot's endpoint id in `~/.cerulion/robots.toml`,
+    /// so `cerulion connect <name>` works afterwards with no flags; with
+    /// `--eid` or a hex ROBOT nothing is pinned, so connect with
+    /// `cerulion connect --eid <eid>`.
+    ///
+    /// Runs the `cerulion-connectd` helper binary. The release packages place
+    /// it beside `cerulion`; a source build gets it from
+    /// `cargo build -p cerulion_connectd`, and `CERULION_CONNECTD_BIN` points
+    /// at one anywhere else.
+    ///
+    /// The robot owner runs `cerulion pair --start` on the robot and shares the
+    /// 8-digit code and the endpoint id it prints; you supply the code here
+    /// (`--code`, else typed at the prompt or piped on stdin).
+    /// The desk device key is this machine's key,
+    /// `~/.cerulion/identity/device.key` (also named `~/.cerulion/desk.key`),
+    /// created on the first pair or sign-in (0600 permissions) and reused
+    /// afterwards. An existing key is never overwritten.
+    ///
+    /// STDOUT carries deterministic, machine-parseable state lines:
+    /// `pairing: robot=<name> eid=<hex>`, then on success
+    /// `paired: robot=<name> eid=<hex> account=<hex>` and, once a name is
+    /// pinned, `pinned: name=<name> eid=<hex>`. With no name, `robot=` carries
+    /// the endpoint id. STDERR carries the logs and the interactive code
+    /// prompt.
+    ///
+    /// The exit code is the primary signal: 0 = paired, 1 = a usage or config
+    /// error this command finds (ROBOT and `--eid` together, no robot named, a
+    /// key file it cannot use) or a `CERULION_NETWORK` refusal, 2 = the robot
+    /// refused (no armed code, denied, or the window expired), or the command
+    /// line has an argument this command does not take, 3 = unreachable (dial
+    /// failure or timeout), 4 = wrong pairing code or attempts exhausted, 130 =
+    /// interrupted (Ctrl-C or SIGTERM during the ceremony; no pairing occurred).
+    ///
+    /// On the robot, `cerulion pair --start` makes the code instead. It asks
+    /// `cerulion-netd` to serve this robot, shows an 8-digit pairing code that
+    /// pairs one desk within 10 minutes, with 3 tries every desk shares, and
+    /// waits until a desk pairs, the tries are used up or the code expires. A
+    /// newer `cerulion pair --start` replaces the code. Ctrl-C stops waiting and
+    /// leaves the code working. STDOUT carries
+    /// `pair-code: code=<digits> eid=<hex> port=<port> expires_in_s=<s> tries=<n>`
+    /// (`port=-` when the port is not known), `try-failed: failed=<n> tries=<n>`
+    /// for each failed try, then `paired: desk=<label> account=<hex>`,
+    /// `exhausted: failed=<n> tries=<n>` or `expired: failed=<n> tries=<n>`. Its
+    /// exit codes: 0 = a desk paired, 1 = refused on this robot, 2 = the code
+    /// expired or was withdrawn, or a newer start replaced it, 3 = cerulion-netd
+    /// or cerulion-remoted could not be reached or stopped, 4 = failed tries
+    /// used the code up, 130 = interrupted.
     //
-    // No robot-side verb arms a pairing code, so the desk side of the code
-    // ceremony cannot complete against a real robot. The verb stays parseable
-    // so a script that calls it gets `dispatch`'s refusal (`PAIR_UNAVAILABLE_MSG`,
-    // exit 2, above the login gate) instead of clap's "unrecognized
-    // subcommand". No alias. Hidden from `--help` and from the completion of
-    // `cerulion <TAB>`; clap_complete offers a hidden verb only for a word no
-    // visible verb starts with (`p`, `pa`), and then with the first line
-    // above as its description.
-    //
-    // `disable_help_flag` and the swallowing positional work as on the `Ros`
-    // stub above: every spelling, `--help` and the old flags included,
-    // reaches the refusal rather than a help page or a clap parse error.
-    // (`cerulion help pair` still renders the doc comment above.)
-    //
-    // `--start` alone, first, runs the robot side of code pairing
-    // (`cerulion_cli_engine::pair_start_cmd`); it is hidden like the verb. A
-    // word before it goes to the swallowing positional (the stub's refusal),
-    // and a word after it is a usage error.
-    #[command(hide = true, disable_help_flag = true)]
+    // `--start` takes no other argument (`conflicts_with_all`): the robot side
+    // and the desk side share the verb, never a flag.
     Pair {
-        /// On the robot: make a pairing code for one desk. Takes no other
-        /// argument.
-        #[arg(long, hide = true)]
-        start: bool,
-        /// Swallows whatever followed (`go2 --code ...`, `--help` included) so
-        /// the user sees the refusal, never a clap parse error.
+        /// The robot: a 64-char-hex endpoint id, OR a name resolved via the
+        /// robot's mDNS TXT `eid=` record, else `~/.cerulion/robots.toml`. Omit
+        /// when using `--eid`.
+        // A robot seen on this LAN lands in the peer cache, so the
+        // FIRST pairing completes too, not only a re-pair of a pinned robot.
+        #[arg(value_name = "ROBOT", add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
+        /// The robot's iroh endpoint id (64-char hex). Use instead of ROBOT;
+        /// passing both is refused. From the `pair-code:` line
+        /// `cerulion pair --start` prints on the robot, the robot's mDNS TXT
+        /// `eid=`, or the operator.
+        #[arg(long, value_name = "HEX")]
+        eid: Option<String>,
+        /// A direct `ip:port` for the robot (LAN direct-dial). Repeatable. When
+        /// omitted, the eid is resolved via relay/discovery.
+        #[arg(long = "addr", value_name = "IP:PORT")]
+        addrs: Vec<String>,
+        /// The pairing code the robot owner shared. PREFER omitting this
+        /// and typing the code at the prompt (or piping it on stdin): a code
+        /// passed via `--code` is VISIBLE in process listings (`ps`) for the
+        /// ceremony window, and it authorizes durable enrollment.
+        #[arg(long, value_name = "CODE")]
+        code: Option<String>,
+        /// The account (64-char hex) a code pairing binds. It must be the desk's
+        /// self-account (the public half of its device key), the value used when
+        /// omitted; any other value is refused.
+        #[arg(long, value_name = "HEX")]
+        account: Option<String>,
+        /// The access-list label the robot stores on its pairing row (so the
+        /// owner recognizes this desk). Default: this machine's hostname.
+        #[arg(long, value_name = "NAME")]
+        label: Option<String>,
+        /// The desk device key file (32 raw bytes: an ed25519 seed). Default:
+        /// this machine's key `~/.cerulion/identity/device.key` (created 0600 on
+        /// the first pair or sign-in, reused after).
+        #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::AnyPath)]
+        key_file: Option<PathBuf>,
+        /// Self-hosted relay URL. Default: n0 public relays.
+        #[arg(long, value_name = "URL")]
+        relay_url: Option<String>,
+        /// Disable all relays (LAN / direct-dial only).
+        #[arg(long)]
+        relay_disabled: bool,
+        /// On the robot: make a pairing code for one desk instead of pairing
+        /// this machine. Takes no other argument.
         #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            hide = true,
-            value_name = "ARGS",
-            conflicts_with = "start"
+            long,
+            conflicts_with_all = [
+                "robot",
+                "eid",
+                "addrs",
+                "code",
+                "account",
+                "label",
+                "key_file",
+                "relay_url",
+                "relay_disabled",
+            ]
         )]
-        args: Vec<String>,
+        start: bool,
     },
     /// Sign in to a Cerulion account.
     ///
@@ -628,8 +705,8 @@ pub enum Commands {
 ///   lifecycle bookkeeping around them.
 /// - `LongRunning`: verbs whose lifecycle lines are the operator's window into
 ///   a loop or daemon (`graph profile`, `node run`, `bag record`, `ros2 attach`,
-///   `viz`, `connect`, and the hidden `run-gateway`). These keep the
-///   `cerulion=info` default.
+///   `viz`, `connect`, `pair` on a desk, `login`, and the hidden
+///   `run-gateway`). These keep the `cerulion=info` default.
 ///
 /// `-v/--verbose` raises ANY class to `cerulion=debug`; an explicit `RUST_LOG`
 /// always wins over the default (see `cerulion_core::init_logging`).
@@ -699,10 +776,15 @@ impl Commands {
                 | NodeAction::Info { .. } => OneShot,
             },
             // `viz` spawns/attaches the vizd daemon; `connect` spawns
-            // connectd and stays attached: both runtime verbs.
-            // `login` waits interactively for browser authorization
-            // — keep `info` so any device-registration / auth warns are visible.
-            Commands::Viz { .. } | Commands::Connect { .. } | Commands::Login => LongRunning,
+            // connectd and stays attached; the desk side of `pair` drives the
+            // interactive pairing ceremony through connectd: runtime verbs.
+            // `login` waits interactively for browser authorization; keep
+            // `info` so any device-registration or auth warning is visible.
+            // `pair --start` is classified below.
+            Commands::Viz { .. }
+            | Commands::Connect { .. }
+            | Commands::Pair { start: false, .. }
+            | Commands::Login => LongRunning,
             // `ros2 attach` runs a bridge graph; `ros2 run`/`launch` exec()
             // the real ros2 (runtime processes — the classification covers
             // only the pre-exec window, since init_logging runs before
@@ -722,11 +804,11 @@ impl Commands {
             // lifecycle line (netd's first-use start) cannot interleave with
             // them.
             Commands::Pair { start: true, .. } => QuietRuntime,
-            // The removed-`ros`-family stub and the hidden `pair` stub never
-            // run anything: `main` intercepts both above the login gate and
-            // prints their refusal before `init_logging` matters. Classified
-            // for exhaustiveness only.
-            Commands::Ros { .. } | Commands::Pair { .. } => OneShot,
+            // The removed-`ros`-family stub never runs anything: `main`
+            // intercepts it above the login gate and prints the migration
+            // error before `init_logging` matters. Classified for
+            // exhaustiveness only.
+            Commands::Ros { .. } => OneShot,
             // `bag record` runs a loop until the duration elapses or Ctrl-C,
             // and its lifecycle breadcrumbs (topics refused, taps attached,
             // schemas learned) are the operator's only window into a run:
@@ -2435,66 +2517,166 @@ mod pair_dispatch_tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// The hidden `pair` stub swallows EVERY spelling a script may still
-    /// use, the old flags and the help flags included, so `main` answers
-    /// each with its refusal. Without `disable_help_flag` the `--help` and
-    /// `-h` arms fail with clap's `DisplayHelp`; without the swallowing
-    /// positional the flag arms fail with an unknown-argument error.
+    /// `cerulion pair go2` parses to `Commands::Pair` with the positional
+    /// robot name and every optional flag defaulting to absent.
     #[test]
-    fn hidden_pair_stub_swallows_every_old_spelling() {
-        for argv in [
-            vec!["cerulion", "pair"],
-            vec!["cerulion", "pair", "go2"],
-            vec!["cerulion", "pair", "go2", "--code", "SWAN-42"],
-            vec![
-                "cerulion",
-                "pair",
-                "--eid",
-                "deadbeef",
-                "--addr",
-                "192.168.1.20:7842",
-                "--relay-disabled",
-            ],
-            vec!["cerulion", "pair", "--help"],
-            vec!["cerulion", "pair", "-h"],
-        ] {
-            let expected: Vec<String> = argv[2..].iter().map(|s| s.to_string()).collect();
-            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| {
-                panic!(
-                    "`{}` must parse into the hidden pair stub, never clap's own \
-                     help or error (kind {:?})",
-                    argv.join(" "),
-                    e.kind()
-                )
-            });
-            match cli.command {
-                Commands::Pair { args, start } => {
-                    assert_eq!(args, expected, "`{}`", argv.join(" "));
-                    assert!(!start, "`{}`", argv.join(" "));
-                }
-                _ => panic!("expected the Commands::Pair stub"),
-            }
-        }
-    }
-
-    /// `pair --start` alone selects the robot side; a word after it is a
-    /// usage error, and a word before it keeps `--start` inside the stub's
-    /// swallowed words.
-    #[test]
-    fn pair_start_parses_alone_and_refuses_any_other_word() {
-        let cli = Cli::try_parse_from(["cerulion", "pair", "--start"]).unwrap();
+    fn pair_parses_positional_name_with_defaults() {
+        let cli = Cli::try_parse_from(["cerulion", "pair", "go2"])
+            .expect("`cerulion pair go2` must parse");
         match cli.command {
-            Commands::Pair { start, args } => {
-                assert!(start);
-                assert!(args.is_empty());
+            Commands::Pair {
+                robot,
+                eid,
+                addrs,
+                code,
+                account,
+                label,
+                key_file,
+                relay_url,
+                relay_disabled,
+                start,
+            } => {
+                assert_eq!(robot.as_deref(), Some("go2"));
+                assert!(eid.is_none());
+                assert!(addrs.is_empty());
+                assert!(code.is_none(), "the pairing code defaults to stdin");
+                assert!(account.is_none(), "the account defaults to the desk key");
+                assert!(label.is_none(), "the label defaults to the desk hostname");
+                assert!(
+                    key_file.is_none(),
+                    "the key file defaults to this machine's key"
+                );
+                assert!(relay_url.is_none());
+                assert!(!relay_disabled);
+                assert!(!start, "the desk side is the default");
             }
             _ => panic!("expected Commands::Pair"),
         }
-        for argv in [
-            vec!["cerulion", "pair", "--start", "go2"],
-            vec!["cerulion", "pair", "--start", "--help"],
-            vec!["cerulion", "pair", "--start", "--eid", "ab"],
+    }
+
+    /// All desk flags together: `--eid`, `--addr` (repeatable), `--code`,
+    /// `--account`, `--label`, `--key-file`, `--relay-url`, `--relay-disabled`.
+    #[test]
+    fn pair_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "pair",
+            "--eid",
+            "deadbeef",
+            "--addr",
+            "192.168.1.20:7842",
+            "--addr",
+            "[::1]:9000",
+            "--code",
+            "48213907",
+            "--account",
+            "aabb",
+            "--label",
+            "my-desk",
+            "--key-file",
+            "/keys/desk.key",
+            "--relay-url",
+            "https://relay.example",
+            "--relay-disabled",
+        ])
+        .expect("all pair flags must parse");
+        match cli.command {
+            Commands::Pair {
+                robot,
+                eid,
+                addrs,
+                code,
+                account,
+                label,
+                key_file,
+                relay_url,
+                relay_disabled,
+                start,
+            } => {
+                assert!(robot.is_none(), "--eid replaces the positional");
+                assert_eq!(eid.as_deref(), Some("deadbeef"));
+                assert_eq!(addrs, vec!["192.168.1.20:7842", "[::1]:9000"]);
+                assert_eq!(code.as_deref(), Some("48213907"));
+                assert_eq!(account.as_deref(), Some("aabb"));
+                assert_eq!(label.as_deref(), Some("my-desk"));
+                assert_eq!(key_file, Some(PathBuf::from("/keys/desk.key")));
+                assert_eq!(relay_url.as_deref(), Some("https://relay.example"));
+                assert!(relay_disabled);
+                assert!(!start);
+            }
+            _ => panic!("expected Commands::Pair"),
+        }
+    }
+
+    /// `cerulion pair` with no robot AND no `--eid` still PARSES (both are
+    /// optional at the clap layer); the engine's `resolve_pair_target` gives
+    /// the "specify a robot" error, matching the `connect` verb's shape.
+    #[test]
+    fn pair_with_no_target_parses_then_engine_errors() {
+        let cli = Cli::try_parse_from(["cerulion", "pair"]).expect("`cerulion pair` parses");
+        match cli.command {
+            Commands::Pair {
+                robot, eid, start, ..
+            } => {
+                assert!(robot.is_none());
+                assert!(eid.is_none());
+                assert!(!start);
+            }
+            _ => panic!("expected Commands::Pair"),
+        }
+    }
+
+    /// A positional ROBOT and `--eid` together parse, and the engine's plan
+    /// refuses them (exit 1 in `main`), as the help says.
+    #[test]
+    fn pair_with_a_robot_and_an_eid_parses_and_the_plan_refuses_both() {
+        let cli = Cli::try_parse_from(["cerulion", "pair", "bench-arm", "--eid", "ab"]).unwrap();
+        let Commands::Pair {
+            robot,
+            eid,
+            start: false,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the desk side of Commands::Pair");
+        };
+        let refusal = cerulion_cli_engine::pair_cmd::resolve_pair_target_with(
+            robot.as_deref(),
+            eid.as_deref(),
+            |_: &str| None,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect_err("ROBOT and --eid together are refused");
+        assert!(refusal.to_string().contains("not both"), "{refusal}");
+    }
+
+    /// `pair --start` alone selects the robot side; every desk flag and the
+    /// positional conflict with it.
+    #[test]
+    fn pair_start_takes_no_other_argument() {
+        let cli = Cli::try_parse_from(["cerulion", "pair", "--start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Pair {
+                start: true,
+                robot: None,
+                eid: None,
+                ..
+            }
+        ));
+        for extra in [
+            &["go2"][..],
+            &["--eid", "ab"],
+            &["--addr", "10.0.0.1:7842"],
+            &["--code", "48213907"],
+            &["--account", "ab"],
+            &["--label", "desk"],
+            &["--key-file", "/k"],
+            &["--relay-url", "https://relay.example"],
+            &["--relay-disabled"],
         ] {
+            let mut argv = vec!["cerulion", "pair", "--start"];
+            argv.extend_from_slice(extra);
             let err = match Cli::try_parse_from(&argv) {
                 Ok(_) => panic!("`{}` must not parse", argv.join(" ")),
                 Err(e) => e,
@@ -2507,85 +2689,178 @@ mod pair_dispatch_tests {
             );
             assert_eq!(err.exit_code(), 2);
         }
-        let cli = Cli::try_parse_from(["cerulion", "pair", "go2", "--start"]).unwrap();
-        match cli.command {
-            Commands::Pair { start, args } => {
-                assert!(!start);
-                assert_eq!(args, ["go2", "--start"]);
+    }
+
+    /// Every argument of `pair` but `--start` itself conflicts with it, so an
+    /// argument added later cannot be passed beside `--start` by accident.
+    #[test]
+    fn every_pair_argument_conflicts_with_start() {
+        let mut cmd = Cli::command();
+        let pair = cmd.find_subcommand_mut("pair").unwrap().clone();
+        let start = pair
+            .get_arguments()
+            .find(|a| a.get_id() == "start")
+            .unwrap()
+            .clone();
+        let conflicts: Vec<String> = pair
+            .get_arg_conflicts_with(&start)
+            .iter()
+            .map(|a| a.get_id().to_string())
+            .collect();
+        for arg in pair.get_arguments() {
+            let id = arg.get_id().as_str();
+            if matches!(id, "start" | "help" | "verbose") {
+                continue;
             }
-            _ => panic!("expected Commands::Pair"),
+            assert!(
+                conflicts.iter().any(|c| c == id),
+                "`--start` does not conflict with `{id}`"
+            );
         }
     }
 
-    /// The robot side defaults quiet, the stub one-shot.
+    /// The desk side keeps `info`, the robot side defaults quiet.
     #[test]
-    fn pair_start_defaults_quiet_and_the_stub_one_shot() {
+    fn pair_log_classes() {
         let class = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.log_verb_class();
+        assert_eq!(
+            class(&["cerulion", "pair", "go2"]),
+            VerbLogClass::LongRunning
+        );
         assert_eq!(
             class(&["cerulion", "pair", "--start"]),
             VerbLogClass::QuietRuntime
         );
-        assert_eq!(class(&["cerulion", "pair", "go2"]), VerbLogClass::OneShot);
     }
 
-    /// Every command a `pair --start` text names parses, and none of them is
-    /// the stub.
+    /// `cerulion help pair` renders both sides: the robot paragraph with the
+    /// policy's numbers, both exit lists and the `--eid` rule.
     #[test]
-    fn every_command_pair_start_names_parses() {
-        for named in cerulion_cli_engine::pair_start_cmd::COMMANDS_NAMED {
-            let argv: Vec<&str> = named.split(' ').collect();
-            let cli = Cli::try_parse_from(&argv)
-                .unwrap_or_else(|e| panic!("`{named}` does not parse: {e}"));
-            match cli.command {
-                Commands::Pair { start, .. } => assert!(start, "`{named}` is the stub"),
-                Commands::Login => {}
-                _ => panic!("`{named}` parses as an unexpected verb"),
-            }
-        }
-    }
-
-    /// `cerulion help pair` is the one spelling clap answers itself: it renders
-    /// the stub's doc comment (the refusal's own words), never the old
-    /// ceremony's flags.
-    #[test]
-    fn help_pair_renders_the_unavailable_notice() {
+    fn help_pair_renders_both_sides() {
         let err = match Cli::try_parse_from(["cerulion", "help", "pair"]) {
             Ok(_) => panic!("`cerulion help pair` must render help, not parse"),
             Err(e) => e,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         let text = err.to_string();
-        assert!(
-            text.contains("Code pairing is not available in this release"),
-            "{text}"
-        );
-        assert!(text.contains("cerulion login"), "{text}");
-        assert!(!text.contains("--code"), "{text}");
-        assert!(!text.contains("--start"), "{text}");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The policy's numbers, pinned against `cerulion_pairing::pair_code`
+        // by `pair_start_cmd`'s own tests.
+        for needle in [
+            "shows an 8-digit pairing code",
+            "pairs one desk within 10 minutes, with 3 tries every desk shares",
+            "passing both is refused",
+            "0 = paired, 1 = a usage or config",
+            "0 = a desk paired, 1 = refused on this robot",
+            "--start",
+        ] {
+            assert!(flat.contains(needle), "{needle:?} in:\n{text}");
+        }
     }
 
-    /// `pair` is hidden: `cerulion --help` lists no `pair` row. Completion is
-    /// pinned in `completion_wiring_tests`.
+    /// Only a ROBOT given as a name is pinned. The parsed `cerulion pair go2`
+    /// resolves to the name `go2`; `--eid` and a hex ROBOT resolve to no name,
+    /// so `pair_cmd::finalize_pairing` writes nothing to `robots.toml` and
+    /// prints no `pinned:` line. The help states that rule and the connect
+    /// command a desk paired by endpoint id runs, and that command parses.
     #[test]
-    fn pair_is_hidden_from_the_root_help() {
+    fn pair_help_says_only_a_robot_name_is_pinned() {
+        const EID: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let robots = std::collections::BTreeMap::from([("go2".to_string(), EID.to_string())]);
+        let pinned_name = |argv: &[&str]| {
+            let Commands::Pair {
+                robot,
+                eid,
+                start: false,
+                ..
+            } = Cli::try_parse_from(argv).unwrap().command
+            else {
+                panic!("{argv:?} must parse as the desk side of `pair`");
+            };
+            cerulion_cli_engine::pair_cmd::resolve_pair_target_with(
+                robot.as_deref(),
+                eid.as_deref(),
+                |_: &str| None,
+                &robots,
+            )
+            .unwrap()
+            .name
+        };
+        assert_eq!(
+            pinned_name(&["cerulion", "pair", "go2"]).as_deref(),
+            Some("go2")
+        );
+        assert_eq!(pinned_name(&["cerulion", "pair", "--eid", EID]), None);
+        assert_eq!(pinned_name(&["cerulion", "pair", EID]), None);
+
+        let Err(help) = Cli::try_parse_from(["cerulion", "help", "pair"]) else {
+            panic!("`cerulion help pair` must render help, not parse");
+        };
+        let text = help.to_string();
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "When ROBOT is a name, it then pins that name and the robot's endpoint id in \
+             `~/.cerulion/robots.toml`, so `cerulion connect <name>` works afterwards with no \
+             flags",
+            "with `--eid` or a hex ROBOT nothing is pinned, so connect with \
+             `cerulion connect --eid <eid>`",
+            "and, once a name is pinned, `pinned: name=<name> eid=<hex>`",
+            "With no name, `robot=` carries the endpoint id.",
+        ] {
+            assert!(flat.contains(needle), "{needle:?} in:\n{text}");
+        }
+        assert!(
+            !flat.contains("then records the robot's name"),
+            "the help must not say every pairing pins a name:\n{text}"
+        );
+
+        let Commands::Connect { robot, eid, .. } =
+            Cli::try_parse_from(["cerulion", "connect", "--eid", EID])
+                .unwrap()
+                .command
+        else {
+            panic!("`cerulion connect --eid <eid>` must parse as `connect`");
+        };
+        assert_eq!((robot, eid.as_deref()), (None, Some(EID)));
+    }
+
+    /// `pair` is listed again: `cerulion --help` has its row.
+    #[test]
+    fn pair_is_listed_in_the_root_help() {
         let mut cmd = Cli::command();
-        let pair = cmd
-            .find_subcommand("pair")
-            .expect("`pair` stays a verb so old scripts reach its refusal");
-        assert!(pair.is_hide_set(), "`pair` must be hidden");
+        let pair = cmd.find_subcommand("pair").unwrap();
+        assert!(!pair.is_hide_set(), "`pair` is listed");
         let help = cmd.render_long_help().to_string();
         assert!(
-            !help
-                .lines()
+            help.lines()
                 .any(|line| line.trim_start().starts_with("pair ")),
             "`cerulion --help` lists `pair`:\n{help}"
         );
-        // The listing is still rendered: the check above is not vacuous.
-        assert!(
-            help.lines()
-                .any(|line| line.trim_start().starts_with("connect ")),
-            "{help}"
-        );
+    }
+
+    /// Every command a `pair --start` text names parses: `cerulion pair
+    /// --start` to the robot side, `cerulion pair --eid <eid>` to the desk
+    /// side, and `cerulion login` to the sign-in.
+    #[test]
+    fn every_command_pair_start_names_parses() {
+        for named in cerulion_cli_engine::pair_start_cmd::COMMANDS_NAMED {
+            let argv: Vec<&str> = named
+                .split(' ')
+                .map(|word| if word == "<eid>" { "ab" } else { word })
+                .collect();
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("`{named}` does not parse: {e}"));
+            match cli.command {
+                Commands::Pair {
+                    start: true, eid, ..
+                } => assert!(eid.is_none(), "`{named}`"),
+                Commands::Pair {
+                    start: false, eid, ..
+                } => assert_eq!(eid.as_deref(), Some("ab"), "`{named}`"),
+                Commands::Login => {}
+                _ => panic!("`{named}` parses as an unexpected verb"),
+            }
+        }
     }
 }
 

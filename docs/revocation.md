@@ -194,7 +194,7 @@ The writer anchors on the WELL-KNOWN desk key `~/.cerulion/desk.key` (the same f
 keeps all three in agreement.
 
 **Which `<robot>` keys the cache: the name the DESK knows the robot by**, the
-name pinned in `~/.cerulion/robots.toml` (whose name→eid binding the dial
+name pinned in `~/.cerulion/robots.toml`, as `cerulion pair <name>` pins it (whose name→eid binding the dial
 then authenticates cryptographically), never the name the robot reports about itself in
 its catalog. A peer-reported key would let the dialed robot choose which cached artifact
 it is handed, e.g. another robot's signed epoch, whose revoked account/device ids are

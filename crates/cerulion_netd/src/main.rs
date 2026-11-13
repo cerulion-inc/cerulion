@@ -626,8 +626,8 @@ const DESK_WIDE_ENV_VARS: [(&str, &str); 2] = [
     ),
     (
         "CERULION_RELAY_URL",
-        "`cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, `topic snapshot` \
-         and `service call` (cerulion-connectd reads it on each)",
+        "`cerulion connect`, `cerulion pair`, `cerulion rcp` and `--robot` on `topic pub`, \
+         `topic snapshot` and `service call` (cerulion-connectd reads it on each)",
     ),
 ];
 
@@ -1171,12 +1171,12 @@ mod tests {
         let relay = lean_build_env_warn_message("CERULION_RELAY_URL");
         assert!(
             relay.contains(
-                "`cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, \
-                 `topic snapshot` and `service call` (cerulion-connectd reads it on each)"
+                "`cerulion connect`, `cerulion pair`, `cerulion rcp` and `--robot` on \
+                 `topic pub`, `topic snapshot` and `service call` (cerulion-connectd reads it \
+                 on each)"
             ),
             "{relay}"
         );
-        assert!(!relay.contains("cerulion pair"), "{relay}");
 
         for var in [
             "CERULION_NETD_WAN_ROBOTS",

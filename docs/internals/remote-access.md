@@ -3,9 +3,8 @@
 Scope: the remote-plane family: `cerulion_remoted` (the robot daemon), `cerud`
 (the robot ops-verb service), `cerulion_pairing` (identity + trust), `cerulion_link`
 (iroh dial-by-key QUIC), `cerulion_wireclient` (desk client substrate),
-`cerulion_connectd` (the worker behind `cerulion connect`, `cerulion rcp` and `--robot`
-on `topic pub`, `topic snapshot` and `service call`; its hidden `pair` subcommand
-has no `cerulion` caller),
+`cerulion_connectd` (the worker behind `cerulion connect`, `cerulion pair`, `cerulion rcp`
+and `--robot` on `topic pub`, `topic snapshot` and `service call`),
 `cerulion_accountd` (the cloud issuer/CA + accounts), `cerulion-wire` (the
 permissive frame decoder), and `cerulion_netd`'s iroh WAN plane. Read this
 alongside `docs/internals/network-daemons.md` (the LAN zenoh half; its §8 and §10
@@ -172,8 +171,8 @@ the same entry instead of running the daemon.
   reading the key file (`daemon_wiring_test.rs`).
 - **Desk side, three consumers of the same robot surface**: the
   `cerulion connect` verb (spawns the `cerulion-connectd` sibling binary),
-  `cerulion-connectd pair` (the code ceremony; the `cerulion pair` verb that
-  spawned it is a hidden stub that refuses on a desk, §7), and `cerulion_netd`'s
+  `cerulion-connectd pair` (the code ceremony, which the `cerulion pair` verb
+  spawns, §7), and `cerulion_netd`'s
   embedded iroh WAN plane (the `wan` feature). All three dial the same two
   ALPNs and share one client substrate (§7 to §8).
 
@@ -188,7 +187,7 @@ the same entry instead of running the daemon.
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
-| `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the worker binary behind `cerulion connect`, `cerulion rcp` and `topic pub`/`topic snapshot`/`service call --robot` (session driver; its hidden `pair` subcommand is the CPace initiator) |
+| `cerulion_connectd` | desk | AGPL-3.0-only | **no** | the worker binary behind `cerulion connect`, `cerulion pair`, `cerulion rcp` and `topic pub`/`topic snapshot`/`service call --robot` (session driver; its `pair` subcommand is the CPace initiator) |
 | `cerulion_accountd` | cloud | AGPL-3.0-only | **no** (web stack) | issuer/CA + accounts + OAuth/device-code login + revocation endpoints + the Team page |
 
 Load-bearing boundary contracts:
@@ -791,19 +790,18 @@ every slot is taken.
   into a `cerulion-connectd` argv and spawns the sibling binary
   (`connect_cmd.rs`, pure + oracle-tested; `CERULION_CONNECTD_BIN` overrides
   the binary). A positional name resolves via `~/.cerulion/robots.toml`; a
-  pinned robot's name just works. No `cerulion` verb writes the file: `pair_cmd`
-  pins a name after a successful `cerulion-connectd pair` ceremony, and nothing
-  calls `pair_cmd`, so it holds hand-written pins and any a 1.x `cerulion pair`
-  wrote.
+  pinned robot's name just works. `cerulion pair <name>` (`pair_cmd`) pins that
+  name after a successful `cerulion-connectd pair` ceremony, and a pairing by
+  `--eid` or a hex positional pins nothing; the file also holds hand-written
+  pins.
   connectd's `worker::run_connect` dials, fetches the catalog, demands, and
   spawns one reader per accepted topic; the whole loop is pinned over real
   loopback iroh + real per-test SHM roots by `reinject_e2e_test.rs`.
-- **`cerulion pair`** is a hidden stub on a desk: `dispatch` in `main.rs`
-  refuses every spelling but `pair --start` with `PAIR_UNAVAILABLE_MSG` and
-  exit 2 above the login gate, and sends only its `cli_command_run` (verb
-  `pair`, exit 2). The ceremony below lives on in
-  `cerulion_cli_engine::pair_cmd` and `cerulion-connectd pair`, which no
-  `cerulion` verb calls.
+- **`cerulion pair <robot>`** on a desk resolves the robot (`--eid`, a hex
+  positional, mDNS `eid=`, then `robots.toml`) and spawns
+  `cerulion-connectd pair` (`cerulion_cli_engine::pair_cmd`), forwarding its
+  exit code and sending `pair_completed`; below the kill switch (exit 1) and
+  the login gate.
 - **`cerulion pair --start`** is the step on the robot that leaves the request
   file below (`cerulion_cli_engine::pair_start_cmd`). Below the kill switch
   (exit 1) and the login gate, it checks `require_serving_authority`, draws the
@@ -1372,6 +1370,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk; each refusal text of the robot's code-pairing store maps to its desk exit class (every try failed and a wrong code are a code mismatch; a used code, a throttled try, every try taken by a desk still pairing, an expired window, no armed code and no try in progress are refusals) |
+| `crates/cerulion_connectd/tests/pair_interrupt_e2e_test.rs` | The real `cerulion-connectd pair` with stdin a pipe held open: with no code written, SIGINT and SIGTERM after the desk key line each end it with exit 130 within 2 s, log the signal caught and print nothing on stdout; a code written on the pipe reaches a test robot that accepts the ops stream and never answers, and SIGINT there ends it with exit 130 within 2 s after exactly the `pairing:` line; a stdin closed with no code is exit 1 |
 | `cerulion_wireclient` in-module tests | Dial-config parsers, epoch push decisions + cache-path pins, reply classification |
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |
 | `crates/cerulion_ops_proto/tests/wire_golden_test.rs` | Every `cerulion/ops/1` message type encodes to, and decodes from, a golden frame built from JSON text |

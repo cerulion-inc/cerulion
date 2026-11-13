@@ -9,6 +9,7 @@ service	Call services
 ros2	ROS 2 interop: run, launch, attach to and migrate a ROS 2 stack
 viz	Visualize live topics in Cerulion Studio
 connect	Connect to a remote robot and mirror its topics into local shared memory
+pair	Pair a desk with a robot; on the robot, --start makes the pairing code
 rcp	Serve a robot's cerulion-rcpd as a local stdio MCP server
 login	Sign in to a Cerulion account
 logout	Sign this machine out of its Cerulion account

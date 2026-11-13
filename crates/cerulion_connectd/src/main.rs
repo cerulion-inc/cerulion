@@ -16,10 +16,9 @@
 //!   ALPN, so the robot's `cerulion-rcpd` serves as a local stdio MCP server.
 //!   STDOUT carries only MCP messages.
 //!
-//! The subcommands are spawned by `cerulion connect`, `cerulion rcp` and the
-//! `--robot` forms of `topic pub`, `topic snapshot` and `service call` (the
-//! hidden `pair` subcommand has no `cerulion` caller); users run those verbs,
-//! not this binary directly. All logic
+//! The subcommands are spawned by `cerulion connect`, `cerulion pair`,
+//! `cerulion rcp` and the `--robot` forms of `topic pub`, `topic snapshot` and
+//! `service call`; users run those verbs, not this binary directly. All logic
 //! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
@@ -46,8 +45,9 @@ use cerulion_core::transport::cerulion_q::CatalogReply;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{RelayConfig, RelayUrl};
 
-/// The desk-side iroh sibling `cerulion connect`, `cerulion rcp` and the
-/// `--robot` forms of `topic pub`, `topic snapshot` and `service call` spawn.
+/// The desk-side iroh sibling `cerulion connect`, `cerulion pair`, `cerulion rcp`
+/// and the `--robot` forms of `topic pub`, `topic snapshot` and `service call`
+/// spawn.
 //
 // `about` is spelled out here. A bare `about` takes the crate's manifest
 // description, which is written for crates.io, not for a terminal.
@@ -55,7 +55,7 @@ use cerulion_link::{RelayConfig, RelayUrl};
 #[command(
     name = "cerulion-connectd",
     version,
-    about = "The helper that `cerulion connect`, `cerulion rcp` and `--robot` on `topic pub`, `topic snapshot` and `service call` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
+    about = "The helper that `cerulion connect`, `cerulion pair`, `cerulion rcp` and `--robot` on `topic pub`, `topic snapshot` and `service call` run to reach a remote robot. Use those verbs; you do not normally run this binary yourself.",
     long_about = None
 )]
 struct Cli {
@@ -73,10 +73,6 @@ enum ConnectdCommand {
     /// Runs the code-pairing ceremony, so the robot adds this desk's device key
     /// to its access list. Afterwards `cerulion connect <robot>` is admitted
     /// with no flags.
-    //
-    // Hidden from `--help`: no robot-side verb arms a pairing code, and the
-    // `cerulion pair` verb that ran this is a hidden stub that refuses.
-    #[command(hide = true)]
     Pair(PairCli),
     /// Call one of the robot's act verbs (`topic-publish`, `service-call`,
     /// `topic-snapshot`, `topic-echo-once`) and print its JSON result.
@@ -241,8 +237,9 @@ struct ConnectCli {
 #[derive(Parser)]
 struct PairCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
-    /// 32-byte device key), from the robot's mDNS `eid=` record or the robot
-    /// operator.
+    /// 32-byte device key). `cerulion pair` resolves it from the robot name you
+    /// typed (mDNS `eid=`, else `robots.toml`) or takes it from `--eid`;
+    /// `cerulion pair --start` prints it on the robot.
     #[arg(long, value_name = "HEX")]
     eid: String,
 
@@ -252,8 +249,9 @@ struct PairCli {
 
     /// The desk device key file (32 raw bytes: an ed25519 seed). REQUIRED for
     /// pairing (an ephemeral key the robot added to its access list would
-    /// vanish on exit). Pass this machine's key,
-    /// `~/.cerulion/identity/device.key`, which `cerulion login` creates.
+    /// vanish on exit). `cerulion pair` passes this machine's key,
+    /// `~/.cerulion/identity/device.key`, which it or `cerulion login`
+    /// creates.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -271,7 +269,7 @@ struct PairCli {
     account: Option<String>,
 
     /// The human label the robot stores on its access-list row (so the owner
-    /// recognizes this desk). Default: the desk hostname.
+    /// recognizes this desk). `cerulion pair` defaults it to the desk hostname.
     #[arg(long, value_name = "NAME")]
     label: Option<String>,
 
@@ -746,6 +744,11 @@ async fn run_connect_command(cli: ConnectCli) -> ExitCode {
 /// The `pair` subcommand: run the CPace code-pairing ceremony. Maps the ceremony
 /// outcome to the documented 0–4 exit-code contract.
 async fn run_pair_command(cli: PairCli) -> ExitCode {
+    // Made before anything else: on Unix this installs the SIGINT and SIGTERM
+    // handlers, so a signal that lands while the inputs below resolve is kept
+    // for the select at the end instead of ending the process by its default
+    // disposition.
+    let interrupt = pair_interrupt();
     // Resolve every input up front; any config error is exit USAGE.
     let robot_eid = match parse_eid(&cli.eid) {
         Ok(e) => e,
@@ -784,19 +787,25 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
         .unwrap_or_else(|| hex::encode(robot_eid.as_bytes()));
     let cli_code = cli.code;
 
-    // The code read + the ceremony, BOTH cancellable by a Ctrl-C. The (blocking)
-    // stdin code read runs on a blocking task so a Ctrl-C AT the prompt is caught
-    // by the select below (a deliberate EXIT_INTERRUPTED) instead of killing us by
-    // default disposition — a keystroke must never surface as a
-    // synthesized clean "paired" 0 in the parent (`exit_code_of` would otherwise
-    // see signal death and `spawn_and_pair` would falsely pin robots.toml).
+    // The code read + the ceremony, BOTH cancellable by an interrupt. The
+    // blocking stdin code read runs on a detached thread that hands its result
+    // over a oneshot, so a signal AT the prompt resolves the select below (a
+    // deliberate EXIT_INTERRUPTED) and the process then exits with the read
+    // still parked on an open stdin. Dropping the runtime waits for every
+    // running blocking-pool task, a parked `spawn_blocking` read included, but
+    // never for a plain thread, which the process exit ends.
     let ceremony = async move {
-        let code = match tokio::task::spawn_blocking(move || resolve_pair_code(cli_code)).await {
+        let (code_tx, code_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = code_tx.send(resolve_pair_code(cli_code));
+        });
+        let code = match code_rx.await {
             Ok(Ok(c)) => c,
             Ok(Err(msg)) => {
                 tracing::error!("cerulion pair: {msg}");
                 return ExitCode::from(EXIT_USAGE);
             }
+            // The reader thread ended without sending a result (it panicked).
             Err(e) => {
                 tracing::error!("cerulion pair: reading the pairing code failed: {e}");
                 return ExitCode::from(EXIT_USAGE);
@@ -834,42 +843,60 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
 
     tokio::select! {
         code = ceremony => code,
-        _ = pair_interrupt() => {
+        _ = interrupt => {
             tracing::warn!("cerulion pair: interrupted (Ctrl-C) before completion — NOT paired");
             ExitCode::from(EXIT_INTERRUPTED)
         }
     }
 }
 
-/// An interrupt watcher for the pairing ceremony — Ctrl-C (SIGINT) AND, on Unix,
-/// SIGTERM. Unlike `connect`, stdin is the pairing-CODE channel here, so stdin-EOF
-/// is NOT a shutdown — only a termination signal interrupts. Registering this
-/// future (via the `select!`) installs the signal handlers, so a signal AT the
-/// code prompt is caught (a deliberate `EXIT_INTERRUPTED`) rather than
-/// default-killing the process by disposition.
-async fn pair_interrupt() {
+/// An interrupt watcher for the pairing ceremony: Ctrl-C (SIGINT) and, on
+/// Unix, SIGTERM. Unlike `connect`, stdin is the pairing-CODE channel here, so
+/// stdin-EOF is NOT a shutdown; only a termination signal interrupts. On Unix
+/// the CALL installs both handlers and the returned future only waits, so a
+/// signal that lands before the future is first polled is kept and resolves it
+/// on that poll, and a signal AT the code prompt is caught (a deliberate
+/// `EXIT_INTERRUPTED`) rather than default-killing the process by disposition.
+fn pair_interrupt() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => tracing::info!("cerulion pair: Ctrl-C received"),
-                    _ = term.recv() => tracing::info!("cerulion pair: SIGTERM received"),
-                }
-            }
-            Err(e) => {
-                // SIGTERM couldn't be registered — fall back to Ctrl-C only.
-                tracing::debug!(error = %e, "cerulion pair: could not watch SIGTERM; Ctrl-C only");
+        let ctrl_c = signal(SignalKind::interrupt());
+        let term = signal(SignalKind::terminate());
+        async move {
+            let Ok(mut ctrl_c) = ctrl_c else {
+                // No SIGINT stream: `tokio::signal::ctrl_c` makes its own on its
+                // first poll, and resolves at once with the error if that fails.
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("cerulion pair: Ctrl-C received");
+                return;
+            };
+            match term {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = ctrl_c.recv() => tracing::info!("cerulion pair: Ctrl-C received"),
+                        _ = term.recv() => tracing::info!("cerulion pair: SIGTERM received"),
+                    }
+                }
+                Err(e) => {
+                    // SIGTERM could not be registered: fall back to Ctrl-C only.
+                    tracing::debug!(
+                        error = %e,
+                        "cerulion pair: could not watch SIGTERM; Ctrl-C only"
+                    );
+                    ctrl_c.recv().await;
+                    tracing::info!("cerulion pair: Ctrl-C received");
+                }
             }
         }
     }
+    // `tokio::signal::ctrl_c` installs its handler on its first poll here.
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("cerulion pair: Ctrl-C received");
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("cerulion pair: Ctrl-C received");
+        }
     }
 }
 
@@ -1002,23 +1029,21 @@ mod tests {
         }
     }
 
-    /// `pair` is hidden from `cerulion-connectd --help`: no `cerulion` verb runs it.
+    /// `pair` is listed in `cerulion-connectd --help`: `cerulion pair` runs it.
     #[test]
-    fn the_pair_subcommand_is_hidden_from_help() {
+    fn the_pair_subcommand_is_listed_in_help() {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let pair = cmd
             .find_subcommand("pair")
             .expect("`pair` stays a subcommand");
-        assert!(
-            pair.is_hide_set(),
-            "`cerulion-connectd pair` must be hidden"
-        );
+        assert!(!pair.is_hide_set(), "`cerulion-connectd pair` is listed");
         let help = cmd.clone().render_long_help().to_string();
         assert!(
-            !help.lines().any(|l| l.trim_start().starts_with("pair ")),
+            help.lines().any(|l| l.trim_start().starts_with("pair ")),
             "{help}"
         );
+        assert!(help.contains("`cerulion pair`"), "{help}");
         assert!(
             help.lines().any(|l| l.trim_start().starts_with("connect ")),
             "{help}"

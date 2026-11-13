@@ -29,7 +29,7 @@
 //! - [`schema`]: materialize a robot-served schema closure into the desk store.
 //! - [`worker`]: [`run_connect`], the dial, demand and per-topic re-inject engine.
 //! - [`pair`]: [`run_pair`], the desk-side CPace pairing ceremony over the
-//!   robot's `cerulion/ops/1` plane (no `cerulion` verb runs it).
+//!   robot's `cerulion/ops/1` plane (the `cerulion pair` verb's engine).
 //! - [`rcp`]: [`rcp::run_rcp`], the stdio MCP bridge to a robot's
 //!   `cerulion/rcp/1` plane (the `cerulion rcp` verb's engine).
 //! - [`error`]: the unified [`ConnectError`] enum.
