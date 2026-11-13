@@ -993,8 +993,9 @@ echo "Rebuilding cerulion binary + workspace cdylibs (release) for iceoryx2 pari
 # `graph run` spawns the `cerulion-netd` gateway from beside the binary that
 # runs it (or from CERULION_NETD_BIN), and a CLI-only build leaves no daemon
 # there: the leg fails before its first sample. One invocation builds the
-# pair the way the release does. bench.py names a missing or stale daemon
-# beside a CERULION override before any cell runs.
+# pair the way the release does. bench.py names a missing or stale daemon,
+# beside a CERULION override or named by CERULION_NETD_BIN, before any cell
+# runs.
 if ! ( cd "$REPO_ROOT" && cargo build -p cerulion_cli -p cerulion_netd --release ); then
     echo "!!! pre-sweep cerulion_cli + cerulion_netd rebuild failed, aborting (would run stale binaries)" >&2
     exit 1

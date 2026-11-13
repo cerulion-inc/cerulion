@@ -549,15 +549,23 @@ name. Each guard matches the tool that actually reads the variable.)
 | **undatable** (no `git`, a sparse checkout, a source dated in the future) | **runs**, with a loud `proceeding UNVERIFIED` warning on stderr; refusing would block a campaign over a transient failure |
 | **stale**, older than the newest source in `cerulion_cli`'s member closure | **refused** (exit 1), naming how far behind |
 | **foreign**, built from another tree (its depfile says so, or it is outside every target dir this checkout writes) | **refused** (exit 1) |
-| accepted, but the **`cerulion-netd`** it would spawn (`CERULION_NETD_BIN` when set, else the daemon beside it) is missing, not executable, stale against the daemon's own member closure, or foreign | **refused** (exit 1), naming the paths it looked at: every leg serves the network, so `graph run` spawns that daemon and a CLI-only build fails each leg before its first sample. An undatable daemon runs with the same `proceeding UNVERIFIED` warning |
+| accepted, but the **`cerulion-netd`** beside it is missing, not executable, stale against the daemon's own member closure, or foreign | **refused** (exit 1), naming the paths it looked at: every leg serves the network, so `graph run` spawns that daemon and a CLI-only build fails each leg before its first sample. An undatable daemon runs with the same `proceeding UNVERIFIED` warning |
+| any value that runs, unset, empty and the default path included, while **`CERULION_NETD_BIN`** is set and not empty | the daemon it names is checked the same way, because the CLI spawns that file and no other and the runner's rebuild never reaches it: a relative, missing, non-executable, stale or foreign one is **refused** (exit 1) before the SHM sweep |
 | **whitespace-only** | **refused**: the shell does *not* treat it as unset, so the runner would take the spaces literally and abort on `[ ! -x ]` after its rebuild |
-| a **relative** path, or a relative `CERULION_NETD_BIN` | **refused**: this process and the runner do not share a working directory, so it could name two different files |
+| a **relative** path | **refused**: this process and the runner do not share a working directory, so it could name two different files |
 | a path ending in a **separator**, not a file, or not **executable** | **refused** |
 | under `workspace/target/debug` | **refused**: the runner `rm -rf`s that directory (its freshest-wins guard) before running `$CERULION` |
 
-Every refusal names the remedy: `unset CERULION`, or
+Every refusal names the remedy: `unset CERULION` (`unset
+CERULION_NETD_BIN` for a daemon that variable names), or
 `cargo build -p cerulion_cli -p cerulion_netd --release`, which builds
 the CLI and the daemon it spawns in one invocation, as the runner does.
+A stale daemon names
+`cargo clean --release -p cerulion_netd && cargo build -p cerulion_cli -p cerulion_netd --release`
+instead: the daemon's floor also dates `Cargo.lock`, the root manifest
+and the tests, benches and examples of its member crates, and cargo
+relinks the daemon for none of them, so only the clean forces the relink
+that clears the refusal.
 A **direct** `bash workspace/run_workspace.sh <leg>` invocation does not go through
 `bench.py` and is not covered, and is **not a supported entry point**
 (see above): the policy is not duplicated in shell, it is declined there.

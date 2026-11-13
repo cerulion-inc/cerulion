@@ -9368,10 +9368,19 @@ def check_serving_runners_build_netd() -> int:
               f"{bench.CLI_REBUILD_CMD!r} must build -p cerulion_cli and -p "
               f"cerulion_netd in ONE cargo invocation]")
         errors += 1
+    want_relink = (f"cargo clean --release -p cerulion_netd && "
+                   f"{bench.CLI_REBUILD_CMD}")
+    if bench.NETD_RELINK_CMD != want_relink:
+        print(f"FAIL  [netd build: the stale-daemon remedy "
+              f"{bench.NETD_RELINK_CMD!r} must be {want_relink!r}: cargo "
+              f"relinks cerulion-netd only for code it links, so only the "
+              f"clean forces the relink a Cargo.lock or test edit needs]")
+        errors += 1
     if errors == 0:
         print("ok    [netd build: run_workspace.sh, crosshost.py and the "
               "rebuild remedy each build cerulion-netd in the CLI's own "
-              "cargo invocation]")
+              "cargo invocation, and a stale daemon names the clean that "
+              "forces its relink]")
     return errors
 
 
@@ -9418,6 +9427,9 @@ def check_cerulion_override_is_documented() -> int:
         ("the remedy", "unset CERULION"),
         ("the rebuild remedy", bench.CLI_REBUILD_CMD),
         ("the daemon beside the override", "cerulion-netd"),
+        ("the explicit daemon checked on every path",
+         "unset, empty and the default path included"),
+        ("the stale-daemon relink", bench.NETD_RELINK_CMD),
         ("the uncovered direct invocation", "does not go through"),
     ):
         if needle not in doc:
@@ -15188,10 +15200,13 @@ def check_cerulion_binary_freshness() -> int:
                         ("a daemon that is not executable", None,
                          floor + HOUR, 0o644, floor, "refused",
                          ("no executable", str(debug_netd))),
+                        # A plain rebuild cannot clear this one (cargo
+                        # relinks the daemon only for code it links), so it
+                        # names the clean that forces the relink.
                         ("a STALE daemon", None, floor - 2 * HOUR, 0o755,
                          floor, "refused",
                          ("7200 s older", "the daemon is built from",
-                          bench.CLI_REBUILD_CMD)),
+                          bench.NETD_RELINK_CMD)),
                         ("an undatable daemon", None, floor + HOUR, 0o755,
                          None, "warned", (bench.NETD_BIN_NAME,)),
                         # EXCLUSIVE, as the CLI reads it: a named daemon is
@@ -15199,7 +15214,8 @@ def check_cerulion_binary_freshness() -> int:
                         ("CERULION_NETD_BIN naming a FOREIGN daemon",
                          str(outside_netd), floor + HOUR, 0o755, floor,
                          "refused", ("not this checkout",
-                                     f"unset {bench.NETD_BIN_ENV}")),
+                                     f"unset {bench.NETD_BIN_ENV}",
+                                     bench.CLI_REBUILD_CMD)),
                         ("CERULION_NETD_BIN naming a missing daemon while "
                          "a fresh one sits beside the CLI",
                          str(nowhere_netd), floor + HOUR, 0o755, floor,
@@ -15255,6 +15271,114 @@ def check_cerulion_binary_freshness() -> int:
                         print("FAIL  [netd ladder: CERULION_NETD_BIN must be "
                               "the ONLY entry, as the CLI reads it]")
                         errors += 1
+
+                    # ---- CERULION_NETD_BIN with NO accepted override -----
+                    # CERULION unset, empty, or the runner's default path
+                    # (raw and through a symlinked prefix): the runner
+                    # rebuilds its default pair, but the CLI spawns a set
+                    # CERULION_NETD_BIN exclusively, so that rebuild never
+                    # reaches the daemon the run uses. Driven through
+                    # run_workspace_leg with cleanup_iceoryx() raising, so a
+                    # row that is refused is refused BEFORE the SHM sweep,
+                    # and the fresh control proves the sweep is reachable.
+                    stale_netd = tree / "target" / "release" / "deps" / \
+                        bench.NETD_BIN_NAME
+                    swept_at = []
+
+                    def sweep_reached():
+                        swept_at.append(1)
+                        raise _CaptureProceeded()
+
+                    saved_sweep = bench.cleanup_iceoryx
+                    saved_ws_dir = bench.WORKSPACE_DIR
+                    which_now = bench.shutil.which
+                    bench.cleanup_iceoryx = sweep_reached
+                    bench.shutil.which = (
+                        lambda n, *a, **k: "/bin/bash" if n == "bash"
+                        else which_now(n, *a, **k))
+                    bench.netd_source_floor_ns = lambda: floor
+                    try:
+                        _touch_ns(release_netd, floor + HOUR)
+                        _touch_ns(stale_netd, floor - 2 * HOUR)
+                        if nowhere_netd.exists():
+                            nowhere_netd.unlink()
+                        with tempfile.TemporaryDirectory(
+                                prefix="netd_leg_") as leg_td:
+                            leg_raw = Path(leg_td) / "raw"
+                            leg_raw.mkdir()
+                            # A runner that does nothing, so a guard and a
+                            # sweep both gone cannot start a real campaign.
+                            stub_ws = Path(leg_td) / "workspace"
+                            stub_ws.mkdir()
+                            (stub_ws / "run_workspace.sh").write_text(
+                                "exit 97\n")
+                            bench.WORKSPACE_DIR = stub_ws
+                            for cli_label, cli_value in (
+                                ("CERULION unset", None),
+                                ("CERULION empty", ""),
+                                ("CERULION at the default path",
+                                 str(release)),
+                                ("CERULION at the default path via a "
+                                 "symlinked prefix", str(alias_release)),
+                            ):
+                                for netd_label, netd_value, want, needles in (
+                                    ("a RELATIVE CERULION_NETD_BIN",
+                                     "target/release/cerulion-netd",
+                                     "refused", ("relative path",
+                                                 f"unset {bench.NETD_BIN_ENV}")),
+                                    ("a MISSING CERULION_NETD_BIN",
+                                     str(nowhere_netd), "refused",
+                                     (str(nowhere_netd), "first sample",
+                                      bench.CLI_REBUILD_CMD,
+                                      f"unset {bench.NETD_BIN_ENV}")),
+                                    ("a STALE CERULION_NETD_BIN",
+                                     str(stale_netd), "refused",
+                                     ("7200 s older", bench.NETD_RELINK_CMD,
+                                      f"unset {bench.NETD_BIN_ENV}")),
+                                    ("a fresh in-tree CERULION_NETD_BIN",
+                                     str(release_netd), "swept", ()),
+                                ):
+                                    if cli_value is None:
+                                        os.environ.pop(bench.CERULION_BIN_ENV,
+                                                       None)
+                                    else:
+                                        os.environ[bench.CERULION_BIN_ENV] = \
+                                            cli_value
+                                    os.environ[bench.NETD_BIN_ENV] = netd_value
+                                    del swept_at[:]
+                                    try:
+                                        with contextlib.redirect_stdout(
+                                                io.StringIO()), \
+                                                contextlib.redirect_stderr(
+                                                    io.StringIO()):
+                                            bench.run_workspace_leg(
+                                                "iox2", 0, "quiescent", leg_raw,
+                                                leg_raw / "_logs", [64])
+                                        got, text = "ran", ""
+                                    except _CaptureProceeded:
+                                        got, text = "swept", ""
+                                    except SystemExit as e:
+                                        got, text = "refused", str(e.code)
+                                    label = f"{cli_label}, {netd_label}"
+                                    if got != want:
+                                        print(f"FAIL  [netd without an "
+                                              f"override: {label} must be "
+                                              f"{want}, got {got} (swept: "
+                                              f"{bool(swept_at)}): {text!r}]")
+                                        errors += 1
+                                        continue
+                                    for needle in needles:
+                                        if needle not in text:
+                                            print(f"FAIL  [netd without an "
+                                                  f"override: {label} must "
+                                                  f"say {needle!r}, got "
+                                                  f"{text!r}]")
+                                            errors += 1
+                    finally:
+                        bench.cleanup_iceoryx = saved_sweep
+                        bench.WORKSPACE_DIR = saved_ws_dir
+                        bench.shutil.which = which_now
+                        os.environ.pop(bench.NETD_BIN_ENV, None)
                 finally:
                     bench.netd_source_floor_ns = lambda: floor
                     _touch_ns(debug_netd, floor + HOUR)

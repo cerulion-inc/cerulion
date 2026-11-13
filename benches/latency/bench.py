@@ -1755,6 +1755,14 @@ class _NotTheDefault(Exception):
 # the pair is built in ONE invocation, as run_workspace.sh and the release
 # build it (see refuse_unusable_netd).
 CLI_REBUILD_CMD = "cargo build -p cerulion_cli -p cerulion_netd --release"
+# The remedy a STALE daemon carries instead. The daemon's floor also dates
+# the root Cargo.lock and Cargo.toml and the tests, benches and examples of
+# its closure, and cargo relinks `cerulion-netd` for none of them, so after
+# a pull that touched only those, CLI_REBUILD_CMD leaves the daemon older
+# than the floor and the refusal stands. `cargo clean --release -p
+# cerulion_netd` drops its artifacts under whatever target dir cargo uses,
+# so the build that follows relinks it.
+NETD_RELINK_CMD = f"cargo clean --release -p cerulion_netd && {CLI_REBUILD_CMD}"
 
 # The variable every reader below consults, spelled once.
 CARGO_TARGET_DIR_ENV = "CARGO_TARGET_DIR"
@@ -2898,7 +2906,10 @@ def refuse_foreign_cerulion_override(subcommand: str) -> None:
     because `git` hiccuped once. (The parity harness takes the opposite
     view of the same condition; see resolve_cerulion_cli.) Either way the
     `cerulion-netd` the override would spawn is then asked the same
-    questions (`refuse_unusable_netd`).
+    questions (`refuse_unusable_netd`). A set CERULION_NETD_BIN is asked
+    them on EVERY path, CERULION unset, empty or the runner's default path
+    included: the CLI spawns that file exclusively, so the runner's rebuild
+    of the default pair does not protect it.
 
     SCOPE: this covers every path bench.py drives (the workspace,
     full and smoke subcommands, and run_workspace_leg itself). A DIRECT
@@ -2924,6 +2935,9 @@ def refuse_foreign_cerulion_override(subcommand: str) -> None:
     # Refusing `CERULION=` would refuse a run the runner performs correctly
     # with its own build.
     if raw is None or raw == "":
+        # No override, so the runner rebuilds and runs its default pair,
+        # but a set CERULION_NETD_BIN still replaces the daemon it spawns.
+        refuse_unusable_netd(None, raw, subcommand)
         return
     # WHITESPACE-ONLY is NOT null, and the difference is the whole point of
     # this guard. `${CERULION:-...}` substitutes nothing for `'   '` — it
@@ -3012,7 +3026,12 @@ def refuse_foreign_cerulion_override(subcommand: str) -> None:
     default_cli = REPO_ROOT / "target" / "release" / "cerulion"
     runner_builds_default = _runner_rebuilds(default_cli)
     if runner_builds_default and candidate == default_cli:
+        # The same ask as no override, the daemon included.
+        refuse_unusable_netd(None, raw, subcommand)
         return
+    # Set inside the `try` and acted on after it, so a netd refusal is never
+    # inside the OSError/RuntimeError handlers below.
+    names_default = False
     try:
         if not runner_builds_default:
             raise _NotTheDefault
@@ -3035,8 +3054,7 @@ def refuse_foreign_cerulion_override(subcommand: str) -> None:
         # Resolving the parent and re-attaching the name answers the first
         # and refuses the second.
         default_canonical = default_cli.parent.resolve() / default_cli.name
-        if candidate.resolve() == default_canonical:
-            return
+        names_default = candidate.resolve() == default_canonical
     except _NotTheDefault:
         pass
     except (OSError, RuntimeError):
@@ -3055,6 +3073,9 @@ def refuse_foreign_cerulion_override(subcommand: str) -> None:
         # The RAW comparison above has already answered the exact-path
         # case, which is what keeps the exemption working here.
         pass
+    if names_default:
+        refuse_unusable_netd(None, raw, subcommand)
+        return
     if not candidate.is_file():
         raise SystemExit(
             f"{CERULION_BIN_ENV}={raw!r} is set in the environment but is "
@@ -3146,23 +3167,34 @@ def netd_candidates_for(cli: Path) -> List[Path]:
     return [named] if resolved == named else [named, resolved]
 
 
-def refuse_unusable_netd(cli: Path, raw: str, subcommand: str) -> None:
-    """Refuse when the `cerulion-netd` an accepted CERULION= override would
-    spawn is missing, not executable, foreign or stale, or is named by a
-    relative CERULION_NETD_BIN; proceed with a loud warning when it cannot
-    be dated, the override's own policy.
+def refuse_unusable_netd(cli: Optional[Path], raw: Optional[str],
+                         subcommand: str) -> None:
+    """Refuse when the `cerulion-netd` a workspace run would spawn is
+    missing, not executable, foreign or stale, or is named by a relative
+    CERULION_NETD_BIN; proceed with a loud warning when it cannot be dated,
+    the override's own policy.
 
     Every workspace leg serves the network, so `graph run` spawns the
     daemon: with none to find, each leg fails before its first sample, and
     one built from other code serves the run while the manifest records
-    THIS checkout. Asked only for an override the CLI check accepted;
-    run_workspace.sh rebuilds the pair at its default path itself.
+    THIS checkout.
+
+    `cli` is the CERULION= override the CLI check accepted, or None when
+    there is none (CERULION unset, empty, or the runner's default path).
+    With None only an explicit CERULION_NETD_BIN is asked: run_workspace.sh
+    rebuilds the pair at its default path, but the CLI spawns a set
+    CERULION_NETD_BIN EXCLUSIVELY, whichever binary runs, so that rebuild
+    never reaches the daemon the run uses. Unset, the default pair stands.
 
     Dated against the daemon's OWN closure (`netd_source_floor_ns`): cargo
     relinks it only when something it links changed, so the CLI's floor
     would call it stale after every CLI-only edit, a refusal no rebuild
-    clears."""
+    clears. A stale daemon names NETD_RELINK_CMD: cargo does not relink it
+    for the floor's unlinked inputs (Cargo.lock, tests), and the clean
+    forces that relink."""
     explicit = os.environ.get(NETD_BIN_ENV, "")
+    if cli is None and not explicit:
+        return
     if explicit and not Path(explicit).is_absolute():
         raise SystemExit(
             f"{NETD_BIN_ENV}={explicit!r} is a relative path, refusing to "
@@ -3170,7 +3202,7 @@ def refuse_unusable_netd(cli: Path, raw: str, subcommand: str) -> None:
             f"it runs ${CERULION_BIN_ENV}, so the daemon checked here and "
             f"the one `graph run` spawns could be two different files. Give "
             f"an absolute path, or unset it (`unset {NETD_BIN_ENV}`).")
-    tried = netd_candidates_for(cli)
+    tried = netd_candidates_for(cli) if cli is not None else [Path(explicit)]
     found = None
     for path in tried:
         try:
@@ -3179,21 +3211,27 @@ def refuse_unusable_netd(cli: Path, raw: str, subcommand: str) -> None:
                 break
         except OSError:
             continue
-    remedy = (f"Point {NETD_BIN_ENV} at a fresh build of this tree "
-              f"(`{CLI_REBUILD_CMD}`), or unset it (`unset {NETD_BIN_ENV}`)"
-              if explicit else
-              f"Rebuild the pair with `{CLI_REBUILD_CMD}`, set "
-              f"{NETD_BIN_ENV} to a fresh daemon, or unset "
-              f"{CERULION_BIN_ENV} (`unset {CERULION_BIN_ENV}`) to use this "
-              f"checkout's own build")
+
+    def remedy(build_cmd: str) -> str:
+        if explicit:
+            return (f"Point {NETD_BIN_ENV} at a fresh build of this tree "
+                    f"(`{build_cmd}`), or unset it (`unset {NETD_BIN_ENV}`)")
+        return (f"Rebuild the pair with `{build_cmd}`, set {NETD_BIN_ENV} to "
+                f"a fresh daemon, or unset {CERULION_BIN_ENV} (`unset "
+                f"{CERULION_BIN_ENV}`) to use this checkout's own build")
+
     if found is None:
         named = ", ".join(str(p) for p in tried)
+        subject = (f"{NETD_BIN_ENV}={explicit!r} names no executable "
+                   f"`{NETD_BIN_NAME}`, and the CLI looks nowhere else"
+                   if explicit else
+                   f"{CERULION_BIN_ENV}={raw!r} has no executable "
+                   f"`{NETD_BIN_NAME}` where it looks for one ({named})")
         raise SystemExit(
-            f"{CERULION_BIN_ENV}={raw!r} has no executable `{NETD_BIN_NAME}` "
-            f"where it looks for one ({named}), refusing to run "
-            f"'{subcommand}'. Every workspace leg serves the network, so "
-            f"`graph run` spawns that daemon and each leg would fail before "
-            f"its first sample. {remedy}.")
+            f"{subject}, refusing to run '{subcommand}'. Every workspace leg "
+            f"serves the network, so `graph run` spawns that daemon and each "
+            f"leg would fail before its first sample. "
+            f"{remedy(CLI_REBUILD_CMD)}.")
     try:
         mtime: Optional[int] = found.stat().st_mtime_ns
     except OSError:
@@ -3208,11 +3246,20 @@ def refuse_unusable_netd(cli: Path, raw: str, subcommand: str) -> None:
               f"this checkout ({reason}); proceeding UNVERIFIED",
               file=sys.stderr)
         return
+    subject = (f"the `{NETD_BIN_NAME}` that {NETD_BIN_ENV}={explicit!r} names"
+               if explicit else
+               f"the `{NETD_BIN_NAME}` that {CERULION_BIN_ENV}={raw!r} would "
+               f"spawn ({found})")
+    if verdict == CLI_STALE:
+        fix = (f"Cargo relinks the daemon only when code it links changes, so "
+               f"a plain rebuild can leave it older than that source. "
+               f"{remedy(NETD_RELINK_CMD)}")
+    else:
+        fix = remedy(CLI_REBUILD_CMD)
     raise SystemExit(
-        f"the `{NETD_BIN_NAME}` that {CERULION_BIN_ENV}={raw!r} would spawn "
-        f"({found}): {reason}. Refusing to run '{subcommand}': every "
+        f"{subject}: {reason}. Refusing to run '{subcommand}': every "
         f"workspace leg serves the network, so that daemon would serve the "
-        f"run while the manifest records THIS checkout. {remedy}.")
+        f"run while the manifest records THIS checkout. {fix}.")
 
 
 def resolve_run_dir(args: argparse.Namespace) -> Path:
