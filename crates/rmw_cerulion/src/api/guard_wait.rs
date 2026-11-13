@@ -337,7 +337,13 @@ struct ParkEnd {
 /// The seqs a park measures a ring against ([`WaitSetData::park_until`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParkRef {
-    /// Each bell's seq read when the park starts (the stock park).
+    /// The stock park: each bell's seq read by the call's entry pass BEFORE its full
+    /// readiness probe ([`WaitSetData::note_entry_bells`]), once per entry pass; a park
+    /// with no unspent entry read (a later park of a `ThroughRung` call) reads the seqs
+    /// when it starts. A publisher commits, then rings, so a frame that probe did not
+    /// see rings after that read: its ring ends the park at the first check, and a
+    /// frame that reaches the park through the fd behind an unmoved bell is evidence of
+    /// a stale page ([`bell_is_stale`]), never a ring the reference already counted.
     Entry,
     /// Each bell's seq at the period learners' last note or sync (feature `period-park`). A
     /// ring that landed after that read, during the kernel lead included, ends the park at
@@ -1018,11 +1024,17 @@ struct ParkBells {
     missing: Vec<String>,
     /// Calls since the last retry of `missing`.
     calls_since_retry: u32,
-    /// Each bell's reference seq for the LAST park (parallel to `bells`): read
-    /// at the park's entry, or for a predicted park the seq at the period
+    /// Each bell's reference seq for the LAST park (parallel to `bells`): the
+    /// call's entry read, or for a predicted park the seq at the period
     /// learners' last note or sync ([`ParkRef`]). What "stayed silent" is
     /// measured against.
     last_snap: Vec<u64>,
+    /// Each bell's seq read by the call's entry pass before its probe
+    /// (parallel to `bells`), the stock park's reference ([`ParkRef::Entry`]).
+    entry_seqs: Vec<u64>,
+    /// `entry_seqs` was read by this call's latest entry pass and no park has
+    /// used it yet.
+    entry_unspent: bool,
     /// The last park returned via the FD path with every bell silent —
     /// a frame may have arrived without its bell ringing; reconcile.
     fd_wake_suspect: bool,
@@ -1096,12 +1108,16 @@ impl ParkBells {
 
 /// PURE: is a park bell STALE? A frame reached the subscription (a sample
 /// is pending) while the bell that should have rung for it is still at
-/// the value the park snapshotted. The publisher rings BEFORE it notifies
-/// the listener (both after the sample is committed), so by the time an
-/// fd wake delivers a frame a HEALTHY bell has already advanced — a bell
-/// still silent with a frame behind it maps a page nobody writes any
-/// more: the producer was destroyed (the owner `shm_unlink`s the name on
-/// drop) and re-created (a fresh inode under the same name).
+/// the park's reference value. The publisher rings BEFORE it notifies
+/// the listener (both after the sample is committed), and the reference is
+/// read before the probe that last found nothing ([`ParkRef`]), so by the
+/// time an fd wake delivers a frame that probe missed, a HEALTHY bell has
+/// already advanced past it. A bell still silent with a frame behind it
+/// maps a page nobody writes any more: the producer was destroyed (the
+/// owner `shm_unlink`s the name on drop) and re-created (a fresh inode
+/// under the same name). A reference
+/// read AFTER that probe would already count a ring whose frame is still
+/// on its way, and this predicate would call the live bell stale.
 fn bell_is_stale(sample_pending: bool, seq_now: u64, seq_at_park: u64) -> bool {
     sample_pending && seq_now == seq_at_park
 }
@@ -1175,6 +1191,24 @@ impl WaitSetData {
             .unwrap_or_else(|e| e.into_inner())
             .bells
             .len()
+    }
+
+    /// Read every mapped bell's seq as the next stock park's reference
+    /// ([`ParkRef::Entry`]). The call's entry pass runs this BEFORE its full
+    /// readiness probe: a frame that probe misses was committed after it, and
+    /// so rang after this read. Reuses the buffer (no allocation once it has
+    /// grown to the bell count).
+    fn note_entry_bells(&self) {
+        let mut pb = self.park_bells.lock().unwrap_or_else(|e| e.into_inner());
+        let ParkBells {
+            bells,
+            entry_seqs,
+            entry_unspent,
+            ..
+        } = &mut *pb;
+        entry_seqs.clear();
+        entry_seqs.extend(bells.iter().map(|(_, b)| b.seq()));
+        *entry_unspent = true;
     }
 
     /// After a park that returned via the FD path with every bell silent:
@@ -1348,9 +1382,14 @@ impl WaitSetData {
         } else {
             0
         };
+        // Every park spends the entry read: a later park of the same call
+        // measures against the seqs at its own start.
+        let entry_read = std::mem::replace(&mut bells.entry_unspent, false)
+            && bells.entry_seqs.len() == bells.bells.len();
         // hot-path-alloc-ok: one small Vec per park entry (the idle path,
         // never the frame path).
         let snap: Vec<u64> = match reference {
+            ParkRef::Entry if entry_read => bells.entry_seqs.clone(),
             ParkRef::Entry => bells.bells.iter().map(|(_, b)| b.seq()).collect(),
             #[cfg(feature = "period-park")]
             ParkRef::Noted => {
@@ -1364,7 +1403,7 @@ impl WaitSetData {
                 if noted.len() == bells.bells.len() {
                     noted
                 } else {
-                    // Learners not matched to this bell set: the entry seqs.
+                    // Learners not matched to this bell set: the seqs at the park's start.
                     bells.bells.iter().map(|(_, b)| b.seq()).collect()
                 }
             }
@@ -2775,6 +2814,11 @@ unsafe fn rmw_wait_live(
                     fired_buf.clear();
                     match phase {
                         Phase::Entry => {
+                            // The stock park's reference, read before the full
+                            // probe below for the same reason as the sync below.
+                            if parked {
+                                ws.note_entry_bells();
+                            }
                             // Period-learned park: the full probe below serves every
                             // message whose ring came before this read.
                             #[cfg(feature = "period-park")]
@@ -2969,6 +3013,10 @@ unsafe fn rmw_wait_live(
                     let outcome = if let Some(outcome) = predicted {
                         outcome
                     } else if this_block_parks {
+                        // Fault seam (`test-seams` builds only): one publish lands
+                        // HERE, after the entry probe and before the park.
+                        #[cfg(feature = "test-seams")]
+                        crate::test_seams::maybe_publish_before_park();
                         let park_budget = match park_policy {
                             ParkHorizon::FirstRungOnce => {
                                 budget.min(Duration::from_micros(PARK_HORIZON_US))
@@ -3541,7 +3589,6 @@ mod tests {
     }
 
     /// A readable fd in the wait set's fd snapshot, as a landed listener notify leaves it.
-    #[cfg(feature = "period-park")]
     fn readable_fd(ws: &WaitSetData) -> std::os::unix::net::UnixStream {
         use std::io::Write as _;
         use std::os::fd::AsRawFd as _;
@@ -3554,8 +3601,8 @@ mod tests {
 
     /// The predicted bell rings after the learners' last note and before the park, as a ring
     /// during the kernel lead does. The park measures against the noted seq, so its first
-    /// check returns on the bell. Measured against its own entry seqs, it would arm the
-    /// monitor wait on a line that had already moved and sleep to its end, 2 s here.
+    /// check returns on the bell. Measured against the seqs at its own start, it would arm
+    /// the monitor wait on a line that had already moved and sleep to its end, 2 s here.
     #[cfg(feature = "period-park")]
     #[test]
     fn a_ring_during_the_lead_ends_the_predicted_park_at_its_first_check() {
@@ -3913,6 +3960,83 @@ mod tests {
         assert_eq!(
             kept_ws.next_window(kept_base + ms(11) + us(21)),
             Some((kept_base + ms(12) - us(40), us(60), 0))
+        );
+    }
+
+    /// The stock park measures a ring against the entry pass's read, taken before the
+    /// call's probe: a ring that lands after that read and before the park, its listener
+    /// notify already readable, returns on the bell at the first check and leaves the
+    /// reconcile nothing to suspect. Measured against the seqs at the park's own start, the
+    /// ring would count as seen and the park would return on the fd with the bell suspect.
+    #[test]
+    fn a_ring_after_the_entry_read_ends_the_stock_park_on_the_bell_not_the_fd() {
+        let topic = format!("/rmw_pp/{}/entry_ring", std::process::id());
+        let page =
+            cerulion_core::doorbell::Doorbell::open_owned(doorbell_ns(), &topic).expect("page");
+        let ws = WaitSetData::default();
+        ws.refresh_park_bells(std::slice::from_ref(&topic));
+        assert_eq!(ws.doorbell_topics(), 1);
+        ws.note_entry_bells();
+        let read = page.seq();
+        page.ring();
+        let _notify = readable_fd(&ws);
+        assert_eq!(ws.park_block(Duration::from_secs(2), 0), BlockWake::Bell(0));
+        let pb = ws.park_bells.lock().expect("bells");
+        assert!(
+            !pb.fd_wake_suspect,
+            "a bell wake does not ask for the reconcile"
+        );
+        assert_eq!(pb.last_snap, [read]);
+        assert!(!pb.entry_unspent, "the park spent the entry read");
+    }
+
+    /// Only the call's first park measures against the entry read: a later park with no
+    /// ring since its own start waits out its budget rather than returning at once on a
+    /// ring the first park already reported.
+    #[test]
+    fn a_park_after_the_entry_read_is_spent_measures_against_its_own_start() {
+        let topic = format!("/rmw_pp/{}/entry_spent", std::process::id());
+        let page =
+            cerulion_core::doorbell::Doorbell::open_owned(doorbell_ns(), &topic).expect("page");
+        let ws = WaitSetData::default();
+        ws.refresh_park_bells(std::slice::from_ref(&topic));
+        ws.note_entry_bells();
+        page.ring();
+        assert_eq!(ws.park_block(Duration::from_secs(2), 0), BlockWake::Bell(0));
+        assert_eq!(
+            ws.park_block(Duration::from_millis(5), 0),
+            BlockWake::Timeout
+        );
+        let pb = ws.park_bells.lock().expect("bells");
+        assert_eq!(pb.last_snap, [page.seq()]);
+    }
+
+    /// STRUCTURAL: the entry pass reads the stock park's reference before its fd check and
+    /// its full probe. A read after the probe would count a ring whose message no probe
+    /// looked for, and the park would take that message through the fd behind a bell that
+    /// looks silent. Walked over a comment-stripped view of `rmw_wait_live`.
+    #[test]
+    fn the_entry_pass_reads_the_park_reference_before_its_full_probe() {
+        let src = include_str!("guard_wait.rs");
+        let start = src
+            .find("unsafe fn rmw_wait_live(")
+            .expect("rmw_wait_live present");
+        let end = src[start..]
+            .find("fn rmw_publisher_event_init(")
+            .map(|e| start + e)
+            .expect("rmw_publisher_event_init follows rmw_wait_live");
+        let body = code_only(&src[start..end]);
+        let arm = &body[body.find("Phase::Entry => {").expect("the entry arm")..];
+        let read = arm
+            .find("ws.note_entry_bells()")
+            .expect("the entry arm reads the park reference");
+        let check = arm
+            .find("fd_set.check()")
+            .expect("the entry arm checks the fds");
+        let probe = arm.find("probe_ready_into(").expect("the probe follows");
+        assert!(
+            read < check && check < probe,
+            "the reference read, then the fd check, then the probe"
         );
     }
 
