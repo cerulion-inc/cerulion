@@ -111,7 +111,7 @@ set to `on` or `off`:
 | `WORKER_DEATH` | A worker process exits without being asked to. | on |
 | `PANIC_DISABLE` | A node is disabled after consecutive panics, or a panic poisons its entry mutex. The process stays alive and one node has stopped. | on |
 | `RUN_VANISHED` | The run this recorder is bound to disappears without announcing anything: a hard crash such as a segfault, an OOM kill or an abort. | on |
-| `ESTOP` | A human engages the e-stop over the Cerulion ops plane. A hardwired stop that never reaches the middleware fires nothing. | on |
+| `ESTOP` | A human engages the e-stop with `engage-estop` over the Cerulion ops plane; an rcp `estop` tool call does not ask for a capture. To capture a hardwired stop too, have the robot-side process that senses it, such as a safety PLC reader, declare an incident (`DECLARED`). | on |
 | `DECLARED` | A robot-side process declares an incident on `/__cerulion/flashback`, for example a bumper, a safety PLC, a domain e-stop topic or a grasp-failure detector. | on |
 | `STALL` | A topic that was streaming goes idle or reports no data, confirmed. Topics slower than the monitors' minimum rate are not judged. | on |
 | `RATE` | A topic's rate leaves the band around its learned baseline: below half of it or above double it. | on |

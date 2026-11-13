@@ -151,6 +151,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
     let flush = recording.clone();
     let worker = VizLogWorker::spawn(recording, builtin_walker(), SinkState::new()).unwrap();
     let viz_socket = directory.0.join("viz.sock");
+    let demand_plane = Arc::new(NetdDemandPlane::with_socket(desk_socket.clone()));
     let mut vizd = start_with_demand_plane(
         viz_socket.clone(),
         DEFAULT_POLL_INTERVAL,
@@ -158,7 +159,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
         worker,
         builtin_walker(),
         None,
-        Arc::new(NetdDemandPlane::with_socket(desk_socket.clone())),
+        demand_plane.clone(),
     )
     .unwrap();
     let mut client = support::Client::connect(&viz_socket);
@@ -210,15 +211,21 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
                 cerulion_cli_engine::account_robot_access::prepare_viz_target(&route, &[], &[])
                     .unwrap();
             assert_eq!(refreshed.route, route);
-            let deadline = Instant::now() + BOUND;
-            while netd.active_demand_count() != 1 {
-                assert!(
-                    Instant::now() < deadline,
-                    "visualization did not re-demand the retired source"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
         }
+
+        // A global demand count can rise before this holding client accepts
+        // its reply. Publish once only after viz has acknowledged its own
+        // initial Observe, or the re-Observe following the actual retirement.
+        assert!(
+            demand_plane.wait_for_observe_ack_for_test(
+                &route,
+                TOPIC,
+                if i == 0 { 1 } else { 2 },
+                BOUND,
+            ),
+            "visualization did not acknowledge its source demand before sample {i}"
+        );
+        assert_eq!(netd.active_demand_count(), 1);
 
         let oracle = frame(robot.hash, i);
         publisher.publish_raw(&oracle).unwrap();
@@ -248,7 +255,7 @@ fn account_directory_to_vizd_renders_exact_loopback_samples_and_detaches() {
                 Instant::now() < deadline,
                 "sample {i} delivery={delivered}, rendered={values:?}"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::yield_now();
         }
     }
     assert_eq!(

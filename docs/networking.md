@@ -207,11 +207,15 @@ sign-in. An existing robot reuses its validated registration offline; first
 registration still requires its account issuer.
 
 For an intentionally open zenoh LAN deployment, set `CERULION_LAN_ACCESS=open`
-and provide a listen endpoint on the serving machine:
+for every Cerulion command and daemon on every machine that should send or
+receive topics over that LAN, restart `cerulion-netd` on each machine, and
+provide a listen endpoint on the serving machine:
 
 ```bash
 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683
 ```
+
+After upgrading from 1.x, restart any `cerulion-netd` that is still running so it uses the paired default.
 
 That optional setting binds the legacy LAN plane and permits its mDNS beacon
 when the endpoint has a LAN-dialable nonzero fixed TCP port. It is not the switch

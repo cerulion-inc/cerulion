@@ -143,6 +143,21 @@ env:
   # saw, and `cerulion_cli_engine::ci_test_coverage_test` refuses that shape.
   CI_SELECTION: ${{ vars.CI_SELECTION || 'on' }}
   RUST_BACKTRACE: 1
+  # CARGO BUILD-DIR LAYOUT. Cargo 1.100 builds test executables into
+  # `<profile>/build/<pkg>/<hash>/out/` in place of `<profile>/deps/`. The
+  # test-side fixture lookups (`cerulion_core::testing::test_target_profile_dir`
+  # and the tests in other crates that repeat its rule) take the profile
+  # directory from the test executable's own path, one or two directories up.
+  # Under the 1.100 layout that is `build/<pkg>/<hash>/out` or
+  # `build/<pkg>/<hash>`, which hold no fixture cdylib or binary, so every
+  # lookup misses. Set to exactly "1" (`true` does not count as set), this
+  # cargo variable makes cargo 1.100 build the previous layout: test
+  # executables in `<profile>/deps/`, with `.fingerprint/` and build-script
+  # output (`build/<pkg>-<hash>/out/`) where they were. Final artifacts (bins,
+  # cdylibs, examples) land in `<profile>/` under either layout, and cargo
+  # before 1.100 (the 1.95.0 jobs and the pinned nightly) builds the previous
+  # layout with or without it.
+  __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
   # Suppress iceoryx2 log noise
   IOX2_LOG_LEVEL: error
   # The toolchain the fuzz and miri jobs run on. PINNED, deliberately, and it

@@ -46,8 +46,9 @@ the same entry instead of running the daemon.
   once for both hosts. A library host
   (`RemotePlane::new`) refuses the daemon-only verbs by name with
   `unsupported_host`: `restart` (it restarts a systemd unit), `engage-estop`
-  (it engages the daemon's control lease and incident capture; a host that served
-  it would report an e-stop that stops nothing), and the act verbs
+  (it engages the daemon's control lease, sends an `estop` to rcpd and asks for
+  an incident capture; a library host has neither that lease nor an rcpd
+  link), and the act verbs
   `topic-publish`, `service-call`, `topic-snapshot` and `topic-echo-once` (they
   run on the process's transport singleton and the daemon's schema directory, and
   the two that send are gated by the daemon's e-stop, which a library host does
@@ -370,7 +371,7 @@ The demand GET loop does not consult the posture: it keeps sending GETs while
 paired, and each GET's selector names one ingress topic it demands. The
 remote plane's wire protocol does not carry writes from a desk:
 `cerulion/wire/2` moves frames from robot to desk only, and the `teleop` verb
-has no handler yet (see `docs/remote_plane.md`). Its re-inject seam is the
+has no handler (see `docs/remote_plane.md`). Its re-inject seam is the
 desk-side path that copies robot frames into the desk's own shared memory; it
 does not consult the LAN posture and it is not a write path to the robot. A desk
 writes the robot's topics and services over the ops plane instead (§5.1):
@@ -400,7 +401,7 @@ binds each session to its pairing key over an authenticated transport and
 authorizes each peer and each demanded topic, with revocation. Its wire protocol
 carries the observe direction only (robot to desk topic data). The teleop
 command direction is classified (`teleop` needs `CAP_TELEOP`) but has no
-handler, so no verb takes the control lease or runs under the deadman yet. The
+handler, so no verb takes the control lease or runs under the deadman. The
 ops protocol still runs the verbs the robot registers (for example `restart` and
 `engage-estop`), the act verbs among them (§5.1): with `CAP_TELEOP` and
 role ≥ OPERATOR a desk publishes a message on a robot topic (`topic-publish`) or
@@ -422,7 +423,7 @@ snapshot (`topic-snapshot`).
   refused to a row whose principal is cloud whether the allow-from-cloud switch
   is on or off (class `NonCloud`: the authorizer refuses it before dispatch, so
   the refusal is receipted `Denied`); `estop-status` needs `CAP_OBSERVE` AND the
-  VIEWER role or higher; no host registers either e-stop verb yet, so a caller
+  VIEWER role or higher; no host registers either e-stop verb, so a caller
   the authorizer admits gets `unknown_verb`; an UNCLASSIFIED verb is DENIED,
   never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read

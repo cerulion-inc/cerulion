@@ -1,5 +1,7 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
+Experimental: not in any release; build from source.
+
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
 itself as `cerulion-rcp`. Every tool call is written to a hash-chained receipt
@@ -447,11 +449,17 @@ rcpd until rcpd answers, so rcpd engages its own latch too. While the ops latch 
   latch again after its stop command and before its start command, and an
   engage in between means the start command does not run (`unavailable:
   the robot's e-stop was engaged during the restart, so the graph was not
-  started again after its stop`). An engage after that second read does
-  not stop the graph the start command starts;
+  started again after its stop`). An engage after that second read
+  leaves the started graph running, as an engage leaves any running graph
+  running;
 - `estop`, `tools/list`, the resources and the session messages still work.
 
-LAN ingress does not read the latch.
+Apart from these refusals and the calls rcpd's own latch refuses, an e-stop
+gates no topic data: a graph's nodes and other local publishers can keep
+publishing, and a graph's `ingress:` topics and the topics this machine
+mirrors keep receiving from their producers, including a paired producer
+over the remote plane and, under `CERULION_LAN_ACCESS=open`, LAN peers. Stop
+those producers where they run.
 
 The ops latch is read when a desk's message arrives and again on the open
 connection to rcpd just before the plane sends it. A tool call already sent
@@ -495,12 +503,27 @@ with no line and no `DELETE`. A `cerulion-netd` stop sends SIGTERM, and sends
 SIGKILL only if `cerulion-remoted` has not exited within
 `CERULION_REMOTED_HARD_EXIT_MS` plus 500 ms.
 
-The latch clears only when `cerulion-remoted` restarts. To recover, restart
-`cerulion-remoted`, then clear rcpd's own latch: `estop_clear` under
-`limits.estop_clear: agent`, or deleting `<receipts>.estop` and restarting
-rcpd. While the ops latch is clear, `estop_clear` reaches rcpd like any other
-tool call. Clients that talk to rcpd directly, over stdio or its own HTTP
-listener, see only rcpd's latch.
+The ops latch holds while `cerulion-remoted` runs, and any exit of the daemon
+clears it: a crash, a stop or restart of `cerulion-netd` (which stops
+`cerulion-remoted` too) or a restart of the machine. After a crash,
+`cerulion-netd` starts `cerulion-remoted` again, after a wait of at least
+5 s, only while this machine still serves (a live export or
+`CERULION_NETD_LISTEN`); when it no longer serves, `cerulion rcp` cannot reach
+rcpd, so clear rcpd's latch locally (delete `<receipts>.estop` and restart
+rcpd, or call `estop_clear` from a local client under
+`limits.estop_clear: agent`). No verb reads the latch back, so
+while you need the e-stop engaged, engage it again after any reconnect or any
+restart you did not make to clear it. To clear both latches, restart
+`cerulion-remoted` on the robot, then clear rcpd's latch: `estop_clear` under
+`limits.estop_clear: agent` (after restarting the MCP server in your MCP
+client, since `cerulion rcp` exits when `cerulion-remoted` restarts), or
+deleting `<receipts>.estop` and restarting rcpd. rcpd's latch holds across
+rcpd restarts through that file. If rcpd cannot write the file, it logs an
+error and its e-stop may not survive an rcpd restart: after one, engage the
+e-stop again. While the ops
+latch is clear, `estop_clear` reaches rcpd like any other tool call. Clients
+that talk to rcpd directly, over stdio or its own HTTP listener, see only
+rcpd's latch.
 
 When rcpd restarts, it forgets every MCP session. The next request on a desk's
 session is answered with error `-32603` (`rcpd lost this MCP session (it

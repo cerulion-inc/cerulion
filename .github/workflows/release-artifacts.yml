@@ -199,8 +199,7 @@ jobs:
       # `container:`), so every other step of the matrix, the macOS legs
       # included, runs on the runner as before. The container is native to
       # the runner's architecture. The script installs RELEASE_TOOLCHAIN and
-      # writes target/<TARGET>/release/, with the `rustc -vV` of the compiler
-      # that built them in rustc-version.txt, where the steps below read it.
+      # writes target/<TARGET>/release/, where the steps below read it.
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
@@ -226,7 +225,6 @@ jobs:
               ;;
             *)
               cargo build --release --locked "${packages[@]}" --target "$TARGET"
-              rustc -vV > "target/$TARGET/release/rustc-version.txt"
               ;;
           esac
 
@@ -303,7 +301,6 @@ jobs:
           cp "target/$TARGET/release/cerulion-connectd" "$stage/cerulion-connectd"
           cp "target/$TARGET/release/cerulion-remoted" "$stage/cerulion-remoted"
           cp tools/scripts/install_rust.sh "$stage/install_rust.sh"
-          cp "target/$TARGET/release/rustc-version.txt" "$stage/rustc-version.txt"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"

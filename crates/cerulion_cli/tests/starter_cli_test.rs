@@ -115,6 +115,52 @@ fn bare_workspace_create_preserves_the_empty_authoring_workflow() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("starter:"));
 }
 
+/// Workspace setup needs no Rust itself. Off a terminal, with no Rust to find,
+/// both verbs name the install command on stderr, never ask, write no toolchain
+/// file and still succeed.
+#[test]
+fn workspace_setup_without_rust_names_the_install_command_and_succeeds() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = auth_home();
+    let empty = parent.path().join("empty-path");
+    let cargo_home = parent.path().join("cargo-home");
+    let rustup_home = parent.path().join("rustup-home");
+    for dir in [&empty, &cargo_home, &rustup_home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for (verb, name) in [("create", "created"), ("init", "initialized")] {
+        let output = command(parent.path(), home.path())
+            .args(["workspace", verb, name])
+            .env("PATH", &empty)
+            .env("CARGO_HOME", &cargo_home)
+            .env("RUSTUP_HOME", &rustup_home)
+            .env("RUST_LOG", "warn")
+            .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{verb}: {stderr}");
+        assert_eq!(
+            stderr,
+            format!(
+                "{}\nTo install it, run: {}\n",
+                cerulion_cli_engine::rust_setup::RUST_NEEDED,
+                cerulion_cli_engine::rust_setup::RUSTUP_INIT_COMMAND
+            ),
+            "{verb}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("Rust"), "{verb} stdout: {stdout}");
+        let root = parent.path().join(name);
+        assert!(root.join("Cargo.toml").is_file(), "{verb}");
+        for toolchain in ["rust-toolchain", "rust-toolchain.toml"] {
+            assert!(!root.join(toolchain).exists(), "{verb} wrote {toolchain}");
+        }
+    }
+    assert_eq!(std::fs::read_dir(&cargo_home).unwrap().count(), 0);
+}
+
 #[test]
 fn relative_init_of_an_absent_folder_reserves_and_creates_the_workspace() {
     // `workspace init demo` with no such folder reaches the engine as the
