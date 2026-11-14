@@ -23,6 +23,11 @@
 //!   [`TRY_END_LIMIT`] of letting its held step go, with no row written;
 //! - a desk whose ceremony paired, interrupted while it waits for its
 //!   endpoint close, still returns paired, the robot's row on disk;
+//! - a desk interrupted after it sent `code-pair-finish`, while the robot
+//!   holds that right code's row save, returns paired once the robot answers;
+//! - a desk interrupted after it sent `code-pair-finish`, whose answer does
+//!   not arrive while it waits, returns interrupted with a text that says the
+//!   robot may have paired this desk, and the robot then pairs it;
 //! - each refusal the robot's code-pairing store answers maps to its desk exit
 //!   class: every try failed is a code mismatch; a used code, a throttled try,
 //!   every try taken by a desk still pairing, an expired window, no armed code
@@ -67,6 +72,14 @@ const CEREMONY_TIMEOUT: Duration = Duration::from_secs(5);
 /// as the step's reply fails; a connection the desk only dropped ends at the
 /// robot at its 30 s QUIC idle timeout, past this bound.
 const TRY_END_LIMIT: Duration = Duration::from_secs(5);
+/// How long an interrupted run waits for the robot's answer to its
+/// `code-pair-finish` request.
+const FINISH_ANSWER_WAIT: Duration = Duration::from_secs(3);
+/// The text of an interrupted run whose `code-pair-finish` answer did not
+/// arrive: hand-written, never the const it renders.
+const UNCONFIRMED_TEXT: &str = "interrupted after the robot was asked to save this desk, before \
+     its answer arrived; the robot may have paired this desk, and `cerulion connect --eid \
+     <eid>` connects if it did";
 const T_NOW: u64 = 1_000_000_000_000;
 const CHASSIS: &[u8] = b"pair-e2e-chassis-secret-not-serial-derived";
 const MAC_KEY: &[u8] = b"pair-e2e-firmware-mac-key";
@@ -511,6 +524,144 @@ async fn an_interrupt_during_the_close_of_a_paired_desk_returns_paired() {
     let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
     let row = store
         .account_access(&AccountId(desk_pk), 0)
+        .expect("desk row on disk");
+    assert_eq!(row.source, PairingSource::CodePaired);
+}
+
+/// A desk interrupted after it sent `code-pair-finish`, while the robot holds
+/// that right code's row save, returns paired once the robot answers. The
+/// robot saves the desk's row before it answers, so the run waits for that
+/// answer: the interrupt resolves while the save is held, the save is let go
+/// only once the run took the interrupt, and the run returns the desk key's
+/// own account, with the code-paired row on disk and the robot's code paired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_while_the_robot_saves_the_desk_returns_paired() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot_ep = disabled_endpoint([206; 32]).await;
+    let r = build_robot(dir.path(), *robot_ep.id().as_bytes());
+    const CODE: &str = "RIGHT-CODE";
+    r.sessions.arm(CODE, CeremonyConfig::default());
+    let held = r.sessions.hold_next_save_for_test();
+    let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
+    let resolved = Arc::new(AtomicBool::new(false));
+    let desk_seed = [18u8; 32];
+
+    let result = with_serving(&r, &robot_ep, async {
+        let desk = run_pair(pair_config(&robot_ep, desk_seed, CODE), {
+            let resolved = resolved.clone();
+            async move {
+                let _ = interrupted.await;
+                resolved.store(true, Ordering::SeqCst);
+            }
+        });
+        let robot = {
+            let resolved = resolved.clone();
+            async move {
+                let (reached, held) =
+                    tokio::task::spawn_blocking(move || (held.reached_within(STEP_TIMEOUT), held))
+                        .await
+                        .expect("the hold watch ends");
+                assert!(reached, "the desk's code-pair-finish reached the held save");
+                let _ = interrupt.send(());
+                while !resolved.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                held.release();
+            }
+        };
+        let (result, ()) = bounded("the run interrupted while the robot saves", async {
+            tokio::join!(desk, robot)
+        })
+        .await;
+        result
+    })
+    .await;
+    robot_ep.close().await;
+
+    let outcome = result.expect("a desk interrupted while the robot saves it returns paired");
+    assert!(
+        resolved.load(Ordering::SeqCst),
+        "the run took the interrupt"
+    );
+    let desk_pk = desk_pubkey(desk_seed);
+    assert_eq!(outcome.account_hex, hex::encode(desk_pk));
+    assert_eq!(outcome.source, "code_paired");
+    let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
+    let row = store
+        .account_access(&AccountId(desk_pk), 0)
+        .expect("desk row on disk");
+    assert_eq!(row.source, PairingSource::CodePaired);
+    let code = r.sessions.snapshot().expect("the code is armed");
+    assert_eq!(code.state.status(), PairCodeStatus::Paired, "{code:?}");
+}
+
+/// A desk interrupted after it sent `code-pair-finish`, whose answer does not
+/// arrive while it waits, returns interrupted with exit 130 and a text that
+/// says the robot may have paired this desk. The robot's row save is held
+/// until the run returned, so the run waited the [`FINISH_ANSWER_WAIT`] it
+/// gives the answer; once the save is let go the robot pairs the desk, as the
+/// text says it may have, and the row is on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_whose_finish_answer_does_not_arrive_says_the_robot_may_have_paired() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot_ep = disabled_endpoint([207; 32]).await;
+    let r = build_robot(dir.path(), *robot_ep.id().as_bytes());
+    const CODE: &str = "RIGHT-CODE";
+    r.sessions.arm(CODE, CeremonyConfig::default());
+    let held = r.sessions.hold_next_save_for_test();
+    let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
+    let desk_seed = [19u8; 32];
+
+    let (result, waited, paired) = with_serving(&r, &robot_ep, async {
+        let desk = run_pair(pair_config(&robot_ep, desk_seed, CODE), async move {
+            let _ = interrupted.await;
+        });
+        let robot = async move {
+            let (reached, held) =
+                tokio::task::spawn_blocking(move || (held.reached_within(STEP_TIMEOUT), held))
+                    .await
+                    .expect("the hold watch ends");
+            assert!(reached, "the desk's code-pair-finish reached the held save");
+            let at = tokio::time::Instant::now();
+            let _ = interrupt.send(());
+            (held, at)
+        };
+        let (result, (held, at)) = bounded("the run whose finish answer is held", async {
+            tokio::join!(desk, robot)
+        })
+        .await;
+        let waited = at.elapsed();
+        held.release();
+        let paired = tokio::time::timeout(TRY_END_LIMIT, async {
+            loop {
+                match r.sessions.snapshot() {
+                    Some(code) if code.state.status() == PairCodeStatus::Paired => return code,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| r.sessions.snapshot());
+        (result, waited, paired)
+    })
+    .await;
+    robot_ep.close().await;
+
+    let error = result.expect_err("a run whose finish answer did not arrive is not paired");
+    assert_eq!(
+        (error.exit_code(), error.to_string()),
+        (130, UNCONFIRMED_TEXT.to_string())
+    );
+    assert!(
+        waited >= FINISH_ANSWER_WAIT,
+        "the run waited {waited:?} for the robot's answer"
+    );
+    paired.unwrap_or_else(|at_the_limit| {
+        panic!("the robot did not pair the desk once its save was let go: {at_the_limit:?}")
+    });
+    let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
+    let row = store
+        .account_access(&AccountId(desk_pubkey(desk_seed)), 0)
         .expect("desk row on disk");
     assert_eq!(row.source, PairingSource::CodePaired);
 }

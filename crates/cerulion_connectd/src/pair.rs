@@ -42,6 +42,8 @@
 //! Desk-authored prefixes/remediation stay OUTSIDE the bound.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use cerud::client::OpsClient;
@@ -80,11 +82,21 @@ pub const EXIT_UNREACHABLE: u8 = 3;
 /// The pairing CODE was wrong (the CPace confirmation did not match) or its
 /// bounded attempts were exhausted. Re-check the code with the robot owner.
 pub const EXIT_CODE_MISMATCH: u8 = 4;
-/// The ceremony was INTERRUPTED (Ctrl-C) before completing — NOT paired. Follows
-/// the Unix `128 + SIGINT(2)` convention, aligning with
+/// The ceremony was interrupted (Ctrl-C or SIGTERM): not paired
+/// ([`PairError::Interrupted`]), unless the interrupt came after the robot was
+/// asked to save this desk and its answer did not arrive in time
+/// ([`PairError::InterruptedUnconfirmed`]); the robot may then have paired
+/// this desk. Follows the Unix `128 + SIGINT(2)` convention, aligning with
 /// `connect_cmd::exit_code_of`'s signal mapping (a caught Ctrl-C exits 130
 /// deliberately; an uncaught one would surface as 130 via the signal too).
 pub const EXIT_INTERRUPTED: u8 = 130;
+
+/// The text of [`PairError::InterruptedUnconfirmed`]: the run was interrupted
+/// after it asked the robot to save this desk, and the robot's answer did not
+/// arrive within the bound the run waits for it.
+pub const INTERRUPTED_UNCONFIRMED: &str = "interrupted after the robot was asked to save this \
+     desk, before its answer arrived; the robot may have paired this desk, and `cerulion \
+     connect --eid <eid>` connects if it did";
 
 // ── error taxonomy ────────────────────────────────────────────────────────────
 
@@ -101,9 +113,16 @@ pub enum PairError {
     Refused(String),
     /// The pairing code was wrong / attempts exhausted — [`EXIT_CODE_MISMATCH`].
     CodeMismatch(String),
-    /// The interrupt [`run_pair`] watches resolved before the ceremony
-    /// completed: not paired. Maps to [`EXIT_INTERRUPTED`].
+    /// The interrupt [`run_pair`] watches resolved before the ceremony sent
+    /// its `code-pair-finish` request: not paired. Maps to
+    /// [`EXIT_INTERRUPTED`].
     Interrupted,
+    /// The interrupt resolved after the ceremony sent its `code-pair-finish`
+    /// request, and the robot's answer did not arrive within the bound the
+    /// run waits for it once interrupted. The robot saves the desk's row
+    /// before it answers, so it may have paired this desk. Maps to
+    /// [`EXIT_INTERRUPTED`]; renders as [`INTERRUPTED_UNCONFIRMED`].
+    InterruptedUnconfirmed,
 }
 
 impl PairError {
@@ -114,7 +133,7 @@ impl PairError {
             PairError::Unreachable(_) => EXIT_UNREACHABLE,
             PairError::Refused(_) => EXIT_REFUSED,
             PairError::CodeMismatch(_) => EXIT_CODE_MISMATCH,
-            PairError::Interrupted => EXIT_INTERRUPTED,
+            PairError::Interrupted | PairError::InterruptedUnconfirmed => EXIT_INTERRUPTED,
         }
     }
 }
@@ -127,6 +146,7 @@ impl std::fmt::Display for PairError {
             PairError::Refused(m) => write!(f, "the robot refused pairing: {m}"),
             PairError::CodeMismatch(m) => write!(f, "wrong pairing code: {m}"),
             PairError::Interrupted => f.write_str("interrupted before completion; not paired"),
+            PairError::InterruptedUnconfirmed => f.write_str(INTERRUPTED_UNCONFIRMED),
         }
     }
 }
@@ -195,6 +215,91 @@ pub struct PairOutcome {
 /// exit stays prompt.
 const INTERRUPTED_CLOSE_LIMIT: Duration = Duration::from_millis(500);
 
+/// How long a run waits for its ceremony once the interrupt resolved after
+/// the `code-pair-finish` request was sent. The robot saves the desk's row
+/// before it answers that request, so the answer is the only way the desk
+/// learns whether it paired. This bound plus [`INTERRUPTED_CLOSE_LIMIT`] stays
+/// under the 5 s `cerulion pair` waits for this process after it forwards a
+/// signal, before it kills it.
+const INTERRUPTED_FINISH_LIMIT: Duration = Duration::from_secs(3);
+
+/// Whether a ceremony's `code-pair-finish` request may still be sent, decided
+/// once between the ceremony and the run that watches the interrupt: the
+/// ceremony sends the request only when it takes the gate first, and a run
+/// that shuts it first knows the request was never sent and never will be.
+#[derive(Debug)]
+struct FinishGate(AtomicU8);
+
+impl FinishGate {
+    const OPEN: u8 = 0;
+    const SENT: u8 = 1;
+    const SHUT: u8 = 2;
+
+    /// A gate neither side has decided yet.
+    fn open() -> Self {
+        FinishGate(AtomicU8::new(Self::OPEN))
+    }
+
+    /// Taken by the ceremony just before it sends `code-pair-finish`: whether
+    /// it may send it, which is false once the run shut the gate.
+    fn take_for_send(&self) -> bool {
+        self.0
+            .compare_exchange(Self::OPEN, Self::SENT, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Shut by the run once the interrupt resolved: whether the ceremony had
+    /// sent its `code-pair-finish` request. When it had not, it never will.
+    fn shut(&self) -> bool {
+        match self
+            .0
+            .compare_exchange(Self::OPEN, Self::SHUT, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => false,
+            Err(state) => state == Self::SENT,
+        }
+    }
+}
+
+/// The result a run returns when the interrupt resolved before its ceremony
+/// ended. `finish_sent` is whether the ceremony had sent its
+/// `code-pair-finish` request by then; `answered` is the ceremony's own
+/// result when the run then waited for it and it ended within
+/// [`INTERRUPTED_FINISH_LIMIT`], and `None` otherwise. Before that request the
+/// robot has saved nothing for this desk, so the run is
+/// [`PairError::Interrupted`]. After it the robot may have saved this desk,
+/// so the ceremony's own result stands: paired, a wrong code or a refusal
+/// keeps its exit code. A ceremony that did not end within the bound is
+/// [`PairError::InterruptedUnconfirmed`]. Pure, table-tested.
+fn result_after_interrupt<T>(
+    finish_sent: bool,
+    answered: Option<Result<T, PairError>>,
+) -> Result<T, PairError> {
+    match (finish_sent, answered) {
+        (false, _) => Err(PairError::Interrupted),
+        (true, Some(ceremony)) => ceremony,
+        (true, None) => Err(PairError::InterruptedUnconfirmed),
+    }
+}
+
+/// The result of a ceremony the desk-side timeout cut, from the result of its
+/// blocking task reaped after the connection was closed. A task that ended
+/// paired keeps it: the robot saved this desk before it answered. Any other
+/// end is reported as the timeout: the close fails a read still parked, so an
+/// error of the task's own is not told apart from one the close caused. Pure,
+/// table-tested.
+fn result_after_timeout<T, E>(
+    reaped: Result<Result<T, PairError>, E>,
+    timeout: Duration,
+) -> Result<T, PairError> {
+    match reaped {
+        Ok(Ok(paired)) => Ok(paired),
+        Ok(Err(_)) | Err(_) => Err(PairError::Unreachable(format!(
+            "the pairing ceremony timed out after {timeout:?}"
+        ))),
+    }
+}
+
 /// How a run's wait for its endpoint close ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseWait {
@@ -207,10 +312,10 @@ enum CloseWait {
 
 /// The result a run returns once its wait for the endpoint close ended: the
 /// ceremony's own result, however the wait ended. An interrupt that resolved
-/// before the ceremony ended made that result [`PairError::Interrupted`]; one
-/// that resolved during the close only bounded the wait, so a ceremony that
-/// paired returns paired, and a wrong code or a refusal keeps its exit code.
-/// Pure, table-tested.
+/// before the ceremony ended made that result what [`result_after_interrupt`]
+/// returns; one that resolved during the close only bounded the wait, so a
+/// ceremony that paired returns paired, and a wrong code or a refusal keeps
+/// its exit code. Pure, table-tested.
 fn result_after_close<T>(ceremony: Result<T, PairError>, wait: CloseWait) -> Result<T, PairError> {
     match wait {
         CloseWait::UntilDrained | CloseWait::Bounded => ceremony,
@@ -227,11 +332,16 @@ fn result_after_close<T>(ceremony: Result<T, PairError>, wait: CloseWait) -> Res
 /// fails the parked read. Once it is bound, the endpoint is closed before this
 /// returns, on every path: the close queues each open connection's close at
 /// once and waits for those connections to drain. An `interrupt` that resolves
-/// before the ceremony ends makes the run [`PairError::Interrupted`]. One that
+/// before the ceremony sent its `code-pair-finish` request makes the run
+/// [`PairError::Interrupted`]. One that resolves after that request, before
+/// the ceremony ends, makes the run wait up to 3 s
+/// (`INTERRUPTED_FINISH_LIMIT`) for the ceremony's own result, as the robot
+/// saves this desk before it answers; past that bound the run is
+/// [`PairError::InterruptedUnconfirmed`] (`result_after_interrupt`). One that
 /// resolves during the wait for the close only bounds that wait, and the run
 /// returns the ceremony's own result (`result_after_close`): paired, a wrong
-/// code or a refusal. Once the interrupt resolved, the wait is bounded to
-/// 500 ms (`INTERRUPTED_CLOSE_LIMIT`).
+/// code or a refusal. Once the interrupt resolved, the wait for the close is
+/// bounded to 500 ms (`INTERRUPTED_CLOSE_LIMIT`).
 // Logging-rule exception (Principle 12): the two `println!`s below are not logging — they are this
 // process's OUTPUT PROTOCOL. `pairing:` and `paired:` are machine-parseable
 // state lines on STDOUT that a Studio driver reads; routing them through
@@ -286,15 +396,38 @@ pub async fn run_pair(
     // robot's ops session ends now and not at its idle timeout: a code-pairing
     // try this desk left pending is counted failed when that session ends.
     // `biased` polls the ceremony first, so a ceremony that has its result
-    // keeps it when the interrupt is ready at the same poll.
-    let ceremony = tokio::select! {
-        biased;
-        paired = dial_and_pair(&endpoint, &config, desk_pubkey, account) => paired,
-        () = &mut interrupt => Err(PairError::Interrupted),
+    // keeps it when the interrupt is ready at the same poll. Once the
+    // interrupt resolved the run shuts the ceremony's `FinishGate`: a
+    // ceremony that had not sent `code-pair-finish` then never sends it, and
+    // one that had is polled on, within `INTERRUPTED_FINISH_LIMIT`, for the
+    // robot's answer. The block drops the ceremony before the close below.
+    let gate = Arc::new(FinishGate::open());
+    let (ceremony, interrupted) = {
+        let pairing = dial_and_pair(&endpoint, &config, desk_pubkey, account, Arc::clone(&gate));
+        tokio::pin!(pairing);
+        let ended = tokio::select! {
+            biased;
+            paired = &mut pairing => Some(paired),
+            () = &mut interrupt => None,
+        };
+        match ended {
+            Some(ceremony) => (ceremony, false),
+            None => {
+                let sent = gate.shut();
+                let answered = if sent {
+                    tokio::time::timeout(INTERRUPTED_FINISH_LIMIT, &mut pairing)
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                (result_after_interrupt(sent, answered), true)
+            }
+        }
     };
     let close = endpoint.close();
     tokio::pin!(close);
-    let wait = if matches!(ceremony, Err(PairError::Interrupted)) {
+    let wait = if interrupted {
         // The interrupt resolved, so it is not watched again.
         CloseWait::Bounded
     } else {
@@ -338,12 +471,14 @@ pub async fn run_pair(
 }
 
 /// Dial the robot from `endpoint` and run the ceremony on one ops connection:
-/// the account the robot paired and how, on success.
+/// the account the robot paired and how, on success. The ceremony sends
+/// `code-pair-finish` only when it takes `gate` first.
 async fn dial_and_pair(
     endpoint: &Endpoint,
     config: &PairConfig,
     desk_pubkey: PublicKey,
     account: AccountId,
+    gate: Arc<FinishGate>,
 ) -> Result<(String, String), PairError> {
     // 2. The peer address (LAN direct-dial when addrs are given, else bare eid).
     let peer: EndpointAddr = if config.direct_addrs.is_empty() {
@@ -384,23 +519,25 @@ async fn dial_and_pair(
             robot_pubkey,
             account,
             &label,
+            &gate,
         )
     });
     tokio::pin!(ceremony);
 
+    // `biased` polls the task first, so a ceremony that ended keeps its
+    // result when the timeout is ready at the same poll.
     let result = tokio::select! {
+        biased;
         joined = &mut ceremony => joined
             .map_err(|e| PairError::Unreachable(format!("the ceremony task failed: {e}")))?,
-        _ = tokio::time::sleep(config.timeout) => {
+        () = tokio::time::sleep(config.timeout) => {
             // The stream halves the blocking task holds keep the connection
             // open past a drop of this handle; the close fails the parked
-            // read, so the reap returns.
+            // read, so the reap returns. A task that paired meanwhile keeps
+            // its result (`result_after_timeout`).
             connection.close(0u32.into(), b"");
-            let _ = (&mut ceremony).await;
-            return Err(PairError::Unreachable(format!(
-                "the pairing ceremony timed out after {:?}",
-                config.timeout
-            )));
+            let reaped = (&mut ceremony).await;
+            return result_after_timeout(reaped, config.timeout);
         }
     };
     // Keep the connection alive until the ceremony finished.
@@ -422,7 +559,10 @@ async fn bounded<F: std::future::Future>(
 }
 
 /// The synchronous CPace ceremony over one ops connection (runs on a blocking
-/// task). Returns `(account_hex, source)` on success.
+/// task). Returns `(account_hex, source)` on success. Sends `code-pair-finish`
+/// only when it takes `gate` first; a gate the run already shut makes it
+/// [`PairError::Interrupted`] with the request never sent.
+#[allow(clippy::too_many_arguments)]
 fn run_ceremony(
     send: cerulion_link::SendStream,
     recv: cerulion_link::RecvStream,
@@ -431,6 +571,7 @@ fn run_ceremony(
     robot_pubkey: PublicKey,
     account: AccountId,
     label: &str,
+    gate: &FinishGate,
 ) -> Result<(String, String), PairError> {
     let stream = QuicOpsStream::new(send, recv);
     let mut client =
@@ -464,6 +605,11 @@ fn run_ceremony(
         .map_err(classify_finish_error)?;
 
     // Step 2: send the initiator confirmation tag + the account/label to persist.
+    // The robot saves this desk's row before it answers, so once the gate is
+    // taken an interrupted run waits for that answer (`result_after_interrupt`).
+    if !gate.take_for_send() {
+        return Err(PairError::Interrupted);
+    }
     let finish = client
         .call(
             "code-pair-finish",
@@ -748,6 +894,125 @@ mod tests {
         // The interrupt code is the Unix Ctrl-C convention (128 + SIGINT).
         assert_eq!(EXIT_INTERRUPTED, 130);
         assert_eq!(PairError::Interrupted.exit_code(), EXIT_INTERRUPTED);
+        assert_eq!(
+            PairError::InterruptedUnconfirmed.exit_code(),
+            EXIT_INTERRUPTED
+        );
+    }
+
+    /// The gate is decided once. A ceremony that takes it first sends its
+    /// request, and a run that shuts it afterwards learns the request was
+    /// sent; a run that shuts it first learns the request was never sent, and
+    /// the ceremony can no longer take it.
+    #[test]
+    fn the_finish_gate_is_decided_once_by_whichever_side_comes_first() {
+        let gate = FinishGate::open();
+        assert!(gate.take_for_send(), "an open gate is taken");
+        assert!(
+            gate.shut(),
+            "a run shutting a taken gate learns it was sent"
+        );
+        assert!(gate.shut(), "and learns it again");
+        assert!(!gate.take_for_send(), "a gate is taken once");
+
+        let gate = FinishGate::open();
+        assert!(
+            !gate.shut(),
+            "a run shutting an open gate learns it was not sent"
+        );
+        assert!(!gate.take_for_send(), "a shut gate is never taken");
+        assert!(!gate.shut(), "and a shut gate still reports not sent");
+    }
+
+    /// The text of an interrupted run whose `code-pair-finish` answer did not
+    /// arrive: hand-written, never the const it renders.
+    const UNCONFIRMED_TEXT: &str = "interrupted after the robot was asked to save this desk, \
+         before its answer arrived; the robot may have paired this desk, and `cerulion connect \
+         --eid <eid>` connects if it did";
+
+    /// Hand-written table: whether the ceremony had sent `code-pair-finish`
+    /// when the interrupt resolved, and its own result when the run then
+    /// waited for it within the bound (`None`: no wait, or the bound ran out),
+    /// then the exit code and text the run returns. Before the request the
+    /// run is interrupted, not paired; after it the ceremony's own result
+    /// stands, and a ceremony still running at the bound may have paired.
+    #[test]
+    fn an_interrupt_after_the_finish_request_keeps_the_robots_answer() {
+        type Ceremony = Result<&'static str, PairError>;
+        type Returned = Result<&'static str, (u8, &'static str)>;
+        let interrupted = Err((130, "interrupted before completion; not paired"));
+        let cases: [(bool, Option<Ceremony>, Returned); 10] = [
+            (false, None, interrupted),
+            (false, Some(Ok("paired")), interrupted),
+            (
+                false,
+                Some(Err(PairError::Unreachable("u".into()))),
+                interrupted,
+            ),
+            (true, Some(Ok("paired")), Ok("paired")),
+            (
+                true,
+                Some(Err(PairError::CodeMismatch("m".into()))),
+                Err((4, "wrong pairing code: m")),
+            ),
+            (
+                true,
+                Some(Err(PairError::Refused("r".into()))),
+                Err((2, "the robot refused pairing: r")),
+            ),
+            (
+                true,
+                Some(Err(PairError::Unreachable("u".into()))),
+                Err((3, "could not reach the robot: u")),
+            ),
+            (
+                true,
+                Some(Err(PairError::Usage("x".into()))),
+                Err((1, "pairing usage error: x")),
+            ),
+            (true, None, Err((130, UNCONFIRMED_TEXT))),
+            (
+                true,
+                Some(Err(PairError::InterruptedUnconfirmed)),
+                Err((130, UNCONFIRMED_TEXT)),
+            ),
+        ];
+        for (finish_sent, answered, want) in cases {
+            let row = format!("{finish_sent} {answered:?}");
+            let got = result_after_interrupt(finish_sent, answered)
+                .map_err(|e| (e.exit_code(), e.to_string()));
+            let want = want.map_err(|(code, text)| (code, text.to_string()));
+            assert_eq!(got, want, "{row}");
+        }
+    }
+
+    /// Hand-written table: the reaped result of a ceremony task the desk-side
+    /// timeout cut (`Err(())` for a task that panicked), then the exit code
+    /// and text the run returns. A task that paired keeps paired; every other
+    /// end is the timeout.
+    #[test]
+    fn a_ceremony_that_paired_as_the_timeout_fired_returns_paired() {
+        type Reaped = Result<Result<&'static str, PairError>, ()>;
+        type Returned = Result<&'static str, (u8, &'static str)>;
+        let timed_out = Err((
+            3,
+            "could not reach the robot: the pairing ceremony timed out after 30s",
+        ));
+        let cases: [(Reaped, Returned); 6] = [
+            (Ok(Ok("paired")), Ok("paired")),
+            (Ok(Err(PairError::Unreachable("u".into()))), timed_out),
+            (Ok(Err(PairError::Refused("r".into()))), timed_out),
+            (Ok(Err(PairError::CodeMismatch("m".into()))), timed_out),
+            (Ok(Err(PairError::Usage("x".into()))), timed_out),
+            (Err(()), timed_out),
+        ];
+        for (reaped, want) in cases {
+            let row = format!("{reaped:?}");
+            let got = result_after_timeout(reaped, Duration::from_secs(30))
+                .map_err(|e| (e.exit_code(), e.to_string()));
+            let want = want.map_err(|(code, text)| (code, text.to_string()));
+            assert_eq!(got, want, "{row}");
+        }
     }
 
     /// Hand-written table: the ceremony's result and how the wait for the
@@ -757,7 +1022,7 @@ mod tests {
     #[test]
     fn the_ceremony_result_stands_however_the_close_wait_ends() {
         type Returned = Result<&'static str, (u8, &'static str)>;
-        let cases: [(Result<&'static str, PairError>, CloseWait, Returned); 12] = [
+        let cases: [(Result<&'static str, PairError>, CloseWait, Returned); 14] = [
             (Ok("paired"), CloseWait::UntilDrained, Ok("paired")),
             (Ok("paired"), CloseWait::Bounded, Ok("paired")),
             (
@@ -809,6 +1074,16 @@ mod tests {
                 Err(PairError::Interrupted),
                 CloseWait::UntilDrained,
                 Err((130, "interrupted before completion; not paired")),
+            ),
+            (
+                Err(PairError::InterruptedUnconfirmed),
+                CloseWait::Bounded,
+                Err((130, UNCONFIRMED_TEXT)),
+            ),
+            (
+                Err(PairError::InterruptedUnconfirmed),
+                CloseWait::UntilDrained,
+                Err((130, UNCONFIRMED_TEXT)),
             ),
         ];
         for (ceremony, wait, want) in cases {

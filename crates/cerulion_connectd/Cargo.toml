@@ -102,7 +102,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # desk carries only the ops CLIENT (`cerud`, a prod dep for the `pair` ceremony).
 # Its `test-seam` feature gives `pair_e2e` the hold on the robot's next admitted
 # `code-pair-start` (`SharedCodePairSessions::hold_next_build_for_test`), so an
-# interrupt lands on a try the robot holds pending.
+# interrupt lands on a try the robot holds pending, and the hold on its next
+# right code's row save (`hold_next_save_for_test`), so an interrupt lands
+# after the desk sent `code-pair-finish` and before the robot answers.
 cerulion_remoted = { path = "../cerulion_remoted", features = ["test-seam"] }
 # The e2e tests build a CLAIMED + paired trust store to seed the robot's access
 # list (the desk key is admitted). Already a prod dep; the test uses more of it.

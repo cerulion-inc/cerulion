@@ -829,23 +829,36 @@ every slot is taken.
   `run_pair` returns on every path, so the robot's ops session ends as the desk
   exits and a try it left pending is counted failed then, not at the 30 s QUIC
   idle timeout. An interrupt is one of those paths: `run_pair` watches it
-  through the ceremony and the close. One that resolves before the ceremony
-  ends makes the run interrupted (exit 130); one that resolves during the
-  close only bounds the wait, and the run returns the ceremony's own result,
-  so a desk the robot paired prints its `paired:` line and exits 0, and a
-  wrong code or a refusal keeps its exit code. Once the interrupt resolved,
-  the wait for the close is bounded to 500 ms so the exit stays prompt; a
-  desk-side ceremony timeout closes the connection, which fails the read the
-  blocking ceremony task is parked on, before that task is reaped; stdout
-  carries machine-parseable state lines for Studio, everything else goes to
-  stderr. Pinned against a REAL in-process remoted ops plane by
-  `pair_e2e_test.rs`, with the robot's durable trust state verified from disk;
-  that test also holds the robot's admitted `code-pair-start` (the remoted
-  `test-seam` hold), so an interrupt lands on a pending try, and pins the robot
-  counting that try failed within 5 s, and pins an interrupt that resolves
-  while a paired desk waits for its endpoint close returning paired, the row
-  on disk; `pair_interrupt_e2e_test.rs` pins the same close for a SIGINT to
-  the real binary, at a test robot that sees the connection closed.
+  through the ceremony and the close. The ceremony sends `code-pair-finish`
+  only when it takes its `FinishGate` first, and the run shuts that gate once
+  the interrupt resolved, so exactly one of them decides. An interrupt that
+  resolves before that request makes the run interrupted, not paired (exit
+  130). The robot saves the desk's row before it answers that request, so
+  one that resolves after it makes the run poll the same ceremony for up to
+  3 s (`INTERRUPTED_FINISH_LIMIT`) and return its own result: a desk the
+  robot paired prints its `paired:` line and exits 0. When that bound runs
+  out the run exits 130 with `INTERRUPTED_UNCONFIRMED`, which says the robot
+  may have paired the desk; the two bounds stay under the 5 s `cerulion pair`
+  waits after it forwards a signal. One that resolves during the close only
+  bounds the wait, and the run returns the ceremony's own result, so a desk
+  the robot paired prints its `paired:` line and exits 0, and a wrong code or
+  a refusal keeps its exit code. Once the interrupt resolved, the wait for the
+  close is bounded to 500 ms so the exit stays prompt; a desk-side ceremony
+  timeout closes the connection, which fails the read the blocking ceremony
+  task is parked on, before that task is reaped, and a task that paired by
+  then keeps paired; stdout carries machine-parseable state lines for Studio,
+  everything else goes to stderr. Pinned against a REAL in-process remoted ops
+  plane by `pair_e2e_test.rs`, with the robot's durable trust state verified
+  from disk; that test also holds the robot's admitted `code-pair-start` (the
+  remoted `test-seam` hold), so an interrupt lands on a pending try, and pins
+  the robot counting that try failed within 5 s, pins an interrupt that
+  resolves while a paired desk waits for its endpoint close returning paired,
+  the row on disk, and holds a right code's row save (the second hold), so an
+  interrupt lands after `code-pair-finish`: the run returns paired once the
+  save is let go, and returns the unconfirmed 130 after 3 s while it is held,
+  the robot then pairing the desk; `pair_interrupt_e2e_test.rs` pins the same
+  close for a SIGINT to the real binary, at a test robot that sees the
+  connection closed.
 - **Desk key discipline** (`wireclient::config`): a key file is exactly 32 raw
   bytes; `resolve_or_create_desk_seed` creates 0600 with `create_new` and NEVER
   overwrites an existing key (a wrong-size file is a loud error, never silently
@@ -1386,7 +1399,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_connectd/tests/rcp_network_switch_test.rs` | The real `cerulion-connectd rcp` under `CERULION_NETWORK=off` or `--network off` exits 1 with the refusal and sends no datagram to the robot's address; with no switch the same command dials it |
 | `crates/cerulion_connectd/tests/protocol_parity_test.rs` | Desk protocol mirror == robot serve types, byte-for-byte |
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
-| `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk; each refusal text of the robot's code-pairing store maps to its desk exit class (every try failed and a wrong code are a code mismatch; a used code, a throttled try, every try taken by a desk still pairing, an expired window, no armed code and no try in progress are refusals); against a robot that accepts the ops stream and never answers, the desk-side ceremony timeout returns as unreachable and the robot sees the desk close the connection with code 0; a desk interrupted while the robot holds its admitted `code-pair-start` returns as interrupted, and once the hold is let go the robot counts that try failed within 5 s, under the 30 s QUIC idle timeout, with no row written; an interrupt that resolves while a paired desk waits for its endpoint close leaves the run paired, with the desk key's own account and the code-paired row on disk |
+| `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk; each refusal text of the robot's code-pairing store maps to its desk exit class (every try failed and a wrong code are a code mismatch; a used code, a throttled try, every try taken by a desk still pairing, an expired window, no armed code and no try in progress are refusals); against a robot that accepts the ops stream and never answers, the desk-side ceremony timeout returns as unreachable and the robot sees the desk close the connection with code 0; a desk interrupted while the robot holds its admitted `code-pair-start` returns as interrupted, and once the hold is let go the robot counts that try failed within 5 s, under the 30 s QUIC idle timeout, with no row written; an interrupt that resolves while a paired desk waits for its endpoint close leaves the run paired, with the desk key's own account and the code-paired row on disk; an interrupt that resolves while the robot holds a right code's row save, after the desk sent `code-pair-finish`, leaves the run paired once the save is let go, with the code-paired row on disk; one whose save stays held past the 3 s the run waits returns exit 130 with the text that the robot may have paired the desk, and the robot pairs it once the save is let go |
 | `crates/cerulion_connectd/tests/pair_interrupt_e2e_test.rs` | The real `cerulion-connectd pair` with stdin a pipe held open: with no code written, SIGINT and SIGTERM after the desk key line each end it with exit 130 within 2 s, log the signal caught and print nothing on stdout; a code written on the pipe reaches a test robot that accepts the ops stream and never answers, and SIGINT there ends it with exit 130 within 2 s after exactly the `pairing:` line, the robot seeing the connection closed with code 0 within 5 s of the reap; a stdin closed with no code is exit 1 |
 | `cerulion_wireclient` in-module tests | Dial-config parsers, epoch push decisions + cache-path pins, reply classification |
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |

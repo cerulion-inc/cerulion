@@ -32,7 +32,9 @@ use cerulion_connectd::config::{
     parse_account, parse_addrs, parse_eid, resolve_desk_seed, resolve_or_create_desk_seed,
     ConnectConfig, DemandSet, DEFAULT_ROBOT_TIMEOUT,
 };
-use cerulion_connectd::pair::{run_pair, PairConfig, PairError, EXIT_INTERRUPTED, EXIT_USAGE};
+use cerulion_connectd::pair::{
+    run_pair, PairConfig, PairError, EXIT_INTERRUPTED, EXIT_USAGE, INTERRUPTED_UNCONFIRMED,
+};
 use cerulion_connectd::rcp::{run_rcp, stdin_reader, RcpConfig};
 use cerulion_connectd::resolve_epoch_dir_from_env;
 use cerulion_connectd::sanitize_peer_text;
@@ -233,7 +235,10 @@ struct ConnectCli {
 /// - `0` paired, `1` usage or config error, `2` robot refused (no armed code,
 ///   denied, or the window expired), `3` unreachable (dial failure or timeout),
 ///   `4` wrong pairing code or attempts exhausted, `130` interrupted (Ctrl-C or
-///   SIGTERM during the ceremony; no pairing occurred).
+///   SIGTERM during the ceremony; not paired, unless the robot was already
+///   asked to save this desk and its answer did not arrive in time: then the
+///   robot may have paired this desk, and `cerulion connect --eid <eid>`
+///   connects if it did).
 #[derive(Parser)]
 struct PairCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
@@ -788,16 +793,20 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     let cli_code = cli.code;
 
     // The code read and the ceremony: an interrupt that lands before the
-    // ceremony ends makes the result `None`; one that lands during the endpoint
-    // close after it ended only shortens that wait, and run_pair returns the
-    // ceremony's own result. The blocking stdin code read runs on a detached
-    // thread that hands its result over a oneshot, so a signal AT the prompt
-    // resolves the select below (a deliberate EXIT_INTERRUPTED) and the process
-    // then exits with the read still parked on an open stdin. Dropping the
-    // runtime waits for every running blocking-pool task, a parked
-    // `spawn_blocking` read included, but never for a plain thread, which the
-    // process exit ends. The ceremony watches the same interrupt itself, so it
-    // closes its endpoint before it ends as interrupted.
+    // ceremony sent `code-pair-finish` makes the result `None`; one that lands
+    // after that request makes run_pair wait a bounded time for the robot's
+    // answer and return the ceremony's own result, or
+    // `PairError::InterruptedUnconfirmed` when the answer did not arrive; one
+    // that lands during the endpoint close after the ceremony ended only
+    // shortens that wait, and run_pair returns the ceremony's own result. The
+    // blocking stdin code read runs on a detached thread that hands its result
+    // over a oneshot, so a signal AT the prompt resolves the select below (a
+    // deliberate EXIT_INTERRUPTED) and the process then exits with the read
+    // still parked on an open stdin. Dropping the runtime waits for every
+    // running blocking-pool task, a parked `spawn_blocking` read included, but
+    // never for a plain thread, which the process exit ends. The ceremony
+    // watches the same interrupt itself, so it closes its endpoint before it
+    // ends as interrupted.
     let ceremony = async move {
         let (code_tx, code_rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -819,6 +828,7 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
                 return Some(ExitCode::from(EXIT_USAGE));
             }
         };
+        let eid = hex::encode(robot_eid.as_bytes());
         let config = PairConfig {
             robot_eid,
             direct_addrs,
@@ -833,6 +843,12 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
         match run_pair(config, interrupt).await {
             Ok(_outcome) => Some(ExitCode::SUCCESS),
             Err(PairError::Interrupted) => None,
+            // The robot may have paired this desk, so the "NOT paired" line
+            // below would be false.
+            Err(e @ PairError::InterruptedUnconfirmed) => {
+                tracing::warn!(eid = %eid, "cerulion pair: {INTERRUPTED_UNCONFIRMED}");
+                Some(ExitCode::from(e.exit_code()))
+            }
             Err(e) => {
                 // Every other `PairError` variant renders HERE, and the
                 // Refused / CodeMismatch ones carry text the ROBOT chose — at the moment
