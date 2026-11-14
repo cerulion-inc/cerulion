@@ -5,9 +5,12 @@
 //! (Principle #13) — with the robot's durable trust state verified from DISK
 //! (never a self-compare).
 //!
-//! Every await is BOUNDED (a generous 20s desk-side timeout the fast loopback
-//! ceremony never reaches) and the harness is load-tolerant — no tight deadline
-//! the ops-loopback deadline class warns about.
+//! Every await is BOUNDED. A run's desk-side timeout is a generous 20 s
+//! ([`STEP_TIMEOUT`]) the fast loopback ceremony never reaches, except in the
+//! scenarios that set a short one on purpose: the silent robot's run sets 5 s
+//! ([`CEREMONY_TIMEOUT`]), and the two runs whose row save the robot holds set
+//! 3 s ([`SAVE_HELD_TIMEOUT`]), which the ceremony must beat to send
+//! `code-pair-finish`.
 //!
 //! Scenarios:
 //! - a correct code establishes a code-paired row for the desk's device key +
@@ -28,6 +31,13 @@
 //! - a desk interrupted after it sent `code-pair-finish`, whose answer does
 //!   not arrive while it waits, returns interrupted with a text that says the
 //!   robot may have paired this desk, and the robot then pairs it;
+//! - a desk whose ceremony timeout fires after it sent `code-pair-finish`,
+//!   while the robot holds that right code's row save, returns paired once
+//!   the robot answers;
+//! - a desk whose ceremony timeout fires after it sent `code-pair-finish`,
+//!   whose answer does not arrive while it waits, returns exit 3 with a text
+//!   that says the robot may have paired this desk, and the robot then pairs
+//!   it;
 //! - each refusal the robot's code-pairing store answers maps to its desk exit
 //!   class: every try failed is a code mismatch; a used code, a throttled try,
 //!   every try taken by a desk still pairing, an expired window, no armed code
@@ -36,12 +46,13 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use cerulion_connectd::pair::{run_pair, PairConfig, PairError};
+use cerulion_connectd::pair::{run_pair, PairConfig, PairError, PairOutcome};
 
 use cerulion_link::{
     accept_frame_stream, accept_one, build_endpoint, ConnectionError, Endpoint, EndpointConfig,
@@ -72,14 +83,35 @@ const CEREMONY_TIMEOUT: Duration = Duration::from_secs(5);
 /// as the step's reply fails; a connection the desk only dropped ends at the
 /// robot at its 30 s QUIC idle timeout, past this bound.
 const TRY_END_LIMIT: Duration = Duration::from_secs(5);
-/// How long an interrupted run waits for the robot's answer to its
-/// `code-pair-finish` request.
+/// How long an interrupted or timed-out run waits for the robot's answer to
+/// its `code-pair-finish` request.
 const FINISH_ANSWER_WAIT: Duration = Duration::from_secs(3);
+/// The desk-side timeout of a run whose row save the robot holds. The run
+/// starts this timer right after it spawns the ceremony task, in the same
+/// poll, ahead of the round trips that bring the ceremony to the save. The
+/// ceremony must send `code-pair-finish` before the timer fires: a timeout
+/// before that request shuts the gate, and the save is never reached.
+const SAVE_HELD_TIMEOUT: Duration = Duration::from_secs(3);
+/// The least time from the desk-side timeout's deadline to the robot letting
+/// a held row save go, in the run that is to get its answer. The test lets
+/// the save go [`SAVE_HELD_TIMEOUT`] plus this after it saw the save reached,
+/// so the gap is this plus the time from the timer's start to the test
+/// seeing the save reached.
+/// The run waits [`FINISH_ANSWER_WAIT`] from the timeout firing, which is at
+/// or after the deadline, so the release lands in that wait whenever the test
+/// saw the save within [`FINISH_ANSWER_WAIT`] minus this (2.5 s) of the
+/// timer's start.
+const RELEASE_AFTER_THE_TIMEOUT: Duration = Duration::from_millis(500);
 /// The text of an interrupted run whose `code-pair-finish` answer did not
 /// arrive: hand-written, never the const it renders.
 const UNCONFIRMED_TEXT: &str = "interrupted after the robot was asked to save this desk, before \
      its answer arrived; the robot may have paired this desk, and `cerulion connect --eid \
      <eid>` connects if it did";
+/// The text of a timed-out run whose `code-pair-finish` answer did not
+/// arrive: hand-written, never the const it renders.
+const TIMED_OUT_UNCONFIRMED_TEXT: &str = "the pairing ceremony timed out after the robot was \
+     asked to save this desk, before its answer arrived; the robot may have paired this desk, \
+     and `cerulion connect --eid <eid>` connects if it did";
 const T_NOW: u64 = 1_000_000_000_000;
 const CHASSIS: &[u8] = b"pair-e2e-chassis-secret-not-serial-derived";
 const MAC_KEY: &[u8] = b"pair-e2e-firmware-mac-key";
@@ -231,6 +263,17 @@ fn pair_config(robot: &Endpoint, desk_seed: [u8; 32], code: &str) -> PairConfig 
     }
 }
 
+/// [`run_pair`] with its future on the heap. Each scenario moves that future
+/// through several others on its test thread: boxed, each move copies a
+/// pointer; inline, an unoptimized build copies the whole future at each
+/// move, which comes near the 2 MiB a test thread's stack holds by default.
+fn run_pair_boxed(
+    config: PairConfig,
+    interrupt: impl Future<Output = ()>,
+) -> Pin<Box<impl Future<Output = Result<PairOutcome, PairError>>>> {
+    Box::pin(run_pair(config, interrupt))
+}
+
 // ── scenarios ─────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -245,7 +288,7 @@ async fn correct_code_establishes_a_code_paired_row_for_the_desk_key() {
 
     let desk_seed = [9u8; 32];
     let outcome = with_serving(&r, &robot_ep, async {
-        run_pair(
+        run_pair_boxed(
             pair_config(&robot_ep, desk_seed, CODE),
             std::future::pending(),
         )
@@ -288,7 +331,7 @@ async fn wrong_code_is_a_code_mismatch_and_writes_no_row() {
 
     let desk_seed = [11u8; 32];
     let result = with_serving(&r, &robot_ep, async {
-        run_pair(
+        run_pair_boxed(
             pair_config(&robot_ep, desk_seed, "WRONG-CODE"),
             std::future::pending(),
         )
@@ -319,7 +362,7 @@ async fn no_armed_code_is_refused_and_writes_no_row() {
 
     let desk_seed = [13u8; 32];
     let result = with_serving(&r, &robot_ep, async {
-        run_pair(
+        run_pair_boxed(
             pair_config(&robot_ep, desk_seed, "ANY-CODE"),
             std::future::pending(),
         )
@@ -369,7 +412,7 @@ async fn a_ceremony_timeout_closes_the_connection_and_is_unreachable() {
         closed
     };
     let (result, closed) = bounded("the timed-out ceremony and its close", async {
-        tokio::join!(run_pair(config, std::future::pending()), silent_robot)
+        tokio::join!(run_pair_boxed(config, std::future::pending()), silent_robot)
     })
     .await;
     robot_ep.close().await;
@@ -410,7 +453,7 @@ async fn an_interrupted_desk_closes_and_the_robot_counts_its_pending_try_failed(
     let desk_seed = [16u8; 32];
 
     let (result, counted) = with_serving(&r, &robot_ep, async {
-        let desk = run_pair(pair_config(&robot_ep, desk_seed, CODE), async move {
+        let desk = run_pair_boxed(pair_config(&robot_ep, desk_seed, CODE), async move {
             let _ = interrupted.await;
         });
         let robot = async move {
@@ -506,7 +549,7 @@ async fn an_interrupt_during_the_close_of_a_paired_desk_returns_paired() {
         }
     });
 
-    let result = run_pair(pair_config(&robot_ep, desk_seed, CODE), interrupt).await;
+    let result = run_pair_boxed(pair_config(&robot_ep, desk_seed, CODE), interrupt).await;
     let _ = stop.send(());
     bounded("the robot's serving", serving)
         .await
@@ -547,7 +590,7 @@ async fn an_interrupt_while_the_robot_saves_the_desk_returns_paired() {
     let desk_seed = [18u8; 32];
 
     let result = with_serving(&r, &robot_ep, async {
-        let desk = run_pair(pair_config(&robot_ep, desk_seed, CODE), {
+        let desk = run_pair_boxed(pair_config(&robot_ep, desk_seed, CODE), {
             let resolved = resolved.clone();
             async move {
                 let _ = interrupted.await;
@@ -613,7 +656,7 @@ async fn an_interrupt_whose_finish_answer_does_not_arrive_says_the_robot_may_hav
     let desk_seed = [19u8; 32];
 
     let (result, waited, paired) = with_serving(&r, &robot_ep, async {
-        let desk = run_pair(pair_config(&robot_ep, desk_seed, CODE), async move {
+        let desk = run_pair_boxed(pair_config(&robot_ep, desk_seed, CODE), async move {
             let _ = interrupted.await;
         });
         let robot = async move {
@@ -655,6 +698,137 @@ async fn an_interrupt_whose_finish_answer_does_not_arrive_says_the_robot_may_hav
     assert!(
         waited >= FINISH_ANSWER_WAIT,
         "the run waited {waited:?} for the robot's answer"
+    );
+    paired.unwrap_or_else(|at_the_limit| {
+        panic!("the robot did not pair the desk once its save was let go: {at_the_limit:?}")
+    });
+    let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
+    let row = store
+        .account_access(&AccountId(desk_pubkey(desk_seed)), 0)
+        .expect("desk row on disk");
+    assert_eq!(row.source, PairingSource::CodePaired);
+}
+
+/// A desk whose ceremony timeout fires after it sent `code-pair-finish`,
+/// while the robot holds that right code's row save, returns paired once the
+/// robot answers. The save is let go [`SAVE_HELD_TIMEOUT`] plus
+/// [`RELEASE_AFTER_THE_TIMEOUT`] after the test saw it reached. The run's
+/// ceremony timer started right after it spawned the ceremony task, before
+/// the save was reached, so the timer's deadline passed at least
+/// [`RELEASE_AFTER_THE_TIMEOUT`] before the save was let go. The run then
+/// waits up to [`FINISH_ANSWER_WAIT`] from the timeout firing, with the
+/// connection open, for the answer. The release lands in that wait whenever
+/// the test saw the save within [`FINISH_ANSWER_WAIT`] minus
+/// [`RELEASE_AFTER_THE_TIMEOUT`] (2.5 s) of the timer's start, and the answer
+/// reaches the run in it when the save and its reply take the rest. The run
+/// returns the desk key's own account, with the code-paired row on disk and
+/// the robot's code paired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_while_the_robot_saves_the_desk_returns_paired() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot_ep = disabled_endpoint([208; 32]).await;
+    let r = build_robot(dir.path(), *robot_ep.id().as_bytes());
+    const CODE: &str = "RIGHT-CODE";
+    r.sessions.arm(CODE, CeremonyConfig::default());
+    let held = r.sessions.hold_next_save_for_test();
+    let desk_seed = [21u8; 32];
+    let mut config = pair_config(&robot_ep, desk_seed, CODE);
+    config.timeout = SAVE_HELD_TIMEOUT;
+
+    let result = with_serving(&r, &robot_ep, async {
+        let desk = run_pair_boxed(config, std::future::pending());
+        let robot = async move {
+            let (reached, held) =
+                tokio::task::spawn_blocking(move || (held.reached_within(STEP_TIMEOUT), held))
+                    .await
+                    .expect("the hold watch ends");
+            assert!(reached, "the desk's code-pair-finish reached the held save");
+            tokio::time::sleep(SAVE_HELD_TIMEOUT + RELEASE_AFTER_THE_TIMEOUT).await;
+            held.release();
+        };
+        let (result, ()) = bounded("the run timed out while the robot saves", async {
+            tokio::join!(desk, robot)
+        })
+        .await;
+        result
+    })
+    .await;
+    robot_ep.close().await;
+
+    let outcome = result.expect("a desk timed out while the robot saves it returns paired");
+    let desk_pk = desk_pubkey(desk_seed);
+    assert_eq!(outcome.account_hex, hex::encode(desk_pk));
+    assert_eq!(outcome.source, "code_paired");
+    let store = TrustStore::load(&r.store_path, MAC_KEY).expect("store reloads");
+    let row = store
+        .account_access(&AccountId(desk_pk), 0)
+        .expect("desk row on disk");
+    assert_eq!(row.source, PairingSource::CodePaired);
+    let code = r.sessions.snapshot().expect("the code is armed");
+    assert_eq!(code.state.status(), PairCodeStatus::Paired, "{code:?}");
+}
+
+/// A desk whose ceremony timeout fires after it sent `code-pair-finish`,
+/// whose answer does not arrive while it waits, returns exit 3 with a text
+/// that says the robot may have paired this desk. The robot's row save is
+/// held until the run returned, so the run took at least its
+/// [`SAVE_HELD_TIMEOUT`] plus the [`FINISH_ANSWER_WAIT`] it then gives the
+/// answer; once the save is let go the robot pairs the desk, as the text says
+/// it may have, and the row is on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_whose_finish_answer_does_not_arrive_says_the_robot_may_have_paired() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot_ep = disabled_endpoint([209; 32]).await;
+    let r = build_robot(dir.path(), *robot_ep.id().as_bytes());
+    const CODE: &str = "RIGHT-CODE";
+    r.sessions.arm(CODE, CeremonyConfig::default());
+    let held = r.sessions.hold_next_save_for_test();
+    let desk_seed = [22u8; 32];
+    let mut config = pair_config(&robot_ep, desk_seed, CODE);
+    config.timeout = SAVE_HELD_TIMEOUT;
+
+    let started = tokio::time::Instant::now();
+    let (result, took, paired) = with_serving(&r, &robot_ep, async {
+        let desk = run_pair_boxed(config, std::future::pending());
+        let robot = async move {
+            let (reached, held) =
+                tokio::task::spawn_blocking(move || (held.reached_within(STEP_TIMEOUT), held))
+                    .await
+                    .expect("the hold watch ends");
+            assert!(reached, "the desk's code-pair-finish reached the held save");
+            held
+        };
+        let (result, held) = bounded("the timed-out run whose finish answer is held", async {
+            tokio::join!(desk, robot)
+        })
+        .await;
+        // The run returned last: the robot side returned once the save was
+        // reached.
+        let took = started.elapsed();
+        held.release();
+        let paired = tokio::time::timeout(TRY_END_LIMIT, async {
+            loop {
+                match r.sessions.snapshot() {
+                    Some(code) if code.state.status() == PairCodeStatus::Paired => return code,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| r.sessions.snapshot());
+        (result, took, paired)
+    })
+    .await;
+    robot_ep.close().await;
+
+    let error = result.expect_err("a run whose finish answer did not arrive is not paired");
+    assert_eq!(
+        (error.exit_code(), error.to_string()),
+        (3, TIMED_OUT_UNCONFIRMED_TEXT.to_string())
+    );
+    assert!(
+        took >= SAVE_HELD_TIMEOUT + FINISH_ANSWER_WAIT,
+        "the run took {took:?}"
     );
     paired.unwrap_or_else(|at_the_limit| {
         panic!("the robot did not pair the desk once its save was let go: {at_the_limit:?}")

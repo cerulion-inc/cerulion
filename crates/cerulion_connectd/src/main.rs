@@ -33,7 +33,8 @@ use cerulion_connectd::config::{
     ConnectConfig, DemandSet, DEFAULT_ROBOT_TIMEOUT,
 };
 use cerulion_connectd::pair::{
-    run_pair, PairConfig, PairError, EXIT_INTERRUPTED, EXIT_USAGE, INTERRUPTED_UNCONFIRMED,
+    run_pair, PairConfig, PairError, PairOutcome, EXIT_INTERRUPTED, EXIT_PAIRED, EXIT_USAGE,
+    INTERRUPTED_UNCONFIRMED, TIMED_OUT_UNCONFIRMED,
 };
 use cerulion_connectd::rcp::{run_rcp, stdin_reader, RcpConfig};
 use cerulion_connectd::resolve_epoch_dir_from_env;
@@ -798,7 +799,8 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     // answer and return the ceremony's own result, or
     // `PairError::InterruptedUnconfirmed` when the answer did not arrive; one
     // that lands during the endpoint close after the ceremony ended only
-    // shortens that wait, and run_pair returns the ceremony's own result. The
+    // shortens that wait, and run_pair returns the ceremony's own result
+    // (`pair_end` decides the line logged for each result). The
     // blocking stdin code read runs on a detached thread that hands its result
     // over a oneshot, so a signal AT the prompt resolves the select below (a
     // deliberate EXIT_INTERRUPTED) and the process then exits with the read
@@ -840,16 +842,18 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
             robot_display,
             timeout: DEFAULT_ROBOT_TIMEOUT,
         };
-        match run_pair(config, interrupt).await {
-            Ok(_outcome) => Some(ExitCode::SUCCESS),
-            Err(PairError::Interrupted) => None,
-            // The robot may have paired this desk, so the "NOT paired" line
-            // below would be false.
-            Err(e @ PairError::InterruptedUnconfirmed) => {
+        let result = run_pair(config, interrupt).await;
+        let (exit, end) = pair_end(&result);
+        match end {
+            PairEnd::Paired => {}
+            PairEnd::NotPaired => return None,
+            PairEnd::InterruptedUnconfirmed => {
                 tracing::warn!(eid = %eid, "cerulion pair: {INTERRUPTED_UNCONFIRMED}");
-                Some(ExitCode::from(e.exit_code()))
             }
-            Err(e) => {
+            PairEnd::TimedOutUnconfirmed => {
+                tracing::warn!(eid = %eid, "cerulion pair: {TIMED_OUT_UNCONFIRMED}");
+            }
+            PairEnd::Failed(error) => {
                 // Every other `PairError` variant renders HERE, and the
                 // Refused / CodeMismatch ones carry text the ROBOT chose — at the moment
                 // the desk trusts the robot LEAST. Peer text is neutered + bounded where
@@ -858,12 +862,12 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
                 // this arm sanitizes AGAIN as cheap defense-in-depth, exactly like the
                 // `connect` arms above and under the same idempotence + cost notes.
                 tracing::error!(
-                    error = %sanitize_peer_text(&e.to_string()),
+                    error = %sanitize_peer_text(&error),
                     "cerulion pair: pairing failed"
                 );
-                Some(ExitCode::from(e.exit_code()))
             }
         }
+        Some(ExitCode::from(exit))
     };
 
     match ceremony.await {
@@ -873,6 +877,45 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
             ExitCode::from(EXIT_INTERRUPTED)
         }
     }
+}
+
+/// The line `cerulion-connectd pair` logs once `run_pair` returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairEnd {
+    /// Paired: no line here, as `run_pair` printed its `paired:` line.
+    Paired,
+    /// Interrupted before the robot was asked to save this desk: the NOT
+    /// paired line.
+    NotPaired,
+    /// Interrupted after the robot was asked to save this desk, before its
+    /// answer arrived: [`INTERRUPTED_UNCONFIRMED`] at warn, as the robot may
+    /// have paired this desk and the NOT paired line would be false.
+    InterruptedUnconfirmed,
+    /// Timed out after the robot was asked to save this desk, before its
+    /// answer arrived: [`TIMED_OUT_UNCONFIRMED`] at warn, as the robot may
+    /// have paired this desk and `pairing failed` would be false.
+    TimedOutUnconfirmed,
+    /// Any other failure: `pairing failed` at error, with this text of the
+    /// error.
+    Failed(String),
+}
+
+/// The exit code `cerulion-connectd pair` ends with for a `run_pair` result,
+/// and the line it logs. Pure, table-tested.
+fn pair_end(result: &Result<PairOutcome, PairError>) -> (u8, PairEnd) {
+    let Err(error) = result else {
+        return (EXIT_PAIRED, PairEnd::Paired);
+    };
+    let end = match error {
+        PairError::Interrupted => PairEnd::NotPaired,
+        PairError::InterruptedUnconfirmed => PairEnd::InterruptedUnconfirmed,
+        PairError::TimedOutUnconfirmed => PairEnd::TimedOutUnconfirmed,
+        PairError::Usage(_)
+        | PairError::Unreachable(_)
+        | PairError::Refused(_)
+        | PairError::CodeMismatch(_) => PairEnd::Failed(error.to_string()),
+    };
+    (error.exit_code(), end)
 }
 
 /// An interrupt watcher for the pairing ceremony: Ctrl-C (SIGINT) and, on
@@ -1051,6 +1094,57 @@ mod tests {
                 assert_eq!(output, "PairCli { code: [REDACTED] }");
                 assert!(!output.contains(code));
             }
+        }
+    }
+
+    /// Hand-written table: a `run_pair` result, then the exit code the binary
+    /// ends with and the line it logs. A run interrupted or timed out after
+    /// the robot was asked to save this desk logs that the robot may have
+    /// paired it, never the NOT paired line or `pairing failed`.
+    #[test]
+    fn a_pairing_the_robot_may_have_saved_is_never_logged_as_not_paired() {
+        let paired = PairOutcome {
+            account_hex: "8a2e".into(),
+            source: "code_paired".into(),
+            desk_eid_hex: "8a2e".into(),
+        };
+        let cases: [(Result<PairOutcome, PairError>, u8, PairEnd); 8] = [
+            (Ok(paired), 0, PairEnd::Paired),
+            (Err(PairError::Interrupted), 130, PairEnd::NotPaired),
+            (
+                Err(PairError::InterruptedUnconfirmed),
+                130,
+                PairEnd::InterruptedUnconfirmed,
+            ),
+            (
+                Err(PairError::TimedOutUnconfirmed),
+                3,
+                PairEnd::TimedOutUnconfirmed,
+            ),
+            (
+                Err(PairError::Unreachable("u".into())),
+                3,
+                PairEnd::Failed("could not reach the robot: u".into()),
+            ),
+            (
+                Err(PairError::Refused("r".into())),
+                2,
+                PairEnd::Failed("the robot refused pairing: r".into()),
+            ),
+            (
+                Err(PairError::CodeMismatch("m".into())),
+                4,
+                PairEnd::Failed("wrong pairing code: m".into()),
+            ),
+            (
+                Err(PairError::Usage("x".into())),
+                1,
+                PairEnd::Failed("pairing usage error: x".into()),
+            ),
+        ];
+        for (result, exit, end) in cases {
+            let row = format!("{result:?}");
+            assert_eq!(pair_end(&result), (exit, end), "{row}");
         }
     }
 
