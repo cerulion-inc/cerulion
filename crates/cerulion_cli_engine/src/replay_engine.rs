@@ -6224,9 +6224,9 @@ fn assemble_outcome(
                         })
                         .collect();
                     format!(
-                        "frame: {extra} trailing frame(s) on '{topic}' tolerated: the topic's \
-                         writers span {} ranks whose tails add up — {} (recorded \
-                         {recorded_count}, replay produced {replayed_count})",
+                        "frame: {extra} trailing frame(s) on '{topic}' tolerated: the tails of \
+                         {} ranks explain them: {} (recorded {recorded_count}, replay \
+                         produced {replayed_count})",
                         ranks.len(),
                         causes.join("; ")
                     )

@@ -38904,8 +38904,8 @@ fn c6_a_split_bus_is_tolerated_writer_by_writer_within_each_owning_rank_s_tail()
     assert_eq!(
         notes,
         vec![&format!(
-            "frame: 3 trailing frame(s) on '{RT_TOPIC}' tolerated: the topic's writers span \
-             2 ranks whose tails add up — rank 0: final recorded step banked its step \
+            "frame: 3 trailing frame(s) on '{RT_TOPIC}' tolerated: the tails of 2 ranks \
+             explain them: rank 0: final recorded step banked its step \
              boundary with no fires behind it (either the step ran and fired nothing, or the \
              worker shut down between the step boundary and the step's fires — the recording \
              cannot tell which; 1 step(s)); rank 1: ragged shutdown tail (2 step(s)) \
