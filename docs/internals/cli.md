@@ -193,14 +193,17 @@ Rules that must not drift:
   read gate, the `--record-out` channels) and leave only the comparison: `pass_topics`
   captures a topic only where a member other than a driver writes it and lists the rest in
   `record_out_only`, which a `--record-out` run taps (`RecordOutTap`) for the output bag
-  alone, and `assemble_outcome` neither diffs nor counts it. A record-health-lossy driver
+  alone, leaving out the frames its own pass's injector re-publishes on the topic, and
+  `assemble_outcome` neither diffs nor counts it. A record-health-lossy driver
   topic is still a per-topic `RecordSideTapLoss`, judged in a partial report once a rank of
-  its drivers completed (`topic_owner_ranks`). A `multi_publisher_topics` topic a driver shares with other nodes
+  its drivers completed (`topic_owner_ranks`); a topic a driver shares is owned by its other
+  writers' ranks alone, so an abort in those ranks leaves it unjudged. A `multi_publisher_topics` topic a driver shares with other nodes
   (`TopicClasses::driver_shared`) stays captured: `build_capture_partitionings` leaves the
   driver's writer out of `producible` and names a driver of the pass in `uncompared`, whose
   replayed frames `diff_partitioned` leaves out of the diff, the tripwire and every count
   (the drain still writes them to `--record-out`), and the topic-level count is the
-  partitions' sum; an unpartitioned one keeps the whole recorded count and fails. A metadata read that fails
+  partitions' sum; an unpartitioned one keeps the whole recorded count and fails, and a fed
+  read of one is refused before that (`read_identity_frames_unattributed`, exit 2). A metadata read that fails
   keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
   LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
   driver node and every topic one writes, shared ones included, and still fires for a

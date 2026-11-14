@@ -120,10 +120,14 @@ A graph whose produced topics are all driver outputs, such as a capture-only
 graph, has nothing to re-compute: its `--verify` passes with `0/0`, and a
 warning and a verdict NOTE say that no topic was compared. A driver topic no
 node reads is neither fed nor compared, and a warning and a verdict NOTE name
-it. On a `multi_publisher_topics`
-topic a driver shares with other nodes, the other writers' frames are compared
-and the driver's are not, when the bag attributes every frame of the topic to
-its writer; a replay of a bag that cannot fails on that topic.
+it. On a `multi_publisher_topics` topic a driver shares with other nodes, the
+other writers' frames are compared and the driver's are not, when the bag
+attributes every frame of the topic to its writer. A bag that does not cannot
+say which frames are the driver's: a `--verify` that feeds a node's reads of
+the topic refuses with exit 2 (`read_identity_frames_unattributed`), and
+otherwise every recorded frame of the topic, the driver's included, is
+compared against what the replay publishes on it, so the topic fails (exit 1)
+unless the replayed driver publishes its recorded frames again.
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,
