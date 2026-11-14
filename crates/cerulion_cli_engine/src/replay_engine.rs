@@ -16572,7 +16572,7 @@ fn read_record_coverage(reader: &BagReader) -> Option<RecordCoverage> {
 
 /// The recorded topics partitioned by class (graph order, deduplicated).
 struct TopicClasses {
-    /// Graph-produced topics (an in-graph node output) — captured + diffed,
+    /// Graph-produced topics (an in-graph node output), captured + diffed,
     /// except the [`Self::driver`] topics among them.
     produced: Vec<String>,
     /// The `produced` topics whose every in-graph writer is an `external`
@@ -16607,7 +16607,7 @@ struct TopicClasses {
 /// Extracted so [`classify_topics`] and [`external_prefix_below_capture_anchor`]
 /// ask it through the SAME code. Two spellings can disagree: a classifier asking
 /// "consumed" while the prefix scan asks the wider "not produced" is a second
-/// classification rule in the codebase — so the rule lives here instead of
+/// classification rule in the codebase, so the rule lives here instead of
 /// being written twice.
 fn graph_consumed_topics(config: &GraphConfig) -> std::collections::HashSet<String> {
     let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
