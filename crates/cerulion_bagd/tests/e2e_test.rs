@@ -5465,10 +5465,16 @@ fn an_append_failure_keeps_the_open_chunks_earlier_batch() {
     cfg.flush_interval = Duration::from_millis(20);
     // Far above the whole recording: nothing may auto-flush, so batch one's
     // frames are still OPEN when batch two fails. (The time floor is 1 s and
-    // the two bursts are 200 ms apart, so it cannot close one either.)
+    // the handshakes between the two bursts take tens of milliseconds, so it
+    // cannot close one either.)
     cfg.chunk_max_bytes = cerulion_bag::DEFAULT_CHUNK_MAX_BYTES;
     // Fire mid-batch-two: FIRST + 2 messages accepted, then the failure.
     cfg.fault_inject_flush_error_after_messages = Some(FIRST as u64 + 2);
+    // The handshakes below read this feed; a short period keeps each one to
+    // tens of milliseconds.
+    cfg.status_period = Some(Duration::from_millis(20));
+    let drain_gate = Arc::new(AtomicBool::new(true));
+    cfg.fault_inject_tap_drain_gate = Some(drain_gate.clone());
     let handle = spawn_bagd(mgr.clone(), cfg, shutdown.clone());
     // This run is expected to SELF-TERMINATE on its injected fault, so
     // nothing in this arm ever stores the shutdown flag and the `join()` below is
@@ -5480,6 +5486,11 @@ fn an_append_failure_keeps_the_open_chunks_earlier_batch() {
         wait_for_file(&ready, LIVENESS_CEILING),
         "ready-file never appeared"
     );
+    // bagd's setup created the /bagd/status publisher BEFORE the ready-file, so
+    // the service exists; attach open-only on the SAME manager.
+    let mut status_sub = mgr
+        .create_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+        .expect("status subscriber");
     settle();
 
     let mut expect: Vec<Vec<u8>> = Vec::new();
@@ -5488,14 +5499,33 @@ fn an_append_failure_keeps_the_open_chunks_earlier_batch() {
         pubr.publish_raw(&frame).expect("publish batch one");
         expect.push(frame);
     }
-    // Let batch one flush ON ITS OWN — it must be a SEPARATE batch, and its
-    // frames must still be in the open chunk when batch two arrives.
-    std::thread::sleep(Duration::from_millis(200));
+    // Batch one is handed off ON ITS OWN before any of batch two exists, so
+    // the two can never share a hand-off, and its frames stay in the open
+    // chunk. No fault can fire on batch one, so the writer stays writable and
+    // the count is reported.
+    assert!(
+        await_status_messages(&mut status_sub, FIRST as u64, LIVENESS_CEILING),
+        "batch one must be handed to the writer before batch two is published"
+    );
+    // The salvage retries only the FAILING hand-off, so batch two must reach
+    // the writer as ONE: close the drain gate and wait out any pass that read
+    // it open (see `await_drain_gate_quiesced`), so all four frames are queued
+    // before a drain can take any of them. Published with the drain running,
+    // a pass between two publishes would split the burst, and the writer,
+    // latched by the first part's failure, would discard the rest.
+    drain_gate.store(false, Ordering::Relaxed);
+    assert!(
+        await_drain_gate_quiesced(&mut status_sub, LIVENESS_CEILING),
+        "the recorder must reach a pass that began AFTER the gate closed"
+    );
     for i in FIRST..FIRST + SECOND {
         let frame = build_frame(0x0C40, i, 10 + i as u64, &[(i as u8) + 1; BODY]);
         pubr.publish_raw(&frame).expect("publish batch two");
         expect.push(frame);
     }
+    // One pass drains the tap queue to EMPTY and the flush that follows hands
+    // everything staged to the writer: one hand-off.
+    drain_gate.store(true, Ordering::Relaxed);
 
     let result = handle.join().expect("join");
     assert!(
