@@ -208,17 +208,27 @@ Rules that must not drift:
   the frame-index record budget) keeps the whole recorded count, the drivers' frames
   included; `assemble_outcome` lists it in `DriverInputsReport::unattributed_topics`, whose
   NOTE says it was compared over every recorded frame, and a fed read of one is refused before
-  that (`read_identity_frames_unattributed`, exit 2). Every topic, shared or not, is judged
-  over every pass that captured it: a pass captures a topic its rank writes, so a split
-  `multi_publisher_topics` topic has one `CaptureSummary` per writing rank, and
-  `PassAccumulators` keeps them all. `uncompared` also names a pass's injector by its publisher
-  id (`WriterKey::Origin`): it re-publishes the recorded frames of every foreign writer of the
-  topic, however many, so a pass's partitions hold only the writers it runs, and
-  `merge_partitioned_summaries` folds passes that all partitioned the topic into their union,
-  each writer from the one pass that runs it. Where a pass did not partition it, each
-  unpartitioned pass is judged as one stream, its injector's frames diffed and run through the
-  tripwire with the rest, against the whole recorded count and the partitioned ones per writer
-  (`push_split_unattributed_violations`, no count summed across passes). A metadata read that fails
+  that when its reads name more than one writer (`read_identity_frames_unattributed`, exit 2).
+  Every topic, shared or not, is judged over every pass that captured it: a pass captures a
+  topic its rank runs a writer of other than a driver, so a split `multi_publisher_topics`
+  topic has one `CaptureSummary` per such rank, and `PassAccumulators` keeps them all.
+  `uncompared` also names a pass's injector by its publisher id (`WriterKey::Origin`): it
+  re-publishes the recorded frames of every foreign writer of the topic, however many, copies of
+  what each writer's own pass compares or a foreign driver's recorded inputs, which no pass
+  compares, so a pass's partitions hold only the writers it runs. `judge_passes` picks the
+  verdict: `merge_partitioned_summaries` folds passes that all partitioned the topic into their
+  union, each writer from the one pass that runs it; the only pass that counted a frame, if it
+  neither partitioned nor injected the topic (`CaptureSummary::injected`), is judged alone
+  against every recorded frame, its rank the tail window; any other mix goes to `push_split_violations`, which
+  judges the partitioned passes per writer, counts the rest together (the recorded frames no
+  partition holds against `CaptureSummary::own_replayed`), compares an injecting pass's one
+  stream with every recorded frame, and returns a pass of its own writers' frames alone, beside
+  another with frames, as `SplitUnjudged`, which `assemble_outcome` DECLINES
+  (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else on the
+  topic failed. The ragged-tail frame tolerance bounds a partitioned topic writer by writer, each
+  by its node's rank's window (`tail_extra_ranks`), and a one-stream topic by the sum of its
+  ranks' windows; `--tolerance` rows fold across passes to one per field and metric
+  (`fold_tolerance_worsts`). A metadata read that fails
   keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
   LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
   driver node and every topic one writes, shared ones included, and still fires for a

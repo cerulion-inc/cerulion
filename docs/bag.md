@@ -141,35 +141,55 @@ and those a resim feeds from the bag to a node that reads the topic, are
 compared nowhere. Otherwise the replay cannot say which frames are the
 driver's, and a warning names the cause: a `--verify` that feeds a node's
 reads of the topic from a bag that labels no writer refuses with exit 2
-(`read_identity_frames_unattributed`), and otherwise each process or executor
-unit that runs another writer of the topic and cannot attribute its frames
-compares the frames published on the topic there, as one stream, with every
-recorded frame of the topic, the driver's included. A replayed driver's frames
-are among them only where the driver runs beside such a writer, so the topic
-fails (exit 1) where the driver's recorded frames are missing, and where two
-writers' frames are published in one process or executor unit, one stream
-cannot tell their sequences apart and the replay stops (exit 5). Its verdict
-`NOTE:` line says the topic was compared over every recorded frame, and
-`driver_inputs.unattributed_topics` names it.
+(`read_identity_frames_unattributed`) when the topic's reads name more than
+one writer, and otherwise the topic is compared over every recorded frame, the
+driver's included, the way the next paragraph describes for a process or
+executor unit that cannot attribute the frames. A replayed driver's frames are
+among those compared only where the driver runs beside another writer of the
+topic, so the topic fails (exit 1) where the driver's recorded frames are
+missing. Where a driver's frames and another writer's are published in one
+process or executor unit, one stream cannot tell their sequences apart, so the
+replay stops (exit 5) once a frame skips a sequence the recording holds, and
+otherwise the topic fails (exit 1). Its verdict `NOTE:` line says the topic
+was compared over every recorded frame, and `driver_inputs.unattributed_topics`
+names it.
 
 A `multi_publisher_topics` topic whose writers run in several processes or
-executor units is compared in every one of them. When the replay attributes
-every recorded frame of the topic to its writer, which needs a bag that labels
-each frame with its writer, a wire header on every frame, and at most 200000
-recorded frames, the verifier's record budget, on the `multi_publisher_topics`
-topics one process or executor unit writes, each writer is compared in the
-process or executor unit that runs it, and a byte mismatch names it (below).
-The frames a process or executor unit then feeds from the bag to its nodes that
-read the topic, the recorded frames of the writers that run elsewhere, are left
-out of the comparison, so a node that reads only some of them, such as one that
-reads the latest value on a slower period, does not stop the replay. Otherwise
-a `--verify` that feeds a node's reads of the topic from a bag that labels no
-writer refuses with exit 2 (`read_identity_frames_unattributed`), and otherwise
-each process or executor unit that writes the topic compares the frames
-published on it there, the frames it feeds included, as one stream with every
-recorded frame of the topic, and a byte mismatch there names no writer; where
-that stream holds the frames of two writers, one stream cannot tell their
-sequences apart and the replay stops (exit 5).
+executor units is compared in every one of them that runs a writer of the
+topic other than a driver. When the replay attributes every recorded frame of
+the topic to its writer, which needs a bag that labels each frame with its
+writer, a wire header on every frame, and at most 200000 recorded frames, the
+verifier's record budget, on the `multi_publisher_topics` topics one process
+or executor unit writes, each writer is compared in the process or executor
+unit that runs it, and a byte mismatch names it (below). The frames a process
+or executor unit then feeds from the bag to its nodes that read the topic, the
+recorded frames of the writers that run elsewhere, are left out of the
+comparison, so a node that reads only some of them, such as one that reads the
+latest value on a slower period, does not stop the replay. Otherwise a
+`--verify` that feeds a node's reads of the topic from a bag that labels no
+writer refuses with exit 2 (`read_identity_frames_unattributed`) when the
+topic's reads name more than one writer, and a process or executor unit that
+runs a writer of the topic other than a driver and cannot attribute the frames
+compares the frames published on the topic there as one stream, and a byte
+mismatch there names no writer. When it is the only one whose writers
+published frames of the topic, and it fed none of the topic's recorded frames
+to its nodes, its stream is compared with every recorded frame of the topic. Otherwise the
+frames such processes or executor units published are counted together
+against every recorded frame of the topic that no attributed writer holds.
+One of them that, in a replay that does not feed reads by their recorded
+identity, feeds its nodes the other writers' recorded frames compares its
+stream, the frames it feeds included, with every recorded frame of the topic.
+One whose stream holds its own writers' frames alone, beside another that
+published frames of the topic, is not compared, since no recorded stream lines
+up with it: when nothing else on the topic fails, the topic is DECLINED,
+counted as checked and not credited, and
+`declined_frame_comparisons` names it with the cause
+`split_topic_frames_unattributed`, the ranks of those processes or executor
+units, and the byte mismatch their stream reads against every recorded frame.
+Where one stream holds the frames of two writers, it cannot tell their
+sequences apart, so the replay stops (exit 5) once a frame skips a sequence
+the recording holds, and otherwise a frame published in another order than
+recorded fails the topic (exit 1).
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,
