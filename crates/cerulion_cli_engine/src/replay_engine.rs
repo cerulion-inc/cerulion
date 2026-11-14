@@ -37110,7 +37110,7 @@ mod capture_partition_tests {
     }
 
     /// The ragged-tail bound of a split topic and the guard it stands on: its
-    /// partitioned writers rank by rank, and the frames its one-stream passes'
+    /// partitioned writers writer by writer, and the frames its one-stream passes'
     /// own writers published past the recorded frames no partition holds by
     /// what their ranks' windows hold together; the guard reads the byte
     /// verdicts of the frames compared and every shortfall. Rank 1's tail is 1
@@ -37143,7 +37143,7 @@ mod capture_partition_tests {
             ),
             (true, Some(vec![1]))
         );
-        // A partitioned writer's extra frame inside its own rank's window,
+        // A partitioned writer's extra frame inside its own window,
         // the one-stream pass's frames the recorded ones no partition holds.
         let mixed = |rank: u32, label: &str| {
             [
