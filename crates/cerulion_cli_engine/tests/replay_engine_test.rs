@@ -47534,16 +47534,17 @@ fn an_unattributed_shared_topic_fails_though_its_driver_publishes_its_recorded_f
     );
 }
 
-/// The topic the camera shares with two period writers, which no node reads.
+/// The topic the camera shares with two other writers, which no node reads.
 const DRV_UNREAD_TRIO_BUS: &str = "/drvtru/bus";
 
-/// The camera (`w1`) and two period writers (`w2` and `w3`, writers 2 and 3)
-/// on one `multi_publisher_topics` topic no node reads.
+/// The camera (`w1`), a period writer (`w2`, writer 2, one frame per step)
+/// and a fast writer (`w3`, writer 3, five frames per step) on one
+/// `multi_publisher_topics` topic no node reads.
 fn drv_unread_trio_yaml() -> &'static str {
     "name: drvtru\nprefix: drvtru\nmulti_publisher_topics:\n  - /drvtru/bus\nnodes:\n\
      \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n\
      \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n\
-     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n"
+     \x20 - id: w3\n    type: ri_fast_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n"
 }
 
 fn drv_unread_trio_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
@@ -47564,7 +47565,7 @@ fn drv_unread_trio_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEn
         ),
         (
             "w3",
-            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            Box::new(RiFastWriterNodeEntry::with_state(RiFastWriterNode {
                 writer: 3.0,
                 ..Default::default()
             })),
@@ -47575,12 +47576,15 @@ fn drv_unread_trio_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEn
 /// A topic a driver shares that the replay cannot attribute frame by frame,
 /// whose two other writers run in two processes, is judged in each of them:
 /// each compares every recorded frame, the camera's included, with the frames
-/// its own writer replayed, so each is a `missing-messages` violation,
-/// recorded `n + 2c` frames against its writer's `c`, followed by a byte
+/// its own writer replayed. The writers publish at different rates, `w2` one
+/// frame per step and `w3` five, so each process has a verdict of its own: a
+/// `missing-messages` violation, recorded `7n` frames against `w2`'s `n` in
+/// the first and against `w3`'s `5n` in the second, each followed by a byte
 /// mismatch at the first recorded frame that is not that writer's next one.
-/// Neither process's verdict is dropped and no count is summed across them:
-/// exit 1, with the NOTE naming the bus as compared over every recorded
-/// frame. The bag labels no frame, and the replayed camera has no device.
+/// Neither process's verdict is dropped or repeated and no count is summed
+/// across them: exit 1, with the NOTE naming the bus as compared over every
+/// recorded frame. The bag labels no frame, and the replayed camera has no
+/// device.
 #[test]
 #[serial]
 fn an_unattributed_shared_topic_split_across_processes_is_judged_in_each_of_them() {
@@ -47607,26 +47611,27 @@ fn an_unattributed_shared_topic_split_across_processes_is_judged_in_each_of_them
             .filter(|&(x, _, _)| x == writer)
             .collect()
     };
-    let writer_frames = |writer: f64| -> Vec<(f64, f64, f64)> {
-        (1..=RI_STEPS)
+    let n = RI_STEPS;
+    // `writer`'s first `count` frames, `(writer, c, writer * 1_000_000 + 7c)`.
+    let writer_frames = |writer: f64, count: usize| -> Vec<(f64, f64, f64)> {
+        (1..=count)
             .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
             .collect()
     };
-    let n = RI_STEPS;
     assert_eq!(
         of(DRV_DEVICE),
         (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
         "the recorded camera readings"
     );
-    assert_eq!(of(2.0), writer_frames(2.0), "the recorded w2 frames");
-    assert_eq!(of(3.0), writer_frames(3.0), "the recorded w3 frames");
-    assert_eq!(recorded.len(), 3 * n, "PREMISE: nothing else is on the bus");
-    // The first recorded frame that is not `writer`'s next frame, where the
+    assert_eq!(of(2.0), writer_frames(2.0, n), "the recorded w2 frames");
+    assert_eq!(of(3.0), writer_frames(3.0, 5 * n), "the recorded w3 frames");
+    assert_eq!(recorded.len(), 7 * n, "PREMISE: nothing else is on the bus");
+    // The first recorded frame that is not the writer's next frame, where the
     // writer's replayed stream, its own frames in order, first differs.
-    let first_differing = |writer: f64| {
+    let first_differing = |frames: Vec<(f64, f64, f64)>| {
         recorded
             .iter()
-            .zip(writer_frames(writer))
+            .zip(frames)
             .position(|(r, w)| *r != w)
             .expect("PREMISE: the bus interleaves the writers")
     };
@@ -47650,7 +47655,7 @@ fn an_unattributed_shared_topic_split_across_processes_is_judged_in_each_of_them
         }),
         "the outcome names the bus as unattributed"
     );
-    let got: Vec<(&str, String)> = outcome
+    let got: Vec<(&str, String, &str)> = outcome
         .violations
         .iter()
         .map(|v| {
@@ -47661,25 +47666,42 @@ fn an_unattributed_shared_topic_split_across_processes_is_judged_in_each_of_them
                 ViolationClass::ByteMismatch { index, .. } => format!("byte {index}"),
                 other => format!("{other:?}"),
             };
-            (v.topic.as_str(), class)
+            (v.topic.as_str(), class, v.detail.as_str())
         })
         .collect();
-    let want: Vec<(&str, String)> = vec![
-        (DRV_UNREAD_TRIO_BUS, format!("missing {} {n}", 3 * n)),
-        (
-            DRV_UNREAD_TRIO_BUS,
-            format!("byte {}", first_differing(2.0)),
-        ),
-        (DRV_UNREAD_TRIO_BUS, format!("missing {} {n}", 3 * n)),
-        (
-            DRV_UNREAD_TRIO_BUS,
-            format!("byte {}", first_differing(3.0)),
-        ),
+    let missing = |replayed: usize| {
+        format!(
+            "recorded {} frame(s), replay produced {replayed} on '{DRV_UNREAD_TRIO_BUS}'",
+            7 * n
+        )
+    };
+    let (w2_at, w3_at) = (
+        first_differing(writer_frames(2.0, n)),
+        first_differing(writer_frames(3.0, 5 * n)),
+    );
+    let want_classes: Vec<(&str, String)> = vec![
+        (DRV_UNREAD_TRIO_BUS, format!("missing {} {n}", 7 * n)),
+        (DRV_UNREAD_TRIO_BUS, format!("byte {w2_at}")),
+        (DRV_UNREAD_TRIO_BUS, format!("missing {} {}", 7 * n, 5 * n)),
+        (DRV_UNREAD_TRIO_BUS, format!("byte {w3_at}")),
     ];
     assert_eq!(
-        got, want,
-        "w2's process, then w3's, each against every recorded frame"
+        got.iter()
+            .map(|(t, c, _)| (*t, c.clone()))
+            .collect::<Vec<_>>(),
+        want_classes,
+        "w2's process, then w3's, each against every recorded frame: {got:?}"
     );
+    assert_eq!(got[0].2, missing(n), "w2's process: {got:?}");
+    assert_eq!(got[2].2, missing(5 * n), "w3's process: {got:?}");
+    // A one-stream comparison names no writer.
+    for (at, (_, _, detail)) in [(w2_at, &got[1]), (w3_at, &got[3])] {
+        assert!(
+            detail.starts_with(&format!("frame {at} on '{DRV_UNREAD_TRIO_BUS}' differs "))
+                && detail.ends_with(" (recorded 64 B, replayed 64 B)"),
+            "the byte mismatch of the whole stream: {detail}"
+        );
+    }
     assert_eq!(
         drv_driver_lines(&replay_engine::render_verdict(&outcome, &bag)),
         vec![drv_unattributed_note(DRV_UNREAD_TRIO_BUS)]
