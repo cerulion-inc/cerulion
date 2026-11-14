@@ -52,8 +52,8 @@
 //!   `multi_publisher_topics` topic a driver shares with other nodes stays
 //!   GRAPH-PRODUCED, diffed over the other writers' frames, each in the pass
 //!   that runs it, when the replay attributes each recorded frame to its
-//!   writer, and over every recorded frame otherwise
-//!   (`DriverInputsReport::unattributed_topics`).
+//!   writer, and counted over every recorded frame no partition holds
+//!   otherwise (`DriverInputsReport::unattributed_topics`).
 //! - EXTERNAL (consumed in-graph, no in-graph producer: the
 //!   absolute `source:` class) — the recorded frames are re-INJECTED byte-exact
 //!   so the downstream graph sees the same inputs it saw live.
@@ -962,8 +962,10 @@ pub struct ReplayOutcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injection_stand_downs: Vec<InjectionStandDown>,
     /// The topics whose FRAME comparison was declined because
-    /// the read log steering their producer's input stream was refused, carrying
-    /// the violations that were therefore NOT reported.
+    /// the read log steering their producer's input stream was refused, or
+    /// because some process or executor unit that captured a split
+    /// `multi_publisher_topics` topic could not attribute its frames to their
+    /// writers, carrying the violations that were therefore NOT reported.
     ///
     /// A read-log condition never produces a DATA verdict, so a refusal must not
     /// surface as one, see [`DeclinedFrameComparison`] for why the violation would be an
@@ -1137,10 +1139,17 @@ pub struct DriverInputsReport {
     /// each recorded frame to its writer (for example, the bag labels no
     /// writer for a frame, a frame carries no wire header, or the topics'
     /// frame index is over the verifier's record budget), and a warning
-    /// logged during the replay names the cause. Each pass that could not
-    /// attribute them compares every recorded frame with every frame it
-    /// captured on the topic, which holds a replayed driver's frames only when
-    /// the driver runs in that pass.
+    /// logged during the replay names the cause. The passes that could not
+    /// attribute them count every recorded frame no partition holds against
+    /// the frames they captured on the topic but those their injectors
+    /// re-published, which hold a replayed driver's frames only where the
+    /// driver runs in such a pass. Such a pass's frames are also compared byte
+    /// for byte with every recorded frame where it is the only pass with
+    /// frames of the topic and no pass injected it, or where it injected the
+    /// topic itself; a pass of its own writers' frames alone beside another
+    /// with frames is not compared, and the topic is then declined
+    /// ([`ReplayOutcome::declined_frame_comparisons`]) unless something else
+    /// on it failed.
     pub unattributed_topics: Vec<String>,
     /// The topics of [`Self::input_topics`] and [`Self::shared_topics`] that a
     /// node reads where this replay does not feed it the drivers' recorded
@@ -3348,19 +3357,36 @@ impl ReadLogEnforcement {
 /// Listing only topics that would have raised a divergence would
 /// keep healthy reports byte-identical, at the cost of a report that says "passed"
 /// about a comparison it cannot stand behind.
+///
+/// # A split topic's frames no stream lines up with
+///
+/// The second cause, `split_topic_frames_unattributed`, is a
+/// `multi_publisher_topics` topic whose writers run in several processes or
+/// executor units, where one that captured frames of it could not attribute its
+/// recorded frames to their writers and injected none of them. Its capture then
+/// holds its own writers' frames alone, which no recorded stream lines up with
+/// while another one captured frames of the topic too, so they are not compared.
+/// The topic is declined only when nothing compared on it failed: its counts
+/// are judged over every recorded frame, and a failure there stands. Such a row
+/// names the ranks whose frames were not compared, withholds the byte verdict and
+/// tolerance rows their one stream reads against every recorded frame, and never
+/// MATCHED under a fallback.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeclinedFrameComparison {
     /// The resolved topic whose comparison was declined.
     pub topic: String,
-    /// The rank(s) producing it whose read-log-steered injection stood down.
+    /// The rank(s) producing it whose read-log-steered injection stood down,
+    /// or, on a `split_topic_frames_unattributed` row, whose captured frames
+    /// were not compared.
     pub ranks: Vec<u32>,
-    /// The stable machine token of the cause, the same one the matching
-    /// [`InjectionStandDown::code`] carries.
+    /// The stable machine token of the cause: on a read-log decline, the same
+    /// one the matching [`InjectionStandDown::code`] carries.
     ///
-    /// TWO families reach this field: a whole-rank `VerifierDecline::code`
+    /// TWO read-log families reach this field: a whole-rank `VerifierDecline::code`
     /// (`verifier_declined_*`), and a PER-TOPIC read-log-derived
     /// `replay_inject::StandDownReason::code` (`truncated_read_log`,
-    /// `unresolved_producer`). Naming only the first family was false from the
+    /// `unresolved_producer`), and so does `split_topic_frames_unattributed`,
+    /// which no stand-down carries. Naming only the first family was false from the
     /// moment the second was admitted; `no_read_log_coverage` does not belong
     /// here and is excluded from the filter
     /// because it reports a recording that never carried read records, not a
@@ -3368,7 +3394,8 @@ pub struct DeclinedFrameComparison {
     /// intra-doc LINK from this public item to it is a `-D warnings` docs
     /// failure, so it is named rather than linked).
     pub code: String,
-    /// The stand-down's own sentence, so this row is readable alone.
+    /// The stand-down's own sentence, or the cause's, so this row is readable
+    /// alone.
     pub reason: String,
     /// The violations that were NOT reported as a verdict — verbatim, so nothing
     /// is hidden by the decline. EMPTY when the comparison matched.
@@ -3377,7 +3404,8 @@ pub struct DeclinedFrameComparison {
     /// under the fallback input stream. Always `withheld.is_empty()`; carried
     /// explicitly so the `--report` JSON states the outcome rather than leaving a
     /// reader to infer it from an absent array, and so the two outcomes can be
-    /// counted without walking `withheld`.
+    /// counted without walking `withheld`. Always `false` on a
+    /// `split_topic_frames_unattributed` row, whose frames were not compared.
     pub matched_under_fallback: bool,
 }
 
@@ -5617,8 +5645,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
 struct PassAccumulators {
     /// Per topic, the capture SUMMARY of every pass that captured it, in
     /// pass order (the ports die with their pass). A topic is captured by
-    /// every pass whose rank writes it, so a `multi_publisher_topics` topic
-    /// whose writers are split across ranks has one per such rank.
+    /// every pass whose rank runs a writer of it other than a driver, so a
+    /// `multi_publisher_topics` topic whose writers are split across ranks
+    /// has one per such rank.
     captures: IndexMap<String, Vec<CaptureSummary>>,
     tolerated_ragged_tails: Vec<String>,
     /// The two additive gates' stand-down channels. Empty on
@@ -5839,6 +5868,24 @@ fn assemble_outcome(
             }
             None => std::collections::HashMap::new(),
         };
+    // Per `node/output` label, the rank its node ran in, off the same
+    // `node_rank` map: the label a partitioned topic's writer is keyed by, so
+    // the frame tolerance bounds each writer by its own rank's tail. Empty on
+    // a single-rank bag, whose ranks have no tail.
+    let writer_ranks: std::collections::HashMap<String, u32> = node_rank
+        .map(|nr| {
+            config
+                .nodes
+                .iter()
+                .filter_map(|node| nr.get(node.id.as_str()).map(|&rank| (node, rank)))
+                .flat_map(|(node, rank)| {
+                    node.outputs
+                        .iter()
+                        .map(move |output| (format!("{}/{}", node.id, output.name), rank))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // The ranks whose READ-LOG-STEERED INJECTION stood down for
     // a WHOLE-RANK verifier decline, with the cause. Read off the stand-down rows
@@ -5897,16 +5944,23 @@ fn assemble_outcome(
         // its subscriber port) died with the pass that opened it.
         let summaries: &[CaptureSummary] = captures.get(topic).map_or(&[][..], Vec::as_slice);
         // A topic is judged over every pass that captured it: a pass whose
-        // rank writes it captures it, so a `multi_publisher_topics` topic
-        // whose writers run in several ranks has one capture per such rank.
-        // Partitioned by writer in each, it is one verdict per writer, each
-        // from the one pass that runs the writer (`merge_partitioned_summaries`).
-        // Where a pass did not partition it, each pass's capture is judged on
-        // its own (`push_split_unattributed_violations`).
+        // rank runs a writer of it other than a driver captures it, so a
+        // `multi_publisher_topics` topic whose writers run in several ranks
+        // has one capture per such rank. Partitioned by writer in each, it is
+        // one verdict per writer, each from the one pass that runs the writer
+        // (`merge_partitioned_summaries`). The only pass that counted a frame
+        // of it is judged alone where it neither partitioned nor injected the
+        // topic; any other mix is judged by `push_split_violations`.
         let shared = classes.driver_shared.contains(topic);
-        let merged = merge_partitioned_summaries(summaries);
-        let split_unattributed = merged.is_none() && summaries.len() > 1;
-        let summary: Option<&CaptureSummary> = merged.as_ref().or_else(|| summaries.last());
+        let judged = judge_passes(summaries);
+        let split = matches!(judged, PassJudgement::Split);
+        let (summary, alone_in): (Option<&CaptureSummary>, Option<u32>) = match &judged {
+            PassJudgement::One { summary, alone_in } => (*summary, *alone_in),
+            PassJudgement::Merged(merged) => (Some(&**merged), None),
+            PassJudgement::Split => (None, None),
+        };
+        // Every frame the replay compared is attributed to its writer.
+        let attributed = !split && summary.is_some_and(|c| c.partition_counts.is_some());
         // Partial report: under an ABORT a topic is judged iff
         // some rank that OWNS it COMPLETED — membership in the report's own
         // `rank_execution`, the same set the report states as complete, so
@@ -5954,11 +6008,12 @@ fn assemble_outcome(
         // inside the band still lands short, and one that over-produces beyond it
         // still lands long.
         //
-        // A split unattributed topic sums its passes' counts for the vacuous
-        // check alone: each pass is judged against the whole recorded count,
-        // and no reproduced band is taken off a count no verdict reads.
-        let replayed_count = if split_unattributed {
-            summaries.iter().map(|c| c.replayed_count).sum()
+        // A split topic counts the frames its passes' own writers published
+        // for the vacuous check alone: `push_split_violations` reads its
+        // counts off the passes, and no reproduced band is taken off a count
+        // no verdict reads.
+        let replayed_count = if split {
+            summaries.iter().map(CaptureSummary::own_replayed).sum()
         } else {
             summary.map_or(0, |c| c.replayed_count).saturating_sub(
                 covered_range
@@ -5967,14 +6022,8 @@ fn assemble_outcome(
                     .unwrap_or(0),
             )
         };
-        let (byte_violation, partition_counts) = if split_unattributed {
-            (None, None)
-        } else {
-            (
-                summary.and_then(|c| c.byte_violation.as_ref()),
-                summary.and_then(|c| c.partition_counts.clone()),
-            )
-        };
+        let byte_violation = summary.and_then(|c| c.byte_violation.as_ref());
+        let partition_counts = summary.and_then(|c| c.partition_counts.clone());
         // A topic a driver shares with re-executed writers is judged per
         // writer over the re-executed writers' partitions only
         // (`build_capture_partitionings`), so its topic-level count is theirs
@@ -5986,16 +6035,10 @@ fn assemble_outcome(
             Some(parts) if shared => parts.values().map(|c| c.recorded).sum(),
             _ => recorded_count,
         };
-        let tolerance_violations: Vec<Violation> = if split_unattributed {
-            summaries
-                .iter()
-                .flat_map(|c| c.tolerance_violations.iter().cloned())
-                .collect()
-        } else {
-            summary
-                .map(|c| c.tolerance_violations.clone())
-                .unwrap_or_default()
-        };
+        // A split topic's rows come from `push_split_violations`, which
+        // judges each pass's.
+        let tolerance_violations: Vec<Violation> =
+            summary.map_or_else(Vec::new, |c| tolerance_rows(topic, &c.tolerance_worsts));
         // A record-side-lossy topic (rules 5b/5e) RE-LABELS its real
         // diff to ONE attributed violation and forces exit 1 REGARDLESS of the
         // byte/count result (even a would-be-clean topic). A `multi_publisher`
@@ -6032,9 +6075,9 @@ fn assemble_outcome(
             continue; // vacuous — nothing produced or recorded on this topic.
         }
         topics_checked += 1;
-        // A shared topic a pass did not partition is diffed and counted over
-        // every recorded frame, the drivers' included.
-        if shared && merged.is_none() {
+        // A shared topic a pass did not partition is counted over every
+        // recorded frame no partition holds, the drivers' included.
+        if shared && !attributed {
             unattributed_shared.insert(topic.as_str());
         }
         // Tolerate TRAILING extra frames on a topic whose producing
@@ -6059,57 +6102,62 @@ fn assemble_outcome(
         //     writer's genuine shortfall and land inside the window. The window
         //     only ever explains frames produced PAST the recording's end, so it
         //     never explains a shortfall;
-        //   * `extra <= tolerated_extra` — bounded by the recording's own
-        //     `tail width × frames-per-step`; over-production beyond the tail is
-        //     a real bug and still fails;
-        //   * `tolerated_extra == 0` with no ragged tail (single-rank, or a rank
-        //     that ran to the authoritative end, or a non-owned/rank-0 topic) —
-        //     the tolerance is INERT, so a byte-identical replay still passes and
-        //     an over-produced frame still fails.
+        //   * the extra frames lie within the recording's own
+        //     `tail width × frames-per-step` (`tail_extra_ranks`);
+        //     over-production beyond the tail is a real bug and still fails;
+        //   * with no ragged tail (single-rank, or a rank that ran to the
+        //     authoritative end, or a non-owned/rank-0 topic) the window is
+        //     empty and the tolerance INERT, so a byte-identical replay still
+        //     passes and an over-produced frame still fails.
         // Recorded in `tolerated_ragged_tails` (never silent).
         //
-        // Over a topic owned by MORE THAN ONE rank (only a
-        // `multi_publisher_topics` topic whose writers were split) the
-        // widths are SUMMED — each owning rank can re-fire its own tail
-        // independently and the frames add, so the sum is the true ceiling on
-        // "extra frames the ragged shutdown can explain". In the single-rank case
-        // the sum has one term, so a single-writer topic's tolerance is exactly
-        // its one owner's width.
-        let owner_ranks = topic_owner_ranks.get(topic.as_str());
-        let tolerated_extra = owner_ranks
-            .map(|ranks| {
-                let per_step = recorded_messages.max_burst(topic).max(1);
-                ranks
-                    .iter()
-                    .map(|&rank| (ragged.tail_width(rank) as usize).saturating_mul(per_step))
-                    .fold(0usize, usize::saturating_add)
-            })
-            .unwrap_or(0);
+        // A partitioned topic is bounded WRITER BY WRITER: each writer's extra
+        // frames lie within its own node's rank's window, so one rank's tail
+        // never explains another rank's writer's frames, and the note names
+        // the ranks whose writers produced them. A topic compared as one
+        // stream cannot say which writer produced an extra frame, so it is
+        // bounded by the SUM of the windows of the ranks its frames come from:
+        // the topic's owning ranks, or the one pass judged alone. On a
+        // single-writer topic the sum has one term, its one owner's width.
+        // Never on a split topic `push_split_violations` judges: no pair of
+        // counts there states which pass's frames are extra.
+        let per_step = recorded_messages.max_burst(topic).max(1);
         let extra = replayed_count.saturating_sub(recorded_count);
-        // Never on a split unattributed topic: its passes are judged one by
-        // one, so no single pair of counts states its extra frames.
-        let ragged_trailing_tolerated = !split_unattributed
-            && extra > 0
+        let stream_ranks: BTreeSet<u32> = match alone_in {
+            Some(rank) => BTreeSet::from([rank]),
+            None => topic_owner_ranks
+                .get(topic.as_str())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let tail_ranks = if split {
+            None
+        } else {
+            tail_extra_ranks(
+                partition_counts.as_ref(),
+                &stream_ranks,
+                extra,
+                per_step,
+                |rank| ragged.tail_width(rank) as usize,
+                |writer| match writer {
+                    WriterKey::Named(label) => writer_ranks.get(&**label).copied(),
+                    WriterKey::Origin(_) => None,
+                },
+            )
+        };
+        let ragged_trailing_tolerated = extra > 0
             && recorded_count > 0
             && summary.is_none_or(|c| !c.any_byte_violation())
             && summary.is_none_or(CaptureSummary::no_writer_under_produced)
-            && extra <= tolerated_extra;
+            && tail_ranks.as_ref().is_some_and(|r| !r.is_empty());
         let before = violations.len();
+        let mut split_unjudged: Option<SplitUnjudged> = None;
         if ragged_trailing_tolerated {
-            // The note names every owning rank whose tail CONTRIBUTED
-            // to the tolerance (width > 0). `tolerated_extra > 0` here, so at
-            // least one did; on every single-writer topic that is exactly the
-            // one owning rank. Only a split `multi_publisher_topics` topic
-            // reaches the multi-rank arm.
-            let contributing: Vec<u32> = owner_ranks
-                .map(|ranks| {
-                    ranks
-                        .iter()
-                        .copied()
-                        .filter(|&rank| ragged.tail_width(rank) > 0)
-                        .collect()
-                })
-                .unwrap_or_default();
+            // The note names every rank whose tail explains extra frames: on a
+            // single-writer topic exactly the one owning rank, and the multi-rank
+            // arm only on a `multi_publisher_topics` topic whose writers were
+            // split.
+            let contributing: Vec<u32> = tail_ranks.unwrap_or_default();
             // The same two causes the structural note distinguishes —
             // a short boundary stream, or a final boundary that banked no fires.
             // The fire-less arm states the cause as an EITHER/OR because the
@@ -6167,8 +6215,12 @@ fn assemble_outcome(
             // partitioned topic as well as the topic-level one — a mid-stream
             // extra keeps its byte violation and falls through below), and
             // neither can a per-writer SHORTFALL (`no_writer_under_produced`).
-        } else if split_unattributed {
-            push_split_unattributed_violations(topic, recorded_count, summaries, &mut violations);
+        } else if split {
+            // The topic-level triage reads counts that leave a driver's frames
+            // out wherever a pass partitioned a topic a driver shares.
+            let triage = !shared || summaries.iter().all(|c| c.partition_counts.is_none());
+            split_unjudged =
+                push_split_violations(topic, recorded_count, summaries, triage, &mut violations);
         } else if let Some(parts) = partition_counts.as_ref().filter(|_| shared) {
             // Per writer, with no topic-level triage: the topic-level counts
             // leave the drivers' frames out, so a `MissingTopic` ("replay
@@ -6233,7 +6285,13 @@ fn assemble_outcome(
             None => Vec::new(),
         };
         if !declining.is_empty() {
-            let withheld: Vec<Violation> = violations.split_off(before);
+            let mut withheld: Vec<Violation> = violations.split_off(before);
+            withheld.extend(
+                split_unjudged
+                    .take()
+                    .map(|u| u.withheld)
+                    .unwrap_or_default(),
+            );
             let matched_under_fallback = withheld.is_empty();
             // The cause is taken from the FIRST declining owner. Where the cause
             // is the whole-rank census decline that is exact — one
@@ -6293,6 +6351,47 @@ fn assemble_outcome(
             // decline array names which is which — a topic counted as passed would
             // claim a verification that did not happen.
             continue;
+        }
+        // A split topic some pass's frames could not be compared on is
+        // DECLINED when nothing else on it failed: neither passed, for those
+        // frames were not compared, nor failed, for their one-stream verdicts
+        // say nothing of the candidate, which `withheld` carries verbatim. Not
+        // counted in `topics_passed`, as above. Where something else failed,
+        // the topic fails on that alone.
+        if let Some(unjudged) = split_unjudged {
+            if violations.len() == before {
+                tracing::warn!(
+                    topic = %topic,
+                    ranks = ?unjudged.ranks,
+                    code = SPLIT_FRAMES_UNATTRIBUTED,
+                    withheld = unjudged.withheld.len(),
+                    "replay: the frame comparison on this `multi_publisher_topics` topic is \
+                     DECLINED, not passed: the processes or executor units in `ranks` could not \
+                     attribute its recorded frames to their writers, and the frames each \
+                     captured, its own writers' alone, have no recorded stream to be compared \
+                     with while another one captured frames of the topic too. It is counted in \
+                     `topics_checked`, never `topics_passed`, and recorded in \
+                     `declined_frame_comparisons`. A bag that labels each frame with its writer, \
+                     within the verifier's record budget, compares each writer where it runs."
+                );
+                declined_frame_comparisons.push(DeclinedFrameComparison {
+                    topic: topic.clone(),
+                    ranks: unjudged.ranks,
+                    code: SPLIT_FRAMES_UNATTRIBUTED.to_string(),
+                    reason: SPLIT_FRAMES_UNATTRIBUTED_REASON.to_string(),
+                    matched_under_fallback: false,
+                    withheld: unjudged.withheld,
+                });
+                continue;
+            }
+            tracing::warn!(
+                topic = %topic,
+                ranks = ?unjudged.ranks,
+                "replay: this `multi_publisher_topics` topic failed on the frames the replay \
+                 could compare, and the frames the processes or executor units in `ranks` \
+                 captured were not compared: those could not attribute the topic's recorded \
+                 frames to their writers"
+            );
         }
         if violations.len() == before {
             topics_passed += 1;
@@ -9569,11 +9668,19 @@ struct CaptureSummary {
     /// reports per writer in [`Self::partition_counts`]; see
     /// [`Self::any_byte_violation`].
     byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
-    /// The per-field tolerance violations, already rendered against the topic.
-    tolerance_violations: Vec<Violation>,
+    /// The `--tolerance` fields whose bound some frame exceeded, each with its
+    /// worst frame, unrendered: the passes that captured one topic fold them
+    /// into one row per field and metric ([`fold_tolerance_worsts`]).
+    tolerance_worsts: Vec<FieldMetric>,
     /// The per-WRITER count/byte inputs of a label-partitioned topic (`None` on
     /// every single-stream topic).
     partition_counts: Option<BTreeMap<WriterKey, PartitionCounts>>,
+    /// The rank of the pass that captured the topic.
+    rank: u32,
+    /// The frames this pass's injector re-published on the topic: recorded
+    /// frames of the writers other passes run, which a capture that did not
+    /// partition the topic counts beside its own writers' frames.
+    injected: usize,
 }
 
 impl CaptureSummary {
@@ -9611,6 +9718,18 @@ impl CaptureSummary {
         self.partition_counts
             .as_ref()
             .is_none_or(|p| p.values().all(|c| c.replayed >= c.recorded))
+    }
+
+    /// The counted frames this pass's own writers published: every counted
+    /// frame of a partitioned topic, whose capture leaves its injector's frames
+    /// out, and every counted frame but the injected ones of a topic captured
+    /// as one stream.
+    fn own_replayed(&self) -> usize {
+        if self.partition_counts.is_some() {
+            self.replayed_count
+        } else {
+            self.replayed_count.saturating_sub(self.injected)
+        }
     }
 }
 
@@ -16603,6 +16722,8 @@ fn run_rank_pass(
     //
     // A stream's first byte divergence is judged HERE, after the step loop:
     // its frame pair is decoded to name the differing field, then dropped.
+    // The injector's count is read here too, while the dispatch still holds
+    // the injectors.
     let captures: IndexMap<String, CaptureSummary> = captures_owned
         .iter_mut()
         .map(|(topic, c)| {
@@ -16620,8 +16741,10 @@ fn run_rank_pass(
                 CaptureSummary {
                     replayed_count: c.replayed_count,
                     byte_violation,
-                    tolerance_violations: c.tolerance_violations(topic),
+                    tolerance_worsts: c.tolerance_worsts(),
                     partition_counts,
+                    rank: plan.rank(),
+                    injected: injectors.get(topic).map_or(0, |i| i.injected),
                 },
             )
         })
@@ -16820,8 +16943,9 @@ struct TopicClasses {
     /// The `produced` topics a driver writes beside at least one other node (a
     /// `multi_publisher_topics` topic), in graph order: captured, and diffed
     /// over the other writers' frames only where every pass that captures it
-    /// partitions it (`build_capture_partitionings`), over every recorded
-    /// frame where one does not.
+    /// partitions it (`build_capture_partitionings`), and counted over every
+    /// recorded frame no partition holds where one does not
+    /// (`push_split_violations`).
     driver_shared: Vec<String>,
     /// The graph's `external` (driver) nodes ([`external_node_ids`]). A pass
     /// captures only a topic one of its other members writes, and a driver's
@@ -18139,7 +18263,8 @@ struct CapturePartitioning {
     /// compare: its own `external` drivers, whose frames are recorded inputs,
     /// and, as a [`WriterKey::Origin`], the publisher of its injector, which
     /// re-publishes the recorded frames of every foreign writer of the topic,
-    /// copies of what each writer's own pass publishes and compares. A
+    /// copies of what each writer's own pass publishes and compares, or a
+    /// foreign driver's recorded inputs, which no pass compares. A
     /// captured frame of one of these is left out of the diff, the loss
     /// tripwire and every count, and a replayed driver's (not an injected
     /// one's) is written to `--record-out`.
@@ -18387,6 +18512,7 @@ struct CaptureTolerance {
 }
 
 /// One overridden field's metric plan + O(1) running-worst accumulator.
+#[derive(Debug, Clone)]
 struct FieldMetric {
     /// The top-level field name.
     field: String,
@@ -19077,43 +19203,83 @@ impl Capture {
         }))
     }
 
-    /// The [`ViolationClass::ToleranceExceeded`]
-    /// violations for this topic — one per overridden field whose running-worst
-    /// accumulator tripped its bound across the replayed frames. Empty when no
-    /// tolerance targets the topic or every tolerated field stayed within
-    /// bounds. Deterministic order (field declaration order in the document).
-    fn tolerance_violations(&self, topic: &str) -> Vec<Violation> {
-        let Some(ct) = &self.tolerance else {
-            return Vec::new();
-        };
-        ct.metrics
-            .iter()
-            .filter(|m| m.violated)
-            .map(|m| {
-                let threshold = m.metric.report_threshold();
-                let (worst_value, worst_desc) = m.worst_value_report();
-                Violation {
-                    topic: topic.to_string(),
-                    class: ViolationClass::ToleranceExceeded {
-                        metric: m.metric.label().to_string(),
-                        field: Some(m.field.clone()),
-                        worst_value,
-                        threshold,
-                        worst_tick: m.worst_tick,
-                    },
-                    detail: format!(
-                        "field '{}' exceeded the {} tolerance on '{topic}': {} vs threshold {} \
-                         (worst at frame {})",
-                        m.field,
-                        m.metric.label(),
-                        worst_desc,
-                        threshold,
-                        m.worst_tick
-                    ),
-                }
-            })
-            .collect()
+    /// The overridden fields whose running-worst accumulator tripped its bound
+    /// across the replayed frames, each with its worst frame, in field
+    /// declaration order. Empty when no tolerance targets the topic or every
+    /// tolerated field stayed within bounds.
+    fn tolerance_worsts(&self) -> Vec<FieldMetric> {
+        self.tolerance.as_ref().map_or_else(Vec::new, |ct| {
+            ct.metrics.iter().filter(|m| m.violated).cloned().collect()
+        })
     }
+}
+
+/// The tolerated fields that tripped their bound in any of the passes that
+/// captured one topic, folded to one entry per field and metric, in first-seen
+/// order. PURE.
+///
+/// Each entry keeps the worst frame [`FieldMetric::observe`] would keep over
+/// the frames of every pass: the larger `worst_exceedance`, and on a tie the
+/// earlier pass's. A structurally incomparable worst frame carries an infinite
+/// exceedance, so it outranks every finite divergence here as it does within
+/// a pass. Every pass compiles the same tolerance plan for a topic, so a
+/// field and metric pair names one declaration.
+fn fold_tolerance_worsts<'a>(
+    passes: impl IntoIterator<Item = &'a [FieldMetric]>,
+) -> Vec<FieldMetric> {
+    let mut folded: Vec<FieldMetric> = Vec::new();
+    for metrics in passes {
+        for m in metrics {
+            match folded
+                .iter_mut()
+                .find(|f| f.field == m.field && f.metric == m.metric)
+            {
+                Some(kept) => {
+                    if m.worst_exceedance > kept.worst_exceedance {
+                        kept.worst_exceedance = m.worst_exceedance;
+                        kept.worst_value = m.worst_value;
+                        kept.worst_tick = m.worst_tick;
+                        kept.worst_cause = m.worst_cause;
+                    }
+                    kept.violated |= m.violated;
+                }
+                None => folded.push(m.clone()),
+            }
+        }
+    }
+    folded
+}
+
+/// The [`ViolationClass::ToleranceExceeded`] violations of `topic`: one per
+/// field of `worsts` that tripped its bound, in their order.
+fn tolerance_rows(topic: &str, worsts: &[FieldMetric]) -> Vec<Violation> {
+    worsts
+        .iter()
+        .filter(|m| m.violated)
+        .map(|m| {
+            let threshold = m.metric.report_threshold();
+            let (worst_value, worst_desc) = m.worst_value_report();
+            Violation {
+                topic: topic.to_string(),
+                class: ViolationClass::ToleranceExceeded {
+                    metric: m.metric.label().to_string(),
+                    field: Some(m.field.clone()),
+                    worst_value,
+                    threshold,
+                    worst_tick: m.worst_tick,
+                },
+                detail: format!(
+                    "field '{}' exceeded the {} tolerance on '{topic}': {} vs threshold {} \
+                     (worst at frame {})",
+                    m.field,
+                    m.metric.label(),
+                    worst_desc,
+                    threshold,
+                    m.worst_tick
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Every graph-produced topic on this pass with TWO OR MORE
@@ -19304,8 +19470,8 @@ fn build_capture_partitionings(
     // publisher, the injector's, however many writers that is; its id is not
     // in this run's own table, so its captured frames classify
     // `WriterKey::Origin`. They are recorded frames: copies of what each
-    // foreign writer's own pass publishes and compares, or a driver's recorded
-    // inputs. So none of them is compared here, and none needs attributing to
+    // foreign writer's own pass publishes and compares, or a foreign driver's
+    // recorded inputs, which no pass compares. So none of them is compared here, and none needs attributing to
     // the writer that recorded it: the injector's id is named in
     // `CapturePartitioning::uncompared` as `WriterKey::Origin`, and the drain
     // leaves its frames out of the diff, the tripwire and every count. Each
@@ -24944,36 +25110,170 @@ fn push_partition_violations(
     }
 }
 
+/// How the capture summaries of one topic, one per pass that captured it in
+/// pass order, are judged ([`judge_passes`]).
+#[derive(Debug)]
+enum PassJudgement<'a> {
+    /// One summary stands for the topic: its only capture, or none at all,
+    /// with `alone_in: None`; or, with `alone_in: Some(rank)`, the only pass
+    /// of several that counted a frame of it, which neither partitioned nor
+    /// injected it.
+    One {
+        summary: Option<&'a CaptureSummary>,
+        alone_in: Option<u32>,
+    },
+    /// Every pass partitioned the topic: the union of their partitions
+    /// ([`merge_partitioned_summaries`]).
+    Merged(Box<CaptureSummary>),
+    /// Several passes captured the topic and at least one did not partition
+    /// it ([`push_split_violations`]).
+    Split,
+}
+
+/// Choose how the capture summaries of one topic are judged. PURE.
+///
+/// A pass captures a topic when its rank runs a writer of it other than a
+/// driver. A pass that did not partition the topic and injected none of its
+/// frames captured its own writers' frames alone. Where it is the only pass
+/// that counted any, it is judged alone against every recorded frame: the
+/// other passes' writers published nothing, so a recorded frame of theirs is
+/// one this stream lacks, and the stream fails. An unpartitioned pass counts
+/// every frame its injector re-published, so where the only pass that counted
+/// a frame injected none, no unpartitioned pass injected the topic; a
+/// partitioned pass counts none of its injector's frames, whatever it
+/// injected.
+fn judge_passes(summaries: &[CaptureSummary]) -> PassJudgement<'_> {
+    if summaries.len() <= 1 {
+        return PassJudgement::One {
+            summary: summaries.first(),
+            alone_in: None,
+        };
+    }
+    if let Some(merged) = merge_partitioned_summaries(summaries) {
+        return PassJudgement::Merged(Box::new(merged));
+    }
+    let mut counting = summaries.iter().filter(|s| s.replayed_count > 0);
+    if let (Some(only), None) = (counting.next(), counting.next()) {
+        if only.partition_counts.is_none() && only.injected == 0 {
+            return PassJudgement::One {
+                summary: Some(only),
+                alone_in: Some(only.rank),
+            };
+        }
+    }
+    PassJudgement::Split
+}
+
+/// What [`push_split_violations`] could not judge: the passes that captured a
+/// split topic as one stream of their own writers' frames alone, beside other
+/// passes that captured frames of it too, by rank, and the verdicts their one
+/// stream reads against every recorded frame, which say nothing of the
+/// candidate.
+#[derive(Debug)]
+struct SplitUnjudged {
+    ranks: Vec<u32>,
+    withheld: Vec<Violation>,
+}
+
+/// The machine token of a [`DeclinedFrameComparison`] whose topic
+/// [`push_split_violations`] could not judge.
+const SPLIT_FRAMES_UNATTRIBUTED: &str = "split_topic_frames_unattributed";
+
+/// The [`DeclinedFrameComparison::reason`] of a [`SPLIT_FRAMES_UNATTRIBUTED`]
+/// decline.
+const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in several processes \
+     or executor units, and those these ranks name could not attribute its recorded frames to \
+     their writers: the frames each captured, its own writers' alone, were not compared, since \
+     another one captured frames of the topic too and no recorded stream lines up with them. \
+     A bag that labels each frame with its writer, within the verifier's record budget, \
+     compares each writer where it runs";
+
 /// The violations of a topic several passes captured, at least one of them
-/// without partitioning it by writer. Each such pass is judged as one stream:
-/// every recorded frame of the topic (`recorded_count`, a driver's included)
-/// against every frame the pass captured. The writers of the passes that did
-/// partition it are judged per writer ([`merge_partitioned_summaries`]). No
-/// count is summed across passes: a frame one pass injects and another
-/// publishes live would count twice, and could net against a shortfall
-/// elsewhere.
-fn push_split_unattributed_violations(
+/// without partitioning it by writer, and what could not be judged. PURE.
+///
+/// With `triage`, a topic whose passes' writers published no frame is one
+/// `MissingTopic`, and one whose bag holds no frame one `ExtraTopic`, as
+/// [`push_topic_violations`] judges a topic. The caller turns it off on a
+/// topic a driver shares that a pass partitioned, whose partitions leave the
+/// driver's frames out.
+///
+/// The partitioned passes are judged per writer
+/// ([`merge_partitioned_summaries`]). The other passes are judged together by
+/// count: every recorded frame no partition holds, a driver's included,
+/// against the frames their own writers published, which leaves out the
+/// frames their injectors re-published ([`CaptureSummary::own_replayed`]). A
+/// pass that injected the topic captured its own writers' frames among the
+/// recorded frames of every other writer, so its one stream is compared with
+/// every recorded frame byte for byte. A pass that injected nothing captured
+/// its own writers' frames alone, which no recorded stream lines up with
+/// while another pass captured frames too, so its byte verdict and its
+/// tolerance rows are returned unjudged ([`SplitUnjudged`]), with its rank.
+/// The tolerance rows of the judged passes fold to one per field and metric
+/// ([`fold_tolerance_worsts`]).
+fn push_split_violations(
     topic: &str,
     recorded_count: usize,
     summaries: &[CaptureSummary],
+    triage: bool,
     violations: &mut Vec<Violation>,
-) {
-    for summary in summaries.iter().filter(|s| s.partition_counts.is_none()) {
-        push_stream_violations(
-            topic,
-            None,
-            recorded_count,
-            summary.replayed_count,
-            summary.byte_violation.as_ref(),
-            violations,
-        );
+) -> Option<SplitUnjudged> {
+    let own: usize = summaries.iter().map(CaptureSummary::own_replayed).sum();
+    if triage {
+        if recorded_count > 0 && own == 0 {
+            push_topic_violations(topic, recorded_count, 0, None, None, violations);
+            return None;
+        }
+        if recorded_count == 0 && own > 0 {
+            push_topic_violations(topic, 0, own, None, None, violations);
+            return None;
+        }
     }
-    let partitioned = summaries.iter().filter(|s| s.partition_counts.is_some());
-    if let Some(parts) =
-        merge_partitioned_summaries(partitioned).and_then(|merged| merged.partition_counts)
-    {
-        push_partition_violations(topic, &parts, violations);
+    let (partitioned, one_stream): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
+        summaries.iter().partition(|s| s.partition_counts.is_some());
+    let merged = merge_partitioned_summaries(partitioned.iter().copied());
+    let parts = merged.as_ref().and_then(|m| m.partition_counts.as_ref());
+    if let Some(parts) = parts {
+        push_partition_violations(topic, parts, violations);
     }
+    let partitioned_recorded: usize = parts.map_or(0, |p| p.values().map(|c| c.recorded).sum());
+    push_stream_violations(
+        topic,
+        None,
+        recorded_count.saturating_sub(partitioned_recorded),
+        one_stream.iter().map(|s| s.own_replayed()).sum(),
+        None,
+        violations,
+    );
+    let (injecting, own_only): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
+        one_stream.into_iter().partition(|s| s.injected > 0);
+    for s in &injecting {
+        if let Some(bv) = &s.byte_violation {
+            violations.push(byte_mismatch_violation(topic, None, bv));
+        }
+    }
+    let judged = partitioned.iter().chain(&injecting);
+    violations.extend(tolerance_rows(
+        topic,
+        &fold_tolerance_worsts(judged.map(|s| s.tolerance_worsts.as_slice())),
+    ));
+    let unjudged: Vec<&CaptureSummary> = own_only
+        .into_iter()
+        .filter(|s| s.replayed_count > 0)
+        .collect();
+    if unjudged.is_empty() {
+        return None;
+    }
+    let mut ranks: Vec<u32> = unjudged.iter().map(|s| s.rank).collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+    let mut withheld = Vec::new();
+    for s in &unjudged {
+        if let Some(bv) = &s.byte_violation {
+            withheld.push(byte_mismatch_violation(topic, None, bv));
+        }
+        withheld.extend(tolerance_rows(topic, &s.tolerance_worsts));
+    }
+    Some(SplitUnjudged { ranks, withheld })
 }
 
 /// The capture summaries of one topic, from every pass that captured it in
@@ -24984,17 +25284,20 @@ fn push_split_unattributed_violations(
 /// in one rank, so the fold is the union of the passes' partitions. A
 /// partition two passes both hold has its counts added and keeps the first
 /// pass's byte violation, so no captured frame drops out of the verdict. The
-/// fold's frame count is its partitions' sum, and its per-field tolerance
-/// violations are every pass's.
+/// fold's frame count is its partitions' sum, its tolerance worsts fold to one
+/// per field and metric ([`fold_tolerance_worsts`]), its injected count is the
+/// passes' sum, which no partition counts, and its rank is the first pass's.
 fn merge_partitioned_summaries<'a>(
     summaries: impl IntoIterator<Item = &'a CaptureSummary>,
 ) -> Option<CaptureSummary> {
     let mut parts: BTreeMap<WriterKey, PartitionCounts> = BTreeMap::new();
-    let mut tolerance_violations: Vec<Violation> = Vec::new();
-    let mut any = false;
+    let mut worsts: Vec<&[FieldMetric]> = Vec::new();
+    let mut first_rank: Option<u32> = None;
+    let mut injected = 0usize;
     for summary in summaries {
         let counts = summary.partition_counts.as_ref()?;
-        any = true;
+        first_rank.get_or_insert(summary.rank);
+        injected = injected.saturating_add(summary.injected);
         for (writer, c) in counts {
             let kept = parts.entry(writer.clone()).or_insert(PartitionCounts {
                 recorded: 0,
@@ -25007,14 +25310,66 @@ fn merge_partitioned_summaries<'a>(
                 kept.byte_violation = c.byte_violation.clone();
             }
         }
-        tolerance_violations.extend(summary.tolerance_violations.iter().cloned());
+        worsts.push(&summary.tolerance_worsts);
     }
-    any.then(|| CaptureSummary {
+    first_rank.map(|rank| CaptureSummary {
         replayed_count: parts.values().map(|c| c.replayed).sum(),
         byte_violation: None,
-        tolerance_violations,
+        tolerance_worsts: fold_tolerance_worsts(worsts),
         partition_counts: Some(parts),
+        rank,
+        injected,
     })
+}
+
+/// The ranks whose ragged shutdown tails explain a topic's trailing extra
+/// frames, or `None` when one of them lies past every window that could
+/// explain it. PURE.
+///
+/// A partitioned topic is bounded writer by writer: each writer's extra
+/// frames, `replayed - recorded`, lie within its own node's rank's window,
+/// `tail_width(rank) x per_step` (`writer_rank`), and the ranks named are
+/// those whose writers produced extra frames. A writer whose rank is unknown
+/// has no window. A topic compared as one stream cannot say which writer
+/// produced an extra frame, so its `extra` frames lie within the sum of the
+/// windows of `stream_ranks`, the ranks its frames come from, and the ranks
+/// named are those with a tail.
+fn tail_extra_ranks(
+    partitions: Option<&BTreeMap<WriterKey, PartitionCounts>>,
+    stream_ranks: &BTreeSet<u32>,
+    extra: usize,
+    per_step: usize,
+    tail_width: impl Fn(u32) -> usize,
+    writer_rank: impl Fn(&WriterKey) -> Option<u32>,
+) -> Option<Vec<u32>> {
+    let window = |rank: u32| tail_width(rank).saturating_mul(per_step);
+    let mut ranks: BTreeSet<u32> = BTreeSet::new();
+    match partitions {
+        Some(parts) => {
+            for (writer, c) in parts {
+                let over = c.replayed.saturating_sub(c.recorded);
+                if over == 0 {
+                    continue;
+                }
+                let rank = writer_rank(writer)?;
+                if over > window(rank) {
+                    return None;
+                }
+                ranks.insert(rank);
+            }
+        }
+        None => {
+            let allowance = stream_ranks
+                .iter()
+                .map(|&rank| window(rank))
+                .fold(0usize, usize::saturating_add);
+            if extra > allowance {
+                return None;
+            }
+            ranks.extend(stream_ranks.iter().filter(|&&rank| tail_width(rank) > 0));
+        }
+    }
+    Some(ranks.into_iter().collect())
 }
 
 /// The count + byte verdict of ONE frame stream — a whole topic when `writer`
@@ -25061,17 +25416,29 @@ fn push_stream_violations(
     // the incremental diff and judged at the pass harvest; append it, matching
     // the batch diff which reported only the FIRST differing frame per topic.
     if let Some(bv) = byte_violation {
-        violations.push(Violation {
-            topic: topic.to_string(),
-            class: ViolationClass::ByteMismatch {
-                index: bv.index,
-                first_diff_byte_offset: bv.first_diff_byte_offset,
-                recorded_len: bv.recorded_len,
-                replayed_len: bv.replayed_len,
-                difference: crate::replay_value_diff::report_entry(&bv.difference),
-            },
-            detail: crate::replay_value_diff::byte_mismatch_detail(topic, &scope, bv),
-        });
+        violations.push(byte_mismatch_violation(topic, writer, bv));
+    }
+}
+
+/// The [`ViolationClass::ByteMismatch`] of one frame stream's first byte
+/// divergence: a whole topic's when `writer` is `None`, one writer's
+/// partition's when it is `Some`.
+fn byte_mismatch_violation(
+    topic: &str,
+    writer: Option<&WriterKey>,
+    bv: &crate::replay_value_diff::ByteVerdict,
+) -> Violation {
+    let scope = writer.map_or_else(String::new, |w| format!(" from writer {w}"));
+    Violation {
+        topic: topic.to_string(),
+        class: ViolationClass::ByteMismatch {
+            index: bv.index,
+            first_diff_byte_offset: bv.first_diff_byte_offset,
+            recorded_len: bv.recorded_len,
+            replayed_len: bv.replayed_len,
+            difference: crate::replay_value_diff::report_entry(&bv.difference),
+        },
+        detail: crate::replay_value_diff::byte_mismatch_detail(topic, &scope, bv),
     }
 }
 
@@ -29880,11 +30247,13 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         let _ = writeln!(
             s,
             "NOTE: the frame comparison was DECLINED on {} topic(s) ({} matched under the \
-             fallback, {} had divergences withheld) — a refused read log steered their \
-             producer's input stream, so a difference there would be the harness, not the \
-             candidate, and a MATCH is evidence the fallback reproduced the frames rather \
-             than evidence the candidate is correct. None is counted as passed; none is \
-             reported as a violation. Re-record the bag with this binary to verify them:",
+             fallback, {} had divergences withheld). Where a refused read log steered the \
+             producer's input stream, a difference would be the harness, not the candidate, \
+             and a MATCH is evidence the fallback reproduced the frames rather than evidence \
+             the candidate is correct; re-record the bag with this binary to verify such a \
+             topic. Where the replay could not attribute a split topic's frames to their \
+             writers, the frames no recorded stream lines up with were not compared. None is \
+             counted as passed; none is reported as a violation. Each line names its cause:",
             outcome.declined_frame_comparisons.len(),
             outcome
                 .declined_frame_comparisons
@@ -29894,7 +30263,7 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
             outcome
                 .declined_frame_comparisons
                 .iter()
-                .filter(|d| !d.matched_under_fallback)
+                .filter(|d| !d.withheld.is_empty())
                 .count()
         );
         for d in &outcome.declined_frame_comparisons {
@@ -35930,7 +36299,9 @@ mod capture_partition_tests {
         CaptureSummary {
             replayed_count: parts.iter().map(|p| p.2).sum(),
             byte_violation: None,
-            tolerance_violations: Vec::new(),
+            tolerance_worsts: Vec::new(),
+            rank: 0,
+            injected: 0,
             partition_counts: Some(
                 parts
                     .iter()
@@ -36022,6 +36393,380 @@ mod capture_partition_tests {
         assert!(merge_partitioned_summaries([&one, &unpartitioned]).is_none());
         assert!(merge_partitioned_summaries([&unpartitioned, &one]).is_none());
         assert!(merge_partitioned_summaries(&[] as &[CaptureSummary]).is_none());
+    }
+
+    /// One pass's summary of a topic it captured as one stream: `replayed`
+    /// counted frames, `injected` of them its injector's, in rank `rank`,
+    /// its first byte divergence at `diverged`.
+    fn one_stream(
+        rank: u32,
+        replayed: usize,
+        injected: usize,
+        diverged: Option<usize>,
+    ) -> CaptureSummary {
+        CaptureSummary {
+            replayed_count: replayed,
+            byte_violation: diverged.map(verdict_at),
+            tolerance_worsts: Vec::new(),
+            partition_counts: None,
+            rank,
+            injected,
+        }
+    }
+
+    /// `pass_summary` in rank `rank`.
+    fn partitioned_in(rank: u32, parts: &[(&str, usize, usize, Option<usize>)]) -> CaptureSummary {
+        CaptureSummary {
+            rank,
+            ..pass_summary(parts)
+        }
+    }
+
+    /// The `(rank of the pass judged alone, its frame count)` a judgement
+    /// names, `"merged"` or `"split"`.
+    fn judgement(summaries: &[CaptureSummary]) -> String {
+        match judge_passes(summaries) {
+            PassJudgement::One { summary, alone_in } => format!(
+                "one {alone_in:?} {:?}",
+                summary.map(|s| (s.rank, s.replayed_count))
+            ),
+            PassJudgement::Merged(_) => "merged".to_string(),
+            PassJudgement::Split => "split".to_string(),
+        }
+    }
+
+    /// A topic one pass captured is that pass's; every pass partitioned is
+    /// their union. The only pass that counted a frame, neither partitioning
+    /// nor injecting the topic, is judged alone in either pass order, beside a
+    /// partitioned pass that injected it too. Any other mix is split: an
+    /// unpartitioned pass that injected, a partitioned counting pass, two
+    /// counting passes, or none.
+    #[test]
+    fn a_topic_s_passes_are_judged_alone_merged_or_split() {
+        assert_eq!(judgement(&[]), "one None None");
+        assert_eq!(
+            judgement(&[one_stream(1, 5, 0, None)]),
+            "one None Some((1, 5))"
+        );
+        assert_eq!(
+            judgement(&[pass_summary(&[("a/out", 1, 1, None)]), pass_summary(&[])]),
+            "merged"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 0, 0, None), one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 5, 0, None), one_stream(1, 0, 0, None)]),
+            "one Some(0) Some((0, 5))"
+        );
+        assert_eq!(
+            judgement(&[partitioned_in(0, &[]), one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))",
+            "a partitioned pass that captured nothing"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 0, 0, None), one_stream(1, 5, 2, None)]),
+            "split",
+            "an injected pass"
+        );
+        let partitioned_injecting = CaptureSummary {
+            injected: 3,
+            ..partitioned_in(0, &[])
+        };
+        assert_eq!(
+            judgement(&[partitioned_injecting, one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))",
+            "a partitioned pass counts none of its injector's frames"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 2, 0, None), one_stream(1, 5, 0, None)]),
+            "split"
+        );
+        assert_eq!(
+            judgement(&[
+                partitioned_in(0, &[("a/out", 4, 4, None)]),
+                one_stream(1, 0, 0, None)
+            ]),
+            "split",
+            "the capturing pass partitioned"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 0, 0, None), one_stream(1, 0, 0, None)]),
+            "split"
+        );
+    }
+
+    /// The `(class, detail)` rows of `violations`, classes by kind and counts.
+    fn named(violations: &[Violation]) -> Vec<String> {
+        violations
+            .iter()
+            .map(|v| match &v.class {
+                ViolationClass::MissingMessages { recorded, replayed } => {
+                    format!("missing {recorded} {replayed}: {}", v.detail)
+                }
+                ViolationClass::ExtraMessages { recorded, replayed } => {
+                    format!("extra {recorded} {replayed}: {}", v.detail)
+                }
+                ViolationClass::ByteMismatch { index, .. } => format!("byte {index}"),
+                ViolationClass::MissingTopic => format!("missing-topic: {}", v.detail),
+                ViolationClass::ExtraTopic => format!("extra-topic: {}", v.detail),
+                ViolationClass::ToleranceExceeded {
+                    field, worst_tick, ..
+                } => format!("tolerance {field:?} at {worst_tick}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// The rows `push_split_violations` pushed and, when it could not judge
+    /// some pass, those passes' ranks and withheld rows.
+    type SplitRows = (Vec<String>, Option<(Vec<u32>, Vec<String>)>);
+
+    /// Run `push_split_violations` on `/t` and return its rows and what it
+    /// could not judge.
+    fn split(recorded: usize, summaries: &[CaptureSummary], triage: bool) -> SplitRows {
+        let mut violations = Vec::new();
+        let unjudged = push_split_violations("/t", recorded, summaries, triage, &mut violations);
+        (
+            named(&violations),
+            unjudged.map(|u| (u.ranks, named(&u.withheld))),
+        )
+    }
+
+    /// A split topic's partitioned passes are judged per writer, and the rest
+    /// together by count: every recorded frame no partition holds against the
+    /// frames their own writers published. A pass that injected the topic is
+    /// judged byte for byte; one that injected nothing, beside another pass
+    /// with frames, is unjudged, its byte verdict withheld. Hand oracles.
+    #[test]
+    fn a_split_topic_is_counted_together_and_compared_where_a_stream_lines_up() {
+        // Rank 0 attributes `w2`'s 4 frames; rank 1 published `w3`'s 4 and
+        // its one stream reads a difference at frame 1 against all 8.
+        let mixed = |w3: usize| {
+            [
+                partitioned_in(0, &[("w2/out", 4, 4, None)]),
+                one_stream(1, w3, 0, Some(1)),
+            ]
+        };
+        assert_eq!(
+            split(8, &mixed(4), true),
+            (vec![], Some((vec![1], vec!["byte 1".to_string()])))
+        );
+        assert_eq!(
+            split(8, &mixed(3), true),
+            (
+                vec!["missing 4 3: recorded 4 frame(s), replay produced 3 on '/t'".to_string()],
+                Some((vec![1], vec!["byte 1".to_string()]))
+            )
+        );
+        // A changed `w2` is its own writer's verdict.
+        let changed = [
+            partitioned_in(0, &[("w2/out", 4, 4, Some(0))]),
+            one_stream(1, 4, 0, Some(1)),
+        ];
+        assert_eq!(
+            split(8, &changed, true),
+            (
+                vec!["byte 0".to_string()],
+                Some((vec![1], vec!["byte 1".to_string()]))
+            )
+        );
+        // Two passes of their own writers' frames alone: counted together.
+        let two = |a: usize, b: usize| [one_stream(0, a, 0, Some(0)), one_stream(1, b, 0, None)];
+        assert_eq!(
+            split(7, &two(2, 5), true),
+            (vec![], Some((vec![0, 1], vec!["byte 0".to_string()])))
+        );
+        assert_eq!(
+            split(7, &two(1, 5), true).0,
+            vec!["missing 7 6: recorded 7 frame(s), replay produced 6 on '/t'".to_string()]
+        );
+        // Passes that injected the rest are compared with every recorded
+        // frame, counted by their own writers' frames.
+        let injecting = [one_stream(0, 6, 3, None), one_stream(1, 6, 3, Some(2))];
+        assert_eq!(
+            split(6, &injecting, true),
+            (vec!["byte 2".to_string()], None)
+        );
+        let short = [one_stream(0, 6, 3, None), one_stream(1, 5, 3, None)];
+        assert_eq!(
+            split(6, &short, true),
+            (
+                vec!["missing 6 5: recorded 6 frame(s), replay produced 5 on '/t'".to_string()],
+                None
+            )
+        );
+        // An injected pass beside one of its own writers' frames alone.
+        assert_eq!(
+            split(
+                6,
+                &[one_stream(0, 6, 3, None), one_stream(1, 3, 0, None)],
+                true
+            ),
+            (vec![], Some((vec![1], vec![])))
+        );
+        // A pass with no frame of its own is counted, never unjudged.
+        assert_eq!(
+            split(
+                6,
+                &[
+                    partitioned_in(0, &[("w2/out", 3, 3, None)]),
+                    one_stream(1, 0, 0, None)
+                ],
+                true
+            ),
+            (
+                vec!["missing 3 0: recorded 3 frame(s), replay produced 0 on '/t'".to_string()],
+                None
+            )
+        );
+    }
+
+    /// With `triage`, a split topic whose writers published nothing is one
+    /// `MissingTopic` and one with no recorded frame one `ExtraTopic`, the
+    /// injected frames no writer's; without it, the counts stand.
+    #[test]
+    fn a_split_topic_takes_the_topic_level_triage_once() {
+        let none = [one_stream(0, 0, 0, None), one_stream(1, 2, 2, None)];
+        assert_eq!(
+            split(5, &none, true),
+            (
+                vec![
+                    "missing-topic: recorded 5 frame(s) but replay produced NONE on '/t'"
+                        .to_string()
+                ],
+                None
+            )
+        );
+        let unrecorded = [one_stream(0, 2, 0, None), one_stream(1, 1, 0, None)];
+        assert_eq!(
+            split(0, &unrecorded, true),
+            (
+                vec![
+                    "extra-topic: replay produced 3 frame(s) on '/t' but the bag has no channel \
+                      for it"
+                        .to_string()
+                ],
+                None
+            )
+        );
+        let partitioned = [
+            partitioned_in(0, &[("w2/out", 0, 0, None)]),
+            one_stream(1, 0, 0, None),
+        ];
+        assert_eq!(
+            split(5, &partitioned, false),
+            (
+                vec!["missing 5 0: recorded 5 frame(s), replay produced 0 on '/t'".to_string()],
+                None
+            )
+        );
+    }
+
+    /// One field's tolerance worst: `worst` at `tick`, `exceedance` past the
+    /// bound.
+    fn worst(field: &str, worst: f64, exceedance: f64, tick: u64) -> FieldMetric {
+        FieldMetric {
+            field: field.to_string(),
+            metric: MetricKind::MaxAbs { threshold: 0.5 },
+            integer_domain: false,
+            worst_value: worst,
+            worst_exceedance: exceedance,
+            worst_tick: tick,
+            worst_cause: if worst.is_finite() {
+                NonFiniteCause::Finite
+            } else {
+                NonFiniteCause::Structural
+            },
+            violated: true,
+        }
+    }
+
+    /// The `(field, worst value, tick)` of each folded worst.
+    fn worsts(folded: &[FieldMetric]) -> Vec<(String, f64, u64)> {
+        folded
+            .iter()
+            .map(|m| (m.field.clone(), m.worst_value, m.worst_tick))
+            .collect()
+    }
+
+    /// The passes' tolerance worsts fold to one per field and metric, in
+    /// first-seen order: the larger exceedance wins, the earlier pass's on a
+    /// tie, and an incomparable frame outranks every finite one.
+    #[test]
+    fn the_passes_tolerance_worsts_fold_to_one_per_declaration() {
+        let a = [worst("x", 2.0, 1.5, 3), worst("z", 9.0, 8.5, 1)];
+        let b = [worst("x", 3.0, 2.5, 0)];
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&a[..], &b[..]])),
+            vec![("x".to_string(), 3.0, 0), ("z".to_string(), 9.0, 1)]
+        );
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&b[..], &a[..]])),
+            vec![("x".to_string(), 3.0, 0), ("z".to_string(), 9.0, 1)]
+        );
+        let tie = [worst("x", 3.0, 2.5, 7)];
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&b[..], &tie[..]])),
+            vec![("x".to_string(), 3.0, 0)]
+        );
+        let incomparable = [worst("x", f64::INFINITY, f64::INFINITY, 4)];
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&b[..], &incomparable[..]])),
+            vec![("x".to_string(), f64::INFINITY, 4)]
+        );
+        let rows = tolerance_rows("/t", &fold_tolerance_worsts([&a[..], &b[..]]));
+        assert_eq!(
+            rows.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>(),
+            vec![
+                "field 'x' exceeded the max_abs tolerance on '/t': worst value 3 vs threshold 0.5 \
+                 (worst at frame 0)",
+                "field 'z' exceeded the max_abs tolerance on '/t': worst value 9 vs threshold 0.5 \
+                 (worst at frame 1)",
+            ]
+        );
+    }
+
+    /// The ragged-tail window of a partitioned topic bounds each writer by its
+    /// own rank's tail and names the ranks whose writers produced extra
+    /// frames; a one-stream topic is bounded by the sum of its ranks' windows
+    /// and names the ranks with a tail. Rank 0's tail is 1 step, rank 1's
+    /// none, 2 frames per step.
+    #[test]
+    fn the_tail_window_bounds_each_writer_by_its_own_rank() {
+        let width = |rank: u32| usize::from(rank == 0);
+        let rank_of = |w: &WriterKey| match w {
+            WriterKey::Named(label) if label.starts_with("r0/") => Some(0),
+            WriterKey::Named(label) if label.starts_with("r1/") => Some(1),
+            _ => None,
+        };
+        let parts =
+            |r0: (usize, usize), r1: (usize, usize)| -> BTreeMap<WriterKey, PartitionCounts> {
+                pass_summary(&[("r0/out", r0.0, r0.1, None), ("r1/out", r1.0, r1.1, None)])
+                    .partition_counts
+                    .expect("partitioned")
+            };
+        let ranks = BTreeSet::from([0, 1]);
+        let bound = |p: &BTreeMap<WriterKey, PartitionCounts>| {
+            tail_extra_ranks(Some(p), &ranks, 0, 2, width, rank_of)
+        };
+        assert_eq!(bound(&parts((9, 9), (9, 10))), None, "rank 1 has no tail");
+        assert_eq!(bound(&parts((9, 11), (9, 9))), Some(vec![0]));
+        assert_eq!(bound(&parts((9, 12), (9, 9))), None, "past rank 0's window");
+        assert_eq!(bound(&parts((9, 9), (9, 9))), Some(vec![]));
+        let unknown = pass_summary(&[("q/out", 1, 2, None)])
+            .partition_counts
+            .expect("partitioned");
+        assert_eq!(bound(&unknown), None, "a writer of no known rank");
+        let stream = |extra: usize| tail_extra_ranks(None, &ranks, extra, 2, width, rank_of);
+        assert_eq!(stream(2), Some(vec![0]));
+        assert_eq!(stream(3), None);
+        assert_eq!(
+            tail_extra_ranks(None, &BTreeSet::from([1]), 1, 2, width, rank_of),
+            None,
+            "the one pass judged alone has no tail"
+        );
     }
 }
 
