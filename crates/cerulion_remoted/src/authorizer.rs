@@ -145,6 +145,20 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
     })
 }
 
+/// Whether `verb` is on the bootstrap surface, the verbs an unpaired key may
+/// call ([`VerbClass::Bootstrap`]). A daemon ops plane with serving holds runs
+/// every other verb under a serving-hold work guard (`FencedVerb` in ops.rs).
+pub(crate) fn is_bootstrap_verb(verb: &str) -> bool {
+    classify_verb(verb) == Some(VerbClass::Bootstrap)
+}
+
+/// Whether `verb` is the e-stop floor ([`VerbClass::EstopFloor`]). The ops
+/// plane never refuses it for an idle stop: it takes the serving-hold work
+/// guard when it can and runs either way.
+pub(crate) fn is_estop_floor_verb(verb: &str) -> bool {
+    classify_verb(verb) == Some(VerbClass::EstopFloor)
+}
+
 /// The accept-time routing decision for one incoming connection (per ALPN).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]

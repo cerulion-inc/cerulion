@@ -5,8 +5,9 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 ## Invariants
 - Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
-  final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
-  fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
+  final drain/witness. Paired ops/RCP, non-bootstrap verbs, latch/owed work hold the
+  shared fence (unpaired: none); parent exclusive fences idle. Never unlink;
+  explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
   verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.

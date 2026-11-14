@@ -2,7 +2,7 @@
 
 One host gateway/zenoh session; NDJSON refcounts; spy wiring pins
 
-- Protocol11: paired catalogs. WAN observers use `/__cerulion/observers/`; LAN shares canonical demands. Last observer releases source/mode mirror; wire/2 canonical. MirrorLost queues without replacing replies; demand-free Busy probes mean unknown. Supervised forwards startup errors; Paired/Open watches latch them; serving clears them.
+- Protocol12: paired catalogs. WAN observers use `/__cerulion/observers/`; LAN shares canonical demands. Last observer releases source/mode mirror; wire/2 canonical. MirrorLost queues without replacing replies; demand-free Busy probes mean unknown. Supervised forwards startup errors; Paired/Open watches latch them; serving clears them.
 - Demand/Observe: same-socket retry of exact controller/login Busy or same-source ensure wrapper, seven uneven deterministic backoffs within 2 s. Exhaustion preserves text/latches warn; retry/recovery debug.
 
 ## Rules
@@ -22,8 +22,8 @@ One host gateway/zenoh session; NDJSON refcounts; spy wiring pins
   (gateway boots at start, no idle exit). Missing means refusal, never a default port;
   `CERULION_NETD_NETWORK=off` wins.
 - Egress rechecks prior login (expiry ignored) or claimed trust/key/index;
-  LISTEN needs login; off/injected exempt. First nonempty WAN egress starts one
-  remoted without LISTEN; query/off starts none; standing persists until shutdown.
+  LISTEN needs login; off/injected exempt. Nonempty egress or hold_serving starts
+  one remoted without LISTEN; query/off start none; standing lasts to shutdown.
 - Idle reap waits for work/latch/owed delivery, retains singleton and exclusive
   `serving.hold`; guards/sources share it, never unlink. Own process group, direct
   TERM, hard budget plus 500 ms and fetch grace. See network-daemons.md.

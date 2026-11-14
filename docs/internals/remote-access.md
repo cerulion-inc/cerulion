@@ -345,6 +345,26 @@ endpoints is `loopback_test.rs` (`wire_unpaired_key_is_refused`,
 `ops_unpaired_key_reaches_bootstrap_only`,
 `unclaimed_robot_wire_refused_ops_bootstrap_only`).
 
+The decision also sets idle fencing on the owned daemon. Only an `OpsAdmit` or
+`RcpAdmit` session holds a shared `serving.hold` guard, from classification
+until it ends (`daemon::fences_idle_teardown`); every ops verb outside the
+bootstrap surface runs under its own guard (`ops::FencedVerb`), so a key that
+claims or pairs on a bootstrap-only session runs its later calls fenced. While
+netd's idle stop is committed, an arriving `OpsAdmit` or `RcpAdmit` connection
+is closed at admission with `remote server is stopping`, a fenced call answers
+`unavailable: the remote server is stopping, so <verb> is refused`, and a
+bootstrap-only session is still served. The e-stop floor is the exception:
+`engage-estop` takes a guard when it can and runs either way, so a committed
+idle stop never refuses an e-stop, and the engage latches and starts its
+delivery to rcpd before the server stops.
+`OpsBootstrapOnly`, `WireAdmit`, `Refuse` and `UnknownAlpn` connections hold
+none, so a peer that never pairs cannot keep the server running
+(`network-daemons.md`, authenticated serving). An `RcpAdmit` connection
+re-checks the session floor every `RcpLimits::revoke_check`, with or without a
+stream open, so a revoked key's connection is closed with `rcp::CLOSE_REVOKED`
+and its guard released. Pinned by `serving_fence_admission_test.rs` and, for
+the revoked connection with no stream, `rcp_forward_e2e_test.rs`.
+
 A `DemandSubject::Lan` carries no paired identity, so `PairingAuthorizer`
 admits it. The LAN posture lives in front of every serving plane instead:
 `NetworkManager` retains `LanAccess` separately from the caller-installed inner
@@ -607,10 +627,11 @@ classified by method: lifecycle needs an allowed row, `resources/*`,
 `<= VIEWER`, `tools/call` naming `estop` needs an allowed row (the e-stop
 floor), any other `tools/call` needs `CAP_TELEOP` with role value `<= OPERATOR`
 (`rcp::requirement`). The canonical re-serialization is what reaches rcpd. Each
-frame back is checked against the class that produced it, and the session
-floor every `RcpLimits::revoke_check` (`--rcp-revoke-check-ms`); a key that fails the floor has its
-connection closed. Pinned end to end against a
-real rcpd by `rcp_forward_e2e_test.rs`. The desk half is `cerulion rcp`
+frame back is checked against the class that produced it, and the connection
+checks the session floor every `RcpLimits::revoke_check`
+(`--rcp-revoke-check-ms`), with or without a stream open; a key that fails the
+floor has its connection closed. Pinned end to end against a real rcpd by
+`rcp_forward_e2e_test.rs`. The desk half is `cerulion rcp`
 (`cerulion-connectd rcp`, `connectd::rcp::bridge`): stdin lines to frames,
 frames to stdout lines. A robot frame that is not a JSON-RPC 2.0 message is
 never written to stdout: the accept decision of a refused key, an
@@ -1132,6 +1153,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/authorizer_matrix_test.rs` | Every cell of the sacred verb table, real-crypto access rows |
 | `crates/cerulion_remoted/tests/loopback_test.rs` | Accept-gate routing over real endpoints (wire refuses unpaired; ops bootstraps) |
 | `crates/cerulion_remoted/tests/ops_loopback_test.rs` | The real ops plane over iroh: verbs, receipts, pair-then-allowed |
+| `crates/cerulion_remoted/tests/serving_fence_admission_test.rs` | Through `serve_endpoint`: a bootstrap-only ops session and a refused rcp connection leave `serving.hold` free, a paired ops session holds it until it closes and so does a paired rcp connection with no stream open; while the idle stop is committed a paired session is closed at admission, a bootstrap-only one is still served, and a key claimed on a bootstrap session has its next call refused, then served once the stop is withdrawn |
 | `crates/cerulion_remoted/tests/wire_plane_test.rs` | Wire plane e2e: catalog/demand/schema/status, byte-exact frames, demand gate |
 | `crates/cerulion_remoted/tests/estop_starvation_test.rs` | E-stop bounded latency under hostile concurrent sessions; the 120 s doc pin |
 | `crates/cerulion_remoted/tests/offline_connect_test.rs` | Established pairing connects with issuer down + relay unreachable |

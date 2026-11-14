@@ -151,8 +151,21 @@ remove them before committing.
   lock.
   Native admission uses `serving_hold::ServingHolds`, re-exported by remoted:
   acquire a guard before ops/RCP or shell/exec work and retain it through final
-  drain and witness. Latch and owed-delivery sources refresh before the last
-  shared unlock. Both daemons use `serving_hold::fence_path(state_root)` for
+  drain and witness. Remoted takes one after accept classification, for an
+  `OpsAdmit` or `RcpAdmit` session only (`daemon::fences_idle_teardown`), and
+  around each ops verb outside the bootstrap surface (`ops::FencedVerb`), so a
+  key that claims or pairs on a bootstrap-only session runs its later calls
+  fenced. A bootstrap-only, wire, refused or unknown-ALPN connection takes
+  none: a peer that never pairs cannot keep the server running past the last
+  egress release or a lapsed serving hold, and pairing over a bootstrap-only
+  session is served only while something else keeps the server: standing
+  serving, an egress registration, a serving hold, or work that holds the
+  fence (a paired session, outbound readers, the engaged latch or owed
+  delivery). An `RcpAdmit` connection re-checks the session floor every
+  `RcpLimits::revoke_check`, with or without a stream open, so a revoked key's
+  connection closes and releases its guard. Latch and owed-delivery
+  sources refresh before the last shared unlock. Both daemons use
+  `serving_hold::fence_path(state_root)` for
   `<state_root>/serving/serving.hold`, outside the provisioned `remoted` directory.
   Its parent is created owner-only before the file opens, so fresh provisioning
   still requires no existing robot directory. Netd takes that inode exclusively through
@@ -179,6 +192,45 @@ remove them before committing.
   its own refusal latch. Completed handshakes dispatch before new arrivals, and safety
   refresh waits never cancel a handshake.
   Shutdown aborts and joins pending handshakes before endpoint cleanup.
+- **Serving hold (protocol 12)**: the connection-scoped `hold_serving` verb
+  (`Request::HoldServing { id, ttl_s }`) makes the supervised remote server
+  wanted with no egress registration and announces nothing. The reply does not
+  wait for the server: netd's lifecycle worker starts it, and a start failure
+  is retried and logged there, never reported to the hold. Before anything is
+  held, in order: `ttl_s` must lie in
+  `SERVING_HOLD_MIN_TTL_S..=SERVING_HOLD_MAX_TTL_S` (1 to 900 s), else
+  `SERVING_HOLD_TTL_REFUSAL`; `EgressPlane::serving_state_root`, which changes
+  no state, must name a usable robot state root: its default refuses with
+  `REMOTE_SERVING_UNAVAILABLE` (network off, a build without `wan`, the no-op
+  and spy planes), and `SupervisedEgressPlane` requires the root to resolve
+  (`NO_STATE_ROOT`), be absolute with no `.` or `..` component
+  (`STATE_ROOT_NOT_ABSOLUTE`, the same predicate `RobotSupervisor` applies) and
+  be UTF-8 (`STATE_ROOT_NOT_UTF8`); then the serving-authority check
+  (`EgressLoginPolicy::check`, refusal `serving_login::REFUSAL`) must pass. So a
+  machine is never sent to log in for a server it cannot run. Each refusal text
+  is one named const in `protocol.rs`, `egress.rs` or `serving_login.rs`; a
+  hold that races shutdown is rolled back and refused with `SHUTTING_DOWN` in
+  `supervised_egress.rs`, shown as `remote server startup failed: network
+  daemon is shutting down`. `SupervisedEgressPlane` keeps one monotonic
+  (`Instant`) deadline per connection; a second hold on the same connection
+  replaces the first, shorter or longer. The one `State::wanted(now)` rule
+  (standing, any registration, or an unexpired hold) drives the worker's
+  decision and `State::may_reap`, its re-check under the exclusive fence, so a
+  hold stops counting at its deadline even while its connection stays open.
+  The worker also drops lapsed holds each pass and logs each at info.
+  `cleanup_connection` always releases the connection's hold, egress or not;
+  a stopping daemon clears every hold. The reply
+  `ServingHeld { id, state_root, ttl_s }` names the state root netd serves
+  (remoted's directory is `<state_root>/remoted`) and the granted length,
+  counted on netd's monotonic clock from when it took the hold.
+  `SERVING_HOLD_MIN_DAEMON_VERSION` is 12, so the client's per-verb gate tells
+  a user of an older daemon to upgrade it. A hold does not take
+  `serving.hold`: remoted shares that lock only for paired sessions, ops
+  calls outside the bootstrap surface, outbound readers and its own sources,
+  so a connection from a peer without paired authority never keeps the server
+  past the hold's deadline (`automatic_serving_test.rs` pins the reap with two
+  unpaired ops connections and a refused rcp connection held open, and the
+  wait for a paired session).
 - **Schema-serving merge (the backfill seam)**: the gateway's schema serving is
   SEEDED at boot, not frozen: every `register_egress` MERGES its plan's serving
   (topic→name + hash→name bindings + served docs) into the RUNNING gateway

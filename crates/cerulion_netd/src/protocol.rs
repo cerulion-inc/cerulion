@@ -132,7 +132,26 @@ use serde::{Deserialize, Serialize};
 /// be restarted before these operations.
 /// `10`: bounded automatic catalogs for owned and explicitly paired robots.
 /// `11`: held mirror retirement events, including observer readers.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// `12`: the `hold_serving` verb keeps this machine's remote server running
+/// for a bounded time with no egress registration. The client's per-verb gate
+/// refuses it against an older daemon ([`SERVING_HOLD_MIN_DAEMON_VERSION`]).
+pub const PROTOCOL_VERSION: u32 = 12;
+
+/// First daemon version that serves [`Request::HoldServing`].
+pub const SERVING_HOLD_MIN_DAEMON_VERSION: u32 = 12;
+const _: () = assert!(SERVING_HOLD_MIN_DAEMON_VERSION <= PROTOCOL_VERSION);
+
+/// Shortest serving hold a daemon grants, in seconds.
+pub const SERVING_HOLD_MIN_TTL_S: u64 = 1;
+
+/// Longest serving hold a daemon grants, in seconds (15 minutes).
+pub const SERVING_HOLD_MAX_TTL_S: u64 = 900;
+const _: () =
+    assert!(SERVING_HOLD_MIN_TTL_S >= 1 && SERVING_HOLD_MIN_TTL_S <= SERVING_HOLD_MAX_TTL_S);
+
+/// The refusal for a `hold_serving` whose `ttl_s` lies outside
+/// [`SERVING_HOLD_MIN_TTL_S`]`..=`[`SERVING_HOLD_MAX_TTL_S`].
+pub const SERVING_HOLD_TTL_REFUSAL: &str = "hold_serving needs ttl_s from 1 to 900 seconds";
 
 /// First daemon version that reports retirement of a held mirror.
 pub const MIRROR_LOSS_MIN_DAEMON_VERSION: u32 = 11;
@@ -369,6 +388,24 @@ pub enum Request {
         /// Correlation id echoed in the response.
         id: u64,
     },
+    /// Keep this machine's remote server running for `ttl_s` seconds without
+    /// registering egress, and learn the robot state root it serves. The hold is
+    /// SCOPED to this connection: closing the connection releases it at once, and
+    /// netd releases it at its deadline even while the connection stays open. A
+    /// second hold on the same connection replaces the first, deadline included.
+    /// That netd runs a remote server from a usable robot state root, then the
+    /// local serving authority, are checked before anything is held. Answered
+    /// with a [`ServingHeldResponse`]. The reply does not wait for the server:
+    /// netd's lifecycle worker starts it, and a start failure is retried and
+    /// logged there, never reported to the hold.
+    HoldServing {
+        /// Correlation id echoed in the response.
+        id: u64,
+        /// The hold's length in seconds, from [`SERVING_HOLD_MIN_TTL_S`] to
+        /// [`SERVING_HOLD_MAX_TTL_S`]. Required: a value outside that range is
+        /// refused with [`SERVING_HOLD_TTL_REFUSAL`].
+        ttl_s: u64,
+    },
     /// Query the LAN topic CATALOG over netd's ONE zenoh session — the
     /// desk consumer's replacement for opening its own transient discovery session.
     /// netd harvests the announce space + GETs each robot's `cerulion_q/{robot}/catalog`
@@ -460,6 +497,7 @@ impl Request {
             | Request::Status { id }
             | Request::RegisterEgress { id, .. }
             | Request::ReleaseEgress { id }
+            | Request::HoldServing { id, .. }
             | Request::QueryCatalog { id, .. }
             | Request::QuerySchema { id, .. }
             | Request::QueryRuns { id, .. }
@@ -480,6 +518,7 @@ impl Request {
             Request::Status { .. } => "status",
             Request::RegisterEgress { .. } => "register_egress",
             Request::ReleaseEgress { .. } => "release_egress",
+            Request::HoldServing { .. } => "hold_serving",
             Request::QueryCatalog { .. } => "query_catalog",
             Request::QuerySchema { .. } => "query_schema",
             Request::QueryRuns { .. } => "query_runs",
@@ -535,6 +574,7 @@ impl Request {
             Request::Observe { .. } => MIRROR_LOSS_MIN_DAEMON_VERSION,
             Request::Unobserve { .. } => crate::account_access::REMOTE_DISCOVERY_MIN_DAEMON_VERSION,
             Request::SubscribeCatalog { .. } => 6,
+            Request::HoldServing { .. } => SERVING_HOLD_MIN_DAEMON_VERSION,
             // The `runs` verb needs a v7 daemon. A v<7 daemon has no
             // `runs` handler and would answer the generic unknown-method error, which
             // a consumer cannot tell from a daemon that knows the verb and failed —
@@ -767,6 +807,20 @@ pub struct EgressReleaseResponse {
     /// self-exit); this reports the CONNECTION-SCOPED demand accounting, not the
     /// physical announce lifecycle.
     pub released_topics: usize,
+}
+
+/// The response to [`Request::HoldServing`]. Discriminated by its REQUIRED
+/// `state_root` and `ttl_s` keys, which no other response carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingHeldResponse {
+    /// Echoed correlation id.
+    pub id: u64,
+    /// The robot state root this daemon's remote server uses: an absolute,
+    /// traversal-free UTF-8 path. The server's own directory is
+    /// `<state_root>/remoted`.
+    pub state_root: String,
+    /// The granted hold length in seconds, counted from when netd took the hold.
+    pub ttl_s: u64,
 }
 
 /// Whether netd's shared zenoh session had COMPLETED at least one
@@ -1236,7 +1290,8 @@ pub fn classify_control_line(line: &str) -> ControlLine {
 /// ([`StatusResponse`]), `gateway_started`+`registered_topics` ([`EgressResponse`]),
 /// `released_topics` ([`EgressReleaseResponse`]), `catalogs` ([`CatalogQueryResponse`]),
 /// `replies` ([`SchemaQueryResponse`]), `run_replies` ([`RunsQueryResponse`]),
-/// `watching` ([`SubscribeCatalogResponse`]), and
+/// `watching` ([`SubscribeCatalogResponse`]), `state_root`+`ttl_s`
+/// ([`ServingHeldResponse`]), and
 /// `error` ([`ErrorResponse`]). Those field
 /// sets are non-overlapping, so serde deserializes each line unambiguously. netd only
 /// ever SERIALIZES a `Response`; the consumer deserializes the concrete struct it
@@ -1276,6 +1331,9 @@ pub enum Response {
     /// A catalog-change subscription accepted. Discriminated by its
     /// REQUIRED `watching` field, which no other variant carries.
     SubscribeCatalog(SubscribeCatalogResponse),
+    /// A serving hold granted. Discriminated by its REQUIRED `state_root` and
+    /// `ttl_s` fields, which no other variant carries.
+    ServingHeld(ServingHeldResponse),
     /// A structured error.
     Error(ErrorResponse),
 }
@@ -1894,6 +1952,79 @@ mod tests {
                 released_topics: 2,
             }
         );
+    }
+
+    /// The `hold_serving` request line, written out by hand: the method tag,
+    /// the id and the REQUIRED `ttl_s`, in that order.
+    #[test]
+    fn a_hold_serving_request_is_the_hand_written_line() {
+        let oracle = r#"{"method":"hold_serving","id":7,"ttl_s":660}"#;
+        let hold = Request::HoldServing { id: 7, ttl_s: 660 };
+        assert_eq!(hold.to_json_line(), oracle);
+        assert_eq!(parse_request(oracle).expect("the oracle parses"), hold);
+        assert_eq!(hold.id(), 7);
+        assert_eq!(hold.method_name(), "hold_serving");
+        assert_eq!(
+            hold.min_daemon_version(),
+            12,
+            "the verb arrived in protocol 12"
+        );
+        assert_eq!(SERVING_HOLD_MIN_DAEMON_VERSION, 12);
+
+        // `ttl_s` has no default: a hold with no length is malformed, and the
+        // refusal still correlates to its id.
+        let err = parse_request(r#"{"method":"hold_serving","id":8}"#)
+            .expect_err("a hold without ttl_s is malformed");
+        assert_eq!(err.id, Some(8));
+        assert!(err.message.contains("ttl_s"), "{}", err.message);
+    }
+
+    /// The `serving_held` reply line, written out by hand, decodes as
+    /// `ServingHeld` and as nothing else; and neither of its keys alone makes a
+    /// line one.
+    #[test]
+    fn a_serving_held_response_is_the_hand_written_line_and_no_other_variant() {
+        let oracle = r#"{"id":7,"state_root":"/home/robot/.cerulion/robot-state","ttl_s":660}"#;
+        let held = Response::ServingHeld(ServingHeldResponse {
+            id: 7,
+            state_root: "/home/robot/.cerulion/robot-state".into(),
+            ttl_s: 660,
+        });
+        assert_eq!(held.to_json_line(), oracle);
+        assert_eq!(
+            serde_json::from_str::<Response>(oracle).expect("untagged decode"),
+            held
+        );
+        for partial in [
+            r#"{"id":7,"state_root":"/home/robot/.cerulion/robot-state"}"#,
+            r#"{"id":7,"ttl_s":660}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Response>(partial).is_err(),
+                "a line missing either key is no response at all: {partial}"
+            );
+        }
+        // Sibling replies keep decoding as themselves beside the new variant.
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"id":2,"released_topics":0}"#).unwrap(),
+            Response::EgressRelease(EgressReleaseResponse {
+                id: 2,
+                released_topics: 0,
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"id":7,"error":"refused"}"#).unwrap(),
+            Response::error(Some(7), "refused", None, None)
+        );
+    }
+
+    /// The hold-length refusal names the range the daemon enforces.
+    #[test]
+    fn the_hold_length_refusal_states_the_enforced_range() {
+        assert_eq!((SERVING_HOLD_MIN_TTL_S, SERVING_HOLD_MAX_TTL_S), (1, 900));
+        assert!(SERVING_HOLD_TTL_REFUSAL.contains(&format!(
+            "from {SERVING_HOLD_MIN_TTL_S} to {SERVING_HOLD_MAX_TTL_S} seconds"
+        )));
     }
 
     #[test]

@@ -467,18 +467,16 @@ pub(crate) async fn serve_core(
     } else {
         None
     };
-    let ops = Arc::new(
-        OpsServing::for_host(
-            ops_host,
-            shared,
-            sessions,
-            access_clock.clone(),
-            &files.receipt_file,
-            files.log_root.clone(),
-            server_name,
-        )?
-        .with_serving_holds(serving_holds),
-    );
+    let ops = Arc::new(OpsServing::for_host(
+        ops_host,
+        shared,
+        sessions,
+        access_clock.clone(),
+        &files.receipt_file,
+        files.log_root.clone(),
+        server_name,
+        serving_holds,
+    )?);
 
     // Install the SAME `PairingAuthorizer` as the wire plane's per-demand
     // authorization gate (this line is the wiring a daemon-level test pins). The serving
@@ -675,10 +673,9 @@ pub async fn serve_planes(
 ) -> Result<(), RemotedError> {
     let mut shutdown = Box::pin(shutdown);
     let holds = ops.as_ref().and_then(|ops| ops.serving_holds()).cloned();
+    let fence = ops.as_ref().and_then(|ops| ops.admission_fence()).cloned();
     let mut refresh = tokio::time::interval(Duration::from_millis(100));
     let mut refresh_failures =
-        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
-    let mut admission_failures =
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
     let mut handshakes = tokio::task::JoinSet::<Result<Accepted, LinkError>>::new();
     let mut handshake_admission_failures = AdmissionLatches::default();
@@ -732,35 +729,14 @@ pub async fn serve_planes(
                                 tracing::info!(suppressed, "remote TLS handshake completion recovered");
                             }
                         }
-                        let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
-                            match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
-                                Ok(hold) => {
-                                    if let Some(suppressed) = admission_failures.on_success() {
-                                        tracing::info!(suppressed, "remote serving admission recovered");
-                                    }
-                                    hold
-                                },
-                                Err(error) => {
-                                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-                                    match admission_failures.on_failure() {
-                                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
-                                        RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
-                                    }
-                                    a.connection.close(0u32.into(), b"remote server is stopping");
-                                    continue;
-                                }
-                            }
-                        } else { None };
-                        if let Some(pull) = &pull {
-                            pull.note_accept(a.remote_id.as_bytes());
-                        }
                         let classify = classify.clone();
                         let ops = ops.clone();
                         let wire = wire.clone();
                         let rcp = rcp.clone();
+                        let fence = fence.clone();
+                        let pull = pull.clone();
                         tokio::spawn(async move {
-                            let _hold = hold;
-                            handle_accepted_planes(a, classify, ops, wire, rcp).await;
+                            serve_accepted(a, classify, ops, wire, rcp, fence, pull).await;
                         });
                     }
                     // A SINGLE inbound connection failed its handshake (a scanner
@@ -919,12 +895,48 @@ pub async fn handle_accepted_with_wire(
 /// [`handle_accepted_with_wire`], plus the rcp arm: an `RcpAdmit` connection
 /// is handed to [`crate::rcp::serve_rcp_connection`] as a long-lived session
 /// when `rcp` is `Some`; with `None` it falls through to the skeleton report.
+/// It takes no idle-teardown guard and notes no key for an epoch fetch: the
+/// accept loop's own handler does both.
 pub async fn handle_accepted_planes(
     accepted: Accepted,
     classify: Arc<PairingAuthorizer>,
     ops: Option<Arc<OpsServing>>,
     wire: Option<Arc<WirePlane>>,
     rcp: Option<Arc<RcpPlane>>,
+) {
+    serve_accepted(accepted, classify, ops, wire, rcp, None, None).await
+}
+
+/// Whether a connection with `decision` holds the serving fence that keeps
+/// idle teardown off: only a session admitted with paired authority, on the
+/// ops or rcp plane. A bootstrap-only, wire, refused or unknown-ALPN
+/// connection holds none, so a peer that never pairs cannot keep the server
+/// running.
+fn fences_idle_teardown(decision: &AcceptDecision) -> bool {
+    match decision {
+        AcceptDecision::OpsAdmit | AcceptDecision::RcpAdmit => true,
+        AcceptDecision::OpsBootstrapOnly
+        | AcceptDecision::WireAdmit
+        | AcceptDecision::Refuse { .. }
+        | AcceptDecision::UnknownAlpn { .. } => false,
+    }
+}
+
+/// Classify one accepted connection, then take its idle-teardown guard from
+/// `fence` when [`fences_idle_teardown`] says the decision needs one, note the
+/// key with `pull` and dispatch on the negotiated plane. When `fence` refuses
+/// the guard (an idle stop is committed, or the lock call fails), a
+/// connection that needs one is closed with the reason `remote server is
+/// stopping`, before its key is noted. The guard is held until the
+/// connection's serving ends.
+async fn serve_accepted(
+    accepted: Accepted,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    rcp: Option<Arc<RcpPlane>>,
+    fence: Option<crate::serving_hold::AdmissionFence>,
+    pull: Option<Arc<EpochPull>>,
 ) {
     let (decision, unpaired) = classify
         .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
@@ -934,6 +946,21 @@ pub async fn handle_accepted_planes(
         ?decision,
         "cerulion_remoted: accept classified"
     );
+    let _hold = match &fence {
+        Some(fence) if fences_idle_teardown(&decision) => match fence.admit() {
+            Some(hold) => Some(hold),
+            None => {
+                accepted
+                    .connection
+                    .close(0u32.into(), b"remote server is stopping");
+                return;
+            }
+        },
+        _ => None,
+    };
+    if let Some(pull) = &pull {
+        pull.note_accept(accepted.remote_id.as_bytes());
+    }
 
     // ── The ops-ALPN dispatch arm ───────────────────────────
     // Ops plane → the real cerud ops server (per-verb authz is the enforcement).
@@ -1216,6 +1243,44 @@ pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, Remot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an ops or rcp session admitted with paired authority fences idle
+    /// teardown; every other decision, the bootstrap surface included, holds
+    /// nothing. Each row is (decision, fences).
+    #[test]
+    fn only_paired_ops_and_rcp_admissions_fence_idle_teardown() {
+        let rows = [
+            (AcceptDecision::OpsAdmit, true),
+            (AcceptDecision::RcpAdmit, true),
+            (AcceptDecision::OpsBootstrapOnly, false),
+            (AcceptDecision::WireAdmit, false),
+            (
+                AcceptDecision::Refuse {
+                    reason: "rcp plane refused: unpaired device key".into(),
+                },
+                false,
+            ),
+            (
+                AcceptDecision::UnknownAlpn {
+                    alpn: b"cerulion/unknown/1".to_vec(),
+                },
+                false,
+            ),
+        ];
+        for (decision, fences) in rows {
+            assert_eq!(fences_idle_teardown(&decision), fences, "{decision:?}");
+        }
+    }
+
+    /// `cerulion_netd`'s `automatic_serving_test.rs` copies this deadline by
+    /// hand as `REMOTED_HANDSHAKE_DEADLINE` and asserts the owned server is
+    /// reaped before it passes. That shows a refused rcp connection does not
+    /// fence idle teardown only while remoted keeps such a connection this
+    /// long, so the two values change together.
+    #[test]
+    fn the_handshake_deadline_is_ten_seconds() {
+        assert_eq!(HANDSHAKE_DEADLINE, Duration::from_secs(10));
+    }
 
     #[test]
     fn handshake_admission_reserves_capacity_at_every_boundary() {
