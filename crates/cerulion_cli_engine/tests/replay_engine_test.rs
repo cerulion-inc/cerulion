@@ -38397,7 +38397,10 @@ fn a_split_bus_verifies_per_writer_while_a_two_connection_consumer_cannot() {
 }
 
 /// THE PER-PARTITION ORACLE: one writer's drift across a SPLIT is attributed to
-/// THAT writer, and the other partition stays clean.
+/// THAT writer, and the other partition stays clean, whichever rank the
+/// drifting writer runs on: `left` on rank 0, whose pass also injects `right`'s
+/// recorded frames for `local`, or `right` on rank 1, the last rank that
+/// writes the bus.
 ///
 /// Without this the headline arm above is satisfied by a capture that skipped
 /// the bus entirely. Here the bus really is compared, per writer, with the
@@ -38407,52 +38410,61 @@ fn a_split_bus_verifies_per_writer_while_a_two_connection_consumer_cannot() {
 #[test]
 #[serial]
 fn a_split_partition_attributes_a_byte_mismatch_to_its_own_writer() {
-    let mut rec = sb_recording();
-    sb_assert_premise(&rec);
-    // Perturb the SECOND `right` frame, in a word the writer classifier ignores
-    // (`sb_writer_of` reads `x`), so the labels stay the ones the recorder wrote.
-    let perturbed = rec.messages[SB_TOPIC]
-        .iter_mut()
-        .filter(|f| frame_x(f) >= CO_SPLIT)
-        .nth(1)
-        .expect("the right writer produced at least two frames");
-    co_perturb_y(perturbed, 42.0);
+    for (drifting, clean) in [("left", "right"), ("right", "left")] {
+        let mut rec = sb_recording();
+        sb_assert_premise(&rec);
+        // Perturb the drifting writer's SECOND frame, in a word the writer
+        // classifier ignores (`sb_writer_of` reads `x`), so the labels stay
+        // the ones the recorder wrote.
+        let perturbed = rec.messages[SB_TOPIC]
+            .iter_mut()
+            .filter(|f| sb_writer_of(f) == drifting)
+            .nth(1)
+            .expect("each writer produced at least two frames");
+        co_perturb_y(perturbed, 42.0);
 
-    let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join("shared_bus_split_perturbed.mcap");
-    write_sb_bag(rec, &bag, sb_split3_rank_of, 3);
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir
+            .path()
+            .join(format!("shared_bus_split_perturbed_{drifting}.mcap"));
+        write_sb_bag(rec, &bag, sb_split3_rank_of, 3);
 
-    let outcome = replay(&bag, sb_factories, None, None).expect("replay runs");
-    assert!(!outcome.passed, "a perturbed recording must not pass");
-    let bus: Vec<&replay_engine::Violation> = outcome
-        .violations
-        .iter()
-        .filter(|v| v.topic == SB_TOPIC)
-        .collect();
-    assert_eq!(
-        bus.len(),
-        1,
-        "exactly ONE violation on the split bus — the right writer's: {bus:?}"
-    );
-    let detail = &bus[0].detail;
-    assert!(
-        detail.contains("from writer right/bus"),
-        "the violation names the DRIFTING writer, across the rank split: {detail}"
-    );
-    assert!(
-        !detail.contains("left/bus"),
-        "and not the clean one, which lives on another rank entirely: {detail}"
-    );
-    // The clean partition's own frames are still compared: the mismatch is at
-    // the RIGHT writer's own index 1, not the merged stream's index 3.
-    assert!(
-        matches!(
-            bus[0].class,
-            replay_engine::ViolationClass::ByteMismatch { index: 1, .. }
-        ),
-        "and it is a byte mismatch at the right writer's own index 1: {:?}",
-        bus[0].class
-    );
+        let outcome = replay(&bag, sb_factories, None, None).expect("replay runs");
+        assert!(
+            !outcome.passed,
+            "{drifting}: a perturbed recording must not pass"
+        );
+        let bus: Vec<&replay_engine::Violation> = outcome
+            .violations
+            .iter()
+            .filter(|v| v.topic == SB_TOPIC)
+            .collect();
+        assert_eq!(
+            bus.len(),
+            1,
+            "{drifting}: exactly ONE violation on the split bus, the drifting writer's: {bus:?}"
+        );
+        // The recording's y was set to 42.0, and the writer replays 0.0.
+        assert_eq!(
+            bus[0].detail,
+            format!(
+                "frame 1 on '{SB_TOPIC}' from writer {drifting}/bus differs at y: recorded \
+                 42.0, replayed 0.0 (recorded 64 B, replayed 64 B)"
+            ),
+            "{drifting}: the violation names the DRIFTING writer, across the rank split, and \
+             not {clean}, which runs on another rank"
+        );
+        // The clean partition's own frames are still compared: the mismatch is
+        // at the drifting writer's own index 1, not the merged stream's.
+        assert!(
+            matches!(
+                bus[0].class,
+                replay_engine::ViolationClass::ByteMismatch { index: 1, .. }
+            ),
+            "{drifting}: a byte mismatch at the writer's own index 1: {:?}",
+            bus[0].class
+        );
+    }
 }
 
 /// The SPLIT verdict is deterministic across two replays AND equals a
@@ -42151,6 +42163,23 @@ fn ri_two_rank_bag_stamped(
     labelled: bool,
     recorder_json: Vec<u8>,
 ) {
+    let label_rows = if labelled {
+        ri_frame_label_rows(rec)
+    } else {
+        Vec::new()
+    };
+    ri_two_rank_bag_with_labels(rec, path, on_rank1, &label_rows, recorder_json);
+}
+
+/// [`ri_two_rank_bag_stamped`] writing `label_rows` as the per-frame producer
+/// labels.
+fn ri_two_rank_bag_with_labels(
+    rec: &Recording,
+    path: &std::path::Path,
+    on_rank1: fn(&str) -> bool,
+    label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
+    recorder_json: Vec<u8>,
+) {
     let rank_of = |id: &str| u32::from(on_rank1(id));
     let stage_rows = rec.stage_rows.clone();
     let staging = move |rank: u32| -> Option<serde_json::Value> {
@@ -42163,11 +42192,6 @@ fn ri_two_rank_bag_stamped(
         // A rank with no read stage declares no table: a present-but-empty one
         // is refused as declaring nothing.
         (!rows.is_empty()).then(|| serde_json::json!({ "capacities": rows }))
-    };
-    let label_rows = if labelled {
-        ri_frame_label_rows(rec)
-    } else {
-        Vec::new()
     };
     let labels: Vec<ProducerLabel<'_>> = label_rows
         .iter()
@@ -47660,6 +47684,450 @@ fn an_unattributed_shared_topic_split_across_processes_is_judged_in_each_of_them
         drv_driver_lines(&replay_engine::render_verdict(&outcome, &bag)),
         vec![drv_unattributed_note(DRV_UNREAD_TRIO_BUS)]
     );
+}
+
+/// One period writer's frames, `(writer, c, writer * 1_000_000 + 7c)` for
+/// `c = 1..=RI_STEPS`, one per step.
+fn ri_period_frames(writer: f64) -> Vec<(f64, f64, f64)> {
+    (1..=RI_STEPS)
+        .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
+        .collect()
+}
+
+/// The recorded frames of `topic` in `rec`, split by writer (`x`), each in
+/// stream order.
+fn ri_frames_by_writer(rec: &Recording, topic: &str) -> BTreeMap<u64, Vec<(f64, f64, f64)>> {
+    let mut by_writer: BTreeMap<u64, Vec<(f64, f64, f64)>> = BTreeMap::new();
+    for f in &rec.messages[topic] {
+        let frame = drv_xyz(f);
+        by_writer.entry(frame.0 as u64).or_default().push(frame);
+    }
+    by_writer
+}
+
+/// The `(topic, class, detail)` of every violation of `outcome`.
+fn ri_named(outcome: &ReplayOutcome) -> Vec<(&str, &ViolationClass, &str)> {
+    outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class, v.detail.as_str()))
+        .collect()
+}
+
+/// The byte-mismatch line of a changed period writer `w2` that stamps 4 where
+/// it recorded 2: its first frame, on `topic`, differs at `x`, and `z` too.
+fn ri_changed_w2_line(topic: &str) -> String {
+    format!(
+        "frame 0 on '{topic}' from writer w2/out differs at x: recorded 2.0, replayed 4.0; 1 more \
+         value(s) differ (recorded 64 B, replayed 64 B)"
+    )
+}
+
+/// The topic a period writer shares with a writer that never publishes.
+const RI_SPLIT_SILENT_BUS: &str = "/risplit/bus";
+
+/// A period writer (`w2`) and a writer that never publishes (`w3`) on one
+/// `multi_publisher_topics` topic no node reads.
+fn ri_split_silent_yaml() -> &'static str {
+    "name: risplit\nprefix: risplit\nmulti_publisher_topics:\n  - /risplit/bus\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risplit/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risplit/bus\n"
+}
+
+fn ri_split_silent_factories(writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// A `multi_publisher_topics` topic whose writers run in two processes is
+/// judged over both of them, not over the last one alone. With the period
+/// writer `w2` in the first process and a writer that publishes nothing, live
+/// or replayed, in the second, whose own capture holds no frame of the topic,
+/// the unchanged candidate passes with the topic checked and credited rather
+/// than failing as a `missing-topic` the replay produced nothing on, and a
+/// changed `w2` fails with exit 1 as one byte mismatch from `w2`. The bag
+/// labels every frame with `w2`'s publisher, as a recorder does.
+#[test]
+#[serial]
+fn a_split_topic_whose_last_process_publishes_nothing_is_judged_by_its_other_writer() {
+    let live = ri_record(ri_split_silent_yaml(), || ri_split_silent_factories(2.0));
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_SPLIT_SILENT_BUS),
+        want,
+        "the recorded bus holds w2's frames alone"
+    );
+    let w2 = real_publisher_id(&live.rec, "w2", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..RI_STEPS)
+        .map(|i| {
+            (
+                RI_SPLIT_SILENT_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                w2,
+            )
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_split_silent.mcap");
+    ri_two_rank_bag_with_labels(
+        &live.rec,
+        &bag,
+        |id| id == "w3",
+        &label_rows,
+        ri_free_run_recorder_json(),
+    );
+
+    let (outcome, _) = ri_replay(
+        &bag,
+        || ri_split_silent_factories(2.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("CONTROL: the replay runs");
+    assert!(
+        outcome.violations.is_empty(),
+        "CONTROL: {:?}",
+        outcome.violations
+    );
+    assert!(outcome.passed, "CONTROL");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 1),
+        "CONTROL: the bus is checked and credited"
+    );
+
+    let (outcome, _) = ri_replay(
+        &bag,
+        || ri_split_silent_factories(4.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert_eq!(resim_exit(&outcome, true), 1, "exit 1");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let want_detail = ri_changed_w2_line(RI_SPLIT_SILENT_BUS);
+    let named = ri_named(&outcome);
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_SPLIT_SILENT_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                if *detail == want_detail
+        ),
+        "exactly w2's byte mismatch: {named:?}"
+    );
+}
+
+/// The topic two period writers share, read by a sink beside one of them.
+const RI_INJ_BUS: &str = "/riinj/bus";
+/// The tag the sink logs each frame it reads under.
+const RI_INJ_SINK: f64 = 13.0;
+
+/// Two period writers (`w2`, writer 2, and `w3`, writer 3) on one
+/// `multi_publisher_topics` topic, read by a per-message sink, or by a
+/// latest-value sink that fires on every third step when `slow`.
+fn ri_inj_yaml(slow: bool) -> String {
+    let sink = if slow { "ri_slow_sink" } else { "ri_fifo_sink" };
+    format!(
+        "name: riinj\nprefix: riinj\nmulti_publisher_topics:\n  - /riinj/bus\nnodes:\n\
+         \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj/bus\n\
+         \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj/bus\n\
+         \x20 - id: sink\n    type: {sink}\n    inputs:\n      - name: inp\n        source: /riinj/bus\n"
+    )
+}
+
+/// The two-writer graph, `w2` stamping `writer` into its frames.
+fn ri_inj_factories(slow: bool, writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let sink: Box<dyn NodeEntry> = if slow {
+        Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 3.0,
+                ..Default::default()
+            })),
+        ),
+        ("sink", sink),
+    ])
+}
+
+/// A replay that does not feed reads by their recorded identity injects the
+/// recorded frames of a writer in another process for the nodes that read
+/// its topic. With the period writer `w2` alone in the first process, and the
+/// period writer `w3` and the bus's sink in the second, the second process
+/// injects `w2`'s recorded frames for the sink. Those are copies of what
+/// `w2`'s own process publishes, so they are left out of the comparison,
+/// which judges `w2` in that process. A per-message sink is injected every
+/// frame of `w2`, and a latest-value sink that fires on every third step only
+/// the frames it reads, which is not `w2`'s recorded stream frame for frame.
+/// With either, a neutral `--resim all` and a `--verify` of a recording below
+/// trace format 8 both run to an outcome with no violation and the bus
+/// checked, and a changed `w2` fails the verify as one byte mismatch from
+/// `w2`, though the process replayed after it injected `w2`'s recorded frames.
+/// That is exit 1 with the per-message sink. The latest-value sink's reads
+/// are reproduced only by a replay that feeds them by their recorded identity,
+/// so its read log diverges in both runs, and the exit is 6, which beats 1.
+#[test]
+#[serial]
+fn a_writers_frames_injected_in_another_process_are_left_out_of_the_comparison() {
+    for slow in [false, true] {
+        let layout = if slow {
+            "latest-value sink"
+        } else {
+            "per-message sink"
+        };
+        let live = ri_record(&ri_inj_yaml(slow), || ri_inj_factories(slow, 2.0));
+        let mut want = BTreeMap::new();
+        want.insert(2, ri_period_frames(2.0));
+        want.insert(3, ri_period_frames(3.0));
+        assert_eq!(
+            ri_frames_by_writer(&live.rec, RI_INJ_BUS),
+            want,
+            "{layout}: the recorded bus, writer by writer"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let neutral = dir.path().join("ri_inj.mcap");
+        ri_two_rank_bag(&live.rec, &neutral, |id| id != "w2");
+        let format7 = dir.path().join("ri_inj_format7.mcap");
+        ri_two_rank_bag_stamped(
+            &live.rec,
+            &format7,
+            |id| id != "w2",
+            true,
+            ri_recorder_json_at(7),
+        );
+        for (run, bag, purpose) in [
+            ("neutral", &neutral, replay_engine::ReplayPurpose::Resim),
+            (
+                "format 7 verify",
+                &format7,
+                replay_engine::ReplayPurpose::Verify,
+            ),
+        ] {
+            let (outcome, _) = ri_replay(bag, || ri_inj_factories(slow, 2.0), purpose);
+            let outcome = outcome
+                .unwrap_or_else(|e| panic!("{layout}: {run}: the replay runs to an outcome: {e}"));
+            assert!(
+                matches!(
+                    outcome.read_identity,
+                    replay_engine::ReadIdentityReport::BestEffort { .. }
+                ),
+                "PREMISE: {layout}: {run}: no read is fed by identity: {:?}",
+                outcome.read_identity
+            );
+            assert!(
+                outcome.violations.is_empty(),
+                "{layout}: {run}: {:?}",
+                outcome.violations
+            );
+            assert_eq!(
+                outcome.topics_checked, 1,
+                "{layout}: {run}: the bus is checked"
+            );
+            let sink_diverged = outcome.read_log_divergence.as_ref().map(|d| {
+                d.edges
+                    .iter()
+                    .map(|e| (e.node_id.as_str(), e.input.as_str()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                sink_diverged,
+                slow.then(|| vec![("sink", "inp")]),
+                "PREMISE: {layout}: {run}: only the latest-value sink's read log diverges"
+            );
+        }
+
+        let (outcome, _) = ri_replay(
+            &format7,
+            || ri_inj_factories(slow, 4.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert_eq!(
+            resim_exit(&outcome, true),
+            if slow { 6 } else { 1 },
+            "{layout}: the exit"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let want_detail = ri_changed_w2_line(RI_INJ_BUS);
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_INJ_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{layout}: exactly w2's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// The topic two period writers in two processes share.
+const RI_MIX_BUS: &str = "/rimix/bus";
+/// The topic a period writer shares with a writer that never publishes, both
+/// in the second process.
+const RI_MIX_AUX: &str = "/rimix/aux";
+
+/// Two period writers (`w2`, writer 2, and `w3`, writer 3) on one
+/// `multi_publisher_topics` topic, and a period writer (`a`, writer 5) and a
+/// writer that never publishes (`b`) on another. No node reads either.
+fn ri_mix_yaml() -> &'static str {
+    "name: rimix\nprefix: rimix\nmulti_publisher_topics:\n  - /rimix/bus\n  - /rimix/aux\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/aux\n"
+}
+
+/// The two-topic graph, `w2` stamping `writer` into its frames.
+fn ri_mix_factories(writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w2", period(writer)),
+        ("w3", period(3.0)),
+        ("a", period(5.0)),
+        (
+            "b",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// A `multi_publisher_topics` topic that one process compares writer by
+/// writer and another as one stream is judged in both. `w2` runs in the
+/// first process, and `w3`, `a` and `b` in the second. With the verifier's
+/// record budget at the bus's `2n` frames, the first process, whose
+/// multi-publisher topics are the bus alone, attributes the bus's frames to
+/// their writers, while the second, whose bus and `/rimix/aux` hold `3n`,
+/// cannot, and compares every recorded frame of the bus with the `n` its
+/// writer `w3` replayed. So the bus is a `missing-messages` violation and a
+/// byte mismatch at the first recorded frame that is not `w3`'s next one,
+/// with the unchanged candidate, and those two followed by one byte mismatch
+/// from `w2` with a changed `w2`, which only the first process runs. Both
+/// exit 1. `/rimix/aux`, which only `a` publishes, matches as one stream.
+#[test]
+#[serial]
+fn a_split_topic_one_process_attributes_and_another_does_not_is_judged_in_both() {
+    let live = ri_record(ri_mix_yaml(), || ri_mix_factories(2.0));
+    let n = RI_STEPS;
+    let mut want_bus = BTreeMap::new();
+    want_bus.insert(2, ri_period_frames(2.0));
+    want_bus.insert(3, ri_period_frames(3.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_MIX_BUS),
+        want_bus,
+        "the recorded bus, writer by writer"
+    );
+    let mut want_aux = BTreeMap::new();
+    want_aux.insert(5, ri_period_frames(5.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_MIX_AUX),
+        want_aux,
+        "the recorded aux topic holds a's frames alone"
+    );
+    // Where `w3`'s replayed frames, its own in order, first differ from the
+    // recorded bus.
+    let w3_at = live.rec.messages[RI_MIX_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .zip(ri_period_frames(3.0))
+        .position(|(r, w)| r != w)
+        .expect("PREMISE: the bus interleaves the writers");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_mix.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id != "w2");
+    let missing = format!(
+        "recorded {} frame(s), replay produced {n} on '{RI_MIX_BUS}'",
+        2 * n
+    );
+    for (run, writer) in [("CONTROL", 2.0), ("changed w2", 4.0)] {
+        let (outcome, _) = {
+            let _budget = replay_engine::override_frame_index_record_budget(2 * n);
+            ri_replay(
+                &bag,
+                || ri_mix_factories(writer),
+                replay_engine::ReplayPurpose::Verify,
+            )
+        };
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        assert_eq!(resim_exit(&outcome, true), 1, "{run}: exit 1");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 1),
+            "{run}: the bus fails and the aux topic passes"
+        );
+        let named = ri_named(&outcome);
+        let one_stream = |got: &[(&str, &ViolationClass, &str)]| {
+            matches!(
+                got,
+                [
+                    (RI_MIX_BUS, ViolationClass::MissingMessages { recorded, replayed }, count),
+                    (RI_MIX_BUS, ViolationClass::ByteMismatch { index, .. }, byte),
+                    ..
+                ] if (*recorded, *replayed, *index) == (2 * n, n, w3_at)
+                    && *count == missing
+                    && byte.starts_with(&format!("frame {w3_at} on '{RI_MIX_BUS}' differs "))
+            )
+        };
+        assert!(
+            one_stream(&named),
+            "{run}: the second process's one-stream verdict first: {named:?}"
+        );
+        if writer == 2.0 {
+            assert_eq!(named.len(), 2, "{run}: nothing else: {named:?}");
+        } else {
+            let want_detail = ri_changed_w2_line(RI_MIX_BUS);
+            assert!(
+                matches!(
+                    &named[2..],
+                    [(RI_MIX_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                        if *detail == want_detail
+                ),
+                "{run}: then w2's byte mismatch from the first process: {named:?}"
+            );
+        }
+    }
 }
 
 /// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
