@@ -48,11 +48,13 @@ else. The recorded inputs are the external-source topics and the outputs of
 so the driver has no device to read, and the bag feeds its recorded frames to
 the nodes that read them. The driver still fires on its recorded wakes, so a
 driver whose tick writes its outputs without a device publishes them:
-`--record-out` holds those frames, and the verdict does not compare them. Of a
-free-run recording (the multi-process default),
-a `--verify` resim feeds every such read, and a resim without `--verify` feeds
-the nodes that ran in another process or executor unit than the driver and
-warns that it does not feed the rest. A lockstep recording
+`--record-out` holds those frames, and the verdict does not compare them,
+except on a shared topic whose frames the replay cannot attribute to their
+writers (see below). Of a free-run recording (the multi-process default) at
+`trace_format` 8 or later, whose reads name their frames, a `--verify` resim
+feeds every such read; a resim without `--verify`, or of an older free-run
+recording, feeds the nodes that ran in another process or executor unit than
+the driver and warns that it does not feed the rest. A lockstep recording
 (`CERULION_EXECUTION_MODE=lockstep`, or `--single-process --record` of a graph
 that is one executor unit) is not supported for a graph with a driver: its
 resim does not fire the driver or feed the nodes that read it, so a warning
