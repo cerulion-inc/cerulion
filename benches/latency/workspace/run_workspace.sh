@@ -230,7 +230,8 @@
 #                             Any other value is an env-contract violation
 #                             (exit 2).
 #   CERULION                  path to the cerulion binary (default: the
-#                             repo's target/release/cerulion, rebuilt here)
+#                             repo's target/release/cerulion, rebuilt here
+#                             with the cerulion-netd it spawns beside it)
 #
 # Exit codes: 0 ok · 1 hard failure (loud) · 2 env-contract violation
 #             (incl. the retired `default` leg refusal) ·
@@ -987,8 +988,16 @@ clean_iox2_state() {
 export CERULION_LOGIN_GATE=off
 CERULION="${CERULION:-$REPO_ROOT/target/release/cerulion}"
 echo "Rebuilding cerulion binary + workspace cdylibs (release) for iceoryx2 parity..."
-if ! ( cd "$REPO_ROOT" && cargo build -p cerulion_cli --release ); then
-    echo "!!! pre-sweep cerulion_cli rebuild failed — aborting (would run stale binary)" >&2
+# cerulion_netd rides the SAME cargo invocation as the CLI. Every leg serves
+# the network (no CERULION_NETWORK override, see the run command below), so
+# `graph run` spawns the `cerulion-netd` gateway from beside the binary that
+# runs it (or from CERULION_NETD_BIN), and a CLI-only build leaves no daemon
+# there: the leg fails before its first sample. One invocation builds the
+# pair the way the release does. bench.py names a missing or stale daemon,
+# beside a CERULION override or named by CERULION_NETD_BIN, before any cell
+# runs; a CERULION_NETD_BIN naming the daemon this build writes is exempt.
+if ! ( cd "$REPO_ROOT" && cargo build -p cerulion_cli -p cerulion_netd --release ); then
+    echo "!!! pre-sweep cerulion_cli + cerulion_netd rebuild failed, aborting (would run stale binaries)" >&2
     exit 1
 fi
 if ! ( cd "$SCRIPT_DIR" && cargo build --release ); then
