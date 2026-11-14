@@ -15156,9 +15156,10 @@ fn run_rank_pass(
         None
     };
     // The injectors are opened BEFORE the capture partitionings,
-    // because on a SPLIT `multi_publisher_topics` topic the injector is one of
-    // the writers the capture has to tell apart — its publisher id stands in
-    // for the FOREIGN writer whose recorded frames it re-publishes. Opening
+    // because on a SPLIT `multi_publisher_topics` topic the capture tells the
+    // injector's frames apart from its own writers' by the injector's
+    // publisher id, and leaves them out: they are the recorded frames of the
+    // FOREIGN writers it re-publishes. Opening
     // order is the only thing that changed; the injectors are handed to the
     // dispatch below exactly as before.
     let injectors = open_injectors(

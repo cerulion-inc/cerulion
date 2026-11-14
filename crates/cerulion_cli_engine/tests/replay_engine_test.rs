@@ -37735,9 +37735,10 @@ fn the_shared_bus_fixture_verdict_is_deterministic() {
 // A rank that owns one of the bus's writers publishes its half LIVE and asks the
 // bag for the other half. That overlap is what the engine has to make work:
 // the capture and the injector become two positional readers of one recorded
-// stream (each gets its own feed), the injector's publisher id stands in for the
-// foreign writer in the per-writer capture partition, and `inject_planned` walks
-// PAST the frames the local producer republishes instead of injecting them too.
+// stream (each gets its own feed), the per-writer capture partition leaves out
+// the frames published under the injector's publisher id, recorded copies of
+// the foreign writers' frames, and `inject_planned` walks PAST the frames the
+// local producer republishes instead of injecting them too.
 
 /// Which topics a replay reported a violation on, deduped and sorted.
 fn sb_dirty(outcome: &ReplayOutcome) -> Vec<String> {
