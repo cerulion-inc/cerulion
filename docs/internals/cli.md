@@ -227,8 +227,10 @@ Rules that must not drift:
   another whose writers published frames, returned as `SplitUnjudged`, which `assemble_outcome`
   DECLINES (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else
   on the topic failed. The ragged-tail frame tolerance (`tail_extra_ranks`) bounds a partitioned
-  topic rank by rank, the extra frames of one rank's writers within that rank's window together,
-  and a one-stream topic by the sum of its ranks' windows; a split topic is bounded part by part
+  topic writer by writer, each writer's extra frames within its rank's tail width times the most
+  frames it published in one recorded step (`PartitionCounts::burst`, `writer_bursts`), and a
+  one-stream topic by the sum of its ranks' windows at the topic's largest one-step burst
+  (`RecordedMessages::max_burst`); a split topic is bounded part by part
   (`SplitPasses::tail_extra_ranks`), its one-stream passes' frames together by the sum of their
   ranks' windows, guarded by the frames it compares (`SplitPasses::tail_clean`). `--tolerance`
   rows fold across passes to one per field and metric (`fold_tolerance_worsts`). A metadata read that fails

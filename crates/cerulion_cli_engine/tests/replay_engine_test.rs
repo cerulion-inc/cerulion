@@ -38710,7 +38710,8 @@ fn c6_a_clean_partitioned_ragged_tail_is_tolerated_with_the_single_rank_note() {
     );
     // The single-rank note, BYTE-IDENTICAL: the owner set has one
     // member, so the multi-rank rendering never engages. Recorded 6 + 6,
-    // replayed 8 + 8, extra 4 inside a 2-step × 2-frames-per-step window.
+    // replayed 8 + 8: each writer's 2 extras inside its own window of 2
+    // steps × its 1 frame per step.
     assert_eq!(
         notes,
         vec![&format!(
@@ -38856,20 +38857,22 @@ fn rt_split_rank_of(id: &str) -> u32 {
 }
 
 /// (iii) A SPLIT bus, its writers on different ranks, each rank ragged by its
-/// own width, is tolerated rank by rank, each rank's writers' extras within
-/// that rank's window, and the note names BOTH ranks with their own causes;
-/// the single-owner topic beside it keeps the single-rank note byte for byte.
+/// own width, is tolerated writer by writer, each writer's extras within its
+/// own rank's tail times its own frames per step, and the note names BOTH
+/// ranks with their own causes; the single-owner topic beside it keeps the
+/// single-rank note byte for byte.
 ///
 /// Rank 0's final recorded step banks a boundary and no fires (width 1, the
 /// fire-less-final-step shape); rank 1 exits after step 5 (width 2, the peer-tail
 /// shape). `left` re-fires 1 frame, `right` 2: three trailing extras on a bus
-/// whose per-step count is 2. A map naming only the FIRST writer's rank —
-/// rank 0, window 1 × 2 = 2 — refuses the three as over-bound: a clean
-/// replay of a legal recording, failed on an owner it half-read. Rank by
-/// rank, `left`'s 1 fits rank 0's window of 2 and `right`'s 2 rank 1's of 4.
+/// whose writers publish 1 frame per step each. A window read off the FIRST
+/// writer's rank alone, 1 step, refuses `right`'s 2: a clean replay of a
+/// legal recording, failed on an owner it half-read. Writer by writer,
+/// `left`'s 1 fits its window of 1 step × 1 frame and `right`'s 2 its window
+/// of 2 steps × 1 frame.
 #[test]
 #[serial]
-fn c6_a_split_bus_is_tolerated_rank_by_rank_within_each_owning_rank_s_window() {
+fn c6_a_split_bus_is_tolerated_writer_by_writer_within_each_owning_rank_s_tail() {
     let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
     rt_assert_premise(&rec);
     rt_drop_writer_tail(&mut rec, "left", 1);
@@ -38894,7 +38897,7 @@ fn c6_a_split_bus_is_tolerated_rank_by_rank_within_each_owning_rank_s_window() {
     assert!(
         outcome.passed && violations.is_empty(),
         "three trailing extras on a bus owned by two ragged ranks are tolerated, \
-         each rank's within its own window: passed={} {:?}",
+         each writer's within its own window: passed={} {:?}",
         outcome.passed,
         outcome.violations
     );
@@ -38932,16 +38935,16 @@ fn c6_a_split_bus_is_tolerated_rank_by_rank_within_each_owning_rank_s_window() {
     );
 }
 
-/// (iv) A SPLIT bus's tolerance is bounded rank by rank: one rank's tail
+/// (iv) A SPLIT bus's tolerance is bounded writer by writer: one rank's tail
 /// never explains another rank's writer's extra frame.
 ///
 /// Rank 0 (`left`) banks a final boundary and no fires (width 1); rank 1
 /// (`right`) records every step (width 0) and lost the frame of its last fire.
-/// `left` re-fires 1 frame inside rank 0's window, `right` replays 1 frame no
-/// window of its own explains. The two extras fit rank 0's window of 1 × 2
-/// frames, which is what a topic-wide bound read; rank by rank, `right`'s is
-/// past rank 1's empty one, so the bus takes no tolerance and both writers' extras
-/// are reported: exit 1, and no note on the bus.
+/// `left` re-fires 1 frame inside its own window, `right` replays 1 frame no
+/// window of its own explains. The two extras fit rank 0's 1 step × the bus's
+/// 2 frames per step, which is what a topic-wide bound read; writer by writer,
+/// `right`'s is past rank 1's empty tail, so the bus takes no tolerance and
+/// both writers' extras are reported: exit 1, and no note on the bus.
 #[test]
 #[serial]
 fn c6_one_rank_s_tail_never_explains_another_rank_s_writer() {
@@ -38983,20 +38986,20 @@ fn c6_one_rank_s_tail_never_explains_another_rank_s_writer() {
     );
 }
 
-/// (v) The writers one ragged rank runs share that rank's one window: the
-/// window bounds the extra frames they produced together, never each writer's
-/// alone.
+/// (v) Each writer one ragged rank runs has a window of its own, its rank's
+/// tail times its own frames per step, which the frames the other writers
+/// publish in the same steps never widen.
 ///
-/// Both writers on rank 1, which exits after step 5 (width 2), on a bus of 2
-/// frames per step: a window of 2 × 2 = 4 frames. The recording lost each
-/// writer's last 3 frames and the replay produces them, 6 trailing extras
-/// together, past the window, though each writer's 3 fit it. Exit 1, each
-/// writer's extras reported, and no note on the bus. The CONTROL, 4 extras
-/// inside the same window, is
+/// Both writers on rank 1, which exits after step 5 (width 2), each at 1 frame
+/// per step on a bus of 2 frames per step: a window of 2 × 1 = 2 frames for
+/// each writer. The recording lost each writer's last 3 frames and the replay
+/// produces them, 3 trailing extras per writer, past its window, though they
+/// fit the rank's 2 steps × the bus's 2 frames. Exit 1, each writer's extras
+/// reported, and no note on the bus. The CONTROL, 2 extras per writer, is
 /// `c6_a_clean_partitioned_ragged_tail_is_tolerated_with_the_single_rank_note`.
 #[test]
 #[serial]
-fn c6_co_located_writers_share_their_rank_s_one_window() {
+fn c6_each_co_located_writer_is_bounded_by_its_own_window() {
     let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
     rt_assert_premise(&rec);
     rt_drop_writer_tail(&mut rec, "left", 3);
@@ -48769,6 +48772,66 @@ fn one_process_tail_never_explains_another_process_writer_frames() {
                 if (*recorded, *replayed) == (n - 1, n) && *detail == want_detail
         ),
         "exactly w3's extra frame: {named:?}"
+    );
+    assert!(
+        outcome.tolerated_ragged_tails.is_empty(),
+        "no tolerance note: {:?}",
+        outcome.tolerated_ragged_tails
+    );
+}
+
+/// A label-partitioned writer's ragged-tail window is its process's tail
+/// times the most frames the writer published in one recorded step, never the
+/// topic's: the slow-writer bag of
+/// `one_process_tail_never_explains_another_process_writer_frames`, with
+/// `w2`'s last two frames lost instead of `w3`'s. `w2` publishes one frame per
+/// fire, so the first process's one-step tail explains one of the two frames
+/// `w2` replays past its five recorded ones, though both fit one step of the
+/// bus's two frames, the frames `w2` and `w3` publish together on `w2`'s
+/// steps. Exit 1, one `extra-messages` violation from `w2`, and no tolerance
+/// note. The bag labels each frame with its writer.
+#[test]
+#[serial]
+fn a_writer_s_tail_window_is_its_own_frames_per_step_not_the_topic_s() {
+    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_tail_slow_writer_lost_two.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w3");
+    assert_eq!(
+        load_inputs(&bag).3.max_burst(RI_TAIL_BUS),
+        2,
+        "PREMISE: the bus carries two frames in one step"
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_tail_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert_eq!(
+        resim_exit(&outcome, true),
+        1,
+        "exit 1: {:?} {:?}",
+        outcome.trace_divergence,
+        outcome.tolerated_ragged_tails
+    );
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let named = ri_named(&outcome);
+    let want_detail =
+        format!("recorded 5 frame(s), replay produced 7 on '{RI_TAIL_BUS}' from writer w2/out");
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_TAIL_BUS, ViolationClass::ExtraMessages { recorded: 5, replayed: 7 }, detail)]
+                if *detail == want_detail
+        ),
+        "exactly w2's extra frames: {named:?}"
     );
     assert!(
         outcome.tolerated_ragged_tails.is_empty(),

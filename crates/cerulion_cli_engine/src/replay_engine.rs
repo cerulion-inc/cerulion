@@ -6087,7 +6087,7 @@ fn assemble_outcome(
         // Tolerate TRAILING extra frames on a topic whose producing
         // node belongs to a rank that ended in a ragged shutdown tail — the
         // monolith re-fired that node past the recording's end, so up to
-        // (tail width × the topic's per-step frame count) extra frames at the
+        // (tail width × the per-step frame count) extra frames at the
         // END of the stream are legitimate, matching the window the in-comparator
         // `TailTolerance` (`is_tail_refire`) tolerates. THREE guards keep it tight:
         //   * NO byte violation ANYWHERE — the extra is TRAILING, not mid-stream:
@@ -6116,18 +6116,20 @@ fn assemble_outcome(
         //     passes and an over-produced frame still fails.
         // Recorded in `tolerated_ragged_tails` (never silent).
         //
-        // A partitioned topic is bounded RANK BY RANK: the extra frames of the
-        // writers one rank runs lie within that rank's window together, so one
-        // rank's tail never explains another rank's writer's frames, and the
-        // note names the ranks whose writers produced them. A topic compared
-        // as one stream cannot say which writer produced an extra frame, so it
-        // is bounded by the SUM of the windows of the ranks its frames come
-        // from: the topic's owning ranks, or the one pass judged alone. On a
-        // single-writer topic the sum has one term, its one owner's width. A
-        // split topic is bounded part by part (`SplitPasses::tail_extra_ranks`):
-        // its partitioned writers rank by rank, and the frames its one-stream
-        // passes' own writers published by the sum of those passes' ranks'
-        // windows.
+        // A partitioned topic is bounded WRITER BY WRITER: a writer's extra
+        // frames lie within its own window, its rank's tail width times the
+        // most frames it published in one recorded step
+        // (`PartitionCounts::burst`), so neither another rank's tail nor
+        // another writer's frames explain them, and the note names the ranks
+        // whose writers produced them. A topic compared as one stream cannot
+        // say which writer produced an extra frame, so it is bounded by the
+        // SUM of the windows of the ranks its frames come from, each its tail
+        // width times the topic's largest one-step burst: the topic's owning
+        // ranks, or the one pass judged alone. On a single-writer topic the sum
+        // has one term, its one owner's width. A split topic is bounded part
+        // by part (`SplitPasses::tail_extra_ranks`): its partitioned writers
+        // writer by writer, and the frames its one-stream passes' own writers
+        // published by the sum of those passes' ranks' windows.
         let per_step = recorded_messages.max_burst(topic).max(1);
         let extra = replayed_count.saturating_sub(recorded_count);
         let tail_width = |rank: u32| ragged.tail_width(rank) as usize;
@@ -10926,6 +10928,11 @@ struct TopicFrameIndex {
     /// INVARIANT: `ordinals.len() == sequences.len()` — the two are pushed
     /// together, entry for entry.
     ordinals: Vec<u64>,
+    /// Each [`Self::sequences`] entry's wire timestamp, pushed with it, so
+    /// `timestamps.len() == sequences.len()`: a partitioned capture reads
+    /// each writer's largest one-step burst off it
+    /// ([`PartitionCounts::burst`]).
+    timestamps: Vec<u64>,
     /// Every recorded frame on this topic, headerless ones INCLUDED — the
     /// recorder's own frame count, and so the exclusive upper bound of the
     /// ordinal space above.
@@ -10957,7 +10964,7 @@ struct TopicFrameIndex {
 }
 
 /// Walk the recorded frames of `topics` once, collecting each topic's ordered
-/// sequences and its `sequence -> wire stamp` join table.
+/// sequences and wire timestamps and its `sequence -> wire stamp` join table.
 ///
 /// `Ok(None)` = the budget was blown (same contract as
 /// [`collect_rank_read_log`]).
@@ -10973,6 +10980,7 @@ fn collect_topic_frame_index(
                 TopicFrameIndex {
                     sequences: Vec::new(),
                     ordinals: Vec::new(),
+                    timestamps: Vec::new(),
                     recorded: 0,
                     stamps: std::collections::HashMap::new(),
                     headerless: 0,
@@ -11010,6 +11018,7 @@ fn collect_topic_frame_index(
         // Pushed TOGETHER — `TopicFrameIndex::ordinals`' length invariant.
         idx.sequences.push(h.sequence);
         idx.ordinals.push(ordinal);
+        idx.timestamps.push(h.timestamp_ns);
         match idx.stamps.get(&h.sequence) {
             None => {
                 idx.stamps.insert(h.sequence, h.timestamp_ns);
@@ -18215,6 +18224,10 @@ struct CaptureStream {
     /// This partition's recorded frame count — the `total_recorded` elision
     /// guard, per writer.
     total_recorded: usize,
+    /// The most frames this writer published in one recorded step
+    /// ([`PartitionCounts::burst`]); 0 for a writer the recording does not
+    /// carry.
+    recorded_burst: usize,
     /// The wire `sequence` of the last captured frame on THIS partition.
     last_seq: Option<u32>,
     /// This partition's RECORDED sequences, run-length compressed — the
@@ -18257,6 +18270,12 @@ struct PartitionCounts {
     recorded: usize,
     replayed: usize,
     byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
+    /// The most frames this writer published in one recorded step: the
+    /// longest run of equal wire timestamps among its own recorded frames in
+    /// file order ([`writer_bursts`]), 0 for a writer the recording does not
+    /// carry. The ragged-tail window of the writer is its rank's tail width
+    /// times this ([`tail_extra_ranks`]).
+    burst: usize,
 }
 
 /// The label-partitioned diff state of ONE co-located multi-publisher topic.
@@ -18320,6 +18339,7 @@ impl CapturePartitioning {
                 CaptureStream {
                     replayed_count: 0,
                     total_recorded: 0,
+                    recorded_burst: 0,
                     last_seq: None,
                     recorded_seq_runs: Vec::new(),
                     pending: VecDeque::new(),
@@ -18391,6 +18411,32 @@ impl CapturePartitioning {
     }
 }
 
+/// Per writer of `frames`, the `(writer, wire timestamp)` of each recorded
+/// frame in file order, the most frames it published in one recorded step:
+/// the longest run of equal timestamps among its own frames, the other
+/// writers' frames between them skipped. One step's clock is stamped into
+/// every frame it publishes, so the run counts the frames one writer
+/// published in one step, whichever other writers published in it too. PURE.
+fn writer_bursts<'a>(
+    frames: impl IntoIterator<Item = (&'a WriterKey, u64)>,
+) -> BTreeMap<&'a WriterKey, usize> {
+    // Per writer: the stamp of its current run, the run's length, the longest.
+    let mut runs: BTreeMap<&WriterKey, (u64, usize, usize)> = BTreeMap::new();
+    for (writer, stamp) in frames {
+        let (at, run, longest) = runs.entry(writer).or_insert((stamp, 0, 0));
+        if *at == stamp {
+            *run += 1;
+        } else {
+            *at = stamp;
+            *run = 1;
+        }
+        *longest = (*longest).max(*run);
+    }
+    runs.into_iter()
+        .map(|(writer, (_, _, longest))| (writer, longest))
+        .collect()
+}
+
 /// Per writer, the count/byte verdict inputs — the UNION of the writers the
 /// RECORDING carries and the writers the replay produced, so a partition
 /// missing from either side still reports (a writer that produced nothing is a
@@ -18422,6 +18468,7 @@ fn fold_partition_counts(
                 recorded: 0,
                 replayed: 0,
                 byte_violation: None,
+                burst: 0,
             })
             .recorded += 1;
     }
@@ -18430,8 +18477,10 @@ fn fold_partition_counts(
             recorded: 0,
             replayed: 0,
             byte_violation: None,
+            burst: 0,
         });
         entry.replayed = stream.replayed_count;
+        entry.burst = stream.recorded_burst;
         entry.byte_violation = stream.byte_violation.take().map(&mut *judge);
     }
     out
@@ -19669,8 +19718,13 @@ fn build_capture_partitionings(
         // wrong direction for an index-length defect. Refuse the partition
         // (fall back to the single-stream path, exactly as the producer
         // window does) instead of seeding a shorter set silently.
-        let seqs = match idx.sequences.get(skip..skip + keep) {
-            Some(s) if s.len() == keep => s,
+        // The timestamps are pushed with the sequences, so one length check
+        // guards both.
+        let (seqs, stamps) = match (
+            idx.sequences.get(skip..skip + keep),
+            idx.timestamps.get(skip..skip + keep),
+        ) {
+            (Some(s), Some(t)) if s.len() == keep && t.len() == keep => (s, t),
             _ => {
                 tracing::warn!(
                     topic = %topic,
@@ -19681,6 +19735,7 @@ fn build_capture_partitionings(
                 continue;
             }
         };
+        let bursts = writer_bursts(recorded_writers.iter().zip(stamps.iter().copied()));
         for (key, seq) in recorded_writers.iter().zip(seqs) {
             // Seed only the partitions this pass can reproduce.
             if !producible_keys.contains(key) {
@@ -19689,6 +19744,7 @@ fn build_capture_partitionings(
             let stream = streams.entry(key.clone()).or_insert_with(|| CaptureStream {
                 replayed_count: 0,
                 total_recorded: 0,
+                recorded_burst: bursts.get(key).copied().unwrap_or(0),
                 last_seq: None,
                 recorded_seq_runs: Vec::new(),
                 pending: VecDeque::new(),
@@ -25286,8 +25342,8 @@ impl<'a> SplitPasses<'a> {
     }
 
     /// The ranks whose ragged shutdown tails explain the topic's trailing
-    /// extra frames ([`tail_extra_ranks`]): its partitioned writers' rank by
-    /// rank, and the frames the one-stream passes' own writers published past
+    /// extra frames ([`tail_extra_ranks`]): its partitioned writers' writer by
+    /// writer, and the frames the one-stream passes' own writers published past
     /// the recorded frames no partition holds within the windows of those
     /// passes' ranks together.
     fn tail_extra_ranks(
@@ -25440,8 +25496,9 @@ fn push_split_violations(
 ///
 /// A pass partitions a topic over the writers its rank runs, and a writer runs
 /// in one rank, so the fold is the union of the passes' partitions. A
-/// partition two passes both hold has its counts added and keeps the first
-/// pass's byte violation, so no captured frame drops out of the verdict. The
+/// partition two passes both hold has its counts added, keeps the first
+/// pass's byte violation, so no captured frame drops out of the verdict, and
+/// keeps the larger recorded burst ([`PartitionCounts::burst`]). The
 /// fold's frame count is its partitions' sum, its tolerance worsts fold to one
 /// per field and metric ([`fold_tolerance_worsts`]), its injected count is the
 /// passes' sum, which no partition counts, and its rank is the first pass's.
@@ -25461,9 +25518,11 @@ fn merge_partitioned_summaries<'a>(
                 recorded: 0,
                 replayed: 0,
                 byte_violation: None,
+                burst: 0,
             });
             kept.recorded += c.recorded;
             kept.replayed += c.replayed;
+            kept.burst = kept.burst.max(c.burst);
             if kept.byte_violation.is_none() {
                 kept.byte_violation = c.byte_violation.clone();
             }
@@ -25484,16 +25543,19 @@ fn merge_partitioned_summaries<'a>(
 /// frames, or `None` when some of them lie past every window that could
 /// explain them. PURE.
 ///
-/// A rank's window is `tail_width(rank) x per_step` frames. The writers of
-/// `partitions` are bounded rank by rank (`writer_rank`): the extra frames,
-/// `replayed - recorded`, of the writers one rank runs lie within its window
-/// together, and a writer whose rank is unknown has no window. Frames compared
-/// as one stream cannot say which writer produced an extra frame, so the
-/// stream's `stream_extra` frames lie within the room the windows of
-/// `stream_ranks`, the ranks its frames come from, keep past the partitioned
-/// writers' extra frames there. The ranks named are those whose writers
-/// produced extra frames and, where the stream has extra frames, those of
-/// `stream_ranks` with room in their window.
+/// The writers of `partitions` are bounded writer by writer: a writer's extra
+/// frames, `replayed - recorded`, lie within its own window, the tail width
+/// of its rank (`writer_rank`) times the most frames it published in one
+/// recorded step ([`PartitionCounts::burst`], at least one), so neither another
+/// rank's tail nor another writer's frames widen it, and a writer whose rank
+/// is unknown has no window. Frames compared as one stream cannot say which
+/// writer produced an extra frame, so their window in a rank is
+/// `tail_width(rank) x per_step`, `per_step` the topic's largest one-step
+/// burst, and the stream's `stream_extra` frames lie within the room the
+/// windows of `stream_ranks`, the ranks its frames come from, keep past the
+/// partitioned writers' extra frames there. The ranks named are those whose
+/// writers produced extra frames and, where the stream has extra frames, those
+/// of `stream_ranks` with room in their window.
 fn tail_extra_ranks(
     partitions: Option<&BTreeMap<WriterKey, PartitionCounts>>,
     stream_ranks: &BTreeSet<u32>,
@@ -25510,11 +25572,11 @@ fn tail_extra_ranks(
             continue;
         }
         let rank = writer_rank(writer)?;
-        let in_rank = used.entry(rank).or_insert(0);
-        *in_rank = in_rank.saturating_add(over);
-        if *in_rank > window(rank) {
+        if over > tail_width(rank).saturating_mul(c.burst.max(1)) {
             return None;
         }
+        let in_rank = used.entry(rank).or_insert(0);
+        *in_rank = in_rank.saturating_add(over);
     }
     let room = |rank: u32| window(rank).saturating_sub(used.get(&rank).copied().unwrap_or(0));
     let mut ranks: BTreeSet<u32> = used.keys().copied().collect();
@@ -36114,6 +36176,7 @@ mod capture_partition_tests {
                     CaptureStream {
                         replayed_count: *n,
                         total_recorded: 0,
+                        recorded_burst: 0,
                         last_seq: None,
                         recorded_seq_runs: Vec::new(),
                         pending: VecDeque::new(),
@@ -36147,12 +36210,12 @@ mod capture_partition_tests {
             .iter()
             .map(|l| key(l))
             .collect();
-        let got = fold_partition_counts(
-            &recorded,
-            &producible,
-            &mut streams(&[("alpha/out", 2), ("gamma/out", 1)]),
-            &mut no_divergence,
-        );
+        let mut captured = streams(&[("alpha/out", 2), ("gamma/out", 1)]);
+        captured
+            .get_mut(&key("alpha/out"))
+            .expect("seeded")
+            .recorded_burst = 2;
+        let got = fold_partition_counts(&recorded, &producible, &mut captured, &mut no_divergence);
         let recorded_only = got
             .get(&key("beta/out"))
             .expect("a recorded-only writer reports");
@@ -36161,6 +36224,8 @@ mod capture_partition_tests {
             .get(&key("alpha/out"))
             .expect("a writer on both sides reports once");
         assert_eq!((both.recorded, both.replayed), (2, 2));
+        assert_eq!(both.burst, 2, "a writer's recorded burst rides its counts");
+        assert_eq!(recorded_only.burst, 0, "no stream, no burst");
         let replayed_only = got
             .get(&key("gamma/out"))
             .expect("a replay-only writer reports");
@@ -36411,6 +36476,7 @@ mod capture_partition_tests {
                 recorded: 3,
                 replayed: 0,
                 byte_violation: None,
+                burst: 1,
             },
         )]
         .into_iter()
@@ -36453,7 +36519,8 @@ mod capture_partition_tests {
     }
 
     /// One pass's partitioned summary: per writer, its `(recorded, replayed)`
-    /// counts and the index of its first byte divergence, if any.
+    /// counts and the index of its first byte divergence, if any, each writer
+    /// one frame per recorded step.
     fn pass_summary(parts: &[(&str, usize, usize, Option<usize>)]) -> CaptureSummary {
         CaptureSummary {
             replayed_count: parts.iter().map(|p| p.2).sum(),
@@ -36471,6 +36538,7 @@ mod capture_partition_tests {
                                 recorded,
                                 replayed,
                                 byte_violation: diverged.map(verdict_at),
+                                burst: 1,
                             },
                         )
                     })
@@ -36541,6 +36609,23 @@ mod capture_partition_tests {
             rows(&merge_partitioned_summaries(&twice).expect("partitioned")),
             vec![w("a/out", 8, 7, Some(1)), w("b/out", 2, 3, Some(1))]
         );
+        // And it keeps the larger recorded burst.
+        let mut wide = twice[1].clone();
+        if let Some(c) = wide
+            .partition_counts
+            .as_mut()
+            .and_then(|p| p.get_mut(&WriterKey::Named("a/out".into())))
+        {
+            c.burst = 3;
+        }
+        let bursts: Vec<usize> = merge_partitioned_summaries([&twice[0], &wide])
+            .expect("partitioned")
+            .partition_counts
+            .expect("partitioned")
+            .values()
+            .map(|c| c.burst)
+            .collect();
+        assert_eq!(bursts, vec![3, 1]);
         let one = pass_summary(&[("a/out", 4, 3, None)]);
         let folded = merge_partitioned_summaries([&one]).expect("partitioned");
         assert_eq!(rows(&folded), vec![w("a/out", 4, 3, None)]);
@@ -37050,51 +37135,89 @@ mod capture_partition_tests {
         );
     }
 
-    /// The ragged-tail window of a partitioned topic bounds the writers of
-    /// each rank together by that rank's tail and names the ranks whose
-    /// writers produced extra frames; a one-stream topic is bounded by the sum
-    /// of its ranks' windows and names the ranks with a tail. Rank 0's tail is
-    /// 1 step, rank 1's none, 2 frames per step.
+    /// The ragged-tail window of a partitioned topic bounds each writer by
+    /// its rank's tail times the most frames it published in one recorded
+    /// step, at least one, and names the ranks whose writers produced extra
+    /// frames; a one-stream topic is bounded by the sum of its ranks' windows
+    /// at the topic's largest one-step burst and names the ranks with a tail.
+    /// Rank 0's tail is 1 step, rank 1's none, and the topic's largest burst
+    /// is 2 frames. Hand oracles.
     #[test]
-    fn the_tail_window_bounds_the_writers_of_each_rank_together() {
+    fn the_tail_window_bounds_each_writer_by_its_own_burst() {
         let width = |rank: u32| usize::from(rank == 0);
         let rank_of = |w: &WriterKey| match w {
             WriterKey::Named(label) if label.starts_with("r0/") => Some(0),
             WriterKey::Named(label) if label.starts_with("r1/") => Some(1),
             _ => None,
         };
-        let parts =
-            |r0: (usize, usize), r1: (usize, usize)| -> BTreeMap<WriterKey, PartitionCounts> {
-                pass_summary(&[("r0/out", r0.0, r0.1, None), ("r1/out", r1.0, r1.1, None)])
-                    .partition_counts
-                    .expect("partitioned")
-            };
-        let ranks = BTreeSet::from([0, 1]);
-        let bound = |p: &BTreeMap<WriterKey, PartitionCounts>| {
-            tail_extra_ranks(Some(p), &ranks, 0, 2, width, rank_of)
+        // Per writer: `(label, recorded, replayed, burst)`.
+        let parts = |rows: &[(&str, usize, usize, usize)]| -> BTreeMap<WriterKey, PartitionCounts> {
+            rows.iter()
+                .map(|&(label, recorded, replayed, burst)| {
+                    (
+                        key(label),
+                        PartitionCounts {
+                            recorded,
+                            replayed,
+                            byte_violation: None,
+                            burst,
+                        },
+                    )
+                })
+                .collect()
         };
-        assert_eq!(bound(&parts((9, 9), (9, 10))), None, "rank 1 has no tail");
-        assert_eq!(bound(&parts((9, 11), (9, 9))), Some(vec![0]));
-        assert_eq!(bound(&parts((9, 12), (9, 9))), None, "past rank 0's window");
-        assert_eq!(bound(&parts((9, 9), (9, 9))), Some(vec![]));
-        let unknown = pass_summary(&[("q/out", 1, 2, None)])
-            .partition_counts
-            .expect("partitioned");
-        assert_eq!(bound(&unknown), None, "a writer of no known rank");
-        let co_located = |a: usize, b: usize| {
-            pass_summary(&[("r0/a", 9, 9 + a, None), ("r0/b", 9, 9 + b, None)])
-                .partition_counts
-                .expect("partitioned")
+        let ranks = BTreeSet::from([0, 1]);
+        let bound = |rows: &[(&str, usize, usize, usize)]| {
+            tail_extra_ranks(Some(&parts(rows)), &ranks, 0, 2, width, rank_of)
         };
         assert_eq!(
-            bound(&co_located(1, 1)),
-            Some(vec![0]),
-            "two writers of rank 0 inside its one window together"
+            bound(&[("r0/out", 9, 9, 1), ("r1/out", 9, 10, 1)]),
+            None,
+            "rank 1 has no tail"
         );
         assert_eq!(
-            bound(&co_located(2, 1)),
+            bound(&[("r0/out", 9, 10, 1), ("r1/out", 9, 9, 1)]),
+            Some(vec![0])
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 11, 1), ("r1/out", 9, 9, 1)]),
             None,
-            "two writers of rank 0 past its one window together, each inside it"
+            "a writer of one frame per step: two extra frames are past its window of \
+             one, though inside the topic's window of two"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 11, 2), ("r1/out", 9, 9, 1)]),
+            Some(vec![0]),
+            "a writer of two frames per step"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 12, 2)]),
+            None,
+            "past its window of two"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 0, 1, 0)]),
+            Some(vec![0]),
+            "a writer the recording does not carry has a window of one frame per step"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 9, 1), ("r1/out", 9, 9, 1)]),
+            Some(vec![])
+        );
+        assert_eq!(
+            bound(&[("q/out", 1, 2, 1)]),
+            None,
+            "a writer of no known rank"
+        );
+        assert_eq!(
+            bound(&[("r0/a", 9, 10, 1), ("r0/b", 9, 10, 1)]),
+            Some(vec![0]),
+            "two writers of rank 0, each inside its own window"
+        );
+        assert_eq!(
+            bound(&[("r0/a", 9, 11, 1), ("r0/b", 9, 9, 3)]),
+            None,
+            "a writer's window is never widened by another writer's burst"
         );
         let stream = |extra: usize| tail_extra_ranks(None, &ranks, extra, 2, width, rank_of);
         assert_eq!(stream(2), Some(vec![0]));
@@ -37103,7 +37226,7 @@ mod capture_partition_tests {
         // frames leave in a window they share.
         let beside = |extra: usize| {
             tail_extra_ranks(
-                Some(&parts((9, 10), (9, 9))),
+                Some(&parts(&[("r0/out", 9, 10, 1), ("r1/out", 9, 9, 1)])),
                 &BTreeSet::from([0]),
                 extra,
                 2,
@@ -37118,6 +37241,34 @@ mod capture_partition_tests {
             None,
             "the one pass judged alone has no tail"
         );
+    }
+
+    /// A writer's burst is the longest run of equal wire timestamps among its
+    /// own recorded frames, the other writers' frames between them skipped:
+    /// `a` publishes two frames at 10 and one each at 20 and 30, `b` one at 10
+    /// and three at 20. Hand oracle.
+    #[test]
+    fn a_writer_s_burst_is_its_own_longest_one_step_run() {
+        let (a, b) = (key("a/out"), key("b/out"));
+        let frames = [
+            (&a, 10),
+            (&b, 10),
+            (&a, 10),
+            (&b, 20),
+            (&a, 20),
+            (&b, 20),
+            (&b, 20),
+            (&a, 30),
+        ];
+        let got: Vec<(String, usize)> = writer_bursts(frames)
+            .into_iter()
+            .map(|(w, n)| (w.to_string(), n))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a/out".to_string(), 2), ("b/out".to_string(), 3)]
+        );
+        assert!(writer_bursts(std::iter::empty()).is_empty());
     }
 }
 
