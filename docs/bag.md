@@ -103,31 +103,40 @@ frame the bag does not hold (exit 2, `read_identity_frame_missing`).
 
 The verdict states what it left out, on a pass and a failure alike, with one
 `NOTE:` line for each of: the topics only drivers write, naming the driver
-nodes; the `multi_publisher_topics` topics a driver shares with other nodes;
-the driver topics this resim did not feed to the nodes that read them; the
-driver topics no node reads; and, on a `0/0` tally, that no topic was
-compared. For the `v4l2_camera` example the first one reads:
+nodes; the `multi_publisher_topics` topics a driver shares with other nodes
+that were compared over the other writers' frames; those compared over every
+frame (below); the driver topics this resim did not feed to the nodes that
+read them; the driver topics no node reads; and, on a `0/0` tally, that no
+topic was compared. For the `v4l2_camera` example the first one reads:
 
 ```
 NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the replayed build declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
 ```
 
 With `--report` the JSON carries the same lists under `driver_inputs`, as
-`nodes`, `input_topics`, `shared_topics`, `unfed_topics` and `unread_topics`
-(absent for a graph with no driver).
+`nodes`, `input_topics`, `shared_topics`, `unattributed_topics`,
+`unfed_topics` and `unread_topics` (absent for a graph with no driver).
+`unattributed_topics` holds the shared topics compared over every frame,
+the driver's included (below).
 
 A graph whose produced topics are all driver outputs, such as a capture-only
 graph, has nothing to re-compute: its `--verify` passes with `0/0`, and a
 warning and a verdict NOTE say that no topic was compared. A driver topic no
 node reads is neither fed nor compared, and a warning and a verdict NOTE name
 it. On a `multi_publisher_topics` topic a driver shares with other nodes, the
-other writers' frames are compared and the driver's are not, when the bag
-attributes every frame of the topic to its writer. A bag that does not cannot
-say which frames are the driver's: a `--verify` that feeds a node's reads of
-the topic refuses with exit 2 (`read_identity_frames_unattributed`), and
-otherwise every recorded frame of the topic, the driver's included, is
-compared against what the replay publishes on it, so the topic fails (exit 1)
-unless the replayed driver publishes its recorded frames again.
+other writers' frames are compared and the driver's are not, when the replay
+attributes every recorded frame of the topic to its writer, which needs a bag
+that labels each frame with its writer, a wire header on every frame, and at
+most 200000 recorded frames, the verifier's record budget, on the
+`multi_publisher_topics` topics one process or executor unit writes.
+Otherwise the replay cannot say which frames are the driver's, and a warning
+names the cause: a `--verify` that feeds a node's reads of the topic from a
+bag that labels no writer refuses with exit 2
+(`read_identity_frames_unattributed`), and otherwise every recorded and
+replayed frame of the topic, the driver's included, is compared, so the topic
+fails (exit 1) unless the replayed driver publishes its recorded frames again.
+Its verdict `NOTE:` line says the topic was compared over every frame, and
+`driver_inputs.unattributed_topics` names it.
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,

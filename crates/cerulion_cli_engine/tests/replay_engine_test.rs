@@ -44574,7 +44574,8 @@ fn a_verify_of_a_driver_graph_feeds_the_driver_frames_and_passes() {
     }
 }
 
-/// A [`replay_engine::DriverInputsReport`] built from hand-written lists.
+/// A [`replay_engine::DriverInputsReport`] built from hand-written lists,
+/// with no unattributed shared topic.
 fn drv_inputs(
     nodes: &[&str],
     input: &[&str],
@@ -44587,6 +44588,7 @@ fn drv_inputs(
         nodes: owned(nodes),
         input_topics: owned(input),
         shared_topics: owned(shared),
+        unattributed_topics: Vec::new(),
         unfed_topics: owned(unfed),
         unread_topics: owned(unread),
     }
@@ -45018,6 +45020,7 @@ fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_ve
                 "nodes": ["src"],
                 "input_topics": [DRV_RECLASS_OUT],
                 "shared_topics": [],
+                "unattributed_topics": [],
                 "unfed_topics": [],
                 "unread_topics": [],
             }),
@@ -45146,6 +45149,7 @@ fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
                 "nodes": ["cam"],
                 "input_topics": [DRV_CAM_ONLY_IMAGE],
                 "shared_topics": [],
+                "unattributed_topics": [],
                 "unfed_topics": [],
                 "unread_topics": [DRV_CAM_ONLY_IMAGE],
             })
@@ -46520,15 +46524,19 @@ fn drv_unread_bus_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEnt
     ])
 }
 
-/// A topic a driver shares with a period writer, which no node reads, in a
-/// bag that does not attribute each frame to its writer, is compared over
-/// every recorded frame, the camera's included. The replayed camera has no
-/// device and publishes none, so the topic fails with exit 1 as a
-/// `missing-messages` violation, recorded `n + c` frames against the
-/// writer's `c` replayed ones, and the replayed stream, the writer's frames
-/// in order, first differs from the recorded one at the first recorded
-/// camera frame when that frame comes before the writer's last. One process
-/// and two.
+/// A topic a driver shares with a period writer, which no node reads, is
+/// compared over every recorded frame, the camera's included, when the replay
+/// cannot attribute each frame to its writer: in a bag that labels no frame,
+/// and in a labelled bag whose frame index is over the verifier's record
+/// budget. The replayed camera has no device and publishes none, so the topic
+/// fails with exit 1 as a `missing-messages` violation, recorded `n + c`
+/// frames against the writer's `c` replayed ones, and the replayed stream,
+/// the writer's frames in order, first differs from the recorded one at the
+/// first recorded camera frame when that frame comes before the writer's
+/// last. The verdict NOTE and the outcome's `driver_inputs` name the topic as
+/// compared over every frame. CONTROL in the same body: the labelled bag
+/// under the shipped budget passes, compared over the writer's frames only.
+/// One process and two.
 #[test]
 #[serial]
 fn an_unattributed_topic_a_driver_shares_is_compared_over_every_recorded_frame() {
@@ -46565,7 +46573,60 @@ fn an_unattributed_topic_a_driver_shares_is_compared_over_every_recorded_frame()
         .position(|&(x, _, _)| x == DRV_DEVICE)
         .expect("PREMISE: the bus holds a camera frame");
     let dir = tempfile::tempdir().unwrap();
-    for (layout, bag) in drv_unlabelled_bags(&rec, dir.path(), "drv_unread_bus") {
+    let labelled_single = dir.path().join("drv_unread_bus_labelled_single.mcap");
+    ri_bag(&rec, &labelled_single, ri_free_run_recorder_json());
+    let labelled_two_rank = dir.path().join("drv_unread_bus_labelled_two_rank.mcap");
+    ri_two_rank_bag(&rec, &labelled_two_rank, |id| id == "w1");
+    let labelled = [
+        ("labelled single-rank", labelled_single),
+        ("labelled two-rank", labelled_two_rank),
+    ];
+    let attributed_note = format!(
+        "NOTE: 1 topic(s) an external (driver) node shares with other writers were compared \
+         over the other writers' frames only (driver nodes, as the replayed build declares \
+         them: w1): {DRV_UNREAD_BUS}"
+    );
+    for (layout, bag) in &labelled {
+        let (outcome, _) = ri_replay(
+            bag,
+            || drv_unread_bus_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert!(
+            outcome.passed,
+            "CONTROL: {layout}: the labelled bag passes under the shipped budget: {:?}",
+            outcome.violations
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "CONTROL: {layout}"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["w1"], &[], &[DRV_UNREAD_BUS], &[], &[])),
+            "CONTROL: {layout}: the bus is attributed"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![attributed_note.as_str()],
+            "CONTROL: {layout}: {verdict}"
+        );
+    }
+    let unattributed_note = format!(
+        "NOTE: 1 topic(s) an external (driver) node shares with other writers were compared \
+         over every recorded and replayed frame, the drivers' included, since the replay could \
+         not attribute each recorded frame to its writer (driver nodes, as the replayed build \
+         declares them: w1): {DRV_UNREAD_BUS}"
+    );
+    let unlabelled = drv_unlabelled_bags(&rec, dir.path(), "drv_unread_bus")
+        .map(|(layout, bag)| (layout.to_string(), bag, None));
+    let over_budget =
+        labelled.map(|(layout, bag)| (format!("{layout}, over budget"), bag, Some(1)));
+    for (layout, bag, budget) in unlabelled.into_iter().chain(over_budget) {
+        let _guard = budget.map(replay_engine::override_frame_index_record_budget);
         let (outcome, _) = ri_replay(
             &bag,
             || drv_unread_bus_factories(false),
@@ -46578,6 +46639,20 @@ fn an_unattributed_topic_a_driver_shares_is_compared_over_every_recorded_frame()
             (outcome.topics_checked, outcome.topics_passed),
             (1, 0),
             "{layout}: the bus is checked and failed"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(replay_engine::DriverInputsReport {
+                unattributed_topics: vec![DRV_UNREAD_BUS.to_string()],
+                ..drv_inputs(&["w1"], &[], &[DRV_UNREAD_BUS], &[], &[])
+            }),
+            "{layout}: the outcome names the bus as unattributed"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![unattributed_note.as_str()],
+            "{layout}: the NOTE says the camera's frames were compared: {verdict}"
         );
         let named: Vec<(&str, &ViolationClass)> = outcome
             .violations

@@ -202,8 +202,12 @@ Rules that must not drift:
   driver's writer out of `producible` and names a driver of the pass in `uncompared`, whose
   replayed frames `diff_partitioned` leaves out of the diff, the tripwire and every count
   (the drain still writes them to `--record-out`), and the topic-level count is the
-  partitions' sum; an unpartitioned one keeps the whole recorded count and fails, and a fed
-  read of one is refused before that (`read_identity_frames_unattributed`, exit 2). A metadata read that fails
+  partitions' sum; an unpartitioned one (any `build_capture_partitionings` fallback: no
+  labels, a headerless frame, an unnamed publisher, an ambiguous injection, a torn index or
+  the frame-index record budget) keeps the whole recorded count and fails, `assemble_outcome`
+  lists it in `DriverInputsReport::unattributed_topics`, whose NOTE says it was compared over
+  every frame, and a fed read of one is refused before that
+  (`read_identity_frames_unattributed`, exit 2). A metadata read that fails
   keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
   LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
   driver node and every topic one writes, shared ones included, and still fires for a
@@ -211,7 +215,7 @@ Rules that must not drift:
   (one WARN each): a pass that is not fed injects no in-rank topic, so a topic a node reads
   in a rank running one of its driver writers is unfed, a shared one too, while fed and
   unread hold only the topics drivers alone write (a shared topic is compared over its
-  other writers). A `0/0` tally with a driver warns that nothing was compared. The same
+  other writers, or over every frame when unattributed). A `0/0` tally with a driver warns that nothing was compared. The same
   classification rides the outcome as `ReplayOutcome::driver_inputs` (`driver_inputs_report`
   over the plan; a lockstep plan counts every driver topic a node reads as unfed), so the
   `--report` JSON and the verdict NOTE lines (`render_driver_input_lines`, PASS and FAIL alike)

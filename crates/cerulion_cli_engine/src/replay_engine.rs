@@ -50,8 +50,9 @@
 //!   publishes on it is written to `--record-out` (`RecordOutTap`). A
 //!   record-side-lossy one is still a violation on its own topic. A
 //!   `multi_publisher_topics` topic a driver shares with other nodes stays
-//!   GRAPH-PRODUCED, diffed over the other writers' frames when the bag
-//!   attributes each frame to its writer.
+//!   GRAPH-PRODUCED, diffed over the other writers' frames when the replay
+//!   attributes each recorded frame to its writer, and over every frame
+//!   otherwise (`DriverInputsReport::unattributed_topics`).
 //! - EXTERNAL (consumed in-graph, no in-graph producer: the
 //!   absolute `source:` class) — the recorded frames are re-INJECTED byte-exact
 //!   so the downstream graph sees the same inputs it saw live.
@@ -1124,9 +1125,18 @@ pub struct DriverInputsReport {
     /// counted in `topics_checked`, but for one the record-health stamp marks
     /// lossy, which is a `record-side-tap-loss` violation on its own topic.
     pub input_topics: Vec<String>,
-    /// The `multi_publisher_topics` topics a driver writes beside other nodes:
-    /// compared and counted over the other writers' frames only.
+    /// The `multi_publisher_topics` topics a driver writes beside other nodes.
+    /// A topic whose every recorded frame the replay attributes to its writer
+    /// is compared and counted over the other writers' frames only; the rest
+    /// are [`Self::unattributed_topics`].
     pub shared_topics: Vec<String>,
+    /// The topics of [`Self::shared_topics`] compared and counted over every
+    /// recorded and replayed frame, the drivers' included: the replay could
+    /// not attribute each recorded frame to its writer (for example, the bag
+    /// labels no writer for a frame, a frame carries no wire header, or the
+    /// topics' frame index is over the verifier's record budget), and a
+    /// warning logged during the replay names the cause.
+    pub unattributed_topics: Vec<String>,
     /// The topics of [`Self::input_topics`] and [`Self::shared_topics`] that a
     /// node reads where this replay does not feed it the drivers' recorded
     /// frames, so that node cannot reproduce its recorded outputs. A lockstep
@@ -1138,10 +1148,13 @@ pub struct DriverInputsReport {
 }
 
 /// The verdict `NOTE` lines of a [`DriverInputsReport`]: one per non-empty
-/// topic list, and one more when a driver writes a topic and `topics_checked`
-/// is 0, the `0/0` verdict that compared nothing. The driver nodes are named
-/// on the first two lines, so a driver that writes no topic prints none. Rendered on the PASS and the FAIL path alike, since each
-/// says what the tally above or below it does not cover.
+/// topic list, the shared topics split into those compared over the other
+/// writers' frames and the [`DriverInputsReport::unattributed_topics`]
+/// compared over every frame, and one more when a driver writes a topic and
+/// `topics_checked` is 0, the `0/0` verdict that compared nothing. The driver
+/// nodes are named on the lines of the topics drivers write, so a driver that
+/// writes no topic prints none. Rendered on the PASS and the FAIL path alike,
+/// since each says what the tally above or below it does not cover.
 pub fn render_driver_input_lines(
     report: &DriverInputsReport,
     topics_checked: usize,
@@ -1156,13 +1169,29 @@ pub fn render_driver_input_lines(
             report.input_topics.join(", ")
         ));
     }
-    if !report.shared_topics.is_empty() {
+    let attributed: Vec<&str> = report
+        .shared_topics
+        .iter()
+        .filter(|t| !report.unattributed_topics.contains(t))
+        .map(String::as_str)
+        .collect();
+    if !attributed.is_empty() {
         lines.push(format!(
             "NOTE: {} topic(s) an external (driver) node shares with other writers were \
              compared over the other writers' frames only (driver nodes, as the replayed build \
              declares them: {nodes}): {}",
-            report.shared_topics.len(),
-            report.shared_topics.join(", ")
+            attributed.len(),
+            attributed.join(", ")
+        ));
+    }
+    if !report.unattributed_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} topic(s) an external (driver) node shares with other writers were \
+             compared over every recorded and replayed frame, the drivers' included, since the \
+             replay could not attribute each recorded frame to its writer (driver nodes, as the \
+             replayed build declares them: {nodes}): {}",
+            report.unattributed_topics.len(),
+            report.unattributed_topics.join(", ")
         ));
     }
     if !report.unfed_topics.is_empty() {
@@ -5474,6 +5503,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             coordination_report,
             ros2_entries_skipped,
             purpose,
+            driver_inputs,
         },
         abort_marker,
     );
@@ -5487,7 +5517,6 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             reason: best_effort_reason,
         }
     };
-    outcome.driver_inputs = driver_inputs;
     match &record_out_result {
         Some(Ok(path)) => outcome.record_out = Some(path.clone()),
         Some(Err(e)) => outcome.record_out_error = Some(e.to_string()),
@@ -5662,6 +5691,10 @@ struct EpilogueInputs<'a> {
     /// verdict, which states every data violation and schedule divergence in
     /// full, or the neutral `--resim` summary, which counts them.
     purpose: ReplayPurpose,
+    /// The driver classification and feed plan ([`driver_inputs_report`]),
+    /// whose [`DriverInputsReport::unattributed_topics`] the per-topic diff
+    /// fills in.
+    driver_inputs: Option<DriverInputsReport>,
 }
 
 /// The `?`-FREE epilogue of [`run_engine`] — fold the passes'
@@ -5718,6 +5751,7 @@ fn assemble_outcome(
         coordination_report,
         ros2_entries_skipped,
         purpose,
+        mut driver_inputs,
     } = ep;
 
     // 5. The read-log verdict, folded across the passes. Under lockstep there
@@ -5833,6 +5867,9 @@ fn assemble_outcome(
     // The ranks whose pass COMPLETED — exactly the `rank_execution` entries
     // (the abort-path judged-topic rule below keys on this set).
     let completed_ranks: BTreeSet<u32> = rank_execution.iter().map(|r| r.rank).collect();
+    // The topics a driver shares that were compared unpartitioned
+    // ([`DriverInputsReport::unattributed_topics`]).
+    let mut unattributed_shared: BTreeSet<&str> = BTreeSet::new();
     for topic in &classes.produced {
         let recorded_count =
             replayed_frame_count(recorded_messages, topic, skipped_prefix, trailing_frames);
@@ -5897,8 +5934,9 @@ fn assemble_outcome(
         // writer over the re-executed writers' partitions only
         // (`build_capture_partitionings`), so its topic-level count is theirs
         // too: the driver's recorded frames are inputs nothing re-produces.
-        // Unpartitioned, the bag cannot say which frames are the driver's, and
-        // the whole recorded count stands.
+        // Unpartitioned, the replay cannot say which frames are the driver's,
+        // so the whole recorded count stands and the report lists the topic in
+        // `DriverInputsReport::unattributed_topics`.
         let recorded_count = match &partition_counts {
             Some(parts) if classes.driver_shared.contains(topic) => {
                 parts.values().map(|c| c.recorded).sum()
@@ -5944,6 +5982,11 @@ fn assemble_outcome(
             continue; // vacuous — nothing produced or recorded on this topic.
         }
         topics_checked += 1;
+        // A shared topic the capture did not partition is diffed and counted
+        // over every frame, the drivers' included.
+        if partition_counts.is_none() && classes.driver_shared.contains(topic) {
+            unattributed_shared.insert(topic.as_str());
+        }
         // Tolerate TRAILING extra frames on a topic whose producing
         // node belongs to a rank that ended in a ragged shutdown tail — the
         // monolith re-fired that node past the recording's end, so up to
@@ -6194,6 +6237,14 @@ fn assemble_outcome(
             topics_passed += 1;
         }
     }
+    if let Some(report) = driver_inputs.as_mut() {
+        report.unattributed_topics = report
+            .shared_topics
+            .iter()
+            .filter(|t| unattributed_shared.contains(t.as_str()))
+            .cloned()
+            .collect();
+    }
 
     // Rule 5e (global catch-all): a LOSSY stamp must NEVER produce
     // exit 0. Per-topic loss on a graph-PRODUCED topic already forced a
@@ -6318,9 +6369,7 @@ fn assemble_outcome(
         record_health,
         tolerated_ragged_tails,
         unmodelled_topics,
-        // Decided by `run_engine` from the feed plan of the rank layout, and
-        // written over this placeholder there.
-        driver_inputs: None,
+        driver_inputs,
         resume: resume_report,
         // The range this bag declared — or the reader
         // derived — carried into the verdict so the exclusion is REPORTED
@@ -16707,8 +16756,9 @@ struct TopicClasses {
     /// `--record-out` alone ([`PassTopics::record_out_only`]).
     driver: Vec<String>,
     /// The `produced` topics a driver writes beside at least one other node (a
-    /// `multi_publisher_topics` topic), in graph order: captured and diffed
-    /// over the other writers' frames only (`build_capture_partitionings`).
+    /// `multi_publisher_topics` topic), in graph order: captured, and diffed
+    /// over the other writers' frames only where the capture is partitioned
+    /// (`build_capture_partitionings`), over every frame where it is not.
     driver_shared: Vec<String>,
     /// The graph's `external` (driver) nodes ([`external_node_ids`]). A pass
     /// captures only a topic one of its other members writes, and a driver's
@@ -16904,7 +16954,8 @@ fn driver_writer_census(
 ///
 /// One non-driver writer keeps a topic re-executed: a `multi_publisher_topics`
 /// topic shared by a driver and an ordinary node is still captured and diffed
-/// ([`driver_shared_topics`]), over its re-executed writers' frames.
+/// ([`driver_shared_topics`]), over its re-executed writers' frames where the
+/// capture is partitioned.
 fn driver_output_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>) -> Vec<String> {
     driver_writer_census(config, external_nodes)
         .into_iter()
@@ -17048,7 +17099,8 @@ fn plan_driver_topic_feeds(
 }
 
 /// The [`DriverInputsReport`] of a replay, from the graph's classification and
-/// the feed plan [`plan_driver_topic_feeds`] made. `None` when the graph has
+/// the feed plan [`plan_driver_topic_feeds`] made, with no
+/// [`DriverInputsReport::unattributed_topics`] yet. `None` when the graph has
 /// no driver. PURE.
 ///
 /// A free-run plan states the unfed and unread topics itself. A lockstep
@@ -17080,6 +17132,9 @@ fn driver_inputs_report(
         nodes: classes.driver_nodes.iter().cloned().collect(),
         input_topics: classes.driver.clone(),
         shared_topics: classes.driver_shared.clone(),
+        // Which shared topics fell back to the single-stream diff is a fact of
+        // the captures, which `assemble_outcome` fills in.
+        unattributed_topics: Vec::new(),
         unfed_topics,
         unread_topics,
     })
@@ -21094,6 +21149,8 @@ mod driver_topic_tests {
         assert!(classes.unmodelled.is_empty(), "{:?}", classes.unmodelled);
     }
 
+    /// A report with no unattributed topic, the shape
+    /// [`driver_inputs_report`] builds before the diff runs.
     fn report(
         nodes: &[&str],
         input: &[&str],
@@ -21105,6 +21162,7 @@ mod driver_topic_tests {
             nodes: strings(nodes),
             input_topics: strings(input),
             shared_topics: strings(shared),
+            unattributed_topics: Vec::new(),
             unfed_topics: strings(unfed),
             unread_topics: strings(unread),
         }
@@ -21260,6 +21318,36 @@ mod driver_topic_tests {
             render_driver_input_lines(&silent, 0).is_empty(),
             "a driver that writes nothing leaves nothing out of the comparison"
         );
+    }
+
+    /// A shared topic the replay could not attribute frame by frame is named on
+    /// a NOTE of its own, which says its frames were compared, the drivers'
+    /// included, and leaves the other-writers NOTE to the shared topics it
+    /// partitioned. Every shared topic unattributed prints no other-writers
+    /// NOTE.
+    #[test]
+    fn an_unattributed_shared_topic_is_named_as_compared_over_every_frame() {
+        let attributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
+                          writers were compared over the other writers' frames only (driver \
+                          nodes, as the replayed build declares them: cam): /rig/bus";
+        let unattributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
+                            writers were compared over every recorded and replayed frame, the \
+                            drivers' included, since the replay could not attribute each \
+                            recorded frame to its writer (driver nodes, as the replayed build \
+                            declares them: cam): /rig/tf";
+        let both = DriverInputsReport {
+            unattributed_topics: strings(&["/rig/tf"]),
+            ..report(&["cam"], &[], &["/rig/bus", "/rig/tf"], &[], &[])
+        };
+        assert_eq!(
+            render_driver_input_lines(&both, 2),
+            vec![attributed, unattributed]
+        );
+        let only = DriverInputsReport {
+            unattributed_topics: strings(&["/rig/tf"]),
+            ..report(&["cam"], &[], &["/rig/tf"], &[], &[])
+        };
+        assert_eq!(render_driver_input_lines(&only, 1), vec![unattributed]);
     }
 }
 
