@@ -1147,6 +1147,19 @@ pub struct DriverInputsReport {
     pub unread_topics: Vec<String>,
 }
 
+impl DriverInputsReport {
+    /// Does the comparison leave a driver's frames out: a topic only drivers
+    /// write, or a shared topic compared over the other writers' frames only
+    /// (one not in [`Self::unattributed_topics`])?
+    pub fn leaves_driver_frames_out(&self) -> bool {
+        !self.input_topics.is_empty()
+            || self
+                .shared_topics
+                .iter()
+                .any(|t| !self.unattributed_topics.contains(t))
+    }
+}
+
 /// The verdict `NOTE` lines of a [`DriverInputsReport`]: one per non-empty
 /// topic list, the shared topics split into those compared over the other
 /// writers' frames and the [`DriverInputsReport::unattributed_topics`]

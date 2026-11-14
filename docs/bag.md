@@ -117,7 +117,10 @@ With `--report` the JSON carries the same lists under `driver_inputs`, as
 `nodes`, `input_topics`, `shared_topics`, `unattributed_topics`,
 `unfed_topics` and `unread_topics` (absent for a graph with no driver).
 `unattributed_topics` holds the shared topics compared over every frame,
-the driver's included (below).
+the driver's included (below). A resim without `--verify` prints the same
+`NOTE:` lines under its `re-executed <N> step(s), <M> produced topic(s)` line,
+and when everything it compared matched, its observation says that the
+driver frames those lines leave out were not compared.
 
 A graph whose produced topics are all driver outputs, such as a capture-only
 graph, has nothing to re-compute: its `--verify` passes with `0/0`, and a

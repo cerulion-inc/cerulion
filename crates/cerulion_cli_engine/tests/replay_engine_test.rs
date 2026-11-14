@@ -28605,6 +28605,9 @@ fn exit_codes_and_precedence_are_unchanged_by_the_rename() {
         // does not read them either.
         injection_anomalies: vec![],
         input_shortfalls: vec![],
+        // The driver lines, which the exit-code precedence does not read.
+        driver_lines: vec![],
+        driver_frames_uncompared: false,
     };
     // The documented precedence, unchanged: 3 preempts 6 preempts 1.
     assert_eq!(resim_exit_code(&report(true, true, true), true), 3);
@@ -44864,6 +44867,50 @@ fn a_neutral_resim_of_a_driver_graph_injects_the_driver_frames_across_ranks() {
     assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
     assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 1));
     ri_judge(&live.reads, &replayed, &[DRV_METER]).expect("the meter's reads are the live ones");
+    drv_assert_neutral_summary_names_the_input(
+        &outcome,
+        &bag,
+        &format!(
+            "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were \
+             NOT compared (driver nodes, as the replayed build declares them: cam): {DRV_IMAGE}"
+        ),
+    );
+}
+
+/// The neutral `--resim` summary of `outcome` prints `input_note` under its
+/// count of one produced topic, and its match observation names the driver
+/// frames the comparison left out.
+fn drv_assert_neutral_summary_names_the_input(
+    outcome: &ReplayOutcome,
+    bag: &std::path::Path,
+    input_note: &str,
+) {
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+        bag,
+    );
+    let lines: Vec<&str> = summary.lines().map(str::trim).collect();
+    let count = format!(
+        "re-executed {} step(s), 1 produced topic(s)",
+        outcome.ticks_replayed
+    );
+    let observation = "observation: the re-executed frames match the recording byte-for-byte, \
+                       except the external (driver) frames the NOTE lines above leave out, which \
+                       were not compared";
+    let at = lines
+        .iter()
+        .position(|l| *l == count)
+        .unwrap_or_else(|| panic!("the summary counts one produced topic: {summary}"));
+    assert_eq!(
+        lines.get(at + 1..at + 3),
+        Some(&[input_note, observation][..]),
+        "the driver NOTE follows the count, then the narrowed observation: {summary}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("byte-for-byte")).count(),
+        1,
+        "{summary}"
+    );
 }
 
 /// The recorded period writer's output topic in the reclassification graph.
@@ -46054,6 +46101,17 @@ fn record_out_of_a_driver_graph_holds_every_frame_its_replayed_driver_published(
             "{layout}: the output holds the graph's two topics and nothing else: {:?}",
             frames.keys().collect::<Vec<_>>()
         );
+        if purpose == replay_engine::ReplayPurpose::Resim {
+            drv_assert_neutral_summary_names_the_input(
+                &outcome,
+                bag,
+                &format!(
+                    "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs \
+                     and were NOT compared (driver nodes, as the replayed build declares them: \
+                     teleop): {DRV_TELEOP_CMD}"
+                ),
+            );
+        }
     }
 }
 
