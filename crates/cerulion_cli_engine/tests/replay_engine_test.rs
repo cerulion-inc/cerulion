@@ -48797,6 +48797,165 @@ topics:
     );
 }
 
+/// The topic a period writer shares with a writer that never publishes, read
+/// by a sink beside the silent one.
+const RI_SILENT_INJ_BUS: &str = "/risilinj/bus";
+/// The topic a second period writer shares with a second silent writer.
+const RI_SILENT_INJ_AUX: &str = "/risilinj/aux";
+
+/// A period writer (`w2`, writer 2) and a writer that never publishes (`w3`)
+/// on one `multi_publisher_topics` topic, read by a per-message sink, and a
+/// period writer (`a`, writer 5) and a writer that never publishes (`b`) on a
+/// second one no node reads.
+fn ri_silent_inj_yaml() -> &'static str {
+    "name: risilinj\nprefix: risilinj\nmulti_publisher_topics:\n  - /risilinj/bus\n  - /risilinj/aux\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /risilinj/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/aux\n"
+}
+
+/// The silent-writer graph, `w2` stamping `writer` into its frames.
+fn ri_silent_inj_factories(writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    let silent = || -> Box<dyn NodeEntry> {
+        Box::new(DrvSilentWriterNodeEntry::with_state(
+            DrvSilentWriterNode::default(),
+        ))
+    };
+    factories(vec![
+        ("w2", period(writer)),
+        ("w3", silent()),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_INJ_SINK,
+                ..Default::default()
+            })),
+        ),
+        ("a", period(5.0)),
+        ("b", silent()),
+    ])
+}
+
+/// A `multi_publisher_topics` topic whose writers run in two processes is
+/// judged by the one process whose own writers published frames of it, beside
+/// another that injects its recorded frames. `w2` and `a` run in the first
+/// process, and `w3`, `b` and the bus's per-message sink in the second, which,
+/// in a `--verify` of a recording below trace format 8, injects `w2`'s
+/// recorded frames for the sink. The bag labels each bus frame with `w2`, and
+/// the verifier's record budget is the bus's `n` frames: the frames the
+/// second process injects fit it, while each process's two
+/// `multi_publisher_topics` topics, `2n` frames, do not, so neither process
+/// attributes the bus's frames to their writers, and the second captures the
+/// injected copies alone. The first's stream, `w2`'s frames, is compared with
+/// every recorded frame: the unchanged candidate passes with both topics
+/// checked and credited, and a changed `w2` fails with exit 1 as one byte
+/// mismatch of the whole stream, which names no writer. Nothing is declined
+/// in either run.
+#[test]
+#[serial]
+fn a_split_topic_one_process_publishes_beside_one_that_injects_is_judged_by_the_first_alone() {
+    let live = ri_record(ri_silent_inj_yaml(), || ri_silent_inj_factories(2.0));
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_SILENT_INJ_BUS),
+        want,
+        "PREMISE: the recorded bus holds w2's frames alone"
+    );
+    assert_eq!(
+        live.rec.messages[RI_SILENT_INJ_AUX].len(),
+        n,
+        "PREMISE: the aux topic holds a's frames"
+    );
+    let w2 = real_publisher_id(&live.rec, "w2", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..n)
+        .map(|i| {
+            (
+                RI_SILENT_INJ_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                w2,
+            )
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_silent_inj_format7.mcap");
+    ri_two_rank_bag_with_labels(
+        &live.rec,
+        &bag,
+        |id| matches!(id, "w3" | "sink" | "b"),
+        &label_rows,
+        ri_recorder_json_at(7),
+    );
+    for (run, writer) in [("CONTROL", 2.0), ("changed w2", 4.0)] {
+        let (outcome, _) = {
+            let _budget = replay_engine::override_frame_index_record_budget(n);
+            ri_replay(
+                &bag,
+                || ri_silent_inj_factories(writer),
+                replay_engine::ReplayPurpose::Verify,
+            )
+        };
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        assert!(
+            matches!(
+                outcome.read_identity,
+                replay_engine::ReadIdentityReport::BestEffort { .. }
+            ),
+            "PREMISE: {run}: no read is fed by identity: {:?}",
+            outcome.read_identity
+        );
+        assert!(
+            outcome.declined_frame_comparisons.is_empty(),
+            "{run}: nothing is declined: {:?}",
+            outcome.declined_frame_comparisons
+        );
+        if writer == 2.0 {
+            assert!(
+                outcome.violations.is_empty(),
+                "{run}: {:?}",
+                outcome.violations
+            );
+            assert!(outcome.passed, "{run}");
+            assert_eq!(
+                (outcome.topics_checked, outcome.topics_passed),
+                (2, 2),
+                "{run}: both topics are checked and credited"
+            );
+            continue;
+        }
+        assert_eq!(resim_exit(&outcome, true), 1, "{run}: exit 1");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 1),
+            "{run}: the bus fails and the aux topic passes"
+        );
+        let want_detail = format!(
+            "frame 0 on '{RI_SILENT_INJ_BUS}' differs at x: recorded 2.0, replayed 4.0; 1 more \
+             value(s) differ (recorded 64 B, replayed 64 B)"
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_SILENT_INJ_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{run}: exactly the stream's byte mismatch: {named:?}"
+        );
+    }
+}
+
 /// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
 /// whose renderer test reads only the class label and the detail it is
 /// given: a header difference, as `timestamp_ns` 7 against 9 reads.

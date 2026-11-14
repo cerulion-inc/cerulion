@@ -1144,12 +1144,12 @@ pub struct DriverInputsReport {
     /// the frames they captured on the topic but those their injectors
     /// re-published, which hold a replayed driver's frames only where the
     /// driver runs in such a pass. Such a pass's frames are also compared byte
-    /// for byte with every recorded frame where it is the only pass with
-    /// frames of the topic and no pass injected it, or where it injected the
-    /// topic itself; a pass of its own writers' frames alone beside another
-    /// with frames is not compared, and the topic is then declined
-    /// ([`ReplayOutcome::declined_frame_comparisons`]) unless something else
-    /// on it failed.
+    /// for byte with every recorded frame where it is the only pass whose own
+    /// writers published frames of the topic and it injected none, or where it
+    /// injected the topic itself; a pass of its own writers' frames alone
+    /// beside another whose writers published frames is not compared, and the
+    /// topic is then declined ([`ReplayOutcome::declined_frame_comparisons`])
+    /// unless something else on it failed.
     pub unattributed_topics: Vec<String>,
     /// The topics of [`Self::input_topics`] and [`Self::shared_topics`] that a
     /// node reads where this replay does not feed it the drivers' recorded
@@ -3365,7 +3365,8 @@ impl ReadLogEnforcement {
 /// executor units, where one that captured frames of it could not attribute its
 /// recorded frames to their writers and injected none of them. Its capture then
 /// holds its own writers' frames alone, which no recorded stream lines up with
-/// while another one captured frames of the topic too, so they are not compared.
+/// while another one's writers published frames of the topic too, so they are
+/// not compared.
 /// The topic is declined only when nothing compared on it failed: its counts
 /// are judged over every recorded frame, and a failure there stands. Such a row
 /// names the ranks whose frames were not compared, withholds the byte verdict and
@@ -5948,9 +5949,10 @@ fn assemble_outcome(
         // `multi_publisher_topics` topic whose writers run in several ranks
         // has one capture per such rank. Partitioned by writer in each, it is
         // one verdict per writer, each from the one pass that runs the writer
-        // (`merge_partitioned_summaries`). The only pass that counted a frame
-        // of it is judged alone where it neither partitioned nor injected the
-        // topic; any other mix is judged by `push_split_violations`.
+        // (`merge_partitioned_summaries`). The only pass whose own writers
+        // published a frame of it is judged alone where it neither partitioned
+        // nor injected the topic; any other mix is judged by
+        // `push_split_violations`.
         let shared = classes.driver_shared.contains(topic);
         let judged = judge_passes(summaries);
         let split = matches!(judged, PassJudgement::Split);
@@ -25116,8 +25118,8 @@ fn push_partition_violations(
 enum PassJudgement<'a> {
     /// One summary stands for the topic: its only capture, or none at all,
     /// with `alone_in: None`; or, with `alone_in: Some(rank)`, the only pass
-    /// of several that counted a frame of it, which neither partitioned nor
-    /// injected it.
+    /// of several whose own writers published a frame of it, which neither
+    /// partitioned nor injected it.
     One {
         summary: Option<&'a CaptureSummary>,
         alone_in: Option<u32>,
@@ -25135,13 +25137,12 @@ enum PassJudgement<'a> {
 /// A pass captures a topic when its rank runs a writer of it other than a
 /// driver. A pass that did not partition the topic and injected none of its
 /// frames captured its own writers' frames alone. Where it is the only pass
-/// that counted any, it is judged alone against every recorded frame: the
-/// other passes' writers published nothing, so a recorded frame of theirs is
-/// one this stream lacks, and the stream fails. An unpartitioned pass counts
-/// every frame its injector re-published, so where the only pass that counted
-/// a frame injected none, no unpartitioned pass injected the topic; a
-/// partitioned pass counts none of its injector's frames, whatever it
-/// injected.
+/// whose own writers published a frame of the topic
+/// ([`CaptureSummary::own_replayed`]), it is judged alone against every
+/// recorded frame: the other passes' writers published nothing, so a recorded
+/// frame of theirs is one this stream lacks, and the stream fails. The frames
+/// another pass captured are then recorded frames its injector re-published,
+/// which no writer the candidate runs published.
 fn judge_passes(summaries: &[CaptureSummary]) -> PassJudgement<'_> {
     if summaries.len() <= 1 {
         return PassJudgement::One {
@@ -25152,8 +25153,8 @@ fn judge_passes(summaries: &[CaptureSummary]) -> PassJudgement<'_> {
     if let Some(merged) = merge_partitioned_summaries(summaries) {
         return PassJudgement::Merged(Box::new(merged));
     }
-    let mut counting = summaries.iter().filter(|s| s.replayed_count > 0);
-    if let (Some(only), None) = (counting.next(), counting.next()) {
+    let mut publishing = summaries.iter().filter(|s| s.own_replayed() > 0);
+    if let (Some(only), None) = (publishing.next(), publishing.next()) {
         if only.partition_counts.is_none() && only.injected == 0 {
             return PassJudgement::One {
                 summary: Some(only),
@@ -25166,9 +25167,9 @@ fn judge_passes(summaries: &[CaptureSummary]) -> PassJudgement<'_> {
 
 /// What [`push_split_violations`] could not judge: the passes that captured a
 /// split topic as one stream of their own writers' frames alone, beside other
-/// passes that captured frames of it too, by rank, and the verdicts their one
-/// stream reads against every recorded frame, which say nothing of the
-/// candidate.
+/// passes whose writers published frames of it too, by rank, and the verdicts
+/// their one stream reads against every recorded frame, which say nothing of
+/// the candidate.
 #[derive(Debug)]
 struct SplitUnjudged {
     ranks: Vec<u32>,
@@ -25206,8 +25207,8 @@ const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in sever
 /// recorded frames of every other writer, so its one stream is compared with
 /// every recorded frame byte for byte. A pass that injected nothing captured
 /// its own writers' frames alone, which no recorded stream lines up with
-/// while another pass captured frames too, so its byte verdict and its
-/// tolerance rows are returned unjudged ([`SplitUnjudged`]), with its rank.
+/// while another pass's writers published frames too, so its byte verdict and
+/// its tolerance rows are returned unjudged ([`SplitUnjudged`]), with its rank.
 /// The tolerance rows of the judged passes fold to one per field and metric
 /// ([`fold_tolerance_worsts`]).
 fn push_split_violations(
@@ -36436,11 +36437,13 @@ mod capture_partition_tests {
     }
 
     /// A topic one pass captured is that pass's; every pass partitioned is
-    /// their union. The only pass that counted a frame, neither partitioning
-    /// nor injecting the topic, is judged alone in either pass order, beside a
-    /// partitioned pass that injected it too. Any other mix is split: an
-    /// unpartitioned pass that injected, a partitioned counting pass, two
-    /// counting passes, or none.
+    /// their union. The only pass whose own writers published a frame,
+    /// neither partitioning nor injecting the topic, is judged alone in either
+    /// pass order, beside a partitioned pass that injected it too or an
+    /// unpartitioned one that counted its injector's frames alone. Any other
+    /// mix is split: an unpartitioned pass whose writers published frames
+    /// beside its injector's, a partitioned one whose writers published
+    /// frames, two whose writers did, or none.
     #[test]
     fn a_topic_s_passes_are_judged_alone_merged_or_split() {
         assert_eq!(judgement(&[]), "one None None");
@@ -36478,6 +36481,16 @@ mod capture_partition_tests {
             judgement(&[partitioned_injecting, one_stream(1, 5, 0, None)]),
             "one Some(1) Some((1, 5))",
             "a partitioned pass counts none of its injector's frames"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 5, 0, Some(0)), one_stream(1, 5, 5, None)]),
+            "one Some(0) Some((0, 5))",
+            "a pass that counted its injector's frames alone"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 5, 5, None), one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))",
+            "a pass that counted its injector's frames alone, first"
         );
         assert_eq!(
             judgement(&[one_stream(0, 2, 0, None), one_stream(1, 5, 0, None)]),
@@ -36538,7 +36551,8 @@ mod capture_partition_tests {
     /// together by count: every recorded frame no partition holds against the
     /// frames their own writers published. A pass that injected the topic is
     /// judged byte for byte; one that injected nothing, beside another pass
-    /// with frames, is unjudged, its byte verdict withheld. Hand oracles.
+    /// whose writers published frames, is unjudged, its byte verdict withheld.
+    /// Hand oracles.
     #[test]
     fn a_split_topic_is_counted_together_and_compared_where_a_stream_lines_up() {
         // Rank 0 attributes `w2`'s 4 frames; rank 1 published `w3`'s 4 and
