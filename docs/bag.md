@@ -107,7 +107,7 @@ The verdict states what it left out, on a pass and a failure alike, with one
 `NOTE:` line for each of: the topics only drivers write, naming the driver
 nodes; the `multi_publisher_topics` topics a driver shares with other nodes
 that were compared over the other writers' frames; those compared over every
-frame (below); the driver topics this resim did not feed to the nodes that
+recorded frame (below); the driver topics this resim did not feed to the nodes that
 read them; the driver topics no node reads; and, on a `0/0` tally, that no
 topic was compared. For the `v4l2_camera` example the first one reads:
 
@@ -118,8 +118,8 @@ NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were
 With `--report` the JSON carries the same lists under `driver_inputs`, as
 `nodes`, `input_topics`, `shared_topics`, `unattributed_topics`,
 `unfed_topics` and `unread_topics` (absent for a graph with no driver).
-`unattributed_topics` holds the shared topics compared over every frame,
-the driver's included (below). A resim without `--verify` prints the same
+`unattributed_topics` holds the shared topics compared over every recorded
+frame, the driver's included (below). A resim without `--verify` prints the same
 `NOTE:` lines under its `re-executed <N> step(s), <M> produced topic(s)` line,
 and when everything it compared matched, its observation says that the
 driver frames those lines leave out were not compared.
@@ -133,14 +133,23 @@ other writers' frames are compared and the driver's are not, when the replay
 attributes every recorded frame of the topic to its writer, which needs a bag
 that labels each frame with its writer, a wire header on every frame, and at
 most 200000 recorded frames, the verifier's record budget, on the
-`multi_publisher_topics` topics one process or executor unit writes.
-Otherwise the replay cannot say which frames are the driver's, and a warning
-names the cause: a `--verify` that feeds a node's reads of the topic from a
-bag that labels no writer refuses with exit 2
-(`read_identity_frames_unattributed`), and otherwise every recorded and
-replayed frame of the topic, the driver's included, is compared, so the topic
-fails (exit 1) unless the replayed driver publishes its recorded frames again.
-Its verdict `NOTE:` line says the topic was compared over every frame, and
+`multi_publisher_topics` topics one process or executor unit writes. Each
+writer is then compared in the process or executor unit that runs it, so a
+topic whose writers run in several of them is compared over every frame of
+its other writers, and the driver's frames, those its replayed ticks publish
+and those a resim feeds from the bag to a node that reads the topic, are
+compared nowhere. Otherwise the replay cannot say which frames are the
+driver's, and a warning names the cause: a `--verify` that feeds a node's
+reads of the topic from a bag that labels no writer refuses with exit 2
+(`read_identity_frames_unattributed`), and otherwise each process or executor
+unit that runs another writer of the topic and cannot attribute its frames
+compares the frames published on the topic there, as one stream, with every
+recorded frame of the topic, the driver's included. A replayed driver's frames
+are among them only where the driver runs beside such a writer, so the topic
+fails (exit 1) where the driver's recorded frames are missing, and where two
+writers' frames are published in one process or executor unit, one stream
+cannot tell their sequences apart and the replay stops (exit 5). Its verdict
+`NOTE:` line says the topic was compared over every recorded frame, and
 `driver_inputs.unattributed_topics` names it.
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
