@@ -504,6 +504,25 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
+`examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
+`Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
+runtime; floor 13), ahead of any build step that could rewrite one, so a dependency change under
+`crates/` that is not carried into those lockfiles fails there. Refresh one with
+`cargo metadata --format-version 1 --manifest-path <dir>/Cargo.toml > /dev/null`. That is not a
+minimal edit: it adds every crate the manifests now require at its newest compatible version, and
+where a path crate's dependencies changed it can re-point a dependency edge of a crate already
+locked (onto another locked major version of `syn`, for example). Read its diff: keep each added
+package and each move the new requirements force (an exact `=` pin or a raised minimum in a
+crate manifest, directly or through the moved crate's own dependencies); restore a changed line
+of an already-locked package only when its old version still satisfies every requirement (an
+edge re-pointed onto another locked version, or a newer version cargo picked on its own); then
+confirm with `cargo metadata --locked`. The
+Android sample runtime's lockfile, seeded from the root one, takes each added registry crate at
+the version the root `Cargo.lock` ships (the Python wheel's does the same for the iceoryx2
+family). `cargo update -p <crate> --precise <root version>` sets that version, but it re-resolves
+the same way and can re-point more edges, so diff the result against the stale file and the root
+`Cargo.lock` again.
+
 Five Linux jobs run on push / `workflow_dispatch` only and never
 on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name

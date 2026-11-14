@@ -618,7 +618,11 @@ def remove_iox2_files(role: str):
 
 
 def build_cerulion():
-    for cwd, cmd in ((REPO_ROOT, ["cargo", "build", "--release", "--locked", "-p", "cerulion_cli"]),
+    # cerulion_netd in the CLI's own invocation: a `graph run` that serves the
+    # network spawns the `cerulion-netd` gateway from beside the `cerulion`
+    # binary, so a CLI-only build fails the run before its first sample.
+    for cwd, cmd in ((REPO_ROOT, ["cargo", "build", "--release", "--locked",
+                                  "-p", "cerulion_cli", "-p", "cerulion_netd"]),
                      (WORKSPACE_DIR, ["cargo", "build", "--release", "--locked",
                                       "-p", "ping_node", "-p", "pong_node", "-p", "latency_node"])):
         say("BUILD", cwd, shlex.join(cmd))
@@ -1194,7 +1198,8 @@ def main(argv=None):
         p.add_argument("--stack", choices=STACKS, required=True)
         p.add_argument("--size", type=int, required=True, help="payload bytes")
         p.add_argument("--port", type=int, default=7690)
-        p.add_argument("--cerulion", default="", help="cerulion binary (default: target/release)")
+        p.add_argument("--cerulion", default="",
+                       help="cerulion binary, with cerulion-netd beside it (default: target/release)")
         p.add_argument("--box-lock", default="", help="flock this file for the life of the run")
         ros_opts(p)
         p.set_defaults(fn=fn)
