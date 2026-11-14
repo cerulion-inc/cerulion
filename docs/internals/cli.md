@@ -187,12 +187,15 @@ Rules that must not drift:
 - **A driver's outputs are recorded inputs**: `classify_topics` names every produced topic
   whose every in-graph writer declares `MacroPolicy::External` (`external_node_ids`, read
   off the candidates' `info()`) in `TopicClasses::driver`. A resim never queries
-  `external_source()`, so the driver fires as recorded with no device and publishes
-  nothing. Its topics stay in `produced` for every derivation about what the graph writes
-  (the consistency checks, a cross-rank injector, the read gate) and leave only the capture
-  (`pass_topics` captures a topic only where a member other than a driver writes it) and the
-  diff (`assemble_outcome`), where a record-health-lossy driver topic is still a per-topic
-  `RecordSideTapLoss`. A `multi_publisher_topics` topic a driver shares with other nodes
+  `external_source()`, so the driver fires as recorded with no device; what its tick still
+  writes is published and never compared. Its topics stay in `produced` for every
+  derivation about what the graph writes (the consistency checks, a cross-rank injector, the
+  read gate, the `--record-out` channels) and leave only the comparison: `pass_topics`
+  captures a topic only where a member other than a driver writes it and lists the rest in
+  `record_out_only`, which a `--record-out` run taps (`RecordOutTap`) for the output bag
+  alone, and `assemble_outcome` neither diffs nor counts it. A record-health-lossy driver
+  topic is still a per-topic `RecordSideTapLoss`, judged in a partial report once a rank of
+  its drivers completed (`topic_owner_ranks`). A `multi_publisher_topics` topic a driver shares with other nodes
   (`TopicClasses::driver_shared`) stays captured: `build_capture_partitionings` leaves the
   driver's writer out of `producible`, and the topic-level count is the partitions' sum; an
   unpartitioned one keeps the whole recorded count and fails. A metadata read that fails

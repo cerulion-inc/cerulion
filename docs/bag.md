@@ -46,7 +46,10 @@ Re-simulation re-injects only the recorded inputs and recomputes everything
 else. The recorded inputs are the external-source topics and the outputs of
 `external` (driver) nodes: a resim never calls a driver's `external_source()`,
 so the driver has no device to read, and the bag feeds its recorded frames to
-the nodes that read them. Of a free-run recording (the multi-process default),
+the nodes that read them. The driver still fires on its recorded wakes, so a
+driver whose tick writes its outputs without a device publishes them:
+`--record-out` holds those frames, and the verdict does not compare them. Of a
+free-run recording (the multi-process default),
 a `--verify` resim feeds every such read, and a resim without `--verify` feeds
 the nodes that ran in another process or executor unit than the driver and
 warns that it does not feed the rest. A lockstep recording

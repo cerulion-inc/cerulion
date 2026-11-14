@@ -46,10 +46,12 @@
 //!   replay never queries the node's `external_source()`, so it cannot
 //!   re-produce the frames. Its consumers are fed the recorded frames (a fed
 //!   read's private feed, or an injector on a cross-rank edge), and the topic
-//!   is neither captured nor diffed. A record-side-lossy one is still a
-//!   violation on its own topic. A `multi_publisher_topics` topic a driver
-//!   shares with other nodes stays GRAPH-PRODUCED, diffed over the other
-//!   writers' frames when the bag attributes each frame to its writer.
+//!   is neither diffed nor counted. What a replayed driver tick still
+//!   publishes on it is written to `--record-out` (`RecordOutTap`). A
+//!   record-side-lossy one is still a violation on its own topic. A
+//!   `multi_publisher_topics` topic a driver shares with other nodes stays
+//!   GRAPH-PRODUCED, diffed over the other writers' frames when the bag
+//!   attributes each frame to its writer.
 //! - EXTERNAL (consumed in-graph, no in-graph producer: the
 //!   absolute `source:` class) — the recorded frames are re-INJECTED byte-exact
 //!   so the downstream graph sees the same inputs it saw live.
@@ -5663,14 +5665,15 @@ fn assemble_outcome(
             Some(nr) => {
                 let mut m: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
                     std::collections::HashMap::new();
-                // A driver re-produces nothing, so it owns no topic here: the
-                // abort rule and the tail tolerance below read only the ranks
-                // whose pass captured the topic (`pass_topics`).
-                for node in config
-                    .nodes
-                    .iter()
-                    .filter(|n| !classes.driver_nodes.contains(&n.id))
-                {
+                // A driver's frames are never compared, so a driver owns only
+                // a topic no other node writes: the abort rule judges that
+                // topic, whose one verdict is its record-side loss, once a
+                // rank of its drivers completed. A topic a driver shares is
+                // owned by its other writers' ranks alone, the ranks whose
+                // pass compares it (`pass_topics`), which the abort rule and
+                // the tail tolerance below read.
+                for node in &config.nodes {
+                    let driver = classes.driver_nodes.contains(&node.id);
                     if let Some(&rank) = nr.get(node.id.as_str()) {
                         for output in &node.outputs {
                             let t = cerulion_core::graph::resolve_output_topic(
@@ -5678,6 +5681,9 @@ fn assemble_outcome(
                                 &node.id,
                                 output,
                             );
+                            if driver && !classes.driver.contains(&t) {
+                                continue;
+                            }
                             m.entry(t).or_default().insert(rank);
                         }
                     }
@@ -5747,7 +5753,7 @@ fn assemble_outcome(
         // is keyed on that RUN FACT rather than on "a summary is present":
         // the two are equivalent BY CONSTRUCTION today — a completed pass
         // opens a capture for every produced topic it owns but one only its
-        // drivers write, which no capture would see a frame of (the graph
+        // drivers write, which is never compared (the graph
         // pre-creates every owned topic's service at build, so an inert
         // producer's tap opens and harvests zero frames) and a tap that
         // cannot be opened ABORTS the pass as a harness failure rather than
@@ -14584,6 +14590,12 @@ struct PassTopics {
     /// graph order: every one a member other than a driver
     /// ([`TopicClasses::driver_nodes`]) writes.
     produced: Vec<String>,
+    /// The graph-produced topics this rank produces that only its drivers
+    /// write, in graph order. Their frames are recorded inputs, so nothing
+    /// compares them, but a replayed driver tick that writes its outputs
+    /// publishes, and `--record-out` holds every frame the re-executed graph
+    /// published: a run that asks for it taps these ([`RecordOutTap`]).
+    record_out_only: Vec<String>,
     /// The topics this rank consumes and another rank (or no graph node)
     /// produces: what the pass injects from the bag.
     inject_topics: Vec<String>,
@@ -14605,13 +14617,14 @@ struct PassTopics {
 fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool, fed: bool) -> PassTopics {
     // A topic only this rank's drivers write opens no capture: its frames are
     // recorded inputs, and a driver re-executed here has no device to read.
+    // What such a driver still publishes goes to `--record-out` alone.
     let re_executed = re_executed_output_topics(plan.subgraph(), &classes.driver_nodes);
-    let produced: Vec<String> = classes
+    let (produced, record_out_only): (Vec<String>, Vec<String>) = classes
         .produced
         .iter()
-        .filter(|t| plan.produced().contains(*t) && re_executed.contains(*t))
+        .filter(|t| plan.produced().contains(*t))
         .cloned()
-        .collect();
+        .partition(|t| re_executed.contains(t));
     // A FED pass injects nothing: every consumed topic, external and
     // cross-rank included, reaches its consumers through their private feeds.
     let mut inject_topics: Vec<String> = if fed {
@@ -14665,6 +14678,7 @@ fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool, fed: boo
     };
     PassTopics {
         produced,
+        record_out_only,
         inject_topics,
         cross: cross.into_iter().map(str::to_string).collect(),
         enforce_topics,
@@ -14768,6 +14782,7 @@ fn run_rank_pass(
     //    target" once each rank has its own clock.
     let PassTopics {
         produced,
+        record_out_only,
         inject_topics,
         cross: cross_rank_topics,
         enforce_topics,
@@ -14978,6 +14993,12 @@ fn run_rank_pass(
         pass.record_out.as_ref(),
         &injectors,
     )?;
+    // The topics only this pass's drivers write, tapped for `--record-out`
+    // alone: no capture compares them, and a run without the flag opens none.
+    let mut record_out_taps = match pass.record_out.as_ref() {
+        Some(sink) => open_record_out_taps(transport, &record_out_only, sink, &injectors)?,
+        None => Vec::new(),
+    };
     // The injectors live behind the pass's ONE injection lock, so
     // the scheduler's intra-step hook — which runs inside `runtime.step()` and
     // can borrow nothing the loop holds — reaches the same publishers the
@@ -15503,6 +15524,9 @@ fn run_rank_pass(
             for (_topic, cap) in captures_owned.iter_mut() {
                 cap.drain(cap_feed)?;
             }
+        }
+        for tap in &mut record_out_taps {
+            tap.drain()?;
         }
         // Advise-behind: this step's frames are drained + diffed and all
         // borrowed slices dropped, so evict the page-aligned bag region behind
@@ -16405,6 +16429,7 @@ fn run_rank_pass(
     drop(dispatch);
     drop(feed);
     drop(captures_owned);
+    drop(record_out_taps);
     let fed = match &read_feed {
         Some(f) => {
             let (faults, dropped) = f.faults();
@@ -16580,8 +16605,10 @@ struct TopicClasses {
     /// outputs. A replay never queries a driver's `external_source()`, so the
     /// node has no device to read and cannot re-produce its frames. Every
     /// derivation that asks which topics the GRAPH writes (the recording's
-    /// consistency checks, a cross-rank injector, the read gate) still keeps
-    /// them in `produced`; only the capture and the diff leave them out.
+    /// consistency checks, a cross-rank injector, the read gate, the
+    /// `--record-out` channels) still keeps them in `produced`; only the diff
+    /// and the topic tally leave them out, and a pass taps them for
+    /// `--record-out` alone ([`PassTopics::record_out_only`]).
     driver: Vec<String>,
     /// The `produced` topics a driver writes beside at least one other node (a
     /// `multi_publisher_topics` topic), in graph order: captured and diffed
@@ -16660,7 +16687,7 @@ fn graph_consumed_topics(config: &GraphConfig) -> std::collections::HashSet<Stri
 /// ([`external_node_ids`]). The produced topics they alone write are returned
 /// again as `driver` ([`driver_output_topics`]): still graph-produced, so every
 /// derivation about what the graph writes keeps them, but recorded inputs as
-/// far as the capture and the diff are concerned.
+/// far as the diff and the topic tally are concerned.
 fn classify_topics(
     config: &GraphConfig,
     recorded_messages: &RecordedMessages,
@@ -16799,9 +16826,9 @@ fn driver_shared_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>)
 }
 
 /// The topics `graph`'s nodes other than `drivers` write, resolved under its
-/// prefix: what a pass over `graph` re-produces. A driver publishes nothing in
-/// a replay, so a topic only a pass's drivers write gives its capture nothing
-/// to see.
+/// prefix: what a pass over `graph` re-produces. A replay never queries a
+/// driver's `external_source()`, so a topic only a pass's drivers write holds
+/// nothing the pass can compare.
 fn re_executed_output_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) -> BTreeSet<String> {
     graph
         .nodes
@@ -16816,8 +16843,8 @@ fn re_executed_output_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) ->
 }
 
 /// The topics `graph`'s nodes in `drivers` write, resolved under its prefix.
-/// A driver publishes nothing in a replay, so a node of the same pass reads its
-/// frames of these topics only when the pass feeds them from the bag.
+/// A replayed driver reads no device, so a node of the same pass reads its
+/// recorded frames of these topics only when the pass feeds them from the bag.
 fn driver_written_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) -> BTreeSet<String> {
     graph
         .nodes
@@ -19301,6 +19328,87 @@ fn diff_recorded_twin(
     }
 }
 
+/// A `--record-out` tap on a topic only this pass's `external` (driver) nodes
+/// write ([`PassTopics::record_out_only`]). Drained after every step beside
+/// the [`Capture`]s, it writes every drained frame to the sink and compares
+/// nothing: a driver's frames are recorded inputs, so the diff, the verdict
+/// and the topic tally never read it.
+struct RecordOutTap {
+    subscriber: cerulion_core::transport::subscriber::DataOnlySubscriber,
+    scratch: Vec<cerulion_core::transport::subscriber::OwnedInboundSample>,
+    /// The `--record-out` sink every drained frame is written to.
+    sink: Arc<crate::resim_record_out::RecordOut>,
+    /// The publisher id of this pass's injector for the topic, when the pass
+    /// both produces and injects it. Its frames are the input bag's, so they
+    /// are not written.
+    injected_origin: Option<u128>,
+}
+
+impl RecordOutTap {
+    /// Write every frame queued on the tap to the sink, in arrival order, and
+    /// release each one's shared-memory slot as it is written.
+    fn drain(&mut self) -> Result<(), ReplayError> {
+        let budget = self.subscriber.max_borrowed_samples().max(1);
+        loop {
+            self.scratch.clear();
+            let n = self
+                .subscriber
+                .drain_owned(budget, &mut self.scratch)
+                .map_err(|e| ReplayError::Internal {
+                    reason: format!(
+                        "failed to capture replayed frames on '{}' for --record-out: {e}",
+                        self.subscriber.topic()
+                    ),
+                })?;
+            for sample in self.scratch.drain(..) {
+                if self.injected_origin != Some(sample.origin()) {
+                    self.sink
+                        .write_frame(self.subscriber.topic(), sample.payload())?;
+                }
+            }
+            if n < budget {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Open a [`RecordOutTap`] on every topic in `topics`, before the first step
+/// like the captures. The graph pre-creates the service of every topic a
+/// member writes at build, so a tap that cannot be opened is the harness
+/// failing to observe the topic, and the pass refuses rather than write an
+/// output bag missing its frames.
+fn open_record_out_taps(
+    transport: &Arc<TransportManager>,
+    topics: &[String],
+    sink: &Arc<crate::resim_record_out::RecordOut>,
+    injectors: &IndexMap<String, Injector>,
+) -> Result<Vec<RecordOutTap>, ReplayError> {
+    topics
+        .iter()
+        .map(|topic| {
+            let opened = match capture_open_fault(topic) {
+                Some(fault) => Err(fault),
+                None => transport.create_data_only_subscriber(topic),
+            };
+            let subscriber = opened.map_err(|e| ReplayError::Internal {
+                reason: format!(
+                    "the --record-out tap for topic '{topic}', which only external (driver) \
+                     nodes write, could not be opened ({e}); the graph pre-creates every owned \
+                     topic's service at build, so this is the harness failing to observe the \
+                     topic (subscriber slots exhausted, a transport fault)"
+                ),
+            })?;
+            Ok(RecordOutTap {
+                subscriber,
+                scratch: Vec::new(),
+                sink: Arc::clone(sink),
+                injected_origin: injectors.get(topic).map(Injector::publisher_id),
+            })
+        })
+        .collect()
+}
+
 /// Open a capture tap on every graph-produced topic (open-only, so a topic the
 /// graph never actually created is skipped rather than minting a phantom
 /// service — its `MissingTopic`/`ExtraTopic` verdict comes from the frame
@@ -20787,7 +20895,7 @@ mod driver_topic_tests {
 
     /// A driver topic a node consumes stays GRAPH-PRODUCED: it is not the
     /// external class, so no second injector is opened on it, and it is named
-    /// as a driver topic so the capture and the diff leave it out.
+    /// as a driver topic so the diff and the topic tally leave it out.
     #[test]
     fn a_consumed_driver_topic_is_produced_and_driver_never_external() {
         let config = parse_graph(CAMERA).expect("the camera graph parses");
@@ -21393,8 +21501,8 @@ impl Drop for CaptureOpenFaultGuard {
     }
 }
 
-/// Make the NEXT `open_captures` on `topic` fail as a transport error, on this
-/// thread, while the guard lives.
+/// Make the NEXT `open_captures` or `open_record_out_taps` on `topic` fail as
+/// a transport error, on this thread, while the guard lives.
 #[cfg(any(test, feature = "test-seams"))]
 pub fn fail_capture_open_for_test(topic: &str) -> CaptureOpenFaultGuard {
     let prev = FAIL_CAPTURE_OPEN_FOR.with(|s| s.borrow_mut().replace(topic.to_string()));
@@ -21414,7 +21522,8 @@ fn capture_open_fault(topic: &str) -> Option<cerulion_core::TransportError> {
 }
 
 /// The shipped twin: a constant `None`, so the fault check in `open_captures`
-/// folds to the real open in any build without `test-seams`.
+/// and `open_record_out_taps` folds to the real open in any build without
+/// `test-seams`.
 #[cfg(not(any(test, feature = "test-seams")))]
 fn capture_open_fault(_topic: &str) -> Option<cerulion_core::TransportError> {
     None

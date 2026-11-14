@@ -42197,11 +42197,14 @@ fn ri_replay_reporting(
         feed_index_budget,
         report_path,
         RecordHealthReport::Absent,
+        None,
     )
 }
 
 /// [`ri_replay_reporting`] of a bag whose record-health stamp reads
-/// `record_health`.
+/// `record_health`, writing `--record-out` to `record_out` when it is given.
+// Every argument is one independent knob of the replay.
+#[allow(clippy::too_many_arguments)]
 fn ri_replay_stamped(
     bag: &std::path::Path,
     make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
@@ -42210,8 +42213,27 @@ fn ri_replay_stamped(
     feed_index_budget: Option<u64>,
     report_path: Option<std::path::PathBuf>,
     record_health: RecordHealthReport,
+    record_out: Option<std::path::PathBuf>,
 ) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
     ri_take();
+    // The plan `run_replay` builds: the input bag's user channels and catalog,
+    // and no current-workspace schema, so each channel's hash comes from the
+    // first frame written to it.
+    let record_out = record_out.map(|path| {
+        let reader = BagReader::open(bag).expect("the input bag opens");
+        let channels = reader
+            .channels()
+            .expect("the input bag lists its channels")
+            .into_iter()
+            .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+            .collect();
+        cerulion_cli_engine::resim_record_out::RecordOutPlan {
+            path,
+            channels,
+            catalog: reader.schema_catalog(),
+            current: std::collections::BTreeMap::new(),
+        }
+    });
     let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(bag);
     let clock = Arc::new(VirtualClock::new());
     let transport = cerulion_core::transport::TransportManager::init_for_test(
@@ -42240,7 +42262,7 @@ fn ri_replay_stamped(
         tolerance: None,
         strict_state: false,
         allow_param_change: false,
-        record_out: None,
+        record_out,
         purpose,
     };
     let outcome = replay_engine::run_engine(
@@ -44560,6 +44582,7 @@ fn a_driver_topic_stamped_lossy_still_fails_naming_it() {
         None,
         None,
         health_stamp(&[(DRV_IMAGE, 2, 1, false, false)], 0),
+        None,
     );
     let outcome = outcome.expect("the fed replay runs");
     assert_sole_tap_loss(&outcome, DRV_IMAGE, 2, 1, false);
@@ -44568,6 +44591,85 @@ fn a_driver_topic_stamped_lossy_still_fails_naming_it() {
         (outcome.topics_checked, outcome.topics_passed),
         (2, 1),
         "the lossy camera topic is checked and failed, the meter's passed"
+    );
+}
+
+/// A replay that aborts after the camera's rank completed still names the
+/// camera topic's record-side loss in its partial `--report`: the stamp is a
+/// fact about the bag, judged once a rank of the topic's driver completed,
+/// though nothing compares the topic's frames. The meter's rank refuses to
+/// init, so its topic is not judged.
+#[test]
+#[serial]
+fn a_partial_report_names_a_lossy_driver_topic_whose_rank_completed() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let report = dir.path().join("drv_partial_report.json");
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        || {
+            factories(vec![
+                (
+                    "cam",
+                    Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode::default())),
+                ),
+                (
+                    "meter",
+                    Box::new(InitFailsEntry {
+                        inner: Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                            gain: DRV_GAIN,
+                            ..Default::default()
+                        })),
+                    }),
+                ),
+            ])
+        },
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+        health_stamp(&[(DRV_IMAGE, 2, 1, false, false)], 0),
+        None,
+    );
+    let err = outcome.expect_err("the meter refuses to init, so the run aborts at rank 1");
+    assert_eq!(err.exit_code(), 5, "{err}");
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report).expect("the partial report is written despite the abort"),
+    )
+    .expect("the partial report is JSON");
+    assert_eq!(json["aborted"]["failed_at_rank"], 1, "{json}");
+    assert_eq!(
+        json["rank_execution"]
+            .as_array()
+            .map(|ranks| ranks.iter().map(|r| r["rank"].clone()).collect::<Vec<_>>()),
+        Some(vec![serde_json::json!(0)]),
+        "the camera's rank completed: {json}"
+    );
+    assert_eq!(
+        (
+            json["topics_checked"].as_u64(),
+            json["topics_passed"].as_u64()
+        ),
+        (Some(1), Some(0)),
+        "the lossy camera topic is checked and failed, the meter's is not judged: {json}"
+    );
+    let violations: Vec<(&str, &str, u64)> = json["violations"]
+        .as_array()
+        .expect("violations is an array")
+        .iter()
+        .map(|v| {
+            (
+                v["topic"].as_str().unwrap_or_default(),
+                v["class"]["kind"].as_str().unwrap_or_default(),
+                v["class"]["frames_lost"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        violations,
+        vec![(DRV_IMAGE, "RecordSideTapLoss", 2)],
+        "exactly the camera topic's record-side loss: {json}"
     );
 }
 
@@ -45350,6 +45452,294 @@ fn a_shared_topic_only_its_driver_published_is_not_reported_missing() {
             )),
         }
     });
+}
+
+/// The teleop's output topic.
+const DRV_TELEOP_CMD: &str = "/drvt/teleop/cmd";
+/// The meter's output topic in the teleop graph.
+const DRV_TELEOP_BRIGHTNESS: &str = "/drvt/meter/brightness";
+
+/// A teleop driver: an `external` node fired by its key pump that writes its
+/// command on every tick, as `KeyboardTeleop` does. With the pump attached
+/// (the live run) its k-th command carries the key reading `3k + 2`; with
+/// none (a replay) no key arrives and its k-th tick writes the zero command
+/// `(1, k, 0)`, so a replayed tick still publishes.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvTeleopNode {
+    #[output]
+    cmd: Vector3,
+    /// The key pump is attached: true in the live run only.
+    connected: bool,
+    /// Ticks run so far.
+    ticks: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvTeleopNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1.0;
+        let k = self.ticks;
+        self.cmd.x = DRV_DEVICE;
+        self.cmd.y = k;
+        self.cmd.z = if self.connected { 3.0 * k + 2.0 } else { 0.0 };
+        Ok(())
+    }
+}
+
+/// The teleop feeding the meter.
+fn drv_teleop_yaml() -> &'static str {
+    "name: drvt\nprefix: drvt\nnodes:\n\
+     \x20 - id: teleop\n    type: drv_teleop_node\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: teleop/cmd\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn drv_teleop_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "teleop",
+            Box::new(DrvTeleopNodeEntry::with_state(DrvTeleopNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain: DRV_GAIN,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live teleop run, its teleop fired before every step as its key pump
+/// wakes it, anchored to the hand oracle: the teleop published command
+/// k = 1..=N as `(1, k, 3k + 2)`, the meter read each and published
+/// `(1, k, 30k + 21)`.
+fn drv_teleop_record() -> RiLive {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_teleop_yaml(),
+        || drv_teleop_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["teleop"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let cmd = &live.rec.messages[DRV_TELEOP_CMD];
+    assert!(
+        cmd.len() >= RI_MIN_READS,
+        "PREMISE: the teleop published every wake: {} frames",
+        cmd.len()
+    );
+    for (i, f) in cmd.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 3.0 * k + 2.0),
+            "recorded teleop frame {i}"
+        );
+    }
+    let brightness = &live.rec.messages[DRV_TELEOP_BRIGHTNESS];
+    assert_eq!(
+        brightness.len(),
+        cmd.len(),
+        "PREMISE: the meter read every command"
+    );
+    for (i, f) in brightness.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 30.0 * k + 21.0),
+            "recorded meter frame {i}"
+        );
+    }
+    live
+}
+
+/// Every message of a finalized `--record-out` bag as `(x, y, z)`, per topic
+/// in the order the bag holds them.
+fn drv_record_out_frames(path: &std::path::Path) -> BTreeMap<String, Vec<(f64, f64, f64)>> {
+    let reader = BagReader::open(path).expect("the --record-out bag opens");
+    assert!(
+        matches!(
+            reader
+                .completeness()
+                .expect("the bag states its completeness"),
+            cerulion_bag::BagCompleteness::Finalized
+        ),
+        "the --record-out bag is finalized"
+    );
+    let mut frames: BTreeMap<String, Vec<(f64, f64, f64)>> = BTreeMap::new();
+    for message in reader.messages().expect("the bag's messages") {
+        let message = message.expect("a readable message");
+        frames
+            .entry(message.topic)
+            .or_default()
+            .push(drv_xyz(&message.data));
+    }
+    frames
+}
+
+/// `--record-out` of a driver graph holds every frame its replayed driver
+/// published. A teleop whose tick writes its command with no key pump
+/// attached publishes on every recorded fire, and the output bag holds every
+/// frame the re-executed graph published: the zero commands `(1, k, 0)` and
+/// the meter's readings `(1, k, 30k + 21)`, k = 1..=N. The comparison still
+/// treats the teleop's topic as a recorded input: the meter is fed the
+/// recorded commands, reproduces its readings and is the one topic checked
+/// and credited, and the replayed zero commands, which differ from every
+/// recorded one, are no violation. Both process layouts under `--verify`, and
+/// the neutral resim of the two-process bag, which feeds the meter through
+/// its cross-rank injector, whose re-published commands are not the graph's
+/// and are not written.
+#[test]
+#[serial]
+fn record_out_of_a_driver_graph_holds_every_frame_its_replayed_driver_published() {
+    let live = drv_teleop_record();
+    let n = live.rec.messages[DRV_TELEOP_CMD].len();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_teleop_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    let two_rank = dir.path().join("drv_teleop_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &two_rank, |id| id == "meter");
+    let want_cmd: Vec<(f64, f64, f64)> = (1..=n).map(|k| (DRV_DEVICE, k as f64, 0.0)).collect();
+    let want_brightness: Vec<(f64, f64, f64)> = (1..=n)
+        .map(|k| (DRV_DEVICE, k as f64, 30.0 * k as f64 + 21.0))
+        .collect();
+    for (run, (layout, bag, purpose)) in [
+        (
+            "single-rank, --verify",
+            &single,
+            replay_engine::ReplayPurpose::Verify,
+        ),
+        (
+            "two-rank, --verify",
+            &two_rank,
+            replay_engine::ReplayPurpose::Verify,
+        ),
+        (
+            "two-rank, neutral",
+            &two_rank,
+            replay_engine::ReplayPurpose::Resim,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = dir.path().join(format!("drv_teleop_out_{run}.mcap"));
+        let (outcome, replayed) = ri_replay_stamped(
+            bag,
+            || drv_teleop_factories(false),
+            purpose,
+            None,
+            None,
+            None,
+            RecordHealthReport::Absent,
+            Some(out.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: the teleop's replayed commands are no violation: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked and credited"
+        );
+        assert_eq!(
+            outcome.record_out.as_deref(),
+            Some(out.display().to_string().as_str()),
+            "{layout}: the outcome names the finished output bag: {:?}",
+            outcome.record_out_error
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: the meter read the recorded commands: {e}"));
+        let frames = drv_record_out_frames(&out);
+        assert_eq!(
+            frames.get(DRV_TELEOP_CMD).cloned().unwrap_or_default(),
+            want_cmd,
+            "{layout}: the output holds every command the replayed teleop published"
+        );
+        assert_eq!(
+            frames
+                .get(DRV_TELEOP_BRIGHTNESS)
+                .cloned()
+                .unwrap_or_default(),
+            want_brightness,
+            "{layout}: the output holds every reading the replayed meter published"
+        );
+        assert_eq!(
+            frames.len(),
+            2,
+            "{layout}: the output holds the graph's two topics and nothing else: {:?}",
+            frames.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A `--record-out` tap on the teleop's topic that cannot be opened refuses
+/// the pass with exit 5 naming the topic, and leaves no output bag: an output
+/// missing the driver's frames is never written. CONTROL in the same body:
+/// with the same fault armed and no `--record-out`, no tap is opened and the
+/// verify passes.
+#[test]
+#[serial]
+fn a_record_out_tap_on_a_driver_topic_that_cannot_be_opened_refuses_the_pass() {
+    let live = drv_teleop_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_teleop_tap_fault.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let out = dir.path().join("drv_teleop_tap_fault_out.mcap");
+    let _faulted = cerulion_cli_engine::replay_engine::fail_capture_open_for_test(DRV_TELEOP_CMD);
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        || drv_teleop_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        RecordHealthReport::Absent,
+        Some(out.clone()),
+    );
+    let err = outcome.expect_err("a --record-out tap the harness cannot open refuses the pass");
+    let ReplayError::Internal { reason } = &err else {
+        panic!("a harness observation failure is the exit-5 Internal class: {err:?}");
+    };
+    assert!(
+        reason.contains(DRV_TELEOP_CMD)
+            && reason.contains("--record-out tap")
+            && reason.contains("could not be opened"),
+        "the refusal names the topic, the tap and the failure: {reason}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert!(
+        !out.exists(),
+        "an aborted run leaves no partial output bag at {}",
+        out.display()
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        || drv_teleop_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("without --record-out no tap is opened");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 1));
 }
 
 /// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
