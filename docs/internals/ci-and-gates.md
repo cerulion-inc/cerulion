@@ -414,6 +414,33 @@ string, the public-surface gate's own fixture) is recorded in `NOT_AN_INVOCATION
 its reason, and a line there that stops matching fails too. `cerulion --version` is not
 an invocation for this purpose: clap answers it above the gate.
 
+`CERULION_LOGIN_GATE=off` switches off the command-wide check and nothing else.
+Serving the network is a second rule the variable does not reach. These need a
+saved login on the machine (an expired one counts):
+
+- a real-clock `graph run` or `node run` that offers topics to the network: under
+  the permissive default (no `network:` block, or one with `mode: disabled` or no
+  `mode:`), any graph with a producer or a `ros2:` node; under an enabled
+  `network:` block (`mode: peer` or `mode: client`), one that lists egress topics;
+- a `ros2 attach` that is not a dry run;
+- a `cerulion-netd` started with `CERULION_NETD_LISTEN`.
+
+Without one they refuse with
+`` serving the network requires a prior login; run `cerulion login` ``. The runs
+and `ros2 attach` also accept a saved robot pairing; the netd listener does not.
+A job with no account keeps a `graph run` or `node run` on the runner with
+`--network off` (also spelled `--local`) or `CERULION_NETWORK=off`, and a
+`ros2 attach` with `CERULION_NETWORK=off` (it has no `--network` flag); a
+`graph run` under `--time-source virtual` or `external` is inert too. The release
+install smoke and the perception replay demo both pass `--network off`. The seeded
+login below satisfies the serving rule as well, and a run under it then serves for
+real. The workspace latency harness runs its real-clock legs under the permissive
+default (its backtoback leg passes `--time-source virtual` and stays inert), and the
+cross-host harness's `cerulion-tcp` and `cerulion-quic` stacks give each machine a
+`network:` block that lists egress topics. Both harnesses therefore need a
+signed-in machine for those legs, and the cross-host harness needs a login on each
+of its two machines.
+
 A job that wants a machine WITH an account instead seeds one:
 `tools/ci/seed_test_login.sh <dir>` writes the `auth.json` a real sign-in writes,
 and `CERULION_HOME=<dir>` points the gate at it. The file's shape is pinned
