@@ -152,6 +152,23 @@ cannot tell their sequences apart and the replay stops (exit 5). Its verdict
 `NOTE:` line says the topic was compared over every recorded frame, and
 `driver_inputs.unattributed_topics` names it.
 
+A `multi_publisher_topics` topic whose writers run in several processes or
+executor units is compared in every one of them. When the replay attributes
+every recorded frame of the topic to its writer, which needs a bag that labels
+each frame with its writer, a wire header on every frame, and at most 200000
+recorded frames, the verifier's record budget, on the `multi_publisher_topics`
+topics one process or executor unit writes, each writer is compared in the
+process or executor unit that runs it, and a byte mismatch names it (below).
+The frames a process or executor unit then feeds from the bag to its nodes that
+read the topic, the recorded frames of the writers that run elsewhere, are left
+out of the comparison, so a node that reads only some of them, such as one that
+reads the latest value on a slower period, does not stop the replay. Otherwise
+each process or executor unit that writes the topic compares the frames
+published on it there, the frames it feeds included, as one stream with every
+recorded frame of the topic, and a byte mismatch there names no writer; where
+that stream holds the frames of two writers, one stream cannot tell their
+sequences apart and the replay stops (exit 5).
+
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,
 the tally, one line per violation with its topic, its class and what was
