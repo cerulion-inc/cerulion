@@ -5501,6 +5501,7 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -5670,6 +5671,7 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -5785,6 +5787,7 @@ fn render_verdict_pass_path_counts_an_other_variable_in_one_note() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -6374,6 +6377,7 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -6486,6 +6490,7 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -13785,6 +13790,7 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -28480,6 +28486,7 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         read_log_divergence: Some(replay_engine::ReadLogDivergenceReport {
             diverging_edges: 1,
@@ -44505,6 +44512,11 @@ fn a_verify_of_a_driver_graph_feeds_the_driver_frames_and_passes() {
             !ri_by_consumer(&replayed).contains_key(&DRV_CAMERA.to_bits()),
             "{layout}: the replayed camera had no device and published nothing"
         );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[], &[])),
+            "{layout}: the camera's topic is the one recorded input"
+        );
         let verdict = replay_engine::render_verdict(&outcome, &bag);
         let pass_line = format!(
             "replay PASS: {} ({} tick(s) replayed, 1/1 topic(s) matched byte-for-byte and were \
@@ -44512,12 +44524,49 @@ fn a_verify_of_a_driver_graph_feeds_the_driver_frames_and_passes() {
             bag.display(),
             outcome.ticks_replayed
         );
-        assert!(
-            verdict.lines().any(|l| l == pass_line),
-            "{layout}: the PASS line: {verdict}"
+        let input_note = format!(
+            "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were \
+             NOT compared (driver nodes, as the replayed build declares them: cam): {DRV_IMAGE}"
+        );
+        assert_eq!(
+            verdict.lines().rev().take(2).collect::<Vec<_>>(),
+            vec![pass_line.as_str(), input_note.as_str()],
+            "{layout}: the verdict ends with the NOTE naming the camera and its topic, then \
+             the PASS line: {verdict}"
+        );
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![input_note.as_str()],
+            "{layout}: one driver NOTE: {verdict}"
         );
         assert!(!verdict.contains("missing-topic"), "{layout}: {verdict}");
     }
+}
+
+/// A [`replay_engine::DriverInputsReport`] built from hand-written lists.
+fn drv_inputs(
+    nodes: &[&str],
+    input: &[&str],
+    shared: &[&str],
+    unfed: &[&str],
+    unread: &[&str],
+) -> replay_engine::DriverInputsReport {
+    let owned = |list: &[&str]| list.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    replay_engine::DriverInputsReport {
+        nodes: owned(nodes),
+        input_topics: owned(input),
+        shared_topics: owned(shared),
+        unfed_topics: owned(unfed),
+        unread_topics: owned(unread),
+    }
+}
+
+/// The verdict lines that speak of external (driver) nodes, in order.
+fn drv_driver_lines(verdict: &str) -> Vec<&str> {
+    verdict
+        .lines()
+        .filter(|l| l.contains("external (driver)"))
+        .collect()
 }
 
 /// A candidate whose meter changed fails with exit 1, naming the meter's
@@ -44561,7 +44610,19 @@ fn a_changed_meter_in_a_driver_graph_exits_1_naming_its_topic() {
             verdict.contains(&format!("  - {DRV_BRIGHTNESS} [byte-mismatch]: ")),
             "{layout}: {verdict}"
         );
-        assert!(!verdict.contains(DRV_IMAGE), "{layout}: {verdict}");
+        assert!(
+            !verdict.contains(&format!("  - {DRV_IMAGE} [")),
+            "{layout}: no violation names the camera's topic: {verdict}"
+        );
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the replayed build declares them: cam): \
+                 {DRV_IMAGE}"
+            )],
+            "{layout}: the FAIL verdict names the recorded input too: {verdict}"
+        );
     }
 }
 
@@ -44772,6 +44833,178 @@ fn a_neutral_resim_of_a_driver_graph_injects_the_driver_frames_across_ranks() {
     ri_judge(&live.reads, &replayed, &[DRV_METER]).expect("the meter's reads are the live ones");
 }
 
+/// The recorded period writer's output topic in the reclassification graph.
+const DRV_RECLASS_OUT: &str = "/drvx/src/out";
+/// The meter's output topic in the reclassification graph.
+const DRV_RECLASS_BRIGHTNESS: &str = "/drvx/meter/brightness";
+
+/// A period writer (`src`, writer 1) feeding the meter.
+fn drv_reclass_yaml() -> &'static str {
+    "name: drvx\nprefix: drvx\nnodes:\n\
+     \x20 - id: src\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: src/out\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// What a build declares in place of the recorded period writer: an
+/// `external` node whose k-th tick writes `(1, k, -1)`, a changed output.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvReclassifiedNode {
+    #[output]
+    out: Vector3,
+    /// Ticks run so far.
+    ticks: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvReclassifiedNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1.0;
+        self.out.x = 1.0;
+        self.out.y = self.ticks;
+        self.out.z = -1.0;
+        Ok(())
+    }
+}
+
+/// The reclassification graph with `src` as `src_entry` builds it.
+fn drv_reclass_factories(src_entry: Box<dyn NodeEntry>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", src_entry),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain: DRV_GAIN,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A bag records no node's trigger policy, so the replayed build's
+/// declarations decide which nodes are drivers. A build that declares
+/// `external` a node recorded as a period writer, and changes what it writes,
+/// takes that node's outputs as recorded inputs: its changed frames, which
+/// `--record-out` holds as `(1, k, -1)`, are not compared, the meter is fed
+/// the recorded frames and reproduces its readings, and `--verify` passes
+/// 1/1 with exit 0. What the verdict covered is stated where a reader of the
+/// run sees it: the verdict NOTE and the `--report`'s `driver_inputs` name the
+/// node and its topic. One process and two.
+#[test]
+#[serial]
+fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_verdict() {
+    let live = ri_record(drv_reclass_yaml(), || {
+        drv_reclass_factories(Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: 1.0,
+            ..Default::default()
+        })))
+    });
+    let out = &live.rec.messages[DRV_RECLASS_OUT];
+    let c = out.len();
+    assert!(c >= RI_MIN_READS, "PREMISE: the writer published: {c}");
+    for (i, f) in out.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (1.0, k, 1_000_000.0 + 7.0 * k),
+            "recorded writer frame {i}"
+        );
+    }
+    let brightness = &live.rec.messages[DRV_RECLASS_BRIGHTNESS];
+    assert_eq!(brightness.len(), c, "PREMISE: the meter read every frame");
+    for (i, f) in brightness.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (1.0, k, 10_000_001.0 + 70.0 * k),
+            "recorded meter frame {i}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_reclass_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    let two_rank = dir.path().join("drv_reclass_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &two_rank, |id| id == "meter");
+    let changed: Vec<(f64, f64, f64)> = (1..=c).map(|k| (1.0, k as f64, -1.0)).collect();
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        let record_out = dir.path().join(format!("drv_reclass_out_{run}.mcap"));
+        let report = dir.path().join(format!("drv_reclass_report_{run}.json"));
+        let (outcome, replayed) = ri_replay_stamped(
+            bag,
+            || {
+                drv_reclass_factories(Box::new(DrvReclassifiedNodeEntry::with_state(
+                    DrvReclassifiedNode::default(),
+                )))
+            },
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+            RecordHealthReport::Absent,
+            Some(record_out.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: the meter read the recorded frames: {e}"));
+        assert_eq!(
+            drv_record_out_frames(&record_out)
+                .get(DRV_RECLASS_OUT)
+                .cloned()
+                .unwrap_or_default(),
+            changed,
+            "{layout}: the reclassified node published its changed output"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["src"], &[DRV_RECLASS_OUT], &[], &[], &[])),
+            "{layout}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).expect("the report is written"))
+                .expect("the report is JSON");
+        assert_eq!(
+            json["driver_inputs"],
+            serde_json::json!({
+                "nodes": ["src"],
+                "input_topics": [DRV_RECLASS_OUT],
+                "shared_topics": [],
+                "unfed_topics": [],
+                "unread_topics": [],
+            }),
+            "{layout}: {json}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the replayed build declares them: src): \
+                 {DRV_RECLASS_OUT}"
+            )],
+            "{layout}: {verdict}"
+        );
+    }
+}
+
 /// The camera device's k-th reading, `(device, k, 3k + 2)`, as the bus
 /// camera publishes it.
 fn drv_reading(k: f64) -> (f64, f64, f64) {
@@ -44802,7 +45035,9 @@ fn drv_cam_only_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry
 /// camera's topic is a recorded input and no node re-computes a topic, so the
 /// verdict is the `0/0` PASS with exit 0. Two WARN lines say so at the default
 /// log level, one naming the topic no node reads and one stating that nothing
-/// was compared.
+/// was compared; the verdict's NOTE lines and the `--report`'s
+/// `driver_inputs` say the same, so neither a log filter nor a report reader
+/// can take the `0/0` for a comparison.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
@@ -44836,10 +45071,14 @@ fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("drv_cam_only.mcap");
     ri_bag(&rec, &bag, ri_free_run_recorder_json());
-    let (outcome, replayed) = ri_replay(
+    let report = dir.path().join("drv_cam_only_report.json");
+    let (outcome, replayed) = ri_replay_reporting(
         &bag,
         || drv_cam_only_factories(false),
         replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
     );
     let outcome = outcome.expect("the replay runs");
     assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
@@ -44850,6 +45089,38 @@ fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
         replayed.is_empty(),
         "the replayed camera had no device and published nothing: {replayed:?}"
     );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(drv_inputs(
+            &["cam"],
+            &[DRV_CAM_ONLY_IMAGE],
+            &[],
+            &[],
+            &[DRV_CAM_ONLY_IMAGE]
+        ))
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the report is written"))
+            .expect("the report is JSON");
+    assert_eq!(
+        (
+            &json["passed"],
+            &json["topics_checked"],
+            &json["driver_inputs"]
+        ),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(0),
+            &serde_json::json!({
+                "nodes": ["cam"],
+                "input_topics": [DRV_CAM_ONLY_IMAGE],
+                "shared_topics": [],
+                "unfed_topics": [],
+                "unread_topics": [DRV_CAM_ONLY_IMAGE],
+            })
+        ),
+        "the report names the uncompared, unread driver topic beside its 0/0 pass: {json}"
+    );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
     let pass_line = format!(
         "replay PASS: {} ({} tick(s) replayed, 0/0 topic(s) matched byte-for-byte and were \
@@ -44858,6 +45129,24 @@ fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
         outcome.ticks_replayed
     );
     assert!(verdict.lines().any(|l| l == pass_line), "{verdict}");
+    assert_eq!(
+        drv_driver_lines(&verdict),
+        vec![
+            format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the replayed build declares them: cam): \
+                 {DRV_CAM_ONLY_IMAGE}"
+            ),
+            format!(
+                "NOTE: 1 external (driver) topic(s) are read by no node, so nothing in this \
+                 replay verifies them: {DRV_CAM_ONLY_IMAGE}"
+            ),
+            "NOTE: no topic was compared against the recording: no node other than an \
+             external (driver) node recorded or replayed a frame"
+                .to_string(),
+        ],
+        "{verdict}"
+    );
     for phrase in [
         "no node in the graph reads these external (driver) topics",
         "no topic was compared against the recording",
@@ -44930,6 +45219,11 @@ fn a_lockstep_recording_of_a_driver_graph_diverges_naming_the_driver() {
             [(DRV_BRIGHTNESS, ViolationClass::MissingTopic)]
         ),
         "the meter, never fed, published nothing: {named:?}"
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[DRV_IMAGE], &[])),
+        "a lockstep replay feeds the meter none of the camera's frames"
     );
     logs_assert(|lines: &[&str]| {
         let hits: Vec<&&str> = lines
@@ -45107,6 +45401,21 @@ fn a_topic_a_driver_shares_is_compared_over_its_other_writer_and_passes() {
         );
         ri_judge(&live.reads, &replayed, &[DRV_BUS_SINK])
             .unwrap_or_else(|e| panic!("{layout}: the sink read the live frames: {e}"));
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["w1"], &[], &[DRV_BUS], &[], &[])),
+            "{layout}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                 compared over the other writers' frames only (driver nodes, as the replayed \
+                 build declares them: w1): {DRV_BUS}"
+            )],
+            "{layout}: {verdict}"
+        );
     }
 }
 
@@ -45176,6 +45485,11 @@ fn a_neutral_resim_beside_the_driver_warns_that_it_does_not_feed_the_reader() {
     assert!(
         ri_judge(&live.reads, &replayed, &[DRV_METER]).is_err(),
         "the meter, fed no camera frame, does not reproduce its live reads"
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[DRV_IMAGE], &[])),
+        "the outcome names the camera's topic as unfed"
     );
     logs_assert(|lines: &[&str]| {
         let hits: Vec<&&str> = lines
@@ -45440,6 +45754,20 @@ fn a_shared_topic_only_its_driver_published_is_not_reported_missing() {
     assert_eq!(resim_exit(&outcome, true), 0);
     assert_eq!((outcome.topics_checked, outcome.topics_passed), (0, 0));
     ri_judge(&live_reads, &replayed, &[DRV_SILENT_SINK]).expect("the sink read the live frames");
+    assert_eq!(
+        drv_driver_lines(&replay_engine::render_verdict(&outcome, &bag)),
+        vec![
+            format!(
+                "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                 compared over the other writers' frames only (driver nodes, as the replayed \
+                 build declares them: w1): {DRV_SILENT_BUS}"
+            ),
+            "NOTE: no topic was compared against the recording: no node other than an \
+             external (driver) node recorded or replayed a frame"
+                .to_string(),
+        ],
+        "the 0/0 verdict says it compared nothing"
+    );
     logs_assert(|lines: &[&str]| {
         let hits: Vec<&&str> = lines
             .iter()

@@ -158,18 +158,20 @@ BAG="recordings/v4l2_camera_<timestamp>.mcap"
 cerulion bag play "$BAG" --resim all --verify
 ```
 
-It ends with one line:
+It ends with these two lines:
 
 ```
+NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the replayed build declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
 replay PASS: recordings/v4l2_camera_<timestamp>.mcap (<N> tick(s) replayed, 1/1 topic(s) matched byte-for-byte and were credited)
 ```
 
 `replay PASS` and exit code 0 mean the rebuilt `brightness_meter` reproduced
 the recorded readings from the recorded frames byte for byte. The camera node
 is a driver: replay feeds its recorded frames downstream and never opens the
-device, so the camera's `image` topic is a recorded input and the one topic
-compared is the meter's `brightness`. A recording that lost camera frames
-still fails: replay never feeds the meter a frame other than the one it read.
+device, so the camera's `image` topic is a recorded input, as the `NOTE:` line
+says, and the one topic compared is the meter's `brightness`. A recording that
+lost camera frames still fails: replay never feeds the meter a frame other
+than the one it read.
 
 Verify a recording made in the default multi-process layout. A
 `--single-process` recording of this graph is lockstep, which a resim of a

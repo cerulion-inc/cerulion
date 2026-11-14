@@ -208,7 +208,13 @@ Rules that must not drift:
   (one WARN each): a pass that is not fed injects no in-rank topic, so a topic a node reads
   in a rank running one of its driver writers is unfed, a shared one too, while fed and
   unread hold only the topics drivers alone write (a shared topic is compared over its
-  other writers). A `0/0` tally with a driver warns that nothing was compared. Pinned by
+  other writers). A `0/0` tally with a driver warns that nothing was compared. The same
+  classification rides the outcome as `ReplayOutcome::driver_inputs` (`driver_inputs_report`
+  over the plan; a lockstep plan counts every driver topic a node reads as unfed), so the
+  `--report` JSON and the verdict NOTE lines (`render_driver_input_lines`, PASS and FAIL alike)
+  carry it, not log text alone. The driver set is the candidate's declared policy: the bag
+  records no node's policy, so a candidate that newly declares a node `external` moves that
+  node's outputs out of the diff, and the NOTE and `driver_inputs.nodes` name it. Pinned by
   `driver_topic_tests` and the driver-graph arms of `replay_engine_test.rs` (the `drv_*`
   fixtures); `docs/bag.md` states the user-facing rules.
 - **Environment divergence prints once and never changes the exit code.** A resim never

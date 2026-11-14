@@ -822,6 +822,16 @@ pub struct ReplayOutcome {
     /// report stays byte-identical (additive field; old readers ignore it).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unmodelled_topics: Vec<String>,
+    /// The topics the graph's `external` (driver) nodes write, and what this
+    /// replay did with them ([`DriverInputsReport`]). A driver's outputs are
+    /// recorded inputs: they leave the comparison and [`Self::topics_checked`],
+    /// so this is what tells a machine reader how much of the bag a PASS
+    /// covered, a `0/0` one included. The human-readable twin is the verdict
+    /// `NOTE` ([`render_driver_input_lines`]). `None` for a graph with no
+    /// driver, and skipped from the `--report` JSON then, so every such report
+    /// stays byte-identical (additive field; old readers ignore it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_inputs: Option<DriverInputsReport>,
     /// What this replay RESUMED from, when the recording
     /// began mid-run and an anchor was applied.
     ///
@@ -1099,6 +1109,86 @@ pub struct ReplayOutcome {
     /// the exit code, because only it knows whether a verdict was asked for.
     #[serde(skip)]
     pub record_out_error: Option<String>,
+}
+
+/// The topics a replay took as recorded inputs because an `external` (driver)
+/// node writes them ([`ReplayOutcome::driver_inputs`]). A bag records no node's
+/// trigger policy, so the driver set is the REPLAYED build's: a node this build
+/// declares `external` is named here, and its outputs are inputs, whatever
+/// policy it recorded under. Each topic list is in graph order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DriverInputsReport {
+    /// Every node the replayed build declares `external`, in id order.
+    pub nodes: Vec<String>,
+    /// The topics only drivers write: recorded inputs, neither compared nor
+    /// counted in `topics_checked`, but for one the record-health stamp marks
+    /// lossy, which is a `record-side-tap-loss` violation on its own topic.
+    pub input_topics: Vec<String>,
+    /// The `multi_publisher_topics` topics a driver writes beside other nodes:
+    /// compared and counted over the other writers' frames only.
+    pub shared_topics: Vec<String>,
+    /// The topics of [`Self::input_topics`] and [`Self::shared_topics`] that a
+    /// node reads where this replay does not feed it the drivers' recorded
+    /// frames, so that node cannot reproduce its recorded outputs. A lockstep
+    /// replay feeds none.
+    pub unfed_topics: Vec<String>,
+    /// The topics of [`Self::input_topics`] that no node reads: fed to nothing
+    /// and compared by nothing, so nothing in the replay verifies them.
+    pub unread_topics: Vec<String>,
+}
+
+/// The verdict `NOTE` lines of a [`DriverInputsReport`], one per non-empty
+/// list, and one more when `topics_checked` is 0, the `0/0` verdict: it
+/// compared nothing. Rendered on the PASS and the FAIL path alike, since each
+/// says what the tally above or below it does not cover.
+pub fn render_driver_input_lines(
+    report: &DriverInputsReport,
+    topics_checked: usize,
+) -> Vec<String> {
+    let nodes = report.nodes.join(", ");
+    let mut lines = Vec::new();
+    if !report.input_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} topic(s) only external (driver) nodes write are recorded inputs and were \
+             NOT compared (driver nodes, as the replayed build declares them: {nodes}): {}",
+            report.input_topics.len(),
+            report.input_topics.join(", ")
+        ));
+    }
+    if !report.shared_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} topic(s) an external (driver) node shares with other writers were \
+             compared over the other writers' frames only (driver nodes, as the replayed build \
+             declares them: {nodes}): {}",
+            report.shared_topics.len(),
+            report.shared_topics.join(", ")
+        ));
+    }
+    if !report.unfed_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} external (driver) topic(s) were not fed to the nodes that read them, so \
+             those nodes cannot reproduce their recorded outputs: {}",
+            report.unfed_topics.len(),
+            report.unfed_topics.join(", ")
+        ));
+    }
+    if !report.unread_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} external (driver) topic(s) are read by no node, so nothing in this replay \
+             verifies them: {}",
+            report.unread_topics.len(),
+            report.unread_topics.join(", ")
+        ));
+    }
+    let drivers_write = !report.input_topics.is_empty() || !report.shared_topics.is_empty();
+    if drivers_write && topics_checked == 0 {
+        lines.push(
+            "NOTE: no topic was compared against the recording: no node other than an external \
+             (driver) node recorded or replayed a frame"
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// The verdict's coordination line, or `None` when the contract applied needs
@@ -4962,16 +5052,17 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     //     rank's clock, which it then skips). Root cause first — the same
     //     precedence the exit codes use.
     let plans = build_rank_plans(coordination, &config, &rank_tables, &boundary_summaries)?;
-    log_driver_topic_feeds(
-        &plan_driver_topic_feeds(
-            &config,
-            &classes,
-            &plans,
-            coordination == CoordinationMode::Lockstep,
-            fed,
-        ),
-        &best_effort_reason,
+    let driver_feeds = plan_driver_topic_feeds(
+        &config,
+        &classes,
+        &plans,
+        coordination == CoordinationMode::Lockstep,
+        fed,
     );
+    log_driver_topic_feeds(&driver_feeds, &best_effort_reason);
+    // Carried into the outcome/report (the machine-readable twin of the log
+    // lines and the verdict NOTE).
+    let driver_inputs = driver_inputs_report(&config, &classes, &driver_feeds);
 
     // What this bag DECLARES its resume covers — or the
     // range a multi-rank lockstep bag DERIVES (rank 0's last boundary target;
@@ -5395,6 +5486,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             reason: best_effort_reason,
         }
     };
+    outcome.driver_inputs = driver_inputs;
     match &record_out_result {
         Some(Ok(path)) => outcome.record_out = Some(path.clone()),
         Some(Err(e)) => outcome.record_out_error = Some(e.to_string()),
@@ -6225,6 +6317,9 @@ fn assemble_outcome(
         record_health,
         tolerated_ragged_tails,
         unmodelled_topics,
+        // Decided by `run_engine` from the feed plan of the rank layout, and
+        // written over this placeholder there.
+        driver_inputs: None,
         resume: resume_report,
         // The range this bag declared — or the reader
         // derived — carried into the verdict so the exclusion is REPORTED
@@ -16951,6 +17046,44 @@ fn plan_driver_topic_feeds(
     }
 }
 
+/// The [`DriverInputsReport`] of a replay, from the graph's classification and
+/// the feed plan [`plan_driver_topic_feeds`] made. `None` when the graph has
+/// no driver. PURE.
+///
+/// A free-run plan states the unfed and unread topics itself. A lockstep
+/// replay fires no driver and feeds no reader, so there every driver topic a
+/// node reads is unfed, and a topic only drivers write that no node reads is
+/// unread.
+fn driver_inputs_report(
+    config: &GraphConfig,
+    classes: &TopicClasses,
+    feeds: &DriverTopicFeeds,
+) -> Option<DriverInputsReport> {
+    if classes.driver_nodes.is_empty() {
+        return None;
+    }
+    let (unfed_topics, unread_topics) = match feeds {
+        DriverTopicFeeds::FreeRun { unfed, unread, .. } => (unfed.clone(), unread.clone()),
+        DriverTopicFeeds::Lockstep { topics, .. } => {
+            let consumed = graph_consumed_topics(config);
+            let (read, not_read): (Vec<String>, Vec<String>) =
+                topics.iter().cloned().partition(|t| consumed.contains(t));
+            let unread = not_read
+                .into_iter()
+                .filter(|t| classes.driver.contains(t))
+                .collect();
+            (read, unread)
+        }
+    };
+    Some(DriverInputsReport {
+        nodes: classes.driver_nodes.iter().cloned().collect(),
+        input_topics: classes.driver.clone(),
+        shared_topics: classes.driver_shared.clone(),
+        unfed_topics,
+        unread_topics,
+    })
+}
+
 /// Log [`DriverTopicFeeds`]: one line per list, never one per topic.
 ///
 /// The fed list is INFO, since an input is not a topic the verdict claims to
@@ -20473,9 +20606,10 @@ mod restored_sync_heads_tests {
 #[cfg(test)]
 mod driver_topic_tests {
     use super::{
-        build_rank_plans, classify_topics, driver_output_topics, driver_shared_topics,
-        driver_written_topics, external_node_ids, log_driver_topic_feeds, plan_driver_topic_feeds,
-        re_executed_output_topics, CoordinationMode, DriverTopicFeeds, NodeEntry, RecordedMessages,
+        build_rank_plans, classify_topics, driver_inputs_report, driver_output_topics,
+        driver_shared_topics, driver_written_topics, external_node_ids, log_driver_topic_feeds,
+        plan_driver_topic_feeds, re_executed_output_topics, render_driver_input_lines,
+        CoordinationMode, DriverInputsReport, DriverTopicFeeds, NodeEntry, RecordedMessages,
         TopicClasses,
     };
     use crate::replay_rank::RankBoundarySummary;
@@ -20957,6 +21091,174 @@ mod driver_topic_tests {
         assert_eq!(classes.driver_nodes, ids(&["cam"]));
         assert!(classes.external.is_empty(), "{:?}", classes.external);
         assert!(classes.unmodelled.is_empty(), "{:?}", classes.unmodelled);
+    }
+
+    fn report(
+        nodes: &[&str],
+        input: &[&str],
+        shared: &[&str],
+        unfed: &[&str],
+        unread: &[&str],
+    ) -> DriverInputsReport {
+        DriverInputsReport {
+            nodes: strings(nodes),
+            input_topics: strings(input),
+            shared_topics: strings(shared),
+            unfed_topics: strings(unfed),
+            unread_topics: strings(unread),
+        }
+    }
+
+    /// The report names the drivers, every topic only they write and every
+    /// topic they share, and carries the free-run plan's unfed and unread
+    /// lists. A lockstep replay feeds nothing, so every driver topic a node
+    /// reads is unfed there, and a shared topic no node reads is never unread,
+    /// since its other writers' frames are compared. A graph with no driver
+    /// has no report.
+    #[test]
+    fn the_driver_inputs_report_names_every_driver_topic_and_what_was_fed() {
+        let camera = parse_graph(CAMERA).expect("the camera graph parses");
+        let bus = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        let unread_bus = parse_graph(UNREAD_SHARED_BUS).expect("the unread bus graph parses");
+        let door = parse_graph(OUTPUTLESS_DRIVER).expect("the outputless driver graph parses");
+        let image = "/rig/cam/image";
+        let info = "/rig/cam/info";
+        let shared = "/rig/bus";
+        let free = CoordinationMode::FreeRun;
+        let lock = CoordinationMode::Lockstep;
+        let one_cam: &[&[&str]] = &[&["cam", "meter"]];
+        let one_bus: &[&[&str]] = &[&["cam", "timer", "sink"]];
+        let one_unread_bus: &[&[&str]] = &[&["cam", "timer"]];
+        let one_door: &[&[&str]] = &[&["door", "timer"]];
+        for (layout, config, drivers, coordination, ranks, fed, want) in [
+            (
+                "camera, one rank, fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
+                true,
+                Some(report(&["cam"], &[image, info], &[], &[], &[info])),
+            ),
+            (
+                "camera, one rank, not fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
+                false,
+                Some(report(&["cam"], &[image, info], &[], &[image], &[info])),
+            ),
+            (
+                "camera, lockstep",
+                &camera,
+                &["cam"][..],
+                lock,
+                one_cam,
+                false,
+                Some(report(&["cam"], &[image, info], &[], &[image], &[info])),
+            ),
+            (
+                "shared bus, one rank, not fed",
+                &bus,
+                &["cam"][..],
+                free,
+                one_bus,
+                false,
+                Some(report(&["cam"], &[], &[shared], &[shared], &[])),
+            ),
+            (
+                "shared bus, lockstep",
+                &bus,
+                &["cam"][..],
+                lock,
+                one_bus,
+                false,
+                Some(report(&["cam"], &[], &[shared], &[shared], &[])),
+            ),
+            (
+                "shared bus no node reads, lockstep",
+                &unread_bus,
+                &["cam"][..],
+                lock,
+                one_unread_bus,
+                false,
+                Some(report(&["cam"], &[], &[shared], &[], &[])),
+            ),
+            (
+                "outputless driver, lockstep",
+                &door,
+                &["door"][..],
+                lock,
+                one_door,
+                false,
+                Some(report(&["door"], &[], &[], &[], &[])),
+            ),
+            (
+                "no driver, free run",
+                &camera,
+                &[][..],
+                free,
+                one_cam,
+                true,
+                None,
+            ),
+        ] {
+            let classes = classes_of(config, drivers);
+            let plans = rank_plans(config, coordination, ranks);
+            let feeds =
+                plan_driver_topic_feeds(config, &classes, &plans, lock == coordination, fed);
+            assert_eq!(
+                driver_inputs_report(config, &classes, &feeds),
+                want,
+                "{layout}"
+            );
+        }
+    }
+
+    /// One NOTE per non-empty list, each naming its topics, the first two
+    /// naming the drivers as the replayed build declares them, and one more
+    /// when nothing was compared. A driver that writes nothing prints no line.
+    #[test]
+    fn the_driver_input_lines_name_every_list_and_a_comparison_of_nothing() {
+        let inputs = "NOTE: 2 topic(s) only external (driver) nodes write are recorded inputs \
+                      and were NOT compared (driver nodes, as the replayed build declares them: \
+                      cam, lidar): /rig/cam/image, /rig/lidar/scan";
+        let shared = "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                      compared over the other writers' frames only (driver nodes, as the \
+                      replayed build declares them: cam, lidar): /rig/bus";
+        let unfed = "NOTE: 1 external (driver) topic(s) were not fed to the nodes that read \
+                     them, so those nodes cannot reproduce their recorded outputs: /rig/bus";
+        let unread = "NOTE: 1 external (driver) topic(s) are read by no node, so nothing in this \
+                      replay verifies them: /rig/lidar/scan";
+        let nothing = "NOTE: no topic was compared against the recording: no node other than an \
+                       external (driver) node recorded or replayed a frame";
+        let full = report(
+            &["cam", "lidar"],
+            &["/rig/cam/image", "/rig/lidar/scan"],
+            &["/rig/bus"],
+            &["/rig/bus"],
+            &["/rig/lidar/scan"],
+        );
+        assert_eq!(
+            render_driver_input_lines(&full, 0),
+            vec![inputs, shared, unfed, unread, nothing]
+        );
+        assert_eq!(
+            render_driver_input_lines(&full, 1),
+            vec![inputs, shared, unfed, unread],
+            "a compared topic prints no nothing-compared line"
+        );
+        let shared_only = report(&["cam", "lidar"], &[], &["/rig/bus"], &[], &[]);
+        assert_eq!(
+            render_driver_input_lines(&shared_only, 0),
+            vec![shared, nothing]
+        );
+        let silent = report(&["door"], &[], &[], &[], &[]);
+        assert!(
+            render_driver_input_lines(&silent, 0).is_empty(),
+            "a driver that writes nothing leaves nothing out of the comparison"
+        );
     }
 }
 
@@ -29326,6 +29628,15 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
             outcome.unmodelled_topics.len(),
             outcome.unmodelled_topics.join(", ")
         );
+    }
+
+    // The topics the external (driver) nodes write, rendered in BOTH the PASS
+    // and the FAIL path for the same reason: they are recorded inputs, the
+    // tally does not count them, and a `0/0` verdict compared nothing.
+    if let Some(report) = &outcome.driver_inputs {
+        for line in render_driver_input_lines(report, outcome.topics_checked) {
+            let _ = writeln!(s, "{line}");
+        }
     }
 
     // The topics whose frame comparison was DECLINED. Rendered

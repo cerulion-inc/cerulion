@@ -91,17 +91,36 @@ replay PASS: <bag> (<N> tick(s) replayed, <P>/<M> topic(s) matched byte-for-byte
 
 `<M>` counts the topics the re-executed nodes publish. A driver's outputs are
 recorded inputs and are not compared: the nodes that read them are fed the
-recorded frames, and those nodes' own topics are. A driver topic still fails
-the run when the bag lost its frames: a record-health stamp that counts lost
-frames on it makes it a `record-side-tap-loss` violation, counted in `<M>`
-(exit 1), and a replay that feeds reads by their recorded identity (see "Read
-identity" below) refuses a recorded read of a frame the bag does not hold
-(exit 2, `read_identity_frame_missing`).
+recorded frames, and those nodes' own topics are. A node is a driver when the
+build you replay declares it `external`, since a bag does not record a node's
+policy: a build that newly declares a node `external` takes that node's
+outputs as recorded inputs too, and the verdict names it as a driver. A
+driver topic still fails the run when the bag lost its frames: a record-health
+stamp that counts lost frames on it makes it a `record-side-tap-loss`
+violation, counted in `<M>` (exit 1), and a replay that feeds reads by their
+recorded identity (see "Read identity" below) refuses a recorded read of a
+frame the bag does not hold (exit 2, `read_identity_frame_missing`).
+
+The verdict states what it left out, on a pass and a failure alike, with one
+`NOTE:` line for each of: the topics only drivers write, naming the driver
+nodes; the `multi_publisher_topics` topics a driver shares with other nodes;
+the driver topics this resim did not feed to the nodes that read them; the
+driver topics no node reads; and, on a `0/0` tally, that no topic was
+compared. For the `v4l2_camera` example the first one reads:
+
+```
+NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the replayed build declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
+```
+
+With `--report` the JSON carries the same lists under `driver_inputs`, as
+`nodes`, `input_topics`, `shared_topics`, `unfed_topics` and `unread_topics`
+(absent for a graph with no driver).
 
 A graph whose produced topics are all driver outputs, such as a capture-only
 graph, has nothing to re-compute: its `--verify` passes with `0/0`, and a
-warning says that no topic was compared. A driver topic no node reads is
-neither fed nor compared, and a warning names it. On a `multi_publisher_topics`
+warning and a verdict NOTE say that no topic was compared. A driver topic no
+node reads is neither fed nor compared, and a warning and a verdict NOTE name
+it. On a `multi_publisher_topics`
 topic a driver shares with other nodes, the other writers' frames are compared
 and the driver's are not, when the bag attributes every frame of the topic to
 its writer; a replay of a bag that cannot fails on that topic.
