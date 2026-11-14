@@ -1551,18 +1551,13 @@ mod tests {
         // The spawned daemon's stderr must land in a RECOVERABLE log
         // file (next to the socket), NOT /dev/null — otherwise every daemon
         // diagnostic (startup failure, the host TOCTOU warn) vanishes.
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::Instant;
 
         let dir = std::env::temp_dir().join(format!("cer_vizc_log_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // A fake "daemon": a tiny script that writes a marker to STDERR and exits.
         let script = dir.join("fake-vizd.sh");
-        let mut f = std::fs::File::create(&script).unwrap();
-        writeln!(f, "#!/bin/sh\necho STDERR_MARKER 1>&2\n").unwrap();
-        drop(f);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fresh_executable::install_script(&script, "#!/bin/sh\necho STDERR_MARKER 1>&2\n");
 
         let socket = dir.join("vizd.sock");
         let log = vizd_log_path(&socket);
@@ -1600,7 +1595,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_vizd_detached_tightens_a_writable_log_directory_and_refuses_planted_paths() {
-        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
 
         let mode =
@@ -1609,10 +1603,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let script = base.join("fake-vizd.sh");
-        let mut f = std::fs::File::create(&script).unwrap();
-        writeln!(f, "#!/bin/sh\nexit 0\n").unwrap();
-        drop(f);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fresh_executable::install_script(&script, "#!/bin/sh\nexit 0\n");
 
         // Happy + determinism: two identically built writable dirs end identically.
         let run = |name: &str, before: u32| {
@@ -1662,8 +1653,6 @@ mod tests {
     fn spawn_vizd_detached_passes_the_switch_on_to_the_daemon() {
         // Under the switch the daemon starts with `CERULION_NETWORK=off`, so its
         // telemetry sends nothing; without it the variable is inherited as is.
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::Instant;
 
         let dir = std::env::temp_dir().join(format!("cer_vizc_switch_{}", std::process::id()));
@@ -1672,15 +1661,13 @@ mod tests {
         for (network_off, expected) in [(true, "off".to_string()), (false, inherited)] {
             let out = dir.join(format!("network-{network_off}.out"));
             let script = dir.join(format!("fake-vizd-switch-{network_off}.sh"));
-            let mut f = std::fs::File::create(&script).unwrap();
-            writeln!(
-                f,
-                "#!/bin/sh\nprintf 'network=[%s]\\n' \"$CERULION_NETWORK\" > {}\n",
-                out.display()
-            )
-            .unwrap();
-            drop(f);
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::fresh_executable::install_script(
+                &script,
+                &format!(
+                    "#!/bin/sh\nprintf 'network=[%s]\\n' \"$CERULION_NETWORK\" > {}\n",
+                    out.display()
+                ),
+            );
             spawn_vizd_detached(&script, &dir.join("vizd.log"), &[], &[], network_off)
                 .expect("spawn the fake daemon");
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1712,25 +1699,21 @@ mod tests {
         // SPAWNED daemon via its env (comma-joined). A fake daemon dumps the two
         // env vars to a file; we assert both carry the joined locators — and that
         // an EMPTY locator set leaves the env unset (a scouting-only run).
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::Instant;
 
         let dir = std::env::temp_dir().join(format!("cer_vizc_env_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("env.out");
         let script = dir.join("fake-vizd-env.sh");
-        let mut f = std::fs::File::create(&script).unwrap();
         // Print `connect=<val>` / `listen=<val>` (empty when unset) to the out file.
-        writeln!(
-            f,
-            "#!/bin/sh\nprintf 'connect=%s\\nlisten=%s\\n' \
-             \"$CERULION_VIZD_CONNECT\" \"$CERULION_VIZD_LISTEN\" > {}\n",
-            out.display()
-        )
-        .unwrap();
-        drop(f);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fresh_executable::install_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf 'connect=%s\\nlisten=%s\\n' \
+                 \"$CERULION_VIZD_CONNECT\" \"$CERULION_VIZD_LISTEN\" > {}\n",
+                out.display()
+            ),
+        );
 
         let log = dir.join("vizd.log");
         spawn_vizd_detached(
@@ -1769,16 +1752,14 @@ mod tests {
         // Empty locator sets leave the env unset (scouting-only run).
         let out2 = dir.join("env2.out");
         let script2 = dir.join("fake-vizd-env2.sh");
-        let mut f2 = std::fs::File::create(&script2).unwrap();
-        writeln!(
-            f2,
-            "#!/bin/sh\nprintf 'connect=[%s]\\nlisten=[%s]\\n' \
-             \"$CERULION_VIZD_CONNECT\" \"$CERULION_VIZD_LISTEN\" > {}\n",
-            out2.display()
-        )
-        .unwrap();
-        drop(f2);
-        std::fs::set_permissions(&script2, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fresh_executable::install_script(
+            &script2,
+            &format!(
+                "#!/bin/sh\nprintf 'connect=[%s]\\nlisten=[%s]\\n' \
+                 \"$CERULION_VIZD_CONNECT\" \"$CERULION_VIZD_LISTEN\" > {}\n",
+                out2.display()
+            ),
+        );
         spawn_vizd_detached(&script2, &log, &[], &[], false).expect("spawn (no locators)");
         let deadline = Instant::now() + Duration::from_secs(5);
         let contents2 = loop {

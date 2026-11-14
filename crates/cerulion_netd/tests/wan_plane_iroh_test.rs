@@ -22,6 +22,11 @@
 //! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- --test-threads=1`.
 #![cfg(feature = "wan")]
 
+// This binary waits only on copied binaries, so the script helpers stay unused.
+#[allow(dead_code)]
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

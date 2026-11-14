@@ -3051,89 +3051,11 @@ mod tests {
         }
     }
 
-    /// Probe runs of a freshly written stub before `wait_until_stub_runs` gives up.
-    #[cfg(unix)]
-    const STUB_PROBE_ATTEMPTS: u32 = 500;
-
-    /// Writes an executable shell stub at `path` and returns once it can be
-    /// executed. A process forked by a concurrent test before its exec holds a
-    /// copy of this write descriptor, and while it does, executing the stub
-    /// fails with ETXTBSY; a probe run (which exits before `body`) is retried
-    /// every 10 ms, at most `STUB_PROBE_ATTEMPTS` times.
+    /// Writes a `/bin/sh` stub running `body` at `path`, and returns once it
+    /// can be executed (see `crate::fresh_executable`).
     #[cfg(unix)]
     fn install_python_stub(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::write(
-            path,
-            format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        wait_until_stub_runs(path);
-    }
-
-    #[cfg(unix)]
-    fn wait_until_stub_runs(path: &Path) {
-        for _ in 0..STUB_PROBE_ATTEMPTS {
-            match std::process::Command::new(path)
-                .env("CERULION_TEST_PROBE", "1")
-                .status()
-            {
-                Ok(status) => {
-                    assert!(
-                        status.success(),
-                        "probe run of {}: {status}",
-                        path.display()
-                    );
-                    return;
-                }
-                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("probe run of {}: {error}", path.display()),
-            }
-        }
-        panic!(
-            "{} stayed busy for {STUB_PROBE_ATTEMPTS} probe runs",
-            path.display()
-        );
-    }
-
-    /// Holds a write descriptor on a stub, the way a concurrently forked child
-    /// does, and checks that running it fails with ETXTBSY and that
-    /// `wait_until_stub_runs` returns only after the descriptor is closed.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn python_stub_install_waits_out_a_held_write_descriptor() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("busy");
-        install_python_stub(&path, "exit 0");
-        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let error = std::process::Command::new(&path)
-            .env("CERULION_TEST_PROBE", "1")
-            .status()
-            .expect_err("a stub open for writing must not run");
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        assert_eq!(
-            error.raw_os_error(),
-            Some(libc::ETXTBSY),
-            "{error} (kernel {})",
-            kernel.trim()
-        );
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let released = std::time::Instant::now();
-            drop(writer);
-            released
-        });
-        wait_until_stub_runs(&path);
-        let returned = std::time::Instant::now();
-        let released = release.join().unwrap();
-        assert!(
-            returned > released,
-            "wait_until_stub_runs returned before the writer closed"
-        );
+        crate::fresh_executable::install_script(path, &format!("#!/bin/sh\n{body}\n"));
     }
 
     #[cfg(unix)]
@@ -4863,7 +4785,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_build_given_a_cargo_dir_runs_its_cargo_with_it_first_on_path() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("ws");
         let node = root.join("nodes").join("probe_node");
@@ -4877,15 +4798,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let record = tmp.path().join("record");
         let cargo = dir.join("cargo");
-        std::fs::write(
+        crate::fresh_executable::install_script(
             &cargo,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$0\" \"${{PATH%%:*}}\" \"$*\" > '{}'\n",
                 record.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         node_build_with_cargo_dir(
             &root,

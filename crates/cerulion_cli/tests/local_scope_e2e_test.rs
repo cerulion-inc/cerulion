@@ -2,6 +2,9 @@
 //! Real-binary local-scope refusals and precedence over network locators.
 //! Each spawn reads a private shared-memory registry and Cerulion home.
 
+#[cfg(unix)]
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -449,15 +452,13 @@ fn stand_in_connectd(root: &Path) -> (PathBuf, PathBuf) {
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
     let marker = root.join("connectd-ran");
     let helper = root.join("connectd-helper");
-    std::fs::write(
+    fresh_executable::install_script(
         &helper,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf ran > '{}'\nprintf '{{}}'\n",
             marker.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     (helper, marker)
 }
 

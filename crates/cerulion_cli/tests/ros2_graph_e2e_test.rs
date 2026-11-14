@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use serial_test::serial;
 
+mod fresh_executable;
 mod mp_support;
 use mp_support::{dylib_file, fixture_cdylib, read_file, send_signal, ChildGuard};
 
@@ -76,14 +77,6 @@ const ONE_ENTRY: &str = "\
     package: moveit_ros_move_group
     executable: move_group
 ";
-
-fn write_executable(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body).expect("write script");
-    let mut perms = std::fs::metadata(path).expect("meta").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).expect("chmod");
-}
 
 /// A workspace with ONE native period node (`ticker`, the prebuilt fixture)
 /// plus `entries` appended to `nodes:`, the launch/params fixture files the
@@ -148,7 +141,7 @@ impl Sandbox {
             root.join("target/debug").join(dylib_file("ticker")),
         )
         .expect("copy fixture cdylib");
-        write_executable(&root.join("bin/ros2"), FAKE_ROS2);
+        fresh_executable::install_script(&root.join("bin/ros2"), FAKE_ROS2);
         std::fs::write(root.join("libs/librmw_cerulion.so"), b"fixture").expect("write rmw");
         std::fs::write(root.join("config/params.yaml"), b"{}").expect("write params");
         std::fs::write(root.join("launch/robot.launch.py"), b"# fixture").expect("write launch");
