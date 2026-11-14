@@ -204,20 +204,21 @@ Rules that must not drift:
   replayed one to `--record-out`). A shared topic every capturing pass partitioned is judged
   per writer with no topic-level `MissingTopic`/`ExtraTopic` triage and counted as the
   partitions' sum. An unpartitioned one (any `build_capture_partitionings` fallback: no
-  labels, a headerless frame, an unnamed publisher, an ambiguous injection, a torn index or
+  labels, a headerless frame, an unnamed publisher, a torn index or
   the frame-index record budget) keeps the whole recorded count, the drivers' frames
   included; `assemble_outcome` lists it in `DriverInputsReport::unattributed_topics`, whose
   NOTE says it was compared over every recorded frame, and a fed read of one is refused before
   that (`read_identity_frames_unattributed`, exit 2). Every topic, shared or not, is judged
   over every pass that captured it: a pass captures a topic its rank writes, so a split
   `multi_publisher_topics` topic has one `CaptureSummary` per writing rank, and
-  `PassAccumulators` keeps them all. `uncompared` also names the single foreign writer a
-  pass's injector re-publishes, so a pass's partitions hold only the writers it runs, and
+  `PassAccumulators` keeps them all. `uncompared` also names a pass's injector by its publisher
+  id (`WriterKey::Origin`): it re-publishes the recorded frames of every foreign writer of the
+  topic, however many, so a pass's partitions hold only the writers it runs, and
   `merge_partitioned_summaries` folds passes that all partitioned the topic into their union,
   each writer from the one pass that runs it. Where a pass did not partition it, each
-  unpartitioned pass is judged as one stream against the whole recorded count and the
-  partitioned ones per writer (`push_split_unattributed_violations`, no count summed across
-  passes). A metadata read that fails
+  unpartitioned pass is judged as one stream, its injector's frames diffed and run through the
+  tripwire with the rest, against the whole recorded count and the partitioned ones per writer
+  (`push_split_unattributed_violations`, no count summed across passes). A metadata read that fails
   keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
   LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
   driver node and every topic one writes, shared ones included, and still fires for a

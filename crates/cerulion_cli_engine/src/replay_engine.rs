@@ -18136,11 +18136,12 @@ struct CapturePartitioning {
     producible: BTreeSet<WriterKey>,
     /// The writers of the topic whose frames this pass captures and does not
     /// compare: its own `external` drivers, whose frames are recorded inputs,
-    /// and the single foreign writer its injector re-publishes, whose captured
-    /// frames are recorded ones, copies of what that writer's own pass
-    /// publishes and compares. A captured frame of one of these writers is
-    /// left out of the diff, the loss tripwire and every count, and a replayed
-    /// driver's (not an injected one's) is written to `--record-out`.
+    /// and, as a [`WriterKey::Origin`], the publisher of its injector, which
+    /// re-publishes the recorded frames of every foreign writer of the topic,
+    /// copies of what each writer's own pass publishes and compares. A
+    /// captured frame of one of these is left out of the diff, the loss
+    /// tripwire and every count, and a replayed driver's (not an injected
+    /// one's) is written to `--record-out`.
     uncompared: BTreeSet<WriterKey>,
     /// How many feed positions have been walked into [`Self::streams`].
     walked: usize,
@@ -18887,8 +18888,9 @@ impl Capture {
         // comment above claims.
         let p = self.partitions.as_mut().expect("caller checked");
         let key = classify_capture_origin(&p.live_labels, sample.origin());
-        // A driver's frame is a recorded input: the drain already wrote a
-        // replayed one to `--record-out`, and nothing else reads it.
+        // A driver's frame, or one this pass's injector re-published, is a
+        // recorded frame: the drain already wrote a replayed driver's to
+        // `--record-out`, and nothing else reads it.
         if p.uncompared.contains(&key) {
             return Ok(());
         }
@@ -18896,7 +18898,8 @@ impl Capture {
             // A captured frame whose origin this run's OWN table does not name.
             // Structurally unreachable — the topic is partitioned only when
             // every in-graph producer of it appears in that table, and nothing
-            // else can hold the SHM write slot — so it is LOUD and then handled:
+            // else can hold the SHM write slot but this pass's injector, whose
+            // frames the check above leaves out. So it is LOUD and then handled:
             // it costs only its own partition's ExtraMessages verdict.
             // (A `debug_assert!` here would abort a test build at the consumer
             // rather than report, so it was dropped.)
@@ -19284,8 +19287,8 @@ fn build_capture_partitionings(
     // inputs, so its partition is not one this pass compares, and what a
     // local one's replayed ticks publish is left out of the diff.
     drivers: &BTreeSet<String>,
-    // This pass's injectors, for the id of the publisher that
-    // stands in for a split topic's foreign writer.
+    // This pass's injectors, for the id of the publisher that re-publishes
+    // a split topic's foreign writers' recorded frames.
     injectors: &IndexMap<String, Injector>,
 ) -> Result<BTreeMap<String, CapturePartitioning>, ReplayError> {
     let mut out: BTreeMap<String, CapturePartitioning> = BTreeMap::new();
@@ -19293,34 +19296,33 @@ fn build_capture_partitionings(
     if candidates.is_empty() {
         return Ok(out); // the zero-cost path every other bag takes.
     }
-    let mut live_labels = live_publisher_labels(live_publisher_ids);
+    let live_labels = live_publisher_labels(live_publisher_ids);
     // On a SPLIT `multi_publisher_topics` topic this rank produces
-    // only SOME of the writers; the rest are injected from the bag, and their
-    // captured frames carry the INJECTOR's publisher id — which this run's own
-    // table does not name, so every one of them classified `WriterKey::Origin`
-    // and tripped the "structurally unreachable" assertion. The injector's
-    // publisher id is named as the foreign writer, whose recorded frames it
-    // re-publishes in their recorded order, so its frames are attributed to
-    // that writer and left out of this pass's comparison
-    // (`CapturePartitioning::uncompared`): the writer is compared in the pass
-    // that runs it.
-    //
-    // Only where the foreign side is a SINGLE writer. With two foreign writers
-    // one injector serves both, and one publisher id cannot say which frame
-    // belongs to which — so the topic declines partitioning (loudly, below)
-    // rather than attributing half its frames by a guess.
+    // only SOME of the writers. Where a node of the rank reads the topic, the
+    // others' recorded frames are injected from the bag through ONE
+    // publisher, the injector's, however many writers that is; its id is not
+    // in this run's own table, so its captured frames classify
+    // `WriterKey::Origin`. They are recorded frames: copies of what each
+    // foreign writer's own pass publishes and compares, or a driver's recorded
+    // inputs. So none of them is compared here, and none needs attributing to
+    // the writer that recorded it: the injector's id is named in
+    // `CapturePartitioning::uncompared` as `WriterKey::Origin`, and the drain
+    // leaves its frames out of the diff, the tripwire and every count. Each
+    // writer is compared in the pass that runs it.
     let local: BTreeSet<&str> = members.iter().map(String::as_str).collect();
-    let mut ambiguous_injection: BTreeSet<&str> = BTreeSet::new();
     // Per topic, the writers THIS PASS replays and compares (see
-    // `CapturePartitioning::producible`) and the writers whose frames it
-    // captures and leaves out (`CapturePartitioning::uncompared`).
+    // `CapturePartitioning::producible`), its drivers, whose frames it
+    // captures and leaves out (`CapturePartitioning::uncompared`), and the
+    // publisher id of the injector that re-publishes its foreign writers'
+    // frames, also left out.
     let mut producible_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut uncompared_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut injected_by_topic: BTreeMap<String, u128> = BTreeMap::new();
     for (topic, writers) in &candidates {
         let (mine, foreign) = split_local_and_foreign(writers, &local);
         let (local_drivers, mine): (Vec<&ProducedWriter>, Vec<&ProducedWriter>) =
             mine.into_iter().partition(|w| drivers.contains(&w.node_id));
-        let mut uncompared: BTreeSet<String> =
+        let uncompared: BTreeSet<String> =
             local_drivers.into_iter().map(|w| w.label.clone()).collect();
         let producible: BTreeSet<String> = mine.into_iter().map(|w| w.label.clone()).collect();
         match (injectors.get(topic), foreign.as_slice()) {
@@ -19337,17 +19339,8 @@ fn build_capture_partitionings(
                      partition(s) and leaves the others to the passes that own them"
                 );
             }
-            (Some(injector), [only]) => {
-                live_labels.insert(injector.publisher_id(), Arc::from(only.label.as_str()));
-                // The injector re-publishes the foreign writer's recorded
-                // frames: copies of the frames the writer's own pass publishes
-                // and compares, or a driver's recorded inputs. Named so the
-                // drain leaves them out of the diff, the tripwire and every
-                // count.
-                uncompared.insert(only.label.clone());
-            }
-            (Some(_), _) => {
-                ambiguous_injection.insert(topic.as_str());
+            (Some(injector), _) => {
+                injected_by_topic.insert(topic.clone(), injector.publisher_id());
             }
         }
         producible_by_topic.insert(topic.clone(), producible);
@@ -19368,27 +19361,13 @@ fn build_capture_partitionings(
     };
 
     for topic in candidates.keys() {
-        // A topic whose FOREIGN side is more than one writer — one
-        // injector publisher id cannot tell them apart, so the capture cannot
-        // attribute its own frames and must not pretend to.
-        if ambiguous_injection.contains(topic.as_str()) {
-            tracing::warn!(
-                topic = %topic,
-                "replay: this `multi_publisher_topics` topic is written by SEVERAL writers on \
-                 other ranks, whose recorded frames one injection publisher re-publishes — so a \
-                 captured injected frame cannot be attributed to the writer that recorded it. \
-                 The capture diff falls back to the single-stream path rather than attributing \
-                 by a guess"
-            );
-            continue;
-        }
-        // (2) every producer THIS PASS can put on the wire must be nameable from
-        // it — its own publishers directly, and a split topic's single
-        // foreign writer through the injector that re-publishes it. A writer
-        // this pass neither produces nor injects is deliberately NOT required:
-        // no frame of it will ever be captured here, so nothing needs a name for
-        // it. The writers it replays are `producible`, what the counts are
-        // scoped to; an injected writer and its drivers are `uncompared`.
+        // (2) every producer THIS PASS publishes through its own publishers
+        // must be nameable from its table. The frames its injector
+        // re-publishes are named by the injector's publisher id, and a foreign
+        // writer needs no name here: none of its frames is captured but
+        // through the injector. The writers it replays are `producible`, what
+        // the counts are scoped to; its drivers and its injector are
+        // `uncompared`.
         let producible: &BTreeSet<String> = producible_by_topic
             .get(topic)
             .expect("every candidate got a producible set above");
@@ -19404,8 +19383,8 @@ fn build_capture_partitionings(
             .get(topic)
             .expect("every candidate got an uncompared set above");
         let live: BTreeSet<&str> = live_labels.values().map(|l| &**l).collect();
-        // An uncompared writer's frames must be nameable too: one the table
-        // cannot name would be diffed as an unknown writer instead of left out.
+        // A driver's frames must be nameable too: one the table cannot name
+        // would be diffed as an unknown writer instead of left out.
         if let Some(missing) = producible
             .iter()
             .chain(uncompared)
@@ -19539,6 +19518,7 @@ fn build_capture_partitionings(
                 uncompared: uncompared
                     .iter()
                     .map(|w| WriterKey::Named(Arc::from(w.as_str())))
+                    .chain(injected_by_topic.get(topic).copied().map(WriterKey::Origin))
                     .collect(),
                 walked: 0,
                 streams,

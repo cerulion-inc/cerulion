@@ -42180,13 +42180,33 @@ fn ri_two_rank_bag_with_labels(
     label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
     recorder_json: Vec<u8>,
 ) {
-    let rank_of = |id: &str| u32::from(on_rank1(id));
+    ri_ranked_bag_with_labels(
+        rec,
+        path,
+        move |id: &str| u32::from(on_rank1(id)),
+        2,
+        label_rows,
+        recorder_json,
+    );
+}
+
+/// Write `live` as a free-run bag of `rank_count` ranks, each node on the rank
+/// `rank_of` names, each rank declaring the stage rows of its own nodes, with
+/// the publisher table and `label_rows` as the per-frame producer labels.
+fn ri_ranked_bag_with_labels(
+    rec: &Recording,
+    path: &std::path::Path,
+    rank_of: impl Fn(&str) -> u32 + Copy,
+    rank_count: u32,
+    label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
+    recorder_json: Vec<u8>,
+) {
     let stage_rows = rec.stage_rows.clone();
     let staging = move |rank: u32| -> Option<serde_json::Value> {
         let rows: serde_json::Map<String, serde_json::Value> = stage_rows
             .as_object()?
             .iter()
-            .filter(|(node, _)| u32::from(on_rank1(node)) == rank)
+            .filter(|(node, _)| rank_of(node) == rank)
             .map(|(n, v)| (n.clone(), v.clone()))
             .collect();
         // A rank with no read stage declares no table: a present-but-empty one
@@ -42200,7 +42220,7 @@ fn ri_two_rank_bag_with_labels(
     write_multi_rank_bag_impl(
         rec,
         rank_of,
-        2,
+        rank_count,
         MpLayout::PerStepBatches,
         path,
         |_| {},
@@ -48014,6 +48034,191 @@ fn a_writers_frames_injected_in_another_process_are_left_out_of_the_comparison()
                     if *detail == want_detail
             ),
             "{layout}: exactly w2's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// The topic three period writers share, read by a sink beside one of them.
+const RI_INJ3_BUS: &str = "/riinj3/bus";
+
+/// Three period writers (`w1`, `w2` and `w3`, writers 1, 2 and 3) on one
+/// `multi_publisher_topics` topic, read by a per-message sink, or by a
+/// latest-value sink that fires on every third step when `slow`.
+fn ri_inj3_yaml(slow: bool) -> String {
+    let sink = if slow { "ri_slow_sink" } else { "ri_fifo_sink" };
+    format!(
+        "name: riinj3\nprefix: riinj3\nmulti_publisher_topics:\n  - /riinj3/bus\nnodes:\n\
+         \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj3/bus\n\
+         \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj3/bus\n\
+         \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj3/bus\n\
+         \x20 - id: sink\n    type: {sink}\n    inputs:\n      - name: inp\n        source: /riinj3/bus\n"
+    )
+}
+
+/// The three-writer graph, `w1` stamping `writer` into its frames.
+fn ri_inj3_factories(slow: bool, writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let sink: Box<dyn NodeEntry> = if slow {
+        Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    };
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", period(writer)),
+        ("w2", period(2.0)),
+        ("w3", period(3.0)),
+        ("sink", sink),
+    ])
+}
+
+/// The process of each node of the three-writer graph: `w1` and the sink in
+/// the first, `w2` in the second, `w3` in the third.
+fn ri_inj3_rank_of(id: &str) -> u32 {
+    match id {
+        "w2" => 1,
+        "w3" => 2,
+        _ => 0,
+    }
+}
+
+/// A replay that does not feed reads by their recorded identity injects the
+/// recorded frames of every writer in another process for the nodes that read
+/// their topic, through one publisher, however many writers that is. With the
+/// period writer `w1` and the bus's sink in the first process, `w2` in the
+/// second and `w3` in the third, the first process injects the recorded frames
+/// of both `w2` and `w3` for the sink. Those are copies of what the other two
+/// processes publish, so they are left out of the comparison, which judges
+/// each writer in the process that runs it. With a per-message sink or a
+/// latest-value sink that fires on every third step, a neutral `--resim all`
+/// and a `--verify` of a recording below trace format 8 both run to an outcome
+/// with no violation and the bus checked, and a changed `w1` fails the verify
+/// as one byte mismatch from `w1`. That is exit 1 with the per-message sink,
+/// and exit 6, which beats 1, with the latest-value sink, whose read log
+/// diverges in both runs.
+#[test]
+#[serial]
+fn the_frames_of_two_writers_injected_in_one_process_are_left_out_of_the_comparison() {
+    for slow in [false, true] {
+        let layout = if slow {
+            "latest-value sink"
+        } else {
+            "per-message sink"
+        };
+        let live = ri_record(&ri_inj3_yaml(slow), || ri_inj3_factories(slow, 1.0));
+        let mut want = BTreeMap::new();
+        want.insert(1, ri_period_frames(1.0));
+        want.insert(2, ri_period_frames(2.0));
+        want.insert(3, ri_period_frames(3.0));
+        assert_eq!(
+            ri_frames_by_writer(&live.rec, RI_INJ3_BUS),
+            want,
+            "{layout}: the recorded bus, writer by writer"
+        );
+        let label_rows = ri_frame_label_rows(&live.rec);
+        assert_eq!(
+            label_rows.len(),
+            3 * RI_STEPS,
+            "PREMISE: {layout}: the bag labels every frame of the bus"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let neutral = dir.path().join("ri_inj3.mcap");
+        ri_ranked_bag_with_labels(
+            &live.rec,
+            &neutral,
+            ri_inj3_rank_of,
+            3,
+            &label_rows,
+            ri_free_run_recorder_json(),
+        );
+        let format7 = dir.path().join("ri_inj3_format7.mcap");
+        ri_ranked_bag_with_labels(
+            &live.rec,
+            &format7,
+            ri_inj3_rank_of,
+            3,
+            &label_rows,
+            ri_recorder_json_at(7),
+        );
+        for (run, bag, purpose) in [
+            ("neutral", &neutral, replay_engine::ReplayPurpose::Resim),
+            (
+                "format 7 verify",
+                &format7,
+                replay_engine::ReplayPurpose::Verify,
+            ),
+        ] {
+            let (outcome, _) = ri_replay(bag, || ri_inj3_factories(slow, 1.0), purpose);
+            let outcome = outcome
+                .unwrap_or_else(|e| panic!("{layout}: {run}: the replay runs to an outcome: {e}"));
+            assert!(
+                matches!(
+                    outcome.read_identity,
+                    replay_engine::ReadIdentityReport::BestEffort { .. }
+                ),
+                "PREMISE: {layout}: {run}: no read is fed by identity: {:?}",
+                outcome.read_identity
+            );
+            assert!(
+                outcome.violations.is_empty(),
+                "{layout}: {run}: {:?}",
+                outcome.violations
+            );
+            assert_eq!(
+                outcome.topics_checked, 1,
+                "{layout}: {run}: the bus is checked"
+            );
+            let sink_diverged = outcome.read_log_divergence.as_ref().map(|d| {
+                d.edges
+                    .iter()
+                    .map(|e| (e.node_id.as_str(), e.input.as_str()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                sink_diverged,
+                slow.then(|| vec![("sink", "inp")]),
+                "PREMISE: {layout}: {run}: only the latest-value sink's read log diverges"
+            );
+        }
+
+        let (outcome, _) = ri_replay(
+            &format7,
+            || ri_inj3_factories(slow, 4.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert_eq!(
+            resim_exit(&outcome, true),
+            if slow { 6 } else { 1 },
+            "{layout}: the exit"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let want_detail = format!(
+            "frame 0 on '{RI_INJ3_BUS}' from writer w1/out differs at x: recorded 1.0, replayed \
+             4.0; 1 more value(s) differ (recorded 64 B, replayed 64 B)"
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_INJ3_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{layout}: exactly w1's byte mismatch: {named:?}"
         );
     }
 }
