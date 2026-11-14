@@ -3405,14 +3405,18 @@ pub struct DeclinedFrameComparison {
     /// alone.
     pub reason: String,
     /// The violations that were NOT reported as a verdict — verbatim, so nothing
-    /// is hidden by the decline. EMPTY when the comparison matched.
+    /// is hidden by the decline. Empty when the comparison matched, and on a
+    /// `split_topic_frames_unattributed` row whose uncompared frames read no
+    /// byte mismatch and no tolerance row, which never matched.
     pub withheld: Vec<Violation>,
     /// `true` when the comparison RAN and found no difference — the topic matched
-    /// under the fallback input stream. Always `withheld.is_empty()`; carried
-    /// explicitly so the `--report` JSON states the outcome rather than leaving a
-    /// reader to infer it from an absent array, and so the two outcomes can be
-    /// counted without walking `withheld`. Always `false` on a
-    /// `split_topic_frames_unattributed` row, whose frames were not compared.
+    /// under the fallback input stream. On a read-log decline it is always
+    /// `withheld.is_empty()`; carried explicitly so the `--report` JSON states
+    /// the outcome rather than leaving a reader to infer it from an absent
+    /// array. Always `false` on a `split_topic_frames_unattributed` row, whose
+    /// frames were not compared, so such a row can carry an empty `withheld`
+    /// without having matched: count a match by this field and withheld
+    /// divergences by `withheld`, and a row with neither by its `code`.
     pub matched_under_fallback: bool,
 }
 
