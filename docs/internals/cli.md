@@ -197,8 +197,10 @@ Rules that must not drift:
   topic is still a per-topic `RecordSideTapLoss`, judged in a partial report once a rank of
   its drivers completed (`topic_owner_ranks`). A `multi_publisher_topics` topic a driver shares with other nodes
   (`TopicClasses::driver_shared`) stays captured: `build_capture_partitionings` leaves the
-  driver's writer out of `producible`, and the topic-level count is the partitions' sum; an
-  unpartitioned one keeps the whole recorded count and fails. A metadata read that fails
+  driver's writer out of `producible` and names a driver of the pass in `uncompared`, whose
+  replayed frames `diff_partitioned` leaves out of the diff, the tripwire and every count
+  (the drain still writes them to `--record-out`), and the topic-level count is the
+  partitions' sum; an unpartitioned one keeps the whole recorded count and fails. A metadata read that fails
   keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
   LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
   driver node and every topic one writes, shared ones included, and still fires for a

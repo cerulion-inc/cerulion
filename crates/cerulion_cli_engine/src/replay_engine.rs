@@ -17867,9 +17867,10 @@ struct CapturePartitioning {
     /// unattributed frame is never partitioned in the first place.
     recorded_writers: Vec<WriterKey>,
     /// The writers THIS PASS can put on the wire — the ones it
-    /// produces LIVE (members of its rank but its `external` drivers, which
-    /// publish nothing in a replay) plus, where the topic is injected here, the
-    /// single foreign writer the injector re-publishes.
+    /// produces LIVE (members of its rank but its `external` drivers, whose
+    /// frames are recorded inputs: see [`Self::uncompared`]) plus, where the
+    /// topic is injected here, the single foreign writer the injector
+    /// re-publishes.
     ///
     /// A SPLIT `multi_publisher_topics:` topic is written by several ranks, and
     /// a pass reproduces only what it owns or injects: a writer that is neither
@@ -17879,9 +17880,15 @@ struct CapturePartitioning {
     /// this scoping exists to prevent, measured on the three-rank split fixture
     /// as "recorded 28 frame(s), replay produced 14".
     ///
-    /// On a CO-LOCATED topic (every writer on one rank) it holds every writer,
-    /// so the behaviour is that of an unsplit topic.
+    /// On a CO-LOCATED topic (every writer on one rank) it holds every writer
+    /// but the drivers, so the behaviour is that of an unsplit topic.
     producible: BTreeSet<WriterKey>,
+    /// This pass's own `external` (driver) writers of the topic. A replayed
+    /// driver tick that writes its output publishes, but a driver's frames are
+    /// recorded inputs: a captured frame of one of these writers is written to
+    /// `--record-out` and is left out of the diff, the loss tripwire and every
+    /// count.
+    uncompared: BTreeSet<WriterKey>,
     /// How many feed positions have been walked into [`Self::streams`].
     walked: usize,
     /// Per writer, its stream state. `BTreeMap` — the violation order is
@@ -18626,6 +18633,11 @@ impl Capture {
         // comment above claims.
         let p = self.partitions.as_mut().expect("caller checked");
         let key = classify_capture_origin(&p.live_labels, sample.origin());
+        // A driver's frame is a recorded input: the drain already wrote it to
+        // `--record-out`, and nothing else reads it.
+        if p.uncompared.contains(&key) {
+            return Ok(());
+        }
         if matches!(key, WriterKey::Origin(_)) {
             // A captured frame whose origin this run's OWN table does not name.
             // Structurally unreachable — the topic is partitioned only when
@@ -19014,9 +19026,9 @@ fn build_capture_partitionings(
     // LOCAL (published live, and so nameable from this run's publisher table)
     // and which are FOREIGN (re-published by the injector).
     members: &[String],
-    // The graph's `external` (driver) nodes. A local driver publishes nothing
-    // in a replay, so its recorded frames are inputs and its partition is not
-    // one this pass can reproduce.
+    // The graph's `external` (driver) nodes. A local driver's recorded
+    // frames are inputs, so its partition is not one this pass compares, and
+    // what its replayed ticks publish is left out of the diff.
     drivers: &BTreeSet<String>,
     // This pass's injectors, for the id of the publisher that
     // stands in for a split topic's foreign writer.
@@ -19042,16 +19054,20 @@ fn build_capture_partitionings(
     // rather than attributing half its frames by a guess.
     let local: BTreeSet<&str> = members.iter().map(String::as_str).collect();
     let mut ambiguous_injection: BTreeSet<&str> = BTreeSet::new();
-    // Per topic, the writers THIS PASS can put on the wire — see
-    // `CapturePartitioning::producible`.
+    // Per topic, the writers THIS PASS can put on the wire (see
+    // `CapturePartitioning::producible`) and its own drivers among the
+    // writers (`CapturePartitioning::uncompared`).
     let mut producible_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut uncompared_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (topic, writers) in &candidates {
         let (mine, foreign) = split_local_and_foreign(writers, &local);
-        let mut producible: BTreeSet<String> = mine
-            .into_iter()
-            .filter(|w| !drivers.contains(&w.node_id))
-            .map(|w| w.label.clone())
-            .collect();
+        let (local_drivers, mine): (Vec<&ProducedWriter>, Vec<&ProducedWriter>) =
+            mine.into_iter().partition(|w| drivers.contains(&w.node_id));
+        uncompared_by_topic.insert(
+            topic.clone(),
+            local_drivers.into_iter().map(|w| w.label.clone()).collect(),
+        );
+        let mut producible: BTreeSet<String> = mine.into_iter().map(|w| w.label.clone()).collect();
         match (injectors.get(topic), foreign.as_slice()) {
             (_, []) => {}
             (None, _) => {
@@ -19122,8 +19138,17 @@ fn build_capture_partitionings(
             );
             continue;
         }
+        let uncompared: &BTreeSet<String> = uncompared_by_topic
+            .get(topic)
+            .expect("every candidate got an uncompared set above");
         let live: BTreeSet<&str> = live_labels.values().map(|l| &**l).collect();
-        if let Some(missing) = producible.iter().find(|w| !live.contains(w.as_str())) {
+        // A driver's frames must be nameable too: one the table cannot name
+        // would be diffed as an unknown writer instead of left out.
+        if let Some(missing) = producible
+            .iter()
+            .chain(uncompared)
+            .find(|w| !live.contains(w.as_str()))
+        {
             tracing::warn!(
                 topic = %topic,
                 writer = %missing,
@@ -19249,6 +19274,10 @@ fn build_capture_partitionings(
                 live_labels: Arc::clone(&live_labels),
                 recorded_writers,
                 producible: producible_keys,
+                uncompared: uncompared
+                    .iter()
+                    .map(|w| WriterKey::Named(Arc::from(w.as_str())))
+                    .collect(),
                 walked: 0,
                 streams,
             },
@@ -35280,6 +35309,7 @@ mod capture_partition_tests {
                 key("right/bus"),
             ],
             producible: [key("left/bus"), key("right/bus")].into_iter().collect(),
+            uncompared: BTreeSet::new(),
             walked: 0,
             streams: BTreeMap::new(),
             topic: "/mp/bus".to_string(),

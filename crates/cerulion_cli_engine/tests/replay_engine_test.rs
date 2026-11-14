@@ -45742,6 +45742,180 @@ fn a_record_out_tap_on_a_driver_topic_that_cannot_be_opened_refuses_the_pass() {
     assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 1));
 }
 
+/// The tag the teleop-bus sink logs each frame it reads under.
+const DRV_TELEOP_BUS_SINK: f64 = 10.0;
+/// The topic the teleop shares with a period writer.
+const DRV_TELEOP_BUS: &str = "/drvbt/bus";
+
+/// [`DrvTeleopNode`] on a shared bus, its output port named `out` as the
+/// bus label rows name each writer's (`ri_frame_label_rows`).
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvBusTeleopNode {
+    #[output]
+    out: Vector3,
+    /// The key pump is attached: true in the live run only.
+    connected: bool,
+    /// Ticks run so far.
+    ticks: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvBusTeleopNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1.0;
+        let k = self.ticks;
+        self.out.x = DRV_DEVICE;
+        self.out.y = k;
+        self.out.z = if self.connected { 3.0 * k + 2.0 } else { 0.0 };
+        Ok(())
+    }
+}
+
+/// The teleop (`w1`) and a period writer (`w2`, writer 2) on one
+/// `multi_publisher_topics` topic, read per message by a sink.
+fn drv_teleop_bus_yaml() -> &'static str {
+    "name: drvbt\nprefix: drvbt\nmulti_publisher_topics:\n  - /drvbt/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_teleop_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvbt/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvbt/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /drvbt/bus\n"
+}
+
+fn drv_teleop_bus_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusTeleopNodeEntry::with_state(DrvBusTeleopNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: DRV_TELEOP_BUS_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The frames of one shared-bus stream split by writer: the teleop's (`x` is
+/// the device id 1) and the period writer's (`x` is 2), each in stream order.
+type DrvBusSplit = (Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>);
+
+fn drv_split_bus(frames: &[(f64, f64, f64)]) -> DrvBusSplit {
+    frames
+        .iter()
+        .copied()
+        .partition(|&(x, _, _)| x == DRV_DEVICE)
+}
+
+/// A topic a teleop shares with a period writer, the teleop's replayed ticks
+/// publishing their zero commands beside the writer's frames, is compared
+/// over the writer's frames only: the verify passes with the bus checked and
+/// credited, and the replayed zero commands, which differ from every recorded
+/// command, are no violation. `--record-out` holds both writers' frames: the
+/// zero commands `(1, k, 0)` and the writer's `(2, c, 2_000_000 + 7c)`. In
+/// one process, where the bag attributes each frame to its writer, and with
+/// the teleop alone in its own process.
+#[test]
+#[serial]
+fn a_shared_topic_compares_its_other_writer_while_its_replayed_driver_publishes() {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_teleop_bus_yaml(),
+        || drv_teleop_bus_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    let live_reads = ri_take();
+    let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_TELEOP_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .collect();
+    let (commands, written) = drv_split_bus(&recorded);
+    let (n, c) = (commands.len(), written.len());
+    assert!(
+        n >= RI_MIN_READS && c >= RI_MIN_READS,
+        "PREMISE: both writers published: {n} teleop and {c} writer frames"
+    );
+    let want_written: Vec<(f64, f64, f64)> = (1..=c)
+        .map(|i| (2.0, i as f64, 2_000_000.0 + 7.0 * i as f64))
+        .collect();
+    assert_eq!(
+        commands,
+        (1..=n)
+            .map(|k| (DRV_DEVICE, k as f64, 3.0 * k as f64 + 2.0))
+            .collect::<Vec<_>>(),
+        "the recorded teleop commands"
+    );
+    assert_eq!(written, want_written, "the recorded writer frames");
+    let want_commands: Vec<(f64, f64, f64)> =
+        (1..=n).map(|k| (DRV_DEVICE, k as f64, 0.0)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_teleop_bus_single.mcap");
+    ri_bag(&rec, &single, ri_free_run_recorder_json());
+    let two_rank = dir.path().join("drv_teleop_bus_two_rank.mcap");
+    ri_two_rank_bag(&rec, &two_rank, |id| id == "w1");
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        let out = dir.path().join(format!("drv_teleop_bus_out_{run}.mcap"));
+        let (outcome, replayed) = ri_replay_stamped(
+            bag,
+            || drv_teleop_bus_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            None,
+            RecordHealthReport::Absent,
+            Some(out.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: the teleop's replayed commands are no violation: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the bus is checked and credited"
+        );
+        ri_judge(&live_reads, &replayed, &[DRV_TELEOP_BUS_SINK])
+            .unwrap_or_else(|e| panic!("{layout}: the sink read the live frames: {e}"));
+        let frames = drv_record_out_frames(&out);
+        let (out_commands, out_written) =
+            drv_split_bus(frames.get(DRV_TELEOP_BUS).map_or(&[][..], Vec::as_slice));
+        assert_eq!(
+            out_commands, want_commands,
+            "{layout}: the output holds every command the replayed teleop published"
+        );
+        assert_eq!(
+            out_written, want_written,
+            "{layout}: the output holds every frame the replayed writer published"
+        );
+    }
+}
+
 /// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
 /// whose renderer test reads only the class label and the detail it is
 /// given: a header difference, as `timestamp_ns` 7 against 9 reads.
