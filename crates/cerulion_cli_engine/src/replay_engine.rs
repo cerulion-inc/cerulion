@@ -1137,9 +1137,10 @@ pub struct DriverInputsReport {
     pub unread_topics: Vec<String>,
 }
 
-/// The verdict `NOTE` lines of a [`DriverInputsReport`], one per non-empty
-/// list, and one more when `topics_checked` is 0, the `0/0` verdict: it
-/// compared nothing. Rendered on the PASS and the FAIL path alike, since each
+/// The verdict `NOTE` lines of a [`DriverInputsReport`]: one per non-empty
+/// topic list, and one more when a driver writes a topic and `topics_checked`
+/// is 0, the `0/0` verdict that compared nothing. The driver nodes are named
+/// on the first two lines, so a driver that writes no topic prints none. Rendered on the PASS and the FAIL path alike, since each
 /// says what the tally above or below it does not cover.
 pub fn render_driver_input_lines(
     report: &DriverInputsReport,
