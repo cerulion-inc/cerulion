@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::account_access::AccountSnapshot;
+use std::cell::RefCell;
 use std::io::Read;
 use std::time::Duration;
 
@@ -10,8 +11,86 @@ const HELLO: &[u8] = b"{\"hello\":\"cerulion-netd\",\"protocol\":9,\"wire_header
 const INSTALLED: &[u8] =
     b"{\"id\":1,\"account_access\":{\"operation\":\"installed\",\"robot_count\":0}}\n";
 
+/// Bounds a wait for the other side of a scripted exchange: a peer's wait for
+/// the client and a client deadline that a passing run never reaches. Only a
+/// side that never acts is expected to reach it.
+const HANG_BOUND: Duration = Duration::from_secs(30);
+
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    Instant::now() + HANG_BOUND
+}
+
+/// Joins a helper thread and fails with the helper's own panic message.
+fn join_helper<T>(helper: std::thread::JoinHandle<T>) -> T {
+    match helper.join() {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic payload that is not text");
+            panic!("helper thread panicked: {message}")
+        }
+    }
+}
+
+/// A busy-mirror clock the test drives. It starts `HANG_BOUND` after the real
+/// instant it is installed and moves only when the retry loop sleeps, each
+/// sleep waking `late` after the delay asked for. Round trips take no scripted
+/// time, and the loop compares scripted instants only with each other, so the
+/// schedule does not depend on how fast the host runs. The budget's end, also
+/// the retry round trips' real I/O deadline, is never earlier than the install
+/// instant plus `HANG_BOUND` plus the whole budget.
+struct ScriptedClock {
+    start: Instant,
+    slept: Duration,
+    late: Duration,
+    requested: Vec<Duration>,
+}
+
+thread_local! {
+    static SCRIPTED_CLOCK: RefCell<Option<ScriptedClock>> = const { RefCell::new(None) };
+}
+
+fn scripted_now() -> Instant {
+    SCRIPTED_CLOCK.with_borrow(|clock| {
+        let clock = clock.as_ref().expect("no scripted clock on this thread");
+        clock.start + clock.slept
+    })
+}
+
+fn scripted_sleep(delay: Duration) {
+    SCRIPTED_CLOCK.with_borrow_mut(|clock| {
+        let clock = clock.as_mut().expect("no scripted clock on this thread");
+        clock.requested.push(delay);
+        clock.slept += delay + clock.late;
+    });
+}
+
+/// Runs `client`'s busy-mirror retries on a fresh scripted clock.
+fn script_retry_clock(client: &mut NetdClient, late: Duration) {
+    SCRIPTED_CLOCK.set(Some(ScriptedClock {
+        start: Instant::now() + HANG_BOUND,
+        slept: Duration::ZERO,
+        late,
+        requested: Vec::new(),
+    }));
+    client.mirror_busy_clock = super::super::MirrorBusyClock {
+        now: scripted_now,
+        sleep: scripted_sleep,
+    };
+}
+
+/// The backoffs the retry loop asked the scripted clock for, in order.
+fn scripted_sleeps() -> Vec<Duration> {
+    SCRIPTED_CLOCK.with_borrow(|clock| {
+        clock
+            .as_ref()
+            .expect("no scripted clock on this thread")
+            .requested
+            .clone()
+    })
 }
 
 fn install() -> AccountAccessRequest {
@@ -28,9 +107,8 @@ fn install() -> AccountAccessRequest {
 
 fn client_and_peer() -> (NetdClient, UnixStream) {
     let (stream, mut peer) = UnixStream::pair().unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    peer.set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    peer.set_read_timeout(Some(HANG_BOUND)).unwrap();
+    peer.set_write_timeout(Some(HANG_BOUND)).unwrap();
     peer.write_all(HELLO).unwrap();
     let client =
         NetdClient::finish_bounded_handshake(stream, "test.sock".into(), deadline()).unwrap();
@@ -38,12 +116,15 @@ fn client_and_peer() -> (NetdClient, UnixStream) {
 }
 
 // Hand-written control replies; one socket proves retries retain the held key.
+// Every test whose script sends a transient refusal drives the retry budget
+// with `script_retry_clock`; a non-transient refusal is never retried and
+// never reads the budget.
 fn busy_mirror_peer(
     messages: Vec<&'static str>,
     persistent: bool,
 ) -> (NetdClient, std::thread::JoinHandle<(usize, Vec<u64>)>) {
     let (stream, mut peer) = UnixStream::pair().unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.set_read_timeout(Some(HANG_BOUND)).unwrap();
     peer.write_all(b"{\"hello\":\"cerulion-netd\",\"protocol\":11,\"wire_header\":2}\n")
         .unwrap();
     let client =
@@ -118,14 +199,16 @@ fn busy_mirror_observe_and_demand_retry_then_acknowledge_on_the_same_connection(
                 false,
             );
             client.demand("arm", "/held", 7).unwrap();
+            script_retry_clock(&mut client, Duration::ZERO);
             let result = if observer {
                 client.observe("arm", "/topic", 7).map(|reply| reply.demand)
             } else {
                 client.demand("arm", "/topic", 7)
             };
+            assert_eq!(scripted_sleeps(), [23, 47].map(Duration::from_millis));
             assert!(client.release("arm", "/held").unwrap().last_release);
             drop(client);
-            let counts = worker.join().unwrap();
+            let counts = join_helper(worker);
             let reply = result.unwrap();
             assert_eq!(
                 (reply.robot.as_str(), reply.topic.as_str(), reply.refcount),
@@ -140,27 +223,40 @@ fn busy_mirror_observe_and_demand_retry_then_acknowledge_on_the_same_connection(
 
 #[test]
 fn busy_mirror_persistent_refusal_keeps_original_error_and_live_hold_within_a_bound() {
-    for observer in [true, false] {
-        let (mut client, worker) =
-            busy_mirror_peer(vec![crate::account_access::CONTROLLER_BUSY], true);
-        client.demand("arm", "/held", 7).unwrap();
-        let started = Instant::now();
-        let result = if observer {
-            client.observe("arm", "/topic", 7).map(|reply| reply.demand)
-        } else {
-            client.demand("arm", "/topic", 7)
-        };
-        assert!(started.elapsed() < Duration::from_millis(2500));
-        assert!(client.release("arm", "/held").unwrap().last_release);
-        drop(client);
-        let (attempts, ids) = worker.join().unwrap();
-        assert!(
-            matches!(result, Err(ClientError::Netd { error, robot, topic })
-            if error == crate::account_access::CONTROLLER_BUSY
-                && robot.as_deref() == Some("arm") && topic.as_deref() == Some("/topic"))
-        );
-        assert_eq!(attempts, 8);
-        assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+    let ms = Duration::from_millis;
+    let schedule = [23, 47, 83, 139, 211, 307, 389].map(ms);
+    // Each scripted sleep wakes `late` after its delay. The 2 s budget starts
+    // at the first Busy reply; the times below are scripted time since then.
+    for (late, sleeps, attempts, last_id) in [
+        // All seven backoffs fit (1199 ms): the schedule's length ends it.
+        (ms(0), &schedule[..], 8, 10),
+        // The 389 ms backoff starts at 1530 ms and wakes at 2039 ms, past the budget.
+        (ms(120), &schedule[..], 7, 9),
+        // At 1710 ms only 290 ms are left, so the 389 ms backoff never starts.
+        (ms(150), &schedule[..6], 7, 9),
+    ] {
+        for observer in [true, false] {
+            let (mut client, worker) =
+                busy_mirror_peer(vec![crate::account_access::CONTROLLER_BUSY], true);
+            client.demand("arm", "/held", 7).unwrap();
+            script_retry_clock(&mut client, late);
+            let result = if observer {
+                client.observe("arm", "/topic", 7).map(|reply| reply.demand)
+            } else {
+                client.demand("arm", "/topic", 7)
+            };
+            assert_eq!(scripted_sleeps(), sleeps);
+            assert!(client.release("arm", "/held").unwrap().last_release);
+            drop(client);
+            let (seen, ids) = join_helper(worker);
+            assert!(
+                matches!(result, Err(ClientError::Netd { error, robot, topic })
+                if error == crate::account_access::CONTROLLER_BUSY
+                    && robot.as_deref() == Some("arm") && topic.as_deref() == Some("/topic"))
+            );
+            assert_eq!(seen, attempts);
+            assert_eq!(ids, (1..=last_id).collect::<Vec<_>>());
+        }
     }
 }
 
@@ -181,7 +277,7 @@ fn busy_mirror_non_transient_refusals_are_not_retried_or_replaced() {
             };
             assert!(client.release("arm", "/held").unwrap().last_release);
             drop(client);
-            assert_eq!(worker.join().unwrap(), (1, vec![1, 2, 3]));
+            assert_eq!(join_helper(worker), (1, vec![1, 2, 3]));
             assert!(matches!(result, Err(ClientError::Netd { error, .. }) if error == message));
         }
     }
@@ -193,11 +289,13 @@ fn busy_mirror_wrapped_ensure_refusals_retry_without_matching_another_source() {
     for _ in 0..2 {
         let (mut client, worker) = busy_mirror_peer(vec![wrapped], false);
         client.demand("arm", "/held", 7).unwrap();
+        script_retry_clock(&mut client, Duration::ZERO);
         let reply = client.observe("arm", "/topic", 7).unwrap();
+        assert_eq!(scripted_sleeps(), [Duration::from_millis(23)]);
         assert_eq!(reply.local_topic, "/topic");
         assert!(client.release("arm", "/held").unwrap().last_release);
         drop(client);
-        assert_eq!(worker.join().unwrap(), (2, vec![1, 2, 3, 4]));
+        assert_eq!(join_helper(worker), (2, vec![1, 2, 3, 4]));
     }
     let key = crate::registry::TopicKey::new("arm", "/topic");
     for message in [
@@ -234,6 +332,9 @@ fn busy_mirror_exhaustion_latches_until_a_completed_recovery() {
     let (mut client, worker) =
         busy_mirror_peer(vec![crate::account_access::CONTROLLER_BUSY; 16], false);
     client.demand("arm", "/held", 7).unwrap();
+    // Each exhausted call makes exactly eight attempts, so the third call's
+    // first attempt is the seventeenth: the script's first success.
+    script_retry_clock(&mut client, Duration::ZERO);
     for total in [1, 2] {
         assert!(matches!(
             client.observe("arm", "/topic", 7),
@@ -250,7 +351,7 @@ fn busy_mirror_exhaustion_latches_until_a_completed_recovery() {
     assert_eq!(client.mirror_busy_failures.total_failures(), 2);
     assert!(client.release("arm", "/held").unwrap().last_release);
     drop(client);
-    assert_eq!(worker.join().unwrap(), (17, (1..=19).collect()));
+    assert_eq!(join_helper(worker), (17, (1..=19).collect()));
 }
 
 #[test]
@@ -297,17 +398,13 @@ fn receive_install(peer: &UnixStream) -> String {
 
 /// Reads `peer` to the end and asserts the other end closed without sending more.
 ///
-/// The read timeout bounds a peer that never closes. The other end may already
-/// have closed when this runs: macOS then refuses `setsockopt` with EINVAL, since
-/// the socket can neither send nor receive. Such a socket is already
-/// disconnected, so the read returns its buffered bytes and then EOF without a
-/// timeout.
+/// Call it only after the client call or drop that must close the connection
+/// has returned. The shutdown or close completes inside that call, so the end of
+/// the stream is already readable when this runs: the read never waits, and a
+/// read that would block means the client left its end open.
 fn assert_peer_closed(mut peer: UnixStream) {
-    match peer.set_read_timeout(Some(Duration::from_secs(5))) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
-        Err(error) => panic!("could not bound the closure read: {error}"),
-    }
+    peer.set_nonblocking(true)
+        .expect("the closure read could not be made nonblocking");
     let mut unexpected = Vec::new();
     match peer.read_to_end(&mut unexpected) {
         Ok(_) => {}
@@ -316,7 +413,11 @@ fn assert_peer_closed(mut peer: UnixStream) {
                 error.kind(),
                 io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
             ) => {}
-        Err(error) => panic!("peer did not observe connection closure: {error}"),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => panic!(
+            "the client returned with its end of the connection still open ({} bytes sent after the exchange)",
+            unexpected.len()
+        ),
+        Err(error) => panic!("the closure read failed: {error}"),
     }
     assert!(
         unexpected.is_empty(),
@@ -395,7 +496,7 @@ fn progress_cannot_renew_the_absolute_read_deadline() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ));
     drop(reader);
-    writer.join().unwrap();
+    join_helper(writer);
 }
 
 #[test]
@@ -466,7 +567,7 @@ fn valid_fixed_response_is_repeatable_and_does_not_poison() {
             client.stream.read_timeout().unwrap(),
             Some(ROUNDTRIP_TIMEOUT)
         );
-        requests.push(writer.join().unwrap());
+        requests.push(join_helper(writer));
     }
     // The semantic oracle above is independent; this adds the determinism pin.
     assert_eq!(requests[0], requests[1]);
@@ -489,28 +590,36 @@ fn malformed_truncated_wrong_id_and_wrong_operation_poison_and_close() {
             receive_install(&peer);
             peer.write_all(response).unwrap();
             let _ = peer.shutdown(Shutdown::Write);
-            assert_peer_closed(peer);
+            peer
         });
         assert!(client.account_access_once(install()).is_err());
         assert_poisoned(&mut client);
-        writer.join().unwrap();
+        assert_peer_closed(join_helper(writer));
     }
 }
 
 #[test]
 fn oversized_response_poisons_before_parsing_unbounded_input() {
     let (mut client, mut peer) = client_and_peer();
+    // The cap is reached only once every byte has crossed the socket. A 1 MiB
+    // send buffer carries them in a few writer wakeups, and the call runs to
+    // `deadline()` rather than the 5 s round-trip timeout.
+    socket2::SockRef::from(&peer)
+        .set_send_buffer_size(1 << 20)
+        .unwrap();
     let writer = std::thread::spawn(move || {
         receive_install(&peer);
         let _ = peer.write_all(&vec![b' '; MAX_RESPONSE_BYTES + 1]);
-        assert_peer_closed(peer);
+        peer
     });
-    let error = client.account_access_once(install()).unwrap_err();
+    let error = client
+        .account_access_until(install(), deadline())
+        .unwrap_err();
     assert!(
         matches!(error, ClientError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData)
     );
     assert_poisoned(&mut client);
-    writer.join().unwrap();
+    assert_peer_closed(join_helper(writer));
 }
 
 #[test]
@@ -519,9 +628,9 @@ fn delayed_response_cannot_be_reused_for_a_later_request() {
     let (release, wait) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         receive_install(&peer);
-        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        wait.recv_timeout(HANG_BOUND).unwrap();
         let _ = peer.write_all(INSTALLED);
-        assert_peer_closed(peer);
+        peer
     });
     let error = client
         .account_access_until(install(), Instant::now() + Duration::from_millis(100))
@@ -531,7 +640,7 @@ fn delayed_response_cannot_be_reused_for_a_later_request() {
     );
     assert_poisoned(&mut client);
     release.send(()).unwrap();
-    writer.join().unwrap();
+    assert_peer_closed(join_helper(writer));
 }
 
 #[test]
@@ -547,7 +656,7 @@ fn correlated_remote_refusal_is_complete_and_keeps_connection_usable() {
         Err(ClientError::Netd { .. })
     ));
     assert!(!client.poisoned);
-    writer.join().unwrap();
+    join_helper(writer);
 }
 
 #[test]
@@ -568,7 +677,7 @@ fn schema_for_another_topic_poisons_even_with_matching_id_and_robot() {
             .as_bytes(),
         )
         .unwrap();
-        assert_peer_closed(peer);
+        peer
     });
     assert!(client
         .account_access_once(AccountAccessRequest::Schema {
@@ -577,7 +686,7 @@ fn schema_for_another_topic_poisons_even_with_matching_id_and_robot() {
         })
         .is_err());
     assert_poisoned(&mut client);
-    writer.join().unwrap();
+    assert_peer_closed(join_helper(writer));
 }
 
 #[test]
@@ -591,12 +700,12 @@ fn malformed_oversized_and_old_hello_close_without_a_request() {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let writer = std::thread::spawn(move || {
             let _ = peer.write_all(&bytes);
-            assert_peer_closed(peer);
+            peer
         });
         assert!(
             NetdClient::finish_bounded_handshake(stream, "test.sock".into(), deadline()).is_err()
         );
-        writer.join().unwrap();
+        assert_peer_closed(join_helper(writer));
     }
 }
 
@@ -637,7 +746,7 @@ fn existing_only_constructor_uses_actual_unix_socket_and_never_creates_missing_p
         peer.write_all(HELLO).unwrap();
         receive_install(&peer);
         peer.write_all(INSTALLED).unwrap();
-        assert_peer_closed(peer);
+        peer
     });
     let mut client = NetdClient::connect_existing_at_until(path, deadline()).unwrap();
     assert_eq!(
@@ -645,7 +754,7 @@ fn existing_only_constructor_uses_actual_unix_socket_and_never_creates_missing_p
         AccountAccessReply::Installed { robot_count: 0 }
     );
     drop(client);
-    writer.join().unwrap();
+    assert_peer_closed(join_helper(writer));
 }
 
 #[test]
@@ -681,11 +790,11 @@ fn unix_connect_with_a_full_accept_queue_cannot_block_past_its_deadline() {
         );
         send.send(result.map(|_| ())).unwrap();
     });
-    // This generous watchdog catches an unbounded connect, not small timing jitter.
-    let observed = receive.recv_timeout(Duration::from_secs(5));
+    // This watchdog catches an unbounded connect, not a slow host.
+    let observed = receive.recv_timeout(HANG_BOUND);
     drop(held);
     drop(listener);
-    worker.join().unwrap();
+    join_helper(worker);
     assert!(observed.expect("bounded Unix connect must return").is_err());
 }
 
@@ -694,17 +803,14 @@ fn connection_and_hello_share_the_callers_deadline() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let path = dir.path().join("silent.sock");
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let peer = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        assert_peer_closed(stream);
-    });
+    let peer = std::thread::spawn(move || listener.accept().unwrap().0);
     let error =
         NetdClient::connect_existing_at_until(path, Instant::now() + Duration::from_millis(100))
             .unwrap_err();
     assert!(
         matches!(error, ClientError::Io(ref error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
     );
-    peer.join().unwrap();
+    assert_peer_closed(join_helper(peer));
 }
 
 #[cfg(target_os = "linux")]
@@ -727,7 +833,7 @@ fn the_bounded_connect_reaches_an_abstract_control_socket() {
     let stream = connect_control(&path, deadline(), true).unwrap();
     let client = NetdClient::finish_bounded_handshake(stream, path, deadline()).unwrap();
     drop(client);
-    server.join().unwrap();
+    join_helper(server);
 }
 
 #[test]
@@ -744,4 +850,19 @@ fn closure_check_still_reports_bytes_left_by_a_peer_that_already_closed() {
     stream.write_all(b"unexpected").unwrap();
     drop(stream);
     assert_peer_closed(peer);
+}
+
+#[test]
+#[should_panic(expected = "still open")]
+fn closure_check_refuses_a_client_end_that_is_still_open() {
+    let (_open, peer) = UnixStream::pair().unwrap();
+    assert_peer_closed(peer);
+}
+
+#[test]
+#[should_panic(expected = "helper thread panicked: the scripted peer saw this")]
+fn a_helper_panic_reaches_the_test_with_its_message() {
+    let helper: std::thread::JoinHandle<()> =
+        std::thread::spawn(|| panic!("the scripted peer saw this"));
+    join_helper(helper);
 }

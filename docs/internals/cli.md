@@ -206,6 +206,23 @@ Rules that must not drift:
   other writers). A `0/0` tally with a driver warns that nothing was compared. Pinned by
   `driver_topic_tests` and the driver-graph arms of `replay_engine_test.rs` (the `drv_*`
   fixtures); `docs/bag.md` states the user-facing rules.
+- **Environment divergence prints once and never changes the exit code.** A resim never
+  applies the bag's `env.json`: its nodes read the replay shell's environment, and
+  `replay_engine::compare_env_against` compares the two (no `env.json`, no comparison). One
+  pure rule, `env_reader`, names the variables that can change the re-execution
+  (`CERULION_`, `IOX2_`, `LD_`, `DYLD_`, `PYTHON`, plus the exact name `CARGO_TARGET_DIR`,
+  which `graph_cmd::cdylib_target_base` reads to pick the node library build directory,
+  minus every name the recorder's secret marker rule marks); such a variable set only at
+  replay is `Added`. The terminal text has one source, `render_env_divergence_lines` (a
+  `WARNING:` per such variable, then one `NOTE:` counting the rest, with no value or hash),
+  printed by the verdict and, through `ResimReport::env_lines`, by both arms of the neutral
+  summary. The engine logs each divergence once (`log_env_divergences`, after the report
+  write): an `info!` for every divergence on a run that returns its outcome, and a `warn!`
+  for a loud one on a run that returns an error instead (a rank aborts, or a passing run's
+  `--report` cannot be written), where the CLI prints only that error (the others stay
+  `info!`). At the quiet default each divergence shows once; with `-v` a loud one also
+  shows as its `info!` line, as a violation does. The `--report` entry's `read_by` is
+  derived from the name by the same rule.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.
@@ -1004,7 +1021,7 @@ own binary.
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
-| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
+| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
@@ -1033,7 +1050,9 @@ own binary.
 `ros2_graph.rs` carries its own unit oracles (the `classify_child_exit` matrix, relative
 launch/params resolution + missing-file refusal). Metric math + decodability
 classification live as unit tests inside `tolerance_metrics.rs` /
-`replay_field_registry.rs`.
+`replay_field_registry.rs`. The byte-mismatch value diff (`replay_value_diff.rs`: what a
+byte-mismatch line names, in which order, and how each value is spelled) carries its
+hand-oracle unit tests in `replay_value_diff/tests.rs`.
 
 ## 9. Test map: `cerulion_cli`
 
@@ -1164,7 +1183,11 @@ whether stdin and stderr are both terminals; only that last case asks.
 `check_rust` reads that itself and never fails the verb: a terminal error is
 logged and taken as a no. Install routes, after a yes only: `cerulion-install-rust`,
 else the existing rustup (stable added, default set only when unset), else the
-official installer with the release installer's arguments. A route that installs
+official installer with the release installer's arguments, which installs
+rustup alone with its stdout held (`run_bootstrap` shows it, through the pure
+`bootstrap_stdout_shown`, only when the installer fails) and is followed, in
+`bootstrap_then_add_stable`, by the existing-rustup step on the rustup it
+installed in Cargo's home. A route that installs
 into a Cargo home off `PATH` hands that directory to
 `node_build_with_cargo_dir`, which runs its `cargo` with the directory first on
 `PATH`. A declined or non-terminal check prints the command and returns, so

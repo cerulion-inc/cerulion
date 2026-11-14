@@ -3,6 +3,9 @@
 //! Prerequisite: cargo build -p cerulion_remoted in the same target/profile.
 #![cfg(all(feature = "wan", unix))]
 
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -919,16 +922,52 @@ struct ServerFixture {
 }
 
 impl ServerFixture {
+    /// A copied netd beside `script`, the `cerulion-remoted` it starts.
     fn new(script: &str) -> Self {
+        let fixture = Self::with_netd();
+        fresh_executable::install_script(&fixture.root.path().join("cerulion-remoted"), script);
+        fixture
+    }
+
+    /// A copied netd beside a `cerulion-remoted` whose interpreter does not
+    /// exist, so every start of it fails.
+    fn unstartable() -> Self {
         use std::os::unix::fs::PermissionsExt;
+        let fixture = Self::with_netd();
+        let remoted = fixture.root.path().join("cerulion-remoted");
+        std::fs::write(&remoted, "#!/nonexistent/cerulion-test-interpreter\n").unwrap();
+        std::fs::set_permissions(&remoted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = fresh_executable::retry_while_busy(fresh_executable::BUSY_PAUSE, || {
+            Command::new(&remoted).status()
+        })
+        .expect_err("a script whose interpreter is absent must not start");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        fixture
+    }
+
+    /// A temporary directory holding a copy of netd that has started once.
+    fn with_netd() -> Self {
         let root = tempfile::tempdir().unwrap();
         let netd = root.path().join("cerulion-netd");
         std::fs::copy(test_netd_binary(), &netd).unwrap();
-        let remoted = root.path().join("cerulion-remoted");
-        std::fs::write(&remoted, script).unwrap();
-        std::fs::set_permissions(remoted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_copy_runs(&netd, "--version");
         Self { root, netd }
     }
+}
+
+/// Returns once `binary`, a file just copied into place, has started with
+/// `argument` and exited 0.
+fn wait_until_copy_runs(binary: &Path, argument: &str) {
+    let output = fresh_executable::retry_while_busy(fresh_executable::BUSY_PAUSE, || {
+        Command::new(binary).arg(argument).output()
+    })
+    .unwrap_or_else(|error| panic!("{} {argument}: {error}", binary.display()));
+    assert!(
+        output.status.success(),
+        "{} {argument}: {}",
+        binary.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1081,6 +1120,7 @@ fn registration_replies_while_endpoint_transfer_waits_on_the_controller() {
     let fixture_root = tempfile::tempdir().unwrap();
     let netd = fixture_root.path().join("cerulion-netd");
     std::fs::copy(std::env::current_exe().unwrap(), &netd).unwrap();
+    wait_until_copy_runs(&netd, "--list");
     std::os::unix::fs::symlink(
         test_netd_binary().with_file_name("cerulion-remoted"),
         fixture_root.path().join("cerulion-remoted"),
@@ -1225,7 +1265,7 @@ fn endpoint_controller_fixture_process() {
 #[test]
 fn a_failed_server_spawn_keeps_registration_and_releases_endpoint_fencing() {
     let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = ServerFixture::new("#!/nonexistent/cerulion-test-interpreter\n");
+    let fixture = ServerFixture::unstartable();
     let ix = IsolatedRoot::mint("spawn");
     let mut daemon = Daemon::start_with(
         &ix,

@@ -268,6 +268,12 @@ keys, layout and error text are a contract. Source: `dynamic/message_yaml/`
   `*` is a false refusal (quote the string). `dynamic::find_anchor_or_alias` is the
   same scan for a caller that parses message YAML itself: `cerulion_msgio` runs it
   before it fills omitted fields and hands the codec the filled text.
+- **Shared spellings**: `format_f64`, `format_f32` and `quote_within` are re-exported
+  `#[doc(hidden)]` as `dynamic::yaml_format_f64`, `yaml_format_f32` and
+  `yaml_quote_within`, and `FrameWalker::walk_by_hash_keeping_raw_bools` is `pub` and
+  hidden too. `cerulion_cli_engine`'s replay byte-mismatch line prints values
+  through them, so a value reads the same there as in `topic echo`; none of them is
+  part of the bindings surface above.
 - **Floats**: shortest round-trip form; an `f32` is recovered by picking the neighbour
   of `x as f32` whose shortest form reads back to the parsed `f64` (two `f32` values
   round twice under a plain cast; bit pattern `363742205` is pinned). Every NaN prints

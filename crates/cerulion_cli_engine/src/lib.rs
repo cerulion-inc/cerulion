@@ -146,6 +146,11 @@ pub mod replay_cmd;
 // transport).
 #[cfg(unix)]
 pub mod replay_engine;
+// What a replay byte-mismatch line names: the first differing field of a
+// frame and its two values, in `topic echo`'s spelling. Pure; called by the
+// engine once per diverging stream after a pass. Unix-gated with its caller.
+#[cfg(unix)]
+pub(crate) mod replay_value_diff;
 // The `--record-out` sink of `bag play --resim`: the re-executed frames, written
 // to a fresh bag. Unix-gated with the engine that feeds it.
 #[cfg(unix)]
@@ -319,6 +324,11 @@ pub mod viz_cmd;
 // `cerulion_core::wedge_page`.
 pub mod wedge_alarm;
 pub mod workspace;
+
+/// Shell scripts a test writes and runs at once, guarded against ETXTBSY. The
+/// `tests/*.rs` binaries that need it compile the same file by `#[path]`.
+#[cfg(all(test, unix))]
+mod fresh_executable;
 
 /// The ONE crate-wide lock serializing every env-mutating
 /// **lib** test in `cerulion_cli_engine`.

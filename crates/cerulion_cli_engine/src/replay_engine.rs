@@ -691,8 +691,8 @@ pub const REPORT_VERSION: u32 = 1;
 pub struct ReplayOutcome {
     /// `true` iff the replay FULLY matched the recording — no data [`Violation`],
     /// no structural [`Self::trace_divergence`], AND no panic-class
-    /// [`Self::node_failures`]. Env divergences are WARN-only and do NOT clear
-    /// this flag (see [`Self::env_divergence`]). A `false` value is decomposed
+    /// [`Self::node_failures`]. Environment divergences never clear this flag
+    /// (see [`Self::env_divergence`]). A `false` value is decomposed
     /// by the three failure fields — a non-empty `node_failures` (exit 3, which
     /// PREEMPTS everything: root cause over symptoms), a populated
     /// `trace_divergence` (exit 6, which takes precedence over data), a
@@ -751,8 +751,13 @@ pub struct ReplayOutcome {
     /// downstream data drift). Serialized in the `--report` JSON (additive field
     /// — `report_version` unchanged; old readers ignore it).
     pub trace_divergence: Option<TraceDivergenceReport>,
-    /// Environment divergences vs the bag's `env.json` — WARN-only, never
-    /// exit-affecting (a replay host legitimately differs from the record host).
+    /// Every difference between the replay's own environment and the bag's
+    /// `env.json`, sorted by name: each recorded variable that differs or is
+    /// gone, and each variable that can change the re-execution that only the
+    /// replay sets. Never exit-affecting (a replay host legitimately differs
+    /// from the record host). The terminal prints a `WARNING:` line for each
+    /// variable that can change the re-execution and one `NOTE:` counting the
+    /// rest; this list, and its `read_by` key, carries all of them.
     pub env_divergence: Vec<EnvDivergence>,
     /// The recording host's identity from the bag's `__cerulion/recorder.json`
     /// attachment, if present + parseable. `None` for
@@ -3247,6 +3252,84 @@ pub struct Violation {
     pub detail: String,
 }
 
+/// What differs in a byte-mismatched frame, as the `--report` JSON carries
+/// it: one flat object whose `kind` says which keys hold a value (the
+/// byte-mismatch forms in `docs/bag.md`).
+///
+/// Hidden from the docs: the JSON is the contract; this is its carrier.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ByteDifference {
+    /// What the line names.
+    pub kind: DifferenceKind,
+    /// The field path (`field`), the header field (`header`, `schema_hash`)
+    /// or the framed field (`layout` in `field_framing`).
+    pub path: Option<String>,
+    /// The recorded value: a JSON number or bool where the value is one; a
+    /// string value is the string itself; otherwise the text the line
+    /// prints.
+    pub recorded: Option<DifferenceValue>,
+    /// The replayed value, as [`Self::recorded`].
+    pub replayed: Option<DifferenceValue>,
+    /// The differing byte inside the field (`field`): of a value compared as
+    /// opaque bytes, of a string that is not UTF-8, or of a `string_fixed`
+    /// whose text is equal (its two values are then the same text).
+    pub field_byte: Option<usize>,
+    /// The first differing character of a string longer than 64 characters
+    /// (`field`).
+    pub field_char: Option<usize>,
+    /// The first differing byte (`layout`, `undecoded`).
+    pub byte_offset: Option<usize>,
+    /// Where the byte sits (`layout`): `fixed_section_padding`,
+    /// `offset_table`, `field_framing`, `unused_variable_bytes` or
+    /// `trailing_bytes`.
+    pub region: Option<&'static str>,
+    /// Why the fields were not decoded (`undecoded`):
+    /// `recorded_frame_too_short`, `replayed_frame_too_short`,
+    /// `unknown_schema_hash`, `recorded_frame_undecodable` or
+    /// `replayed_frame_undecodable`.
+    pub reason: Option<&'static str>,
+    /// How many other values of the frame differ.
+    pub more: u64,
+}
+
+/// [`ByteDifference::kind`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferenceKind {
+    /// A message field value.
+    Field,
+    /// A wire-header field.
+    Header,
+    /// The frames carry different schemas.
+    SchemaHash,
+    /// Every value is equal; a framing byte differs.
+    Layout,
+    /// The fields were not decoded.
+    Undecoded,
+}
+
+/// One value of a [`ByteDifference`], serialized as the bare JSON value.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum DifferenceValue {
+    /// A `bool`.
+    Bool(bool),
+    /// A signed integer, exact.
+    Int(i64),
+    /// An unsigned integer, exact.
+    UInt(u64),
+    /// A finite `float32`, in its own shortest form.
+    Float32(f32),
+    /// A finite `float64`.
+    Float64(f64),
+    /// A string value, or the line's text for a value with no JSON number
+    /// form (`.nan`, `.inf`, a byte, a window of a long string).
+    Text(String),
+}
+
 /// The divergence classes. Two distinct "missing" classes, by design:
 /// a topic with ZERO replayed frames is [`Self::MissingTopic`]; a topic with
 /// FEWER replayed frames than recorded is [`Self::MissingMessages`].
@@ -3279,12 +3362,19 @@ pub enum ViolationClass {
         /// The 0-based frame index of the first differing frame.
         index: usize,
         /// The byte offset of the first differing byte (or the shorter length
-        /// when one frame is a prefix of the other).
+        /// when one frame is a prefix of the other). It can sit in another
+        /// field than `difference.path`: the path is the first differing
+        /// value in the schema's declaration order, the offset is byte order.
         first_diff_byte_offset: usize,
         /// The recorded frame's length.
         recorded_len: usize,
         /// The replayed frame's length.
         replayed_len: usize,
+        /// What differs in that frame, from the same comparison the detail
+        /// line renders (the byte-mismatch forms in `docs/bag.md`). Hidden
+        /// with its type: the JSON is the contract.
+        #[doc(hidden)]
+        difference: ByteDifference,
     },
     /// The recording itself lost frames on this topic at RECORD time
     /// (the bag's `record_health.json` stamp reports `frames_lost > 0` or a
@@ -3349,20 +3439,41 @@ pub enum ViolationClass {
     },
 }
 
-/// One environment divergence vs the bag's `env.json` (WARN-only).
-#[derive(Debug, Clone, serde::Serialize)]
+/// One difference between the replay's own environment and the bag's
+/// `env.json`. Never exit-affecting.
+///
+/// The `--report` JSON entry carries a fourth key beside these three fields,
+/// `read_by`: `"cerulion"`, `"dynamic_linker"` or `"python"` for a variable that
+/// can change the re-execution, `null` for every other one. It is derived from
+/// [`Self::name`] by the one rule the terminal output uses, so the two can never
+/// disagree about a variable.
+#[derive(Debug, Clone)]
 pub struct EnvDivergence {
     /// The variable name.
     pub name: String,
     /// What differs.
     pub kind: EnvDivergenceKind,
-    /// A human-readable one-line detail.
+    /// A human-readable one-line detail (the `--report` JSON's `detail`).
     pub detail: String,
+}
+
+impl serde::Serialize for EnvDivergence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut entry = serializer.serialize_struct("EnvDivergence", 4)?;
+        entry.serialize_field("name", &self.name)?;
+        entry.serialize_field("kind", &self.kind)?;
+        entry.serialize_field("detail", &self.detail)?;
+        entry.serialize_field("read_by", &env_reader(&self.name).map(EnvReader::label))?;
+        entry.end()
+    }
 }
 
 /// The env-divergence classes. Values are compared only for entries the bag
 /// recorded a value for (plain string) or a hash for (redacted `fnv64`);
-/// names-only (null) entries are compared for presence only.
+/// names-only (null) entries are compared for presence only. A variable the bag
+/// did not record is reported only when it can change the re-execution
+/// ([`Self::Added`]).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind")]
 pub enum EnvDivergenceKind {
@@ -3373,6 +3484,116 @@ pub enum EnvDivergenceKind {
     /// The bag recorded a redacted `fnv64` that the current value does not hash
     /// to (the value changed under redaction).
     HashChanged,
+    /// The replay env sets a variable that can change the re-execution (a
+    /// `CERULION_`, `IOX2_`, `LD_`, `DYLD_` or `PYTHON` name that does not mark
+    /// a secret, or `CARGO_TARGET_DIR`) and the bag did not record it.
+    Added,
+}
+
+impl EnvDivergenceKind {
+    /// The variant name, which is also the serialized `kind` tag.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Missing => "Missing",
+            Self::ValueChanged => "ValueChanged",
+            Self::HashChanged => "HashChanged",
+            Self::Added => "Added",
+        }
+    }
+
+    /// How the variable changed, worded for the terminal line.
+    fn change_phrase(&self) -> &'static str {
+        match self {
+            Self::ValueChanged | Self::HashChanged => "has a different value than in the recording",
+            Self::Missing => "was set in the recording and is not set now",
+            Self::Added => "is set now and was not set in the recording",
+        }
+    }
+}
+
+/// What reads an environment variable that can change a re-execution: the
+/// re-execution itself or a runtime it starts ([`env_reader`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvReader {
+    /// Cerulion itself or its shared-memory transport (`CERULION_`, `IOX2_`).
+    Cerulion,
+    /// The dynamic linker, which maps every node library (`LD_`, `DYLD_`).
+    DynamicLinker,
+    /// The Python interpreter that runs Python nodes (`PYTHON`).
+    Python,
+    /// Cerulion's node library lookup, which picks the build directory every
+    /// node library loads from (`CARGO_TARGET_DIR`,
+    /// [`crate::graph_cmd::cdylib_target_base`]).
+    NodeLibraryLookup,
+}
+
+impl EnvReader {
+    /// The `--report` JSON's `read_by` value and the log field's value. It
+    /// names the program that reads the variable, so both Cerulion readers
+    /// are `cerulion`; [`Self::reason`] says what each reads it for.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cerulion | Self::NodeLibraryLookup => "cerulion",
+            Self::DynamicLinker => "dynamic_linker",
+            Self::Python => "python",
+        }
+    }
+
+    /// Why a difference in a variable this reader reads matters, worded for the
+    /// terminal line.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Cerulion => {
+                "Cerulion reads its settings from CERULION_ and IOX2_ variables, so this one can \
+                 change the re-execution."
+            }
+            Self::DynamicLinker => {
+                "The dynamic linker reads it to choose the libraries each node loads, so it can \
+                 change the re-execution."
+            }
+            Self::Python => {
+                "The Python interpreter that runs Python nodes reads it, so it can change the \
+                 re-execution."
+            }
+            Self::NodeLibraryLookup => {
+                "Cerulion reads it to choose the build directory it loads each node library \
+                 from, so it can change the re-execution."
+            }
+        }
+    }
+}
+
+/// The reader whose settings namespace `name` is in, or that reads `name`
+/// itself (`CARGO_TARGET_DIR`), or `None` for any other name or one that marks
+/// a secret.
+///
+/// Loud means the name is in a namespace the re-execution itself, or a
+/// runtime it starts, reads its settings from: Cerulion and its shared-memory
+/// transport (`CERULION_`, `IOX2_`), the dynamic linker that maps every node
+/// library (`LD_`, `DYLD_`), and the Python interpreter that runs Python nodes
+/// (`PYTHON`). One exact name outside those namespaces is loud too:
+/// `CARGO_TARGET_DIR`, which Cerulion reads to pick the build directory every
+/// node library loads from. Every other variable (the shell's, the session's,
+/// `PATH`, `HOME`, locale, `RUST_LOG`, library knobs such as
+/// `OMP_NUM_THREADS`) is counted with the rest; it matters when code in a node
+/// reads it, which the replay cannot see. A name that marks a secret is never
+/// loud: credentials authenticate a session and do not decide what a
+/// re-execution computes. The secret rule is the recorder's own, so the two
+/// agree on every name. Case-sensitive, like Unix names. Pure.
+fn env_reader(name: &str) -> Option<EnvReader> {
+    if crate::graph_cmd::env_name_marks_a_secret(name) {
+        None
+    } else if name.starts_with("CERULION_") || name.starts_with("IOX2_") {
+        Some(EnvReader::Cerulion)
+    } else if name.starts_with("LD_") || name.starts_with("DYLD_") {
+        Some(EnvReader::DynamicLinker)
+    } else if name.starts_with("PYTHON") {
+        Some(EnvReader::Python)
+    } else if name == "CARGO_TARGET_DIR" {
+        Some(EnvReader::NodeLibraryLookup)
+    } else {
+        None
+    }
 }
 
 // ===========================================================================
@@ -4398,9 +4619,15 @@ pub enum ReplayNodes {
 
 /// Run the deterministic replay engine and return its [`ReplayOutcome`].
 ///
-/// Writes the JSON report to `inputs.report_path` when set. Emits a
-/// `tracing::warn!` per env divergence and a `tracing::info!` per node failure
-/// (both terminal reports name each failed node). A data violation and a
+/// Writes the JSON report to `inputs.report_path` when set. An environment
+/// variable that differs from the recording and that Cerulion does not read
+/// is a `tracing::info!` (the terminal counts those in one NOTE line, and `-v`
+/// shows these). One that can change the re-execution is a `tracing::info!` on
+/// a run that returns its outcome, because the verdict and the neutral summary
+/// each print it, and a `tracing::warn!` on a run that returns an error once
+/// the passes ran (a rank ABORTS, or a passing run's `--report` cannot be
+/// written), where the CLI prints only that error. A node failure is a `tracing::info!` (both
+/// terminal reports name each failed node). A data violation and a
 /// structural trace divergence are a `tracing::info!` under
 /// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
 /// printed by the CLI) states each in full, and a `tracing::warn!` under
@@ -4568,6 +4795,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         clock,
         mut factories,
         schema_hashes,
+        verdict_schemas_dir,
         resume,
     } = build_replay_context(&config, nodes, || {
         resolve_resume(
@@ -4870,6 +5098,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // can run on BOTH exits of the loop below — the completed one and an
     // abort at rank k, which still owes the operator ranks 0..k's results.
     let mut acc = PassAccumulators::default();
+    // Every pass judges its byte divergences against ONE schema set, built
+    // the first time a stream diverges (a passing replay never builds it).
+    let verdict = VerdictDecoder::new(verdict_schemas_dir);
     let mut warned_partial_discard: std::collections::HashSet<Arc<str>> =
         std::collections::HashSet::new();
     let last_pass = plans.len().saturating_sub(1);
@@ -4964,6 +5195,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
+                verdict: &verdict,
                 rank_tables: &rank_tables,
                 rank_count,
                 node_rank: node_rank.as_ref(),
@@ -5182,6 +5414,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                  rank's pass; the abort's own error stands"
             );
         }
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
         drop(transport);
         drop(clock);
         return Err(e);
@@ -5205,7 +5438,14 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
              other writer recorded or replayed a frame"
         );
     }
-    persist_report(report_path.as_deref(), &outcome)?;
+    // A PASSING run whose `--report` cannot be written returns the write error,
+    // and the CLI prints only that error, so the environment lines are logged
+    // as on an abort.
+    if let Err(e) = persist_report(report_path.as_deref(), &outcome) {
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
+        return Err(e);
+    }
+    log_env_divergences(&outcome.env_divergence, OutcomeShown::Yes);
     // A bag that could not be finished is reported on the outcome, not raised
     // here: the engine does not know whether a verdict was asked for, and the
     // surface keeps a failing verdict's own exit code while never letting a
@@ -5552,7 +5792,7 @@ fn assemble_outcome(
                 .and_then(|c| c.reproduced.get(topic).copied())
                 .unwrap_or(0),
         );
-        let byte_violation = summary.and_then(|c| c.byte_violation);
+        let byte_violation = summary.and_then(|c| c.byte_violation.as_ref());
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
         // A topic a driver shares with re-executed writers is judged per
         // writer over the re-executed writers' partitions only
@@ -5876,11 +6116,11 @@ fn assemble_outcome(
         ));
     }
 
-    // 7. Env divergence (WARN-only) + report + verdict data.
+    // 7. Env divergence (never exit-affecting) + report + verdict data. The
+    // divergences are logged by `run_engine` once it knows whether the CLI
+    // shows this outcome, which a failed `--report` write decides after this
+    // epilogue (`log_env_divergences`).
     let env_divergence = compare_env(env_json);
-    for d in &env_divergence {
-        tracing::warn!(var = %d.name, detail = %d.detail, "replay: environment divergence vs bag env.json");
-    }
     // A completed `--verify`: INFO, because the verdict renders each violation
     // and the schedule divergence as its own block on the same stderr, so these
     // lines are for a log pipeline only. A bare `--resim`: WARN, because its
@@ -6107,6 +6347,47 @@ fn build_read_log_verdict(
         unmet_total,
         detail,
     })
+}
+
+/// Whether the CLI shows a run's outcome: `Yes` when [`run_engine`] returns it
+/// (the verdict and the neutral summary each print
+/// [`render_env_divergence_lines`]), `No` when it returns an error instead,
+/// which is all the CLI then prints.
+#[derive(Clone, Copy)]
+enum OutcomeShown {
+    Yes,
+    No,
+}
+
+/// Log each environment divergence once. A variable that can change the
+/// re-execution ([`env_reader`]) is an `info!` when the outcome is shown, which
+/// already prints it, and a `warn!` when it is not, so it still reaches the
+/// terminal. Every other variable is an `info!` either way: the NOTE line
+/// counts it, and `-v` lists it.
+fn log_env_divergences(divergences: &[EnvDivergence], shown: OutcomeShown) {
+    for d in divergences {
+        match (env_reader(&d.name), shown) {
+            (None, _) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                "replay: an environment variable differs from the recording"
+            ),
+            (Some(reader), OutcomeShown::Yes) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+            (Some(reader), OutcomeShown::No) => tracing::warn!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+        }
+    }
 }
 
 /// Persist the `--report` artifact, if one was requested, under the decided
@@ -8616,6 +8897,9 @@ struct ReplayContext {
     factories: IndexMap<String, Box<dyn NodeEntry>>,
     /// The workspace schema hashes on the CLI path; `None` on the test seam.
     schema_hashes: Option<std::collections::HashMap<String, u64>>,
+    /// The workspace `schemas/` directory a byte-mismatch verdict decodes
+    /// with on the CLI path; `None` (the built-in set alone) on the test seam.
+    verdict_schemas_dir: Option<PathBuf>,
     resume: Option<ResumePlan>,
 }
 
@@ -8708,6 +8992,7 @@ fn build_replay_context(
                 clock,
                 factories,
                 schema_hashes: Some(schema_hashes),
+                verdict_schemas_dir: Some(workspace_root.join("schemas")),
                 resume,
             })
         }
@@ -8730,6 +9015,7 @@ fn build_replay_context(
                 clock,
                 factories,
                 schema_hashes: None,
+                verdict_schemas_dir: None,
                 resume,
             })
         }
@@ -8995,6 +9281,9 @@ struct PassInputs<'a> {
     catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     trace: &'a RecordedTrace,
     recorded_messages: &'a RecordedMessages,
+    /// The schema set each byte divergence is decoded with at the pass
+    /// harvest, built on first use and shared by every pass.
+    verdict: &'a VerdictDecoder,
     rank_tables: &'a [Vec<Arc<str>>],
     rank_count: usize,
     node_rank: Option<&'a std::collections::HashMap<Arc<str>, u32>>,
@@ -9063,10 +9352,11 @@ impl PassInputs<'_> {
 struct CaptureSummary {
     /// Frames replay produced on the topic — [`Capture::replayed_count`].
     replayed_count: usize,
-    /// The TOPIC-level first byte divergence — written by the single-stream
-    /// diff only. A partitioned topic leaves this `None` and reports per writer
-    /// in [`Self::partition_counts`]; see [`Self::any_byte_violation`].
-    byte_violation: Option<ByteViolation>,
+    /// The TOPIC-level first byte divergence, judged: written by the
+    /// single-stream diff only. A partitioned topic leaves this `None` and
+    /// reports per writer in [`Self::partition_counts`]; see
+    /// [`Self::any_byte_violation`].
+    byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
     /// The per-field tolerance violations, already rendered against the topic.
     tolerance_violations: Vec<Violation>,
     /// The per-WRITER count/byte inputs of a label-partitioned topic (`None` on
@@ -16079,16 +16369,28 @@ fn run_rank_pass(
     // [`CaptureSummary`]), so the capture subscriber ports die with the pass
     // that opened them instead of being carried — still attached, still being
     // filled by the transport — across every later rank's pass.
+    //
+    // A stream's first byte divergence is judged HERE, after the step loop:
+    // its frame pair is decoded to name the differing field, then dropped.
     let captures: IndexMap<String, CaptureSummary> = captures_owned
-        .iter()
+        .iter_mut()
         .map(|(topic, c)| {
+            let skip = CaptureTolerance::tolerated_fields(c.tolerance.as_ref());
+            let byte_violation = c
+                .byte_violation
+                .take()
+                .map(|v| judge_byte_violation(pass.verdict, &skip, v));
+            let partition_counts = c
+                .partitions
+                .as_mut()
+                .map(|p| p.counts(&mut |v| judge_byte_violation(pass.verdict, &skip, v)));
             (
                 topic.clone(),
                 CaptureSummary {
                     replayed_count: c.replayed_count,
-                    byte_violation: c.byte_violation,
+                    byte_violation,
                     tolerance_violations: c.tolerance_violations(topic),
-                    partition_counts: c.partition_counts(),
+                    partition_counts,
                 },
             )
         })
@@ -17305,16 +17607,77 @@ mod provisionable_depth_tests {
 /// the replayed frame is compared to its recorded twin the moment it is drained,
 /// then dropped — the replayed side is never accumulated). At most one per topic
 /// (comparison stops at the first differing frame, matching the batch diff).
-#[derive(Debug, Clone, Copy)]
+///
+/// It keeps a copy of BOTH frames of that one pair, so the pass harvest can
+/// name the field that differs ([`judge_byte_violation`]); every other frame
+/// is still dropped once compared.
+#[derive(Debug)]
 struct ByteViolation {
     /// 0-based frame index of the first differing frame.
     index: usize,
     /// Byte offset of the first differing byte (or the shorter length).
     first_diff_byte_offset: usize,
-    /// The recorded frame's length.
-    recorded_len: usize,
-    /// The replayed frame's length.
-    replayed_len: usize,
+    /// The recorded frame.
+    recorded: Box<[u8]>,
+    /// The replayed frame.
+    replayed: Box<[u8]>,
+    /// The tolerance plan's field decoder refused one of the two frames, so
+    /// its byte-exact remainder was not compared.
+    refusal: Option<crate::replay_value_diff::RemainderRefusal>,
+}
+
+/// Turn a stream's first divergence into its verdict: what differs in that
+/// frame pair. The frame copies are dropped here.
+///
+/// `skip` is the top-level fields a tolerance metric judges on this topic
+/// (the set the byte-exact remainder leaves out), so a tolerated field is
+/// never named in a byte mismatch.
+fn judge_byte_violation(
+    decoder: &VerdictDecoder,
+    skip: &[&str],
+    violation: ByteViolation,
+) -> crate::replay_value_diff::ByteVerdict {
+    let difference = crate::replay_value_diff::locate_difference(
+        || decoder.walker(),
+        &violation.recorded,
+        &violation.replayed,
+        violation.first_diff_byte_offset,
+        skip,
+        violation.refusal.as_ref(),
+    );
+    crate::replay_value_diff::ByteVerdict {
+        index: violation.index,
+        first_diff_byte_offset: violation.first_diff_byte_offset,
+        recorded_len: violation.recorded.len(),
+        replayed_len: violation.replayed.len(),
+        difference,
+    }
+}
+
+/// The schema set a byte-mismatch verdict decodes its frames with: the one
+/// `topic echo` decodes with (built-ins, then the workspace's `.msg` store
+/// and YAML schemas), built at most once per run and only when a stream
+/// diverged, so a passing replay never builds it.
+struct VerdictDecoder {
+    /// The workspace `schemas/` directory; `None` decodes with the built-in
+    /// set alone (the in-process test path, which has no workspace).
+    schemas_dir: Option<PathBuf>,
+    walker: std::sync::OnceLock<cerulion_core::codegen::FrameWalker>,
+}
+
+impl VerdictDecoder {
+    fn new(schemas_dir: Option<PathBuf>) -> Self {
+        Self {
+            schemas_dir,
+            walker: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn walker(&self) -> &cerulion_core::codegen::FrameWalker {
+        self.walker.get_or_init(|| {
+            crate::topic_cmd::local_walker_from_workspace(self.schemas_dir.as_deref())
+        })
+    }
 }
 
 // ===========================================================================
@@ -17455,11 +17818,11 @@ struct CaptureStream {
 }
 
 /// One partition's count/byte verdict inputs, for the violation assembly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PartitionCounts {
     recorded: usize,
     replayed: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
 }
 
 /// The label-partitioned diff state of ONE co-located multi-publisher topic.
@@ -17567,9 +17930,18 @@ impl CapturePartitioning {
         }
     }
 
-    /// Per writer, the count/byte verdict inputs.
-    fn counts(&self) -> BTreeMap<WriterKey, PartitionCounts> {
-        fold_partition_counts(&self.recorded_writers, &self.producible, &self.streams)
+    /// Per writer, the count/byte verdict inputs; each writer's first
+    /// divergence goes through `judge` (and its frame copies are dropped).
+    fn counts(
+        &mut self,
+        judge: &mut dyn FnMut(ByteViolation) -> crate::replay_value_diff::ByteVerdict,
+    ) -> BTreeMap<WriterKey, PartitionCounts> {
+        fold_partition_counts(
+            &self.recorded_writers,
+            &self.producible,
+            &mut self.streams,
+            judge,
+        )
     }
 }
 
@@ -17591,7 +17963,8 @@ impl CapturePartitioning {
 fn fold_partition_counts(
     recorded_writers: &[WriterKey],
     producible: &BTreeSet<WriterKey>,
-    streams: &BTreeMap<WriterKey, CaptureStream>,
+    streams: &mut BTreeMap<WriterKey, CaptureStream>,
+    judge: &mut dyn FnMut(ByteViolation) -> crate::replay_value_diff::ByteVerdict,
 ) -> BTreeMap<WriterKey, PartitionCounts> {
     let mut out: BTreeMap<WriterKey, PartitionCounts> = BTreeMap::new();
     for key in recorded_writers {
@@ -17606,14 +17979,14 @@ fn fold_partition_counts(
             })
             .recorded += 1;
     }
-    for (key, stream) in streams {
+    for (key, stream) in streams.iter_mut() {
         let entry = out.entry(key.clone()).or_insert(PartitionCounts {
             recorded: 0,
             replayed: 0,
             byte_violation: None,
         });
         entry.replayed = stream.replayed_count;
-        entry.byte_violation = stream.byte_violation;
+        entry.byte_violation = stream.byte_violation.take().map(&mut *judge);
     }
     out
 }
@@ -17802,9 +18175,18 @@ impl FieldMetric {
 /// so it stays byte-compared along with schema_hash, offset_table_count,
 /// sequence and timestamp_ns (any layout change that could move it also
 /// changes schema_hash). See [`CaptureTolerance::remainder_first_diff`].
-const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
+pub(crate) const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
 
 impl CaptureTolerance {
+    /// The top-level fields a tolerance metric judges on a topic: the
+    /// fields the byte-exact remainder leaves out, so a byte-mismatch line
+    /// never names one. Empty with no tolerance plan.
+    fn tolerated_fields(plan: Option<&Self>) -> Vec<&str> {
+        plan.map_or_else(Vec::new, |ct| {
+            ct.metrics.iter().map(|m| m.field.as_str()).collect()
+        })
+    }
+
     /// The offset of the first BYTE that differs between the recorded and
     /// replayed frames OUTSIDE every overridden field's span, or `None` when the
     /// non-tolerated bytes match. This is the byte-exact "remainder" — a
@@ -17817,9 +18199,18 @@ impl CaptureTolerance {
     /// override may change length) compares the header + fixed section (minus
     /// overridden fixed spans) + each non-overridden variable field's DATA span,
     /// ignoring the offset table + overridden fields.
-    fn remainder_first_diff(&mut self, rec: &[u8], rep: &[u8]) -> Option<usize> {
+    ///
+    /// The second half of the pair is set when the field decoder refused a
+    /// frame, so the remainder could not be compared field by field; the
+    /// offset is then the end of the header.
+    fn remainder_first_diff(
+        &mut self,
+        rec: &[u8],
+        rep: &[u8],
+    ) -> Option<(usize, Option<crate::replay_value_diff::RemainderRefusal>)> {
         if !self.has_variable_override {
-            return remainder_skip_ranges(rec, rep, &self.excluded_frame_ranges);
+            return remainder_skip_ranges(rec, rep, &self.excluded_frame_ranges)
+                .map(|offset| (offset, None));
         }
         // Structural (Case B): header compared FIELD-WISE, EXCLUDING the ONE
         // LENGTH-DERIVED header field. A tolerated variable field whose
@@ -17848,17 +18239,17 @@ impl CaptureTolerance {
                 continue;
             }
             if rec[i] != rep[i] {
-                return Some(i);
+                return Some((i, None));
             }
         }
         if rec.len() < hdr || rep.len() < hdr {
-            return Some(common_hdr); // a frame too short to hold the header.
+            return Some((common_hdr, None)); // a frame too short to hold the header.
         }
         // Fixed section (payload-relative 0..fixed_size), skipping overridden
         // fixed spans (their frame-coord ranges are in excluded_frame_ranges).
         let fixed_end = hdr + self.fixed_size;
         if rec.len() < fixed_end || rep.len() < fixed_end {
-            return Some(hdr.min(rec.len()).min(rep.len()));
+            return Some((hdr.min(rec.len()).min(rep.len()), None));
         }
         for i in hdr..fixed_end {
             if self
@@ -17869,7 +18260,7 @@ impl CaptureTolerance {
                 continue;
             }
             if rec[i] != rep[i] {
-                return Some(i);
+                return Some((i, None));
             }
         }
         // Each non-overridden variable field's DATA span, compared byte-exact.
@@ -17887,15 +18278,110 @@ impl CaptureTolerance {
                         let off = (0..common)
                             .find(|&i| rl.bytes[i] != pl.bytes[i])
                             .unwrap_or(common);
-                        return Some(base + off);
+                        return Some((base + off, None));
                     }
                 }
                 // A decode failure on either side is a structural difference
                 // (a corrupt frame the bounds-checked decoder refused).
-                _ => return Some(hdr),
+                (Err(e), _) => {
+                    return Some((
+                        hdr,
+                        Some(crate::replay_value_diff::RemainderRefusal {
+                            side: crate::replay_value_diff::Side::Recorded,
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
+                (_, Err(e)) => {
+                    return Some((
+                        hdr,
+                        Some(crate::replay_value_diff::RemainderRefusal {
+                            side: crate::replay_value_diff::Side::Replayed,
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod remainder_refusal_tests {
+    use super::*;
+    use crate::replay_value_diff::{RemainderRefusal, Side};
+
+    const TOPIC: &str = "/rt/arm/out";
+
+    /// A `sensor_msgs/JointState` topic whose `position` (a variable
+    /// `float64[]`) a `max_abs` metric judges: the remainder takes the
+    /// structural path and locates `header`, `name`, `velocity` and `effort`
+    /// itself.
+    fn joint_state_plan() -> CaptureTolerance {
+        let config = cerulion_core::graph::parse_graph(&format!(
+            "name: rt\nprefix: rt\nnodes:\n\
+             \x20 - id: arm\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: sensor_msgs/JointState\n        topic: {TOPIC}\n"
+        ))
+        .expect("fixture graph parses");
+        let root = tempfile::tempdir().expect("a workspace directory");
+        let registry =
+            crate::replay_field_registry::FieldRegistry::from_graph(&config, root.path());
+        let spec = crate::tolerance::ToleranceSpec::parse(&format!(
+            "topics:\n  {TOPIC}:\n    fields:\n      position:\n        kind: max_abs\n        \
+             threshold: 0.1\n"
+        ))
+        .expect("fixture tolerance parses");
+        let plan = build_capture_tolerance(&CompiledTolerance { spec, registry }, TOPIC)
+            .expect("position is judged by a metric");
+        assert!(plan.has_variable_override, "a variable field is tolerated");
+        plan
+    }
+
+    /// A JointState frame, and the same frame with `header`'s offset-table
+    /// entry (the first of five, frame bytes 40..48) claiming 10000 bytes.
+    fn frames() -> (Vec<u8>, Vec<u8>) {
+        let walker = crate::topic_cmd::local_walker_from_workspace(None);
+        let good = cerulion_core::dynamic::yaml_to_message(
+            &walker,
+            "sensor_msgs/JointState",
+            b"header: {stamp: {sec: 0, nanosec: 0}, frame_id: \"base\"}\nname: [\"j1\"]\n\
+              position: [1.0]\nvelocity: [0.0]\neffort: [0.0]\n",
+            7,
+        )
+        .expect("fixture YAML encodes");
+        // header's data starts right after the 40-byte table.
+        assert_eq!(good[40..44], 40u32.to_le_bytes());
+        let mut bad = good.clone();
+        bad[44..48].copy_from_slice(&10_000u32.to_le_bytes());
+        (good, bad)
+    }
+
+    /// The side the field decoder refused is the side the refusal names, and
+    /// the offset is the end of the wire header.
+    #[test]
+    fn a_refused_frame_is_named_by_its_side() {
+        let mut plan = joint_state_plan();
+        let (good, bad) = frames();
+        let refused = |got: Option<(usize, Option<RemainderRefusal>)>, side: Side| {
+            let (offset, refusal) = got.expect("a refused frame is a difference");
+            let refusal = refusal.expect("the decoder refused a frame");
+            assert_eq!((offset, refusal.side), (WireHeader::SIZE, side));
+            assert!(
+                refusal
+                    .error
+                    .starts_with("variable field 'header' offset-table entry [40, 10040) exceeds"),
+                "{}",
+                refusal.error
+            );
+        };
+        refused(plan.remainder_first_diff(&bad, &good), Side::Recorded);
+        refused(plan.remainder_first_diff(&good, &bad), Side::Replayed);
+        // Both refused: the recorded side is the one named.
+        refused(plan.remainder_first_diff(&bad, &bad), Side::Recorded);
+        // Neither refused and nothing differs.
+        assert_eq!(plan.remainder_first_diff(&good, &good), None);
     }
 }
 
@@ -18065,15 +18551,13 @@ impl Capture {
             None
         };
         if let Some(rec_frame) = rec_frame {
-            let mut byte_violation = self.byte_violation;
             diff_recorded_twin(
                 self.tolerance.as_mut(),
-                &mut byte_violation,
+                &mut self.byte_violation,
                 index,
                 rec_frame,
                 sample.payload(),
             );
-            self.byte_violation = byte_violation;
         }
         self.replayed_count += 1;
         Ok(())
@@ -18294,13 +18778,6 @@ impl Capture {
                 self.subscriber.topic()
             ),
         }))
-    }
-
-    /// Per WRITER, the count/byte verdict inputs of a partitioned
-    /// topic — `None` on every single-stream topic, where the topic-level
-    /// counts are the whole answer.
-    fn partition_counts(&self) -> Option<BTreeMap<WriterKey, PartitionCounts>> {
-        self.partitions.as_ref().map(CapturePartitioning::counts)
     }
 
     /// The [`ViolationClass::ToleranceExceeded`]
@@ -18804,17 +19281,21 @@ fn diff_recorded_twin(
             None
         }
     } else if want_byte {
-        frame_first_diff(DiffMetric::BitExact, rec_frame, rep_frame)
+        frame_first_diff(DiffMetric::BitExact, rec_frame, rep_frame).map(|offset| (offset, None))
     } else {
         None
     };
     if want_byte {
-        if let Some(offset) = remainder {
+        if let Some((offset, refusal)) = remainder {
             *byte_violation = Some(ByteViolation {
                 index,
                 first_diff_byte_offset: offset,
-                recorded_len: rec_frame.len(),
-                replayed_len: rep_frame.len(),
+                // hot-path-alloc-ok: once per diverging stream, at its first
+                // differing frame (`want_byte` is false after it); the pair is
+                // decoded at the pass harvest to name the differing field.
+                recorded: rec_frame.into(),
+                replayed: rep_frame.into(),
+                refusal,
             });
         }
     }
@@ -23807,7 +24288,7 @@ fn push_topic_violations(
     topic: &str,
     recorded_count: usize,
     replayed_count: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<&crate::replay_value_diff::ByteVerdict>,
     // Per WRITER, the count/byte inputs of a label-partitioned
     // topic. `None` — every single-writer topic, and every multi-publisher one
     // the capture could not fully attribute — reports exactly as an unpartitioned
@@ -23854,7 +24335,7 @@ fn push_topic_violations(
                 Some(writer),
                 counts.recorded,
                 counts.replayed,
-                counts.byte_violation,
+                counts.byte_violation.as_ref(),
                 violations,
             );
         }
@@ -23882,7 +24363,7 @@ fn push_stream_violations(
     writer: Option<&WriterKey>,
     recorded_count: usize,
     replayed_count: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<&crate::replay_value_diff::ByteVerdict>,
     violations: &mut Vec<Violation>,
 ) {
     // `""` on the single-stream path, so a single-writer topic's message
@@ -23911,8 +24392,8 @@ fn push_stream_violations(
     }
 
     // The byte-level divergence (first differing frame) was found in-loop during
-    // the incremental diff — append it, matching the batch diff which reported
-    // only the FIRST differing frame per topic.
+    // the incremental diff and judged at the pass harvest; append it, matching
+    // the batch diff which reported only the FIRST differing frame per topic.
     if let Some(bv) = byte_violation {
         violations.push(Violation {
             topic: topic.to_string(),
@@ -23921,11 +24402,9 @@ fn push_stream_violations(
                 first_diff_byte_offset: bv.first_diff_byte_offset,
                 recorded_len: bv.recorded_len,
                 replayed_len: bv.replayed_len,
+                difference: crate::replay_value_diff::report_entry(&bv.difference),
             },
-            detail: format!(
-                "frame {} differs at byte {} on '{topic}'{scope} (recorded {} B, replayed {} B)",
-                bv.index, bv.first_diff_byte_offset, bv.recorded_len, bv.replayed_len
-            ),
+            detail: crate::replay_value_diff::byte_mismatch_detail(topic, &scope, bv),
         });
     }
 }
@@ -27326,14 +27805,42 @@ fn describe_fire(f: &FireTuple) -> String {
 // Environment divergence
 // ===========================================================================
 
-/// Compare the CURRENT process environment against the bag's `env.json`
-/// (WARN-only). Iterates the RECORDED entries (the bag is the golden): a
-/// recorded name absent now is `Missing`; a recorded plain value that differs is
-/// `ValueChanged`; a recorded redacted `fnv64` the current value does not hash
-/// to is `HashChanged`; a names-only (null) entry is presence-checked only.
-/// Extra current-only variables are NOT reported (a replay host legitimately
-/// has more). Returns divergences in the recorded object's key order.
+/// Compare the replay process's own environment with the bag's `env.json`.
+///
+/// [`compare_env_against`] over `std::env::vars_os()`: every variable whose
+/// name is UTF-8 (a recorded name always is, since `env.json` is JSON), with its
+/// value as raw bytes, so a value that is not UTF-8 compares as the bytes it is
+/// rather than reading as absent.
 fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let current: BTreeMap<String, Vec<u8>> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            name.to_str()
+                .map(|name| (name.to_string(), value.as_bytes().to_vec()))
+        })
+        .collect();
+    compare_env_against(env_json, &current)
+}
+
+/// Compare `current` (name to raw value bytes) with the bag's `env.json`. Pure.
+///
+/// The RECORDED entries are walked first: a recorded name absent now is
+/// `Missing`; a recorded plain value the current bytes differ from is
+/// `ValueChanged`; a recorded redacted `fnv64` the current bytes do not hash to
+/// is `HashChanged`; a names-only (null) entry is presence-checked only; a
+/// redacted object without an `fnv64` and a bool or number carry nothing to
+/// compare and are skipped. Then every CURRENT name the bag did not record is
+/// `Added` when [`env_reader`] says it can change the re-execution, and ignored
+/// otherwise (a replay host legitimately has more shell and session variables
+/// than the recording host).
+///
+/// No `env.json` means no comparison at all, `Added` included. The result is
+/// sorted by name, so its order depends on neither the JSON object's key order
+/// nor the environment's.
+fn compare_env_against(
+    env_json: Option<&[u8]>,
+    current: &BTreeMap<String, Vec<u8>>,
+) -> Vec<EnvDivergence> {
     let Some(bytes) = env_json else {
         return Vec::new();
     };
@@ -27345,12 +27852,11 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
     };
     let mut out = Vec::new();
     for (name, value) in &map {
-        let current = std::env::var(name).ok();
+        let now = current.get(name);
         match value {
-            // Names-only: presence check only. (Match-arm guard rather than
-            // a nested `if` — newer stable clippy collapses the two,
-            // deny-level in CI.)
-            serde_json::Value::Null if current.is_none() => {
+            // Names-only: presence check only. A match-arm guard rather than a
+            // nested `if`, which newer stable clippy collapses (deny-level in CI).
+            serde_json::Value::Null if now.is_none() => {
                 out.push(EnvDivergence {
                     name: name.clone(),
                     kind: EnvDivergenceKind::Missing,
@@ -27358,26 +27864,28 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                 });
             }
             serde_json::Value::Null => {}
-            serde_json::Value::String(recorded_value) => match current {
+            serde_json::Value::String(recorded_value) => match now {
                 None => out.push(EnvDivergence {
                     name: name.clone(),
                     kind: EnvDivergenceKind::Missing,
                     detail: format!("recorded variable '{name}' is absent at replay"),
                 }),
-                Some(cur) if cur != *recorded_value => out.push(EnvDivergence {
-                    name: name.clone(),
-                    kind: EnvDivergenceKind::ValueChanged,
-                    detail: format!("variable '{name}' value changed since recording"),
-                }),
+                Some(cur) if cur.as_slice() != recorded_value.as_bytes() => {
+                    out.push(EnvDivergence {
+                        name: name.clone(),
+                        kind: EnvDivergenceKind::ValueChanged,
+                        detail: format!("variable '{name}' value changed since recording"),
+                    })
+                }
                 Some(_) => {}
             },
             serde_json::Value::Object(obj) => {
                 // Redacted shape: {"redacted": true, "fnv64": "<hex>"}.
                 let recorded_fnv = obj.get("fnv64").and_then(serde_json::Value::as_str);
                 let Some(recorded_fnv) = recorded_fnv else {
-                    continue; // unknown object shape — nothing to compare.
+                    continue; // An unknown object shape has nothing to compare.
                 };
-                match current {
+                match now {
                     None => out.push(EnvDivergence {
                         name: name.clone(),
                         kind: EnvDivergenceKind::Missing,
@@ -27386,8 +27894,7 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                         ),
                     }),
                     Some(cur) => {
-                        let cur_fnv =
-                            format!("{:016x}", cerulion_core::wire::fnv1a_hash(cur.as_bytes()));
+                        let cur_fnv = format!("{:016x}", cerulion_core::wire::fnv1a_hash(cur));
                         if cur_fnv != recorded_fnv {
                             out.push(EnvDivergence {
                                 name: name.clone(),
@@ -27401,10 +27908,912 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                     }
                 }
             }
-            _ => {} // unexpected scalar (bool/number) — no value semantics.
+            _ => {} // An unexpected scalar (bool or number) has no value semantics.
         }
     }
+    for name in current.keys() {
+        if !map.contains_key(name) && env_reader(name).is_some() {
+            out.push(EnvDivergence {
+                name: name.clone(),
+                kind: EnvDivergenceKind::Added,
+                detail: format!("variable '{name}' is set at replay but absent from the recording"),
+            });
+        }
+    }
+    // Names are unique (a recorded name is never also `Added`), so the order is
+    // total.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The NOTE line for `n` differing variables that Cerulion does not read
+/// ([`env_reader`] gives `None`), or `None` for zero. It names no variable and
+/// no value.
+fn render_other_env_note(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some(
+            "NOTE: 1 other environment variable differs from the recording. Cerulion does not \
+             read it to decide what the re-execution runs, so it matters only if code in one of \
+             your nodes reads it. Run with -v to list it."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "NOTE: {n} other environment variables differ from the recording. Cerulion does not \
+             read them to decide what the re-execution runs, so they matter only if code in one \
+             of your nodes reads them. Run with -v to list them."
+        )),
+    }
+}
+
+/// The terminal lines for `divergences`, the one source of that text for the
+/// verdict ([`render_verdict`]) and the neutral resim summary.
+///
+/// One `WARNING:` line for each variable that can change the re-execution
+/// ([`env_reader`]), in list order, then at most one `NOTE:` that counts every
+/// other one. No line carries a value or a hash, and the NOTE names no
+/// variable: `-v` lists those (the engine's `info` line for each), and the
+/// `--report` JSON carries every divergence in full. A name is printed escaped
+/// (`str::escape_debug`), so a crafted `env.json` key cannot start a line of its
+/// own.
+pub(crate) fn render_env_divergence_lines(divergences: &[EnvDivergence]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut others = 0usize;
+    for d in divergences {
+        match env_reader(&d.name) {
+            Some(reader) => lines.push(format!(
+                "WARNING: environment variable {} {}. {}",
+                d.name.escape_debug(),
+                d.kind.change_phrase(),
+                reader.reason()
+            )),
+            None => others += 1,
+        }
+    }
+    lines.extend(render_other_env_note(others));
+    lines
+}
+
+#[cfg(test)]
+mod env_divergence_tests {
+    use super::*;
+
+    /// A current environment from hand-written pairs.
+    fn current(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.to_vec()))
+            .collect()
+    }
+
+    /// `(name, kind tag, detail, read_by)` as the `--report` JSON states them.
+    type Row = (String, String, String, serde_json::Value);
+
+    /// Each divergence as a [`Row`], read through the `--report` serialization
+    /// so the JSON contract is what is compared.
+    fn project(divergences: &[EnvDivergence]) -> Vec<Row> {
+        divergences
+            .iter()
+            .map(|d| {
+                let json = serde_json::to_value(d).expect("an entry serializes");
+                (
+                    json["name"].as_str().expect("name").to_string(),
+                    json["kind"]["kind"].as_str().expect("kind tag").to_string(),
+                    json["detail"].as_str().expect("detail").to_string(),
+                    json["read_by"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn row(name: &str, kind: &str, detail: &str, read_by: Option<&str>) -> Row {
+        (
+            name.to_string(),
+            kind.to_string(),
+            detail.to_string(),
+            read_by.map_or(serde_json::Value::Null, |r| {
+                serde_json::Value::String(r.to_string())
+            }),
+        )
+    }
+
+    #[test]
+    fn the_variables_cerulion_the_linker_and_python_read_are_classified_by_reader() {
+        let table = [
+            ("CERULION_DRAIN_DISCIPLINE", EnvReader::Cerulion),
+            ("CERULION_FIRE_THREADS", EnvReader::Cerulion),
+            ("IOX2_LOG_LEVEL", EnvReader::Cerulion),
+            ("CERULION_KEYBOARD_LAYOUT", EnvReader::Cerulion),
+            ("CERULION_APIKEY", EnvReader::Cerulion),
+            ("LD_LIBRARY_PATH", EnvReader::DynamicLinker),
+            ("LD_PRELOAD", EnvReader::DynamicLinker),
+            ("DYLD_INSERT_LIBRARIES", EnvReader::DynamicLinker),
+            ("DYLD_FALLBACK_LIBRARY_PATH", EnvReader::DynamicLinker),
+            ("PYTHONPATH", EnvReader::Python),
+            ("PYTHONHASHSEED", EnvReader::Python),
+            ("CARGO_TARGET_DIR", EnvReader::NodeLibraryLookup),
+        ];
+        for (name, reader) in table {
+            assert_eq!(env_reader(name), Some(reader), "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_session_library_and_secret_named_variables_are_not_classified() {
+        let none = [
+            "SHLVL",
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "TERM_SESSION_ID",
+            "ROS_DOMAIN_ID",
+            "RMW_IMPLEMENTATION",
+            "AMENT_PREFIX_PATH",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "LDFLAGS",
+            "LD",
+            "CARGO_HOME",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_TARGET_DIRS",
+            "CARGO_TARGET",
+            "cargo_target_dir",
+            "CERULION",
+            "IOX2",
+            "DYLD",
+            "cerulion_drain_discipline",
+            "ld_library_path",
+            "pythonpath",
+            "",
+            // Secret-marked names, by the recorder's own marker rule.
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "CERULION_KEY2",
+            "CERULION_ACCOUNTD_SUPABASE_JWT_SECRET",
+            "IOX2_SECRET",
+            "LD_PASSWORD",
+            "PYTHON_KEYS",
+        ];
+        for name in none {
+            assert_eq!(env_reader(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_changed_hash_and_a_changed_plain_value_are_reported_with_their_details() {
+        // FNV-1a 64 of "a" is the published test vector af63dc4c8601ec8c, and of
+        // "foobar" 85944171f73967e8.
+        let env = br#"{"SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("SHLVL", b"foobar")])
+            )),
+            vec![row(
+                "SHLVL",
+                "HashChanged",
+                "redacted variable 'SHLVL' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                None,
+            )]
+        );
+
+        let env = br#"{"CERULION_X": "a"}"#;
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("CERULION_X", b"b")])
+            )),
+            vec![row(
+                "CERULION_X",
+                "ValueChanged",
+                "variable 'CERULION_X' value changed since recording",
+                Some("cerulion"),
+            )]
+        );
+    }
+
+    #[test]
+    fn matching_values_and_hashes_report_nothing() {
+        // FNV-1a 64 of "" is the offset basis cbf29ce484222325, of "a"
+        // af63dc4c8601ec8c.
+        let env = br#"{
+            "EMPTY": {"redacted": true, "fnv64": "cbf29ce484222325"},
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "CERULION_X": "a",
+            "PRESENT_NAME": null
+        }"#;
+        let now = current(&[
+            ("EMPTY", b""),
+            ("SHLVL", b"a"),
+            ("CERULION_X", b"a"),
+            ("PRESENT_NAME", b"anything"),
+        ]);
+        assert!(compare_env_against(Some(env), &now).is_empty());
+    }
+
+    #[test]
+    fn a_bag_without_env_json_is_never_compared_even_for_added_variables() {
+        let now = current(&[("CERULION_A", b"1"), ("LD_PRELOAD", b"/x.so")]);
+        assert!(compare_env_against(None, &now).is_empty());
+    }
+
+    #[test]
+    fn every_recorded_arm_reports_its_own_kind_and_detail() {
+        let env = br#"{
+            "NAMES_ONLY_ABSENT": null,
+            "NAMES_ONLY_PRESENT": null,
+            "PLAIN_ABSENT": "v",
+            "REDACTED_ABSENT": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "REDACTED_NO_HASH": {"redacted": true},
+            "A_BOOL": true,
+            "A_NUMBER": 3
+        }"#;
+        let now = current(&[
+            ("NAMES_ONLY_PRESENT", b"x"),
+            ("REDACTED_NO_HASH", b"x"),
+            ("A_BOOL", b"false"),
+            ("A_NUMBER", b"4"),
+        ]);
+        assert_eq!(
+            project(&compare_env_against(Some(env), &now)),
+            vec![
+                row(
+                    "NAMES_ONLY_ABSENT",
+                    "Missing",
+                    "recorded (names-only) variable 'NAMES_ONLY_ABSENT' is absent at replay",
+                    None,
+                ),
+                row(
+                    "PLAIN_ABSENT",
+                    "Missing",
+                    "recorded variable 'PLAIN_ABSENT' is absent at replay",
+                    None,
+                ),
+                row(
+                    "REDACTED_ABSENT",
+                    "Missing",
+                    "recorded (redacted) variable 'REDACTED_ABSENT' is absent at replay",
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loud_variable_set_only_at_replay_is_added_in_name_order() {
+        let now = current(&[
+            ("CERULION_B", b"2"),
+            ("LD_PRELOAD", b"/x.so"),
+            ("CERULION_A", b"1"),
+        ]);
+        assert_eq!(
+            project(&compare_env_against(Some(b"{}"), &now)),
+            vec![
+                row(
+                    "CERULION_A",
+                    "Added",
+                    "variable 'CERULION_A' is set at replay but absent from the recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "CERULION_B",
+                    "Added",
+                    "variable 'CERULION_B' is set at replay but absent from the recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "LD_PRELOAD",
+                    "Added",
+                    "variable 'LD_PRELOAD' is set at replay but absent from the recording",
+                    Some("dynamic_linker"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn other_and_secret_variables_set_only_at_replay_are_not_added() {
+        let env = br#"{"CERULION_X": {"redacted": true}}"#;
+        let now = current(&[
+            ("SHLVL", b"2"),
+            ("PATH", b"/bin"),
+            ("HOME", b"/h"),
+            ("OMP_NUM_THREADS", b"4"),
+            ("CERULION_RCP_TOKEN", b"t"),
+            // Recorded, as an object with no hash: skipped, never Added.
+            ("CERULION_X", b"x"),
+        ]);
+        assert!(compare_env_against(Some(env), &now).is_empty());
+    }
+
+    #[test]
+    fn a_value_that_is_not_utf8_is_compared_as_bytes_and_never_reads_as_absent() {
+        let env =
+            br#"{"CERULION_X": "a", "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let now = current(&[("CERULION_X", &[0xff]), ("SHLVL", &[0xff])]);
+        let kinds: Vec<(String, String)> = project(&compare_env_against(Some(env), &now))
+            .into_iter()
+            .map(|(name, kind, _, _)| (name, kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("CERULION_X".to_string(), "ValueChanged".to_string()),
+                ("SHLVL".to_string(), "HashChanged".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shape_the_gate_refuses_yields_no_divergence() {
+        let now = current(&[("CERULION_A", b"1")]);
+        assert!(compare_env_against(Some(b"[1, 2]"), &now).is_empty());
+        assert!(compare_env_against(Some(b"{not json"), &now).is_empty());
+    }
+
+    #[test]
+    fn a_mixed_list_is_sorted_by_name_whatever_the_key_order() {
+        // Keys deliberately out of order in the document.
+        let env = br#"{
+            "ZZ_SESSION": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "PYTHONPATH": "/old",
+            "AA_GONE": null
+        }"#;
+        let now = current(&[
+            ("ZZ_SESSION", b"foobar"),
+            ("PYTHONPATH", b"/new"),
+            ("DYLD_INSERT_LIBRARIES", b"/x.dylib"),
+        ]);
+        let names: Vec<String> = compare_env_against(Some(env), &now)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "AA_GONE",
+                "DYLD_INSERT_LIBRARIES",
+                "PYTHONPATH",
+                "ZZ_SESSION"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_comparison_is_identical_across_runs_and_insertion_orders() {
+        let env =
+            br#"{"SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}, "CERULION_X": "a"}"#;
+        let pairs: [(&str, &[u8]); 4] = [
+            ("SHLVL", b"foobar"),
+            ("CERULION_X", b"b"),
+            ("LD_PRELOAD", b"/x.so"),
+            ("HOME", b"/h"),
+        ];
+        let forward = current(&pairs);
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let reversed = current(&reversed_pairs);
+        let first = compare_env_against(Some(env), &forward);
+        let second = compare_env_against(Some(env), &forward);
+        let other_order = compare_env_against(Some(env), &reversed);
+        assert_eq!(project(&first), project(&second));
+        assert_eq!(project(&first), project(&other_order));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+    }
+
+    #[test]
+    fn a_report_entry_carries_read_by_after_the_existing_keys() {
+        let entries = [
+            EnvDivergence {
+                name: "CERULION_DRAIN_DISCIPLINE".to_string(),
+                kind: EnvDivergenceKind::Added,
+                detail: "variable 'CERULION_DRAIN_DISCIPLINE' is set at replay but absent from \
+                         the recording"
+                    .to_string(),
+            },
+            EnvDivergence {
+                name: "SHLVL".to_string(),
+                kind: EnvDivergenceKind::HashChanged,
+                detail: "d".to_string(),
+            },
+            EnvDivergence {
+                name: "PYTHONHOME".to_string(),
+                kind: EnvDivergenceKind::Missing,
+                detail: "d".to_string(),
+            },
+            EnvDivergence {
+                name: "LD_LIBRARY_PATH".to_string(),
+                kind: EnvDivergenceKind::ValueChanged,
+                detail: "d".to_string(),
+            },
+        ];
+        let rendered: Vec<String> = entries
+            .iter()
+            .map(|e| serde_json::to_string(e).expect("serializes"))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                r#"{"name":"CERULION_DRAIN_DISCIPLINE","kind":{"kind":"Added"},"detail":"variable 'CERULION_DRAIN_DISCIPLINE' is set at replay but absent from the recording","read_by":"cerulion"}"#,
+                r#"{"name":"SHLVL","kind":{"kind":"HashChanged"},"detail":"d","read_by":null}"#,
+                r#"{"name":"PYTHONHOME","kind":{"kind":"Missing"},"detail":"d","read_by":"python"}"#,
+                r#"{"name":"LD_LIBRARY_PATH","kind":{"kind":"ValueChanged"},"detail":"d","read_by":"dynamic_linker"}"#,
+            ]
+        );
+    }
+
+    fn divergence(name: &str, kind: EnvDivergenceKind) -> EnvDivergence {
+        EnvDivergence {
+            name: name.to_string(),
+            kind,
+            detail: format!("detail of {name}"),
+        }
+    }
+
+    const NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
+                            Cerulion does not read it to decide what the re-execution runs, so \
+                            it matters only if code in one of your nodes reads it. Run with -v \
+                            to list it.";
+
+    #[test]
+    fn the_change_label_is_the_serialized_kind_tag() {
+        for (kind, tag) in [
+            (EnvDivergenceKind::Missing, "Missing"),
+            (EnvDivergenceKind::ValueChanged, "ValueChanged"),
+            (EnvDivergenceKind::HashChanged, "HashChanged"),
+            (EnvDivergenceKind::Added, "Added"),
+        ] {
+            assert_eq!(kind.label(), tag);
+            assert_eq!(
+                serde_json::to_value(&kind).expect("serializes")["kind"],
+                serde_json::Value::String(tag.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_and_reader_renders_its_exact_warning_line() {
+        let table = [
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE has a different value \
+                 than in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE has a different value \
+                 than in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE was set in the \
+                 recording and is not set now. Cerulion reads its settings from CERULION_ and \
+                 IOX2_ variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE is set now and was not \
+                 set in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable LD_PRELOAD has a different value than in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable LD_PRELOAD has a different value than in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable LD_PRELOAD was set in the recording and is not \
+                 set now. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable PYTHONHASHSEED has a different value than in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable PYTHONHASHSEED has a different value than in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable PYTHONHASHSEED was set in the recording and is \
+                 not set now. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable PYTHONHASHSEED is set now and was not set in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::ValueChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::HashChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CARGO_TARGET_DIR was set in the recording and is \
+                 not set now. Cerulion reads it to choose the build directory it loads each node \
+                 library from, so it can change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Added,
+                CARGO_TARGET_DIR_ADDED,
+            ),
+        ];
+        for (name, kind, expected) in table {
+            assert_eq!(
+                render_env_divergence_lines(&[divergence(name, kind)]),
+                vec![expected.to_string()]
+            );
+        }
+    }
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` whose value or hash differs,
+    /// hand-written.
+    const CARGO_TARGET_DIR_CHANGED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR has a different value than in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` set only at replay,
+    /// hand-written.
+    const CARGO_TARGET_DIR_ADDED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR is set now and was not set in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    #[test]
+    fn a_changed_cargo_target_dir_is_reported_loud_on_its_own_line() {
+        // A plain recorded value (`--record-env all`) the replay shell changed,
+        // beside one differing shell variable the NOTE counts. FNV-1a 64 of "a"
+        // is the published vector af63dc4c8601ec8c, and of "foobar"
+        // 85944171f73967e8.
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[("CARGO_TARGET_DIR", b"/build/replay"), ("SHLVL", b"foobar")]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(
+            project(&divergences),
+            vec![
+                row(
+                    "CARGO_TARGET_DIR",
+                    "ValueChanged",
+                    "variable 'CARGO_TARGET_DIR' value changed since recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "SHLVL",
+                    "HashChanged",
+                    "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)",
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string(), NOTE_ONE.to_string()]
+        );
+
+        // The default recorder hashes the value: a changed hash is just as loud.
+        let env = br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let divergences =
+            compare_env_against(Some(env), &current(&[("CARGO_TARGET_DIR", b"foobar")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "HashChanged",
+                "redacted variable 'CARGO_TARGET_DIR' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string()]
+        );
+
+        // Set only in the replay shell: Added, though the name is in no loud
+        // namespace.
+        let divergences =
+            compare_env_against(Some(b"{}"), &current(&[("CARGO_TARGET_DIR", b"/build/x")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "Added",
+                "variable 'CARGO_TARGET_DIR' is set at replay but absent from the recording",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_ADDED.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_cargo_target_dir_equal_to_the_recording_is_silent() {
+        // FNV-1a 64 of "a" is the published vector af63dc4c8601ec8c.
+        let now = current(&[("CARGO_TARGET_DIR", b"a")]);
+        for env in [
+            &br#"{"CARGO_TARGET_DIR": "a"}"#[..],
+            &br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#[..],
+            &br#"{"CARGO_TARGET_DIR": null}"#[..],
+        ] {
+            let divergences = compare_env_against(Some(env), &now);
+            assert!(divergences.is_empty(), "{divergences:?}");
+            assert!(render_env_divergence_lines(&divergences).is_empty());
+        }
+        // Unset on both sides: nothing to compare.
+        assert!(compare_env_against(Some(b"{}"), &current(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_cargo_target_dir_lines_are_identical_across_runs_and_insertion_orders() {
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let pairs: [(&str, &[u8]); 3] = [
+            ("SHLVL", b"foobar"),
+            ("CARGO_TARGET_DIR", b"/build/replay"),
+            ("LD_PRELOAD", b"/x.so"),
+        ];
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let first = compare_env_against(Some(env), &current(&pairs));
+        let second = compare_env_against(Some(env), &current(&pairs));
+        let other_order = compare_env_against(Some(env), &current(&reversed_pairs));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+        let lines = render_env_divergence_lines(&first);
+        assert_eq!(lines, render_env_divergence_lines(&second));
+        assert_eq!(lines, render_env_divergence_lines(&other_order));
+        assert_eq!(
+            lines,
+            vec![
+                CARGO_TARGET_DIR_CHANGED.to_string(),
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                NOTE_ONE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_other_variable_renders_the_singular_note() {
+        assert_eq!(
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]),
+            vec![NOTE_ONE.to_string()]
+        );
+    }
+
+    #[test]
+    fn two_other_variables_render_the_plural_note() {
+        assert_eq!(
+            render_env_divergence_lines(&[
+                divergence("SHLVL", EnvDivergenceKind::HashChanged),
+                divergence("OLDPWD", EnvDivergenceKind::Missing),
+            ]),
+            vec![
+                "NOTE: 2 other environment variables differ from the recording. Cerulion does \
+                 not read them to decide what the re-execution runs, so they matter only if code \
+                 in one of your nodes reads them. Run with -v to list them."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn no_divergence_renders_no_line_and_loud_only_input_renders_no_note() {
+        assert!(render_env_divergence_lines(&[]).is_empty());
+        let lines = render_env_divergence_lines(&[
+            divergence("CERULION_A", EnvDivergenceKind::Added),
+            divergence("DYLD_INSERT_LIBRARIES", EnvDivergenceKind::Missing),
+        ]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.starts_with("WARNING: ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_input_renders_the_loud_lines_in_list_order_and_then_one_note() {
+        let lines = render_env_divergence_lines(&[
+            divergence("SHLVL", EnvDivergenceKind::HashChanged),
+            divergence("LD_PRELOAD", EnvDivergenceKind::Missing),
+            divergence("TERM_SESSION_ID", EnvDivergenceKind::HashChanged),
+            divergence("CERULION_A", EnvDivergenceKind::Added),
+            divergence("OMP_NUM_THREADS", EnvDivergenceKind::ValueChanged),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: environment variable LD_PRELOAD was set in the recording and is not \
+                 set now. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                "WARNING: environment variable CERULION_A is set now and was not set in the \
+                 recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, so \
+                 this one can change the re-execution."
+                    .to_string(),
+                "NOTE: 3 other environment variables differ from the recording. Cerulion does \
+                 not read them to decide what the re-execution runs, so they matter only if code \
+                 in one of your nodes reads them. Run with -v to list them."
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// Whether `line` holds a run of 16 hex digits, the shape of an `fnv64`.
+    fn has_hex_run(line: &str) -> bool {
+        let mut run = 0usize;
+        for c in line.chars() {
+            run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+            if run >= 16 {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn no_rendered_line_carries_a_value_a_hash_or_an_other_name() {
+        // FNV-1a 64 of "a" is af63dc4c8601ec8c; the current values hash to
+        // something else, so both entries diverge.
+        let env = br#"{
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "CERULION_SECRETARY_MODE": "recorded-value",
+            "LD_LIBRARY_PATH": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[
+            ("SHLVL", b"foobar"),
+            ("CERULION_SECRETARY_MODE", b"current-value"),
+            ("LD_LIBRARY_PATH", b"/opt/lib"),
+        ]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(divergences.len(), 3, "{divergences:?}");
+        let lines = render_env_divergence_lines(&divergences);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(!has_hex_run(line), "a hash reached the terminal: {line}");
+            for value in ["foobar", "recorded-value", "current-value", "/opt/lib"] {
+                assert!(
+                    !line.contains(value),
+                    "a value reached the terminal: {line}"
+                );
+            }
+        }
+        let note = lines.last().expect("the NOTE");
+        assert!(note.starts_with("NOTE: 1 other"), "{note}");
+        assert!(
+            !note.contains("SHLVL"),
+            "the NOTE names no variable: {note}"
+        );
+        assert_eq!(lines, render_env_divergence_lines(&divergences));
+    }
+
+    #[test]
+    fn a_control_character_in_a_name_cannot_start_a_line_of_its_own() {
+        let lines = render_env_divergence_lines(&[divergence(
+            "CERULION_X\nreplay PASS: forged",
+            EnvDivergenceKind::Added,
+        )]);
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: environment variable CERULION_X\\nreplay PASS: forged is set now and \
+                 was not set in the recording. Cerulion reads its settings from CERULION_ and \
+                 IOX2_ variables, so this one can change the re-execution."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The getting-started tutorial quotes the NOTE line a resim prints for
+    /// one differing shell variable, in a fence of its own in the section that
+    /// verifies the unchanged code, names the WARNING prefix the renderer
+    /// prints, and quotes no `WARNING: env divergence` line, a prefix the
+    /// renderer does not print.
+    #[test]
+    fn the_getting_started_tutorial_quotes_the_environment_lines_the_resim_prints() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/tutorials/01-getting-started.md");
+        let tutorial = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let section = tutorial
+            .split_once("### Verify the unchanged code")
+            .expect("the tutorial verifies the unchanged code")
+            .1
+            .split_once("### Change the controller")
+            .expect("the section ends at the controller change")
+            .0;
+        let fences: Vec<&str> = section
+            .split("```")
+            .skip(1)
+            .step_by(2)
+            .map(str::trim)
+            .collect();
+        let note =
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]);
+        assert_eq!(note.len(), 1, "{note:?}");
+        assert!(
+            fences.contains(&note[0].as_str()),
+            "the tutorial must fence the exact NOTE line: {fences:?}"
+        );
+        let loud = render_env_divergence_lines(&[divergence(
+            "CERULION_DRAIN_DISCIPLINE",
+            EnvDivergenceKind::ValueChanged,
+        )]);
+        assert!(
+            loud[0].starts_with("WARNING: environment variable "),
+            "{loud:?}"
+        );
+        assert!(
+            section.contains("`WARNING: environment variable`"),
+            "the tutorial names the WARNING prefix"
+        );
+        assert!(
+            !tutorial.contains("WARNING: env divergence"),
+            "the tutorial must not quote the `WARNING: env divergence` prefix, which the \
+             renderer does not print"
+        );
+    }
 }
 
 // ===========================================================================
@@ -27677,8 +29086,10 @@ pub fn render_enforcement_line(enforcement: &ReadLogEnforcement) -> Option<Strin
 /// (both headers render from [`DivergenceClass`]) naming each
 /// violated topic and its first divergence, in graph-definition order
 /// (deterministic). Both blocks render when both are present (the trace
-/// divergence takes exit precedence but the data section is still shown). Env
-/// divergences are always listed as warnings (they never fail the run).
+/// divergence takes exit precedence but the data section is still shown). On
+/// both paths, a `WARNING:` line names each environment variable that can
+/// change the re-execution and differs from the recording, and one `NOTE:`
+/// counts the other differing variables; neither fails the run.
 ///
 /// Both count lines also state how many topics were DECLINED and
 /// how many of those matched under the fallback — `topics_passed` excludes a
@@ -27699,8 +29110,11 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         let _ = writeln!(s, "{line}");
     }
 
-    for d in &outcome.env_divergence {
-        let _ = writeln!(s, "WARNING: env divergence: {}", d.detail);
+    // The environment block, on the pass path and the fail path alike: a
+    // WARNING for each variable that can change the re-execution, then one
+    // NOTE counting the rest.
+    for line in render_env_divergence_lines(&outcome.env_divergence) {
+        let _ = writeln!(s, "{line}");
     }
 
     // The ragged shutdown-tail tolerances that ENGAGED — rendered in
@@ -33510,6 +34924,11 @@ mod capture_partition_tests {
             .collect()
     }
 
+    /// The judge of a fold whose streams never diverged.
+    fn no_divergence(_: ByteViolation) -> crate::replay_value_diff::ByteVerdict {
+        unreachable!("no stream in these folds diverged")
+    }
+
     /// The verdict inputs are the UNION of both sides: a writer the recording
     /// carries that replay never produced, and a writer replay produced that
     /// the recording never carried, must BOTH report.
@@ -33528,7 +34947,8 @@ mod capture_partition_tests {
         let got = fold_partition_counts(
             &recorded,
             &producible,
-            &streams(&[("alpha/out", 2), ("gamma/out", 1)]),
+            &mut streams(&[("alpha/out", 2), ("gamma/out", 1)]),
+            &mut no_divergence,
         );
         let recorded_only = got
             .get(&key("beta/out"))
@@ -33562,7 +34982,12 @@ mod capture_partition_tests {
         // This pass owns `left` only: `right` runs on another rank and is not
         // injected here.
         let producible: BTreeSet<WriterKey> = std::iter::once(key("left/bus")).collect();
-        let got = fold_partition_counts(&recorded, &producible, &streams(&[("left/bus", 2)]));
+        let got = fold_partition_counts(
+            &recorded,
+            &producible,
+            &mut streams(&[("left/bus", 2)]),
+            &mut no_divergence,
+        );
         assert_eq!(
             got.keys().cloned().collect::<Vec<_>>(),
             vec![key("left/bus")],
@@ -33577,7 +35002,8 @@ mod capture_partition_tests {
         let surprise = fold_partition_counts(
             &recorded,
             &producible,
-            &streams(&[("left/bus", 2), ("right/bus", 1)]),
+            &mut streams(&[("left/bus", 2), ("right/bus", 1)]),
+            &mut no_divergence,
         );
         let extra = surprise
             .get(&key("right/bus"))
@@ -33586,22 +35012,40 @@ mod capture_partition_tests {
     }
 
     /// The count/byte sentences NAME the writer on a partitioned topic and carry
-    /// no writer clause at all without one.
+    /// no writer clause at all without one; the byte line names the field and
+    /// both values either way.
     #[test]
     fn a_stream_violation_names_its_writer_only_when_it_has_one() {
-        let bv = ByteViolation {
+        use crate::replay_value_diff::{ByteVerdict, FrameDifference, Shown, ValueDifference};
+        let bv = ByteVerdict {
             index: 4,
-            first_diff_byte_offset: 37,
-            recorded_len: 56,
-            replayed_len: 56,
+            first_diff_byte_offset: 40,
+            recorded_len: 64,
+            replayed_len: 64,
+            difference: FrameDifference::Field {
+                value: ValueDifference {
+                    path: "x".to_string(),
+                    within: None,
+                    recorded: Shown {
+                        text: "5.0".to_string(),
+                        json: DifferenceValue::Float64(5.0),
+                    },
+                    replayed: Shown {
+                        text: "6.0".to_string(),
+                        json: DifferenceValue::Float64(6.0),
+                    },
+                },
+                more: 0,
+            },
         };
         let mut plain = Vec::new();
-        push_stream_violations("/mp/bus", None, 3, 2, Some(bv), &mut plain);
+        push_stream_violations("/mp/bus", None, 3, 2, Some(&bv), &mut plain);
         assert_eq!(
             plain.iter().map(|v| v.detail.clone()).collect::<Vec<_>>(),
             vec![
                 "recorded 3 frame(s), replay produced 2 on '/mp/bus'".to_string(),
-                "frame 4 differs at byte 37 on '/mp/bus' (recorded 56 B, replayed 56 B)"
+                "frame 4 on '/mp/bus' differs at x: recorded 5.0, replayed 6.0 (recorded 64 B, \
+                 replayed 64 B)"
                     .to_string(),
             ]
         );
@@ -33611,7 +35055,7 @@ mod capture_partition_tests {
             Some(&WriterKey::Named("beta/out".into())),
             3,
             2,
-            Some(bv),
+            Some(&bv),
             &mut named,
         );
         assert_eq!(
@@ -33619,8 +35063,8 @@ mod capture_partition_tests {
             vec![
                 "recorded 3 frame(s), replay produced 2 on '/mp/bus' from writer beta/out"
                     .to_string(),
-                "frame 4 differs at byte 37 on '/mp/bus' from writer beta/out (recorded 56 B, \
-                 replayed 56 B)"
+                "frame 4 on '/mp/bus' from writer beta/out differs at x: recorded 5.0, replayed \
+                 6.0 (recorded 64 B, replayed 64 B)"
                     .to_string(),
             ]
         );
@@ -33635,6 +35079,29 @@ mod capture_partition_tests {
                 .iter()
                 .map(|v| format!("{:?}", v.class))
                 .collect::<Vec<_>>()
+        );
+        // The report keeps the frame coordinates and gains the flat entry.
+        assert_eq!(
+            serde_json::to_value(&plain[1].class).expect("serializes"),
+            serde_json::json!({
+                "kind": "ByteMismatch",
+                "index": 4,
+                "first_diff_byte_offset": 40,
+                "recorded_len": 64,
+                "replayed_len": 64,
+                "difference": {
+                    "kind": "field",
+                    "path": "x",
+                    "recorded": 5.0,
+                    "replayed": 6.0,
+                    "field_byte": null,
+                    "field_char": null,
+                    "byte_offset": null,
+                    "region": null,
+                    "reason": null,
+                    "more": 0,
+                },
+            })
         );
     }
 

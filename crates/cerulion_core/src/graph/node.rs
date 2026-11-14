@@ -2398,8 +2398,9 @@ impl NodeContext {
     /// vars, prefer [`Self::env_str`] — it skips the `FromStr` round-trip.
     ///
     /// Reads the snapshot of the environment taken when the graph was built,
-    /// never live `std::env`, so a replay reads the same value. A key that was
-    /// unset at build time returns `default` for the whole run.
+    /// never live `std::env`, so every read in a run returns the same value; a
+    /// resim takes the snapshot from the shell it runs in. A key that was unset
+    /// at build time returns `default` for the whole run.
     ///
     /// # Example
     ///
@@ -2456,9 +2457,8 @@ impl NodeContext {
 
     /// String-typed env var lookup.
     ///
-    /// Reads from the runtime's frozen env snapshot
-    /// (for replay determinism).
-    /// There is no live `std::env::var` fallback;
+    /// Reads from the runtime's frozen env snapshot, so every read in a run
+    /// returns the same value. There is no live `std::env::var` fallback;
     /// keys absent from the snapshot return `default`.
     ///
     /// See [`Self::env`] for an example in a node's `init`.

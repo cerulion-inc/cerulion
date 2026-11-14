@@ -40,8 +40,8 @@ use cerulion_bag::{BagReader, BagWriter, BagWriterConfig, TopicSchema};
 use cerulion_bagd::{RecordHealth, TopicHealth, RECORD_HEALTH_VERSION};
 use cerulion_cli_engine::replay_cmd::ReplayError;
 use cerulion_cli_engine::replay_engine::{
-    self, FireSide, RecordHealthReport, RecordedMessages, RecordedTrace, ReplayInputs, ReplayNodes,
-    ReplayOutcome, ViolationClass,
+    self, ByteDifference, DifferenceKind, DifferenceValue, FireSide, RecordHealthReport,
+    RecordedMessages, RecordedTrace, ReplayInputs, ReplayNodes, ReplayOutcome, ViolationClass,
 };
 use cerulion_core::graph::config::GraphConfig;
 use cerulion_core::graph::GraphRuntime;
@@ -2681,6 +2681,7 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ref difference,
         } => {
             assert_eq!(index, 2, "frame index named");
             assert_eq!(
@@ -2689,9 +2690,41 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
                 "the flip was at the first payload byte"
             );
             assert_eq!((recorded_len, replayed_len), (64, 64));
+            assert_eq!(difference.path.as_deref(), Some("x"));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
+    // The line names the field and both values. Oracle: frame 2's relay x
+    // is 3.0 + 100 = 103.0 (LE `00 00 00 00 00 c0 59 40`); byte 0 XOR 0xFF
+    // reads back as 103.00000000000362, the RECORDED side.
+    assert_eq!(
+        relay_violations[0].detail,
+        "frame 2 on '/sr/relay/out' differs at x: recorded 103.00000000000362, replayed 103.0 \
+         (recorded 64 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(&relay_violations[0].class).unwrap()["difference"],
+        serde_json::json!({
+            "kind": "field",
+            "path": "x",
+            "recorded": 103.00000000000362,
+            "replayed": 103.0,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": null,
+            "region": null,
+            "reason": null,
+            "more": 0,
+        })
+    );
+    // Determinism: a second replay of the same diverging bag names the same
+    // field with the same values, byte for byte.
+    let again = replay(&bag, source_relay_factories, None, None).unwrap();
+    assert_eq!(
+        serde_json::to_string(&outcome.violations).unwrap(),
+        serde_json::to_string(&again.violations).unwrap(),
+        "two replays of one diverging bag report identically"
+    );
     // The source topic (untouched) still passes.
     assert!(outcome
         .violations
@@ -2847,6 +2880,7 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ..
         } => {
             assert_eq!(index, 1, "the flipped common-prefix frame is named");
             assert_eq!(first_diff_byte_offset, WireHeader::SIZE);
@@ -2854,6 +2888,13 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
         }
         ref other => panic!("expected ByteMismatch second, got {other:?}"),
     }
+    // Oracle: frame 1's relay x is 2.0 + 100 = 102.0; byte 0 XOR 0xFF reads
+    // back as 102.00000000000362.
+    assert_eq!(
+        relay[1].detail,
+        "frame 1 on '/sr/relay/out' differs at x: recorded 102.00000000000362, replayed 102.0 \
+         (recorded 64 B, replayed 64 B)"
+    );
     // The untouched source topic still passes.
     assert!(outcome
         .violations
@@ -2977,10 +3018,18 @@ fn a_bare_resim_warns_each_data_violation_by_topic() {
             warned.as_slice(),
             cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
         ) {
-            ([line], 0) if line.contains("/sr/relay/out") => Ok(()),
+            // Hand oracle: frame 0's relay adds 101 instead of 100 to x = 1.0.
+            ([line], 0)
+                if line.contains(
+                    "frame 0 on '/sr/relay/out' differs at x: recorded 101.0, replayed 102.0 \
+                     (recorded 64 B, replayed 64 B)",
+                ) =>
+            {
+                Ok(())
+            }
             (other, infos) => Err(format!(
-                "expected ONE WARN naming /sr/relay/out and no INFO twin, got {other:?} and \
-                 {infos} INFO line(s)"
+                "expected ONE WARN naming /sr/relay/out's x and no INFO twin, got {other:?} \
+                 and {infos} INFO line(s)"
             )),
         }
     });
@@ -3579,12 +3628,12 @@ fn a_sampled_latest_relay_replays_byte_exact() {
 }
 
 // ===========================================================================
-// 10. Env divergence (WARN-only, never exit-affecting)
+// 10. Env divergence (never exit-affecting)
 // ===========================================================================
 
 #[test]
 #[serial]
-fn env_divergence_is_warn_only_and_surfaced() {
+fn env_divergence_never_fails_the_run_and_is_surfaced() {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 4);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("env.mcap");
@@ -3626,6 +3675,21 @@ fn env_divergence_is_warn_only_and_surfaced() {
         !names.contains(&"CER_REPLAY_HASHED"),
         "matching hashed var must NOT surface"
     );
+    // No runtime Cerulion starts reads it, so the report entry says so.
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_PLAIN"),
+        serde_json::Value::Null
+    );
+}
+
+/// The `--report` JSON's `read_by` value for the divergence named `name`.
+fn env_read_by(outcome: &ReplayOutcome, name: &str) -> serde_json::Value {
+    let d = outcome
+        .env_divergence
+        .iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| panic!("{name} diverged: {:?}", outcome.env_divergence));
+    serde_json::to_value(d).expect("an entry serializes")["read_by"].clone()
 }
 
 #[test]
@@ -3652,6 +3716,10 @@ fn env_redacted_hash_mismatch_is_surfaced() {
         matches!(d.kind, replay_engine::EnvDivergenceKind::HashChanged),
         "redacted value change is a HashChanged, got {:?}",
         d.kind
+    );
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_HASHED2"),
+        serde_json::Value::Null
     );
 }
 
@@ -4963,6 +5031,7 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ..
         } => {
             assert_eq!(index, 3, "the extended frame is the last of 4");
             assert_eq!(
@@ -4973,6 +5042,28 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
+    // Every value of the two frames is equal: the four extra bytes sit past
+    // the Vector3's last field (payload 24, frame byte 64).
+    assert_eq!(
+        source_violations[0].detail,
+        "frame 3 on '/sr/source/out' differs at byte 64, in bytes past the last field; every \
+         field value is equal (recorded 68 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(&source_violations[0].class).unwrap()["difference"],
+        serde_json::json!({
+            "kind": "layout",
+            "path": null,
+            "recorded": null,
+            "replayed": null,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": 64,
+            "region": "trailing_bytes",
+            "reason": null,
+            "more": 0,
+        })
+    );
 }
 
 // ===========================================================================
@@ -4991,7 +5082,7 @@ fn env_missing_recorded_var_is_missing_divergence() {
     std::env::remove_var("CER_REPLAY_ABSENT_V"); // ensure absent
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let d = outcome
         .env_divergence
         .iter()
@@ -5001,6 +5092,10 @@ fn env_missing_recorded_var_is_missing_divergence() {
         matches!(d.kind, replay_engine::EnvDivergenceKind::Missing),
         "got {:?}",
         d.kind
+    );
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_ABSENT_V"),
+        serde_json::Value::Null
     );
 }
 
@@ -5024,7 +5119,7 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
     std::env::remove_var("CER_REPLAY_NULL_PRESENT");
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let names: Vec<&str> = outcome
         .env_divergence
         .iter()
@@ -5044,6 +5139,343 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
         .find(|d| d.name == "CER_REPLAY_NULL_ABSENT")
         .unwrap();
     assert!(matches!(d.kind, replay_engine::EnvDivergenceKind::Missing));
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_NULL_ABSENT"),
+        serde_json::Value::Null
+    );
+}
+
+/// The singular NOTE line, hand-written: one differing variable that no
+/// runtime Cerulion starts reads.
+const ENV_NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
+                            Cerulion does not read it to decide what the re-execution runs, so \
+                            it matters only if code in one of your nodes reads it. Run with -v \
+                            to list it.";
+
+/// The WARNING line for `CERULION_REPLAY_TEST_KNOB` with a changed value,
+/// hand-written.
+const ENV_KNOB_WARNING: &str = "WARNING: environment variable CERULION_REPLAY_TEST_KNOB has a \
+                                different value than in the recording. Cerulion reads its \
+                                settings from CERULION_ and IOX2_ variables, so this one can \
+                                change the re-execution.";
+
+/// The `env.json` the two emission-level arms record: a Cerulion knob with the
+/// value `a`, and a variable no runtime Cerulion starts reads, hashed (FNV-1a
+/// 64 of `a` is the published vector `af63dc4c8601ec8c`).
+fn knob_and_other_env_json() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "CERULION_REPLAY_TEST_KNOB": "a",
+        "CER_REPLAY_OTHER": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+    }))
+    .unwrap()
+}
+
+/// A completed run logs each environment divergence ONCE, at INFO: the
+/// verdict prints the variable Cerulion reads as a WARNING line, so its log
+/// line is for a log pipeline, and the NOTE line counts the other one, which
+/// `-v` lists. No environment line is a WARN, so the default output shows each
+/// divergence once.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_completed_run_logs_every_env_divergence_at_info_and_warns_none() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, None);
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let outcome = outcome.expect("the clean recording replays");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert_eq!(
+        verdict.lines().filter(|l| *l == ENV_KNOB_WARNING).count(),
+        1,
+        "the verdict prints the knob once: {verdict}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        let env_warns = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: an environment variable")
+            })
+            .count();
+        match (knob.as_slice(), other.as_slice(), env_warns) {
+            ([k], [o], 0)
+                if cerulion_core::testing::line_level(k) == Some("INFO")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged")
+                    && o.contains("replay: an environment variable differs from the recording")
+                    && !o.contains("read_by=") =>
+            {
+                Ok(())
+            }
+            (k, o, warns) => Err(format!(
+                "expected ONE INFO naming the knob with its reader, ONE INFO naming the other \
+                 variable and no environment WARN, got {k:?}, {o:?} and {warns} WARN(s)"
+            )),
+        }
+    });
+}
+
+/// A PASSING run whose `--report` cannot be written returns the write error
+/// (exit 5) and the CLI prints only that error, no verdict, so a variable that
+/// can change the re-execution is logged at WARN, once, naming its reader; the
+/// other variable stays at INFO.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_passing_run_whose_report_cannot_be_written_warns_a_loud_env_variable() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_report_fail.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let blocker = dir.path().join("iam_a_regular_file");
+    std::fs::write(&blocker, b"x").unwrap();
+    let report = blocker.join("report.json"); // parent is a file, so unwritable.
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, Some(report));
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("a passing run whose report cannot be written is an error");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("cannot write report")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 5);
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
+            )),
+        }
+    });
+}
+
+/// An ABORTED run renders no verdict and no summary (the CLI prints only the
+/// aborting error), so a variable that can change the re-execution is logged
+/// there at WARN, once, naming its reader; the other variable stays at INFO.
+///
+/// The single-rank source and relay bag with `source` refusing to init, so
+/// rank 0's pass aborts at build.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_run_warns_a_loud_env_variable_and_logs_the_others_at_info() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_aborted.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let make = || {
+        factories(vec![
+            (
+                "source",
+                Box::new(InitFailsEntry {
+                    inner: Box::new(SourceNodeEntry::new()),
+                }) as Box<dyn NodeEntry>,
+            ),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 100.0,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, make, None, None);
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("the source refuses to init, so the run aborts");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("refuses to init")),
+        "{err:?}"
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
+            )),
+        }
+    });
+}
+
+/// Every divergence kind, `Added` included, leaves a clean replay PASSING and
+/// its exit code unchanged under BOTH purposes, and the `--report` JSON carries
+/// each entry with its `read_by`.
+#[test]
+#[serial]
+fn every_env_divergence_kind_leaves_a_clean_replay_passing_in_both_modes() {
+    use cerulion_cli_engine::resim_cmd::{resim_exit_code, ResimReport, EXIT_PASS};
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_every_kind.mcap");
+    // FNV-1a 64 of `a` is the published vector `af63dc4c8601ec8c`.
+    let env = serde_json::json!({
+        "CER_REPLAY_GONE": "v",
+        "CERULION_REPLAY_TEST_PLAIN": "a",
+        "CER_REPLAY_HASHED3": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+    });
+    write_bag(&rec, &bag, Some(&serde_json::to_vec(&env).unwrap()));
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Resim,
+        replay_engine::ReplayPurpose::Verify,
+    ] {
+        let report_path = dir.path().join(format!("env_every_kind_{purpose:?}.json"));
+        std::env::remove_var("CER_REPLAY_GONE");
+        std::env::set_var("CERULION_REPLAY_TEST_PLAIN", "b");
+        std::env::set_var("CER_REPLAY_HASHED3", "foobar");
+        std::env::set_var("CERULION_REPLAY_TEST_ADDED", "1");
+        let (outcome, _) = ri_replay_reporting(
+            &bag,
+            source_relay_factories,
+            purpose,
+            None,
+            None,
+            Some(report_path.clone()),
+        );
+        std::env::remove_var("CERULION_REPLAY_TEST_PLAIN");
+        std::env::remove_var("CER_REPLAY_HASHED3");
+        std::env::remove_var("CERULION_REPLAY_TEST_ADDED");
+        let outcome = outcome.expect("the clean recording replays");
+
+        let ours: Vec<(&str, String)> = outcome
+            .env_divergence
+            .iter()
+            .filter(|d| d.name.starts_with("CER_REPLAY_") || d.name.starts_with("CERULION_REPLAY_"))
+            .map(|d| (d.name.as_str(), format!("{:?}", d.kind)))
+            .collect();
+        assert_eq!(
+            ours,
+            vec![
+                ("CERULION_REPLAY_TEST_ADDED", "Added".to_string()),
+                ("CERULION_REPLAY_TEST_PLAIN", "ValueChanged".to_string()),
+                ("CER_REPLAY_GONE", "Missing".to_string()),
+                ("CER_REPLAY_HASHED3", "HashChanged".to_string()),
+            ],
+            "{purpose:?}"
+        );
+        assert!(outcome.passed, "{purpose:?}: {:?}", outcome.violations);
+        let report = ResimReport::from_outcome(&outcome);
+        let verify = purpose == replay_engine::ReplayPurpose::Verify;
+        assert_eq!(resim_exit_code(&report, verify), EXIT_PASS, "{purpose:?}");
+        for expected in [
+            "WARNING: environment variable CERULION_REPLAY_TEST_ADDED is set now and was not set \
+             in the recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, \
+             so this one can change the re-execution.",
+            "WARNING: environment variable CERULION_REPLAY_TEST_PLAIN has a different value than \
+             in the recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, so \
+             this one can change the re-execution.",
+        ] {
+            assert!(
+                report.env_lines.iter().any(|l| l == expected),
+                "{purpose:?}: {:?}",
+                report.env_lines
+            );
+        }
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("the report is written"))
+                .expect("the report is JSON");
+        let entry = |name: &str| -> serde_json::Value {
+            json["env_divergence"]
+                .as_array()
+                .expect("env_divergence is an array")
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in the report: {json}"))
+                .clone()
+        };
+        assert_eq!(
+            entry("CERULION_REPLAY_TEST_ADDED"),
+            serde_json::json!({
+                "name": "CERULION_REPLAY_TEST_ADDED",
+                "kind": {"kind": "Added"},
+                "detail": "variable 'CERULION_REPLAY_TEST_ADDED' is set at replay but absent \
+                           from the recording",
+                "read_by": "cerulion",
+            })
+        );
+        assert_eq!(
+            entry("CER_REPLAY_HASHED3"),
+            serde_json::json!({
+                "name": "CER_REPLAY_HASHED3",
+                "kind": {"kind": "HashChanged"},
+                "detail": "redacted variable 'CER_REPLAY_HASHED3' hash changed since recording \
+                           (recorded af63dc4c8601ec8c, now 85944171f73967e8)",
+                "read_by": null,
+            })
+        );
+        assert_eq!(entry("CER_REPLAY_GONE")["read_by"], serde_json::Value::Null);
+    }
 }
 
 // ===========================================================================
@@ -5215,6 +5647,7 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
                 first_diff_byte_offset: 32,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
             detail: "detail-e".to_string(),
         },
@@ -5279,10 +5712,15 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         s.contains("FRAME-CONTENT DIVERGENCE: /tmp/x.mcap"),
         "verdict:\n{s}"
     );
-    assert!(
-        s.contains("WARNING: env divergence: variable 'SOME_VAR' value changed since recording"),
+    // SOME_VAR is read by no runtime Cerulion starts, so it is counted by the
+    // one NOTE line and never named.
+    assert_eq!(
+        s.lines().filter(|l| *l == ENV_NOTE_ONE).count(),
+        1,
         "verdict:\n{s}"
     );
+    assert!(!s.contains("SOME_VAR"), "verdict:\n{s}");
+    assert!(!s.contains("WARNING:"), "verdict:\n{s}");
     // The line says what its numbers MEAN. A line printing
     // `topics_passed/topics_checked` as "matched" would under-report once a
     // declined-but-matched topic exists — such a topic matched and is deliberately
@@ -5314,6 +5752,80 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         );
         prev_pos = pos;
     }
+}
+
+/// The PASS path counts a differing shell variable in ONE NOTE line above the
+/// verdict, names no variable and prints no hash and no `WARNING:`.
+///
+/// Hand-built outcome whose only finding is a `SHLVL` hash change, under the
+/// clean provenance states (a stamped contract, reads fed by identity, a clean
+/// read log), each of which prints nothing, so the whole verdict is two
+/// hand-written lines.
+#[test]
+#[serial]
+fn render_verdict_pass_path_counts_an_other_variable_in_one_note() {
+    use cerulion_cli_engine::replay_engine::{EnvDivergence, EnvDivergenceKind};
+    let outcome = ReplayOutcome {
+        ros2_entries_skipped: Vec::new(),
+        passed: true,
+        node_failures: vec![],
+        ticks_replayed: 7,
+        topics_checked: 2,
+        topics_passed: 2,
+        violations: vec![],
+        trace_divergence: None,
+        env_divergence: vec![EnvDivergence {
+            name: "SHLVL".to_string(),
+            kind: EnvDivergenceKind::HashChanged,
+            detail: "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)"
+                .to_string(),
+        }],
+        recorder: None,
+        record_health: RecordHealthReport::Absent,
+        tolerated_ragged_tails: vec![],
+        unmodelled_topics: vec![],
+        resume: None,
+        covered_range: None,
+        read_log_divergence: None,
+        read_log: replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 0,
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+        },
+        read_log_quarantine: Vec::new(),
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::Fed {
+            reads: 0,
+            frames: 0,
+        },
+        coordination: replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::Lockstep,
+            inferred: false,
+        },
+        divergence_classes: vec![],
+        injection_stand_downs: Vec::new(),
+        declined_frame_comparisons: Vec::new(),
+        injection_coverage: Vec::new(),
+        rederivation_notes: Vec::new(),
+        replay_input_shortfalls: Vec::new(),
+        injection_anomalies: Vec::new(),
+        rank_execution: Vec::new(),
+        aborted: None,
+        report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
+    };
+
+    let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
+    assert_eq!(
+        s,
+        format!(
+            "{ENV_NOTE_ONE}\nreplay PASS: /tmp/x.mcap (7 tick(s) replayed, 2/2 topic(s) matched \
+             byte-for-byte and were credited)\n"
+        )
+    );
 }
 
 /// The per-topic frame-MONOTONICITY killer. Two recorded frames
@@ -10265,8 +10777,8 @@ fn replay_probing_reader(
 fn many_step_source_relay_bag(dir: &std::path::Path, steps: usize) -> std::path::PathBuf {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
     // Anchor the recording (not a self-compare): source.out.x == step+1.
-    for k in 0..steps {
-        assert_eq!(frame_x(&rec.messages["/sr/source/out"][k]), (k + 1) as f64);
+    for (k, frame) in rec.messages["/sr/source/out"][..steps].iter().enumerate() {
+        assert_eq!(frame_x(frame), (k + 1) as f64);
     }
     let bag = dir.join("advise_source_relay.mcap");
     write_bag(&rec, &bag, None);
@@ -10494,9 +11006,9 @@ fn advise_behind_de_pins_a_lagging_topics_frozen_consume_cursor() {
         steps,
     );
     // Anchor (not a self-compare): every topic recorded byte-clean, x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_lagging_topic.mcap");
@@ -10654,9 +11166,9 @@ fn advise_behind_engages_and_verdict_is_stable_under_a_lagging_consumed_topic() 
         steps,
     );
     // Anchor (not a self-compare): every recorded frame x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_reread_lagging.mcap");
@@ -10825,9 +11337,9 @@ fn advise_behind_evicted_pages_re_fault_byte_identical() {
         steps,
     );
     // Anchor the RECORDING (not a self-compare): every recorded frame x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_refault_bytes.mcap");
@@ -11769,6 +12281,19 @@ topics:
             .any(|v| matches!(v.class, ViolationClass::ToleranceExceeded { .. })),
         "x stayed within tolerance — no ToleranceExceeded expected: {:?}",
         outcome.violations
+    );
+    // The byte mismatch names y, never the tolerated x that also changed
+    // (x is declared first). Oracle: frame 0 records x = 1.0, y = 0.0; the
+    // candidate writes x = 1.01 (judged by the metric) and y = 1.0.
+    let byte = outcome
+        .violations
+        .iter()
+        .find(|v| matches!(v.class, ViolationClass::ByteMismatch { .. }))
+        .expect("asserted above");
+    assert_eq!(
+        byte.detail,
+        "frame 0 on '/tg/source/out' differs at y: recorded 0.0, replayed 1.0 (recorded 64 B, \
+         replayed 64 B)"
     );
 }
 
@@ -12964,6 +13489,25 @@ fn an_aborted_verify_warns_the_data_violation_its_completed_rank_found() {
         "the flipped byte is a byte mismatch at frame 2, first payload byte: {}",
         violations[0]
     );
+    // The report names the field and both values. Oracle: frame 2's x is 3.0
+    // (`00 .. 08 40`); byte 0 XOR 0xFF reads back as 3.0000000000001132.
+    assert_eq!(
+        violations[0]["class"]["difference"],
+        serde_json::json!({
+            "kind": "field",
+            "path": "x",
+            "recorded": 3.0000000000001132,
+            "replayed": 3.0,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": null,
+            "region": null,
+            "reason": null,
+            "more": 0,
+        }),
+        "{}",
+        violations[0]
+    );
 
     logs_assert(|lines: &[&str]| {
         let warned: Vec<&&str> = lines
@@ -13221,6 +13765,7 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
                 first_diff_byte_offset: 40,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
             detail: "c".to_string(),
         },
@@ -13449,11 +13994,6 @@ fn large_frame_byte_mismatch_detail_is_offset_bounded_no_payload_dump() {
         v.detail.len(),
         &v.detail[..v.detail.len().min(200)]
     );
-    assert!(
-        v.detail.contains("differs at byte"),
-        "detail carries the offset: {}",
-        v.detail
-    );
     match v.class {
         ViolationClass::ByteMismatch {
             first_diff_byte_offset,
@@ -13461,6 +14001,15 @@ fn large_frame_byte_mismatch_detail_is_offset_bounded_no_payload_dump() {
             replayed_len,
             ..
         } => {
+            // The detail names the bumped element and both values. Oracle:
+            // positions[i] == i, and the candidate adds 1.0 to element 2048.
+            assert_eq!(
+                v.detail,
+                format!(
+                    "frame 0 on '/bg/source/out' differs at positions[2048]: recorded 2048.0, \
+                     replayed 2049.0 (recorded {recorded_len} B, replayed {replayed_len} B)"
+                )
+            );
             assert!(
                 recorded_len > 30_000 && replayed_len == recorded_len,
                 "large equal-length frames: {recorded_len}/{replayed_len}"
@@ -26389,8 +26938,8 @@ fn free_run_nonzero_epoch_first_boundary_does_not_burst_period_catchup() {
     let steps = 4usize;
     let mut rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
     // Anchor the RECORDING to a hand oracle before re-basing it.
-    for k in 0..steps {
-        assert_eq!(frame_x(&rec.messages["/sr/source/out"][k]), (k + 1) as f64);
+    for (k, frame) in rec.messages["/sr/source/out"][..steps].iter().enumerate() {
+        assert_eq!(frame_x(frame), (k + 1) as f64);
     }
     rebase_recording_onto_epoch(&mut rec, EPOCH_NS);
 
@@ -27907,12 +28456,17 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         violations: vec![Violation {
             topic: "/vocab/relay/out".to_string(),
             class: ViolationClass::ByteMismatch {
+                // timestamp_ns is header bytes 24..32; 7 and 9 first differ
+                // at its low byte.
                 index: 0,
-                first_diff_byte_offset: 32,
+                first_diff_byte_offset: 24,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
-            detail: "frame 0 differs at byte 32".to_string(),
+            detail: "frame 0 on '/vocab/relay/out' differs in the wire header at timestamp_ns: \
+                     recorded 7 ns, replayed 9 ns (recorded 56 B, replayed 56 B)"
+                .to_string(),
         }],
         trace_divergence: Some(TraceDivergenceReport {
             position: 3,
@@ -28037,6 +28591,9 @@ fn exit_codes_and_precedence_are_unchanged_by_the_rename() {
         // The provenance line, which the exit-code
         // precedence likewise does not read.
         coordination: Some("coordination: lockstep".to_string()),
+        // The environment block, which the exit-code precedence does not
+        // read: an environment divergence never changes the exit code.
+        env_lines: vec![],
         // Report-only harness findings; the exit-code precedence
         // does not read them either.
         injection_anomalies: vec![],
@@ -36445,6 +37002,12 @@ fn a_partitioned_topic_attributes_a_byte_mismatch_to_its_own_writer() {
         detail.contains("from writer right/bus"),
         "the violation names the DRIFTING writer: {detail}"
     );
+    // And the field: the recording's y was set to 42.0, the writer replays 0.0.
+    assert_eq!(
+        detail,
+        "frame 1 on '/co/shared_bus' from writer right/bus differs at y: recorded 42.0, \
+         replayed 0.0 (recorded 64 B, replayed 64 B)"
+    );
     assert!(
         !detail.contains("left/bus"),
         "and not the clean one: {detail}"
@@ -44787,4 +45350,22 @@ fn a_shared_topic_only_its_driver_published_is_not_reported_missing() {
             )),
         }
     });
+}
+
+/// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
+/// whose renderer test reads only the class label and the detail it is
+/// given: a header difference, as `timestamp_ns` 7 against 9 reads.
+fn synthetic_difference() -> ByteDifference {
+    ByteDifference {
+        kind: DifferenceKind::Header,
+        path: Some("timestamp_ns".to_string()),
+        recorded: Some(DifferenceValue::UInt(7)),
+        replayed: Some(DifferenceValue::UInt(9)),
+        field_byte: None,
+        field_char: None,
+        byte_offset: None,
+        region: None,
+        reason: None,
+        more: 0,
+    }
 }

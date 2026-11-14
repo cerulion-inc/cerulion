@@ -130,6 +130,73 @@ When the worst frame has no finite value, `worst value <x>` reads
 `worst frame structurally incomparable (length mismatch / NaN / ragged bbox / decode failure)`
 instead.
 
+A `byte-mismatch` detail names the topic's first differing frame and what
+differs in it, then the size of both frames. On a `multi_publisher_topics` topic
+whose frames both runs attribute to their writers, each writer's stream is
+compared on its own, `<i>` counts that writer's frames, and the topic is
+followed by `from writer <node>/<output>`. The common form names a
+field and both values:
+
+```
+frame <i> on '<topic>' differs at <field>: recorded <value>, replayed <value> (recorded <n> B, replayed <m> B)
+```
+
+`<field>` is the field's path in the message (`linear.x`, `ranges[12]`,
+`poses[2].position.x`) and the values are spelled the way `cerulion topic echo`
+prints them: `0.3`, `-0.0`, `.nan`, `.inf`, `-.inf`, integers in exact decimal,
+strings double quoted. The first differing value in the schema's declaration
+order (the order `topic echo` prints) is named, and when other values of the
+frame differ too the line adds `; <k> more value(s) differ` before the sizes.
+For a `geometry_msgs/Vector3` whose `x` changed from 0.3 to 0.25:
+
+```
+  - /obstacle_avoidance/safety_controller/linear_velocity [byte-mismatch]: frame 99 on '/obstacle_avoidance/safety_controller/linear_velocity' differs at x: recorded 0.3, replayed 0.25 (recorded 64 B, replayed 64 B)
+```
+
+Four other forms cover the rest:
+
+- `differs in the wire header at <field>: recorded <value>, replayed <value>`
+  when the frame header's `offset_table_offset`, `offset_table_count`,
+  `sequence`, `timestamp_ns` (printed with ` ns`) or `step_tag` (printed as
+  `rank <r> step <s>`, `rank <r>, no step` or `untagged`) differs. A header field
+  is named ahead of every message value: a different sequence, timestamp or step
+  usually means the two frames are not twins (a frame was lost or added before
+  this one), and the message values that differ as well are counted in
+  `<k> more value(s) differ`. `total_size` follows the payload length, which the
+  sizes at the end already show, so it is named only when nothing else differs.
+- `differs in the wire header at schema_hash: recorded 0x<hash>, replayed 0x<hash>; fields not compared, the frames carry different schemas`.
+- `differs at byte <o>, in <region>; every field value is equal` when every value
+  matches and only the framing differs. `<region>` is `the fixed-section
+  padding`, `the offset table`, `the framing of <field>`, `unused bytes between
+  variable fields` or `bytes past the last field`.
+- `differs at byte <o>, not decoded because <reason>` when the fields cannot be
+  decoded: the frame is shorter than the 40-byte wire header, no schema in this
+  workspace or the built-in set has its schema hash, it does not decode as its
+  schema (the decoder's own error follows), or the `--tolerance` decoder refused
+  it (`the --tolerance decoder refused the <recorded|replayed> frame: <error>`).
+
+A string longer than 64 characters prints 64 characters of each side, starting
+16 before the first difference, and the field is followed by `from char <d>`.
+Two values whose text is the same (two NaNs with different payload bits, a
+`bool` byte 1 and a byte 2) are each followed by their wire bits in hex, such as
+`.nan (0x7ff8000000000001)`, and a `bool` byte other than 0 or 1 always is: it
+reads as true, so it prints as `true (0x02)`. A string that is not valid UTF-8
+prints `not valid UTF-8 (<n> B)`; when neither side is valid UTF-8 and both have
+one length, the field is followed by `, byte <k> of its bytes` and each side's
+value is its byte there (`recorded 0xff, replayed 0xfe`). A `string_fixed` whose
+text is equal but whose bytes differ after the NUL that ends it prints the same
+text twice, followed by `(bytes differ past the NUL at field byte <k>)`. An
+array whose two sides differ in length is named first with both lengths
+(`recorded 360 element(s), replayed 361 element(s)`), and an array whose bytes
+are not in the canonical element framing, or whose element schema the schema set
+does not have, is compared byte by byte (`differs at <field>, byte 12 of its opaque bytes`,
+or `recorded 84 opaque byte(s), replayed 96 opaque byte(s)`). When one side has
+no bytes to compare with the other's, the line prints `the zero value` for a
+side that is an empty nested message and `a value of another shape` for a side
+that is not. A field that `--tolerance` judges by a metric is never named in a
+byte mismatch. The frames are decoded with the schemas `topic echo` uses: the
+built-in set, then the workspace's `.msg` store and its `schemas/*.yaml`.
+
 When the verifier left a topic out of the full comparison, the PASS line and
 the block's first tally add
 `; <K> DECLINED (<J> of them matched under the fallback, not credited)` after
@@ -315,7 +382,7 @@ combination is refused by name with the reason, never silently ignored.
 | `--strict-state` | resim | Refuse the re-execution unless EVERY executed node's state was restored. Inert on a bag that begins at step 0: nothing is restored there. Legal in both resim modes: it is a PRECONDITION on the run, not a claim about the recording, so a neutral resim honours it too (its refusal is the exit-2 not-replay-grade arm, which neutral mode never swallows). |
 | `--allow-param-change` | resim | On a bag that begins MID-RUN, resume on the param values in force even where they differ from the ones the recording names. A param is not node state, so a restore never writes one; without this flag each difference refuses the run with exit 2, one line per param naming the node, the param, the recorded value and the current value. Inert on a bag that begins at step 0. Legal in both resim modes. |
 | `--record-out PATH` | resim | Write the re-executed frames to a new bag at `PATH`: one channel per graph-produced topic holding every frame the re-executed graph published, as the full wire frame stamped with the sequence and timestamp in its own header (a frame shorter than the header is written whole with sequence and timestamp 0, as the recorder does). Each channel's schema hash is the one the re-executed graph publishes: the current workspace's when it resolves, otherwise the input channel's when it was recorded under this build's hash recipe, otherwise the hash in the topic's first frame. Provisioning is copied from the input bag's channel. Its schema name and fixed wire size are copied too when the input channel's hash, under this build's recipe, is the label; otherwise (a schema changed since recording, a legacy recipe, a node added since the recording) the channel takes the current workspace's schema name, else the input's, else `unknown`, and a fixed wire size of 0. A frame whose header names a different schema hash than its channel fails the run, so the output never mislabels a frame; a channel waiting for its first frame to learn its hash, whose first frame has no header, is labelled 0 and holds to it (a headerless frame on a channel already labelled is written under that label). The recorded external inputs a resim injects are not copied, including those re-published on a topic that another rank's graph also writes: they are unchanged and already in the input bag. A custom-type schema catalog in the input bag is carried over, pruned to the schema hashes the output's channels carry (a legacy recipe's hash is not bound in it, so it brings no definition). The output carries no scheduler trace, so it is a recording to read or index, not a bag `--resim` can re-execute. `PATH` must not exist: an existing file (the input bag included) is refused with exit 2 and never overwritten. A run that does not finish removes the partial file. Legal in both resim modes: it shapes what the run produces, not the comparison. With `--report`, the JSON gains a `record_out` field naming the written path (absent without the flag). `--record-out` and `--report` may not name the same file, however each is spelled (`out.mcap` and `./out.mcap`, or a symlink to it). A bag that cannot be finished fails a run that would otherwise exit 0 with exit 5 and removes the file. |
-| `--report PATH` | resim + `--verify` | Persist the machine-readable verdict JSON. Needs `--verify`: its `passed` / `violations` fields ARE the verdict a bare `--resim` declines to make. Beside the verdict it carries the per-rank REPORT-ONLY arrays, none of which move the exit code: `rank_execution` (one entry per pass: steps executed, first/last step, and whether the `--duration` bound is what stopped it; the per-rank breakdown `ticks_replayed` sums away), `injection_anomalies` (a bag-fed topic whose injected stream differed from the recording's: a sequence the plan did not name, a schedule that over-named the stream, or recorded frames a steered schedule left unaccounted for), and `replay_input_shortfalls` (a node whose trace-driven burst asked for the next recorded frame and got nothing, so it fired on its held head). Read all three before attributing a byte mismatch to the candidate: each says the replay's INPUT differed first. |
+| `--report PATH` | resim + `--verify` | Persist the machine-readable verdict JSON. Needs `--verify`: its `passed` / `violations` fields ARE the verdict a bare `--resim` declines to make. Beside the verdict it carries the per-rank REPORT-ONLY arrays, none of which move the exit code: `rank_execution` (one entry per pass: steps executed, first/last step, and whether the `--duration` bound is what stopped it; the per-rank breakdown `ticks_replayed` sums away), `injection_anomalies` (a bag-fed topic whose injected stream differed from the recording's: a sequence the plan did not name, a schedule that over-named the stream, or recorded frames a steered schedule left unaccounted for), and `replay_input_shortfalls` (a node whose trace-driven burst asked for the next recorded frame and got nothing, so it fired on its held head). Read all three before attributing a byte mismatch to the candidate: each says the replay's INPUT differed first. A `byte-mismatch` violation's `class` keeps `index`, `first_diff_byte_offset`, `recorded_len` and `replayed_len` and adds `difference`, one object with the keys `kind` (`field`, `header`, `schema_hash`, `layout` or `undecoded`), `path`, `recorded`, `replayed`, `field_byte`, `field_char`, `byte_offset`, `region` (`fixed_section_padding`, `offset_table`, `field_framing`, `unused_variable_bytes` or `trailing_bytes`), `reason` (`recorded_frame_too_short`, `replayed_frame_too_short`, `unknown_schema_hash`, `recorded_frame_undecodable` or `replayed_frame_undecodable`, the last two whichever decoder refused the frame) and `more`. `more` is an integer, 0 where nothing else is counted (always on `schema_hash`, `layout` and `undecoded`); any other key the kind does not use is `null`. `path` is the field's path for `field`, the wire-header field for `header` and `schema_hash`, and the framed field for `layout` in `field_framing`. `recorded` and `replayed` are a JSON number or boolean where the value is one; a string value is the string itself, without quotes; anything else (`.nan`, a byte such as `0x4c`, a window of a long string) is the line's text. On `field`, `field_byte` is the byte `<k>` inside the field that the line names (`byte <k> of its opaque bytes`, `byte <k> of its bytes`, or `past the NUL at field byte <k>`, where `recorded` and `replayed` then carry the same text), and `field_char` is the `<d>` of `from char <d>`. `first_diff_byte_offset` is the first differing byte in byte order, so it can sit in another field than `path`, which follows declaration order. |
 | `--tolerance PATH` | resim + `--verify` | Relax the byte-comparison per field. Needs `--verify`: there is no comparison to relax without it. |
 | `--feed-index-budget BYTES` | resim + `--verify` | The bytes a fed replay's index of recorded frames is charged (default 1073741824, 1 GiB): 40 for each frame the replayed reads consume, the index's key and slot for it, and 40 for each producer label of the topics they consume, which the build reads to tell a topic's writers apart. The index holds only the frames the replayed reads consume, up to `--duration` when it is given; a replay that needs more is refused with exit 2 (`read_identity_feed_index_budget`), naming the bytes it needs, the budget and this flag. Needs `--verify`: only a verifying resim feeds reads by recorded identity (see "Read identity" below). |
 

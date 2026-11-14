@@ -313,7 +313,8 @@ while it holds the install lock, so a failed setup leaves the previously
 installed binaries in place, though a partly installed Rust toolchain can remain
 under rustup's own management. The helper leaves a Rust 1.95 or newer on `PATH`
 or in `CARGO_HOME/bin` as it is; otherwise it adds current stable through
-rustup, or installs rustup with stable where there is no Rust. Its floor is
+rustup, or installs rustup and then stable through it where there is no Rust,
+showing the rustup installer's stdout only when it fails. Its floor is
 the workspace `rust-version`, and `test_install_rust.sh` fails when the two
 differ. An existing rustup default is kept (stable becomes the default only
 where there is none), profiles and shell startup files are preserved, and a

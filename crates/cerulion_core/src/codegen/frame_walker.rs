@@ -802,7 +802,12 @@ impl FrameWalker {
     /// that byte, not as `Bool(true)`. The YAML writer refuses such a frame
     /// (`true` would read back as 1, so the frame has no YAML form); every
     /// other caller reads any nonzero byte as true.
-    pub(crate) fn walk_by_hash_keeping_raw_bools<'a>(
+    ///
+    /// Hidden from the docs: the YAML writer and the replay verdict's value
+    /// diff (`cerulion_cli_engine`, which names a bool byte 2 apart from a
+    /// byte 1) are its only callers.
+    #[doc(hidden)]
+    pub fn walk_by_hash_keeping_raw_bools<'a>(
         &self,
         frame: &'a [u8],
         keep: usize,

@@ -583,8 +583,10 @@ pub enum Commands {
     /// each channel's wire schema hash from the first message; configured
     /// schema resolution can add names and definitions. That is enough to
     /// inspect and play back the bag. Re-executing a bag (`bag play --resim`)
-    /// also needs the run's graph, environment and scheduler trace, which
-    /// `graph run --record` supplies to this same recorder.
+    /// also needs the run's graph and scheduler trace, which
+    /// `graph run --record` supplies to this same recorder with a record of
+    /// the run's environment; a resim compares that record and never applies
+    /// it.
     //
     // BOXED: `BagdArgs` is by far the widest variant here (it is the recorder's
     // whole argv surface), and growing it by one `Option<String>` (`--run-id`)
