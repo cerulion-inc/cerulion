@@ -41,6 +41,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - Same-user outbound shares endpoint/runtime/node; pre-dial key/namespace gate. Metadata per-call; validation refusals keep readers/idle fence; cleanup errors fence control. Retire only outbound.
 
 ## Tests
+- local_schema_provider_test: serial, own root
 - `wire_plane_test` uses `-- --test-threads=1`: parallel tests at the macOS
   256-file soft limit hit iceoryx service/port errors.
 - Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct
