@@ -50,9 +50,10 @@
 //!   publishes on it is written to `--record-out` (`RecordOutTap`). A
 //!   record-side-lossy one is still a violation on its own topic. A
 //!   `multi_publisher_topics` topic a driver shares with other nodes stays
-//!   GRAPH-PRODUCED, diffed over the other writers' frames when the replay
-//!   attributes each recorded frame to its writer, and over every frame
-//!   otherwise (`DriverInputsReport::unattributed_topics`).
+//!   GRAPH-PRODUCED, diffed over the other writers' frames, each in the pass
+//!   that runs it, when the replay attributes each recorded frame to its
+//!   writer, and over every recorded frame otherwise
+//!   (`DriverInputsReport::unattributed_topics`).
 //! - EXTERNAL (consumed in-graph, no in-graph producer: the
 //!   absolute `source:` class) — the recorded frames are re-INJECTED byte-exact
 //!   so the downstream graph sees the same inputs it saw live.
@@ -1127,15 +1128,19 @@ pub struct DriverInputsReport {
     pub input_topics: Vec<String>,
     /// The `multi_publisher_topics` topics a driver writes beside other nodes.
     /// A topic whose every recorded frame the replay attributes to its writer
-    /// is compared and counted over the other writers' frames only; the rest
-    /// are [`Self::unattributed_topics`].
+    /// is compared and counted over the other writers' frames only, each
+    /// writer's in the pass that runs it; the rest are
+    /// [`Self::unattributed_topics`].
     pub shared_topics: Vec<String>,
     /// The topics of [`Self::shared_topics`] compared and counted over every
-    /// recorded and replayed frame, the drivers' included: the replay could
-    /// not attribute each recorded frame to its writer (for example, the bag
-    /// labels no writer for a frame, a frame carries no wire header, or the
-    /// topics' frame index is over the verifier's record budget), and a
-    /// warning logged during the replay names the cause.
+    /// recorded frame, the drivers' included: the replay could not attribute
+    /// each recorded frame to its writer (for example, the bag labels no
+    /// writer for a frame, a frame carries no wire header, or the topics'
+    /// frame index is over the verifier's record budget), and a warning
+    /// logged during the replay names the cause. Each pass that could not
+    /// attribute them compares every recorded frame with every frame it
+    /// captured on the topic, which holds a replayed driver's frames only when
+    /// the driver runs in that pass.
     pub unattributed_topics: Vec<String>,
     /// The topics of [`Self::input_topics`] and [`Self::shared_topics`] that a
     /// node reads where this replay does not feed it the drivers' recorded
@@ -1163,8 +1168,8 @@ impl DriverInputsReport {
 /// The verdict `NOTE` lines of a [`DriverInputsReport`]: one per non-empty
 /// topic list, the shared topics split into those compared over the other
 /// writers' frames and the [`DriverInputsReport::unattributed_topics`]
-/// compared over every frame, and one more when a driver writes a topic and
-/// `topics_checked` is 0, the `0/0` verdict that compared nothing. The driver
+/// compared over every recorded frame, and one more when a driver writes a
+/// topic and `topics_checked` is 0, the `0/0` verdict that compared nothing. The driver
 /// nodes are named on the lines of the topics drivers write, so a driver that
 /// writes no topic prints none. Rendered on the PASS and the FAIL path alike,
 /// since each says what the tally above or below it does not cover.
@@ -1200,9 +1205,9 @@ pub fn render_driver_input_lines(
     if !report.unattributed_topics.is_empty() {
         lines.push(format!(
             "NOTE: {} topic(s) an external (driver) node shares with other writers were \
-             compared over every recorded and replayed frame, the drivers' included, since the \
-             replay could not attribute each recorded frame to its writer (driver nodes, as the \
-             replayed build declares them: {nodes}): {}",
+             compared over every recorded frame, the drivers' included, since the replay could \
+             not attribute each recorded frame to its writer (driver nodes, as the replayed build \
+             declares them: {nodes}): {}",
             report.unattributed_topics.len(),
             report.unattributed_topics.join(", ")
         ));
@@ -5610,9 +5615,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
 /// 0..k's results.
 #[derive(Default)]
 struct PassAccumulators {
-    /// Per-topic capture SUMMARIES (the ports die with their
-    /// pass).
-    captures: IndexMap<String, CaptureSummary>,
+    /// Per topic, the capture SUMMARY of every pass that captured it, in
+    /// pass order (the ports die with their pass). A topic is captured by
+    /// every pass whose rank writes it, so a `multi_publisher_topics` topic
+    /// whose writers are split across ranks has one per such rank.
+    captures: IndexMap<String, Vec<CaptureSummary>>,
     tolerated_ragged_tails: Vec<String>,
     /// The two additive gates' stand-down channels. Empty on
     /// every lockstep replay.
@@ -5667,7 +5674,7 @@ impl PassAccumulators {
         self.injection_anomalies.extend(injection_anomalies);
         self.rank_execution.push(execution);
         for (topic, cap) in captures {
-            self.captures.insert(topic, cap);
+            self.captures.entry(topic).or_default().push(cap);
         }
         self.tolerated_ragged_tails.extend(tail_notes);
         if self.trace_divergence.is_none() {
@@ -5886,9 +5893,24 @@ fn assemble_outcome(
     for topic in &classes.produced {
         let recorded_count =
             replayed_frame_count(recorded_messages, topic, skipped_prefix, trailing_frames);
-        // Read the pass's SUMMARY: the capture itself (and
+        // Read the passes' SUMMARIES: the capture itself (and
         // its subscriber port) died with the pass that opened it.
-        let summary = captures.get(topic);
+        let summaries: &[CaptureSummary] = captures.get(topic).map_or(&[][..], Vec::as_slice);
+        // A topic a driver shares is judged over every pass that captured
+        // it. Partitioned by writer in each, it is one verdict per writer,
+        // each from the pass that publishes the writer live
+        // (`merge_partitioned_summaries`). Otherwise it is unattributed, and
+        // where several passes captured it each one's capture is judged on
+        // its own (`push_split_unattributed_violations`). Every other topic
+        // is judged from the last pass that captured it.
+        let shared = classes.driver_shared.contains(topic);
+        let merged = if shared {
+            merge_partitioned_summaries(summaries)
+        } else {
+            None
+        };
+        let split_unattributed = shared && merged.is_none() && summaries.len() > 1;
+        let summary: Option<&CaptureSummary> = merged.as_ref().or_else(|| summaries.last());
         // Partial report: under an ABORT a topic is judged iff
         // some rank that OWNS it COMPLETED — membership in the report's own
         // `rank_execution`, the same set the report states as complete, so
@@ -5935,14 +5957,28 @@ fn assemble_outcome(
         // reads the DIFFERENCE between the counts: a replay that under-produces
         // inside the band still lands short, and one that over-produces beyond it
         // still lands long.
-        let replayed_count = summary.map_or(0, |c| c.replayed_count).saturating_sub(
-            covered_range
-                .as_ref()
-                .and_then(|c| c.reproduced.get(topic).copied())
-                .unwrap_or(0),
-        );
-        let byte_violation = summary.and_then(|c| c.byte_violation.as_ref());
-        let partition_counts = summary.and_then(|c| c.partition_counts.clone());
+        //
+        // A split unattributed topic sums its passes' counts for the vacuous
+        // check alone: each pass is judged against the whole recorded count,
+        // and no reproduced band is taken off a count no verdict reads.
+        let replayed_count = if split_unattributed {
+            summaries.iter().map(|c| c.replayed_count).sum()
+        } else {
+            summary.map_or(0, |c| c.replayed_count).saturating_sub(
+                covered_range
+                    .as_ref()
+                    .and_then(|c| c.reproduced.get(topic).copied())
+                    .unwrap_or(0),
+            )
+        };
+        let (byte_violation, partition_counts) = if split_unattributed {
+            (None, None)
+        } else {
+            (
+                summary.and_then(|c| c.byte_violation.as_ref()),
+                summary.and_then(|c| c.partition_counts.clone()),
+            )
+        };
         // A topic a driver shares with re-executed writers is judged per
         // writer over the re-executed writers' partitions only
         // (`build_capture_partitionings`), so its topic-level count is theirs
@@ -5951,14 +5987,19 @@ fn assemble_outcome(
         // so the whole recorded count stands and the report lists the topic in
         // `DriverInputsReport::unattributed_topics`.
         let recorded_count = match &partition_counts {
-            Some(parts) if classes.driver_shared.contains(topic) => {
-                parts.values().map(|c| c.recorded).sum()
-            }
+            Some(parts) if shared => parts.values().map(|c| c.recorded).sum(),
             _ => recorded_count,
         };
-        let tolerance_violations = summary
-            .map(|c| c.tolerance_violations.clone())
-            .unwrap_or_default();
+        let tolerance_violations: Vec<Violation> = if split_unattributed {
+            summaries
+                .iter()
+                .flat_map(|c| c.tolerance_violations.iter().cloned())
+                .collect()
+        } else {
+            summary
+                .map(|c| c.tolerance_violations.clone())
+                .unwrap_or_default()
+        };
         // A record-side-lossy topic (rules 5b/5e) RE-LABELS its real
         // diff to ONE attributed violation and forces exit 1 REGARDLESS of the
         // byte/count result (even a would-be-clean topic). A `multi_publisher`
@@ -5995,9 +6036,9 @@ fn assemble_outcome(
             continue; // vacuous — nothing produced or recorded on this topic.
         }
         topics_checked += 1;
-        // A shared topic the capture did not partition is diffed and counted
-        // over every frame, the drivers' included.
-        if partition_counts.is_none() && classes.driver_shared.contains(topic) {
+        // A shared topic a pass did not partition is diffed and counted over
+        // every recorded frame, the drivers' included.
+        if shared && merged.is_none() {
             unattributed_shared.insert(topic.as_str());
         }
         // Tolerate TRAILING extra frames on a topic whose producing
@@ -6049,7 +6090,10 @@ fn assemble_outcome(
             })
             .unwrap_or(0);
         let extra = replayed_count.saturating_sub(recorded_count);
-        let ragged_trailing_tolerated = extra > 0
+        // Never on a split unattributed topic: its passes are judged one by
+        // one, so no single pair of counts states its extra frames.
+        let ragged_trailing_tolerated = !split_unattributed
+            && extra > 0
             && recorded_count > 0
             && summary.is_none_or(|c| !c.any_byte_violation())
             && summary.is_none_or(CaptureSummary::no_writer_under_produced)
@@ -6127,6 +6171,14 @@ fn assemble_outcome(
             // partitioned topic as well as the topic-level one — a mid-stream
             // extra keeps its byte violation and falls through below), and
             // neither can a per-writer SHORTFALL (`no_writer_under_produced`).
+        } else if split_unattributed {
+            push_split_unattributed_violations(topic, recorded_count, summaries, &mut violations);
+        } else if let Some(parts) = partition_counts.as_ref().filter(|_| shared) {
+            // Per writer, with no topic-level triage: the topic-level counts
+            // leave the drivers' frames out, so a `MissingTopic` ("replay
+            // produced NONE") or an `ExtraTopic` ("the bag has no channel")
+            // read off them could be false of the topic.
+            push_partition_violations(topic, parts, &mut violations);
         } else {
             push_topic_violations(
                 topic,
@@ -9526,6 +9578,9 @@ struct CaptureSummary {
     /// The per-WRITER count/byte inputs of a label-partitioned topic (`None` on
     /// every single-stream topic).
     partition_counts: Option<BTreeMap<WriterKey, PartitionCounts>>,
+    /// The writer in [`Self::partition_counts`] whose frames the pass's
+    /// injector re-published ([`CapturePartitioning::injected`]).
+    injected_writer: Option<WriterKey>,
 }
 
 impl CaptureSummary {
@@ -16573,6 +16628,7 @@ fn run_rank_pass(
                     byte_violation,
                     tolerance_violations: c.tolerance_violations(topic),
                     partition_counts,
+                    injected_writer: c.partitions.as_ref().and_then(|p| p.injected.clone()),
                 },
             )
         })
@@ -16770,8 +16826,9 @@ struct TopicClasses {
     driver: Vec<String>,
     /// The `produced` topics a driver writes beside at least one other node (a
     /// `multi_publisher_topics` topic), in graph order: captured, and diffed
-    /// over the other writers' frames only where the capture is partitioned
-    /// (`build_capture_partitionings`), over every frame where it is not.
+    /// over the other writers' frames only where every pass that captures it
+    /// partitions it (`build_capture_partitionings`), over every recorded
+    /// frame where one does not.
     driver_shared: Vec<String>,
     /// The graph's `external` (driver) nodes ([`external_node_ids`]). A pass
     /// captures only a topic one of its other members writes, and a driver's
@@ -18072,7 +18129,7 @@ struct CapturePartitioning {
     /// produces LIVE (members of its rank but its `external` drivers, whose
     /// frames are recorded inputs: see [`Self::uncompared`]) plus, where the
     /// topic is injected here, the single foreign writer the injector
-    /// re-publishes.
+    /// re-publishes, unless that writer is a driver ([`Self::injected`]).
     ///
     /// A SPLIT `multi_publisher_topics:` topic is written by several ranks, and
     /// a pass reproduces only what it owns or injects: a writer that is neither
@@ -18085,12 +18142,18 @@ struct CapturePartitioning {
     /// On a CO-LOCATED topic (every writer on one rank) it holds every writer
     /// but the drivers, so the behaviour is that of an unsplit topic.
     producible: BTreeSet<WriterKey>,
-    /// This pass's own `external` (driver) writers of the topic. A replayed
-    /// driver tick that writes its output publishes, but a driver's frames are
-    /// recorded inputs: a captured frame of one of these writers is written to
-    /// `--record-out` and is left out of the diff, the loss tripwire and every
-    /// count.
+    /// The `external` (driver) writers of the topic whose frames this pass
+    /// can capture: its own drivers, and a foreign driver whose recorded
+    /// frames its injector re-publishes. A driver's frames are recorded
+    /// inputs: a captured frame of one of these writers is left out of the
+    /// diff, the loss tripwire and every count, and a replayed driver's (not
+    /// an injected one's) is written to `--record-out`.
     uncompared: BTreeSet<WriterKey>,
+    /// The foreign writer in [`Self::producible`] whose frames this pass's
+    /// injector re-publishes, when there is one. Its partition is a copy of
+    /// frames another pass publishes live, so a verdict over several passes
+    /// takes that pass's partition of the writer ([`merge_partitioned_summaries`]).
+    injected: Option<WriterKey>,
     /// How many feed positions have been walked into [`Self::streams`].
     walked: usize,
     /// Per writer, its stream state. `BTreeMap` — the violation order is
@@ -18835,8 +18898,8 @@ impl Capture {
         // comment above claims.
         let p = self.partitions.as_mut().expect("caller checked");
         let key = classify_capture_origin(&p.live_labels, sample.origin());
-        // A driver's frame is a recorded input: the drain already wrote it to
-        // `--record-out`, and nothing else reads it.
+        // A driver's frame is a recorded input: the drain already wrote a
+        // replayed one to `--record-out`, and nothing else reads it.
         if p.uncompared.contains(&key) {
             return Ok(());
         }
@@ -19228,9 +19291,10 @@ fn build_capture_partitionings(
     // LOCAL (published live, and so nameable from this run's publisher table)
     // and which are FOREIGN (re-published by the injector).
     members: &[String],
-    // The graph's `external` (driver) nodes. A local driver's recorded
-    // frames are inputs, so its partition is not one this pass compares, and
-    // what its replayed ticks publish is left out of the diff.
+    // The graph's `external` (driver) nodes. A driver's recorded frames are
+    // inputs, so its partition is not one this pass compares, and what a
+    // local one's replayed ticks publish, or this pass's injector re-publishes
+    // for a foreign one, is left out of the diff.
     drivers: &BTreeSet<String>,
     // This pass's injectors, for the id of the publisher that
     // stands in for a split topic's foreign writer.
@@ -19257,18 +19321,18 @@ fn build_capture_partitionings(
     let local: BTreeSet<&str> = members.iter().map(String::as_str).collect();
     let mut ambiguous_injection: BTreeSet<&str> = BTreeSet::new();
     // Per topic, the writers THIS PASS can put on the wire (see
-    // `CapturePartitioning::producible`) and its own drivers among the
-    // writers (`CapturePartitioning::uncompared`).
+    // `CapturePartitioning::producible`), the drivers whose frames it can
+    // capture (`CapturePartitioning::uncompared`) and the foreign writer its
+    // injector re-publishes (`CapturePartitioning::injected`).
     let mut producible_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut uncompared_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut injected_by_topic: BTreeMap<String, String> = BTreeMap::new();
     for (topic, writers) in &candidates {
         let (mine, foreign) = split_local_and_foreign(writers, &local);
         let (local_drivers, mine): (Vec<&ProducedWriter>, Vec<&ProducedWriter>) =
             mine.into_iter().partition(|w| drivers.contains(&w.node_id));
-        uncompared_by_topic.insert(
-            topic.clone(),
-            local_drivers.into_iter().map(|w| w.label.clone()).collect(),
-        );
+        let mut uncompared: BTreeSet<String> =
+            local_drivers.into_iter().map(|w| w.label.clone()).collect();
         let mut producible: BTreeSet<String> = mine.into_iter().map(|w| w.label.clone()).collect();
         match (injectors.get(topic), foreign.as_slice()) {
             (_, []) => {}
@@ -19286,13 +19350,22 @@ fn build_capture_partitionings(
             }
             (Some(injector), [only]) => {
                 live_labels.insert(injector.publisher_id(), Arc::from(only.label.as_str()));
-                producible.insert(only.label.clone());
+                // A foreign driver's frames the injector re-publishes are the
+                // driver's recorded frames: inputs, named so the drain leaves
+                // them out like a driver of this pass.
+                if drivers.contains(&only.node_id) {
+                    uncompared.insert(only.label.clone());
+                } else {
+                    producible.insert(only.label.clone());
+                    injected_by_topic.insert(topic.clone(), only.label.clone());
+                }
             }
             (Some(_), _) => {
                 ambiguous_injection.insert(topic.as_str());
             }
         }
         producible_by_topic.insert(topic.clone(), producible);
+        uncompared_by_topic.insert(topic.clone(), uncompared);
     }
     let live_labels = Arc::new(live_labels);
     let tokens = load_recorded_publisher_tokens(trace);
@@ -19480,6 +19553,9 @@ fn build_capture_partitionings(
                     .iter()
                     .map(|w| WriterKey::Named(Arc::from(w.as_str())))
                     .collect(),
+                injected: injected_by_topic
+                    .get(topic)
+                    .map(|w| WriterKey::Named(Arc::from(w.as_str()))),
                 walked: 0,
                 streams,
             },
@@ -21344,10 +21420,10 @@ mod driver_topic_tests {
                           writers were compared over the other writers' frames only (driver \
                           nodes, as the replayed build declares them: cam): /rig/bus";
         let unattributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
-                            writers were compared over every recorded and replayed frame, the \
-                            drivers' included, since the replay could not attribute each \
-                            recorded frame to its writer (driver nodes, as the replayed build \
-                            declares them: cam): /rig/tf";
+                            writers were compared over every recorded frame, the drivers' \
+                            included, since the replay could not attribute each recorded \
+                            frame to its writer (driver nodes, as the replayed build declares \
+                            them: cam): /rig/tf";
         let both = DriverInputsReport {
             unattributed_topics: strings(&["/rig/tf"]),
             ..report(&["cam"], &[], &["/rig/bus", "/rig/tf"], &[], &[])
@@ -24871,16 +24947,7 @@ fn push_topic_violations(
     // topic-level triage above is untouched: a topic that produced nothing at
     // all is still ONE `MissingTopic`, not one per writer.
     if let Some(parts) = partitions {
-        for (writer, counts) in parts {
-            push_stream_violations(
-                topic,
-                Some(writer),
-                counts.recorded,
-                counts.replayed,
-                counts.byte_violation.as_ref(),
-                violations,
-            );
-        }
+        push_partition_violations(topic, parts, violations);
         return;
     }
     push_stream_violations(
@@ -24891,6 +24958,95 @@ fn push_topic_violations(
         byte_violation,
         violations,
     );
+}
+
+/// The count and byte verdicts of a label-partitioned topic, one writer at a
+/// time in writer order.
+fn push_partition_violations(
+    topic: &str,
+    parts: &BTreeMap<WriterKey, PartitionCounts>,
+    violations: &mut Vec<Violation>,
+) {
+    for (writer, counts) in parts {
+        push_stream_violations(
+            topic,
+            Some(writer),
+            counts.recorded,
+            counts.replayed,
+            counts.byte_violation.as_ref(),
+            violations,
+        );
+    }
+}
+
+/// The violations of a topic a driver shares ([`TopicClasses::driver_shared`])
+/// that several passes captured, at least one of them without partitioning it
+/// by writer. Each such pass is judged as one stream: every recorded frame of
+/// the topic (`recorded_count`, the drivers' included) against every frame the
+/// pass captured. The writers of the passes that did partition it are judged
+/// per writer ([`merge_partitioned_summaries`]). No count is summed across
+/// passes: a frame one pass injects and another publishes live would count
+/// twice, and could net against a shortfall elsewhere.
+fn push_split_unattributed_violations(
+    topic: &str,
+    recorded_count: usize,
+    summaries: &[CaptureSummary],
+    violations: &mut Vec<Violation>,
+) {
+    for summary in summaries.iter().filter(|s| s.partition_counts.is_none()) {
+        push_stream_violations(
+            topic,
+            None,
+            recorded_count,
+            summary.replayed_count,
+            summary.byte_violation.as_ref(),
+            violations,
+        );
+    }
+    let partitioned = summaries.iter().filter(|s| s.partition_counts.is_some());
+    if let Some(parts) =
+        merge_partitioned_summaries(partitioned).and_then(|merged| merged.partition_counts)
+    {
+        push_partition_violations(topic, &parts, violations);
+    }
+}
+
+/// The capture summaries of one topic a driver shares, from every pass that
+/// captured it in pass order, folded into one when every one of them
+/// partitioned the topic by writer; `None` when one did not or there is none.
+/// PURE.
+///
+/// A writer's partition is taken from the pass that publishes the writer
+/// live. A pass whose injector re-publishes a split topic's foreign writer
+/// captures copies of that writer's recorded frames
+/// ([`CaptureSummary::injected_writer`]), so its partition of the writer is
+/// kept only where no pass that publishes it live completed, and the first
+/// such copy is kept. The fold's frame count is its partitions' sum, and its
+/// per-field tolerance violations are every pass's.
+fn merge_partitioned_summaries<'a>(
+    summaries: impl IntoIterator<Item = &'a CaptureSummary>,
+) -> Option<CaptureSummary> {
+    let mut parts: BTreeMap<WriterKey, PartitionCounts> = BTreeMap::new();
+    let mut tolerance_violations: Vec<Violation> = Vec::new();
+    let mut any = false;
+    for summary in summaries {
+        let counts = summary.partition_counts.as_ref()?;
+        any = true;
+        for (writer, c) in counts {
+            let injected = summary.injected_writer.as_ref() == Some(writer);
+            if !injected || !parts.contains_key(writer) {
+                parts.insert(writer.clone(), c.clone());
+            }
+        }
+        tolerance_violations.extend(summary.tolerance_violations.iter().cloned());
+    }
+    any.then(|| CaptureSummary {
+        replayed_count: parts.values().map(|c| c.replayed).sum(),
+        byte_violation: None,
+        tolerance_violations,
+        partition_counts: Some(parts),
+        injected_writer: None,
+    })
 }
 
 /// The count + byte verdict of ONE frame stream — a whole topic when `writer`
@@ -35723,6 +35879,7 @@ mod capture_partition_tests {
             ],
             producible: [key("left/bus"), key("right/bus")].into_iter().collect(),
             uncompared: BTreeSet::new(),
+            injected: None,
             walked: 0,
             streams: BTreeMap::new(),
             topic: "/mp/bus".to_string(),
@@ -35772,6 +35929,94 @@ mod capture_partition_tests {
             "and it does not name a writer: {}",
             got[0].detail
         );
+    }
+
+    /// One pass's partitioned summary, its writers' `(recorded, replayed)`
+    /// counts in `parts` and `injected` the writer its injector re-published.
+    fn pass_summary(parts: &[(&str, usize, usize)], injected: Option<&str>) -> CaptureSummary {
+        CaptureSummary {
+            replayed_count: parts.iter().map(|p| p.2).sum(),
+            byte_violation: None,
+            tolerance_violations: Vec::new(),
+            partition_counts: Some(
+                parts
+                    .iter()
+                    .map(|&(w, recorded, replayed)| {
+                        (
+                            WriterKey::Named(w.into()),
+                            PartitionCounts {
+                                recorded,
+                                replayed,
+                                byte_violation: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            injected_writer: injected.map(|w| WriterKey::Named(w.into())),
+        }
+    }
+
+    /// The `(writer, recorded, replayed)` rows of a merged summary.
+    fn rows(summary: &CaptureSummary) -> Vec<(String, usize, usize)> {
+        summary
+            .partition_counts
+            .as_ref()
+            .expect("a merged summary is partitioned")
+            .iter()
+            .map(|(w, c)| (w.to_string(), c.recorded, c.replayed))
+            .collect()
+    }
+
+    /// The summaries of a topic a driver shares fold writer by writer across
+    /// passes: a writer's partition from the pass that publishes it live wins
+    /// over a pass's injected copy in either order, an injected copy stands
+    /// only where no pass publishes the writer live (the first such copy), and
+    /// the frame count is the kept partitions' sum. One pass's summary folds
+    /// to itself. A pass that did not partition the topic, or no pass at all,
+    /// folds to nothing.
+    #[test]
+    fn the_passes_of_a_shared_topic_fold_writer_by_writer() {
+        let w =
+            |name: &str, recorded: usize, replayed: usize| (name.to_string(), recorded, replayed);
+        // `b/out` live on pass 0 (5 of 6), injected on pass 1 (6 of 6).
+        let live_first = [
+            pass_summary(&[("a/out", 4, 4), ("b/out", 6, 5)], None),
+            pass_summary(&[("b/out", 6, 6), ("c/out", 2, 3)], Some("b/out")),
+        ];
+        let merged = merge_partitioned_summaries(&live_first).expect("both passes partitioned");
+        assert_eq!(
+            rows(&merged),
+            vec![w("a/out", 4, 4), w("b/out", 6, 5), w("c/out", 2, 3)]
+        );
+        assert_eq!(merged.replayed_count, 12);
+        // The same passes the other way round.
+        let injected_first = [live_first[1].clone(), live_first[0].clone()];
+        assert_eq!(
+            rows(&merge_partitioned_summaries(&injected_first).expect("partitioned")),
+            vec![w("a/out", 4, 4), w("b/out", 6, 5), w("c/out", 2, 3)],
+            "the live partition wins in either order"
+        );
+        // Injected on both passes, live on neither: the first copy stands.
+        let injected_twice = [
+            pass_summary(&[("a/out", 4, 4), ("b/out", 6, 2)], Some("b/out")),
+            pass_summary(&[("b/out", 6, 6)], Some("b/out")),
+        ];
+        assert_eq!(
+            rows(&merge_partitioned_summaries(&injected_twice).expect("partitioned")),
+            vec![w("a/out", 4, 4), w("b/out", 6, 2)]
+        );
+        let one = pass_summary(&[("a/out", 4, 3)], None);
+        let folded = merge_partitioned_summaries([&one]).expect("partitioned");
+        assert_eq!(rows(&folded), vec![w("a/out", 4, 3)]);
+        assert_eq!(folded.replayed_count, one.replayed_count);
+        let unpartitioned = CaptureSummary {
+            partition_counts: None,
+            injected_writer: None,
+            ..one.clone()
+        };
+        assert!(merge_partitioned_summaries([&one, &unpartitioned]).is_none());
+        assert!(merge_partitioned_summaries(&[] as &[CaptureSummary]).is_none());
     }
 }
 
