@@ -49389,6 +49389,244 @@ fn a_writer_whose_one_frame_the_bag_lost_is_tolerated_in_its_process_s_tail() {
     );
 }
 
+/// The `--tolerance` rows of a split topic are judged where its frames are
+/// compared and withheld where they are not. The mixed bag of
+/// `a_split_topic_one_process_attributes_and_another_does_not_is_judged_in_both`,
+/// replayed with the verifier's record budget at the bus's `2n` frames and `x`
+/// bounded at 0.5 and `z` at 10000000 on the bus: `w2`'s partition in the
+/// first process is compared, and the second process's one stream, `w3`'s
+/// frames alone, is not. CONTROL: the unchanged candidate is DECLINED, exit
+/// 0, its row withholding the second process's `x` row, worst at the first
+/// recorded `w2` frame, whose 2 its `w3` frame reads as 3. A changed `w2`,
+/// stamping 4 where it recorded 2, moves `x` by 2 and `z` by 2000000 on every
+/// frame: exit 1, one `x` row from the first process, and nothing declined.
+#[test]
+#[serial]
+fn a_split_topic_s_tolerance_rows_are_judged_where_its_frames_are_compared() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, bag) = ri_mix_bag(dir.path());
+    let first_w2 = live.rec.messages[RI_MIX_BUS]
+        .iter()
+        .position(|f| frame_x(f) == 2.0)
+        .expect("PREMISE: w2 recorded a frame");
+    let yaml = "\
+topics:
+  /rimix/bus:
+    fields:
+      x:
+        kind: max_abs
+        threshold: 0.5
+      z:
+        kind: max_abs
+        threshold: 10000000
+";
+    let replay = |w2: f64| {
+        let _budget = replay_engine::override_frame_index_record_budget(2 * RI_STEPS);
+        replay_with_tolerance(&bag, || ri_mix_factories(w2, 3.0), yaml, None)
+    };
+
+    let outcome = replay(2.0).expect("CONTROL: the replay runs");
+    assert!(
+        outcome.violations.is_empty(),
+        "CONTROL: {:?}",
+        outcome.violations
+    );
+    assert_eq!(resim_exit(&outcome, true), 0, "CONTROL: exit 0");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 1));
+    let withheld: Vec<String> = outcome
+        .declined_frame_comparisons
+        .iter()
+        .flat_map(|d| d.withheld.iter())
+        .filter_map(|v| match &v.class {
+            ViolationClass::ToleranceExceeded {
+                field,
+                worst_value,
+                worst_tick,
+                ..
+            } => Some(format!("{field:?} {worst_value:?} {worst_tick}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        withheld,
+        vec![format!("Some(\"x\") Some(1.0) {first_w2}")],
+        "CONTROL: the second process's x row is withheld: {:?}",
+        outcome.declined_frame_comparisons
+    );
+
+    let outcome = replay(4.0).expect("changed w2: the replay runs");
+    assert_eq!(resim_exit(&outcome, true), 1, "changed w2: exit 1");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 1));
+    let named = ri_named(&outcome);
+    let want_detail = format!(
+        "field 'x' exceeded the max_abs tolerance on '{RI_MIX_BUS}': worst value 2 vs threshold \
+         0.5 (worst at frame 0)"
+    );
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_MIX_BUS, ViolationClass::ToleranceExceeded { .. }, detail)]
+                if *detail == want_detail
+        ),
+        "changed w2: exactly the first process's x row: {named:?}"
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "changed w2: a failed topic is not declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+}
+
+/// A writer that never publishes, on every eighth step: its tick writes no
+/// output.
+#[cerulion_node(period_ms = 40)]
+#[derive(Default)]
+struct RiSlowSilentWriterNode {
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl RiSlowSilentWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+}
+
+/// The topic a writer shares with a slow writer that never publishes.
+const RI_ALONE_BUS: &str = "/rialone/bus";
+
+/// A writer (`w2`, writer 2), a period writer or, when `slow`, one on every
+/// eighth step, and a writer that never publishes, on every eighth step
+/// (`w3`), on one `multi_publisher_topics` topic no node reads.
+fn ri_alone_yaml(slow: bool) -> String {
+    let w2 = if slow {
+        "ri_slow_writer_node"
+    } else {
+        "ri_writer_node"
+    };
+    format!(
+        "name: rialone\nprefix: rialone\nmulti_publisher_topics:\n  - /rialone/bus\nnodes:\n\
+         \x20 - id: w2\n    type: {w2}\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rialone/bus\n\
+         \x20 - id: w3\n    type: ri_slow_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rialone/bus\n"
+    )
+}
+
+fn ri_alone_factories(slow: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let w2: Box<dyn NodeEntry> = if slow {
+        Box::new(RiSlowWriterNodeEntry::with_state(RiSlowWriterNode {
+            writer: 2.0,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: 2.0,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w2", w2),
+        (
+            "w3",
+            Box::new(RiSlowSilentWriterNodeEntry::with_state(
+                RiSlowSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// The ragged-tail window of a `multi_publisher_topics` topic judged by the
+/// one process whose writers published its frames is that process's own.
+/// `w2` runs in the first process, and `w3`, which never publishes and fires
+/// on every eighth step, at 40 ms to 280 ms of the 300 ms run, in the second,
+/// whose final recorded step therefore banked its boundary and no fires, a
+/// one-step tail. The bag labels no frame. The period writer `w2` fires on
+/// every step, and the bag lost the frame of its last fire, so `w2` replays
+/// one frame past its `n - 1` recorded ones, which no tail of the first
+/// process explains, though the second's window would hold it: exit 1, one
+/// `extra-messages` violation of the whole stream, which names no writer, and
+/// no tolerance note. CONTROL: a slow `w2`, on every eighth step, leaves the
+/// first process's final recorded step without fires too, and with the frame
+/// of its last fire lost, its own window explains the extra frame: the bus
+/// passes, checked and credited, with the first process's note.
+#[test]
+#[serial]
+fn a_split_topic_judged_by_one_process_takes_that_process_s_tail_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let on_rank1: fn(&str) -> bool = |id| id == "w3";
+    for slow in [false, true] {
+        let run = if slow { "CONTROL" } else { "period w2" };
+        let mut live = ri_record(&ri_alone_yaml(slow), || ri_alone_factories(slow));
+        let frames = if slow {
+            ri_slow_frames(2.0)
+        } else {
+            ri_period_frames(2.0)
+        };
+        let n = frames.len();
+        let mut want = BTreeMap::new();
+        want.insert(2, frames);
+        assert_eq!(
+            ri_frames_by_writer(&live.rec, RI_ALONE_BUS),
+            want,
+            "PREMISE: {run}: the recorded bus holds w2's frames alone"
+        );
+        ri_drop_last_frame(&mut live.rec, RI_ALONE_BUS, 2.0);
+        let bag = dir.path().join(format!("ri_alone_{slow}.mcap"));
+        ri_two_rank_bag_labelled(&live.rec, &bag, on_rank1, false);
+        let (outcome, _) = ri_replay(
+            &bag,
+            || ri_alone_factories(slow),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        if slow {
+            assert!(
+                outcome.violations.is_empty(),
+                "{run}: {:?}",
+                outcome.violations
+            );
+            assert!(outcome.passed, "{run}");
+            assert_eq!(
+                (outcome.topics_checked, outcome.topics_passed),
+                (1, 1),
+                "{run}: the bus is checked and credited"
+            );
+            assert_eq!(
+                ri_frame_notes(&outcome, RI_ALONE_BUS),
+                vec![ri_fireless_note(RI_ALONE_BUS, 0, n - 1, n).as_str()],
+                "{run}"
+            );
+            continue;
+        }
+        assert_eq!(
+            resim_exit(&outcome, true),
+            1,
+            "{run}: exit 1: {:?} {:?}",
+            outcome.trace_divergence,
+            outcome.tolerated_ragged_tails
+        );
+        assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+        let want_detail = format!(
+            "recorded {} frame(s), replay produced {n} on '{RI_ALONE_BUS}'",
+            n - 1
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_ALONE_BUS, ViolationClass::ExtraMessages { recorded, replayed }, detail)]
+                    if (*recorded, *replayed) == (n - 1, n) && *detail == want_detail
+            ),
+            "{run}: exactly the stream's extra frame: {named:?}"
+        );
+        assert!(
+            outcome.tolerated_ragged_tails.is_empty(),
+            "{run}: no tolerance note: {:?}",
+            outcome.tolerated_ragged_tails
+        );
+    }
+}
+
 /// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
 /// whose renderer test reads only the class label and the detail it is
 /// given: a header difference, as `timestamp_ns` 7 against 9 reads.
