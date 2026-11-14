@@ -682,8 +682,8 @@ pub const REPORT_VERSION: u32 = 1;
 pub struct ReplayOutcome {
     /// `true` iff the replay FULLY matched the recording — no data [`Violation`],
     /// no structural [`Self::trace_divergence`], AND no panic-class
-    /// [`Self::node_failures`]. Env divergences are WARN-only and do NOT clear
-    /// this flag (see [`Self::env_divergence`]). A `false` value is decomposed
+    /// [`Self::node_failures`]. Environment divergences never clear this flag
+    /// (see [`Self::env_divergence`]). A `false` value is decomposed
     /// by the three failure fields — a non-empty `node_failures` (exit 3, which
     /// PREEMPTS everything: root cause over symptoms), a populated
     /// `trace_divergence` (exit 6, which takes precedence over data), a
@@ -740,8 +740,13 @@ pub struct ReplayOutcome {
     /// downstream data drift). Serialized in the `--report` JSON (additive field
     /// — `report_version` unchanged; old readers ignore it).
     pub trace_divergence: Option<TraceDivergenceReport>,
-    /// Environment divergences vs the bag's `env.json` — WARN-only, never
-    /// exit-affecting (a replay host legitimately differs from the record host).
+    /// Every difference between the replay's own environment and the bag's
+    /// `env.json`, sorted by name: each recorded variable that differs or is
+    /// gone, and each variable that can change the re-execution that only the
+    /// replay sets. Never exit-affecting (a replay host legitimately differs
+    /// from the record host). The terminal prints a `WARNING:` line for each
+    /// variable that can change the re-execution and one `NOTE:` counting the
+    /// rest; this list, and its `read_by` key, carries all of them.
     pub env_divergence: Vec<EnvDivergence>,
     /// The recording host's identity from the bag's `__cerulion/recorder.json`
     /// attachment, if present + parseable. `None` for
@@ -3338,20 +3343,41 @@ pub enum ViolationClass {
     },
 }
 
-/// One environment divergence vs the bag's `env.json` (WARN-only).
-#[derive(Debug, Clone, serde::Serialize)]
+/// One difference between the replay's own environment and the bag's
+/// `env.json`. Never exit-affecting.
+///
+/// The `--report` JSON entry carries a fourth key beside these three fields,
+/// `read_by`: `"cerulion"`, `"dynamic_linker"` or `"python"` for a variable that
+/// can change the re-execution, `null` for every other one. It is derived from
+/// [`Self::name`] by the one rule the terminal output uses, so the two can never
+/// disagree about a variable.
+#[derive(Debug, Clone)]
 pub struct EnvDivergence {
     /// The variable name.
     pub name: String,
     /// What differs.
     pub kind: EnvDivergenceKind,
-    /// A human-readable one-line detail.
+    /// A human-readable one-line detail (the `--report` JSON's `detail`).
     pub detail: String,
+}
+
+impl serde::Serialize for EnvDivergence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut entry = serializer.serialize_struct("EnvDivergence", 4)?;
+        entry.serialize_field("name", &self.name)?;
+        entry.serialize_field("kind", &self.kind)?;
+        entry.serialize_field("detail", &self.detail)?;
+        entry.serialize_field("read_by", &env_reader(&self.name).map(EnvReader::label))?;
+        entry.end()
+    }
 }
 
 /// The env-divergence classes. Values are compared only for entries the bag
 /// recorded a value for (plain string) or a hash for (redacted `fnv64`);
-/// names-only (null) entries are compared for presence only.
+/// names-only (null) entries are compared for presence only. A variable the bag
+/// did not record is reported only when it can change the re-execution
+/// ([`Self::Added`]).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind")]
 pub enum EnvDivergenceKind {
@@ -3362,6 +3388,116 @@ pub enum EnvDivergenceKind {
     /// The bag recorded a redacted `fnv64` that the current value does not hash
     /// to (the value changed under redaction).
     HashChanged,
+    /// The replay env sets a variable that can change the re-execution (a
+    /// `CERULION_`, `IOX2_`, `LD_`, `DYLD_` or `PYTHON` name that does not mark
+    /// a secret, or `CARGO_TARGET_DIR`) and the bag did not record it.
+    Added,
+}
+
+impl EnvDivergenceKind {
+    /// The variant name, which is also the serialized `kind` tag.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Missing => "Missing",
+            Self::ValueChanged => "ValueChanged",
+            Self::HashChanged => "HashChanged",
+            Self::Added => "Added",
+        }
+    }
+
+    /// How the variable changed, worded for the terminal line.
+    fn change_phrase(&self) -> &'static str {
+        match self {
+            Self::ValueChanged | Self::HashChanged => "has a different value than in the recording",
+            Self::Missing => "was set in the recording and is not set now",
+            Self::Added => "is set now and was not set in the recording",
+        }
+    }
+}
+
+/// What reads an environment variable that can change a re-execution: the
+/// re-execution itself or a runtime it starts ([`env_reader`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvReader {
+    /// Cerulion itself or its shared-memory transport (`CERULION_`, `IOX2_`).
+    Cerulion,
+    /// The dynamic linker, which maps every node library (`LD_`, `DYLD_`).
+    DynamicLinker,
+    /// The Python interpreter that runs Python nodes (`PYTHON`).
+    Python,
+    /// Cerulion's node library lookup, which picks the build directory every
+    /// node library loads from (`CARGO_TARGET_DIR`,
+    /// [`crate::graph_cmd::cdylib_target_base`]).
+    NodeLibraryLookup,
+}
+
+impl EnvReader {
+    /// The `--report` JSON's `read_by` value and the log field's value. It
+    /// names the program that reads the variable, so both Cerulion readers
+    /// are `cerulion`; [`Self::reason`] says what each reads it for.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cerulion | Self::NodeLibraryLookup => "cerulion",
+            Self::DynamicLinker => "dynamic_linker",
+            Self::Python => "python",
+        }
+    }
+
+    /// Why a difference in a variable this reader reads matters, worded for the
+    /// terminal line.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Cerulion => {
+                "Cerulion reads its settings from CERULION_ and IOX2_ variables, so this one can \
+                 change the re-execution."
+            }
+            Self::DynamicLinker => {
+                "The dynamic linker reads it to choose the libraries each node loads, so it can \
+                 change the re-execution."
+            }
+            Self::Python => {
+                "The Python interpreter that runs Python nodes reads it, so it can change the \
+                 re-execution."
+            }
+            Self::NodeLibraryLookup => {
+                "Cerulion reads it to choose the build directory it loads each node library \
+                 from, so it can change the re-execution."
+            }
+        }
+    }
+}
+
+/// The reader whose settings namespace `name` is in, or that reads `name`
+/// itself (`CARGO_TARGET_DIR`), or `None` for any other name or one that marks
+/// a secret.
+///
+/// Loud means the name is in a namespace the re-execution itself, or a
+/// runtime it starts, reads its settings from: Cerulion and its shared-memory
+/// transport (`CERULION_`, `IOX2_`), the dynamic linker that maps every node
+/// library (`LD_`, `DYLD_`), and the Python interpreter that runs Python nodes
+/// (`PYTHON`). One exact name outside those namespaces is loud too:
+/// `CARGO_TARGET_DIR`, which Cerulion reads to pick the build directory every
+/// node library loads from. Every other variable (the shell's, the session's,
+/// `PATH`, `HOME`, locale, `RUST_LOG`, library knobs such as
+/// `OMP_NUM_THREADS`) is counted with the rest; it matters when code in a node
+/// reads it, which the replay cannot see. A name that marks a secret is never
+/// loud: credentials authenticate a session and do not decide what a
+/// re-execution computes. The secret rule is the recorder's own, so the two
+/// agree on every name. Case-sensitive, like Unix names. Pure.
+fn env_reader(name: &str) -> Option<EnvReader> {
+    if crate::graph_cmd::env_name_marks_a_secret(name) {
+        None
+    } else if name.starts_with("CERULION_") || name.starts_with("IOX2_") {
+        Some(EnvReader::Cerulion)
+    } else if name.starts_with("LD_") || name.starts_with("DYLD_") {
+        Some(EnvReader::DynamicLinker)
+    } else if name.starts_with("PYTHON") {
+        Some(EnvReader::Python)
+    } else if name == "CARGO_TARGET_DIR" {
+        Some(EnvReader::NodeLibraryLookup)
+    } else {
+        None
+    }
 }
 
 // ===========================================================================
@@ -4387,9 +4523,15 @@ pub enum ReplayNodes {
 
 /// Run the deterministic replay engine and return its [`ReplayOutcome`].
 ///
-/// Writes the JSON report to `inputs.report_path` when set. Emits a
-/// `tracing::warn!` per env divergence and a `tracing::info!` per node failure
-/// (both terminal reports name each failed node). A data violation and a
+/// Writes the JSON report to `inputs.report_path` when set. An environment
+/// variable that differs from the recording and that Cerulion does not read
+/// is a `tracing::info!` (the terminal counts those in one NOTE line, and `-v`
+/// shows these). One that can change the re-execution is a `tracing::info!` on
+/// a run that returns its outcome, because the verdict and the neutral summary
+/// each print it, and a `tracing::warn!` on a run that returns an error once
+/// the passes ran (a rank ABORTS, or a passing run's `--report` cannot be
+/// written), where the CLI prints only that error. A node failure is a `tracing::info!` (both
+/// terminal reports name each failed node). A data violation and a
 /// structural trace divergence are a `tracing::info!` under
 /// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
 /// printed by the CLI) states each in full, and a `tracing::warn!` under
@@ -5152,11 +5294,19 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                  rank's pass; the abort's own error stands"
             );
         }
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
         drop(transport);
         drop(clock);
         return Err(e);
     }
-    persist_report(report_path.as_deref(), &outcome)?;
+    // A PASSING run whose `--report` cannot be written returns the write error,
+    // and the CLI prints only that error, so the environment lines are logged
+    // as on an abort.
+    if let Err(e) = persist_report(report_path.as_deref(), &outcome) {
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
+        return Err(e);
+    }
+    log_env_divergences(&outcome.env_divergence, OutcomeShown::Yes);
     // A bag that could not be finished is reported on the outcome, not raised
     // here: the engine does not know whether a verdict was asked for, and the
     // surface keeps a failing verdict's own exit code while never letting a
@@ -5797,11 +5947,11 @@ fn assemble_outcome(
         ));
     }
 
-    // 7. Env divergence (WARN-only) + report + verdict data.
+    // 7. Env divergence (never exit-affecting) + report + verdict data. The
+    // divergences are logged by `run_engine` once it knows whether the CLI
+    // shows this outcome, which a failed `--report` write decides after this
+    // epilogue (`log_env_divergences`).
     let env_divergence = compare_env(env_json);
-    for d in &env_divergence {
-        tracing::warn!(var = %d.name, detail = %d.detail, "replay: environment divergence vs bag env.json");
-    }
     // A completed `--verify`: INFO, because the verdict renders each violation
     // and the schedule divergence as its own block on the same stderr, so these
     // lines are for a log pipeline only. A bare `--resim`: WARN, because its
@@ -6028,6 +6178,47 @@ fn build_read_log_verdict(
         unmet_total,
         detail,
     })
+}
+
+/// Whether the CLI shows a run's outcome: `Yes` when [`run_engine`] returns it
+/// (the verdict and the neutral summary each print
+/// [`render_env_divergence_lines`]), `No` when it returns an error instead,
+/// which is all the CLI then prints.
+#[derive(Clone, Copy)]
+enum OutcomeShown {
+    Yes,
+    No,
+}
+
+/// Log each environment divergence once. A variable that can change the
+/// re-execution ([`env_reader`]) is an `info!` when the outcome is shown, which
+/// already prints it, and a `warn!` when it is not, so it still reaches the
+/// terminal. Every other variable is an `info!` either way: the NOTE line
+/// counts it, and `-v` lists it.
+fn log_env_divergences(divergences: &[EnvDivergence], shown: OutcomeShown) {
+    for d in divergences {
+        match (env_reader(&d.name), shown) {
+            (None, _) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                "replay: an environment variable differs from the recording"
+            ),
+            (Some(reader), OutcomeShown::Yes) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+            (Some(reader), OutcomeShown::No) => tracing::warn!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+        }
+    }
 }
 
 /// Persist the `--report` artifact, if one was requested, under the decided
@@ -26449,14 +26640,42 @@ fn describe_fire(f: &FireTuple) -> String {
 // Environment divergence
 // ===========================================================================
 
-/// Compare the CURRENT process environment against the bag's `env.json`
-/// (WARN-only). Iterates the RECORDED entries (the bag is the golden): a
-/// recorded name absent now is `Missing`; a recorded plain value that differs is
-/// `ValueChanged`; a recorded redacted `fnv64` the current value does not hash
-/// to is `HashChanged`; a names-only (null) entry is presence-checked only.
-/// Extra current-only variables are NOT reported (a replay host legitimately
-/// has more). Returns divergences in the recorded object's key order.
+/// Compare the replay process's own environment with the bag's `env.json`.
+///
+/// [`compare_env_against`] over `std::env::vars_os()`: every variable whose
+/// name is UTF-8 (a recorded name always is, since `env.json` is JSON), with its
+/// value as raw bytes, so a value that is not UTF-8 compares as the bytes it is
+/// rather than reading as absent.
 fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let current: BTreeMap<String, Vec<u8>> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            name.to_str()
+                .map(|name| (name.to_string(), value.as_bytes().to_vec()))
+        })
+        .collect();
+    compare_env_against(env_json, &current)
+}
+
+/// Compare `current` (name to raw value bytes) with the bag's `env.json`. Pure.
+///
+/// The RECORDED entries are walked first: a recorded name absent now is
+/// `Missing`; a recorded plain value the current bytes differ from is
+/// `ValueChanged`; a recorded redacted `fnv64` the current bytes do not hash to
+/// is `HashChanged`; a names-only (null) entry is presence-checked only; a
+/// redacted object without an `fnv64` and a bool or number carry nothing to
+/// compare and are skipped. Then every CURRENT name the bag did not record is
+/// `Added` when [`env_reader`] says it can change the re-execution, and ignored
+/// otherwise (a replay host legitimately has more shell and session variables
+/// than the recording host).
+///
+/// No `env.json` means no comparison at all, `Added` included. The result is
+/// sorted by name, so its order depends on neither the JSON object's key order
+/// nor the environment's.
+fn compare_env_against(
+    env_json: Option<&[u8]>,
+    current: &BTreeMap<String, Vec<u8>>,
+) -> Vec<EnvDivergence> {
     let Some(bytes) = env_json else {
         return Vec::new();
     };
@@ -26468,12 +26687,11 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
     };
     let mut out = Vec::new();
     for (name, value) in &map {
-        let current = std::env::var(name).ok();
+        let now = current.get(name);
         match value {
-            // Names-only: presence check only. (Match-arm guard rather than
-            // a nested `if` — newer stable clippy collapses the two,
-            // deny-level in CI.)
-            serde_json::Value::Null if current.is_none() => {
+            // Names-only: presence check only. A match-arm guard rather than a
+            // nested `if`, which newer stable clippy collapses (deny-level in CI).
+            serde_json::Value::Null if now.is_none() => {
                 out.push(EnvDivergence {
                     name: name.clone(),
                     kind: EnvDivergenceKind::Missing,
@@ -26481,26 +26699,28 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                 });
             }
             serde_json::Value::Null => {}
-            serde_json::Value::String(recorded_value) => match current {
+            serde_json::Value::String(recorded_value) => match now {
                 None => out.push(EnvDivergence {
                     name: name.clone(),
                     kind: EnvDivergenceKind::Missing,
                     detail: format!("recorded variable '{name}' is absent at replay"),
                 }),
-                Some(cur) if cur != *recorded_value => out.push(EnvDivergence {
-                    name: name.clone(),
-                    kind: EnvDivergenceKind::ValueChanged,
-                    detail: format!("variable '{name}' value changed since recording"),
-                }),
+                Some(cur) if cur.as_slice() != recorded_value.as_bytes() => {
+                    out.push(EnvDivergence {
+                        name: name.clone(),
+                        kind: EnvDivergenceKind::ValueChanged,
+                        detail: format!("variable '{name}' value changed since recording"),
+                    })
+                }
                 Some(_) => {}
             },
             serde_json::Value::Object(obj) => {
                 // Redacted shape: {"redacted": true, "fnv64": "<hex>"}.
                 let recorded_fnv = obj.get("fnv64").and_then(serde_json::Value::as_str);
                 let Some(recorded_fnv) = recorded_fnv else {
-                    continue; // unknown object shape — nothing to compare.
+                    continue; // An unknown object shape has nothing to compare.
                 };
-                match current {
+                match now {
                     None => out.push(EnvDivergence {
                         name: name.clone(),
                         kind: EnvDivergenceKind::Missing,
@@ -26509,8 +26729,7 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                         ),
                     }),
                     Some(cur) => {
-                        let cur_fnv =
-                            format!("{:016x}", cerulion_core::wire::fnv1a_hash(cur.as_bytes()));
+                        let cur_fnv = format!("{:016x}", cerulion_core::wire::fnv1a_hash(cur));
                         if cur_fnv != recorded_fnv {
                             out.push(EnvDivergence {
                                 name: name.clone(),
@@ -26524,10 +26743,912 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                     }
                 }
             }
-            _ => {} // unexpected scalar (bool/number) — no value semantics.
+            _ => {} // An unexpected scalar (bool or number) has no value semantics.
         }
     }
+    for name in current.keys() {
+        if !map.contains_key(name) && env_reader(name).is_some() {
+            out.push(EnvDivergence {
+                name: name.clone(),
+                kind: EnvDivergenceKind::Added,
+                detail: format!("variable '{name}' is set at replay but absent from the recording"),
+            });
+        }
+    }
+    // Names are unique (a recorded name is never also `Added`), so the order is
+    // total.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The NOTE line for `n` differing variables that Cerulion does not read
+/// ([`env_reader`] gives `None`), or `None` for zero. It names no variable and
+/// no value.
+fn render_other_env_note(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some(
+            "NOTE: 1 other environment variable differs from the recording. Cerulion does not \
+             read it to decide what the re-execution runs, so it matters only if code in one of \
+             your nodes reads it. Run with -v to list it."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "NOTE: {n} other environment variables differ from the recording. Cerulion does not \
+             read them to decide what the re-execution runs, so they matter only if code in one \
+             of your nodes reads them. Run with -v to list them."
+        )),
+    }
+}
+
+/// The terminal lines for `divergences`, the one source of that text for the
+/// verdict ([`render_verdict`]) and the neutral resim summary.
+///
+/// One `WARNING:` line for each variable that can change the re-execution
+/// ([`env_reader`]), in list order, then at most one `NOTE:` that counts every
+/// other one. No line carries a value or a hash, and the NOTE names no
+/// variable: `-v` lists those (the engine's `info` line for each), and the
+/// `--report` JSON carries every divergence in full. A name is printed escaped
+/// (`str::escape_debug`), so a crafted `env.json` key cannot start a line of its
+/// own.
+pub(crate) fn render_env_divergence_lines(divergences: &[EnvDivergence]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut others = 0usize;
+    for d in divergences {
+        match env_reader(&d.name) {
+            Some(reader) => lines.push(format!(
+                "WARNING: environment variable {} {}. {}",
+                d.name.escape_debug(),
+                d.kind.change_phrase(),
+                reader.reason()
+            )),
+            None => others += 1,
+        }
+    }
+    lines.extend(render_other_env_note(others));
+    lines
+}
+
+#[cfg(test)]
+mod env_divergence_tests {
+    use super::*;
+
+    /// A current environment from hand-written pairs.
+    fn current(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.to_vec()))
+            .collect()
+    }
+
+    /// `(name, kind tag, detail, read_by)` as the `--report` JSON states them.
+    type Row = (String, String, String, serde_json::Value);
+
+    /// Each divergence as a [`Row`], read through the `--report` serialization
+    /// so the JSON contract is what is compared.
+    fn project(divergences: &[EnvDivergence]) -> Vec<Row> {
+        divergences
+            .iter()
+            .map(|d| {
+                let json = serde_json::to_value(d).expect("an entry serializes");
+                (
+                    json["name"].as_str().expect("name").to_string(),
+                    json["kind"]["kind"].as_str().expect("kind tag").to_string(),
+                    json["detail"].as_str().expect("detail").to_string(),
+                    json["read_by"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn row(name: &str, kind: &str, detail: &str, read_by: Option<&str>) -> Row {
+        (
+            name.to_string(),
+            kind.to_string(),
+            detail.to_string(),
+            read_by.map_or(serde_json::Value::Null, |r| {
+                serde_json::Value::String(r.to_string())
+            }),
+        )
+    }
+
+    #[test]
+    fn the_variables_cerulion_the_linker_and_python_read_are_classified_by_reader() {
+        let table = [
+            ("CERULION_DRAIN_DISCIPLINE", EnvReader::Cerulion),
+            ("CERULION_FIRE_THREADS", EnvReader::Cerulion),
+            ("IOX2_LOG_LEVEL", EnvReader::Cerulion),
+            ("CERULION_KEYBOARD_LAYOUT", EnvReader::Cerulion),
+            ("CERULION_APIKEY", EnvReader::Cerulion),
+            ("LD_LIBRARY_PATH", EnvReader::DynamicLinker),
+            ("LD_PRELOAD", EnvReader::DynamicLinker),
+            ("DYLD_INSERT_LIBRARIES", EnvReader::DynamicLinker),
+            ("DYLD_FALLBACK_LIBRARY_PATH", EnvReader::DynamicLinker),
+            ("PYTHONPATH", EnvReader::Python),
+            ("PYTHONHASHSEED", EnvReader::Python),
+            ("CARGO_TARGET_DIR", EnvReader::NodeLibraryLookup),
+        ];
+        for (name, reader) in table {
+            assert_eq!(env_reader(name), Some(reader), "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_session_library_and_secret_named_variables_are_not_classified() {
+        let none = [
+            "SHLVL",
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "TERM_SESSION_ID",
+            "ROS_DOMAIN_ID",
+            "RMW_IMPLEMENTATION",
+            "AMENT_PREFIX_PATH",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "LDFLAGS",
+            "LD",
+            "CARGO_HOME",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_TARGET_DIRS",
+            "CARGO_TARGET",
+            "cargo_target_dir",
+            "CERULION",
+            "IOX2",
+            "DYLD",
+            "cerulion_drain_discipline",
+            "ld_library_path",
+            "pythonpath",
+            "",
+            // Secret-marked names, by the recorder's own marker rule.
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "CERULION_KEY2",
+            "CERULION_ACCOUNTD_SUPABASE_JWT_SECRET",
+            "IOX2_SECRET",
+            "LD_PASSWORD",
+            "PYTHON_KEYS",
+        ];
+        for name in none {
+            assert_eq!(env_reader(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_changed_hash_and_a_changed_plain_value_are_reported_with_their_details() {
+        // FNV-1a 64 of "a" is the published test vector af63dc4c8601ec8c, and of
+        // "foobar" 85944171f73967e8.
+        let env = br#"{"SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("SHLVL", b"foobar")])
+            )),
+            vec![row(
+                "SHLVL",
+                "HashChanged",
+                "redacted variable 'SHLVL' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                None,
+            )]
+        );
+
+        let env = br#"{"CERULION_X": "a"}"#;
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("CERULION_X", b"b")])
+            )),
+            vec![row(
+                "CERULION_X",
+                "ValueChanged",
+                "variable 'CERULION_X' value changed since recording",
+                Some("cerulion"),
+            )]
+        );
+    }
+
+    #[test]
+    fn matching_values_and_hashes_report_nothing() {
+        // FNV-1a 64 of "" is the offset basis cbf29ce484222325, of "a"
+        // af63dc4c8601ec8c.
+        let env = br#"{
+            "EMPTY": {"redacted": true, "fnv64": "cbf29ce484222325"},
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "CERULION_X": "a",
+            "PRESENT_NAME": null
+        }"#;
+        let now = current(&[
+            ("EMPTY", b""),
+            ("SHLVL", b"a"),
+            ("CERULION_X", b"a"),
+            ("PRESENT_NAME", b"anything"),
+        ]);
+        assert!(compare_env_against(Some(env), &now).is_empty());
+    }
+
+    #[test]
+    fn a_bag_without_env_json_is_never_compared_even_for_added_variables() {
+        let now = current(&[("CERULION_A", b"1"), ("LD_PRELOAD", b"/x.so")]);
+        assert!(compare_env_against(None, &now).is_empty());
+    }
+
+    #[test]
+    fn every_recorded_arm_reports_its_own_kind_and_detail() {
+        let env = br#"{
+            "NAMES_ONLY_ABSENT": null,
+            "NAMES_ONLY_PRESENT": null,
+            "PLAIN_ABSENT": "v",
+            "REDACTED_ABSENT": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "REDACTED_NO_HASH": {"redacted": true},
+            "A_BOOL": true,
+            "A_NUMBER": 3
+        }"#;
+        let now = current(&[
+            ("NAMES_ONLY_PRESENT", b"x"),
+            ("REDACTED_NO_HASH", b"x"),
+            ("A_BOOL", b"false"),
+            ("A_NUMBER", b"4"),
+        ]);
+        assert_eq!(
+            project(&compare_env_against(Some(env), &now)),
+            vec![
+                row(
+                    "NAMES_ONLY_ABSENT",
+                    "Missing",
+                    "recorded (names-only) variable 'NAMES_ONLY_ABSENT' is absent at replay",
+                    None,
+                ),
+                row(
+                    "PLAIN_ABSENT",
+                    "Missing",
+                    "recorded variable 'PLAIN_ABSENT' is absent at replay",
+                    None,
+                ),
+                row(
+                    "REDACTED_ABSENT",
+                    "Missing",
+                    "recorded (redacted) variable 'REDACTED_ABSENT' is absent at replay",
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loud_variable_set_only_at_replay_is_added_in_name_order() {
+        let now = current(&[
+            ("CERULION_B", b"2"),
+            ("LD_PRELOAD", b"/x.so"),
+            ("CERULION_A", b"1"),
+        ]);
+        assert_eq!(
+            project(&compare_env_against(Some(b"{}"), &now)),
+            vec![
+                row(
+                    "CERULION_A",
+                    "Added",
+                    "variable 'CERULION_A' is set at replay but absent from the recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "CERULION_B",
+                    "Added",
+                    "variable 'CERULION_B' is set at replay but absent from the recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "LD_PRELOAD",
+                    "Added",
+                    "variable 'LD_PRELOAD' is set at replay but absent from the recording",
+                    Some("dynamic_linker"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn other_and_secret_variables_set_only_at_replay_are_not_added() {
+        let env = br#"{"CERULION_X": {"redacted": true}}"#;
+        let now = current(&[
+            ("SHLVL", b"2"),
+            ("PATH", b"/bin"),
+            ("HOME", b"/h"),
+            ("OMP_NUM_THREADS", b"4"),
+            ("CERULION_RCP_TOKEN", b"t"),
+            // Recorded, as an object with no hash: skipped, never Added.
+            ("CERULION_X", b"x"),
+        ]);
+        assert!(compare_env_against(Some(env), &now).is_empty());
+    }
+
+    #[test]
+    fn a_value_that_is_not_utf8_is_compared_as_bytes_and_never_reads_as_absent() {
+        let env =
+            br#"{"CERULION_X": "a", "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let now = current(&[("CERULION_X", &[0xff]), ("SHLVL", &[0xff])]);
+        let kinds: Vec<(String, String)> = project(&compare_env_against(Some(env), &now))
+            .into_iter()
+            .map(|(name, kind, _, _)| (name, kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("CERULION_X".to_string(), "ValueChanged".to_string()),
+                ("SHLVL".to_string(), "HashChanged".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shape_the_gate_refuses_yields_no_divergence() {
+        let now = current(&[("CERULION_A", b"1")]);
+        assert!(compare_env_against(Some(b"[1, 2]"), &now).is_empty());
+        assert!(compare_env_against(Some(b"{not json"), &now).is_empty());
+    }
+
+    #[test]
+    fn a_mixed_list_is_sorted_by_name_whatever_the_key_order() {
+        // Keys deliberately out of order in the document.
+        let env = br#"{
+            "ZZ_SESSION": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "PYTHONPATH": "/old",
+            "AA_GONE": null
+        }"#;
+        let now = current(&[
+            ("ZZ_SESSION", b"foobar"),
+            ("PYTHONPATH", b"/new"),
+            ("DYLD_INSERT_LIBRARIES", b"/x.dylib"),
+        ]);
+        let names: Vec<String> = compare_env_against(Some(env), &now)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "AA_GONE",
+                "DYLD_INSERT_LIBRARIES",
+                "PYTHONPATH",
+                "ZZ_SESSION"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_comparison_is_identical_across_runs_and_insertion_orders() {
+        let env =
+            br#"{"SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}, "CERULION_X": "a"}"#;
+        let pairs: [(&str, &[u8]); 4] = [
+            ("SHLVL", b"foobar"),
+            ("CERULION_X", b"b"),
+            ("LD_PRELOAD", b"/x.so"),
+            ("HOME", b"/h"),
+        ];
+        let forward = current(&pairs);
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let reversed = current(&reversed_pairs);
+        let first = compare_env_against(Some(env), &forward);
+        let second = compare_env_against(Some(env), &forward);
+        let other_order = compare_env_against(Some(env), &reversed);
+        assert_eq!(project(&first), project(&second));
+        assert_eq!(project(&first), project(&other_order));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+    }
+
+    #[test]
+    fn a_report_entry_carries_read_by_after_the_existing_keys() {
+        let entries = [
+            EnvDivergence {
+                name: "CERULION_DRAIN_DISCIPLINE".to_string(),
+                kind: EnvDivergenceKind::Added,
+                detail: "variable 'CERULION_DRAIN_DISCIPLINE' is set at replay but absent from \
+                         the recording"
+                    .to_string(),
+            },
+            EnvDivergence {
+                name: "SHLVL".to_string(),
+                kind: EnvDivergenceKind::HashChanged,
+                detail: "d".to_string(),
+            },
+            EnvDivergence {
+                name: "PYTHONHOME".to_string(),
+                kind: EnvDivergenceKind::Missing,
+                detail: "d".to_string(),
+            },
+            EnvDivergence {
+                name: "LD_LIBRARY_PATH".to_string(),
+                kind: EnvDivergenceKind::ValueChanged,
+                detail: "d".to_string(),
+            },
+        ];
+        let rendered: Vec<String> = entries
+            .iter()
+            .map(|e| serde_json::to_string(e).expect("serializes"))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                r#"{"name":"CERULION_DRAIN_DISCIPLINE","kind":{"kind":"Added"},"detail":"variable 'CERULION_DRAIN_DISCIPLINE' is set at replay but absent from the recording","read_by":"cerulion"}"#,
+                r#"{"name":"SHLVL","kind":{"kind":"HashChanged"},"detail":"d","read_by":null}"#,
+                r#"{"name":"PYTHONHOME","kind":{"kind":"Missing"},"detail":"d","read_by":"python"}"#,
+                r#"{"name":"LD_LIBRARY_PATH","kind":{"kind":"ValueChanged"},"detail":"d","read_by":"dynamic_linker"}"#,
+            ]
+        );
+    }
+
+    fn divergence(name: &str, kind: EnvDivergenceKind) -> EnvDivergence {
+        EnvDivergence {
+            name: name.to_string(),
+            kind,
+            detail: format!("detail of {name}"),
+        }
+    }
+
+    const NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
+                            Cerulion does not read it to decide what the re-execution runs, so \
+                            it matters only if code in one of your nodes reads it. Run with -v \
+                            to list it.";
+
+    #[test]
+    fn the_change_label_is_the_serialized_kind_tag() {
+        for (kind, tag) in [
+            (EnvDivergenceKind::Missing, "Missing"),
+            (EnvDivergenceKind::ValueChanged, "ValueChanged"),
+            (EnvDivergenceKind::HashChanged, "HashChanged"),
+            (EnvDivergenceKind::Added, "Added"),
+        ] {
+            assert_eq!(kind.label(), tag);
+            assert_eq!(
+                serde_json::to_value(&kind).expect("serializes")["kind"],
+                serde_json::Value::String(tag.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_and_reader_renders_its_exact_warning_line() {
+        let table = [
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE has a different value \
+                 than in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE has a different value \
+                 than in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE was set in the \
+                 recording and is not set now. Cerulion reads its settings from CERULION_ and \
+                 IOX2_ variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE is set now and was not \
+                 set in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable LD_PRELOAD has a different value than in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable LD_PRELOAD has a different value than in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable LD_PRELOAD was set in the recording and is not \
+                 set now. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable PYTHONHASHSEED has a different value than in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable PYTHONHASHSEED has a different value than in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable PYTHONHASHSEED was set in the recording and is \
+                 not set now. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable PYTHONHASHSEED is set now and was not set in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::ValueChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::HashChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CARGO_TARGET_DIR was set in the recording and is \
+                 not set now. Cerulion reads it to choose the build directory it loads each node \
+                 library from, so it can change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Added,
+                CARGO_TARGET_DIR_ADDED,
+            ),
+        ];
+        for (name, kind, expected) in table {
+            assert_eq!(
+                render_env_divergence_lines(&[divergence(name, kind)]),
+                vec![expected.to_string()]
+            );
+        }
+    }
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` whose value or hash differs,
+    /// hand-written.
+    const CARGO_TARGET_DIR_CHANGED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR has a different value than in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` set only at replay,
+    /// hand-written.
+    const CARGO_TARGET_DIR_ADDED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR is set now and was not set in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    #[test]
+    fn a_changed_cargo_target_dir_is_reported_loud_on_its_own_line() {
+        // A plain recorded value (`--record-env all`) the replay shell changed,
+        // beside one differing shell variable the NOTE counts. FNV-1a 64 of "a"
+        // is the published vector af63dc4c8601ec8c, and of "foobar"
+        // 85944171f73967e8.
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[("CARGO_TARGET_DIR", b"/build/replay"), ("SHLVL", b"foobar")]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(
+            project(&divergences),
+            vec![
+                row(
+                    "CARGO_TARGET_DIR",
+                    "ValueChanged",
+                    "variable 'CARGO_TARGET_DIR' value changed since recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "SHLVL",
+                    "HashChanged",
+                    "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)",
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string(), NOTE_ONE.to_string()]
+        );
+
+        // The default recorder hashes the value: a changed hash is just as loud.
+        let env = br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let divergences =
+            compare_env_against(Some(env), &current(&[("CARGO_TARGET_DIR", b"foobar")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "HashChanged",
+                "redacted variable 'CARGO_TARGET_DIR' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string()]
+        );
+
+        // Set only in the replay shell: Added, though the name is in no loud
+        // namespace.
+        let divergences =
+            compare_env_against(Some(b"{}"), &current(&[("CARGO_TARGET_DIR", b"/build/x")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "Added",
+                "variable 'CARGO_TARGET_DIR' is set at replay but absent from the recording",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_ADDED.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_cargo_target_dir_equal_to_the_recording_is_silent() {
+        // FNV-1a 64 of "a" is the published vector af63dc4c8601ec8c.
+        let now = current(&[("CARGO_TARGET_DIR", b"a")]);
+        for env in [
+            &br#"{"CARGO_TARGET_DIR": "a"}"#[..],
+            &br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#[..],
+            &br#"{"CARGO_TARGET_DIR": null}"#[..],
+        ] {
+            let divergences = compare_env_against(Some(env), &now);
+            assert!(divergences.is_empty(), "{divergences:?}");
+            assert!(render_env_divergence_lines(&divergences).is_empty());
+        }
+        // Unset on both sides: nothing to compare.
+        assert!(compare_env_against(Some(b"{}"), &current(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_cargo_target_dir_lines_are_identical_across_runs_and_insertion_orders() {
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let pairs: [(&str, &[u8]); 3] = [
+            ("SHLVL", b"foobar"),
+            ("CARGO_TARGET_DIR", b"/build/replay"),
+            ("LD_PRELOAD", b"/x.so"),
+        ];
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let first = compare_env_against(Some(env), &current(&pairs));
+        let second = compare_env_against(Some(env), &current(&pairs));
+        let other_order = compare_env_against(Some(env), &current(&reversed_pairs));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+        let lines = render_env_divergence_lines(&first);
+        assert_eq!(lines, render_env_divergence_lines(&second));
+        assert_eq!(lines, render_env_divergence_lines(&other_order));
+        assert_eq!(
+            lines,
+            vec![
+                CARGO_TARGET_DIR_CHANGED.to_string(),
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                NOTE_ONE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_other_variable_renders_the_singular_note() {
+        assert_eq!(
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]),
+            vec![NOTE_ONE.to_string()]
+        );
+    }
+
+    #[test]
+    fn two_other_variables_render_the_plural_note() {
+        assert_eq!(
+            render_env_divergence_lines(&[
+                divergence("SHLVL", EnvDivergenceKind::HashChanged),
+                divergence("OLDPWD", EnvDivergenceKind::Missing),
+            ]),
+            vec![
+                "NOTE: 2 other environment variables differ from the recording. Cerulion does \
+                 not read them to decide what the re-execution runs, so they matter only if code \
+                 in one of your nodes reads them. Run with -v to list them."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn no_divergence_renders_no_line_and_loud_only_input_renders_no_note() {
+        assert!(render_env_divergence_lines(&[]).is_empty());
+        let lines = render_env_divergence_lines(&[
+            divergence("CERULION_A", EnvDivergenceKind::Added),
+            divergence("DYLD_INSERT_LIBRARIES", EnvDivergenceKind::Missing),
+        ]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.starts_with("WARNING: ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_input_renders_the_loud_lines_in_list_order_and_then_one_note() {
+        let lines = render_env_divergence_lines(&[
+            divergence("SHLVL", EnvDivergenceKind::HashChanged),
+            divergence("LD_PRELOAD", EnvDivergenceKind::Missing),
+            divergence("TERM_SESSION_ID", EnvDivergenceKind::HashChanged),
+            divergence("CERULION_A", EnvDivergenceKind::Added),
+            divergence("OMP_NUM_THREADS", EnvDivergenceKind::ValueChanged),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: environment variable LD_PRELOAD was set in the recording and is not \
+                 set now. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                "WARNING: environment variable CERULION_A is set now and was not set in the \
+                 recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, so \
+                 this one can change the re-execution."
+                    .to_string(),
+                "NOTE: 3 other environment variables differ from the recording. Cerulion does \
+                 not read them to decide what the re-execution runs, so they matter only if code \
+                 in one of your nodes reads them. Run with -v to list them."
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// Whether `line` holds a run of 16 hex digits, the shape of an `fnv64`.
+    fn has_hex_run(line: &str) -> bool {
+        let mut run = 0usize;
+        for c in line.chars() {
+            run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+            if run >= 16 {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn no_rendered_line_carries_a_value_a_hash_or_an_other_name() {
+        // FNV-1a 64 of "a" is af63dc4c8601ec8c; the current values hash to
+        // something else, so both entries diverge.
+        let env = br#"{
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "CERULION_SECRETARY_MODE": "recorded-value",
+            "LD_LIBRARY_PATH": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[
+            ("SHLVL", b"foobar"),
+            ("CERULION_SECRETARY_MODE", b"current-value"),
+            ("LD_LIBRARY_PATH", b"/opt/lib"),
+        ]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(divergences.len(), 3, "{divergences:?}");
+        let lines = render_env_divergence_lines(&divergences);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(!has_hex_run(line), "a hash reached the terminal: {line}");
+            for value in ["foobar", "recorded-value", "current-value", "/opt/lib"] {
+                assert!(
+                    !line.contains(value),
+                    "a value reached the terminal: {line}"
+                );
+            }
+        }
+        let note = lines.last().expect("the NOTE");
+        assert!(note.starts_with("NOTE: 1 other"), "{note}");
+        assert!(
+            !note.contains("SHLVL"),
+            "the NOTE names no variable: {note}"
+        );
+        assert_eq!(lines, render_env_divergence_lines(&divergences));
+    }
+
+    #[test]
+    fn a_control_character_in_a_name_cannot_start_a_line_of_its_own() {
+        let lines = render_env_divergence_lines(&[divergence(
+            "CERULION_X\nreplay PASS: forged",
+            EnvDivergenceKind::Added,
+        )]);
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: environment variable CERULION_X\\nreplay PASS: forged is set now and \
+                 was not set in the recording. Cerulion reads its settings from CERULION_ and \
+                 IOX2_ variables, so this one can change the re-execution."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The getting-started tutorial quotes the NOTE line a resim prints for
+    /// one differing shell variable, in a fence of its own in the section that
+    /// verifies the unchanged code, names the WARNING prefix the renderer
+    /// prints, and quotes no `WARNING: env divergence` line, a prefix the
+    /// renderer does not print.
+    #[test]
+    fn the_getting_started_tutorial_quotes_the_environment_lines_the_resim_prints() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/tutorials/01-getting-started.md");
+        let tutorial = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let section = tutorial
+            .split_once("### Verify the unchanged code")
+            .expect("the tutorial verifies the unchanged code")
+            .1
+            .split_once("### Change the controller")
+            .expect("the section ends at the controller change")
+            .0;
+        let fences: Vec<&str> = section
+            .split("```")
+            .skip(1)
+            .step_by(2)
+            .map(str::trim)
+            .collect();
+        let note =
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]);
+        assert_eq!(note.len(), 1, "{note:?}");
+        assert!(
+            fences.contains(&note[0].as_str()),
+            "the tutorial must fence the exact NOTE line: {fences:?}"
+        );
+        let loud = render_env_divergence_lines(&[divergence(
+            "CERULION_DRAIN_DISCIPLINE",
+            EnvDivergenceKind::ValueChanged,
+        )]);
+        assert!(
+            loud[0].starts_with("WARNING: environment variable "),
+            "{loud:?}"
+        );
+        assert!(
+            section.contains("`WARNING: environment variable`"),
+            "the tutorial names the WARNING prefix"
+        );
+        assert!(
+            !tutorial.contains("WARNING: env divergence"),
+            "the tutorial must not quote the `WARNING: env divergence` prefix, which the \
+             renderer does not print"
+        );
+    }
 }
 
 // ===========================================================================
@@ -26800,8 +27921,10 @@ pub fn render_enforcement_line(enforcement: &ReadLogEnforcement) -> Option<Strin
 /// (both headers render from [`DivergenceClass`]) naming each
 /// violated topic and its first divergence, in graph-definition order
 /// (deterministic). Both blocks render when both are present (the trace
-/// divergence takes exit precedence but the data section is still shown). Env
-/// divergences are always listed as warnings (they never fail the run).
+/// divergence takes exit precedence but the data section is still shown). On
+/// both paths, a `WARNING:` line names each environment variable that can
+/// change the re-execution and differs from the recording, and one `NOTE:`
+/// counts the other differing variables; neither fails the run.
 ///
 /// Both count lines also state how many topics were DECLINED and
 /// how many of those matched under the fallback — `topics_passed` excludes a
@@ -26822,8 +27945,11 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         let _ = writeln!(s, "{line}");
     }
 
-    for d in &outcome.env_divergence {
-        let _ = writeln!(s, "WARNING: env divergence: {}", d.detail);
+    // The environment block, on the pass path and the fail path alike: a
+    // WARNING for each variable that can change the re-execution, then one
+    // NOTE counting the rest.
+    for line in render_env_divergence_lines(&outcome.env_divergence) {
+        let _ = writeln!(s, "{line}");
     }
 
     // The ragged shutdown-tail tolerances that ENGAGED — rendered in

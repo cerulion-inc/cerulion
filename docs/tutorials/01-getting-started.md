@@ -1070,9 +1070,21 @@ It ends with:
 replay PASS: recordings/obstacle_avoidance_<timestamp>.mcap (387 tick(s) replayed, 2/2 topic(s) matched byte-for-byte and were credited)
 ```
 
-and exits 0. (It may also print `WARNING: env divergence` lines for shell
-variables such as `SHLVL` that differ between the two terminals. They are
-advisory; the verdict is the `replay PASS` line and the exit code.)
+and exits 0. The re-execution runs in your shell's environment, and the bag
+holds a record of the environment the recording ran in, so the two are
+compared. Variables that only your shell or terminal sets, such as `SHLVL`,
+often differ between two terminals, and a difference like that is counted in one
+line above the verdict:
+
+```
+NOTE: 1 other environment variable differs from the recording. Cerulion does not read it to decide what the re-execution runs, so it matters only if code in one of your nodes reads it. Run with -v to list it.
+```
+
+That line is information. A line that starts with
+`WARNING: environment variable` names a variable that Cerulion, the dynamic
+linker or the Python interpreter reads, such as a `CERULION_` setting, so the
+re-execution may not match the recorded run: set that variable as it was when
+you recorded before you trust the result.
 
 ### Change the controller, and verify again
 

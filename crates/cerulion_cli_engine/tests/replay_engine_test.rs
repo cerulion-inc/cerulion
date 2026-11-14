@@ -3567,12 +3567,12 @@ fn a_sampled_latest_relay_replays_byte_exact() {
 }
 
 // ===========================================================================
-// 10. Env divergence (WARN-only, never exit-affecting)
+// 10. Env divergence (never exit-affecting)
 // ===========================================================================
 
 #[test]
 #[serial]
-fn env_divergence_is_warn_only_and_surfaced() {
+fn env_divergence_never_fails_the_run_and_is_surfaced() {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 4);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("env.mcap");
@@ -3614,6 +3614,21 @@ fn env_divergence_is_warn_only_and_surfaced() {
         !names.contains(&"CER_REPLAY_HASHED"),
         "matching hashed var must NOT surface"
     );
+    // No runtime Cerulion starts reads it, so the report entry says so.
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_PLAIN"),
+        serde_json::Value::Null
+    );
+}
+
+/// The `--report` JSON's `read_by` value for the divergence named `name`.
+fn env_read_by(outcome: &ReplayOutcome, name: &str) -> serde_json::Value {
+    let d = outcome
+        .env_divergence
+        .iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| panic!("{name} diverged: {:?}", outcome.env_divergence));
+    serde_json::to_value(d).expect("an entry serializes")["read_by"].clone()
 }
 
 #[test]
@@ -3640,6 +3655,10 @@ fn env_redacted_hash_mismatch_is_surfaced() {
         matches!(d.kind, replay_engine::EnvDivergenceKind::HashChanged),
         "redacted value change is a HashChanged, got {:?}",
         d.kind
+    );
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_HASHED2"),
+        serde_json::Value::Null
     );
 }
 
@@ -4979,7 +4998,7 @@ fn env_missing_recorded_var_is_missing_divergence() {
     std::env::remove_var("CER_REPLAY_ABSENT_V"); // ensure absent
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let d = outcome
         .env_divergence
         .iter()
@@ -4989,6 +5008,10 @@ fn env_missing_recorded_var_is_missing_divergence() {
         matches!(d.kind, replay_engine::EnvDivergenceKind::Missing),
         "got {:?}",
         d.kind
+    );
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_ABSENT_V"),
+        serde_json::Value::Null
     );
 }
 
@@ -5012,7 +5035,7 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
     std::env::remove_var("CER_REPLAY_NULL_PRESENT");
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let names: Vec<&str> = outcome
         .env_divergence
         .iter()
@@ -5032,6 +5055,343 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
         .find(|d| d.name == "CER_REPLAY_NULL_ABSENT")
         .unwrap();
     assert!(matches!(d.kind, replay_engine::EnvDivergenceKind::Missing));
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_NULL_ABSENT"),
+        serde_json::Value::Null
+    );
+}
+
+/// The singular NOTE line, hand-written: one differing variable that no
+/// runtime Cerulion starts reads.
+const ENV_NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
+                            Cerulion does not read it to decide what the re-execution runs, so \
+                            it matters only if code in one of your nodes reads it. Run with -v \
+                            to list it.";
+
+/// The WARNING line for `CERULION_REPLAY_TEST_KNOB` with a changed value,
+/// hand-written.
+const ENV_KNOB_WARNING: &str = "WARNING: environment variable CERULION_REPLAY_TEST_KNOB has a \
+                                different value than in the recording. Cerulion reads its \
+                                settings from CERULION_ and IOX2_ variables, so this one can \
+                                change the re-execution.";
+
+/// The `env.json` the two emission-level arms record: a Cerulion knob with the
+/// value `a`, and a variable no runtime Cerulion starts reads, hashed (FNV-1a
+/// 64 of `a` is the published vector `af63dc4c8601ec8c`).
+fn knob_and_other_env_json() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "CERULION_REPLAY_TEST_KNOB": "a",
+        "CER_REPLAY_OTHER": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+    }))
+    .unwrap()
+}
+
+/// A completed run logs each environment divergence ONCE, at INFO: the
+/// verdict prints the variable Cerulion reads as a WARNING line, so its log
+/// line is for a log pipeline, and the NOTE line counts the other one, which
+/// `-v` lists. No environment line is a WARN, so the default output shows each
+/// divergence once.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_completed_run_logs_every_env_divergence_at_info_and_warns_none() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, None);
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let outcome = outcome.expect("the clean recording replays");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert_eq!(
+        verdict.lines().filter(|l| *l == ENV_KNOB_WARNING).count(),
+        1,
+        "the verdict prints the knob once: {verdict}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        let env_warns = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: an environment variable")
+            })
+            .count();
+        match (knob.as_slice(), other.as_slice(), env_warns) {
+            ([k], [o], 0)
+                if cerulion_core::testing::line_level(k) == Some("INFO")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged")
+                    && o.contains("replay: an environment variable differs from the recording")
+                    && !o.contains("read_by=") =>
+            {
+                Ok(())
+            }
+            (k, o, warns) => Err(format!(
+                "expected ONE INFO naming the knob with its reader, ONE INFO naming the other \
+                 variable and no environment WARN, got {k:?}, {o:?} and {warns} WARN(s)"
+            )),
+        }
+    });
+}
+
+/// A PASSING run whose `--report` cannot be written returns the write error
+/// (exit 5) and the CLI prints only that error, no verdict, so a variable that
+/// can change the re-execution is logged at WARN, once, naming its reader; the
+/// other variable stays at INFO.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_passing_run_whose_report_cannot_be_written_warns_a_loud_env_variable() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_report_fail.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let blocker = dir.path().join("iam_a_regular_file");
+    std::fs::write(&blocker, b"x").unwrap();
+    let report = blocker.join("report.json"); // parent is a file, so unwritable.
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, Some(report));
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("a passing run whose report cannot be written is an error");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("cannot write report")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 5);
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
+            )),
+        }
+    });
+}
+
+/// An ABORTED run renders no verdict and no summary (the CLI prints only the
+/// aborting error), so a variable that can change the re-execution is logged
+/// there at WARN, once, naming its reader; the other variable stays at INFO.
+///
+/// The single-rank source and relay bag with `source` refusing to init, so
+/// rank 0's pass aborts at build.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_run_warns_a_loud_env_variable_and_logs_the_others_at_info() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_aborted.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let make = || {
+        factories(vec![
+            (
+                "source",
+                Box::new(InitFailsEntry {
+                    inner: Box::new(SourceNodeEntry::new()),
+                }) as Box<dyn NodeEntry>,
+            ),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 100.0,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, make, None, None);
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("the source refuses to init, so the run aborts");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("refuses to init")),
+        "{err:?}"
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
+            )),
+        }
+    });
+}
+
+/// Every divergence kind, `Added` included, leaves a clean replay PASSING and
+/// its exit code unchanged under BOTH purposes, and the `--report` JSON carries
+/// each entry with its `read_by`.
+#[test]
+#[serial]
+fn every_env_divergence_kind_leaves_a_clean_replay_passing_in_both_modes() {
+    use cerulion_cli_engine::resim_cmd::{resim_exit_code, ResimReport, EXIT_PASS};
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_every_kind.mcap");
+    // FNV-1a 64 of `a` is the published vector `af63dc4c8601ec8c`.
+    let env = serde_json::json!({
+        "CER_REPLAY_GONE": "v",
+        "CERULION_REPLAY_TEST_PLAIN": "a",
+        "CER_REPLAY_HASHED3": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+    });
+    write_bag(&rec, &bag, Some(&serde_json::to_vec(&env).unwrap()));
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Resim,
+        replay_engine::ReplayPurpose::Verify,
+    ] {
+        let report_path = dir.path().join(format!("env_every_kind_{purpose:?}.json"));
+        std::env::remove_var("CER_REPLAY_GONE");
+        std::env::set_var("CERULION_REPLAY_TEST_PLAIN", "b");
+        std::env::set_var("CER_REPLAY_HASHED3", "foobar");
+        std::env::set_var("CERULION_REPLAY_TEST_ADDED", "1");
+        let (outcome, _) = ri_replay_reporting(
+            &bag,
+            source_relay_factories,
+            purpose,
+            None,
+            None,
+            Some(report_path.clone()),
+        );
+        std::env::remove_var("CERULION_REPLAY_TEST_PLAIN");
+        std::env::remove_var("CER_REPLAY_HASHED3");
+        std::env::remove_var("CERULION_REPLAY_TEST_ADDED");
+        let outcome = outcome.expect("the clean recording replays");
+
+        let ours: Vec<(&str, String)> = outcome
+            .env_divergence
+            .iter()
+            .filter(|d| d.name.starts_with("CER_REPLAY_") || d.name.starts_with("CERULION_REPLAY_"))
+            .map(|d| (d.name.as_str(), format!("{:?}", d.kind)))
+            .collect();
+        assert_eq!(
+            ours,
+            vec![
+                ("CERULION_REPLAY_TEST_ADDED", "Added".to_string()),
+                ("CERULION_REPLAY_TEST_PLAIN", "ValueChanged".to_string()),
+                ("CER_REPLAY_GONE", "Missing".to_string()),
+                ("CER_REPLAY_HASHED3", "HashChanged".to_string()),
+            ],
+            "{purpose:?}"
+        );
+        assert!(outcome.passed, "{purpose:?}: {:?}", outcome.violations);
+        let report = ResimReport::from_outcome(&outcome);
+        let verify = purpose == replay_engine::ReplayPurpose::Verify;
+        assert_eq!(resim_exit_code(&report, verify), EXIT_PASS, "{purpose:?}");
+        for expected in [
+            "WARNING: environment variable CERULION_REPLAY_TEST_ADDED is set now and was not set \
+             in the recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, \
+             so this one can change the re-execution.",
+            "WARNING: environment variable CERULION_REPLAY_TEST_PLAIN has a different value than \
+             in the recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, so \
+             this one can change the re-execution.",
+        ] {
+            assert!(
+                report.env_lines.iter().any(|l| l == expected),
+                "{purpose:?}: {:?}",
+                report.env_lines
+            );
+        }
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("the report is written"))
+                .expect("the report is JSON");
+        let entry = |name: &str| -> serde_json::Value {
+            json["env_divergence"]
+                .as_array()
+                .expect("env_divergence is an array")
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in the report: {json}"))
+                .clone()
+        };
+        assert_eq!(
+            entry("CERULION_REPLAY_TEST_ADDED"),
+            serde_json::json!({
+                "name": "CERULION_REPLAY_TEST_ADDED",
+                "kind": {"kind": "Added"},
+                "detail": "variable 'CERULION_REPLAY_TEST_ADDED' is set at replay but absent \
+                           from the recording",
+                "read_by": "cerulion",
+            })
+        );
+        assert_eq!(
+            entry("CER_REPLAY_HASHED3"),
+            serde_json::json!({
+                "name": "CER_REPLAY_HASHED3",
+                "kind": {"kind": "HashChanged"},
+                "detail": "redacted variable 'CER_REPLAY_HASHED3' hash changed since recording \
+                           (recorded af63dc4c8601ec8c, now 85944171f73967e8)",
+                "read_by": null,
+            })
+        );
+        assert_eq!(entry("CER_REPLAY_GONE")["read_by"], serde_json::Value::Null);
+    }
 }
 
 // ===========================================================================
@@ -5267,10 +5627,15 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         s.contains("FRAME-CONTENT DIVERGENCE: /tmp/x.mcap"),
         "verdict:\n{s}"
     );
-    assert!(
-        s.contains("WARNING: env divergence: variable 'SOME_VAR' value changed since recording"),
+    // SOME_VAR is read by no runtime Cerulion starts, so it is counted by the
+    // one NOTE line and never named.
+    assert_eq!(
+        s.lines().filter(|l| *l == ENV_NOTE_ONE).count(),
+        1,
         "verdict:\n{s}"
     );
+    assert!(!s.contains("SOME_VAR"), "verdict:\n{s}");
+    assert!(!s.contains("WARNING:"), "verdict:\n{s}");
     // The line says what its numbers MEAN. A line printing
     // `topics_passed/topics_checked` as "matched" would under-report once a
     // declined-but-matched topic exists — such a topic matched and is deliberately
@@ -5302,6 +5667,80 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         );
         prev_pos = pos;
     }
+}
+
+/// The PASS path counts a differing shell variable in ONE NOTE line above the
+/// verdict, names no variable and prints no hash and no `WARNING:`.
+///
+/// Hand-built outcome whose only finding is a `SHLVL` hash change, under the
+/// clean provenance states (a stamped contract, reads fed by identity, a clean
+/// read log), each of which prints nothing, so the whole verdict is two
+/// hand-written lines.
+#[test]
+#[serial]
+fn render_verdict_pass_path_counts_an_other_variable_in_one_note() {
+    use cerulion_cli_engine::replay_engine::{EnvDivergence, EnvDivergenceKind};
+    let outcome = ReplayOutcome {
+        ros2_entries_skipped: Vec::new(),
+        passed: true,
+        node_failures: vec![],
+        ticks_replayed: 7,
+        topics_checked: 2,
+        topics_passed: 2,
+        violations: vec![],
+        trace_divergence: None,
+        env_divergence: vec![EnvDivergence {
+            name: "SHLVL".to_string(),
+            kind: EnvDivergenceKind::HashChanged,
+            detail: "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)"
+                .to_string(),
+        }],
+        recorder: None,
+        record_health: RecordHealthReport::Absent,
+        tolerated_ragged_tails: vec![],
+        unmodelled_topics: vec![],
+        resume: None,
+        covered_range: None,
+        read_log_divergence: None,
+        read_log: replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 0,
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+        },
+        read_log_quarantine: Vec::new(),
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::Fed {
+            reads: 0,
+            frames: 0,
+        },
+        coordination: replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::Lockstep,
+            inferred: false,
+        },
+        divergence_classes: vec![],
+        injection_stand_downs: Vec::new(),
+        declined_frame_comparisons: Vec::new(),
+        injection_coverage: Vec::new(),
+        rederivation_notes: Vec::new(),
+        replay_input_shortfalls: Vec::new(),
+        injection_anomalies: Vec::new(),
+        rank_execution: Vec::new(),
+        aborted: None,
+        report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
+    };
+
+    let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
+    assert_eq!(
+        s,
+        format!(
+            "{ENV_NOTE_ONE}\nreplay PASS: /tmp/x.mcap (7 tick(s) replayed, 2/2 topic(s) matched \
+             byte-for-byte and were credited)\n"
+        )
+    );
 }
 
 /// The per-topic frame-MONOTONICITY killer. Two recorded frames
@@ -28025,6 +28464,9 @@ fn exit_codes_and_precedence_are_unchanged_by_the_rename() {
         // The provenance line, which the exit-code
         // precedence likewise does not read.
         coordination: Some("coordination: lockstep".to_string()),
+        // The environment block, which the exit-code precedence does not
+        // read: an environment divergence never changes the exit code.
+        env_lines: vec![],
         // Report-only harness findings; the exit-code precedence
         // does not read them either.
         injection_anomalies: vec![],

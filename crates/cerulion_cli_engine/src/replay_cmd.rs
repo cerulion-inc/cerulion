@@ -1710,8 +1710,9 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         .1;
 
     // 6. env.json — OPTIONAL, but if present it must be a JSON object. Retain
-    //    the bytes so the engine can WARN on env divergence (names always;
-    //    values for plain entries; fnv64 for redacted ones). The manifest's
+    //    the bytes so the engine can compare them with the replay's own
+    //    environment (names always; values for plain entries; fnv64 for
+    //    redacted ones); a resim never applies them. The manifest's
     //    `node_ids` table (already bounds-checked by the gate loop above) is
     //    threaded into the engine below so the trace-divergence check can
     //    resolve each recorded FIRE record's `node_idx` → node id.
