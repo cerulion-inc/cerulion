@@ -163,6 +163,8 @@ The frames a process or executor unit then feeds from the bag to its nodes that
 read the topic, the recorded frames of the writers that run elsewhere, are left
 out of the comparison, so a node that reads only some of them, such as one that
 reads the latest value on a slower period, does not stop the replay. Otherwise
+a `--verify` that feeds a node's reads of the topic from a bag that labels no
+writer refuses with exit 2 (`read_identity_frames_unattributed`), and otherwise
 each process or executor unit that writes the topic compares the frames
 published on it there, the frames it feeds included, as one stream with every
 recorded frame of the topic, and a byte mismatch there names no writer; where
