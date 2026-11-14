@@ -120,6 +120,7 @@ pub mod error;
 // every transport constructor makes, and the pure start-up check `graph run`
 // refuses a graph with. `pub` because that check lives in `cerulion_cli_engine`.
 pub mod fd_limit;
+pub mod fire_tap;
 #[allow(missing_docs)]
 pub mod graph;
 #[allow(missing_docs)]
