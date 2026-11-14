@@ -49080,6 +49080,21 @@ fn a_split_topic_one_process_publishes_beside_one_that_injects_is_judged_by_the_
     }
 }
 
+/// The slow-writer bag that labels no frame, `w2`, the slow writer, in the
+/// second process, recorded from the unchanged graph with the frame of `w2`'s
+/// last fire lost.
+fn ri_tail_split_bag(dir: &std::path::Path) -> (Recording, std::path::PathBuf) {
+    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    let bag = dir.join("ri_tail_unlabelled.mcap");
+    ri_two_rank_bag_labelled(&live.rec, &bag, |id| id == "w2", false);
+    (live.rec, bag)
+}
+
 /// A ragged shutdown tail on a `multi_publisher_topics` topic whose writers
 /// run in two processes, neither of which attributes the topic's frames to
 /// their writers, is tolerated over the frames the two published together.
@@ -49096,22 +49111,15 @@ fn a_split_topic_one_process_publishes_beside_one_that_injects_is_judged_by_the_
 #[test]
 #[serial]
 fn a_split_unattributed_topic_s_ragged_tail_is_tolerated_over_its_processes_together() {
-    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let (rec, bag) = ri_tail_split_bag(dir.path());
     let n = RI_STEPS;
-    let mut want = BTreeMap::new();
-    want.insert(2, ri_slow_frames(2.0));
-    want.insert(3, ri_period_frames(3.0));
-    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
-    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
-    let recorded = ri_recorded_xyz(&live.rec, RI_TAIL_BUS);
+    let recorded = ri_recorded_xyz(&rec, RI_TAIL_BUS);
     assert_eq!(recorded.len(), n + 6, "PREMISE: w2 lost one frame");
     let (w3_at, w2_at) = (
         ri_first_differing(&recorded, &ri_period_frames(3.0)),
         ri_first_differing(&recorded, &ri_slow_frames(2.0)),
     );
-    let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join("ri_tail_unlabelled.mcap");
-    ri_two_rank_bag_labelled(&live.rec, &bag, |id| id == "w2", false);
     let (outcome, _) = ri_replay(
         &bag,
         ri_tail_factories,
@@ -49145,6 +49153,41 @@ fn a_split_unattributed_topic_s_ragged_tail_is_tolerated_over_its_processes_toge
         ),
         "the bus is declined for both processes: {declined:?}"
     );
+}
+
+/// Two `--verify` replays of the slow-writer bag that labels no frame write
+/// the same `--report` bytes, each tolerating the bus's trailing frame in the
+/// second process's tail and declining the bus.
+#[test]
+#[serial]
+fn a_verify_of_a_split_topic_s_tolerated_tail_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bag) = ri_tail_split_bag(dir.path());
+    let note = ri_fireless_note(RI_TAIL_BUS, 1, RI_STEPS + 6, RI_STEPS + 7);
+    let reports = ri_two_reports(dir.path(), "ri_tail", |report| {
+        ri_replay_reporting(
+            &bag,
+            ri_tail_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report),
+        )
+        .0
+    });
+    for (run, json) in reports.iter().enumerate() {
+        assert_eq!(json["passed"], serde_json::json!(true), "run {run}");
+        assert_eq!(
+            json["declined_frame_comparisons"][0]["code"],
+            serde_json::json!("split_topic_frames_unattributed"),
+            "run {run}: {json}"
+        );
+        assert_eq!(
+            json["tolerated_ragged_tails"],
+            serde_json::json!([note]),
+            "run {run}"
+        );
+    }
 }
 
 /// The topic a slow and a period writer share in two processes.
