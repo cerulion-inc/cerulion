@@ -22,6 +22,10 @@
 //! Parallel-safe: every test builds its own tempdir workspace and spawns
 //! `git` only inside it.
 
+#[cfg(unix)]
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1286,11 +1290,9 @@ fn a_byte_identical_occupant_proceeds_because_the_rewrite_is_the_consented_outpu
 #[cfg(unix)]
 #[test]
 fn write_rolls_back_when_the_commit_fails() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fresh_executable::install_script(&hook, "#!/bin/sh\nexit 1\n");
 
     let mut engine = engine_for(&fx);
     let err = drive(&fx, &mut engine, true, true, false, true, true)
@@ -1429,13 +1431,11 @@ fn dry_run_fails_loudly_when_the_manifest_cannot_be_written() {
 #[cfg(unix)]
 #[test]
 fn a_failed_commit_restores_a_pre_existing_patch() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     const SENTINEL: &[u8] = b"--- an earlier migration's patch, user-owned\n";
     std::fs::write(fx.ws.join(PATCH_FILENAME), SENTINEL).unwrap();
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fresh_executable::install_script(&hook, "#!/bin/sh\nexit 1\n");
 
     let mut engine = engine_for(&fx);
     let err = drive(&fx, &mut engine, true, true, false, true, true)
@@ -1465,21 +1465,18 @@ fn a_failed_commit_restores_a_pre_existing_patch() {
 #[test]
 fn a_fifo_planted_at_the_patch_path_never_wedges_the_rollback() {
     use std::os::unix::fs::FileTypeExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook,
-        format!(
+        &format!(
             "#!/bin/sh\n\
              rm -f {p}\n\
              mkfifo {p}\n\
              exit 1\n",
             p = PATCH_FILENAME
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     // DETACHED thread + recv_timeout (not thread::scope, which would JOIN
     // the wedged thread and defeat the bound): the Arc keeps the tempdir
@@ -1606,25 +1603,22 @@ fn a_source_swapped_for_a_fifo_after_consent_refuses_without_wedging() {
 #[cfg(unix)]
 #[test]
 fn a_link_planted_at_the_patch_path_withholds_the_prior_patch_restore() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     const SENTINEL: &[u8] = b"--- an earlier migration's patch, user-owned\n";
     std::fs::write(fx.ws.join(PATCH_FILENAME), SENTINEL).unwrap();
     // The hook swaps the run's patch for a symlink and rejects the commit.
     std::fs::write(fx.ws.join("link-target.txt"), b"external target").unwrap();
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook,
-        format!(
+        &format!(
             "#!/bin/sh\n\
              rm -f {p}\n\
              ln -s link-target.txt {p}\n\
              exit 1\n",
             p = PATCH_FILENAME
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut engine = engine_for(&fx);
     let err = drive(&fx, &mut engine, true, true, false, true, true)
@@ -2029,21 +2023,18 @@ fn a_workspace_reached_through_symlinked_spellings_round_trips() {
 #[cfg(unix)]
 #[test]
 fn a_patch_replaced_by_a_hook_survives_the_rollback() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     const FOREIGN: &str = "foreign patch content from a hook\n";
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook,
-        format!(
+        &format!(
             "#!/bin/sh\n\
              printf '{}' > {}\n\
              exit 1\n",
             "foreign patch content from a hook\\n", PATCH_FILENAME
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut engine = engine_for(&fx);
     let err = drive(&fx, &mut engine, true, true, false, true, true)
@@ -2269,18 +2260,15 @@ fn a_foreign_staged_change_refuses_the_migration_commit() {
 #[cfg(unix)]
 #[test]
 fn a_hook_staged_path_in_the_commit_is_reported_with_the_safe_undo() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook,
         "#!/bin/sh\n\
          echo hook-added > hook-unrelated.txt\n\
          git add -- hook-unrelated.txt\n\
          exit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let head_before = git(&fx.ws, &["rev-parse", "HEAD"]);
 
     let mut engine = engine_for(&fx);
@@ -2348,10 +2336,9 @@ fn a_hook_staged_path_in_the_commit_is_reported_with_the_safe_undo() {
 #[cfg(unix)]
 #[test]
 fn a_hook_that_edits_a_planned_source_is_not_told_to_reverse_the_patch() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook,
         // The hook edits the very lines the migration just wrote (an
         // auto-formatter touching the rewritten region is the realistic
@@ -2364,9 +2351,7 @@ fn a_hook_that_edits_a_planned_source_is_not_told_to_reverse_the_patch() {
          echo hook-added > hook-unrelated.txt\n\
          git add -- hook-unrelated.txt\n\
          exit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut engine = engine_for(&fx);
     let r = drive(&fx, &mut engine, true, true, false, true, true).expect("applies");
@@ -2410,15 +2395,13 @@ fn a_hook_that_edits_a_planned_source_is_not_told_to_reverse_the_patch() {
     // there the recommendation is still made.
     let fx2 = make_workspace();
     let hook2 = fx2.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook2,
         "#!/bin/sh\n\
          echo hook-added > hook-unrelated.txt\n\
          git add -- hook-unrelated.txt\n\
          exit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook2, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut engine2 = engine_for(&fx2);
     let r2 = drive(&fx2, &mut engine2, true, true, false, true, true).expect("applies");
     let out2 = String::from_utf8(r2.stdout).unwrap();
@@ -2509,19 +2492,16 @@ fn a_display_quoted_planned_path_is_not_mistaken_for_a_hook_addition() {
 #[cfg(unix)]
 #[test]
 fn a_hook_staged_edit_on_a_planned_path_survives_the_rollback() {
-    use std::os::unix::fs::PermissionsExt as _;
     let fx = make_workspace();
     const HOOK_EDIT: &str = "// formatted by the pre-commit hook\n";
     let hook = fx.ws.join(".git/hooks/pre-commit");
-    std::fs::write(
+    fresh_executable::install_script(
         &hook,
         "#!/bin/sh\n\
          echo '// formatted by the pre-commit hook' > src/demo_pkg/src/talker.cpp\n\
          git add src/demo_pkg/src/talker.cpp\n\
          exit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut engine = engine_for(&fx);
     let err = drive(&fx, &mut engine, true, true, false, true, true)

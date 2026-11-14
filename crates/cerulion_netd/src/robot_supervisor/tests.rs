@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+use crate::fresh_executable::install_script;
 
 #[test]
 fn parent_stop_budget_tracks_the_remote_daemons_deadline() {
@@ -317,43 +318,15 @@ fn the_epoch_sync_period_is_read_from_the_environment() {
 }
 
 /// A stand-in worker: appends one line to `log` per run, exits with `code`.
-/// Write an executable shell script at `path` and return once it can be
-/// executed. A process forked by a concurrent test before its exec holds a copy
-/// of this write descriptor, and while it does, executing the script fails with
-/// ETXTBSY; a probe run (which exits before `body`) is retried until it starts.
-fn install_script(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(
-        path,
-        format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}"),
-    )
-    .unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    for _ in 0..500 {
-        match Command::new(path).env("CERULION_TEST_PROBE", "1").status() {
-            Ok(status) => {
-                assert!(
-                    status.success(),
-                    "probe run of {}: {status}",
-                    path.display()
-                );
-                return;
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("probe run of {}: {error}", path.display()),
-        }
-    }
-    panic!("{} stayed busy for 5 s", path.display());
-}
-
 fn fake_worker(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
     let log = dir.join("runs.log");
     let script = dir.join("cerulion");
     install_script(
         &script,
-        &format!("echo \"$@\" >> '{}'\nexit {code}\n", log.display()),
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {code}\n",
+            log.display()
+        ),
     );
     (script, log)
 }
@@ -448,7 +421,7 @@ fn a_failing_epoch_sync_backs_off_and_keeps_trying() {
 fn an_overdue_epoch_sync_worker_is_killed_and_counts_as_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("cerulion");
-    install_script(&script, "exec sleep 30\n");
+    install_script(&script, "#!/bin/sh\nexec sleep 30\n");
     let root = dir.path().join("state");
     let t0 = Instant::now();
     let mut sync = EpochSync::new(
@@ -536,7 +509,10 @@ fn slow_worker(dir: &Path, secs: u32) -> (PathBuf, PathBuf) {
     let script = dir.join("cerulion");
     install_script(
         &script,
-        &format!("sleep {secs}\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+        &format!(
+            "#!/bin/sh\nsleep {secs}\necho \"$@\" >> '{}'\nexit 0\n",
+            log.display()
+        ),
     );
     (script, log)
 }

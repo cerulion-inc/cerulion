@@ -23,6 +23,8 @@
 
 #![cfg(unix)]
 
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,14 +49,6 @@ const FAKE_ROS2: &str = r#"#!/bin/sh
 exit "${CER_TEST_EXIT:-0}"
 "#;
 
-fn write_executable(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, body).expect("write script");
-    let mut perms = std::fs::metadata(path).expect("meta").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).expect("chmod");
-}
-
 impl Sandbox {
     fn new() -> Self {
         let root = tempfile::tempdir().expect("tempdir");
@@ -64,7 +58,7 @@ impl Sandbox {
         for d in [&bin_dir, &lib_dir, &home] {
             std::fs::create_dir_all(d).expect("mkdir");
         }
-        write_executable(&bin_dir.join("ros2"), FAKE_ROS2);
+        fresh_executable::install_script(&bin_dir.join("ros2"), FAKE_ROS2);
         std::fs::write(lib_dir.join("librmw_cerulion.so"), b"fixture").expect("write rmw");
         let report = root.path().join("report.txt");
         Sandbox {

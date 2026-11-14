@@ -5,6 +5,7 @@
 
 #![cfg(unix)]
 
+mod fresh_executable;
 mod mp_support;
 
 use std::io::{Read, Write};
@@ -197,12 +198,10 @@ impl Fixture {
         assert_eq!(parsed.global.prefix.as_bytes(), prefix.as_bytes());
         let spawn_marker = root.path().join("spawned");
         let spawn_sentinel = root.path().join("spawn-sentinel");
-        std::fs::write(
+        fresh_executable::install_script(
             &spawn_sentinel,
             "#!/bin/sh\n: > \"$CERULION_TEST_SPAWN_MARKER\"\nexit 78\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&spawn_sentinel, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let status = Command::new(&spawn_sentinel)
             .env("CERULION_TEST_SPAWN_MARKER", &spawn_marker)
             .status()
