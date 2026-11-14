@@ -28,6 +28,7 @@ cerulion_bagd	cerulion_cli_engine	crate-path	crates/cerulion_bagd/tests/state_an
 cerulion_bagd	cerulion_core	crate-path	crates/cerulion_bagd/tests/state_anchor_partial_scan_test.rs
 cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs
 cerulion_cli	all	whole-tree	crates/cerulion_cli/tests/config_home_test.rs
+cerulion_cli	cerulion_connectd	binary	crates/cerulion_cli/tests/pair_interrupt_e2e_test.rs
 cerulion_cli	cerulion_core	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_discovery	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_test.rs
@@ -55,6 +56,9 @@ cerulion_hygiene	cerulion_cli	crate-path	crates/cerulion_hygiene/tests/shipped_s
 cerulion_hygiene	go2_tf	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs
 cerulion_hygiene	go2_tf_source	crate-path	crates/cerulion_hygiene/tests/dependency_rules_test.rs
 cerulion_hygiene	native_ros2_messages	crate-path	crates/cerulion_hygiene/tests/crate_license_texts_test.rs
+cerulion_netd	cerulion_cli	binary	crates/cerulion_netd/tests/pair_start_e2e_test.rs
+cerulion_netd	cerulion_connectd	binary	crates/cerulion_netd/tests/pair_start_e2e_test.rs
+cerulion_netd	cerulion_remoted	binary	crates/cerulion_netd/tests/automatic_serving_test.rs
 cerulion_rcpd	cerulion_cli_engine	crate-path	crates/cerulion_rcpd/src/eye/source.rs
 cerulion_telemetry	go2_tf_source	crate-path	crates/cerulion_telemetry/tests/hot_path_dependency_gate.rs
 rmw_cerulion	cerulion_heaphook	crate-path	crates/rmw_cerulion/src/heaphook.rs

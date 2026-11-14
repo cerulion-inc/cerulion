@@ -42,9 +42,10 @@ WHAT THIS CLOSURE PROVES, AND WHAT IT DOES NOT. On its own it is the reverse
 CARGO DEPENDENCY closure over normal, build and dev edges: a package whose tests
 can observe a change through a dependency edge is in the output. A test can also
 observe another package WITHOUT an edge to it, by opening a path literal into
-that package's tree, by walking the whole repository, or by loading an artifact
-built from it at run time (`dlopen`). Those three classes are derived from the
-test sources by `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` into
+that package's tree, by walking the whole repository, by loading an artifact
+built from it at run time (`dlopen`), or by running a binary built from it.
+Those four classes are derived from the test sources by
+`crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` into
 `tools/ci/observation_edges.tsv`, and `--observation-edges` unions them in.
 
 THE UNION IS ONE HOP, and that is the whole of its meaning. An observation edge
@@ -507,10 +508,11 @@ OBSERVATION_ERROR_CASES = [
 
 # LIVE OBSERVATION ORACLE. Each row is
 # `package: (closure size with the observation edges, closure size without)`,
-# and the two numbers are transcribed BY HAND from an independent measurement
-# run whose log is named below. The two packages are the ones the edges move
-# furthest, which is what makes the row able to fail: a package whose closure
-# already holds every observer would report the same number either way.
+# and every number is written BY HAND, never read off a run of this script.
+# `cerulion_heaphook` and `go2_tf` are transcribed from an independent
+# measurement run whose log is named below; they are the packages the edges
+# move furthest, which is what makes a row able to fail: a package whose
+# closure already holds every observer would report the same number either way.
 #
 # MEASURED 2026-09-28 on this workspace at 9735bf27fed4930bcb5199106775e198a20f04c1,
 # every one of the 66 members measured both ways in one run, the two largest
@@ -524,9 +526,19 @@ OBSERVATION_ERROR_CASES = [
 # members): its `hot_path_dependency_gate` walks `examples/go2`, so `go2_tf`
 # moves to with=9 without=4; `cerulion_heaphook` is unchanged.
 #
-# Dropping the union from the closure shrinks both, which is the mutant these
-# rows exist to kill.
+# `cerulion_cli` and `cerulion_connectd` build the binaries a `cerulion_netd`
+# test runs, counted by hand off the manifests and the table. No member depends
+# on either, so each cargo closure is the package alone. With the edges each
+# gains `cerulion_netd` and the four packages that observe `all`
+# (`cerulion_cli`, `cerulion_cli_engine`, `cerulion_core`, `cerulion_hygiene`);
+# for `cerulion_cli` the first of those four is the package itself.
+#
+# Dropping the union from the closure shrinks every row, which is the mutant
+# these rows exist to kill; dropping one of the two `binary` rows shrinks its
+# package's row by one.
 LIVE_OBSERVATION_ORACLE = {
+    'cerulion_cli': (5, 1),
+    'cerulion_connectd': (6, 1),
     'cerulion_heaphook': (6, 1),
     'go2_tf': (9, 4),
 }

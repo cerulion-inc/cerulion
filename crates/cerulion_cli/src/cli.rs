@@ -448,7 +448,10 @@ pub enum Commands {
     /// refused (no armed code, denied, or the window expired), or the command
     /// line has an argument this command does not take, 3 = unreachable (dial
     /// failure or timeout), 4 = wrong pairing code or attempts exhausted, 130 =
-    /// interrupted (Ctrl-C or SIGTERM during the ceremony; no pairing occurred).
+    /// interrupted (Ctrl-C or SIGTERM during the ceremony; not paired, unless
+    /// the robot was already asked to save this desk and its answer did not
+    /// arrive in time: then the robot may have paired this desk, and
+    /// `cerulion connect --eid <eid>` connects if it did).
     ///
     /// On the robot, `cerulion pair --start` makes the code instead. It asks
     /// `cerulion-netd` to serve this robot, shows an 8-digit pairing code that

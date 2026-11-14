@@ -153,9 +153,10 @@
 //! and dev.
 //!
 //! Neither covers a test that reaches into ANOTHER crate's tree through a
-//! source path literal, a walk over the whole repository, or a `dlopen` of an
-//! artifact built from another package. Those are an OPEN class, and they have
-//! to be pinned before any CI step is gated on the selection.
+//! source path literal, a walk over the whole repository, a `dlopen` of an
+//! artifact built from another package, or a run of a binary built from one.
+//! Those are an OPEN class, and they have to be pinned before any CI step is
+//! gated on the selection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -2415,7 +2416,7 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
 //
 // THE POPULATION. The cargo reverse-dependency closure
 // (`tools/scripts/ci_selected_packages.py`) carries every package whose tests
-// reach another package through a manifest edge. Three classes reach one
+// reach another package through a manifest edge. Four classes reach one
 // WITHOUT an edge, and a selection that gates a step without them skips a test
 // the change could have broken:
 //
@@ -2424,13 +2425,19 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
 //   * a walk over a tree that holds more than one member, or over the
 //     repository root itself (`whole-tree`), which observes EVERY package;
 //   * a `dlopen` of an artifact another member builds, named by its
-//     `lib<name>.so` / `lib<name>.dylib` file name (`dlopen`).
+//     `lib<name>.so` / `lib<name>.dylib` file name (`dlopen`);
+//   * a binary another member builds, named beside one cargo built through
+//     `with_file_name("<binary>")`, which is how a test finds a sibling binary
+//     to run (`binary`). A binary name reached any other way, joined onto a
+//     directory or held in a const, is not read: a directory or a scratch
+//     stub of the same name is joined the same way, so a test names a sibling
+//     binary through `with_file_name`.
 //
 // FAIL CLOSED. A literal this walk cannot attribute to one package, a path
 // whose package segment is built at run time or an artifact name built at run
 // time, records the observing package as observing `all`: the selector then
 // adds it to every selection that names a package, and no step of it may be
-// gated. That is the fourth kind, `unattributable`.
+// gated. That is the fifth kind, `unattributable`.
 //
 // The rules reuse the doc-pin classifier above, literal for literal: the same
 // blanked views, the same `is_path_position`, the same write-target refusal and
@@ -2441,6 +2448,7 @@ fn a_path_joined_onto_the_crates_own_directory_is_not_a_doc_pin() {
 /// The kind column of one row of the committed table.
 const EDGE_CRATE_PATH: &str = "crate-path";
 const EDGE_DLOPEN: &str = "dlopen";
+const EDGE_BINARY: &str = "binary";
 const EDGE_WHOLE_TREE: &str = "whole-tree";
 const EDGE_UNATTRIBUTABLE: &str = "unattributable";
 
@@ -2528,6 +2536,77 @@ fn manifest_declares_cdylib(text: &str) -> bool {
         }
     }
     false
+}
+
+/// `<binary name> -> the packages that build it`, for every member.
+///
+/// Each `[[bin]]` table's `name`; the stem of each `src/bin/*.rs`; and the
+/// package name for a member that holds `src/main.rs`. The last two are the
+/// names cargo gives a binary no table renames, and crediting one where a
+/// table does rename it is the over-inclusive direction. Read from the
+/// manifests for the reason [`workspace_member_dirs`] gives.
+fn member_binary_names() -> BTreeMap<String, BTreeSet<String>> {
+    let root = normalised(&repo_root());
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (rel, package) in member_directories() {
+        let dir = root.join(&rel);
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
+        let mut names = manifest_binary_names(&text);
+        let sources = dir.join("src");
+        if sources.join("main.rs").is_file() {
+            names.push(package.clone());
+        }
+        if let Ok(entries) = std::fs::read_dir(sources.join("bin")) {
+            names.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|e| e == "rs"))
+                    .filter_map(|path| Some(path.file_stem()?.to_string_lossy().into_owned())),
+            );
+        }
+        for name in names {
+            out.entry(name).or_default().insert(package.clone());
+        }
+    }
+    out
+}
+
+/// The `name` of every `[[bin]]` table this manifest declares.
+///
+/// The first `name` key after a `[[bin]]` header and before the next header,
+/// its value the double-quoted string. A `#` comment line is skipped, so a
+/// commented-out table declares nothing.
+fn manifest_binary_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_bin_table = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_bin_table = line == "[[bin]]";
+            continue;
+        }
+        if !in_bin_table {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        if let Some(close) = value.find('"') {
+            out.push(value[..close].to_string());
+            in_bin_table = false;
+        }
+    }
+    out
 }
 
 /// Is `path` inside, or equal to, the directory `dir`?
@@ -2935,6 +3014,7 @@ fn observation_edges_of_source(
     members: &[(String, String)],
     multi: &BTreeSet<String>,
     cdylibs: &BTreeMap<String, String>,
+    binaries: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeSet<SourceEdge> {
     let views = scan_code(src);
     let mut out: BTreeSet<SourceEdge> = BTreeSet::new();
@@ -2978,6 +3058,19 @@ fn observation_edges_of_source(
                 }
             }
             continue;
+        }
+        // A binary another member builds, named beside the one cargo built:
+        // `exe.with_file_name("<binary>")`. The literal is the bare binary
+        // name, so no path rule sees it.
+        if before.trim_end().ends_with("with_file_name(") {
+            if let Some(packages) = binaries.get(literal.text.as_str()) {
+                for package in packages {
+                    if package != observing {
+                        out.insert((package.clone(), EDGE_BINARY, line_at(src, literal.at)));
+                    }
+                }
+                continue;
+            }
         }
         let in_a_read_table = read_tables
             .iter()
@@ -3164,6 +3257,7 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
     let members = member_directories();
     let multi = multi_member_directories(&members);
     let cdylibs = cdylib_artifact_stems();
+    let binaries = member_binary_names();
 
     let mut best: BTreeMap<(String, String, String), (String, usize)> = BTreeMap::new();
     let mut sources_read = 0usize;
@@ -3181,9 +3275,9 @@ fn derived_observation_edges() -> Vec<ObservationEdge> {
                 .unwrap_or(&file)
                 .to_string_lossy()
                 .replace('\\', "/");
-            for (observed, kind, line) in
-                observation_edges_of_source(&src, package, rel, &members, &multi, &cdylibs)
-            {
+            for (observed, kind, line) in observation_edges_of_source(
+                &src, package, rel, &members, &multi, &cdylibs, &binaries,
+            ) {
                 // The witness is the FIRST source, and `first` is decided on
                 // the (path, LINE NUMBER) pair, so line 9 precedes line 10. The
                 // ROW carries the path alone; the line rides along and reaches
@@ -3384,6 +3478,10 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // ros2_graph_e2e_test names `librmw_cerulion.so`, the artifact rmw_cerulion
     // builds, under the sandbox library directory.
     ("cerulion_cli", "rmw_cerulion", "dlopen"),
+    // pair_interrupt_e2e_test names `cerulion-connectd` beside the `cerulion`
+    // binary cargo built for it, through `with_file_name`; the CLI it runs
+    // spawns that desk helper.
+    ("cerulion_cli", "cerulion_connectd", "binary"),
     // block_colocation_adoption_test's `read_src` reads the manifest directory's
     // parent joined with a crate-relative path its callers choose.
     ("cerulion_cli_engine", "all", "whole-tree"),
@@ -3439,6 +3537,14 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_hygiene", "go2_tf_source", "crate-path"),
     // crate_license_texts_test reads `crates/native_ros2_messages`.
     ("cerulion_hygiene", "native_ros2_messages", "crate-path"),
+    // pair_start_e2e_test names `cerulion` and `cerulion-connectd` beside the
+    // netd binary cargo built for it, through `with_file_name`; it runs the
+    // CLI, and the CLI runs the desk helper for each desk.
+    ("cerulion_netd", "cerulion_cli", "binary"),
+    ("cerulion_netd", "cerulion_connectd", "binary"),
+    // automatic_serving_test names `cerulion-remoted` beside the netd binary
+    // the same way; the netd it starts runs that binary.
+    ("cerulion_netd", "cerulion_remoted", "binary"),
     // eye/source.rs's unit test reads `../cerulion_cli_engine/src` for the
     // node names `bag play` and the resim mint their transports with.
     ("cerulion_rcpd", "cerulion_cli_engine", "crate-path"),
@@ -3560,7 +3666,9 @@ fn the_committed_observation_edge_table_matches_the_walk() {
 // ---------------------------------------------------------------------------
 
 /// A hand-built workspace: four members, one of them nested, one of them under
-/// the examples tree, and one that builds a `cdylib`.
+/// the examples tree, and one that builds a `cdylib`. [`fixture_edges`] gives
+/// `alpha` and `beta` a binary each, and `beta` and `delta` one binary name
+/// both build.
 ///
 /// Spelled in HALVES wherever a fixture would otherwise carry a whole rooted
 /// path, for the reason [`ROOT_MARKDOWN_STEMS`] gives: this walk reads its own
@@ -3588,8 +3696,28 @@ fn fixture_edges(src: &str) -> BTreeSet<SourceEdge> {
     let cdylibs: BTreeMap<String, String> = [("gamma".to_string(), "gamma".to_string())]
         .into_iter()
         .collect();
+    let mut binaries: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (name, package) in [
+        ("alpha-tool", "alpha"),
+        ("beta-tool", "beta"),
+        ("shared-tool", "beta"),
+        ("shared-tool", "delta"),
+    ] {
+        binaries
+            .entry(name.to_string())
+            .or_default()
+            .insert(package.to_string());
+    }
     let source_dir = format!("crates{}alpha", "/");
-    observation_edges_of_source(src, "alpha", &source_dir, &members, &multi, &cdylibs)
+    observation_edges_of_source(
+        src,
+        "alpha",
+        &source_dir,
+        &members,
+        &multi,
+        &cdylibs,
+        &binaries,
+    )
 }
 
 fn edge(observed: &str, kind: &'static str, line: usize) -> BTreeSet<SourceEdge> {
@@ -3747,6 +3875,41 @@ fn the_multi_member_directory_set_is_exactly_the_shared_parents() {
     );
 }
 
+/// The binary names a manifest declares: each `[[bin]]` table's `name`, and no
+/// other table's.
+#[test]
+fn manifest_binary_names_reads_each_bin_table_and_nothing_else() {
+    let manifest = "[package]\nname = \"pkg\"\n\n[lib]\nname = \"pkg_lib\"\n\n\
+                    [[bin]]\nname = \"first-tool\"\npath = \"src/main.rs\"\n\n\
+                    # [[bin]]\n# name = \"commented-tool\"\n\n\
+                    [[bin]]\npath = \"src/bin/second.rs\"\nname = \"second-tool\" # why\n\n\
+                    [dependencies]\nname = \"not-a-binary\"\n";
+    assert_eq!(
+        manifest_binary_names(manifest),
+        ["first-tool".to_string(), "second-tool".to_string()]
+    );
+    assert_eq!(manifest_binary_names(""), Vec::<String>::new());
+
+    // The live manifests: the three binaries the netd tests run, each built
+    // by the one package that declares it.
+    let live = member_binary_names();
+    for (binary, package) in [
+        ("cerulion", "cerulion_cli"),
+        ("cerulion-connectd", "cerulion_connectd"),
+        ("cerulion-remoted", "cerulion_remoted"),
+    ] {
+        assert_eq!(
+            live.get(binary),
+            Some(
+                &[package.to_string()]
+                    .into_iter()
+                    .collect::<BTreeSet<String>>()
+            ),
+            "the member binary names do not credit `{binary}` to {package} alone"
+        );
+    }
+}
+
 /// Each kind of edge, derived from the shape that produces it.
 #[test]
 fn each_observation_edge_kind_is_derived_from_its_own_shape() {
@@ -3799,6 +3962,27 @@ fn each_observation_edge_kind_is_derived_from_its_own_shape() {
     assert_eq!(
         fixture_edges("let p = dir.join(graph_cmd::cdylib_name(\n    \"gamma\",\n));\n"),
         edge("gamma", EDGE_DLOPEN, 2)
+    );
+
+    // (e3) A binary another member builds, named beside the one cargo built
+    //      for the test, which is how the test finds it to run.
+    assert_eq!(
+        fixture_edges("let p = exe.with_file_name(\"beta-tool\");\n"),
+        edge("beta", EDGE_BINARY, 1)
+    );
+    assert_eq!(
+        fixture_edges("let p = exe\n    .with_file_name(\n        \"beta-tool\",\n    );\n"),
+        edge("beta", EDGE_BINARY, 3)
+    );
+    // A binary name two members build is an edge onto each of them.
+    assert_eq!(
+        fixture_edges("let p = exe.with_file_name(\"shared-tool\");\n"),
+        [
+            ("beta".to_string(), EDGE_BINARY, 1),
+            ("delta".to_string(), EDGE_BINARY, 1),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<SourceEdge>>()
     );
 
     // (f) An artifact name built at RUN TIME cannot be attributed.
@@ -3920,6 +4104,18 @@ fn a_shape_that_is_not_an_observation_derives_no_edge() {
         ),
         // A shared object no member of this workspace builds.
         ("a foreign artifact", "let p = dir.join(\"libsomething_else.so\");\n".to_string()),
+        // The observing package's OWN binary beside the one cargo built.
+        ("the package's own binary", "let p = exe.with_file_name(\"alpha-tool\");\n".to_string()),
+        // A file beside a binary that no member builds as a binary.
+        ("a file beside a binary", "let p = exe.with_file_name(\"netd.log\");\n".to_string()),
+        // A binary's name joined onto a directory: a scratch stub of that name
+        // and a directory of that name are spelled the same way.
+        (
+            "a binary name joined onto a directory",
+            "let p = dir.join(\"beta-tool\");\n".to_string(),
+        ),
+        // A binary's name the code only NAMES.
+        ("a binary name in a message", "assert!(msg.contains(\"beta-tool\"));\n".to_string()),
         // A const table entry that is a bare NAME rather than a path: a
         // classification key, not a read.
         (
