@@ -217,18 +217,21 @@ Rules that must not drift:
   what each writer's own pass compares or a foreign driver's recorded inputs, which no pass
   compares, so a pass's partitions hold only the writers it runs. `judge_passes` picks the
   verdict: `merge_partitioned_summaries` folds passes that all partitioned the topic into their
-  union, each writer from the one pass that runs it; the only pass that counted a frame, if it
-  neither partitioned nor injected the topic (`CaptureSummary::injected`), is judged alone
-  against every recorded frame, its rank the tail window; any other mix goes to `push_split_violations`, which
-  judges the partitioned passes per writer, counts the rest together (the recorded frames no
-  partition holds against `CaptureSummary::own_replayed`), compares an injecting pass's one
-  stream with every recorded frame, and returns a pass of its own writers' frames alone, beside
-  another with frames, as `SplitUnjudged`, which `assemble_outcome` DECLINES
-  (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else on the
-  topic failed. The ragged-tail frame tolerance bounds a partitioned topic writer by writer, each
-  by its node's rank's window (`tail_extra_ranks`), and a one-stream topic by the sum of its
-  ranks' windows; `--tolerance` rows fold across passes to one per field and metric
-  (`fold_tolerance_worsts`). A metadata read that fails
+  union, each writer from the one pass that runs it; the only pass whose own writers published a
+  frame (`CaptureSummary::own_replayed`, which leaves its injector's frames out), if it neither
+  partitioned nor injected the topic (`CaptureSummary::injected`), is judged alone against every
+  recorded frame, its rank the tail window; any other mix is `SplitPasses`, which
+  `push_split_violations` judges: the partitioned passes per writer, the rest counted together
+  (the recorded frames no partition holds against their `own_replayed`), an injecting pass's one
+  stream compared with every recorded frame, and a pass of its own writers' frames alone, beside
+  another whose writers published frames, returned as `SplitUnjudged`, which `assemble_outcome`
+  DECLINES (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else
+  on the topic failed. The ragged-tail frame tolerance (`tail_extra_ranks`) bounds a partitioned
+  topic rank by rank, the extra frames of one rank's writers within that rank's window together,
+  and a one-stream topic by the sum of its ranks' windows; a split topic is bounded part by part
+  (`SplitPasses::tail_extra_ranks`), its one-stream passes' frames together by the sum of their
+  ranks' windows, guarded by the frames it compares (`SplitPasses::tail_clean`). `--tolerance`
+  rows fold across passes to one per field and metric (`fold_tolerance_worsts`). A metadata read that fails
   keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
   LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
   driver node and every topic one writes, shared ones included, and still fires for a
