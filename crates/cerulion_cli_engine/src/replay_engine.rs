@@ -3368,7 +3368,8 @@ impl ReadLogEnforcement {
 /// while another one's writers published frames of the topic too, so they are
 /// not compared.
 /// The topic is declined only when nothing compared on it failed: its counts
-/// are judged over every recorded frame, and a failure there stands. Such a row
+/// are judged over every recorded frame, a ragged shutdown tail's trailing
+/// frames tolerated as on any topic, and a failure there stands. Such a row
 /// names the ranks whose frames were not compared, withholds the byte verdict and
 /// tolerance rows their one stream reads against every recorded frame, and never
 /// MATCHED under a fallback.
@@ -5824,8 +5825,8 @@ fn assemble_outcome(
     let mut topics_passed = 0usize;
     // Which rank(s) OWN each graph-produced topic — each in-graph
     // producer's node → the rank whose recorded manifest lists that node. Empty
-    // on single-rank bags (`node_rank` is `None`), keeping the frame tolerance
-    // inert (`tolerated_extra == 0`) and single-rank output byte-identical.
+    // on single-rank bags (`node_rank` is `None`), keeping the frame tolerance's
+    // windows empty and single-rank output byte-identical.
     //
     // A SET per topic, not one rank. A map written
     // `entry(t).or_insert(rank)` rests on the single-writer premise
@@ -5955,14 +5956,16 @@ fn assemble_outcome(
         // `push_split_violations`.
         let shared = classes.driver_shared.contains(topic);
         let judged = judge_passes(summaries);
-        let split = matches!(judged, PassJudgement::Split);
         let (summary, alone_in): (Option<&CaptureSummary>, Option<u32>) = match &judged {
             PassJudgement::One { summary, alone_in } => (*summary, *alone_in),
             PassJudgement::Merged(merged) => (Some(&**merged), None),
             PassJudgement::Split => (None, None),
         };
+        let split_passes =
+            matches!(judged, PassJudgement::Split).then(|| SplitPasses::of(summaries));
         // Every frame the replay compared is attributed to its writer.
-        let attributed = !split && summary.is_some_and(|c| c.partition_counts.is_some());
+        let attributed =
+            split_passes.is_none() && summary.is_some_and(|c| c.partition_counts.is_some());
         // Partial report: under an ABORT a topic is judged iff
         // some rank that OWNS it COMPLETED — membership in the report's own
         // `rank_execution`, the same set the report states as complete, so
@@ -6010,19 +6013,18 @@ fn assemble_outcome(
         // inside the band still lands short, and one that over-produces beyond it
         // still lands long.
         //
-        // A split topic counts the frames its passes' own writers published
-        // for the vacuous check alone: `push_split_violations` reads its
-        // counts off the passes, and no reproduced band is taken off a count
-        // no verdict reads.
-        let replayed_count = if split {
-            summaries.iter().map(CaptureSummary::own_replayed).sum()
-        } else {
-            summary.map_or(0, |c| c.replayed_count).saturating_sub(
+        // A split topic counts the frames its passes' own writers published,
+        // with no reproduced band taken off: the vacuous check and the tail
+        // tolerance read it, and `push_split_violations` reads its own counts
+        // off the passes.
+        let replayed_count = match &split_passes {
+            Some(passes) => passes.own_replayed(),
+            None => summary.map_or(0, |c| c.replayed_count).saturating_sub(
                 covered_range
                     .as_ref()
                     .and_then(|c| c.reproduced.get(topic).copied())
                     .unwrap_or(0),
-            )
+            ),
         };
         let byte_violation = summary.and_then(|c| c.byte_violation.as_ref());
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
@@ -6097,7 +6099,8 @@ fn assemble_outcome(
         //     leaves the topic-level one `None` forever, so the bare field made
         //     this guard vacuously true and let a byte-diverged co-located
         //     `multi_publisher_topics` topic take the tolerated arm (which pushes
-        //     no violation at all) and score PASSED;
+        //     no violation at all) and score PASSED. A split topic reads the
+        //     byte verdicts of the frames it compares (`SplitPasses::tail_clean`);
         //   * NO writer under-produced (`no_writer_under_produced`) — the
         //     topic-level `extra` is a SUM across a partitioned topic's writers,
         //     so one writer's legitimate tail re-fire can NET against another
@@ -6113,44 +6116,54 @@ fn assemble_outcome(
         //     passes and an over-produced frame still fails.
         // Recorded in `tolerated_ragged_tails` (never silent).
         //
-        // A partitioned topic is bounded WRITER BY WRITER: each writer's extra
-        // frames lie within its own node's rank's window, so one rank's tail
-        // never explains another rank's writer's frames, and the note names
-        // the ranks whose writers produced them. A topic compared as one
-        // stream cannot say which writer produced an extra frame, so it is
-        // bounded by the SUM of the windows of the ranks its frames come from:
-        // the topic's owning ranks, or the one pass judged alone. On a
-        // single-writer topic the sum has one term, its one owner's width.
-        // Never on a split topic `push_split_violations` judges: no pair of
-        // counts there states which pass's frames are extra.
+        // A partitioned topic is bounded RANK BY RANK: the extra frames of the
+        // writers one rank runs lie within that rank's window together, so one
+        // rank's tail never explains another rank's writer's frames, and the
+        // note names the ranks whose writers produced them. A topic compared
+        // as one stream cannot say which writer produced an extra frame, so it
+        // is bounded by the SUM of the windows of the ranks its frames come
+        // from: the topic's owning ranks, or the one pass judged alone. On a
+        // single-writer topic the sum has one term, its one owner's width. A
+        // split topic is bounded part by part (`SplitPasses::tail_extra_ranks`):
+        // its partitioned writers rank by rank, and the frames its one-stream
+        // passes' own writers published by the sum of those passes' ranks'
+        // windows.
         let per_step = recorded_messages.max_burst(topic).max(1);
         let extra = replayed_count.saturating_sub(recorded_count);
-        let stream_ranks: BTreeSet<u32> = match alone_in {
-            Some(rank) => BTreeSet::from([rank]),
-            None => topic_owner_ranks
-                .get(topic.as_str())
-                .cloned()
-                .unwrap_or_default(),
+        let tail_width = |rank: u32| ragged.tail_width(rank) as usize;
+        let writer_rank = |writer: &WriterKey| match writer {
+            WriterKey::Named(label) => writer_ranks.get(&**label).copied(),
+            WriterKey::Origin(_) => None,
         };
-        let tail_ranks = if split {
-            None
-        } else {
-            tail_extra_ranks(
-                partition_counts.as_ref(),
-                &stream_ranks,
-                extra,
-                per_step,
-                |rank| ragged.tail_width(rank) as usize,
-                |writer| match writer {
-                    WriterKey::Named(label) => writer_ranks.get(&**label).copied(),
-                    WriterKey::Origin(_) => None,
-                },
-            )
+        let (tail_clean, tail_ranks) = match &split_passes {
+            Some(passes) => (
+                passes.tail_clean(recorded_count),
+                passes.tail_extra_ranks(recorded_count, per_step, tail_width, writer_rank),
+            ),
+            None => {
+                let stream_ranks: BTreeSet<u32> = match alone_in {
+                    Some(rank) => BTreeSet::from([rank]),
+                    None => topic_owner_ranks
+                        .get(topic.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                (
+                    summary.is_none_or(|c| !c.any_byte_violation() && c.no_writer_under_produced()),
+                    tail_extra_ranks(
+                        partition_counts.as_ref(),
+                        &stream_ranks,
+                        if partition_counts.is_some() { 0 } else { extra },
+                        per_step,
+                        tail_width,
+                        writer_rank,
+                    ),
+                )
+            }
         };
         let ragged_trailing_tolerated = extra > 0
             && recorded_count > 0
-            && summary.is_none_or(|c| !c.any_byte_violation())
-            && summary.is_none_or(CaptureSummary::no_writer_under_produced)
+            && tail_clean
             && tail_ranks.as_ref().is_some_and(|r| !r.is_empty());
         let before = violations.len();
         let mut split_unjudged: Option<SplitUnjudged> = None;
@@ -6179,8 +6192,8 @@ fn assemble_outcome(
                      tail of rank {rank} (recorded {recorded_count}, replay produced \
                      {replayed_count})"
                 ),
-                // A split multi-writer topic: each rank's tail is its own cause
-                // and its own width, and the tolerance is their SUM — say so,
+                // A multi-writer topic whose writers run in several ranks: each
+                // rank's tail is its own cause and its own width, so say so,
                 // per rank, rather than collapsing the set to one rank (a
                 // collapsed map would name a rank whose tail may not
                 // have produced a single one of the extra frames).
@@ -6217,12 +6230,28 @@ fn assemble_outcome(
             // partitioned topic as well as the topic-level one — a mid-stream
             // extra keeps its byte violation and falls through below), and
             // neither can a per-writer SHORTFALL (`no_writer_under_produced`).
-        } else if split {
+            // A split topic still returns its tolerance rows and the passes
+            // whose frames it does not compare.
+            if let Some(passes) = &split_passes {
+                split_unjudged = push_split_violations(
+                    topic,
+                    recorded_count,
+                    passes,
+                    SplitCounts::TailTolerated,
+                    &mut violations,
+                );
+            }
+        } else if let Some(passes) = &split_passes {
             // The topic-level triage reads counts that leave a driver's frames
             // out wherever a pass partitioned a topic a driver shares.
             let triage = !shared || summaries.iter().all(|c| c.partition_counts.is_none());
-            split_unjudged =
-                push_split_violations(topic, recorded_count, summaries, triage, &mut violations);
+            split_unjudged = push_split_violations(
+                topic,
+                recorded_count,
+                passes,
+                SplitCounts::Judged { triage },
+                &mut violations,
+            );
         } else if let Some(parts) = partition_counts.as_ref().filter(|_| shared) {
             // Per writer, with no topic-level triage: the topic-level counts
             // leave the drivers' frames out, so a `MissingTopic` ("replay
@@ -25128,7 +25157,7 @@ enum PassJudgement<'a> {
     /// ([`merge_partitioned_summaries`]).
     Merged(Box<CaptureSummary>),
     /// Several passes captured the topic and at least one did not partition
-    /// it ([`push_split_violations`]).
+    /// it ([`SplitPasses`]).
     Split,
 }
 
@@ -25165,6 +25194,127 @@ fn judge_passes(summaries: &[CaptureSummary]) -> PassJudgement<'_> {
     PassJudgement::Split
 }
 
+/// The passes of a topic [`judge_passes`] splits, apart by how each captured
+/// it.
+struct SplitPasses<'a> {
+    /// Every pass that captured the topic, in pass order.
+    all: &'a [CaptureSummary],
+    /// The union of the partitions of the passes that partitioned the topic
+    /// ([`merge_partitioned_summaries`]), `None` when none did.
+    merged: Option<CaptureSummary>,
+    /// The passes that captured the topic as one stream, in pass order.
+    one_stream: Vec<&'a CaptureSummary>,
+}
+
+impl<'a> SplitPasses<'a> {
+    fn of(all: &'a [CaptureSummary]) -> Self {
+        let (partitioned, one_stream): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
+            all.iter().partition(|s| s.partition_counts.is_some());
+        Self {
+            all,
+            merged: merge_partitioned_summaries(partitioned),
+            one_stream,
+        }
+    }
+
+    /// The writers the partitioned passes run, each with its counts.
+    fn parts(&self) -> Option<&BTreeMap<WriterKey, PartitionCounts>> {
+        self.merged
+            .as_ref()
+            .and_then(|m| m.partition_counts.as_ref())
+    }
+
+    /// The frames every pass's own writers published
+    /// ([`CaptureSummary::own_replayed`]).
+    fn own_replayed(&self) -> usize {
+        self.all.iter().map(CaptureSummary::own_replayed).sum()
+    }
+
+    /// Of the topic's `recorded_count` frames, those no partition holds, a
+    /// driver's included.
+    fn stream_recorded(&self, recorded_count: usize) -> usize {
+        let partitioned: usize = self
+            .parts()
+            .map_or(0, |p| p.values().map(|c| c.recorded).sum());
+        recorded_count.saturating_sub(partitioned)
+    }
+
+    /// The frames the one-stream passes' own writers published.
+    fn stream_replayed(&self) -> usize {
+        self.one_stream.iter().map(|s| s.own_replayed()).sum()
+    }
+
+    /// The passes whose frames are compared, in pass order: every pass that
+    /// partitioned the topic, and every one-stream pass that injected some of
+    /// its frames, whose stream holds its own writers' frames among the
+    /// recorded frames of every other writer.
+    fn judged(&self) -> Vec<&'a CaptureSummary> {
+        self.all
+            .iter()
+            .filter(|s| s.partition_counts.is_some() || s.injected > 0)
+            .collect()
+    }
+
+    /// The one-stream passes, in pass order, that injected none of the
+    /// topic's frames and captured some: their own writers' frames alone,
+    /// which no recorded stream lines up with while another pass's writers
+    /// published frames of the topic too ([`judge_passes`]).
+    fn unjudged(&self) -> Vec<&'a CaptureSummary> {
+        self.one_stream
+            .iter()
+            .copied()
+            .filter(|s| s.injected == 0 && s.replayed_count > 0)
+            .collect()
+    }
+
+    /// Whether every frame compared on the topic matched its recorded twin and
+    /// nothing compared fell short of the recorded frames: no partitioned
+    /// writer and no injecting pass carries a byte verdict, no partitioned
+    /// writer published fewer frames than it recorded, and the one-stream
+    /// passes' own writers published no fewer than the recorded frames no
+    /// partition holds. A pass of its own writers' frames alone is not
+    /// compared, so its byte verdict is not read.
+    fn tail_clean(&self, recorded_count: usize) -> bool {
+        self.merged
+            .as_ref()
+            .is_none_or(|m| !m.any_byte_violation() && m.no_writer_under_produced())
+            && self
+                .one_stream
+                .iter()
+                .all(|s| s.injected == 0 || s.byte_violation.is_none())
+            && self.stream_replayed() >= self.stream_recorded(recorded_count)
+    }
+
+    /// The ranks whose ragged shutdown tails explain the topic's trailing
+    /// extra frames ([`tail_extra_ranks`]): its partitioned writers' rank by
+    /// rank, and the frames the one-stream passes' own writers published past
+    /// the recorded frames no partition holds within the windows of those
+    /// passes' ranks together.
+    fn tail_extra_ranks(
+        &self,
+        recorded_count: usize,
+        per_step: usize,
+        tail_width: impl Fn(u32) -> usize,
+        writer_rank: impl Fn(&WriterKey) -> Option<u32>,
+    ) -> Option<Vec<u32>> {
+        let stream_ranks: BTreeSet<u32> = self
+            .one_stream
+            .iter()
+            .filter(|s| s.own_replayed() > 0)
+            .map(|s| s.rank)
+            .collect();
+        tail_extra_ranks(
+            self.parts(),
+            &stream_ranks,
+            self.stream_replayed()
+                .saturating_sub(self.stream_recorded(recorded_count)),
+            per_step,
+            tail_width,
+            writer_rank,
+        )
+    }
+}
+
 /// What [`push_split_violations`] could not judge: the passes that captured a
 /// split topic as one stream of their own writers' frames alone, beside other
 /// passes whose writers published frames of it too, by rank, and the verdicts
@@ -25189,14 +25339,24 @@ const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in sever
      A bag that labels each frame with its writer, within the verifier's record budget, \
      compares each writer where it runs";
 
+/// How [`push_split_violations`] judges a split topic's counts.
+#[derive(Debug, Clone, Copy)]
+enum SplitCounts {
+    /// Every count and byte verdict is judged. With `triage`, a topic whose
+    /// passes' writers published no frame is one `MissingTopic`, and one whose
+    /// bag holds no frame one `ExtraTopic`, as [`push_topic_violations`] judges
+    /// a topic; the caller turns it off on a topic a driver shares that a pass
+    /// partitioned, whose partitions leave the driver's frames out.
+    Judged { triage: bool },
+    /// The trailing extra frames lie within the ragged shutdown tails
+    /// ([`SplitPasses::tail_extra_ranks`]) of a topic whose compared frames
+    /// all matched and fell short nowhere ([`SplitPasses::tail_clean`]): no
+    /// count or byte verdict is pushed.
+    TailTolerated,
+}
+
 /// The violations of a topic several passes captured, at least one of them
 /// without partitioning it by writer, and what could not be judged. PURE.
-///
-/// With `triage`, a topic whose passes' writers published no frame is one
-/// `MissingTopic`, and one whose bag holds no frame one `ExtraTopic`, as
-/// [`push_topic_violations`] judges a topic. The caller turns it off on a
-/// topic a driver shares that a pass partitioned, whose partitions leave the
-/// driver's frames out.
 ///
 /// The partitioned passes are judged per writer
 /// ([`merge_partitioned_summaries`]). The other passes are judged together by
@@ -25205,62 +25365,59 @@ const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in sever
 /// frames their injectors re-published ([`CaptureSummary::own_replayed`]). A
 /// pass that injected the topic captured its own writers' frames among the
 /// recorded frames of every other writer, so its one stream is compared with
-/// every recorded frame byte for byte. A pass that injected nothing captured
-/// its own writers' frames alone, which no recorded stream lines up with
-/// while another pass's writers published frames too, so its byte verdict and
-/// its tolerance rows are returned unjudged ([`SplitUnjudged`]), with its rank.
+/// every recorded frame byte for byte. `counts` says whether those count and
+/// byte verdicts are pushed. A pass that injected nothing captured its own
+/// writers' frames alone, which no recorded stream lines up with while
+/// another pass's writers published frames too, so its byte verdict and its
+/// tolerance rows are returned unjudged ([`SplitUnjudged`]), with its rank.
 /// The tolerance rows of the judged passes fold to one per field and metric
-/// ([`fold_tolerance_worsts`]).
+/// in pass order ([`fold_tolerance_worsts`]).
 fn push_split_violations(
     topic: &str,
     recorded_count: usize,
-    summaries: &[CaptureSummary],
-    triage: bool,
+    passes: &SplitPasses<'_>,
+    counts: SplitCounts,
     violations: &mut Vec<Violation>,
 ) -> Option<SplitUnjudged> {
-    let own: usize = summaries.iter().map(CaptureSummary::own_replayed).sum();
-    if triage {
-        if recorded_count > 0 && own == 0 {
-            push_topic_violations(topic, recorded_count, 0, None, None, violations);
-            return None;
+    if let SplitCounts::Judged { triage } = counts {
+        let own = passes.own_replayed();
+        if triage {
+            if recorded_count > 0 && own == 0 {
+                push_topic_violations(topic, recorded_count, 0, None, None, violations);
+                return None;
+            }
+            if recorded_count == 0 && own > 0 {
+                push_topic_violations(topic, 0, own, None, None, violations);
+                return None;
+            }
         }
-        if recorded_count == 0 && own > 0 {
-            push_topic_violations(topic, 0, own, None, None, violations);
-            return None;
+        if let Some(parts) = passes.parts() {
+            push_partition_violations(topic, parts, violations);
         }
-    }
-    let (partitioned, one_stream): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
-        summaries.iter().partition(|s| s.partition_counts.is_some());
-    let merged = merge_partitioned_summaries(partitioned.iter().copied());
-    let parts = merged.as_ref().and_then(|m| m.partition_counts.as_ref());
-    if let Some(parts) = parts {
-        push_partition_violations(topic, parts, violations);
-    }
-    let partitioned_recorded: usize = parts.map_or(0, |p| p.values().map(|c| c.recorded).sum());
-    push_stream_violations(
-        topic,
-        None,
-        recorded_count.saturating_sub(partitioned_recorded),
-        one_stream.iter().map(|s| s.own_replayed()).sum(),
-        None,
-        violations,
-    );
-    let (injecting, own_only): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
-        one_stream.into_iter().partition(|s| s.injected > 0);
-    for s in &injecting {
-        if let Some(bv) = &s.byte_violation {
-            violations.push(byte_mismatch_violation(topic, None, bv));
+        push_stream_violations(
+            topic,
+            None,
+            passes.stream_recorded(recorded_count),
+            passes.stream_replayed(),
+            None,
+            violations,
+        );
+        for s in passes.one_stream.iter().filter(|s| s.injected > 0) {
+            if let Some(bv) = &s.byte_violation {
+                violations.push(byte_mismatch_violation(topic, None, bv));
+            }
         }
     }
-    let judged = partitioned.iter().chain(&injecting);
     violations.extend(tolerance_rows(
         topic,
-        &fold_tolerance_worsts(judged.map(|s| s.tolerance_worsts.as_slice())),
+        &fold_tolerance_worsts(
+            passes
+                .judged()
+                .into_iter()
+                .map(|s| s.tolerance_worsts.as_slice()),
+        ),
     ));
-    let unjudged: Vec<&CaptureSummary> = own_only
-        .into_iter()
-        .filter(|s| s.replayed_count > 0)
-        .collect();
+    let unjudged = passes.unjudged();
     if unjudged.is_empty() {
         return None;
     }
@@ -25324,51 +25481,52 @@ fn merge_partitioned_summaries<'a>(
 }
 
 /// The ranks whose ragged shutdown tails explain a topic's trailing extra
-/// frames, or `None` when one of them lies past every window that could
-/// explain it. PURE.
+/// frames, or `None` when some of them lie past every window that could
+/// explain them. PURE.
 ///
-/// A partitioned topic is bounded writer by writer: each writer's extra
-/// frames, `replayed - recorded`, lie within its own node's rank's window,
-/// `tail_width(rank) x per_step` (`writer_rank`), and the ranks named are
-/// those whose writers produced extra frames. A writer whose rank is unknown
-/// has no window. A topic compared as one stream cannot say which writer
-/// produced an extra frame, so its `extra` frames lie within the sum of the
-/// windows of `stream_ranks`, the ranks its frames come from, and the ranks
-/// named are those with a tail.
+/// A rank's window is `tail_width(rank) x per_step` frames. The writers of
+/// `partitions` are bounded rank by rank (`writer_rank`): the extra frames,
+/// `replayed - recorded`, of the writers one rank runs lie within its window
+/// together, and a writer whose rank is unknown has no window. Frames compared
+/// as one stream cannot say which writer produced an extra frame, so the
+/// stream's `stream_extra` frames lie within the room the windows of
+/// `stream_ranks`, the ranks its frames come from, keep past the partitioned
+/// writers' extra frames there. The ranks named are those whose writers
+/// produced extra frames and, where the stream has extra frames, those of
+/// `stream_ranks` with room in their window.
 fn tail_extra_ranks(
     partitions: Option<&BTreeMap<WriterKey, PartitionCounts>>,
     stream_ranks: &BTreeSet<u32>,
-    extra: usize,
+    stream_extra: usize,
     per_step: usize,
     tail_width: impl Fn(u32) -> usize,
     writer_rank: impl Fn(&WriterKey) -> Option<u32>,
 ) -> Option<Vec<u32>> {
     let window = |rank: u32| tail_width(rank).saturating_mul(per_step);
-    let mut ranks: BTreeSet<u32> = BTreeSet::new();
-    match partitions {
-        Some(parts) => {
-            for (writer, c) in parts {
-                let over = c.replayed.saturating_sub(c.recorded);
-                if over == 0 {
-                    continue;
-                }
-                let rank = writer_rank(writer)?;
-                if over > window(rank) {
-                    return None;
-                }
-                ranks.insert(rank);
-            }
+    let mut used: BTreeMap<u32, usize> = BTreeMap::new();
+    for (writer, c) in partitions.into_iter().flatten() {
+        let over = c.replayed.saturating_sub(c.recorded);
+        if over == 0 {
+            continue;
         }
-        None => {
-            let allowance = stream_ranks
-                .iter()
-                .map(|&rank| window(rank))
-                .fold(0usize, usize::saturating_add);
-            if extra > allowance {
-                return None;
-            }
-            ranks.extend(stream_ranks.iter().filter(|&&rank| tail_width(rank) > 0));
+        let rank = writer_rank(writer)?;
+        let in_rank = used.entry(rank).or_insert(0);
+        *in_rank = in_rank.saturating_add(over);
+        if *in_rank > window(rank) {
+            return None;
         }
+    }
+    let room = |rank: u32| window(rank).saturating_sub(used.get(&rank).copied().unwrap_or(0));
+    let mut ranks: BTreeSet<u32> = used.keys().copied().collect();
+    if stream_extra > 0 {
+        let allowance = stream_ranks
+            .iter()
+            .map(|&rank| room(rank))
+            .fold(0usize, usize::saturating_add);
+        if stream_extra > allowance {
+            return None;
+        }
+        ranks.extend(stream_ranks.iter().copied().filter(|&rank| room(rank) > 0));
     }
     Some(ranks.into_iter().collect())
 }
@@ -36536,15 +36694,38 @@ mod capture_partition_tests {
     /// some pass, those passes' ranks and withheld rows.
     type SplitRows = (Vec<String>, Option<(Vec<u32>, Vec<String>)>);
 
-    /// Run `push_split_violations` on `/t` and return its rows and what it
-    /// could not judge.
-    fn split(recorded: usize, summaries: &[CaptureSummary], triage: bool) -> SplitRows {
+    /// Run `push_split_violations` on `/t` under `counts` and return its rows
+    /// and what it could not judge.
+    fn split_counted(
+        recorded: usize,
+        summaries: &[CaptureSummary],
+        counts: SplitCounts,
+    ) -> SplitRows {
         let mut violations = Vec::new();
-        let unjudged = push_split_violations("/t", recorded, summaries, triage, &mut violations);
+        let unjudged = push_split_violations(
+            "/t",
+            recorded,
+            &SplitPasses::of(summaries),
+            counts,
+            &mut violations,
+        );
         (
             named(&violations),
             unjudged.map(|u| (u.ranks, named(&u.withheld))),
         )
+    }
+
+    /// [`split_counted`] with every count judged.
+    fn split(recorded: usize, summaries: &[CaptureSummary], triage: bool) -> SplitRows {
+        split_counted(recorded, summaries, SplitCounts::Judged { triage })
+    }
+
+    /// `summary` with `worsts` as its tolerance worsts.
+    fn with_worsts(summary: CaptureSummary, worsts: Vec<FieldMetric>) -> CaptureSummary {
+        CaptureSummary {
+            tolerance_worsts: worsts,
+            ..summary
+        }
     }
 
     /// A split topic's partitioned passes are judged per writer, and the rest
@@ -36634,6 +36815,133 @@ mod capture_partition_tests {
                 vec!["missing 3 0: recorded 3 frame(s), replay produced 0 on '/t'".to_string()],
                 None
             )
+        );
+        // `--tolerance` rows: those of the partitioned pass and of the pass
+        // that injected the topic fold, in pass order, the larger exceedance
+        // kept; those of the pass of its own writers' frames alone are
+        // withheld with it.
+        let worsts = [
+            with_worsts(
+                partitioned_in(0, &[("w2/out", 4, 4, None)]),
+                vec![worst("x", 2.0, 1.5, 3), worst("y", 5.0, 4.5, 4)],
+            ),
+            with_worsts(
+                one_stream(1, 4, 2, None),
+                vec![worst("x", 3.0, 2.5, 1), worst("z", 9.0, 8.5, 2)],
+            ),
+            with_worsts(one_stream(2, 2, 0, None), vec![worst("x", 7.0, 6.5, 0)]),
+        ];
+        let rows = (
+            vec![
+                "tolerance Some(\"x\") at 1".to_string(),
+                "tolerance Some(\"y\") at 4".to_string(),
+                "tolerance Some(\"z\") at 2".to_string(),
+            ],
+            Some((vec![2], vec!["tolerance Some(\"x\") at 0".to_string()])),
+        );
+        assert_eq!(split(8, &worsts, true), rows);
+        // Tolerated as a ragged tail: no count verdict, the same rows.
+        assert_eq!(
+            split_counted(7, &worsts, SplitCounts::TailTolerated),
+            rows,
+            "the counts are not judged"
+        );
+        assert_eq!(
+            split(7, &worsts, true).0[0],
+            "extra 3 4: recorded 3 frame(s), replay produced 4 on '/t'",
+            "judged, the same counts are an extra frame"
+        );
+    }
+
+    /// The ragged-tail bound of a split topic and the guard it stands on: its
+    /// partitioned writers rank by rank, and the frames its one-stream passes'
+    /// own writers published past the recorded frames no partition holds by
+    /// what their ranks' windows hold together; the guard reads the byte
+    /// verdicts of the frames compared and every shortfall. Rank 1's tail is 1
+    /// step, rank 0's and rank 2's none, 1 frame per step. Hand oracles.
+    #[test]
+    fn a_split_topic_s_tail_is_bounded_part_by_part() {
+        let width = |rank: u32| usize::from(rank == 1);
+        let rank_of = |w: &WriterKey| match w {
+            WriterKey::Named(label) if label.starts_with("r0/") => Some(0),
+            WriterKey::Named(label) if label.starts_with("r1/") => Some(1),
+            _ => None,
+        };
+        let bound = |recorded: usize, summaries: &[CaptureSummary]| {
+            let passes = SplitPasses::of(summaries);
+            (
+                passes.tail_clean(recorded),
+                passes.tail_extra_ranks(recorded, 1, width, rank_of),
+            )
+        };
+        // Two passes of their own writers' frames alone, one frame past the
+        // recorded ones: inside rank 1's window, whichever pass's it is.
+        let two = [one_stream(0, 5, 0, Some(0)), one_stream(1, 5, 0, None)];
+        assert_eq!(bound(9, &two), (true, Some(vec![1])));
+        assert_eq!(bound(8, &two), (true, None), "two frames past it");
+        // A pass whose writers recorded nothing and published one frame.
+        assert_eq!(
+            bound(
+                5,
+                &[one_stream(0, 5, 0, None), one_stream(1, 1, 0, Some(0))]
+            ),
+            (true, Some(vec![1]))
+        );
+        // A partitioned writer's extra frame inside its own rank's window,
+        // the one-stream pass's frames the recorded ones no partition holds.
+        let mixed = |rank: u32, label: &str| {
+            [
+                partitioned_in(rank, &[(label, 4, 5, None)]),
+                one_stream(1 - rank, 4, 0, Some(1)),
+            ]
+        };
+        assert_eq!(bound(8, &mixed(1, "r1/w")), (true, Some(vec![1])));
+        assert_eq!(
+            bound(8, &mixed(0, "r0/w")),
+            (true, None),
+            "rank 0 has no tail"
+        );
+        // Partitioned writers beside a pass that captured nothing.
+        assert_eq!(
+            bound(
+                8,
+                &[
+                    partitioned_in(1, &[("r1/w", 4, 5, None)]),
+                    partitioned_in(0, &[("r0/v", 4, 4, None)]),
+                    one_stream(2, 0, 0, None),
+                ]
+            ),
+            (true, Some(vec![1]))
+        );
+        // The guard: a compared frame that differs, the one-stream passes'
+        // shortfall, a writer's shortfall.
+        assert!(
+            !bound(
+                6,
+                &[one_stream(0, 6, 3, Some(4)), one_stream(1, 6, 3, None)]
+            )
+            .0
+        );
+        assert!(!bound(6, &[one_stream(0, 5, 3, None), one_stream(1, 6, 3, None)]).0);
+        assert!(
+            !bound(
+                8,
+                &[
+                    partitioned_in(1, &[("r1/w", 4, 3, None)]),
+                    one_stream(0, 5, 0, None)
+                ]
+            )
+            .0
+        );
+        assert!(
+            !bound(
+                8,
+                &[
+                    partitioned_in(1, &[("r1/w", 4, 4, Some(2))]),
+                    one_stream(0, 5, 0, None)
+                ]
+            )
+            .0
         );
     }
 
@@ -36742,13 +37050,13 @@ mod capture_partition_tests {
         );
     }
 
-    /// The ragged-tail window of a partitioned topic bounds each writer by its
-    /// own rank's tail and names the ranks whose writers produced extra
-    /// frames; a one-stream topic is bounded by the sum of its ranks' windows
-    /// and names the ranks with a tail. Rank 0's tail is 1 step, rank 1's
-    /// none, 2 frames per step.
+    /// The ragged-tail window of a partitioned topic bounds the writers of
+    /// each rank together by that rank's tail and names the ranks whose
+    /// writers produced extra frames; a one-stream topic is bounded by the sum
+    /// of its ranks' windows and names the ranks with a tail. Rank 0's tail is
+    /// 1 step, rank 1's none, 2 frames per step.
     #[test]
-    fn the_tail_window_bounds_each_writer_by_its_own_rank() {
+    fn the_tail_window_bounds_the_writers_of_each_rank_together() {
         let width = |rank: u32| usize::from(rank == 0);
         let rank_of = |w: &WriterKey| match w {
             WriterKey::Named(label) if label.starts_with("r0/") => Some(0),
@@ -36773,9 +37081,38 @@ mod capture_partition_tests {
             .partition_counts
             .expect("partitioned");
         assert_eq!(bound(&unknown), None, "a writer of no known rank");
+        let co_located = |a: usize, b: usize| {
+            pass_summary(&[("r0/a", 9, 9 + a, None), ("r0/b", 9, 9 + b, None)])
+                .partition_counts
+                .expect("partitioned")
+        };
+        assert_eq!(
+            bound(&co_located(1, 1)),
+            Some(vec![0]),
+            "two writers of rank 0 inside its one window together"
+        );
+        assert_eq!(
+            bound(&co_located(2, 1)),
+            None,
+            "two writers of rank 0 past its one window together, each inside it"
+        );
         let stream = |extra: usize| tail_extra_ranks(None, &ranks, extra, 2, width, rank_of);
         assert_eq!(stream(2), Some(vec![0]));
         assert_eq!(stream(3), None);
+        // A stream beside partitioned writers keeps the room their extra
+        // frames leave in a window they share.
+        let beside = |extra: usize| {
+            tail_extra_ranks(
+                Some(&parts((9, 10), (9, 9))),
+                &BTreeSet::from([0]),
+                extra,
+                2,
+                width,
+                rank_of,
+            )
+        };
+        assert_eq!(beside(1), Some(vec![0]));
+        assert_eq!(beside(2), None, "past the room rank 0's writer left");
         assert_eq!(
             tail_extra_ranks(None, &BTreeSet::from([1]), 1, 2, width, rank_of),
             None,

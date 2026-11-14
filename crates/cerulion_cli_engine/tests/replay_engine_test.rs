@@ -38856,20 +38856,20 @@ fn rt_split_rank_of(id: &str) -> u32 {
 }
 
 /// (iii) A SPLIT bus, its writers on different ranks, each rank ragged by its
-/// own width, is tolerated writer by writer, each writer's extras within its
-/// own rank's window, and the note names BOTH ranks with their own causes; the
-/// single-owner topic beside it keeps the single-rank note byte for byte.
+/// own width, is tolerated rank by rank, each rank's writers' extras within
+/// that rank's window, and the note names BOTH ranks with their own causes;
+/// the single-owner topic beside it keeps the single-rank note byte for byte.
 ///
 /// Rank 0's final recorded step banks a boundary and no fires (width 1, the
 /// fire-less-final-step shape); rank 1 exits after step 5 (width 2, the peer-tail
 /// shape). `left` re-fires 1 frame, `right` 2: three trailing extras on a bus
 /// whose per-step count is 2. A map naming only the FIRST writer's rank —
 /// rank 0, window 1 × 2 = 2 — refuses the three as over-bound: a clean
-/// replay of a legal recording, failed on an owner it half-read. Per writer,
-/// `left`'s 1 fits rank 0's window of 2 and `right`'s 2 rank 1's of 4.
+/// replay of a legal recording, failed on an owner it half-read. Rank by
+/// rank, `left`'s 1 fits rank 0's window of 2 and `right`'s 2 rank 1's of 4.
 #[test]
 #[serial]
-fn c6_a_split_bus_is_tolerated_writer_by_writer_within_each_owning_rank_s_window() {
+fn c6_a_split_bus_is_tolerated_rank_by_rank_within_each_owning_rank_s_window() {
     let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
     rt_assert_premise(&rec);
     rt_drop_writer_tail(&mut rec, "left", 1);
@@ -38893,8 +38893,8 @@ fn c6_a_split_bus_is_tolerated_writer_by_writer_within_each_owning_rank_s_window
     let (notes, violations) = rt_bus_verdict(&outcome);
     assert!(
         outcome.passed && violations.is_empty(),
-        "three trailing extras on a bus owned by two ragged ranks are tolerated by \
-         the SUM of their windows: passed={} {:?}",
+        "three trailing extras on a bus owned by two ragged ranks are tolerated, \
+         each rank's within its own window: passed={} {:?}",
         outcome.passed,
         outcome.violations
     );
@@ -38932,15 +38932,15 @@ fn c6_a_split_bus_is_tolerated_writer_by_writer_within_each_owning_rank_s_window
     );
 }
 
-/// (iv) A SPLIT bus's tolerance is bounded writer by writer: one rank's tail
+/// (iv) A SPLIT bus's tolerance is bounded rank by rank: one rank's tail
 /// never explains another rank's writer's extra frame.
 ///
 /// Rank 0 (`left`) banks a final boundary and no fires (width 1); rank 1
 /// (`right`) records every step (width 0) and lost the frame of its last fire.
 /// `left` re-fires 1 frame inside rank 0's window, `right` replays 1 frame no
 /// window of its own explains. The two extras fit rank 0's window of 1 × 2
-/// frames, which is what a topic-wide bound read; per writer, `right`'s is past
-/// rank 1's empty one, so the bus takes no tolerance and both writers' extras
+/// frames, which is what a topic-wide bound read; rank by rank, `right`'s is
+/// past rank 1's empty one, so the bus takes no tolerance and both writers' extras
 /// are reported: exit 1, and no note on the bus.
 #[test]
 #[serial]
@@ -38980,6 +38980,53 @@ fn c6_one_rank_s_tail_never_explains_another_rank_s_writer() {
             ] if *left == extra("left") && *right == extra("right")
         ),
         "each writer's extra frame: {got:?}"
+    );
+}
+
+/// (v) The writers one ragged rank runs share that rank's one window: the
+/// window bounds the extra frames they produced together, never each writer's
+/// alone.
+///
+/// Both writers on rank 1, which exits after step 5 (width 2), on a bus of 2
+/// frames per step: a window of 2 × 2 = 4 frames. The recording lost each
+/// writer's last 3 frames and the replay produces them, 6 trailing extras
+/// together, past the window, though each writer's 3 fit it. Exit 1, each
+/// writer's extras reported, and no note on the bus. The CONTROL, 4 extras
+/// inside the same window, is
+/// `c6_a_clean_partitioned_ragged_tail_is_tolerated_with_the_single_rank_note`.
+#[test]
+#[serial]
+fn c6_co_located_writers_share_their_rank_s_one_window() {
+    let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
+    rt_assert_premise(&rec);
+    rt_drop_writer_tail(&mut rec, "left", 3);
+    rt_drop_writer_tail(&mut rec, "right", 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("rt_co_located_window.mcap");
+    rt_bag(&rec, &bag, rt_writers_on_rank1, |per_rank| {
+        per_rank[1].retain(|r| r.step <= 5)
+    });
+
+    let outcome = replay(&bag, rt_factories, None, None).expect("replay runs");
+    let (notes, violations) = rt_bus_verdict(&outcome);
+    assert!(!outcome.passed, "{:?}", outcome.violations);
+    assert!(notes.is_empty(), "no tolerance on the bus: {notes:?}");
+    let got: Vec<(&ViolationClass, &str)> = violations
+        .iter()
+        .map(|v| (&v.class, v.detail.as_str()))
+        .collect();
+    let extra = |writer: &str| {
+        format!("recorded 5 frame(s), replay produced 8 on '{RT_TOPIC}' from writer {writer}/bus")
+    };
+    assert!(
+        matches!(
+            got.as_slice(),
+            [
+                (ViolationClass::ExtraMessages { recorded: 5, replayed: 8 }, left),
+                (ViolationClass::ExtraMessages { recorded: 5, replayed: 8 }, right),
+            ] if *left == extra("left") && *right == extra("right")
+        ),
+        "each writer's extra frames: {got:?}"
     );
 }
 
@@ -48797,6 +48844,83 @@ topics:
     );
 }
 
+/// Drop the last frame the writer stamping `writer` recorded on `topic`.
+fn ri_drop_last_frame(rec: &mut Recording, topic: &str, writer: f64) {
+    let frames = rec.messages.get_mut(topic).expect("the topic was recorded");
+    let last = frames
+        .iter()
+        .rposition(|f| frame_x(f) == writer)
+        .expect("the writer recorded a frame");
+    frames.remove(last);
+}
+
+/// The recorded frames of `topic` in `rec`, in stream order.
+fn ri_recorded_xyz(rec: &Recording, topic: &str) -> Vec<(f64, f64, f64)> {
+    rec.messages[topic].iter().map(|f| drv_xyz(f)).collect()
+}
+
+/// The index of the first frame of `recorded` that is not the next frame of
+/// `frames`, one writer's stream.
+fn ri_first_differing(recorded: &[(f64, f64, f64)], frames: &[(f64, f64, f64)]) -> usize {
+    recorded
+        .iter()
+        .zip(frames)
+        .position(|(r, w)| r != w)
+        .expect("PREMISE: the recorded stream holds another writer's frame")
+}
+
+/// A slow writer's frames, `(writer, c, writer * 1_000_000 + 7c)` for
+/// `c = 1..=7`: one every eighth step, at 40 ms to 280 ms of the 300 ms run.
+fn ri_slow_frames(writer: f64) -> Vec<(f64, f64, f64)> {
+    (1..=7)
+        .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
+        .collect()
+}
+
+/// The frame-tolerance notes of `outcome` on `topic`.
+fn ri_frame_notes<'a>(outcome: &'a ReplayOutcome, topic: &str) -> Vec<&'a str> {
+    let quoted = format!("'{topic}'");
+    outcome
+        .tolerated_ragged_tails
+        .iter()
+        .filter(|n| n.starts_with("frame:") && n.contains(&quoted))
+        .map(String::as_str)
+        .collect()
+}
+
+/// The frame-tolerance note of one trailing frame on `topic` that `rank`'s
+/// final recorded step, a boundary with no fires behind it, explains.
+fn ri_fireless_note(topic: &str, rank: u32, recorded: usize, replayed: usize) -> String {
+    format!(
+        "frame: 1 trailing frame(s) on '{topic}' tolerated: rank {rank}'s final recorded step \
+         banked its step boundary with no fires behind it (either the step ran and fired \
+         nothing, or the worker shut down between the step boundary and the step's fires \
+         \u{2014} the recording cannot tell which) (recorded {recorded}, replay produced \
+         {replayed})"
+    )
+}
+
+/// One declined frame comparison: its topic, ranks, code, whether it matched,
+/// and the classes of the violations it withheld.
+type RiDeclined<'a> = (&'a str, Vec<u32>, &'a str, bool, Vec<&'a ViolationClass>);
+
+/// Every declined frame comparison of `outcome`.
+fn ri_declined(outcome: &ReplayOutcome) -> Vec<RiDeclined<'_>> {
+    outcome
+        .declined_frame_comparisons
+        .iter()
+        .map(|d| {
+            (
+                d.topic.as_str(),
+                d.ranks.clone(),
+                d.code.as_str(),
+                d.matched_under_fallback,
+                d.withheld.iter().map(|v| &v.class).collect(),
+            )
+        })
+        .collect()
+}
+
 /// The topic a period writer shares with a writer that never publishes, read
 /// by a sink beside the silent one.
 const RI_SILENT_INJ_BUS: &str = "/risilinj/bus";
@@ -48954,6 +49078,315 @@ fn a_split_topic_one_process_publishes_beside_one_that_injects_is_judged_by_the_
             "{run}: exactly the stream's byte mismatch: {named:?}"
         );
     }
+}
+
+/// A ragged shutdown tail on a `multi_publisher_topics` topic whose writers
+/// run in two processes, neither of which attributes the topic's frames to
+/// their writers, is tolerated over the frames the two published together.
+/// The period writer `w3` runs in the first process, and the slow writer `w2`
+/// in the second, which fires on every eighth step, at 40 ms to 280 ms of the
+/// 300 ms run, so its final recorded step banked its boundary and no fires, a
+/// one-step tail. The bag lost the frame of `w2`'s last fire, so the replay
+/// produces one frame past the recorded ones, inside the second's window, and
+/// the note names it. Each process's stream holds its own writer's frames
+/// alone, which no recorded stream lines up with, so the bus is DECLINED:
+/// exit 0, checked and not credited, the row naming both processes and
+/// withholding each stream's byte mismatch at the first recorded frame that
+/// is not that writer's next one. The bag labels no frame.
+#[test]
+#[serial]
+fn a_split_unattributed_topic_s_ragged_tail_is_tolerated_over_its_processes_together() {
+    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    let recorded = ri_recorded_xyz(&live.rec, RI_TAIL_BUS);
+    assert_eq!(recorded.len(), n + 6, "PREMISE: w2 lost one frame");
+    let (w3_at, w2_at) = (
+        ri_first_differing(&recorded, &ri_period_frames(3.0)),
+        ri_first_differing(&recorded, &ri_slow_frames(2.0)),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_tail_unlabelled.mcap");
+    ri_two_rank_bag_labelled(&live.rec, &bag, |id| id == "w2", false);
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_tail_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!(resim_exit(&outcome, true), 0, "exit 0");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 0),
+        "the bus is checked and not credited"
+    );
+    assert_eq!(
+        ri_frame_notes(&outcome, RI_TAIL_BUS),
+        vec![ri_fireless_note(RI_TAIL_BUS, 1, n + 6, n + 7).as_str()]
+    );
+    let declined = ri_declined(&outcome);
+    assert!(
+        matches!(
+            declined.as_slice(),
+            [(RI_TAIL_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                if *ranks == vec![0, 1]
+                    && matches!(
+                        withheld.as_slice(),
+                        [
+                            ViolationClass::ByteMismatch { index: a, .. },
+                            ViolationClass::ByteMismatch { index: b, .. },
+                        ] if (*a, *b) == (w3_at, w2_at)
+                    )
+        ),
+        "the bus is declined for both processes: {declined:?}"
+    );
+}
+
+/// The topic a slow and a period writer share in two processes.
+const RI_TAIL_MIX_BUS: &str = "/ritailmix/bus";
+
+/// A slow writer (`w2`, writer 2) and a period writer (`w3`, writer 3) on one
+/// `multi_publisher_topics` topic, and a period writer (`a`, writer 5) and a
+/// writer that never publishes (`b`) on a second; no node reads either.
+fn ri_tail_mix_yaml() -> &'static str {
+    "name: ritailmix\nprefix: ritailmix\nmulti_publisher_topics:\n  - /ritailmix/bus\n  - /ritailmix/aux\nnodes:\n\
+     \x20 - id: w2\n    type: ri_slow_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/aux\n"
+}
+
+fn ri_tail_mix_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiSlowWriterNodeEntry::with_state(RiSlowWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        ("w3", period(3.0)),
+        ("a", period(5.0)),
+        (
+            "b",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// A ragged shutdown tail on a `multi_publisher_topics` topic that one process
+/// attributes writer by writer and another does not is tolerated part by part.
+/// The slow writer `w2` runs in the first process, which fires on every eighth
+/// step, at 40 ms to 280 ms of the 300 ms run, so its final recorded step
+/// banked its boundary and no fires, a one-step tail; `w3`, `a` and `b` run in
+/// the second. The bag lost the frame of `w2`'s last fire, so `w2` replays one
+/// frame past its 6 recorded ones, which the first process's window explains:
+/// the note names it. CONTROL: under the shipped record budget both processes
+/// attribute the bus's frames, which pass, the bus checked and credited. With
+/// the verifier's record budget at the bus's recorded frames, the first still
+/// attributes them and the second, whose two `multi_publisher_topics` topics
+/// hold more, does not: its `n` frames count against the `n` recorded frames
+/// `w2`'s partition does not hold. Its one stream, `w3`'s frames alone, is not
+/// compared, so the bus is DECLINED with the same note: exit 0, checked and not
+/// credited, the row withholding the stream's byte mismatch at the first
+/// recorded frame that is not `w3`'s next one. The bag labels each bus frame
+/// with its writer.
+#[test]
+#[serial]
+fn a_split_topic_s_ragged_tail_is_tolerated_part_by_part() {
+    let mut live = ri_record(ri_tail_mix_yaml(), ri_tail_mix_factories);
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_TAIL_MIX_BUS),
+        want,
+        "PREMISE"
+    );
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_MIX_BUS, 2.0);
+    let recorded = ri_recorded_xyz(&live.rec, RI_TAIL_MIX_BUS);
+    let w3_at = ri_first_differing(&recorded, &ri_period_frames(3.0));
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_tail_mix.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id != "w2");
+    let note = ri_fireless_note(RI_TAIL_MIX_BUS, 0, n + 6, n + 7);
+    for (run, budget) in [("CONTROL", None), ("one process attributes", Some(n + 6))] {
+        let (outcome, _) = {
+            let _budget = budget.map(replay_engine::override_frame_index_record_budget);
+            ri_replay(
+                &bag,
+                ri_tail_mix_factories,
+                replay_engine::ReplayPurpose::Verify,
+            )
+        };
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{run}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{run}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{run}: exit 0");
+        assert_eq!(
+            ri_frame_notes(&outcome, RI_TAIL_MIX_BUS),
+            vec![note.as_str()],
+            "{run}"
+        );
+        let declined = ri_declined(&outcome);
+        if budget.is_none() {
+            assert_eq!(
+                (outcome.topics_checked, outcome.topics_passed),
+                (2, 2),
+                "{run}: both topics are checked and credited"
+            );
+            assert!(declined.is_empty(), "{run}: {declined:?}");
+            continue;
+        }
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 1),
+            "{run}: the bus is checked and not credited, the aux topic passes"
+        );
+        assert!(
+            matches!(
+                declined.as_slice(),
+                [(RI_TAIL_MIX_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                    if *ranks == vec![1]
+                        && matches!(
+                            withheld.as_slice(),
+                            [ViolationClass::ByteMismatch { index, .. }] if *index == w3_at
+                        )
+            ),
+            "{run}: the bus is declined for the second process: {declined:?}"
+        );
+    }
+}
+
+/// A writer that stamps its identity into one frame of the 300 ms run, at
+/// 280 ms.
+#[cerulion_node(period_ms = 280)]
+#[derive(Default)]
+struct RiOnceWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiOnceWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// The topic a period writer shares with a writer that publishes once.
+const RI_ONCE_BUS: &str = "/rionce/bus";
+
+/// A period writer (`w2`, writer 2) and a writer that publishes once in the
+/// run (`w3`, writer 3) on one `multi_publisher_topics` topic no node reads.
+fn ri_once_yaml() -> &'static str {
+    "name: rionce\nprefix: rionce\nmulti_publisher_topics:\n  - /rionce/bus\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rionce/bus\n\
+     \x20 - id: w3\n    type: ri_once_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rionce/bus\n"
+}
+
+fn ri_once_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(RiOnceWriterNodeEntry::with_state(RiOnceWriterNode {
+                writer: 3.0,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A writer whose one frame of a `multi_publisher_topics` topic the bag lost
+/// is tolerated in its process's ragged shutdown tail beside the frames the
+/// other process published. The period writer `w2` runs in the first process,
+/// and `w3`, which publishes once in the 300 ms run, at 280 ms, in the second,
+/// whose final recorded step therefore banked its boundary and no fires, a
+/// one-step tail. The bag lost `w3`'s one frame, so the recorded bus holds
+/// `w2`'s `n` frames alone and the replay produces `n + 1`, the one extra
+/// frame inside the second's window: the note names it. The bag labels no
+/// frame, so neither process attributes the frames, and both published some,
+/// so neither stream is compared: the bus is DECLINED, exit 0, checked and not
+/// credited, the row naming both processes and withholding the second's byte
+/// mismatch at frame 0, while the first's stream matches every recorded frame.
+#[test]
+#[serial]
+fn a_writer_whose_one_frame_the_bag_lost_is_tolerated_in_its_process_s_tail() {
+    let mut live = ri_record(ri_once_yaml(), ri_once_factories);
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    want.insert(3, vec![(3.0, 1.0, 3_000_007.0)]);
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_ONCE_BUS),
+        want,
+        "PREMISE: w3 published once"
+    );
+    ri_drop_last_frame(&mut live.rec, RI_ONCE_BUS, 3.0);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_once_unlabelled.mcap");
+    ri_two_rank_bag_labelled(&live.rec, &bag, |id| id == "w3", false);
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_once_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!(resim_exit(&outcome, true), 0, "exit 0");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 0),
+        "the bus is checked and not credited"
+    );
+    assert_eq!(
+        ri_frame_notes(&outcome, RI_ONCE_BUS),
+        vec![ri_fireless_note(RI_ONCE_BUS, 1, n, n + 1).as_str()]
+    );
+    let declined = ri_declined(&outcome);
+    assert!(
+        matches!(
+            declined.as_slice(),
+            [(RI_ONCE_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                if *ranks == vec![0, 1]
+                    && matches!(
+                        withheld.as_slice(),
+                        [ViolationClass::ByteMismatch { index: 0, .. }]
+                    )
+        ),
+        "the bus is declined for both processes: {declined:?}"
+    );
 }
 
 /// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
