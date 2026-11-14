@@ -235,6 +235,10 @@ the recorded ranges from the recorded depth frames byte for byte. The camera
 node is a driver: replay feeds its recorded frames downstream and never opens
 the SDK.
 
+Verify a recording made in the default multi-process layout. A
+`--single-process` recording of this graph is lockstep, which a resim of a
+graph with a driver does not support: it warns, and `--verify` exits 6.
+
 ## Verify the nodes
 
 The plane checks and the hand-over slot of the camera node, and the cone
