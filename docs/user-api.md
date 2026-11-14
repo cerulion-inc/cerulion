@@ -136,11 +136,13 @@ runs `cerulion-install-rust` when it is on `PATH` or beside `cerulion`; without
 it, a rustup already installed adds stable
 (`rustup toolchain install stable --profile minimal --no-self-update`, and
 `rustup default stable` only when there is no default), and otherwise the
-official rustup installer from `https://sh.rustup.rs` runs with `-y`,
-`--profile minimal`, `--default-toolchain stable` and `--no-modify-path`. The
-CLI then checks again and carries on with the command. When the new Cargo is
-only in `${CARGO_HOME:-$HOME/.cargo}/bin`, `node build` runs it from there and
-prints the PATH line to add.
+official rustup installer from `https://sh.rustup.rs` installs rustup alone
+(`-y`, `--profile minimal`, `--default-toolchain none` and `--no-modify-path`)
+and that rustup then adds stable the same way. The official installer's stdout
+is shown only when it fails; its stderr and the toolchain download stay on the
+terminal. The CLI then checks again and carries on with the command. When the
+new Cargo is only in `${CARGO_HOME:-$HOME/.cargo}/bin`, `node build` runs it
+from there and prints the PATH line to add.
 
 Off a terminal nothing is asked: the CLI prints `Rust 1.95 or newer is needed to
 build nodes.` and the command that installs it. After a no it prints the command.
@@ -160,7 +162,8 @@ and takes no arguments. It runs the release's `install_rust.sh`. The Rust it
 checks is the one in Cargo's home when that directory holds `rustc` and `cargo`,
 else the one on `PATH`; when that is 1.95 or newer it is left as it is
 (`Rust/Cargo <version> is ready.`). Otherwise the helper adds current stable
-through rustup, keeping an existing default, or installs rustup with stable. Put
+through rustup, keeping an existing default, or installs rustup and then
+stable through it, showing the rustup installer's stdout only when it fails. Put
 `${CARGO_HOME:-$HOME/.cargo}/bin` on your `PATH` after it runs.
 
 ### `cerulion node`
