@@ -1139,11 +1139,16 @@ pub struct DriverInputsReport {
     /// each recorded frame to its writer (for example, the bag labels no
     /// writer for a frame, a frame carries no wire header, or the topics'
     /// frame index is over the verifier's record budget), and a warning
-    /// logged during the replay names the cause. The passes that could not
-    /// attribute them count every recorded frame no partition holds against
-    /// the frames they captured on the topic but those their injectors
-    /// re-published, which hold a replayed driver's frames only where the
-    /// driver runs in such a pass. Such a pass's frames are also compared byte
+    /// logged during the replay names the cause. Where one pass captured the
+    /// topic, or only one pass's own writers published frames of it and that
+    /// pass fed none of its recorded frames, every frame that pass captured is
+    /// counted, those its injector re-published included. Otherwise the
+    /// passes that could not attribute them count every recorded frame no
+    /// partition holds against the frames their own writers published, which
+    /// hold a replayed driver's frames where the driver runs in such a pass,
+    /// and, once each, the recorded frames of a driver none of them runs that
+    /// their injectors re-published, where the injection names the writer of
+    /// each frame it re-publishes. Such a pass's frames are also compared byte
     /// for byte with every recorded frame where it is the only pass whose own
     /// writers published frames of the topic and it injected none, or where it
     /// injected the topic itself; a pass of its own writers' frames alone
@@ -5961,8 +5966,8 @@ fn assemble_outcome(
             PassJudgement::Merged(merged) => (Some(&**merged), None),
             PassJudgement::Split => (None, None),
         };
-        let split_passes =
-            matches!(judged, PassJudgement::Split).then(|| SplitPasses::of(summaries));
+        let split_passes = matches!(judged, PassJudgement::Split)
+            .then(|| SplitPasses::of(summaries, |driver| writer_ranks.get(driver).copied()));
         // Every frame the replay compared is attributed to its writer.
         let attributed =
             split_passes.is_none() && summary.is_some_and(|c| c.partition_counts.is_some());
@@ -6013,12 +6018,13 @@ fn assemble_outcome(
         // inside the band still lands short, and one that over-produces beyond it
         // still lands long.
         //
-        // A split topic counts the frames its passes' own writers published,
-        // with no reproduced band taken off: the vacuous check and the tail
-        // tolerance read it, and `push_split_violations` reads its own counts
-        // off the passes.
+        // A split topic counts the frames its passes' own writers published
+        // and the driver frames their injectors re-published
+        // (`SplitPasses::replayed`), with no reproduced band taken off: the
+        // vacuous check and the tail tolerance read it, and
+        // `push_split_violations` reads its own counts off the passes.
         let replayed_count = match &split_passes {
-            Some(passes) => passes.own_replayed(),
+            Some(passes) => passes.replayed(),
             None => summary.map_or(0, |c| c.replayed_count).saturating_sub(
                 covered_range
                     .as_ref()
@@ -9714,6 +9720,10 @@ struct CaptureSummary {
     /// frames of the writers other passes run, which a capture that did not
     /// partition the topic counts beside its own writers' frames.
     injected: usize,
+    /// Of [`Self::injected`], per driver (`node/output`), the frames that
+    /// driver recorded, where the injection names the writer of each recorded
+    /// frame ([`DriverCopies`]); empty where it names none.
+    injected_drivers: BTreeMap<Arc<str>, usize>,
 }
 
 impl CaptureSummary {
@@ -11954,6 +11964,11 @@ fn read_log_edge_not_gateable(
 struct PassVerification {
     /// Topics whose injection is STEERED, and the schedule to drive.
     steered: std::collections::HashMap<String, Vec<replay_inject::StepInjection>>,
+    /// Per injected `multi_publisher_topics` topic whose recorded frames the
+    /// injection attributes to their writers, the frames its drivers wrote,
+    /// which the topic's injector counts as it re-publishes them. Steered or
+    /// not.
+    driver_copies: std::collections::HashMap<String, DriverCopies>,
     stand_downs: Vec<InjectionStandDown>,
     coverage: Vec<InjectionCoverageNote>,
     /// Non-verdict notes minted while PLANNING — today only the
@@ -12175,6 +12190,7 @@ impl PassVerification {
     fn inert() -> Self {
         Self {
             steered: std::collections::HashMap::new(),
+            driver_copies: std::collections::HashMap::new(),
             stand_downs: Vec::new(),
             coverage: Vec::new(),
             notes: Vec::new(),
@@ -13551,7 +13567,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// TWELVE arguments. `roles_stamped` is a per-BAG contract term resolved once
+// THIRTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -13585,6 +13601,9 @@ fn prepare_pass_verification(
     // handed to the latest rule so it reads the writer runs as they were
     // staged.
     identity: cerulion_core::replay_feed::EdgeIdentity,
+    // The graph's `external` (driver) nodes, whose recorded frames an
+    // injector counts apart ([`PassVerification::driver_copies`]).
+    drivers: &BTreeSet<String>,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -13946,6 +13965,18 @@ fn prepare_pass_verification(
             },
         ));
     let mut steered = std::collections::HashMap::new();
+    // The `node/output` labels of the drivers' outputs the bag's publisher
+    // tables name.
+    let driver_labels: BTreeSet<&str> = producer_tokens
+        .values()
+        .filter_map(|resolution| match resolution {
+            ProducerResolution::Named { label, node } if drivers.contains(node) => {
+                Some(label.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut driver_copies = std::collections::HashMap::new();
     let mut stand_downs = Vec::new();
     let mut coverage = Vec::new();
     let mut notes: Vec<RederivationNote> = Vec::new();
@@ -14097,6 +14128,12 @@ fn prepare_pass_verification(
             edges,
         };
         let topic_plan = replay_inject::plan_topic_injection(&replay, &local_producers);
+        // Steered or not, the injector re-publishes these frames by their
+        // index, so it can count a driver's apart.
+        let copies = DriverCopies::of(&replay.frames, &driver_labels);
+        if !copies.is_empty() {
+            driver_copies.insert(topic.clone(), copies);
+        }
         let declines_this_topic = match &topic_plan {
             replay_inject::TopicPlan::StandDown(sd) => {
                 is_read_log_derived_standdown(sd.reason.code())
@@ -14517,6 +14554,7 @@ fn prepare_pass_verification(
 
     Ok(PassVerification {
         steered,
+        driver_copies,
         stand_downs,
         coverage,
         notes,
@@ -14945,6 +14983,7 @@ fn plan_pass_verification(
         pass.kind_width,
         pass.catchup_onset,
         pass.identity,
+        pass.driver_nodes,
     )?;
     Ok(verification)
 }
@@ -15321,7 +15360,7 @@ fn run_rank_pass(
     // FOREIGN writers it re-publishes. Opening
     // order is the only thing that changed; the injectors are handed to the
     // dispatch below exactly as before.
-    let injectors = open_injectors(
+    let mut injectors = open_injectors(
         transport,
         &inject_topics,
         pass.recorded_messages,
@@ -15330,6 +15369,11 @@ fn run_rank_pass(
         &cross,
         plan.rank(),
     )?;
+    for (topic, copies) in std::mem::take(&mut verification.driver_copies) {
+        if let Some(injector) = injectors.get_mut(&topic) {
+            injector.driver_copies = copies;
+        }
+    }
     // The per-WRITER capture diff of every co-located
     // `multi_publisher_topics` topic this pass produces. Built HERE and not
     // inside `open_captures` because the captured side's resolver is the LIVE
@@ -16785,6 +16829,10 @@ fn run_rank_pass(
                     partition_counts,
                     rank: plan.rank(),
                     injected: injectors.get(topic).map_or(0, |i| i.injected),
+                    injected_drivers: injectors
+                        .get(topic)
+                        .map(|i| i.driver_copies.by_driver())
+                        .unwrap_or_default(),
                 },
             )
         })
@@ -22025,13 +22073,17 @@ struct Injector {
     /// Distinct from `injected`, which counts frames PUBLISHED: the two
     /// diverge only on the intra-step slot path, which walks PAST a frame a
     /// LOCAL producer publishes live (see `stage_slot_frames`).
-    /// Maintained on the STEERED arms only — the recorded-clock window arm
-    /// never reads it, and a steered topic never takes that arm.
+    /// Maintained on every arm. The recorded-clock window arm injects every
+    /// frame it pops, so there it is the frame index [`DriverCopies::count`]
+    /// reads, and a steered topic never takes that arm.
     feed_position: usize,
     /// Frames walked past on the feed because a LOCAL producer
     /// publishes them — report-only, and structurally zero until a co-located
     /// topic is planned.
     skipped_live_local: usize,
+    /// The topic's recorded driver frames, by frame index, and how many of
+    /// each driver's this injector re-published.
+    driver_copies: DriverCopies,
     /// The rank whose pass owns this injector, for blame text (every pass opens
     /// its own set, so a bare topic name cannot say which one failed).
     rank: u32,
@@ -23843,6 +23895,7 @@ impl Injector {
                 })?;
             feed.pop(self.publisher.topic())?;
             self.injected += 1;
+            self.driver_copies.count(planned.frame_index);
             self.feed_position += 1;
         }
         Ok(())
@@ -23964,6 +24017,7 @@ impl Injector {
                 ),
             })?;
         self.injected += 1;
+        self.driver_copies.count(planned.frame_index);
         Ok(())
     }
     /// Re-publish every not-yet-injected frame this step's [`InjectionWindow`]
@@ -24019,6 +24073,8 @@ impl Injector {
                 })?;
             feed.pop(self.publisher.topic())?;
             self.injected += 1;
+            self.driver_copies.count(self.feed_position);
+            self.feed_position += 1;
             if self.injected >= self.total_recorded {
                 // The frame just served was the topic's LAST recorded frame —
                 // break BEFORE the loop's next peek, which would otherwise
@@ -24029,6 +24085,75 @@ impl Injector {
             }
         }
         Ok(())
+    }
+}
+
+/// The recorded frames of a topic's drivers that an [`Injector`] can
+/// re-publish, by frame index, and how many of each driver's it has
+/// re-published.
+///
+/// Built where the injection names the writer of each recorded frame
+/// ([`prepare_pass_verification`]), and empty where it names none, so an
+/// injector then counts no frame as a driver's.
+#[derive(Debug, Default)]
+struct DriverCopies {
+    /// `(frame index, index into labels)` of each driver frame, by frame
+    /// index.
+    frames: Vec<(usize, usize)>,
+    /// The drivers' `node/output` labels.
+    labels: Vec<Arc<str>>,
+    /// Per label, the frames re-published so far.
+    counts: Vec<usize>,
+}
+
+impl DriverCopies {
+    /// The frames of `frames`, a topic's recorded frames by frame index, whose
+    /// writer is one of `drivers` (`node/output` labels). PURE.
+    fn of(frames: &[replay_inject::RecordedFrame], drivers: &BTreeSet<&str>) -> Self {
+        let mut out = Self::default();
+        for (index, frame) in frames.iter().enumerate() {
+            let Some(replay_inject::ResolvedProducer::Named(label)) = &frame.producer else {
+                continue;
+            };
+            if !drivers.contains(label.as_str()) {
+                continue;
+            }
+            let at = match out.labels.iter().position(|l| **l == **label) {
+                Some(at) => at,
+                None => {
+                    out.labels.push(Arc::from(label.as_str()));
+                    out.counts.push(0);
+                    out.labels.len() - 1
+                }
+            };
+            out.frames.push((index, at));
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Count the re-published frame at `frame_index` if a driver wrote it.
+    fn count(&mut self, frame_index: usize) {
+        if let Ok(i) = self
+            .frames
+            .binary_search_by_key(&frame_index, |&(index, _)| index)
+        {
+            let at = self.frames[i].1;
+            self.counts[at] += 1;
+        }
+    }
+
+    /// Per driver, the frames re-published, a driver with none left out.
+    fn by_driver(&self) -> BTreeMap<Arc<str>, usize> {
+        self.labels
+            .iter()
+            .zip(&self.counts)
+            .filter(|(_, &n)| n > 0)
+            .map(|(label, &n)| (Arc::clone(label), n))
+            .collect()
     }
 }
 
@@ -24152,6 +24277,7 @@ fn open_injectors(
                 // the `skipped_prefix` parameter doc).
                 feed_position: skipped_prefix.get(topic).copied().unwrap_or(0),
                 skipped_live_local: 0,
+                driver_copies: DriverCopies::default(),
                 rank,
             },
         );
@@ -25260,16 +25386,37 @@ struct SplitPasses<'a> {
     merged: Option<CaptureSummary>,
     /// The passes that captured the topic as one stream, in pass order.
     one_stream: Vec<&'a CaptureSummary>,
+    /// The recorded frames of the drivers no one-stream pass runs that the
+    /// one-stream passes' injectors re-published, each driver's counted once,
+    /// as the most any one of them re-published
+    /// ([`CaptureSummary::injected_drivers`]). No pass's own writers publish
+    /// them, and every recorded frame no partition holds counts them.
+    driver_copies: usize,
 }
 
 impl<'a> SplitPasses<'a> {
-    fn of(all: &'a [CaptureSummary]) -> Self {
+    /// Split `all`, each driver's rank read off `driver_rank`.
+    fn of(all: &'a [CaptureSummary], driver_rank: impl Fn(&str) -> Option<u32>) -> Self {
         let (partitioned, one_stream): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
             all.iter().partition(|s| s.partition_counts.is_some());
+        // A driver a one-stream pass runs is counted by that pass's own
+        // writers' frames, so another pass's copies of it are not counted.
+        let stream_ranks: BTreeSet<u32> = one_stream.iter().map(|s| s.rank).collect();
+        let mut copies: BTreeMap<&str, usize> = BTreeMap::new();
+        for s in &one_stream {
+            for (driver, &n) in &s.injected_drivers {
+                if driver_rank(driver).is_some_and(|rank| stream_ranks.contains(&rank)) {
+                    continue;
+                }
+                let most = copies.entry(&**driver).or_insert(0);
+                *most = (*most).max(n);
+            }
+        }
         Self {
             all,
             merged: merge_partitioned_summaries(partitioned),
             one_stream,
+            driver_copies: copies.values().sum(),
         }
     }
 
@@ -25280,10 +25427,15 @@ impl<'a> SplitPasses<'a> {
             .and_then(|m| m.partition_counts.as_ref())
     }
 
-    /// The frames every pass's own writers published
-    /// ([`CaptureSummary::own_replayed`]).
-    fn own_replayed(&self) -> usize {
-        self.all.iter().map(CaptureSummary::own_replayed).sum()
+    /// The frames counted as replayed on the topic: those every pass's own
+    /// writers published ([`CaptureSummary::own_replayed`]), and the driver
+    /// copies ([`Self::driver_copies`]).
+    fn replayed(&self) -> usize {
+        self.all
+            .iter()
+            .map(CaptureSummary::own_replayed)
+            .sum::<usize>()
+            .saturating_add(self.driver_copies)
     }
 
     /// Of the topic's `recorded_count` frames, those no partition holds, a
@@ -25295,9 +25447,14 @@ impl<'a> SplitPasses<'a> {
         recorded_count.saturating_sub(partitioned)
     }
 
-    /// The frames the one-stream passes' own writers published.
+    /// The frames the one-stream passes' own writers published, and the
+    /// driver copies ([`Self::driver_copies`]).
     fn stream_replayed(&self) -> usize {
-        self.one_stream.iter().map(|s| s.own_replayed()).sum()
+        self.one_stream
+            .iter()
+            .map(|s| s.own_replayed())
+            .sum::<usize>()
+            .saturating_add(self.driver_copies)
     }
 
     /// The passes whose frames are compared, in pass order: every pass that
@@ -25399,10 +25556,11 @@ const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in sever
 #[derive(Debug, Clone, Copy)]
 enum SplitCounts {
     /// Every count and byte verdict is judged. With `triage`, a topic whose
-    /// passes' writers published no frame is one `MissingTopic`, and one whose
-    /// bag holds no frame one `ExtraTopic`, as [`push_topic_violations`] judges
-    /// a topic; the caller turns it off on a topic a driver shares that a pass
-    /// partitioned, whose partitions leave the driver's frames out.
+    /// passes counted no frame ([`SplitPasses::replayed`]) is one
+    /// `MissingTopic`, and one whose bag holds no frame one `ExtraTopic`, as
+    /// [`push_topic_violations`] judges a topic; the caller turns it off on a
+    /// topic a driver shares that a pass partitioned, whose partitions leave
+    /// the driver's frames out.
     Judged { triage: bool },
     /// The trailing extra frames lie within the ragged shutdown tails
     /// ([`SplitPasses::tail_extra_ranks`]) of a topic whose compared frames
@@ -25418,7 +25576,9 @@ enum SplitCounts {
 /// ([`merge_partitioned_summaries`]). The other passes are judged together by
 /// count: every recorded frame no partition holds, a driver's included,
 /// against the frames their own writers published, which leaves out the
-/// frames their injectors re-published ([`CaptureSummary::own_replayed`]). A
+/// frames their injectors re-published ([`CaptureSummary::own_replayed`]),
+/// and the recorded frames of the drivers none of them runs that their
+/// injectors re-published, counted once ([`SplitPasses::driver_copies`]). A
 /// pass that injected the topic captured its own writers' frames among the
 /// recorded frames of every other writer, so its one stream is compared with
 /// every recorded frame byte for byte. `counts` says whether those count and
@@ -25436,14 +25596,14 @@ fn push_split_violations(
     violations: &mut Vec<Violation>,
 ) -> Option<SplitUnjudged> {
     if let SplitCounts::Judged { triage } = counts {
-        let own = passes.own_replayed();
+        let replayed = passes.replayed();
         if triage {
-            if recorded_count > 0 && own == 0 {
+            if recorded_count > 0 && replayed == 0 {
                 push_topic_violations(topic, recorded_count, 0, None, None, violations);
                 return None;
             }
-            if recorded_count == 0 && own > 0 {
-                push_topic_violations(topic, 0, own, None, None, violations);
+            if recorded_count == 0 && replayed > 0 {
+                push_topic_violations(topic, 0, replayed, None, None, violations);
                 return None;
             }
         }
@@ -25501,7 +25661,9 @@ fn push_split_violations(
 /// keeps the larger recorded burst ([`PartitionCounts::burst`]). The
 /// fold's frame count is its partitions' sum, its tolerance worsts fold to one
 /// per field and metric ([`fold_tolerance_worsts`]), its injected count is the
-/// passes' sum, which no partition counts, and its rank is the first pass's.
+/// passes' sum, which no partition counts, its injected driver frames are
+/// none, since no verdict on a partitioned topic reads them, and its rank is
+/// the first pass's.
 fn merge_partitioned_summaries<'a>(
     summaries: impl IntoIterator<Item = &'a CaptureSummary>,
 ) -> Option<CaptureSummary> {
@@ -25536,6 +25698,7 @@ fn merge_partitioned_summaries<'a>(
         partition_counts: Some(parts),
         rank,
         injected,
+        injected_drivers: BTreeMap::new(),
     })
 }
 
@@ -33746,6 +33909,7 @@ mod frame_feed_tests {
             over_planned: 0,
             feed_position: 0,
             skipped_live_local: 0,
+            driver_copies: DriverCopies::default(),
             rank: 7,
         };
         (transport, inj)
@@ -33871,6 +34035,7 @@ mod frame_feed_tests {
             over_planned: 0,
             feed_position: 0,
             skipped_live_local: 0,
+            driver_copies: DriverCopies::default(),
             rank: 0,
         };
         assert_eq!(inj.total_recorded, 3, "aggregate pass counted /e");
@@ -36528,6 +36693,7 @@ mod capture_partition_tests {
             tolerance_worsts: Vec::new(),
             rank: 0,
             injected: 0,
+            injected_drivers: BTreeMap::new(),
             partition_counts: Some(
                 parts
                     .iter()
@@ -36655,6 +36821,7 @@ mod capture_partition_tests {
             partition_counts: None,
             rank,
             injected,
+            injected_drivers: BTreeMap::new(),
         }
     }
 
@@ -36790,7 +36957,7 @@ mod capture_partition_tests {
         let unjudged = push_split_violations(
             "/t",
             recorded,
-            &SplitPasses::of(summaries),
+            &SplitPasses::of(summaries, |_| None),
             counts,
             &mut violations,
         );
@@ -36953,7 +37120,7 @@ mod capture_partition_tests {
             _ => None,
         };
         let bound = |recorded: usize, summaries: &[CaptureSummary]| {
-            let passes = SplitPasses::of(summaries);
+            let passes = SplitPasses::of(summaries, |_| None);
             (
                 passes.tail_clean(recorded),
                 passes.tail_extra_ranks(recorded, 1, width, rank_of),
@@ -37068,6 +37235,127 @@ mod capture_partition_tests {
                 vec!["missing 5 0: recorded 5 frame(s), replay produced 0 on '/t'".to_string()],
                 None
             )
+        );
+    }
+
+    /// `summary` with `drivers`, `(driver, frames)`, as its injected driver
+    /// frames.
+    fn with_drivers(summary: CaptureSummary, drivers: &[(&str, usize)]) -> CaptureSummary {
+        CaptureSummary {
+            injected_drivers: drivers.iter().map(|&(d, n)| (Arc::from(d), n)).collect(),
+            ..summary
+        }
+    }
+
+    /// An injector counts the driver frames it re-publishes by their frame
+    /// index, per driver: of five recorded frames, `cam` wrote 1 and 4, `mic`
+    /// 3, `w2` 0, and frame 2 names no writer. Re-publishing frames 1 to 4
+    /// counts `cam` twice and `mic` once. Hand oracle.
+    #[test]
+    fn an_injector_counts_the_driver_frames_it_re_publishes() {
+        let named = |label: &str| Some(replay_inject::ResolvedProducer::Named(label.to_string()));
+        let frames: Vec<replay_inject::RecordedFrame> = [
+            named("w2/out"),
+            named("cam/out"),
+            None,
+            named("mic/out"),
+            named("cam/out"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, producer)| replay_inject::RecordedFrame {
+            sequence: i as u32,
+            producer,
+        })
+        .collect();
+        let mut copies = DriverCopies::of(&frames, &BTreeSet::from(["cam/out", "mic/out"]));
+        assert!(!copies.is_empty());
+        assert!(copies.by_driver().is_empty(), "nothing re-published yet");
+        for index in 1..=4 {
+            copies.count(index);
+        }
+        let got: Vec<(String, usize)> = copies
+            .by_driver()
+            .into_iter()
+            .map(|(d, n)| (d.to_string(), n))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("cam/out".to_string(), 2), ("mic/out".to_string(), 1)]
+        );
+        assert!(DriverCopies::of(&frames, &BTreeSet::new()).is_empty());
+    }
+
+    /// A split topic's one-stream count takes the recorded frames of a driver
+    /// no one-stream pass runs that their injectors re-published once, as the
+    /// most one of them re-published, and none of a driver a one-stream pass
+    /// runs, whose own writers' frames count it. `cam` writes 3 of the 9
+    /// recorded frames, `w2` in rank 0 and `w3` in rank 1 3 each, and each
+    /// rank injects the other's 3 and `cam`'s. Hand oracles.
+    #[test]
+    fn a_split_topic_counts_a_driver_s_injected_frames_once() {
+        let judge = |summaries: &[CaptureSummary], cam: Option<u32>| -> SplitRows {
+            let passes = SplitPasses::of(summaries, |d| (d == "cam/out").then_some(cam).flatten());
+            let mut violations = Vec::new();
+            let unjudged = push_split_violations(
+                "/t",
+                9,
+                &passes,
+                SplitCounts::Judged { triage: true },
+                &mut violations,
+            );
+            (
+                named(&violations),
+                unjudged.map(|u| (u.ranks, named(&u.withheld))),
+            )
+        };
+        let both = |cam0: usize, cam1: usize| {
+            [
+                with_drivers(
+                    one_stream(0, 6 + cam0, 3 + cam0, None),
+                    &[("cam/out", cam0)],
+                ),
+                with_drivers(
+                    one_stream(1, 6 + cam1, 3 + cam1, None),
+                    &[("cam/out", cam1)],
+                ),
+            ]
+        };
+        assert_eq!(judge(&both(3, 3), Some(2)), (vec![], None), "cam in rank 2");
+        assert_eq!(
+            judge(&both(3, 3), None),
+            (vec![], None),
+            "cam in no rank the bag names"
+        );
+        assert_eq!(
+            judge(&both(3, 2), Some(2)),
+            (vec![], None),
+            "the most one pass re-published"
+        );
+        assert_eq!(
+            judge(&both(2, 2), Some(2)),
+            (
+                vec!["missing 9 8: recorded 9 frame(s), replay produced 8 on '/t'".to_string()],
+                None
+            ),
+            "a frame no pass re-published"
+        );
+        assert_eq!(
+            judge(&both(3, 3), Some(0)),
+            (
+                vec!["missing 9 6: recorded 9 frame(s), replay produced 6 on '/t'".to_string()],
+                None
+            ),
+            "cam in rank 0, whose own frames hold none of it"
+        );
+        let unnamed = [one_stream(0, 9, 6, None), one_stream(1, 9, 6, None)];
+        assert_eq!(
+            judge(&unnamed, Some(2)),
+            (
+                vec!["missing 9 6: recorded 9 frame(s), replay produced 6 on '/t'".to_string()],
+                None
+            ),
+            "an injection that names no frame's writer"
         );
     }
 
