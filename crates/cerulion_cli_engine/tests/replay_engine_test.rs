@@ -40,8 +40,8 @@ use cerulion_bag::{BagReader, BagWriter, BagWriterConfig, TopicSchema};
 use cerulion_bagd::{RecordHealth, TopicHealth, RECORD_HEALTH_VERSION};
 use cerulion_cli_engine::replay_cmd::ReplayError;
 use cerulion_cli_engine::replay_engine::{
-    self, FireSide, RecordHealthReport, RecordedMessages, RecordedTrace, ReplayInputs, ReplayNodes,
-    ReplayOutcome, ViolationClass,
+    self, ByteDifference, DifferenceKind, DifferenceValue, FireSide, RecordHealthReport,
+    RecordedMessages, RecordedTrace, ReplayInputs, ReplayNodes, ReplayOutcome, ViolationClass,
 };
 use cerulion_core::graph::config::GraphConfig;
 use cerulion_core::graph::GraphRuntime;
@@ -2669,6 +2669,7 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ref difference,
         } => {
             assert_eq!(index, 2, "frame index named");
             assert_eq!(
@@ -2677,9 +2678,41 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
                 "the flip was at the first payload byte"
             );
             assert_eq!((recorded_len, replayed_len), (64, 64));
+            assert_eq!(difference.path.as_deref(), Some("x"));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
+    // The line names the field and both values. Oracle: frame 2's relay x
+    // is 3.0 + 100 = 103.0 (LE `00 00 00 00 00 c0 59 40`); byte 0 XOR 0xFF
+    // reads back as 103.00000000000362, the RECORDED side.
+    assert_eq!(
+        relay_violations[0].detail,
+        "frame 2 on '/sr/relay/out' differs at x: recorded 103.00000000000362, replayed 103.0 \
+         (recorded 64 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(&relay_violations[0].class).unwrap()["difference"],
+        serde_json::json!({
+            "kind": "field",
+            "path": "x",
+            "recorded": 103.00000000000362,
+            "replayed": 103.0,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": null,
+            "region": null,
+            "reason": null,
+            "more": 0,
+        })
+    );
+    // Determinism: a second replay of the same diverging bag names the same
+    // field with the same values, byte for byte.
+    let again = replay(&bag, source_relay_factories, None, None).unwrap();
+    assert_eq!(
+        serde_json::to_string(&outcome.violations).unwrap(),
+        serde_json::to_string(&again.violations).unwrap(),
+        "two replays of one diverging bag report identically"
+    );
     // The source topic (untouched) still passes.
     assert!(outcome
         .violations
@@ -2835,6 +2868,7 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ..
         } => {
             assert_eq!(index, 1, "the flipped common-prefix frame is named");
             assert_eq!(first_diff_byte_offset, WireHeader::SIZE);
@@ -2842,6 +2876,13 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
         }
         ref other => panic!("expected ByteMismatch second, got {other:?}"),
     }
+    // Oracle: frame 1's relay x is 2.0 + 100 = 102.0; byte 0 XOR 0xFF reads
+    // back as 102.00000000000362.
+    assert_eq!(
+        relay[1].detail,
+        "frame 1 on '/sr/relay/out' differs at x: recorded 102.00000000000362, replayed 102.0 \
+         (recorded 64 B, replayed 64 B)"
+    );
     // The untouched source topic still passes.
     assert!(outcome
         .violations
@@ -2965,10 +3006,18 @@ fn a_bare_resim_warns_each_data_violation_by_topic() {
             warned.as_slice(),
             cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
         ) {
-            ([line], 0) if line.contains("/sr/relay/out") => Ok(()),
+            // Hand oracle: frame 0's relay adds 101 instead of 100 to x = 1.0.
+            ([line], 0)
+                if line.contains(
+                    "frame 0 on '/sr/relay/out' differs at x: recorded 101.0, replayed 102.0 \
+                     (recorded 64 B, replayed 64 B)",
+                ) =>
+            {
+                Ok(())
+            }
             (other, infos) => Err(format!(
-                "expected ONE WARN naming /sr/relay/out and no INFO twin, got {other:?} and \
-                 {infos} INFO line(s)"
+                "expected ONE WARN naming /sr/relay/out's x and no INFO twin, got {other:?} \
+                 and {infos} INFO line(s)"
             )),
         }
     });
@@ -4970,6 +5019,7 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ..
         } => {
             assert_eq!(index, 3, "the extended frame is the last of 4");
             assert_eq!(
@@ -4980,6 +5030,28 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
+    // Every value of the two frames is equal: the four extra bytes sit past
+    // the Vector3's last field (payload 24, frame byte 64).
+    assert_eq!(
+        source_violations[0].detail,
+        "frame 3 on '/sr/source/out' differs at byte 64, in bytes past the last field; every \
+         field value is equal (recorded 68 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(&source_violations[0].class).unwrap()["difference"],
+        serde_json::json!({
+            "kind": "layout",
+            "path": null,
+            "recorded": null,
+            "replayed": null,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": 64,
+            "region": "trailing_bytes",
+            "reason": null,
+            "more": 0,
+        })
+    );
 }
 
 // ===========================================================================
@@ -5563,6 +5635,7 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
                 first_diff_byte_offset: 32,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
             detail: "detail-e".to_string(),
         },
@@ -12197,6 +12270,19 @@ topics:
         "x stayed within tolerance — no ToleranceExceeded expected: {:?}",
         outcome.violations
     );
+    // The byte mismatch names y, never the tolerated x that also changed
+    // (x is declared first). Oracle: frame 0 records x = 1.0, y = 0.0; the
+    // candidate writes x = 1.01 (judged by the metric) and y = 1.0.
+    let byte = outcome
+        .violations
+        .iter()
+        .find(|v| matches!(v.class, ViolationClass::ByteMismatch { .. }))
+        .expect("asserted above");
+    assert_eq!(
+        byte.detail,
+        "frame 0 on '/tg/source/out' differs at y: recorded 0.0, replayed 1.0 (recorded 64 B, \
+         replayed 64 B)"
+    );
 }
 
 #[test]
@@ -13391,6 +13477,25 @@ fn an_aborted_verify_warns_the_data_violation_its_completed_rank_found() {
         "the flipped byte is a byte mismatch at frame 2, first payload byte: {}",
         violations[0]
     );
+    // The report names the field and both values. Oracle: frame 2's x is 3.0
+    // (`00 .. 08 40`); byte 0 XOR 0xFF reads back as 3.0000000000001132.
+    assert_eq!(
+        violations[0]["class"]["difference"],
+        serde_json::json!({
+            "kind": "field",
+            "path": "x",
+            "recorded": 3.0000000000001132,
+            "replayed": 3.0,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": null,
+            "region": null,
+            "reason": null,
+            "more": 0,
+        }),
+        "{}",
+        violations[0]
+    );
 
     logs_assert(|lines: &[&str]| {
         let warned: Vec<&&str> = lines
@@ -13648,6 +13753,7 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
                 first_diff_byte_offset: 40,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
             detail: "c".to_string(),
         },
@@ -13876,11 +13982,6 @@ fn large_frame_byte_mismatch_detail_is_offset_bounded_no_payload_dump() {
         v.detail.len(),
         &v.detail[..v.detail.len().min(200)]
     );
-    assert!(
-        v.detail.contains("differs at byte"),
-        "detail carries the offset: {}",
-        v.detail
-    );
     match v.class {
         ViolationClass::ByteMismatch {
             first_diff_byte_offset,
@@ -13888,6 +13989,15 @@ fn large_frame_byte_mismatch_detail_is_offset_bounded_no_payload_dump() {
             replayed_len,
             ..
         } => {
+            // The detail names the bumped element and both values. Oracle:
+            // positions[i] == i, and the candidate adds 1.0 to element 2048.
+            assert_eq!(
+                v.detail,
+                format!(
+                    "frame 0 on '/bg/source/out' differs at positions[2048]: recorded 2048.0, \
+                     replayed 2049.0 (recorded {recorded_len} B, replayed {replayed_len} B)"
+                )
+            );
             assert!(
                 recorded_len > 30_000 && replayed_len == recorded_len,
                 "large equal-length frames: {recorded_len}/{replayed_len}"
@@ -28334,12 +28444,17 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         violations: vec![Violation {
             topic: "/vocab/relay/out".to_string(),
             class: ViolationClass::ByteMismatch {
+                // timestamp_ns is header bytes 24..32; 7 and 9 first differ
+                // at its low byte.
                 index: 0,
-                first_diff_byte_offset: 32,
+                first_diff_byte_offset: 24,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
-            detail: "frame 0 differs at byte 32".to_string(),
+            detail: "frame 0 on '/vocab/relay/out' differs in the wire header at timestamp_ns: \
+                     recorded 7 ns, replayed 9 ns (recorded 56 B, replayed 56 B)"
+                .to_string(),
         }],
         trace_divergence: Some(TraceDivergenceReport {
             position: 3,
@@ -36875,6 +36990,12 @@ fn a_partitioned_topic_attributes_a_byte_mismatch_to_its_own_writer() {
         detail.contains("from writer right/bus"),
         "the violation names the DRIFTING writer: {detail}"
     );
+    // And the field: the recording's y was set to 42.0, the writer replays 0.0.
+    assert_eq!(
+        detail,
+        "frame 1 on '/co/shared_bus' from writer right/bus differs at y: recorded 42.0, \
+         replayed 0.0 (recorded 64 B, replayed 64 B)"
+    );
     assert!(
         !detail.contains("left/bus"),
         "and not the clean one: {detail}"
@@ -44057,5 +44178,23 @@ fn the_oracle_catches_writer_runs_on_a_multi_writer_edge() {
             outcome.as_ref().map(|o| (o.passed, &o.violations))
         );
         assert!(caught, "{name}: the read log caught no divergence");
+    }
+}
+
+/// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
+/// whose renderer test reads only the class label and the detail it is
+/// given: a header difference, as `timestamp_ns` 7 against 9 reads.
+fn synthetic_difference() -> ByteDifference {
+    ByteDifference {
+        kind: DifferenceKind::Header,
+        path: Some("timestamp_ns".to_string()),
+        recorded: Some(DifferenceValue::UInt(7)),
+        replayed: Some(DifferenceValue::UInt(9)),
+        field_byte: None,
+        field_char: None,
+        byte_offset: None,
+        region: None,
+        reason: None,
+        more: 0,
     }
 }

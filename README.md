@@ -156,7 +156,7 @@ cerulion node build safety_controller --release
 cerulion bag play "$BAG" --resim all --verify
 ```
 
-This time verification reports a divergence and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation at the top of this page shows this whole run.
+This time verification reports a divergence that names the topic, the field that changed and both values (`differs at x: recorded 0.3, replayed 0.25`), and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation at the top of this page shows this whole run.
 
 If Cerulion is useful to you, a star helps other robotics engineers find it.
 
@@ -166,7 +166,7 @@ If Cerulion is useful to you, a star helps other robotics engineers find it.
 Cerulion re-executes the graph with recorded inputs and execution context, then compares the covered outputs against the recording. A pass means the changed code produces the same covered outputs on those recorded inputs, and each recording you keep adds another case to check against.
 
 - Exit **0**: compared frames match.
-- Exit **1**: output data diverged, and the report names the topic or field.
+- Exit **1**: output data diverged, and the verdict names the topic and what differs (for a changed value, the first field that differs and both values).
 - Exit **6**: the execution schedule diverged.
 - Exits **2 through 5**: verification could not complete, and the error says why.
 

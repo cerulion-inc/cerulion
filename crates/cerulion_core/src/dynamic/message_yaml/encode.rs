@@ -671,7 +671,7 @@ fn format_prim(elem: PrimType, b: &[u8]) -> String {
 /// Shortest decimal that reads back to `v` (Rust's `{:?}`), YAML spellings
 /// for the non-finite values. Every NaN is `.nan`: its sign and payload
 /// bits are not kept (see the module docs).
-pub(super) fn format_f64(v: f64) -> String {
+pub fn format_f64(v: f64) -> String {
     if v.is_nan() {
         ".nan".to_string()
     } else if v.is_infinite() {
@@ -687,7 +687,7 @@ pub(super) fn format_f64(v: f64) -> String {
 }
 
 /// As [`format_f64`], with the shortest decimal for the `f32` itself.
-pub(super) fn format_f32(v: f32) -> String {
+pub fn format_f32(v: f32) -> String {
     if v.is_finite() {
         format!("{v:?}")
     } else {
@@ -722,9 +722,9 @@ pub(super) fn quote(s: &str) -> String {
     quote_within(s, usize::MAX).expect("no limit")
 }
 
-/// [`quote`], or `None` once the quoted form passes `limit` bytes: no more
+/// `quote`, or `None` once the quoted form passes `limit` bytes: no more
 /// than `limit` plus one escape is ever built.
-pub(super) fn quote_within(s: &str, limit: usize) -> Option<String> {
+pub fn quote_within(s: &str, limit: usize) -> Option<String> {
     let mut out = String::with_capacity(s.len().min(limit).saturating_add(2));
     out.push('"');
     for c in s.chars() {

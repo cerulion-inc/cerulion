@@ -903,19 +903,19 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
+# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.5
 y: 0.0
 z: 0.0
 ---
-# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
+# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
 z: 0.0
 ---
-# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
@@ -1051,7 +1051,7 @@ frames: 774 across 2 topic(s); span 38.600s
 
 TOPIC                                       FRAMES   MAX BYTES  SCHEMA
 /demo/lidar_sensor/scan                        387        1361  sensor_msgs/LaserScan
-/demo/safety_controller/cmd_vel                387          56  geometry_msgs/Vector3
+/demo/safety_controller/cmd_vel                387          64  geometry_msgs/Vector3
 ...
 ```
 
@@ -1106,12 +1106,13 @@ This time the verdict is a divergence, and the exit code is 1:
 ```
 FRAME-CONTENT DIVERGENCE: recordings/obstacle_avoidance_<timestamp>.mcap
   387 tick(s) replayed; 1/2 topic(s) matched and were credited; 1 violation(s):
-  - /demo/safety_controller/cmd_vel [byte-mismatch]: frame 0 differs at byte 38 on '/demo/safety_controller/cmd_vel' (recorded 56 B, replayed 56 B)
+  - /demo/safety_controller/cmd_vel [byte-mismatch]: frame 0 on '/demo/safety_controller/cmd_vel' differs at x: recorded 0.5, replayed 0.25 (recorded 64 B, replayed 64 B)
   Topics passed: 1/2
 ```
 
-On the same sensor inputs, the changed controller commands a different speed. The
-scan topic still matches, because the sensor did not change. That is the loop:
+On the same sensor inputs, the changed controller commands a different speed: the
+line names the field that changed, `x`, with the recorded and the replayed value.
+The scan topic still matches, because the sensor did not change. That is the loop:
 record once on the robot, then check every later change against the recording
 before it reaches the robot again. In CI the nonzero exit is the gate.
 
