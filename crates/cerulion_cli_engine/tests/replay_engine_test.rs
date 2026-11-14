@@ -49083,9 +49083,9 @@ fn a_split_topic_one_process_publishes_beside_one_that_injects_is_judged_by_the_
 /// A ragged shutdown tail on a `multi_publisher_topics` topic whose writers
 /// run in two processes, neither of which attributes the topic's frames to
 /// their writers, is tolerated over the frames the two published together.
-/// The period writer `w3` runs in the first process, and the slow writer `w2`
-/// in the second, which fires on every eighth step, at 40 ms to 280 ms of the
-/// 300 ms run, so its final recorded step banked its boundary and no fires, a
+/// The period writer `w3` runs in the first process, and the slow writer `w2`,
+/// on every eighth step, at 40 ms to 280 ms of the 300 ms run, in the second,
+/// whose final recorded step therefore banked its boundary and no fires, a
 /// one-step tail. The bag lost the frame of `w2`'s last fire, so the replay
 /// produces one frame past the recorded ones, inside the second's window, and
 /// the note names it. Each process's stream holds its own writer's frames
@@ -49189,8 +49189,8 @@ fn ri_tail_mix_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 
 /// A ragged shutdown tail on a `multi_publisher_topics` topic that one process
 /// attributes writer by writer and another does not is tolerated part by part.
-/// The slow writer `w2` runs in the first process, which fires on every eighth
-/// step, at 40 ms to 280 ms of the 300 ms run, so its final recorded step
+/// The slow writer `w2`, on every eighth step, at 40 ms to 280 ms of the
+/// 300 ms run, runs in the first process, whose final recorded step therefore
 /// banked its boundary and no fires, a one-step tail; `w3`, `a` and `b` run in
 /// the second. The bag lost the frame of `w2`'s last fire, so `w2` replays one
 /// frame past its 6 recorded ones, which the first process's window explains:
