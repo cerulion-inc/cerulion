@@ -49659,6 +49659,11 @@ fn ri_drv3_rank_of(id: &str) -> u32 {
 /// device attached: the bus holds the camera's `n` frames, each labelled with
 /// the camera, and the aux topic `a`'s `n`.
 fn ri_drv3_bag(dir: &std::path::Path) -> std::path::PathBuf {
+    ri_drv3_bag_stamped(dir, "ri_drv3_format7.mcap", ri_recorder_json_at(7))
+}
+
+/// [`ri_drv3_bag`] written as `name` under the recorder identity `recorder`.
+fn ri_drv3_bag_stamped(dir: &std::path::Path, name: &str, recorder: Vec<u8>) -> std::path::PathBuf {
     ri_take();
     let rec = record_reference_impl_fed(
         ri_drv3_yaml(),
@@ -49699,15 +49704,8 @@ fn ri_drv3_bag(dir: &std::path::Path) -> std::path::PathBuf {
             )
         })
         .collect();
-    let bag = dir.join("ri_drv3_format7.mcap");
-    ri_ranked_bag_with_labels(
-        &rec,
-        &bag,
-        ri_drv3_rank_of,
-        3,
-        &label_rows,
-        ri_recorder_json_at(7),
-    );
+    let bag = dir.join(name);
+    ri_ranked_bag_with_labels(&rec, &bag, ri_drv3_rank_of, 3, &label_rows, recorder);
     bag
 }
 
@@ -49867,24 +49865,11 @@ fn ri_drv4_rank_of(id: &str) -> u32 {
     }
 }
 
-/// The recorded frames of a camera in a process of its own, which a process
-/// that attributes the camera's topic frame by frame feeds from the bag to a
-/// sink, are counted where another process cannot attribute the topic. The
-/// bus's other writers, `w2` in the first process and `w3` in the second,
-/// never publish, so the recorded bus holds the camera's `n` frames alone,
-/// each labelled with the camera, and the first process, in a `--verify` of
-/// a recording below trace format 8, injects them for its sink. The
-/// verifier's record budget is the bus's `n` frames: the first process's one
-/// `multi_publisher_topics` topic fits it, so it attributes the bus and
-/// leaves the camera's frames it injects out of `w2`'s partition, while the
-/// second's two topics, `2n` frames, do not, so it counts the bus as one
-/// stream, which holds no frame. The camera's frames the first process
-/// injected are counted once, `n` against the bus's `n`, so the unchanged
-/// candidate passes with both topics checked and credited, where counting
-/// them nowhere failed the bus as `n` missing frames.
-#[test]
-#[serial]
-fn a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_cannot() {
+/// The second camera bag, recorded from the `ri_drv4_yaml` graph with its
+/// device attached and written as `name` under the recorder identity
+/// `recorder`: the bus holds the camera's `n` frames, each labelled with the
+/// camera, and the aux topic `a`'s frames.
+fn ri_drv4_bag(dir: &std::path::Path, name: &str, recorder: Vec<u8>) -> std::path::PathBuf {
     ri_take();
     let rec = record_reference_impl_fed(
         ri_drv4_yaml(),
@@ -49927,16 +49912,32 @@ fn a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_ca
             )
         })
         .collect();
+    let bag = dir.join(name);
+    ri_ranked_bag_with_labels(&rec, &bag, ri_drv4_rank_of, 3, &label_rows, recorder);
+    bag
+}
+
+/// The recorded frames of a camera in a process of its own, which a process
+/// that attributes the camera's topic frame by frame feeds from the bag to a
+/// sink, are counted where another process cannot attribute the topic. The
+/// bus's other writers, `w2` in the first process and `w3` in the second,
+/// never publish, so the recorded bus holds the camera's `n` frames alone,
+/// each labelled with the camera, and the first process, in a `--verify` of
+/// a recording below trace format 8, injects them for its sink. The
+/// verifier's record budget is the bus's `n` frames: the first process's one
+/// `multi_publisher_topics` topic fits it, so it attributes the bus and
+/// leaves the camera's frames it injects out of `w2`'s partition, while the
+/// second's two topics, `2n` frames, do not, so it counts the bus as one
+/// stream, which holds no frame. The camera's frames the first process
+/// injected are counted once, `n` against the bus's `n`, so the unchanged
+/// candidate passes with both topics checked and credited, where counting
+/// them nowhere failed the bus as `n` missing frames.
+#[test]
+#[serial]
+fn a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_cannot() {
+    let n = RI_STEPS;
     let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join("ri_drv4_format7.mcap");
-    ri_ranked_bag_with_labels(
-        &rec,
-        &bag,
-        ri_drv4_rank_of,
-        3,
-        &label_rows,
-        ri_recorder_json_at(7),
-    );
+    let bag = ri_drv4_bag(dir.path(), "ri_drv4_format7.mcap", ri_recorder_json_at(7));
     let (outcome, _) = {
         let _budget = replay_engine::override_frame_index_record_budget(n);
         ri_replay(
@@ -49974,6 +49975,111 @@ fn a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_ca
         (outcome.topics_checked, outcome.topics_passed),
         (2, 2),
         "both topics are checked and credited"
+    );
+}
+
+/// `--verify` of `bag`, a free-run recording at this binary's trace format,
+/// under a record budget of the bus's `n` frames: the replay feeds every read
+/// by its recorded identity, the bus is compared over every recorded frame
+/// and fails with one violation of the class `want` accepts (exit 1), and the
+/// aux topic is checked and credited.
+fn ri_fed_driver_bus_fails(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    bus: &str,
+    want: fn(&ViolationClass) -> bool,
+) {
+    let (outcome, _) = {
+        let _budget = replay_engine::override_frame_index_record_budget(RI_STEPS);
+        ri_replay(bag, make, replay_engine::ReplayPurpose::Verify)
+    };
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::Fed { .. }
+        ),
+        "PREMISE: every read is fed by identity: {:?}",
+        outcome.read_identity
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![bus.to_string()],
+            ..drv_inputs(&["w1"], &[], &[bus], &[], &[])
+        }),
+        "PREMISE: a process does not attribute the bus"
+    );
+    let named: Vec<(&str, &ViolationClass)> = outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class))
+        .collect();
+    assert!(
+        matches!(named.as_slice(), [(topic, class)] if *topic == bus && want(class)),
+        "exactly the bus's violation: {:?}",
+        outcome.violations
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "nothing is declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 1, "exit 1");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 1),
+        "the bus fails and the aux topic passes"
+    );
+}
+
+/// The camera bag of `a_driver_s_frames_two_processes_feed_are_counted_once`
+/// recorded at this binary's trace format, whose `--verify` feeds every read
+/// by its recorded identity. Each process hands the camera's frames to its
+/// sink on a feed of its own, never on the bus, so neither capture holds a
+/// frame of the bus and nothing counts the camera's: the bus fails as a
+/// `missing-topic` the replay produced nothing on, where the trace-format-7
+/// twin, whose processes inject the camera's frames on the bus, passes.
+#[test]
+#[serial]
+fn a_fed_verify_counts_none_of_the_driver_frames_two_processes_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv3_bag_stamped(dir.path(), "ri_drv3_fed.mcap", ri_free_run_recorder_json());
+    ri_fed_driver_bus_fails(
+        &bag,
+        || ri_drv3_factories(false),
+        RI_DRV3_BUS,
+        |class| matches!(class, ViolationClass::MissingTopic),
+    );
+}
+
+/// The camera bag of
+/// `a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_cannot`
+/// recorded at this binary's trace format, whose `--verify` feeds every read
+/// by its recorded identity. The first process attributes the bus and hands
+/// the camera's frames to its sink on a feed of its own, never on the bus,
+/// so the second process's one stream counts no frame against the camera's
+/// `n`: the bus fails as `n` missing frames, where the trace-format-7 twin,
+/// whose first process injects the camera's frames on the bus, passes.
+#[test]
+#[serial]
+fn a_fed_verify_counts_none_of_the_driver_frames_an_attributing_process_feeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv4_bag(dir.path(), "ri_drv4_fed.mcap", ri_free_run_recorder_json());
+    ri_fed_driver_bus_fails(
+        &bag,
+        || ri_drv4_factories(false),
+        RI_DRV4_BUS,
+        |class| {
+            matches!(
+                class,
+                ViolationClass::MissingMessages {
+                    recorded: RI_STEPS,
+                    replayed: 0,
+                }
+            )
+        },
     );
 }
 

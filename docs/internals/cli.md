@@ -229,7 +229,8 @@ Rules that must not drift:
   recorded frames of a driver none of them runs that any pass's injector re-published, a
   partitioned pass's included, `SplitPasses::driver_copies`, which an injector counts by frame
   index where the injection names each frame's writer, `DriverCopies` and
-  `CaptureSummary::injected_drivers`), an injecting pass's one stream compared with every
+  `CaptureSummary::injected_drivers`; a fed pass opens no injector, so a fed `--verify` counts
+  none and fails such a topic), an injecting pass's one stream compared with every
   recorded frame, and a pass of its own writers' frames alone, beside another whose writers
   published frames, returned as `SplitUnjudged`, which `assemble_outcome` DECLINES
   (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else on the
