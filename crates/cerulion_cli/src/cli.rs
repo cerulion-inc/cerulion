@@ -1306,13 +1306,13 @@ pub enum NodeAction {
         /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost (and it suppresses the
-        /// global C-state cap); elsewhere it is a bounded sleep-recheck park,
-        /// never a busy-spin, and this flag restores the blocking wait there
-        /// too. The default is tunable with `CERULION_MONITOR_WAIT` and
-        /// `CERULION_DOORBELL` (`"1"` forces it on, `"0"` disables it;
-        /// `CERULION_MONITOR_WAIT=0` turns the park off on every target, and
-        /// `CERULION_DOORBELL=1` turns it back on only where a monitor-wait
-        /// primitive exists), but only when this flag is absent.
+        /// global C-state cap); elsewhere it is a bounded park that never
+        /// busy-spins, and this flag restores the blocking wait there too.
+        /// The default is tunable: `CERULION_MONITOR_WAIT=0` turns the park
+        /// off on every target and `=1` forces it on; `CERULION_DOORBELL=0`
+        /// keeps the park but drops its data doorbell, and `CERULION_DOORBELL=1`
+        /// asks for the doorbell and, only where a monitor-wait primitive
+        /// exists, turns the park back on over `CERULION_MONITOR_WAIT=0`.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
         /// Keep this run on this machine: no network gateway, session,
@@ -1444,14 +1444,14 @@ pub enum GraphAction {
         /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost (and it suppresses the
-        /// global C-state cap); elsewhere it is a bounded sleep-recheck park,
-        /// never a busy-spin, and this flag restores the blocking wait there
-        /// too. The default is tunable with `CERULION_MONITOR_WAIT` and
-        /// `CERULION_DOORBELL` (`"1"` forces it on, `"0"` disables it;
-        /// `CERULION_MONITOR_WAIT=0` turns the park off on every target, and
-        /// `CERULION_DOORBELL=1` turns it back on only where a monitor-wait
-        /// primitive exists), but only when this flag is absent.
-        /// No effect under `--time-source virtual` (the poll loop never parks).
+        /// global C-state cap); elsewhere it is a bounded park that never
+        /// busy-spins, and this flag restores the blocking wait there too.
+        /// The default is tunable: `CERULION_MONITOR_WAIT=0` turns the park
+        /// off on every target and `=1` forces it on; `CERULION_DOORBELL=0`
+        /// keeps the park but drops its data doorbell, and `CERULION_DOORBELL=1`
+        /// asks for the doorbell and, only where a monitor-wait primitive
+        /// exists, turns the park back on over `CERULION_MONITOR_WAIT=0`. A single-process `--time-source virtual`
+        /// run never parks, so the flag has no effect there.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
         /// Record the run to an MCAP bag.

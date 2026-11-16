@@ -71,13 +71,14 @@ use std::time::{Duration, Instant};
 ///   the line where the CPU carries a monitor-wait primitive, a kernel block on
 ///   the page's wake word on macOS. IMPLIES
 ///   `monitor_wait` (the ring wakes the same park). The invariant `doorbell` ⇒
-///   `monitor_wait` is TYPE-ENFORCED by [`MonitorWaitPolicy::new`] (the only
-///   constructor that sets the flags), so the illegal state
-///   `(monitor_wait: false, doorbell: true)` is UNREPRESENTABLE. `new` enforces
-///   it in the park-off direction: a doorbell asked for without the park is
-///   dropped, never allowed to turn the park on, so `monitor_wait = false` is
-///   always a real off. Turning the park on for an explicit doorbell request is
-///   the CLI resolver's decision, made (and warned about) there.
+///   `monitor_wait` is enforced by [`MonitorWaitPolicy::new`] (the fields are
+///   private and `new` is the only constructor that takes the flags), so no
+///   value holds `(monitor_wait: false, doorbell: true)`. `new` enforces it in
+///   the park-off direction: a doorbell asked for without the park is dropped,
+///   never allowed to turn the park on, so `monitor_wait = false` is always a
+///   real off. Turning the park on for an explicit doorbell request is the CLI
+///   resolver's decision, and it warns when that overrides an explicit
+///   `CERULION_MONITOR_WAIT=0`.
 /// - `ns`: the SHM doorbell namespace ([`crate::doorbell::default_namespace`]),
 ///   so a producer's owned doorbell and the consumer's registry derive the SAME
 ///   object name and map the same page. The name's shape is per-OS; the one
