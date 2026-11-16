@@ -6750,7 +6750,8 @@ pub fn graph_run(
     // The run directory's `recorder.json`, now that the nodes have loaded: it
     // carries each node's driver flag from the LOADED metadata. Written before
     // either monolith arm declares a trace ring or spawns the window recorder,
-    // so a recorder that finds a ring in `run.json` also finds this file.
+    // so a recorder that finds a ring in `run.json` finds this file unless
+    // the write failed, and then embeds no graph.
     #[cfg(unix)]
     if let Some(descriptor) = _run_descriptor.as_ref() {
         let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
@@ -7205,10 +7206,13 @@ pub fn graph_run(
                     let topics = write_flashback_topics(&dir, graph_name)?;
                     // Resolved INSIDE the closure so a run with
                     // Flashback switched off reads nothing at all.
+                    // This arm hands the recorder no trace ring
+                    // (`ring_names: &[]` below), so the graph rides alone.
                     let handoff = resolve_flashback_handoff(
                         _run_descriptor
                             .as_ref()
                             .map(crate::run_dir::RunDescriptor::path),
+                        false,
                     );
                     spawn_flashback_recorder(FlashbackSpawnSpec {
                         graph_name,
@@ -11311,8 +11315,8 @@ fn graph_run_supervisor(
     // `node_external` key of this run's `recorder.json`, in the run directory
     // and in any bag `--record` writes. The run directory's copy is written
     // HERE, before any trace ring is declared in `run.json` and before the
-    // window recorder spawns, so a recorder that finds a ring also finds this
-    // file.
+    // window recorder spawns, so a recorder that finds a ring finds this file
+    // unless the write failed, and then embeds no graph.
     #[cfg(unix)]
     let node_external = crate::replay_engine::node_external_flags(&loaded_entry_infos);
     #[cfg(unix)]
@@ -12779,7 +12783,7 @@ fn graph_run_supervisor(
             // The same handoff the monolith arm makes. `run_dir`
             // is this deployment's run directory, threaded in by
             // `graph_run` (`None` on a degraded run-directory write).
-            let handoff = resolve_flashback_handoff(run_dir);
+            let handoff = resolve_flashback_handoff(run_dir, !flashback_ring_names.is_empty());
             spawn_flashback_recorder(FlashbackSpawnSpec {
                 graph_name: config.identity(),
                 record_cpu,
@@ -18699,7 +18703,9 @@ fn flashback_switched_off() -> bool {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct FlashbackHandoff {
     /// The effective `graph.yaml` the run executes — what makes a capture
-    /// RE-EXECUTABLE rather than merely viewable.
+    /// RE-EXECUTABLE rather than merely viewable. Not handed over beside the
+    /// run's trace rings when `recorder.json` is missing
+    /// ([`resolve_flashback_handoff`]).
     graph_yaml: Option<std::path::PathBuf>,
     /// The run's environment snapshot.
     env_json: Option<std::path::PathBuf>,
@@ -18726,8 +18732,14 @@ struct FlashbackHandoff {
 /// and bagd would then fail to start. The window is the recorder's own exec, and
 /// the only way to reach it is for the run to end inside it — at which point the
 /// spawn guard is killing the recorder anyway.
+///
+/// `carries_trace` says whether the recorder is handed this run's scheduler
+/// trace rings. Where it is and the directory holds no readable
+/// `recorder.json`, no `graph.yaml` is handed over either
+/// ([`crate::bag_cmd::RunArtifacts::graph_yaml_to_embed`]), so a capture is
+/// viewed rather than re-executed under assumed contract keys.
 #[cfg(unix)]
-fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
+fn resolve_flashback_handoff(run_dir: Option<&Path>, carries_trace: bool) -> FlashbackHandoff {
     let Some(dir) = run_dir else {
         // Not a degradation to report per-file: the run-directory write already logged ONE
         // loud line naming what an undescribed run loses, and repeating it per
@@ -18735,10 +18747,11 @@ fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
         return FlashbackHandoff::default();
     };
     let artifacts = crate::bag_cmd::read_run_artifacts(dir);
-    if !artifacts.unreadable.is_empty() {
+    let unreadable = artifacts.unreadable_for_bag(carries_trace);
+    if !unreadable.is_empty() {
         tracing::warn!(
             dir = %dir.display(),
-            unreadable = ?artifacts.unreadable,
+            unreadable = ?unreadable,
             "flashback: this run's directory is missing artifacts, so a capture of it \
              will carry less than it could — a capture with no graph.yaml can be VIEWED but not \
              re-executed (`cerulion bag play --resim`). `__cerulion/flashback.json` records which \
@@ -18748,7 +18761,7 @@ fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
     let path = |present: bool, name: &str| present.then(|| dir.join(name));
     FlashbackHandoff {
         graph_yaml: path(
-            artifacts.graph_yaml.is_some(),
+            artifacts.graph_yaml_to_embed(carries_trace).is_some(),
             crate::run_dir::RUN_GRAPH_FILE,
         ),
         env_json: path(artifacts.env_json.is_some(), crate::run_dir::RUN_ENV_FILE),
@@ -20073,8 +20086,10 @@ fn departure_ring_tag(graph: &str, sup_pid: u32) -> String {
 /// node's driver flag, `node_external`, from the loaded metadata) and before
 /// the run declares any trace ring in `run.json` or spawns its window
 /// recorder. A recorder reads `run.json` first, so one that finds a ring
-/// there also finds this file. `run_dir` is `None` when no directory was
-/// written, which already logged its own line.
+/// there finds this file unless this write failed, and then the bag or
+/// capture it takes embeds no graph
+/// (`bag_cmd::RunArtifacts::graph_yaml_to_embed`). `run_dir` is `None` when
+/// no directory was written, which already logged its own line.
 #[cfg(unix)]
 fn write_run_recorder_best_effort(
     run_dir: Option<&Path>,
@@ -20090,9 +20105,11 @@ fn write_run_recorder_best_effort(
         tracing::warn!(
             dir = %dir.display(),
             error = %e,
-            "could not write this run's recorder.json, so a bag `cerulion bag record --run` \
-             or the window recorder takes of this run carries none: a resim of it judges \
-             drivers by the build it replays and warns"
+            "could not write this run's recorder.json, which holds the trace format, \
+             coordination and driver flags a resim judges this run's trace by. The graph runs \
+             normally, but a bag `cerulion bag record --run` or the window recorder takes of \
+             this run that carries its trace carries neither that file nor the graph, so it \
+             can be viewed and not re-executed"
         );
     }
 }
@@ -26229,7 +26246,7 @@ process_groups:
         put(crate::run_dir::RUN_ENV_FILE);
         put(crate::run_dir::RUN_RECORDER_FILE);
 
-        let full = resolve_flashback_handoff(Some(&run));
+        let full = resolve_flashback_handoff(Some(&run), false);
         assert_eq!(
             full,
             FlashbackHandoff {
@@ -26242,7 +26259,7 @@ process_groups:
         // One artifact gone: the other two still travel. A capture with no host
         // identity is worth strictly more than no capture.
         std::fs::remove_file(run.join(crate::run_dir::RUN_RECORDER_FILE)).expect("remove");
-        let partial = resolve_flashback_handoff(Some(&run));
+        let partial = resolve_flashback_handoff(Some(&run), false);
         assert!(partial.graph_yaml.is_some(), "{partial:?}");
         assert!(partial.env_json.is_some(), "{partial:?}");
         assert!(
@@ -26255,10 +26272,61 @@ process_groups:
         // directory, and therefore nothing to hand over. The window is still
         // spawned — that is the caller's business, and this returns the empty
         // handoff rather than refusing.
-        assert_eq!(resolve_flashback_handoff(None), FlashbackHandoff::default());
         assert_eq!(
-            resolve_flashback_handoff(Some(&dir.path().join("no-such-run"))),
+            resolve_flashback_handoff(None, false),
             FlashbackHandoff::default()
+        );
+        assert_eq!(
+            resolve_flashback_handoff(Some(&dir.path().join("no-such-run")), false),
+            FlashbackHandoff::default()
+        );
+    }
+
+    /// A recorder handed this run's trace rings is handed its graph only beside
+    /// its `recorder.json`. The directory is the one a failed recorder write
+    /// leaves: `graph.yaml` and `env.json`, no `recorder.json`. A capture of it
+    /// would hold a graph and a trace with none of the contract keys a resim
+    /// judges them by, so the graph is not handed over and the capture can be
+    /// viewed but not re-executed. Handed no ring, the recorder still gets the
+    /// graph, and with `recorder.json` present it gets all three.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_handed_the_trace_gets_no_graph_without_the_recorder_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = dir.path().join("cam-2a");
+        std::fs::create_dir_all(&run).expect("run dir");
+        let put = |name: &str| std::fs::write(run.join(name), b"{}").expect("write artifact");
+        put(crate::run_dir::RUN_GRAPH_FILE);
+        put(crate::run_dir::RUN_ENV_FILE);
+
+        assert_eq!(
+            resolve_flashback_handoff(Some(&run), true),
+            FlashbackHandoff {
+                graph_yaml: None,
+                env_json: Some(run.join(crate::run_dir::RUN_ENV_FILE)),
+                recorder_json: None,
+            },
+            "the trace rides, recorder.json does not: no graph"
+        );
+        assert_eq!(
+            resolve_flashback_handoff(Some(&run), false),
+            FlashbackHandoff {
+                graph_yaml: Some(run.join(crate::run_dir::RUN_GRAPH_FILE)),
+                env_json: Some(run.join(crate::run_dir::RUN_ENV_FILE)),
+                recorder_json: None,
+            },
+            "no trace rides: the graph is viewable and travels"
+        );
+
+        crate::run_dir::write_run_recorder(&run, b"{}").expect("recorder.json");
+        assert_eq!(
+            resolve_flashback_handoff(Some(&run), true),
+            FlashbackHandoff {
+                graph_yaml: Some(run.join(crate::run_dir::RUN_GRAPH_FILE)),
+                env_json: Some(run.join(crate::run_dir::RUN_ENV_FILE)),
+                recorder_json: Some(run.join(crate::run_dir::RUN_RECORDER_FILE)),
+            },
+            "with recorder.json the trace and its graph travel together"
         );
     }
 
@@ -34830,7 +34898,9 @@ process_groups:
     /// declaration and a later `recorder.json` write copies the rings with no
     /// driver stamp, and the replay of that bag falls back to the build's own
     /// declaration. `bag_cmd::read_run_artifacts` reads `run.json` first, so
-    /// this order is what makes a ring imply the stamp.
+    /// this order is what makes a ring imply the stamp wherever the write
+    /// succeeded; a failed write embeds no graph
+    /// (`a_bag_that_carries_the_trace_embeds_no_graph_without_the_recorder_identity`).
     #[cfg(unix)]
     #[test]
     fn the_run_directory_recorder_lands_after_the_nodes_load_and_before_any_ring() {

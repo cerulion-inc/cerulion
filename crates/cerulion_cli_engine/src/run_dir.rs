@@ -1967,14 +1967,16 @@ fn write_run_artifacts(dir: &Path, spec: &RunDescriptorSpec<'_>, run_id: u128) -
 /// node metadata can say, and the description is written before any node
 /// loads. The caller writes it once the nodes load and BEFORE it declares any
 /// trace ring ([`declare_run_rings`]): a recorder reads `run.json` first
-/// (`bag_cmd::read_run_artifacts`), so one that finds a ring there also finds
-/// this file.
+/// (`bag_cmd::read_run_artifacts`), so one that finds a ring there finds this
+/// file unless this write failed.
 ///
 /// # Errors
 ///
 /// Returns the underlying I/O error, naming the file. Callers treat it as a
-/// DEGRADE: the run executes normally, and a bag taken of it by a later
-/// recorder carries no `recorder.json`.
+/// DEGRADE: the run executes normally, and a bag or capture a later recorder
+/// takes of it carries no `recorder.json` and, where it carries the trace, no
+/// graph either (`bag_cmd::RunArtifacts::graph_yaml_to_embed`), so it can be
+/// viewed and not re-executed.
 pub fn write_run_recorder(run_dir: &Path, bytes: &[u8]) -> CliResult<()> {
     let tmp_name = format!("{RUN_RECORDER_FILE}.tmp");
     let tmp_path = run_dir.join(&tmp_name);

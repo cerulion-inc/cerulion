@@ -361,7 +361,10 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   load (the monolith after `load_node_factories_from_cache`, the supervisor after
   `loaded_entry_infos`) and before any ring is named in `run.json` or the window recorder
   spawns; `bag_cmd::read_run_artifacts` reads `run.json` first, so a declared ring implies
-  the file. Source-order pins hold both.
+  the file unless its write failed, and a bag or capture that carries the trace without it
+  embeds no graph (`RunArtifacts::graph_yaml_to_embed`, named in the attach's
+  `artifacts_unreadable`), so it is viewed, never re-executed under assumed contract keys.
+  Source-order pins hold both.
 - **Launch arguments**: `graph run <NAME> [NAME:=VALUE]...` reads the graph through
   `graph_launch_args::graph_read_raw_with_launch_args`, the same read `graph_read_raw` makes
   with no overrides, so every verb sees the resolved graph. The resolution is

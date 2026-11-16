@@ -6041,13 +6041,29 @@ pub fn bag_record_with_manager(
                 config.attachments.push((name.to_string(), b.clone()));
             }
         };
+        // The manifest's rings are opened below, so a bag of a run whose
+        // manifest names one can carry the run's trace, and its graph then
+        // rides only beside the `recorder.json` that states the contract the
+        // trace is judged under (`RunArtifacts::graph_yaml_to_embed`).
+        let carries_trace = !a.artifacts.rings.is_empty();
+        let unreadable = a.artifacts.unreadable_for_bag(carries_trace);
+        if a.artifacts.graph_yaml.is_some()
+            && a.artifacts.graph_yaml_to_embed(carries_trace).is_none()
+        {
+            tracing::warn!(
+                run_dir = %a.run.run_dir,
+                "bag record --run: this run names trace rings but its recorder.json could not \
+                 be read, so the bag does not carry its graph.yaml either: it can be viewed but \
+                 not re-executed (`cerulion bag play --resim`)"
+            );
+        }
         // Through the SAME constants the two `graph run` recorders
         // resolve, for exactly the reason the recorder-identity name already
         // was — three writers of one attachment name is how a reader ends up
         // holding a bag whose graph it cannot find.
         push(
             cerulion_bagd::GRAPH_YAML_ATTACHMENT,
-            a.artifacts.graph_yaml.as_ref(),
+            a.artifacts.graph_yaml_to_embed(carries_trace),
         );
         push(
             cerulion_bagd::ENV_JSON_ATTACHMENT,
@@ -6108,7 +6124,7 @@ pub fn bag_record_with_manager(
                 // manifest can render "the run declared no trace rings".
                 &trace_verdict,
                 &state_rings.render(),
-                &a.artifacts.unreadable,
+                &unreadable,
             ),
         ));
         // Rings open at the LIVE cursor, every declared tap is `attached_late`,
@@ -6512,7 +6528,55 @@ impl RunArtifacts {
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
             .is_some_and(|v| v.is_object())
     }
+
+    /// The run's `graph.yaml` as a bag or capture of it may embed it. PURE.
+    ///
+    /// `carries_trace` says whether that bag or capture holds this run's
+    /// scheduler trace. A graph and a trace together are what a resim
+    /// re-executes, and `recorder.json` holds the replay contract they are
+    /// judged under (`trace_format`, `coordination`, `node_external`). So
+    /// where the trace rides and this run's `recorder.json` could not be read,
+    /// the graph is not embedded ([`GRAPH_WITHHELD_NO_RECORDER`]): the bag or
+    /// capture can then be viewed but not re-executed, rather than
+    /// re-executed under assumed contract keys. `None` too where the graph
+    /// itself could not be read.
+    ///
+    /// A run writes `recorder.json` once its nodes load and before it names
+    /// any trace ring in `run.json`, so a recorder that attaches before then
+    /// finds no ring and keeps the graph; one that finds a ring and no
+    /// `recorder.json` is reading a run whose write of it failed.
+    #[must_use]
+    pub fn graph_yaml_to_embed(&self, carries_trace: bool) -> Option<&Vec<u8>> {
+        self.graph_yaml
+            .as_ref()
+            .filter(|_| !carries_trace || self.recorder_json.is_some())
+    }
+
+    /// The artifacts a bag of this run states it does not carry, each with
+    /// its reason: [`unreadable`](Self::unreadable), and `graph.yaml` with
+    /// [`GRAPH_WITHHELD_NO_RECORDER`] where
+    /// [`graph_yaml_to_embed`](Self::graph_yaml_to_embed) withholds a graph
+    /// that was read. PURE.
+    #[must_use]
+    pub fn unreadable_for_bag(&self, carries_trace: bool) -> Vec<(String, String)> {
+        let mut out = self.unreadable.clone();
+        if self.graph_yaml.is_some() && self.graph_yaml_to_embed(carries_trace).is_none() {
+            out.push((
+                crate::run_dir::RUN_GRAPH_FILE.to_string(),
+                GRAPH_WITHHELD_NO_RECORDER.to_string(),
+            ));
+        }
+        out
+    }
 }
+
+/// Why a bag carries no `graph.yaml` although its run directory holds one
+/// ([`RunArtifacts::graph_yaml_to_embed`]), as the bag's `run.json`
+/// `artifacts_unreadable` names it.
+pub const GRAPH_WITHHELD_NO_RECORDER: &str =
+    "withheld: this run's recorder.json could not be read, and it holds the trace format, \
+     coordination and driver flags a resim judges the trace by, so the bag carries no graph and \
+     can be viewed but not re-executed";
 
 /// Read a run directory's four artifacts.
 ///
@@ -6523,8 +6587,10 @@ impl RunArtifacts {
 ///
 /// `run.json` is read FIRST. A run writes its `recorder.json` once its nodes
 /// load and before it declares any trace ring in `run.json`
-/// (`run_dir::write_run_recorder`), so a manifest that names a ring here was
-/// written after the `recorder.json` read below can find.
+/// (`run_dir::write_run_recorder`), so when a ring is named in the manifest
+/// read here, the `recorder.json` read below finds the file that write
+/// produced, unless the write failed. A bag or capture that would carry the
+/// trace without it embeds no graph ([`RunArtifacts::graph_yaml_to_embed`]).
 pub fn read_run_artifacts(dir: &std::path::Path) -> RunArtifacts {
     let mut out = RunArtifacts::default();
     let slot = |name: &str, into: &mut Option<Vec<u8>>, unreadable: &mut Vec<(String, String)>| {
@@ -12539,6 +12605,63 @@ nodes:
         // And a run directory with no manifest at all declares none.
         let bare = tempfile::tempdir().expect("tempdir");
         assert!(read_run_artifacts(bare.path()).rings.is_empty());
+    }
+
+    /// The directory a failed `recorder.json` write leaves: `run.json` names a
+    /// trace ring, `graph.yaml` and `env.json` are there, `recorder.json` is
+    /// not. A bag that carries the ring carries no graph, and names it withheld
+    /// beside the unreadable `recorder.json`, so it is viewed rather than
+    /// re-executed under assumed contract keys. The topic set still comes
+    /// from the graph that was read. One that carries no trace keeps the graph,
+    /// and so does one beside a readable `recorder.json`.
+    #[test]
+    fn a_bag_that_carries_the_trace_embeds_no_graph_without_the_recorder_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let put = |name: &str, bytes: &[u8]| {
+            std::fs::write(tmp.path().join(name), bytes).expect("write artifact")
+        };
+        put(
+            crate::run_dir::RUN_MANIFEST_FILE,
+            br#"{"version":1,"rings":[{"tag":"cer_rec_cam_1_r0","rank":0}]}"#,
+        );
+        put(crate::run_dir::RUN_GRAPH_FILE, b"name: cam\n");
+        put(crate::run_dir::RUN_ENV_FILE, b"{}");
+
+        let got = read_run_artifacts(tmp.path());
+        assert_eq!(got.rings, vec!["cer_rec_cam_1_r0".to_string()]);
+        assert_eq!(got.graph_yaml.as_deref(), Some(&b"name: cam\n"[..]));
+        assert_eq!(got.graph_yaml_to_embed(true), None);
+        let stated = got.unreadable_for_bag(true);
+        let names: Vec<&str> = stated.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                crate::run_dir::RUN_RECORDER_FILE,
+                crate::run_dir::RUN_GRAPH_FILE
+            ]
+        );
+        assert_eq!(
+            stated[1].1,
+            "withheld: this run's recorder.json could not be read, and it holds the trace \
+             format, coordination and driver flags a resim judges the trace by, so the bag \
+             carries no graph and can be viewed but not re-executed"
+        );
+
+        assert_eq!(
+            got.graph_yaml_to_embed(false).map(Vec::as_slice),
+            Some(&b"name: cam\n"[..]),
+            "no trace rides: the graph is viewable and travels"
+        );
+        assert_eq!(got.unreadable_for_bag(false), got.unreadable);
+
+        put(crate::run_dir::RUN_RECORDER_FILE, b"{}");
+        let whole = read_run_artifacts(tmp.path());
+        assert_eq!(
+            whole.graph_yaml_to_embed(true).map(Vec::as_slice),
+            Some(&b"name: cam\n"[..]),
+            "with recorder.json the trace and its graph travel together"
+        );
+        assert!(whole.unreadable_for_bag(true).is_empty());
     }
 
     #[test]

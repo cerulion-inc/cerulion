@@ -713,7 +713,11 @@ swallow the first positional, so `--run /odom` would look for a run called
 What the bag gains: the run's **effective `graph.yaml`**, its **`env.json`**,
 its **`recorder.json`** (all three copied verbatim out of the run directory) and
 a new `__cerulion/run.json` carrying the run id, the attach instant and
-`attached_mid_run: true`.
+`attached_mid_run: true`. A run that could not write its `recorder.json`, which
+holds the contract a resim judges the trace by, warns, and a bag that carries
+its trace then carries no `graph.yaml` either: the bag's `run.json` names both
+under `artifacts_unreadable`, `graph.yaml` as `withheld`, and the bag can be
+viewed but not re-executed.
 
 | Behaviour | Why |
 |---|---|
