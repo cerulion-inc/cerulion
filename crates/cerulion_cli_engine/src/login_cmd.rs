@@ -1065,7 +1065,7 @@ fn revoke_session_with_timeout(state: &AuthState, timeout: Duration) -> CliResul
 /// The e2e
 /// (`stale_session_refreshes_against_the_real_service`) is its live proof.
 pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
-    refresh_session_until(None)
+    refresh_session_until(None, &std::time::Instant::now, REFRESH_SETTLEMENT_BUDGET)
 }
 
 /// Bound refresh-lock acquisition and the HTTP exchange by `budget`.
@@ -1073,7 +1073,11 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
 /// Runs on the calling thread.
 /// The refresh token is single-use: never abandon this exchange on a worker thread.
 pub fn refresh_session_if_stale_within(budget: Duration) -> CliResult<Option<AuthState>> {
-    refresh_session_until(Some(std::time::Instant::now() + budget))
+    refresh_session_until(
+        Some(std::time::Instant::now() + budget),
+        &std::time::Instant::now,
+        REFRESH_SETTLEMENT_BUDGET,
+    )
 }
 
 // A successful exchange has consumed the old refresh token. Publication (or
@@ -1083,13 +1087,25 @@ const REFRESH_SETTLEMENT_BUDGET: Duration = Duration::from_secs(1);
 // Do not spend a single-use token on a request that cannot receive a reply.
 const REFRESH_REQUEST_FLOOR: Duration = Duration::from_millis(250);
 
-fn refresh_remaining(deadline: Option<std::time::Instant>, fallback: Duration) -> Duration {
-    deadline.map_or(fallback, |deadline| {
-        deadline.saturating_duration_since(std::time::Instant::now())
-    })
+/// What is left of `deadline` at `now`, zero once it has passed, or `fallback`
+/// for an unbounded refresh.
+fn refresh_remaining(
+    deadline: Option<std::time::Instant>,
+    fallback: Duration,
+    now: std::time::Instant,
+) -> Duration {
+    deadline.map_or(fallback, |deadline| deadline.saturating_duration_since(now))
 }
 
-fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Option<AuthState>> {
+/// The refresh behind both public wrappers. Every budget is read off `now`, and
+/// a bounded refresh gives publishing or retiring the rotated pair `settlement`
+/// from the moment the exchange answered. The wrappers pass the monotonic clock
+/// and [`REFRESH_SETTLEMENT_BUDGET`].
+fn refresh_session_until(
+    deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
+    settlement: Duration,
+) -> CliResult<Option<AuthState>> {
     let loaded = auth::load();
     let Some(state) = loaded.state() else {
         // Never logged in (or corrupt) — nothing to refresh (the gate handles it).
@@ -1108,9 +1124,10 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         )
     })?;
     let refresh_lock = match deadline {
-        Some(_) => {
-            auth::hold_refresh_lock_within(&auth_path, refresh_remaining(deadline, HTTP_TIMEOUT))
-        }
+        Some(_) => auth::hold_refresh_lock_within(
+            &auth_path,
+            refresh_remaining(deadline, HTTP_TIMEOUT, now()),
+        ),
         None => auth::hold_refresh_lock(&auth_path),
     };
     let _refreshing =
@@ -1123,7 +1140,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         return Ok(None);
     }
     let base = account_service_base();
-    let remaining = refresh_remaining(deadline, HTTP_TIMEOUT);
+    let remaining = refresh_remaining(deadline, HTTP_TIMEOUT, now());
     if remaining < REFRESH_REQUEST_FLOOR {
         return Err(CliError::Login(
             "session refresh exceeded its time budget".into(),
@@ -1136,14 +1153,14 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         "/v1/auth/refresh",
         &serde_json::json!({ "refresh_token": state.refresh_token }),
     )?;
-    let settlement_deadline =
-        deadline.map(|_| std::time::Instant::now() + REFRESH_SETTLEMENT_BUDGET);
-    let now = auth::now_unix_ns();
+    let settlement_deadline = deadline.map(|_| now() + settlement);
+    let issued_at_ns = auth::now_unix_ns();
     let new_state = AuthState {
         account_id: state.account_id.clone(),
         session_token: refreshed.session_token,
         refresh_token: refreshed.refresh_token,
-        expires_at_ns: now.saturating_add(refreshed.expires_in.saturating_mul(1_000_000_000)),
+        expires_at_ns: issued_at_ns
+            .saturating_add(refreshed.expires_in.saturating_mul(1_000_000_000)),
         logged_in_ever: true,
         // A token refresh preserves this machine's install-determined
         // role (it is orthogonal to the session).
@@ -1159,7 +1176,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
     // with the session it just retired.
     let publication = auth::with_store_lock_within(
         &auth_path,
-        refresh_remaining(settlement_deadline, REFRESH_SETTLEMENT_BUDGET),
+        refresh_remaining(settlement_deadline, settlement, now()),
         || {
             let current = auth::load_from(&auth_path);
             let current_refresh = current.state().map(|c| c.refresh_token.as_str());
@@ -1188,7 +1205,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         // revoked only the pair we exchanged, and a login or a peer's refresh
         // holds a different session. Retire it whatever replaced it, so no
         // session stays live at the service that this machine cannot sign out.
-        let remaining = refresh_remaining(settlement_deadline, HTTP_TIMEOUT);
+        let remaining = refresh_remaining(settlement_deadline, HTTP_TIMEOUT, now());
         let revoked = if remaining.is_zero() {
             Err(CliError::Login(
                 "session refresh exceeded its time budget".into(),
@@ -1564,6 +1581,21 @@ fn post_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_refresh_budget_left_is_read_off_the_given_instant_and_stops_at_zero() {
+        let now = std::time::Instant::now();
+        let fallback = Duration::from_millis(700);
+        assert_eq!(refresh_remaining(None, fallback, now), fallback);
+        assert_eq!(
+            refresh_remaining(Some(now + Duration::from_millis(5)), fallback, now),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            refresh_remaining(Some(now), fallback, now + Duration::from_millis(1)),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn a_refreshed_pair_a_peer_already_stored_is_kept_not_revoked() {
