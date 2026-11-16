@@ -2192,6 +2192,10 @@ mod tests {
                 drop(reader);
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let reply = if operation == "refresh" {
+                    assert!(
+                        served.is_empty(),
+                        "a refresh arrived after {served:?}; the single-use token is exchanged once"
+                    );
                     assert_eq!(
                         body,
                         serde_json::json!({"refresh_token":"single-use-refresh"})
@@ -2294,8 +2298,8 @@ mod tests {
         );
     }
 
-    /// A peer that holds the store past the settlement budget ends the store
-    /// wait at that budget. The wait is measured from the reply: one taken
+    /// While a peer holds the store past the settlement budget, the store wait
+    /// ends at that budget. The wait is measured from the reply: one taken
     /// from the passed request deadline reports 0ms, and one longer than the
     /// shipped budget reports more than 1000ms. The original pair stays.
     #[test]
