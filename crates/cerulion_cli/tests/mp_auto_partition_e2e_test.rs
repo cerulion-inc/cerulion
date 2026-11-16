@@ -1505,6 +1505,17 @@ fn no_tty_default_mp_run_writes_and_announces_its_run_directory() {
         !original_yaml.contains("process_groups:"),
         "the DISCRIMINATOR: the graph file carries no partition"
     );
+    // The supervisor writes the run directory's recorder.json from the nodes it
+    // loaded: one driver flag per node, and none of these three fixtures
+    // declares the `external` policy.
+    let recorder: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("recorder.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        recorder["node_external"],
+        serde_json::json!({"relay": false, "sink": false, "ticker": false}),
+        "the run directory names every node's driver flag: {recorder}"
+    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(

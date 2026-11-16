@@ -267,9 +267,11 @@ Rules that must not drift:
   neutral resim alike. A bag with no stamp takes the candidate set, with ONE warn when it is
   non-empty, and `DriverInputsReport::declared_by` (`recording` or `replayed_build`) and the
   NOTE parenthetical say which. Pinned by `driver_topic_tests`, `driver_stamp_tests`, the
-  stamp arms of `replay_gates_test.rs` and the driver-graph arms of `replay_engine_test.rs`
+  stamp arms of `replay_gates_test.rs`, the driver-graph arms of `replay_engine_test.rs`
   (the `drv_*` fixtures: the unstamped ones pin the older-recording arm, the stamped ones
-  the match and both refusals); `docs/bag.md` states the user-facing rules.
+  the match and both refusals) and `replay_driver_stamp_cdylib_test.rs`, which carries a
+  stamp from the gate to the engine's refusal through `run_replay` over a workspace
+  cdylib; `docs/bag.md` states the user-facing rules.
 - **Environment divergence prints once and never changes the exit code.** A resim never
   applies the bag's `env.json`: its nodes read the replay shell's environment, and
   `replay_engine::compare_env_against` compares the two (no `env.json`, no comparison). One
@@ -1095,6 +1097,7 @@ own binary.
 |---|---|---|---|
 | `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
+| `replay_driver_stamp_cdylib_test.rs` | A crafted bag's `node_external` stamp reaches the engine through `run_replay`: a workspace build that runs a recorded driver as an ordinary node is refused with `DriverSetDrift` (exit 2) | one test (moves the working directory, mints the resim transport) | `test_node_macro_period_cdylib` |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
