@@ -675,7 +675,7 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     // STABLE (~8.5-11.5µs p50) where the epoll-block baseline was unstable
     // (15-54µs p50). `monitor_wait` rides the SAME flag ladder as arm 3;
     // `doorbell` rides it too and is then ANDed with `monitor_wait` and with the
-    // host's wake-word fact, so on this tier a doorbell never coerces the park
+    // host's wake-word fact, so on this tier a doorbell never turns the park
     // ON. It arms where a consumer can kernel-block on a doorbell (Linux and
     // Android, and macOS with the os_sync family resolved, which is what
     // `wake_word_block_primitive_available` reports) and is FORCED OFF elsewhere,
@@ -8068,8 +8068,8 @@ pub fn graph_run_worker(
     // epoll-blocks between steps and a cross-process publish pays a
     // wake-latency backstop; with the doorbell the producer's ring wakes the
     // shallow park at near-spin latency). Rebuilt via the pure, unit-tested
-    // `worker_park_policy` seam (ns re-derivation + doorbell⇒monitor_wait
-    // coercion + old-plan serde-default back-compat — see its doc).
+    // `worker_park_policy` seam (ns re-derivation + the doorbell⇒monitor_wait
+    // invariant + old-plan serde-default back-compat — see its doc).
     let mw_policy = worker_park_policy(&plan);
     // Captured before the policy moves into the builder; the EFFECTIVE verdict
     // feeding the (8.7) cap resolver is computed after the build (see
@@ -10986,7 +10986,9 @@ fn resolve_worker_build_path(
 /// bools. The `ns` is re-derived here: `default_namespace()` is $USER-stable,
 /// and every worker of a deployment runs as the same user on the same machine, so
 /// producer + consumer derive the SAME doorbell SHM names.
-/// `MonitorWaitPolicy::new` re-coerces `doorbell ⇒ monitor_wait`. On a plan
+/// `MonitorWaitPolicy::new` re-enforces `doorbell ⇒ monitor_wait` by dropping
+/// a doorbell stamped without the park, so a plan's `monitor_wait = false` is
+/// park off whatever its `doorbell` says. On a plan
 /// from an OLD supervisor both fields serde-default to false → park off. Pure
 /// (plan in, policy out), so the seam is unit-testable without a live worker.
 fn worker_park_policy(plan: &crate::multiprocess::WorkerPlan) -> cerulion_core::MonitorWaitPolicy {
@@ -46404,7 +46406,8 @@ mod supervisor_tests {
     /// doesn't ring would silently regress the consumer's park to the
     /// epoll-block wake latency). Pure-fn pin: an ON policy stamps both bools
     /// on all workers; `off()` stamps both false; the doorbell⇒monitor_wait
-    /// coercion arrives pre-applied via `MonitorWaitPolicy::new`.
+    /// invariant arrives pre-applied via `MonitorWaitPolicy::new`, so a
+    /// doorbell asked for without the park stamps nothing.
     #[test]
     fn stamp_park_policy_writes_resolved_bools_into_every_worker() {
         let mut plan = bare_plan();
@@ -46416,17 +46419,30 @@ mod supervisor_tests {
             );
         }
 
-        // Doorbell-on: `new` coerces monitor_wait true as well.
-        let on = cerulion_core::MonitorWaitPolicy::new(false, true, "ns".to_string());
+        // Park + doorbell on: both bools stamped on every worker.
+        let on = cerulion_core::MonitorWaitPolicy::new(true, true, "ns".to_string());
         stamp_park_policy(&mut plan, &on);
         for w in &plan.workers {
             assert!(
                 w.monitor_wait && w.doorbell,
-                "every worker must carry the resolved ON policy (doorbell ⇒ monitor_wait coerced)"
+                "every worker must carry the resolved ON policy"
             );
         }
 
-        // Off: both false again (the stamp is authoritative, not sticky).
+        // A doorbell asked for without the park: `new` drops it, so the
+        // stamp is park-off on every worker. The doorbell never turns the park
+        // on by itself.
+        let parkless = cerulion_core::MonitorWaitPolicy::new(false, true, "ns".to_string());
+        stamp_park_policy(&mut plan, &parkless);
+        for w in &plan.workers {
+            assert!(
+                !w.monitor_wait && !w.doorbell,
+                "a doorbell with no park must stamp park-off, not turn the park on"
+            );
+        }
+
+        // Off over ON: both false again (the stamp is authoritative, not sticky).
+        stamp_park_policy(&mut plan, &on);
         let off = cerulion_core::MonitorWaitPolicy::off();
         stamp_park_policy(&mut plan, &off);
         for w in &plan.workers {
@@ -48130,8 +48146,9 @@ mod supervisor_tests {
     /// the supervisor-stamped plan bools — the worker-side seam of the (7a)
     /// handoff. Stamped-ON → both `monitor_wait()` and `doorbell()`;
     /// planner-default (false/false, also the OLD-plan serde default) →
-    /// off-equivalent. Doorbell-only stamping re-coerces monitor_wait via
-    /// `MonitorWaitPolicy::new` (the doorbell⇒monitor_wait invariant).
+    /// off-equivalent. Doorbell-only stamping is park-off too:
+    /// `MonitorWaitPolicy::new` drops a doorbell that has no park (the
+    /// doorbell⇒monitor_wait invariant, enforced in the park-off direction).
     #[test]
     fn worker_park_policy_rebuilds_stamped_plan_bools() {
         let mut plan = bare_plan();
@@ -48152,12 +48169,13 @@ mod supervisor_tests {
             "a stamped-ON plan must yield an active park + doorbell policy"
         );
 
-        // Doorbell-only (a hand-edited plan): `new` coerces monitor_wait true.
+        // Doorbell-only (a hand-edited plan): `new` drops the doorbell, so the
+        // worker parks off. `monitor_wait = false` is a real off at the worker.
         plan.workers[0].monitor_wait = false;
         let policy = worker_park_policy(&plan.workers[0]);
         assert!(
-            policy.monitor_wait() && policy.doorbell(),
-            "doorbell ⇒ monitor_wait must be re-coerced at the worker"
+            !policy.monitor_wait() && !policy.doorbell(),
+            "a doorbell stamped without the park must not turn the park on at the worker"
         );
     }
 

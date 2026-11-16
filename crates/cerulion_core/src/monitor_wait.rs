@@ -70,10 +70,14 @@ use std::time::{Duration, Instant};
 ///   instant DATA is published (the data-hop path): `UMONITOR`/`WFE` armed on
 ///   the line where the CPU carries a monitor-wait primitive, a kernel block on
 ///   the page's wake word on macOS. IMPLIES
-///   `monitor_wait` (the ring wakes the same park) — the invariant `doorbell` ⇒
-///   `monitor_wait` is now TYPE-ENFORCED by [`MonitorWaitPolicy::new`] (the only
-///   constructor that sets the flags coerces it), so the illegal state
-///   `(monitor_wait: false, doorbell: true)` is UNREPRESENTABLE.
+///   `monitor_wait` (the ring wakes the same park). The invariant `doorbell` ⇒
+///   `monitor_wait` is TYPE-ENFORCED by [`MonitorWaitPolicy::new`] (the only
+///   constructor that sets the flags), so the illegal state
+///   `(monitor_wait: false, doorbell: true)` is UNREPRESENTABLE. `new` enforces
+///   it in the park-off direction: a doorbell asked for without the park is
+///   dropped, never allowed to turn the park on, so `monitor_wait = false` is
+///   always a real off. Turning the park on for an explicit doorbell request is
+///   the CLI resolver's decision, made (and warned about) there.
 /// - `ns`: the SHM doorbell namespace ([`crate::doorbell::default_namespace`]),
 ///   so a producer's owned doorbell and the consumer's registry derive the SAME
 ///   object name and map the same page. The name's shape is per-OS; the one
@@ -87,7 +91,8 @@ pub struct MonitorWaitPolicy {
     /// Park the inter-step idle in a shallow monitor-wait instead of the
     /// blocking WaitSet (timer-deadline path). PRIVATE — read via
     /// [`MonitorWaitPolicy::monitor_wait`]; set only by [`MonitorWaitPolicy::new`]
-    /// (which coerces the `doorbell` ⇒ `monitor_wait` invariant).
+    /// (which enforces the `doorbell` ⇒ `monitor_wait` invariant by dropping a
+    /// doorbell that has no park).
     monitor_wait: bool,
     /// Arm the park on the data doorbell line (data-hop path). Implies
     /// `monitor_wait`. PRIVATE — read via [`MonitorWaitPolicy::doorbell`].
@@ -98,13 +103,18 @@ pub struct MonitorWaitPolicy {
 }
 
 impl MonitorWaitPolicy {
-    /// Construct a resolved policy. COERCES the invariant `doorbell ⇒
+    /// Construct a resolved policy. ENFORCES the invariant `doorbell ⇒
     /// monitor_wait` (a doorbell ring wakes the SAME park, so arming the
-    /// doorbell without the park is contradictory) — established ONCE here, so it
-    /// cannot be violated by any caller.
+    /// doorbell without the park is contradictory), established ONCE here so it
+    /// cannot be violated by any caller. The park flag wins: `new(false, true, ..)`
+    /// is the all-off policy with `ns` kept, so `monitor_wait = false` is a real
+    /// off whatever `doorbell` says. A caller that wants an explicit doorbell
+    /// request to turn the park on passes `monitor_wait = true` itself (the CLI
+    /// resolver does, and warns, naming both variables, when that overrides an
+    /// explicit `CERULION_MONITOR_WAIT=0`).
     ///
     /// `ns` is the SHM doorbell namespace. The sibling invariant `doorbell ⇒
-    /// non-empty ns` is NOT coerced here (unlike `doorbell ⇒ monitor_wait`,
+    /// non-empty ns` is NOT enforced here (unlike `doorbell ⇒ monitor_wait`,
     /// which is a pure logical implication): the *correct* namespace is a
     /// CONTEXTUAL value ([`crate::doorbell::default_namespace`], `$USER`-derived)
     /// that the CLI resolver owns — reading the environment inside this
@@ -117,8 +127,8 @@ impl MonitorWaitPolicy {
     /// mistake in debug/tests.
     pub fn new(monitor_wait: bool, doorbell: bool, ns: String) -> Self {
         Self {
-            monitor_wait: monitor_wait || doorbell,
-            doorbell,
+            monitor_wait,
+            doorbell: doorbell && monitor_wait,
             ns,
         }
     }
@@ -1180,21 +1190,35 @@ mod tests {
         assert_ne!(p, MonitorWaitPolicy::off());
     }
 
+    /// The full truth table of `new`, hand-written: the park flag passes
+    /// through unchanged, and a doorbell survives only beside the park. The
+    /// illegal state (monitor_wait: false, doorbell: true) is UNREPRESENTABLE,
+    /// and it is the DOORBELL that gives way: a doorbell never turns the park on
+    /// by itself, so `monitor_wait = false` is a real off for every caller.
     #[test]
-    fn policy_new_coerces_doorbell_implies_monitor_wait() {
-        // The illegal state (monitor_wait: false, doorbell: true) is
-        // UNREPRESENTABLE — `new` coerces `monitor_wait` true whenever `doorbell`
-        // is set, so the invariant `doorbell ⇒ monitor_wait` holds by
-        // construction for EVERY caller.
-        let p = MonitorWaitPolicy::new(false, true, "ns".to_string());
-        assert!(p.monitor_wait(), "doorbell must coerce monitor_wait on");
-        assert!(p.doorbell());
-        assert_eq!(p.ns(), "ns");
-
-        // monitor_wait without doorbell is untouched (the timer-only park).
-        let q = MonitorWaitPolicy::new(true, false, String::new());
-        assert!(q.monitor_wait());
-        assert!(!q.doorbell());
+    fn policy_new_drops_a_doorbell_that_has_no_park() {
+        // (monitor_wait in, doorbell in) -> (monitor_wait out, doorbell out)
+        let table: [((bool, bool), (bool, bool)); 4] = [
+            ((false, false), (false, false)),
+            ((false, true), (false, false)),
+            ((true, false), (true, false)),
+            ((true, true), (true, true)),
+        ];
+        for ((mw, db), (want_mw, want_db)) in table {
+            let p = MonitorWaitPolicy::new(mw, db, "ns".to_string());
+            assert_eq!(
+                (p.monitor_wait(), p.doorbell()),
+                (want_mw, want_db),
+                "new({mw}, {db}) must resolve to park={want_mw} doorbell={want_db}"
+            );
+            assert_eq!(p.ns(), "ns", "the namespace passes through on every row");
+        }
+        // The dropped doorbell is a real off, not merely a park-off look-alike:
+        // only the namespace tells it apart from `off()`.
+        assert_eq!(
+            MonitorWaitPolicy::new(false, true, String::new()),
+            MonitorWaitPolicy::off()
+        );
     }
 
     /// Drift guard: the shared hardware-park slice must keep a

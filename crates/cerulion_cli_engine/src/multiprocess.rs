@@ -965,8 +965,9 @@ pub struct WorkerPlan {
     /// The doorbell half of the resolved park policy (producer-side
     /// ringing plus the consumer registry — the cross-process publish wake).
     /// Same stamping / serde-default contract as
-    /// [`monitor_wait`](Self::monitor_wait); `MonitorWaitPolicy::new` re-coerces
-    /// the doorbell-implies-monitor-wait invariant at the worker.
+    /// [`monitor_wait`](Self::monitor_wait); `MonitorWaitPolicy::new` re-enforces
+    /// the doorbell-implies-monitor-wait invariant at the worker, by dropping a
+    /// doorbell stamped without the park.
     #[serde(default)]
     pub doorbell: bool,
     /// The user's explicit `--no-cpu-dma-lock` opt-out,
