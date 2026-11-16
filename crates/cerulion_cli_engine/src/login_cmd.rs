@@ -2046,12 +2046,32 @@ mod tests {
     struct BusyRefreshResult {
         refreshed: CliResult<Option<AuthState>>,
         stored: AuthState,
-        elapsed: Duration,
+        /// The account service operations the fake service answered, in order.
+        served: Vec<&'static str>,
     }
 
+    /// The bound on every wait in the busy-store fixture. Each step ends on a
+    /// signal from the step before it, so only a wedged step reaches this.
+    #[cfg(unix)]
+    const FIXTURE_CEILING: Duration = Duration::from_secs(30);
+
+    /// How far the fake account service moves the refresh's clock while it
+    /// answers the exchange: past the request deadline and past any
+    /// settlement window opened before the move.
+    #[cfg(unix)]
+    const CLOCK_JUMP: Duration = Duration::from_secs(3_600);
+
+    /// Runs a bounded refresh of a stale session while a peer holds the
+    /// credential store. The refresh reads a clock the fake account service
+    /// moves forward by [`CLOCK_JUMP`] before it sends the rotated pair, so the
+    /// request deadline has passed when the client publishes or retires that
+    /// pair. The peer writes `replacement`, if any, and releases the store once
+    /// the service has answered.
     #[cfg(unix)]
     fn refresh_after_busy_store(replacement: Option<AuthState>) -> BusyRefreshResult {
         use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
         let _environment = env_lock();
         let directory = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("CERULION_HOME", directory.path().to_str().unwrap());
@@ -2074,52 +2094,61 @@ mod tests {
             &format!("http://{}", listener.local_addr().unwrap()),
         );
         listener.set_nonblocking(true).unwrap();
+        let clock_jump_secs = Arc::new(AtomicU64::new(0));
+        let client_returned = Arc::new(AtomicBool::new(false));
         let (held, holding) = std::sync::mpsc::channel();
         let (rotated, rotation) = std::sync::mpsc::channel();
-        let retire = replacement.is_some();
         let peer_path = path.clone();
         let peer = std::thread::spawn(move || {
             auth::with_store_lock(&peer_path, || {
                 held.send(()).unwrap();
-                rotation.recv_timeout(Duration::from_secs(3)).unwrap();
+                rotation
+                    .recv_timeout(FIXTURE_CEILING)
+                    .expect("the account service never answered the refresh");
                 if let Some(replacement) = replacement {
                     auth::write_to(&peer_path, &replacement)?;
                 }
-                // Keep the store occupied after the refresh request succeeded
-                // and past its caller deadline, optionally replacing the login.
-                std::thread::sleep(Duration::from_millis(500));
                 Ok(())
             })
             .unwrap();
         });
-        holding.recv_timeout(Duration::from_secs(1)).unwrap();
+        holding
+            .recv_timeout(FIXTURE_CEILING)
+            .expect("the peer never took the store lock");
+        let service_clock = Arc::clone(&clock_jump_secs);
+        let service_saw_return = Arc::clone(&client_returned);
         let server = std::thread::spawn(move || {
-            for operation in ["refresh", "revoke"]
-                .into_iter()
-                .take(if retire { 2 } else { 1 })
-            {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                let (mut stream, _) = loop {
-                    match listener.accept() {
-                        Ok(accepted) => break accepted,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "refresh never reached the account service"
-                            );
-                            std::thread::sleep(Duration::from_millis(5));
+            let mut served = Vec::new();
+            let ceiling = std::time::Instant::now() + FIXTURE_CEILING;
+            loop {
+                // Read before the accept: a request the client sent before it
+                // returned is already queued, so the loop serves it first.
+                let returned = service_saw_return.load(Ordering::Acquire);
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if returned {
+                            return served;
                         }
-                        Err(error) => panic!("refresh accept failed: {error}"),
+                        assert!(
+                            std::time::Instant::now() < ceiling,
+                            "no further POST /v1/auth request reached the account service \
+                             and the refresh did not return; served {served:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
                     }
+                    Err(error) => panic!("account service accept failed: {error}"),
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(FIXTURE_CEILING)).unwrap();
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 assert_ne!(reader.read_line(&mut first).unwrap(), 0);
-                assert!(first.starts_with(&format!("POST /v1/auth/{operation} ")));
+                let operation = ["refresh", "revoke"]
+                    .into_iter()
+                    .find(|operation| first.starts_with(&format!("POST /v1/auth/{operation} ")))
+                    .unwrap_or_else(|| panic!("unexpected account service request: {first:?}"));
                 let mut length = 0;
                 let mut protocol = false;
                 let mut authorized_rotation = false;
@@ -2146,7 +2175,8 @@ mod tests {
                         body,
                         serde_json::json!({"refresh_token":"single-use-refresh"})
                     );
-                    std::thread::sleep(Duration::from_millis(350));
+                    // The client reads its clock again only after this reply.
+                    service_clock.fetch_add(CLOCK_JUMP.as_secs(), Ordering::SeqCst);
                     r#"{"session_token":"rotated-session","refresh_token":"rotated-refresh","expires_in":60}"#
                 } else {
                     assert!(authorized_rotation);
@@ -2160,37 +2190,45 @@ mod tests {
                 if operation == "refresh" {
                     rotated.send(()).unwrap();
                 }
+                served.push(operation);
             }
         });
-        let budget = Duration::from_millis(500);
-        let began = std::time::Instant::now();
-        let refreshed = refresh_session_if_stale_within(budget);
-        let elapsed = began.elapsed();
-        server.join().unwrap();
-        peer.join().unwrap();
+        let client_clock = Arc::clone(&clock_jump_secs);
+        let now = move || {
+            std::time::Instant::now() + Duration::from_secs(client_clock.load(Ordering::SeqCst))
+        };
+        let deadline = now() + FIXTURE_CEILING;
+        let refreshed = refresh_session_until(Some(deadline), &now, FIXTURE_CEILING);
+        client_returned.store(true, Ordering::Release);
+        let server = server.join();
+        let peer = peer.join();
+        assert!(
+            peer.is_ok(),
+            "the peer holding the store failed; the refresh returned {refreshed:?}"
+        );
+        let Ok(served) = server else {
+            panic!("the fake account service failed; the refresh returned {refreshed:?}");
+        };
         BusyRefreshResult {
             refreshed,
             stored: auth::load_from(&path).state().unwrap().clone(),
-            elapsed,
+            served,
         }
     }
 
+    /// The request deadline passes while the exchange is in flight, and the
+    /// rotated pair is still returned and stored.
     #[test]
     #[cfg(unix)]
     fn a_successful_bounded_refresh_persists_rotated_tokens_after_the_request_deadline() {
         let result = refresh_after_busy_store(None);
-        assert!(
-            result.refreshed.unwrap().is_some(),
-            "a spent refresh token's replacement must be persisted"
-        );
-        assert!(
-            result.elapsed >= Duration::from_millis(500),
-            "publication must wait past the exhausted request budget"
-        );
-        assert!(
-            result.elapsed < Duration::from_secs(2),
-            "publication remains bounded: {:?}",
-            result.elapsed
+        let refreshed = result
+            .refreshed
+            .unwrap()
+            .expect("a spent refresh token's replacement must be persisted");
+        assert_eq!(
+            refreshed, result.stored,
+            "the stored pair is the returned one"
         );
         assert_eq!(result.stored.account_id, "publication-account");
         assert_eq!(result.stored.session_token, "rotated-session");
@@ -2198,8 +2236,12 @@ mod tests {
         assert!(result.stored.session_is_valid(auth::now_unix_ns()));
         assert!(result.stored.logged_in_ever);
         assert_eq!(result.stored.role, None);
+        assert_eq!(result.served, ["refresh"]);
     }
 
+    /// The revoke budget comes from the settlement window opened at the reply.
+    /// One taken from the passed request deadline is zero, which skips the
+    /// revoke and leaves `served` at `["refresh"]`.
     #[test]
     #[cfg(unix)]
     fn a_superseded_bounded_refresh_retires_its_pair_after_the_request_deadline() {
@@ -2212,16 +2254,15 @@ mod tests {
             role: None,
         };
         let result = refresh_after_busy_store(Some(signed_out.clone()));
-        assert!(result.refreshed.unwrap().is_none());
+        assert_eq!(result.refreshed.unwrap(), None);
         assert_eq!(
             result.stored, signed_out,
             "a concurrent sign-out must never be overwritten"
         );
-        assert!(result.elapsed >= Duration::from_millis(500));
-        assert!(
-            result.elapsed < Duration::from_secs(2),
-            "retirement remains bounded: {:?}",
-            result.elapsed
+        assert_eq!(
+            result.served,
+            ["refresh", "revoke"],
+            "the unpublished rotated pair must be revoked"
         );
     }
 
