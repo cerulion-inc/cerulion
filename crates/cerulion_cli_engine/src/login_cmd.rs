@@ -2048,6 +2048,16 @@ mod tests {
         stored: AuthState,
         /// The account service operations the fake service answered, in order.
         served: Vec<&'static str>,
+        auth_path: std::path::PathBuf,
+    }
+
+    /// When the peer in [`refresh_after_busy_store`] releases the store.
+    #[cfg(unix)]
+    enum StoreRelease {
+        /// Once the account service has answered the refresh.
+        AfterRotation,
+        /// Once the refresh call has returned.
+        AfterReturn,
     }
 
     /// The bound on every wait in the busy-store fixture. Each step ends on a
@@ -2065,10 +2075,15 @@ mod tests {
     /// credential store. The refresh reads a clock the fake account service
     /// moves forward by [`CLOCK_JUMP`] before it sends the rotated pair, so the
     /// request deadline has passed when the client publishes or retires that
-    /// pair. The peer writes `replacement`, if any, and releases the store once
-    /// the service has answered.
+    /// pair, and the store wait for either is bounded by `settlement`. The peer
+    /// writes `replacement`, if any, once the service has answered, and releases
+    /// the store as `release` says.
     #[cfg(unix)]
-    fn refresh_after_busy_store(replacement: Option<AuthState>) -> BusyRefreshResult {
+    fn refresh_after_busy_store(
+        replacement: Option<AuthState>,
+        settlement: Duration,
+        release: StoreRelease,
+    ) -> BusyRefreshResult {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::Arc;
@@ -2098,6 +2113,7 @@ mod tests {
         let client_returned = Arc::new(AtomicBool::new(false));
         let (held, holding) = std::sync::mpsc::channel();
         let (rotated, rotation) = std::sync::mpsc::channel();
+        let (returned, returning) = std::sync::mpsc::channel();
         let peer_path = path.clone();
         let peer = std::thread::spawn(move || {
             auth::with_store_lock(&peer_path, || {
@@ -2107,6 +2123,11 @@ mod tests {
                     .expect("the account service never answered the refresh");
                 if let Some(replacement) = replacement {
                     auth::write_to(&peer_path, &replacement)?;
+                }
+                if let StoreRelease::AfterReturn = release {
+                    returning
+                        .recv_timeout(FIXTURE_CEILING)
+                        .expect("the refresh never returned");
                 }
                 Ok(())
             })
@@ -2198,8 +2219,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(client_clock.load(Ordering::SeqCst))
         };
         let deadline = now() + FIXTURE_CEILING;
-        let refreshed = refresh_session_until(Some(deadline), &now, FIXTURE_CEILING);
+        let refreshed = refresh_session_until(Some(deadline), &now, settlement);
         client_returned.store(true, Ordering::Release);
+        // A peer that released the store at the rotation has dropped its receiver.
+        let _ = returned.send(());
         let server = server.join();
         let peer = peer.join();
         assert!(
@@ -2213,6 +2236,7 @@ mod tests {
             refreshed,
             stored: auth::load_from(&path).state().unwrap().clone(),
             served,
+            auth_path: path,
         }
     }
 
@@ -2221,7 +2245,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_successful_bounded_refresh_persists_rotated_tokens_after_the_request_deadline() {
-        let result = refresh_after_busy_store(None);
+        let result = refresh_after_busy_store(None, FIXTURE_CEILING, StoreRelease::AfterRotation);
         let refreshed = result
             .refreshed
             .unwrap()
@@ -2253,7 +2277,11 @@ mod tests {
             logged_in_ever: true,
             role: None,
         };
-        let result = refresh_after_busy_store(Some(signed_out.clone()));
+        let result = refresh_after_busy_store(
+            Some(signed_out.clone()),
+            FIXTURE_CEILING,
+            StoreRelease::AfterRotation,
+        );
         assert_eq!(result.refreshed.unwrap(), None);
         assert_eq!(
             result.stored, signed_out,
@@ -2263,6 +2291,48 @@ mod tests {
             result.served,
             ["refresh", "revoke"],
             "the unpublished rotated pair must be revoked"
+        );
+    }
+
+    /// A peer that holds the store past the settlement budget ends the store
+    /// wait at that budget. The wait is measured from the reply: one taken
+    /// from the passed request deadline reports 0ms, and one longer than the
+    /// shipped budget reports more than 1000ms. The original pair stays.
+    #[test]
+    #[cfg(unix)]
+    fn a_bounded_refresh_stops_waiting_for_a_busy_store_at_the_settlement_budget() {
+        let result =
+            refresh_after_busy_store(None, REFRESH_SETTLEMENT_BUDGET, StoreRelease::AfterReturn);
+        let error = result
+            .refreshed
+            .expect_err("a store held past the settlement budget refuses the publication")
+            .to_string();
+        let prefix = format!(
+            "could not persist the refreshed session: another Cerulion process is writing {} and did not finish within ",
+            result.auth_path.display()
+        );
+        let waited_ms: u128 = error
+            .strip_prefix(&prefix)
+            .and_then(|text| text.strip_suffix("ms"))
+            .unwrap_or_else(|| panic!("the busy store must end the refresh: {error}"))
+            .parse()
+            .unwrap();
+        assert!((1..=1_000).contains(&waited_ms), "{error}");
+        assert_eq!(
+            result.stored,
+            AuthState {
+                account_id: "publication-account".into(),
+                session_token: "original-session".into(),
+                refresh_token: "single-use-refresh".into(),
+                expires_at_ns: 1,
+                logged_in_ever: true,
+                role: None,
+            }
+        );
+        assert_eq!(
+            result.served.first(),
+            Some(&"refresh"),
+            "the store wait follows the exchange"
         );
     }
 
