@@ -1299,17 +1299,20 @@ pub enum NodeAction {
         /// microseconds with `CERULION_CPU_DMA_LOCK_US=N`. Linux-only.
         #[arg(long = "no-cpu-dma-lock")]
         no_cpu_dma_lock: bool,
-        /// Hard opt-out from the live-loop CPU monitor-wait park; no
-        /// environment variable can re-enable it. Without this flag, on the
-        /// live (real or external) clock the park turns on automatically when
-        /// the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64 WFE): it replaces the blocking wait with a shallow per-core
-        /// park (no deep idle state), cutting the wake latency after an idle
-        /// period at a small per-core power cost (and it suppresses the global
-        /// C-state cap). That automatic choice is tunable with
-        /// `CERULION_MONITOR_WAIT` and `CERULION_DOORBELL` (`"1"` forces it on,
-        /// `"0"` disables it), but only when this flag is absent. No effect on
-        /// other targets, where the loop blocks normally.
+        /// Hard opt-out from the live-loop monitor-wait park, on every target;
+        /// no environment variable can re-enable it. Without this flag, on the
+        /// live (real or external) clock the park is on by default everywhere.
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
+        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// per-core park (no deep idle state), cutting the wake latency after an
+        /// idle period at a small per-core power cost (and it suppresses the
+        /// global C-state cap); elsewhere it is a bounded sleep-recheck park,
+        /// never a busy-spin, and this flag restores the blocking wait there
+        /// too. The default is tunable with `CERULION_MONITOR_WAIT` and
+        /// `CERULION_DOORBELL` (`"1"` forces it on, `"0"` disables it;
+        /// `CERULION_MONITOR_WAIT=0` turns the park off on every target, and
+        /// `CERULION_DOORBELL=1` turns it back on only where a monitor-wait
+        /// primitive exists), but only when this flag is absent.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
         /// Keep this run on this machine: no network gateway, session,
@@ -1434,17 +1437,21 @@ pub enum GraphAction {
         /// `CERULION_CPU_DMA_LOCK_US=N`. Linux-only.
         #[arg(long = "no-cpu-dma-lock")]
         no_cpu_dma_lock: bool,
-        /// Hard opt-out from the live-loop CPU monitor-wait park; no
-        /// environment variable can re-enable it. Without this flag, on the
-        /// live (real or external) clock the park turns on automatically when
-        /// the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64 WFE): it replaces the blocking wait with a shallow per-core
-        /// park (no deep idle state), cutting the wake latency after an idle
-        /// period at a small per-core power cost (and it suppresses the global
-        /// C-state cap). That automatic choice is tunable with
-        /// `CERULION_MONITOR_WAIT` and `CERULION_DOORBELL` (`"1"` forces it on,
-        /// `"0"` disables it), but only when this flag is absent. No effect
-        /// under `--time-source virtual` (the poll loop never parks).
+        /// Hard opt-out from the live-loop monitor-wait park, on every target;
+        /// no environment variable can re-enable it. Without this flag, on the
+        /// live (real or external) clock the park is on by default everywhere.
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
+        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// per-core park (no deep idle state), cutting the wake latency after an
+        /// idle period at a small per-core power cost (and it suppresses the
+        /// global C-state cap); elsewhere it is a bounded sleep-recheck park,
+        /// never a busy-spin, and this flag restores the blocking wait there
+        /// too. The default is tunable with `CERULION_MONITOR_WAIT` and
+        /// `CERULION_DOORBELL` (`"1"` forces it on, `"0"` disables it;
+        /// `CERULION_MONITOR_WAIT=0` turns the park off on every target, and
+        /// `CERULION_DOORBELL=1` turns it back on only where a monitor-wait
+        /// primitive exists), but only when this flag is absent.
+        /// No effect under `--time-source virtual` (the poll loop never parks).
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
         /// Record the run to an MCAP bag.
