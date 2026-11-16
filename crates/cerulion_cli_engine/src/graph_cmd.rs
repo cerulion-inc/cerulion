@@ -7204,16 +7204,6 @@ pub fn graph_run(
                 .then(|| {
                     let dir = begin_flashback_plane(workspace_root, graph_name, runtime.config());
                     let topics = write_flashback_topics(&dir, graph_name)?;
-                    // Resolved INSIDE the closure so a run with
-                    // Flashback switched off reads nothing at all.
-                    // This arm hands the recorder no trace ring
-                    // (`ring_names: &[]` below), so the graph rides alone.
-                    let handoff = resolve_flashback_handoff(
-                        _run_descriptor
-                            .as_ref()
-                            .map(crate::run_dir::RunDescriptor::path),
-                        false,
-                    );
                     spawn_flashback_recorder(FlashbackSpawnSpec {
                         graph_name,
                         record_cpu,
@@ -7247,7 +7237,12 @@ pub fn graph_run(
                             .as_ref()
                             .and(capture_plane.as_ref())
                             .map(|(tag, _)| tag.as_str()),
-                        handoff: &handoff,
+                        // The spawn reads this directory inside this closure,
+                        // so a run with Flashback switched off reads nothing
+                        // at all.
+                        run_dir: _run_descriptor
+                            .as_ref()
+                            .map(crate::run_dir::RunDescriptor::path),
                         // By design, the monolith arms mint
                         // no trace ring. Their gating clock is
                         // WALL-driven (`live_gating_quantum: None`), so a trace
@@ -12780,10 +12775,6 @@ fn graph_run_supervisor(
             // the file-stem rule is exactly `config.identity()`.
             let dir = begin_flashback_plane(workspace_root, config.identity(), &config);
             let topics = write_flashback_topics(&dir, config.identity())?;
-            // The same handoff the monolith arm makes. `run_dir`
-            // is this deployment's run directory, threaded in by
-            // `graph_run` (`None` on a degraded run-directory write).
-            let handoff = resolve_flashback_handoff(run_dir, !flashback_ring_names.is_empty());
             spawn_flashback_recorder(FlashbackSpawnSpec {
                 graph_name: config.identity(),
                 record_cpu,
@@ -12822,7 +12813,10 @@ fn graph_run_supervisor(
                 // and a monolith run under a tag whose earlier run was
                 // multi-process.
                 state_tag: armed_tag.as_deref(),
-                handoff: &handoff,
+                // The same run context the monolith arm hands over. `run_dir`
+                // is this deployment's run directory, threaded in by
+                // `graph_run` (`None` on a degraded run-directory write).
+                run_dir,
                 // Only the rings a worker CONFIRMED it created, plus
                 // the departure ring.
                 ring_names: &flashback_ring_names,
@@ -18734,7 +18728,8 @@ struct FlashbackHandoff {
 /// spawn guard is killing the recorder anyway.
 ///
 /// `carries_trace` says whether the recorder is handed this run's scheduler
-/// trace rings. Where it is and the directory holds no readable
+/// trace rings; [`FlashbackSpawnSpec::handoff`] derives it from the rings the
+/// spawn hands over. Where it is and the directory holds no readable
 /// `recorder.json`, no `graph.yaml` is handed over either
 /// ([`crate::bag_cmd::RunArtifacts::graph_yaml_to_embed`]), so a capture is
 /// viewed rather than re-executed under assumed contract keys.
@@ -18805,12 +18800,15 @@ struct FlashbackSpawnSpec<'a> {
     /// in which case there is no ring to find and the recorder is not sent
     /// sweeping for one.
     state_tag: Option<&'a str>,
-    /// **The run context, so a capture describes the run it came
-    /// from.** See [`FlashbackHandoff`] — the recorder expects
-    /// these (`cerulion_bagd::capture::CaptureJob::attachments` is documented as
-    /// "the same attachments the continuous bag carries, so a flashback is as
-    /// self-describing as a recording").
-    handoff: &'a FlashbackHandoff,
+    /// **The run directory a capture's run context is read from, so a capture
+    /// describes the run it came from.** [`FlashbackSpawnSpec::handoff`]
+    /// resolves it into a [`FlashbackHandoff`] against
+    /// [`ring_names`](Self::ring_names); the recorder expects those artifacts
+    /// (`cerulion_bagd::capture::CaptureJob::attachments` is documented as "the
+    /// same attachments the continuous bag carries, so a flashback is as
+    /// self-describing as a recording"). `None` when no run directory was
+    /// written, which already logged its own line.
+    run_dir: Option<&'a Path>,
     /// **The run's SCHEDULER-TRACE rings, by resolved SHM name.**
     ///
     /// This is what makes a capture of a plain `graph run` RE-EXECUTABLE — the
@@ -18847,6 +18845,20 @@ struct FlashbackSpawnSpec<'a> {
     /// recording's bagd would. Consumed on Linux only (see
     /// `spawn_flashback_recorder`).
     record_cpu: RecordCpu,
+}
+
+#[cfg(unix)]
+impl FlashbackSpawnSpec<'_> {
+    /// What this recorder is handed out of [`run_dir`](Self::run_dir).
+    ///
+    /// Whether the recorder carries this run's trace is read off the same
+    /// [`ring_names`](Self::ring_names) its argv hands over, so the graph is
+    /// withheld beside a trace with no `recorder.json`
+    /// ([`resolve_flashback_handoff`]) on every spawn, from the one slice
+    /// that decides both.
+    fn handoff(&self) -> FlashbackHandoff {
+        resolve_flashback_handoff(self.run_dir, !self.ring_names.is_empty())
+    }
 }
 
 /// What `graph run` can truthfully say about its run when it prints its
@@ -19001,8 +19013,14 @@ mod recording_not_started_tests {
 /// continuous bag) but is still REQUIRED by `BagdArgs`; it is placed inside the
 /// flashback directory so that if the mode were ever lost the bag would still
 /// land somewhere deliberate rather than in the operator's CWD.
+///
+/// `handoff` is the run context the spawn resolved for this spec
+/// ([`FlashbackSpawnSpec::handoff`]).
 #[cfg(unix)]
-fn flashback_argv(spec: &FlashbackSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
+fn flashback_argv(
+    spec: &FlashbackSpawnSpec<'_>,
+    handoff: &FlashbackHandoff,
+) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
 
     let mut argv: Vec<OsString> = vec!["bagd".into()];
@@ -19034,18 +19052,18 @@ fn flashback_argv(spec: &FlashbackSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
     // Each is passed only when it was READABLE (see `resolve_flashback_handoff`):
     // bagd reads every `--attach` at startup and a missing file is a LOUD startup
     // failure, so an unconditional path would trade a THIN capture for NO WINDOW.
-    if let Some(p) = spec.handoff.graph_yaml.as_deref() {
+    if let Some(p) = handoff.graph_yaml.as_deref() {
         argv.push("--attach".into());
         argv.push(format!("{GRAPH_YAML_ATTACHMENT}:{}", p.display()).into());
     }
-    if let Some(p) = spec.handoff.env_json.as_deref() {
+    if let Some(p) = handoff.env_json.as_deref() {
         argv.push("--attach".into());
         argv.push(format!("{ENV_JSON_ATTACHMENT}:{}", p.display()).into());
     }
     // The host identity rides its OWN path-only flag, exactly as on the
     // `--record` path — the `__cerulion/` attachment namespace is reserved at
     // bagd's `--attach`, and bagd supplies the name.
-    if let Some(p) = spec.handoff.recorder_json.as_deref() {
+    if let Some(p) = handoff.recorder_json.as_deref() {
         argv.push("--recorder-json".into());
         argv.push(p.into());
     }
@@ -19175,7 +19193,7 @@ fn write_flashback_topics(dir: &Path, graph_name: &str) -> Option<std::path::Pat
 fn spawn_flashback_recorder(spec: FlashbackSpawnSpec<'_>) -> Option<ChildGuard> {
     use std::os::unix::process::CommandExt;
 
-    let argv = flashback_argv(&spec);
+    let argv = flashback_argv(&spec, &spec.handoff());
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -25819,23 +25837,26 @@ process_groups:
                 "/home/u/.cerulion/runs/demo-2a/recorder.json",
             )),
         };
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: Some("cer_run_0000000000000000000000000000002a"),
-            handoff: &handoff,
-            // The run's scheduler-trace rings — one worker ring the
-            // rank CONFIRMED it created, plus the departure ring.
-            ring_names: &[
-                "/cer_rg_0123456789abcdef".to_string(),
-                "/cer_rg_fedcba9876543210".to_string(),
-            ],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: Some("cer_run_0000000000000000000000000000002a"),
+                run_dir: None,
+                // The run's scheduler-trace rings: one worker ring the
+                // rank CONFIRMED it created, plus the departure ring.
+                ring_names: &[
+                    "/cer_rg_0123456789abcdef".to_string(),
+                    "/cer_rg_fedcba9876543210".to_string(),
+                ],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         let expected: Vec<OsString> = [
             "bagd",
@@ -25954,19 +25975,22 @@ process_groups:
     fn the_flashback_argv_passes_no_flag_for_an_artifact_it_was_not_handed() {
         use std::path::Path;
 
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: None,
-            handoff: &FlashbackHandoff::default(),
-            // A run that declined rings, or a shape that mints none.
-            ring_names: &[],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: None,
+                run_dir: None,
+                // A run that declined rings, or a shape that mints none.
+                ring_names: &[],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &FlashbackHandoff::default(),
+        );
         assert!(
             !argv.iter().any(|a| a == "--attach"),
             "a path bagd cannot read is a LOUD startup failure, so an absent artifact must pass \
@@ -26041,18 +26065,21 @@ process_groups:
             env_json: Some(PathBuf::from("/run/env.json")),
             recorder_json: Some(PathBuf::from("/run/recorder.json")),
         };
-        let window = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: Some(&tag),
-            handoff: &handoff,
-            ring_names: &[],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let window = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: Some(&tag),
+                run_dir: None,
+                ring_names: &[],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         // The `--attach` VALUES are `name:path` pairs; taking the name half of
         // each is what compares the two builders' spellings rather than their
@@ -26133,21 +26160,24 @@ process_groups:
             env_json: Some(write("env.json", "{}")),
             recorder_json: Some(write("recorder.json", r#"{"arch":"aarch64","os":"macos"}"#)),
         };
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: dir.path(),
-            topics_json_path: &topics_json,
-            iox2_config_path: None,
-            state_tag: Some("cer_run_0000000000000000000000000000002a"),
-            handoff: &handoff,
-            // The recorder must PARSE `--ring` on this path too — the
-            // always-on spawn hands them over, so a `--ring` the window-only
-            // mode rejected would fail the spawn rather than the trace.
-            ring_names: &["/cer_rg_0123456789abcdef".to_string()],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: dir.path(),
+                topics_json_path: &topics_json,
+                iox2_config_path: None,
+                state_tag: Some("cer_run_0000000000000000000000000000002a"),
+                run_dir: None,
+                // The recorder must PARSE `--ring` on this path too: the
+                // always-on spawn hands them over, so a `--ring` the window-only
+                // mode rejected would fail the spawn rather than the trace.
+                ring_names: &["/cer_rg_0123456789abcdef".to_string()],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         let cmd = cerulion_bagd::BagdArgs::augment_args(clap::Command::new("bagd"));
         let matches = cmd.try_get_matches_from(&argv).unwrap_or_else(|e| {
@@ -26289,43 +26319,102 @@ process_groups:
     /// judges them by, so the graph is not handed over and the capture can be
     /// viewed but not re-executed. Handed no ring, the recorder still gets the
     /// graph, and with `recorder.json` present it gets all three.
+    ///
+    /// Driven through the spec both spawns build, so whether the trace rides
+    /// is read off the `ring_names` the argv carries, and the argv the spawn
+    /// builds from that handoff is what is asserted.
     #[cfg(unix)]
     #[test]
     fn a_recorder_handed_the_trace_gets_no_graph_without_the_recorder_identity() {
+        use std::path::Path;
+
+        fn spec<'a>(run: &'a Path, ring_names: &'a [String]) -> FlashbackSpawnSpec<'a> {
+            FlashbackSpawnSpec {
+                graph_name: "cam",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.cam.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: None,
+                run_dir: Some(run),
+                ring_names,
+                run_id: Some(0x2a),
+            }
+        }
+        // The run context and trace rings the argv hands over, as
+        // `(flag, value)` pairs.
+        let context = |argv: &[std::ffi::OsString]| -> Vec<(String, String)> {
+            argv.windows(2)
+                .filter(|w| w[0] == "--attach" || w[0] == "--recorder-json" || w[0] == "--ring")
+                .map(|w| {
+                    (
+                        w[0].to_string_lossy().into_owned(),
+                        w[1].to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        };
+
         let dir = tempfile::tempdir().expect("tempdir");
         let run = dir.path().join("cam-2a");
         std::fs::create_dir_all(&run).expect("run dir");
         let put = |name: &str| std::fs::write(run.join(name), b"{}").expect("write artifact");
-        put(crate::run_dir::RUN_GRAPH_FILE);
-        put(crate::run_dir::RUN_ENV_FILE);
+        put("graph.yaml");
+        put("env.json");
+        let rings = vec![
+            "/cer_rg_0123456789abcdef".to_string(),
+            "/cer_rg_fedcba9876543210".to_string(),
+        ];
+        let graph = format!("graph.yaml:{}", run.join("graph.yaml").display());
+        let env = format!("env.json:{}", run.join("env.json").display());
 
+        let traced = spec(&run, &rings);
+        let handoff = traced.handoff();
         assert_eq!(
-            resolve_flashback_handoff(Some(&run), true),
+            handoff,
             FlashbackHandoff {
                 graph_yaml: None,
-                env_json: Some(run.join(crate::run_dir::RUN_ENV_FILE)),
+                env_json: Some(run.join("env.json")),
                 recorder_json: None,
             },
             "the trace rides, recorder.json does not: no graph"
         );
         assert_eq!(
-            resolve_flashback_handoff(Some(&run), false),
-            FlashbackHandoff {
-                graph_yaml: Some(run.join(crate::run_dir::RUN_GRAPH_FILE)),
-                env_json: Some(run.join(crate::run_dir::RUN_ENV_FILE)),
-                recorder_json: None,
-            },
+            context(&flashback_argv(&traced, &handoff)),
+            vec![
+                ("--attach".to_string(), env.clone()),
+                ("--ring".to_string(), rings[0].clone()),
+                ("--ring".to_string(), rings[1].clone()),
+            ],
+            "the argv carries the rings and the env, and no graph"
+        );
+
+        let untraced = spec(&run, &[]);
+        let handoff = untraced.handoff();
+        assert_eq!(
+            context(&flashback_argv(&untraced, &handoff)),
+            vec![
+                ("--attach".to_string(), graph.clone()),
+                ("--attach".to_string(), env.clone()),
+            ],
             "no trace rides: the graph is viewable and travels"
         );
 
         crate::run_dir::write_run_recorder(&run, b"{}").expect("recorder.json");
+        let traced = spec(&run, &rings);
+        let handoff = traced.handoff();
         assert_eq!(
-            resolve_flashback_handoff(Some(&run), true),
-            FlashbackHandoff {
-                graph_yaml: Some(run.join(crate::run_dir::RUN_GRAPH_FILE)),
-                env_json: Some(run.join(crate::run_dir::RUN_ENV_FILE)),
-                recorder_json: Some(run.join(crate::run_dir::RUN_RECORDER_FILE)),
-            },
+            context(&flashback_argv(&traced, &handoff)),
+            vec![
+                ("--attach".to_string(), graph),
+                ("--attach".to_string(), env),
+                (
+                    "--recorder-json".to_string(),
+                    run.join("recorder.json").display().to_string()
+                ),
+                ("--ring".to_string(), rings[0].clone()),
+                ("--ring".to_string(), rings[1].clone()),
+            ],
             "with recorder.json the trace and its graph travel together"
         );
     }
@@ -34947,7 +35036,7 @@ process_groups:
             "the monolith writes recorder.json before its recording declares the ring"
         );
         assert!(
-            write < pos(mono, "resolve_flashback_handoff("),
+            write < pos(mono, "spawn_flashback_recorder("),
             "…and before its window recorder reads the directory"
         );
         assert!(
