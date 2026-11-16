@@ -49361,6 +49361,182 @@ fn a_verify_of_a_driver_s_frames_two_processes_feed_is_deterministic() {
     }
 }
 
+/// The topic a camera in a process of its own shares with two writers that
+/// never publish, in two others.
+const RI_DRV4_BUS: &str = "/ridrv4/bus";
+/// The topic two writers in the second process share, one of them a period
+/// writer.
+const RI_DRV4_AUX: &str = "/ridrv4/aux";
+
+/// The camera (`w1`, a driver), two writers that never publish (`w2` and
+/// `w3`) and a per-message sink (`s2`) on one `multi_publisher_topics`
+/// topic, and a period writer (`a`, writer 5) and a writer that never
+/// publishes (`b`) on a second one no node reads.
+fn ri_drv4_yaml() -> &'static str {
+    "name: ridrv4\nprefix: ridrv4\nmulti_publisher_topics:\n  - /ridrv4/bus\n  - /ridrv4/aux\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/bus\n\
+     \x20 - id: w2\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/bus\n\
+     \x20 - id: s2\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /ridrv4/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/aux\n"
+}
+
+/// The `ri_drv4_yaml` graph, the camera's device attached when `connected`.
+fn ri_drv4_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let silent = || -> Box<dyn NodeEntry> {
+        Box::new(DrvSilentWriterNodeEntry::with_state(
+            DrvSilentWriterNode::default(),
+        ))
+    };
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        ("w2", silent()),
+        ("w3", silent()),
+        (
+            "s2",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_DRV3_SINK2,
+                ..Default::default()
+            })),
+        ),
+        (
+            "a",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 5.0,
+                ..Default::default()
+            })),
+        ),
+        ("b", silent()),
+    ])
+}
+
+/// `w2` and `s2` in the first process, `w3`, `a` and `b` in the second, the
+/// camera in the third.
+fn ri_drv4_rank_of(id: &str) -> u32 {
+    match id {
+        "w1" => 2,
+        "w3" | "a" | "b" => 1,
+        _ => 0,
+    }
+}
+
+/// The recorded frames of a camera in a process of its own, which a process
+/// that attributes the camera's topic frame by frame feeds from the bag to a
+/// sink, are counted where another process cannot attribute the topic. The
+/// bus's other writers, `w2` in the first process and `w3` in the second,
+/// never publish, so the recorded bus holds the camera's `n` frames alone,
+/// each labelled with the camera, and the first process, in a `--verify` of
+/// a recording below trace format 8, injects them for its sink. The
+/// verifier's record budget is the bus's `n` frames: the first process's one
+/// `multi_publisher_topics` topic fits it, so it attributes the bus and
+/// leaves the camera's frames it injects out of `w2`'s partition, while the
+/// second's two topics, `2n` frames, do not, so it counts the bus as one
+/// stream, which holds no frame. The camera's frames the first process
+/// injected are counted once, `n` against the bus's `n`, so the unchanged
+/// candidate passes with both topics checked and credited, where counting
+/// them nowhere failed the bus as `n` missing frames.
+#[test]
+#[serial]
+fn a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_cannot() {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        ri_drv4_yaml(),
+        || ri_drv4_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(
+        1,
+        (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        ri_frames_by_writer(&rec, RI_DRV4_BUS),
+        want,
+        "PREMISE: the recorded bus holds the camera's frames alone"
+    );
+    let mut want_aux = BTreeMap::new();
+    want_aux.insert(5, ri_period_frames(5.0));
+    assert_eq!(
+        ri_frames_by_writer(&rec, RI_DRV4_AUX),
+        want_aux,
+        "PREMISE: the aux topic holds a's frames alone"
+    );
+    let camera = real_publisher_id(&rec, "w1", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..n)
+        .map(|i| {
+            (
+                RI_DRV4_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                camera,
+            )
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_drv4_format7.mcap");
+    ri_ranked_bag_with_labels(
+        &rec,
+        &bag,
+        ri_drv4_rank_of,
+        3,
+        &label_rows,
+        ri_recorder_json_at(7),
+    );
+    let (outcome, _) = {
+        let _budget = replay_engine::override_frame_index_record_budget(n);
+        ri_replay(
+            &bag,
+            || ri_drv4_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+        )
+    };
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::BestEffort { .. }
+        ),
+        "PREMISE: no read is fed by identity: {:?}",
+        outcome.read_identity
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![RI_DRV4_BUS.to_string()],
+            ..drv_inputs(&["w1"], &[], &[RI_DRV4_BUS], &[], &[])
+        }),
+        "PREMISE: the second process does not attribute the bus"
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "nothing is declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+    assert!(outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 0, "exit 0");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 2),
+        "both topics are checked and credited"
+    );
+}
+
 /// The slow-writer bag that labels no frame, `w2`, the slow writer, in the
 /// second process, recorded from the unchanged graph with the frame of `w2`'s
 /// last fire lost.

@@ -180,9 +180,9 @@ published frames of the topic, and it fed none of the topic's recorded frames
 to its nodes, its stream is compared with every recorded frame of the topic. Otherwise the
 frames such processes or executor units published are counted together
 against every recorded frame of the topic that no attributed writer holds,
-and, once, so are the recorded frames of a driver none of them runs that they
-feed from the bag to their nodes, when the bag labels each frame with its
-writer and every frame carries a wire header.
+and, once, so are the recorded frames of a driver none of them runs that any
+process or executor unit feeds from the bag to its nodes, when the bag labels
+each frame with its writer and every frame carries a wire header.
 One of them that, in a replay that does not feed reads by their recorded
 identity, feeds its nodes the other writers' recorded frames compares its
 stream, the frames it feeds included, with every recorded frame of the topic.

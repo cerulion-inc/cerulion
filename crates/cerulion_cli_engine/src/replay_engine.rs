@@ -1147,8 +1147,8 @@ pub struct DriverInputsReport {
     /// partition holds against the frames their own writers published, which
     /// hold a replayed driver's frames where the driver runs in such a pass,
     /// and, once each, the recorded frames of a driver none of them runs that
-    /// their injectors re-published, where the injection names the writer of
-    /// each frame it re-publishes. Such a pass's frames are also compared byte
+    /// any pass's injector re-published, where the injection names the writer
+    /// of each frame it re-publishes. Such a pass's frames are also compared byte
     /// for byte with every recorded frame where it is the only pass whose own
     /// writers published frames of the topic and it injected none, or where it
     /// injected the topic itself; a pass of its own writers' frames alone
@@ -25391,10 +25391,11 @@ struct SplitPasses<'a> {
     /// The passes that captured the topic as one stream, in pass order.
     one_stream: Vec<&'a CaptureSummary>,
     /// The recorded frames of the drivers no one-stream pass runs that the
-    /// one-stream passes' injectors re-published, each driver's counted once,
-    /// as the most any one of them re-published
+    /// passes' injectors re-published, a partitioned pass's included, each
+    /// driver's counted once, as the most any one of them re-published
     /// ([`CaptureSummary::injected_drivers`]). No pass's own writers publish
-    /// them, and every recorded frame no partition holds counts them.
+    /// them, no partition holds them, and every recorded frame no partition
+    /// holds counts them.
     driver_copies: usize,
 }
 
@@ -25405,9 +25406,12 @@ impl<'a> SplitPasses<'a> {
             all.iter().partition(|s| s.partition_counts.is_some());
         // A driver a one-stream pass runs is counted by that pass's own
         // writers' frames, so another pass's copies of it are not counted.
+        // A partitioned pass leaves its injector's frames out of every
+        // partition, so its copies of a driver count here like a one-stream
+        // pass's.
         let stream_ranks: BTreeSet<u32> = one_stream.iter().map(|s| s.rank).collect();
         let mut copies: BTreeMap<&str, usize> = BTreeMap::new();
-        for s in &one_stream {
+        for s in all {
             for (driver, &n) in &s.injected_drivers {
                 if driver_rank(driver).is_some_and(|rank| stream_ranks.contains(&rank)) {
                     continue;
@@ -25581,8 +25585,8 @@ enum SplitCounts {
 /// count: every recorded frame no partition holds, a driver's included,
 /// against the frames their own writers published, which leaves out the
 /// frames their injectors re-published ([`CaptureSummary::own_replayed`]),
-/// and the recorded frames of the drivers none of them runs that their
-/// injectors re-published, counted once ([`SplitPasses::driver_copies`]). A
+/// and the recorded frames of the drivers none of them runs that any pass's
+/// injector re-published, counted once ([`SplitPasses::driver_copies`]). A
 /// pass that injected the topic captured its own writers' frames among the
 /// recorded frames of every other writer, so its one stream is compared with
 /// every recorded frame byte for byte. `counts` says whether those count and
@@ -37291,11 +37295,12 @@ mod capture_partition_tests {
     }
 
     /// A split topic's one-stream count takes the recorded frames of a driver
-    /// no one-stream pass runs that their injectors re-published once, as the
-    /// most one of them re-published, and none of a driver a one-stream pass
-    /// runs, whose own writers' frames count it. `cam` writes 3 of the 9
-    /// recorded frames, `w2` in rank 0 and `w3` in rank 1 3 each, and each
-    /// rank injects the other's 3 and `cam`'s. Hand oracles.
+    /// no one-stream pass runs that any pass's injector re-published once, as
+    /// the most one of them re-published, a partitioned pass's copies
+    /// included, and none of a driver a one-stream pass runs, whose own
+    /// writers' frames count it. `cam` writes 3 of the 9 recorded frames, `w2`
+    /// in rank 0 and `w3` in rank 1 3 each, and each rank injects the other's
+    /// 3 and `cam`'s. Hand oracles.
     #[test]
     fn a_split_topic_counts_a_driver_s_injected_frames_once() {
         let judge = |summaries: &[CaptureSummary], cam: Option<u32>| -> SplitRows {
@@ -37360,6 +37365,23 @@ mod capture_partition_tests {
                 None
             ),
             "an injection that names no frame's writer"
+        );
+        // Rank 0 partitions `w2`'s 3 and injects `w3`'s 3 and `cam`'s 3, which
+        // its partitions leave out; rank 1 captures `w3`'s 3 alone, unjudged.
+        let beside_a_partition = [
+            with_drivers(
+                CaptureSummary {
+                    injected: 6,
+                    ..partitioned_in(0, &[("w2/out", 3, 3, None)])
+                },
+                &[("cam/out", 3)],
+            ),
+            one_stream(1, 3, 0, None),
+        ];
+        assert_eq!(
+            judge(&beside_a_partition, Some(2)),
+            (vec![], Some((vec![1], vec![]))),
+            "a partitioned pass's copies"
         );
     }
 

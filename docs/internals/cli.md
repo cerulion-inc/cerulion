@@ -223,14 +223,14 @@ Rules that must not drift:
   recorded frame, its rank the tail window; any other mix is `SplitPasses`, which
   `push_split_violations` judges: the partitioned passes per writer, the rest counted together
   (the recorded frames no partition holds against their `own_replayed` and, once each, the
-  recorded frames of a driver none of them runs that their injectors re-published,
-  `SplitPasses::driver_copies`, which an injector counts by frame index where the injection
-  names each frame's writer, `DriverCopies` and `CaptureSummary::injected_drivers`), an
-  injecting pass's one stream compared with every recorded frame, and a pass of its own
-  writers' frames alone, beside another whose writers published frames, returned as
-  `SplitUnjudged`, which `assemble_outcome`
-  DECLINES (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else
-  on the topic failed. The ragged-tail frame tolerance (`tail_extra_ranks`) bounds a partitioned
+  recorded frames of a driver none of them runs that any pass's injector re-published, a
+  partitioned pass's included, `SplitPasses::driver_copies`, which an injector counts by frame
+  index where the injection names each frame's writer, `DriverCopies` and
+  `CaptureSummary::injected_drivers`), an injecting pass's one stream compared with every
+  recorded frame, and a pass of its own writers' frames alone, beside another whose writers
+  published frames, returned as `SplitUnjudged`, which `assemble_outcome` DECLINES
+  (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else on the
+  topic failed. The ragged-tail frame tolerance (`tail_extra_ranks`) bounds a partitioned
   topic writer by writer, each writer's extra frames within its rank's tail width times the most
   frames it published in one recorded step (`PartitionCounts::burst`, `writer_bursts`), and a
   one-stream topic by the sum of its ranks' windows at the topic's largest one-step burst
