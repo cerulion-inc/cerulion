@@ -450,6 +450,13 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
          are reported against `LEGAL_OUTPUT_KEYS` by the same walk",
     ),
     (
+        "cerulion_core/src/graph/config.rs",
+        "InputBackpressure",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: a unit-variant enum (`block` / `drop_oldest`), so \
+         serde's variant matcher already rejects an unknown VALUE loudly",
+    ),
+    (
         "cerulion_core/src/graph/node.rs",
         "BackpressureJson",
         Classification::ExemptWithReason,

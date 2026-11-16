@@ -131,6 +131,8 @@ pub mod iceoryx_logger;
 // feature) became its first cross-platform consumer. Pure; `os_sync` re-exports
 // it for its own two switches.
 pub(crate) mod kill_switch;
+#[doc(hidden)]
+pub mod oracle_mutant;
 // The env-gated per-stage latency probe shared by the desk daemons
 // (`cerulion-netd`'s ingress + `cerulion-vizd`'s poll/render path). Inert unless
 // `CERULION_H264_LAT_PROBE` is set.
@@ -845,7 +847,9 @@ pub mod wire;
 ///   **OPERATOR COST: every node crate must be rebuilt against this core.**
 ///
 /// Compiler-independent node table; legacy Rust boundaries require a rebuild.
-pub const CERULION_ABI_VERSION: u32 = 32;
+///
+/// v33: host-side per-consumer `block` credit slots; the stable node table is unchanged.
+pub const CERULION_ABI_VERSION: u32 = 33;
 
 // Re-export commonly used types
 #[cfg(unix)]

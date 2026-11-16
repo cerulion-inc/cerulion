@@ -202,6 +202,7 @@ fn context_b_graph(
             inputs: vec![InputDef {
                 name: "scan".to_string(),
                 source: SCAN_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

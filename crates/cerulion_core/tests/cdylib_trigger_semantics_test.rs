@@ -176,6 +176,7 @@ fn data_trigger_cdylib_fires_once_per_frame_zero_on_silence() {
         vec![InputDef {
             name: "trigger_in".to_string(),
             source: TOPIC.to_string(),
+            ..Default::default()
         }],
         "ctsdt",
         8,
@@ -241,10 +242,12 @@ fn build_sync(prefix: &str, topic_cam: &str, topic_imu: &str) -> GraphRuntime {
                 InputDef {
                     name: "cam".to_string(),
                     source: topic_cam.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "imu".to_string(),
                     source: topic_imu.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![out_def("fused")],

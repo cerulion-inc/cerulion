@@ -32,6 +32,7 @@ fn meta_input(name: &str, trigger: bool) -> InputMeta {
         depth: 1,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     }
 }
@@ -72,6 +73,7 @@ fn graph_config(node_id: &str, source_id: Option<&str>) -> GraphConfig {
                 vec![cerulion_core::graph::config::InputDef {
                     name: "data".to_string(),
                     source: format!("{src}/out"),
+                    ..Default::default()
                 }]
             })
             .unwrap_or_default(),
