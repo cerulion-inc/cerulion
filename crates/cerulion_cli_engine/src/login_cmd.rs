@@ -2068,16 +2068,33 @@ mod tests {
         AfterReturn,
     }
 
-    /// The refresh the client in [`refresh_after_busy_store`] runs. Both are
-    /// bounded at [`FIXTURE_CEILING`] on the clock the fake account service
-    /// moves.
+    /// The refresh the client in [`refresh_after_busy_store`] runs.
     #[cfg(unix)]
     enum BusyRefresh {
-        /// [`refresh_session_with_settlement`] with this settlement window.
+        /// [`refresh_session_with_settlement`] with this settlement window,
+        /// bounded at [`FIXTURE_CEILING`] on the moved clock.
         Settling(Duration),
         /// [`refresh_session_until`], the entry both public wrappers call,
-        /// which picks the settlement budget itself.
+        /// bounded at [`FIXTURE_CEILING`] on the moved clock. It picks the
+        /// settlement budget itself.
         Shipped,
+        /// The public [`refresh_session_if_stale`]: no request deadline, on the
+        /// monotonic clock.
+        Unbounded,
+    }
+
+    /// The stale pair the busy-store fixture seeds: its refresh token is the
+    /// single-use one the fake account service accepts.
+    #[cfg(unix)]
+    fn busy_store_seeded_pair() -> AuthState {
+        AuthState {
+            account_id: "publication-account".into(),
+            session_token: "original-session".into(),
+            refresh_token: "single-use-refresh".into(),
+            expires_at_ns: 1,
+            logged_in_ever: true,
+            role: None,
+        }
     }
 
     /// The bound on every wait in the busy-store fixture. Each step ends on a
@@ -2092,11 +2109,11 @@ mod tests {
     const CLOCK_JUMP: Duration = Duration::from_secs(3_600);
 
     /// Runs `refresh` on a stale session while a peer holds the credential
-    /// store. The refresh reads a clock the fake account service moves forward
-    /// by [`CLOCK_JUMP`] before it sends the rotated pair, so the request
-    /// deadline has passed when the client publishes or retires that pair. The
-    /// peer writes `replacement`, if any, once the service has answered, and
-    /// releases the store as `release` says.
+    /// store. A bounded refresh reads a clock the fake account service moves
+    /// forward by [`CLOCK_JUMP`] before it sends the rotated pair, so the
+    /// request deadline has passed when the client publishes or retires that
+    /// pair. The peer writes `replacement`, if any, once the service has
+    /// answered, and releases the store as `release` says.
     #[cfg(unix)]
     fn refresh_after_busy_store(
         replacement: Option<AuthState>,
@@ -2110,18 +2127,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("CERULION_HOME", directory.path().to_str().unwrap());
         let path = directory.path().join("auth.json");
-        auth::write_to(
-            &path,
-            &AuthState {
-                account_id: "publication-account".into(),
-                session_token: "original-session".into(),
-                refresh_token: "single-use-refresh".into(),
-                expires_at_ns: 1,
-                logged_in_ever: true,
-                role: None,
-            },
-        )
-        .unwrap();
+        auth::write_to(&path, &busy_store_seeded_pair()).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let _service = EnvGuard::set(
             ACCOUNT_SERVICE_ENV,
@@ -2247,6 +2253,7 @@ mod tests {
                 refresh_session_with_settlement(Some(deadline), &now, settlement)
             }
             BusyRefresh::Shipped => refresh_session_until(Some(deadline), &now),
+            BusyRefresh::Unbounded => refresh_session_if_stale(),
         };
         client_returned.store(true, Ordering::Release);
         // A peer that released the store at the rotation has dropped its receiver.
@@ -2351,17 +2358,34 @@ mod tests {
             .parse()
             .unwrap();
         assert!((1..=1_000).contains(&waited_ms), "{error}");
+        assert_eq!(result.stored, busy_store_seeded_pair());
         assert_eq!(
-            result.stored,
-            AuthState {
-                account_id: "publication-account".into(),
-                session_token: "original-session".into(),
-                refresh_token: "single-use-refresh".into(),
-                expires_at_ns: 1,
-                logged_in_ever: true,
-                role: None,
-            }
+            result.served.first(),
+            Some(&"refresh"),
+            "the store wait follows the exchange"
         );
+    }
+
+    /// While a peer holds the store, the public unbounded refresh waits for it
+    /// exactly the settlement budget, as its refusal reports: a zero wait
+    /// reports 0ms, and the HTTP timeout 30000ms. The original pair stays.
+    #[test]
+    #[cfg(unix)]
+    fn an_unbounded_refresh_stops_waiting_for_a_busy_store_at_the_settlement_budget() {
+        let result =
+            refresh_after_busy_store(None, BusyRefresh::Unbounded, StoreRelease::AfterReturn);
+        let error = result
+            .refreshed
+            .expect_err("a store held past the settlement budget refuses the publication")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "could not persist the refreshed session: another Cerulion process is writing {} and did not finish within 1000ms",
+                result.auth_path.display()
+            )
+        );
+        assert_eq!(result.stored, busy_store_seeded_pair());
         assert_eq!(
             result.served.first(),
             Some(&"refresh"),
