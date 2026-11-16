@@ -1065,7 +1065,7 @@ fn revoke_session_with_timeout(state: &AuthState, timeout: Duration) -> CliResul
 /// The e2e
 /// (`stale_session_refreshes_against_the_real_service`) is its live proof.
 pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
-    refresh_session_until(None, &std::time::Instant::now, REFRESH_SETTLEMENT_BUDGET)
+    refresh_session_until(None, &std::time::Instant::now)
 }
 
 /// Bound refresh-lock acquisition and the HTTP exchange by `budget`.
@@ -1076,7 +1076,6 @@ pub fn refresh_session_if_stale_within(budget: Duration) -> CliResult<Option<Aut
     refresh_session_until(
         Some(std::time::Instant::now() + budget),
         &std::time::Instant::now,
-        REFRESH_SETTLEMENT_BUDGET,
     )
 }
 
@@ -1097,11 +1096,20 @@ fn refresh_remaining(
     deadline.map_or(fallback, |deadline| deadline.saturating_duration_since(now))
 }
 
-/// The refresh behind both public wrappers. Every budget is read off `now`, and
-/// a bounded refresh gives publishing or retiring the rotated pair `settlement`
-/// from the moment the exchange answered. The wrappers pass the monotonic clock
-/// and [`REFRESH_SETTLEMENT_BUDGET`].
+/// The refresh both public wrappers call: [`refresh_session_with_settlement`]
+/// with [`REFRESH_SETTLEMENT_BUDGET`]. The wrappers pass the monotonic clock.
 fn refresh_session_until(
+    deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
+) -> CliResult<Option<AuthState>> {
+    refresh_session_with_settlement(deadline, now, REFRESH_SETTLEMENT_BUDGET)
+}
+
+/// Every budget is read off `now`. The store wait for publishing or retiring
+/// the rotated pair is `settlement`; for a bounded refresh it runs from the
+/// moment the exchange answered, and a revoke after a superseded publication
+/// spends what is left of it.
+fn refresh_session_with_settlement(
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
     settlement: Duration,
@@ -2060,6 +2068,18 @@ mod tests {
         AfterReturn,
     }
 
+    /// The refresh the client in [`refresh_after_busy_store`] runs. Both are
+    /// bounded at [`FIXTURE_CEILING`] on the clock the fake account service
+    /// moves.
+    #[cfg(unix)]
+    enum BusyRefresh {
+        /// [`refresh_session_with_settlement`] with this settlement window.
+        Settling(Duration),
+        /// [`refresh_session_until`], the entry both public wrappers call,
+        /// which picks the settlement budget itself.
+        Shipped,
+    }
+
     /// The bound on every wait in the busy-store fixture. Each step ends on a
     /// signal from the step before it, so only a wedged step reaches this.
     #[cfg(unix)]
@@ -2071,17 +2091,16 @@ mod tests {
     #[cfg(unix)]
     const CLOCK_JUMP: Duration = Duration::from_secs(3_600);
 
-    /// Runs a bounded refresh of a stale session while a peer holds the
-    /// credential store. The refresh reads a clock the fake account service
-    /// moves forward by [`CLOCK_JUMP`] before it sends the rotated pair, so the
-    /// request deadline has passed when the client publishes or retires that
-    /// pair, and the store wait for either is bounded by `settlement`. The peer
-    /// writes `replacement`, if any, once the service has answered, and releases
-    /// the store as `release` says.
+    /// Runs `refresh` on a stale session while a peer holds the credential
+    /// store. The refresh reads a clock the fake account service moves forward
+    /// by [`CLOCK_JUMP`] before it sends the rotated pair, so the request
+    /// deadline has passed when the client publishes or retires that pair. The
+    /// peer writes `replacement`, if any, once the service has answered, and
+    /// releases the store as `release` says.
     #[cfg(unix)]
     fn refresh_after_busy_store(
         replacement: Option<AuthState>,
-        settlement: Duration,
+        refresh: BusyRefresh,
         release: StoreRelease,
     ) -> BusyRefreshResult {
         use std::io::{BufRead, BufReader, Read, Write};
@@ -2223,7 +2242,12 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(client_clock.load(Ordering::SeqCst))
         };
         let deadline = now() + FIXTURE_CEILING;
-        let refreshed = refresh_session_until(Some(deadline), &now, settlement);
+        let refreshed = match refresh {
+            BusyRefresh::Settling(settlement) => {
+                refresh_session_with_settlement(Some(deadline), &now, settlement)
+            }
+            BusyRefresh::Shipped => refresh_session_until(Some(deadline), &now),
+        };
         client_returned.store(true, Ordering::Release);
         // A peer that released the store at the rotation has dropped its receiver.
         let _ = returned.send(());
@@ -2249,7 +2273,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_successful_bounded_refresh_persists_rotated_tokens_after_the_request_deadline() {
-        let result = refresh_after_busy_store(None, FIXTURE_CEILING, StoreRelease::AfterRotation);
+        let result = refresh_after_busy_store(
+            None,
+            BusyRefresh::Settling(FIXTURE_CEILING),
+            StoreRelease::AfterRotation,
+        );
         let refreshed = result
             .refreshed
             .unwrap()
@@ -2283,7 +2311,7 @@ mod tests {
         };
         let result = refresh_after_busy_store(
             Some(signed_out.clone()),
-            FIXTURE_CEILING,
+            BusyRefresh::Settling(FIXTURE_CEILING),
             StoreRelease::AfterRotation,
         );
         assert_eq!(result.refreshed.unwrap(), None);
@@ -2299,14 +2327,15 @@ mod tests {
     }
 
     /// While a peer holds the store past the settlement budget, the store wait
-    /// ends at that budget. The wait is measured from the reply: one taken
-    /// from the passed request deadline reports 0ms, and one longer than the
-    /// shipped budget reports more than 1000ms. The original pair stays.
+    /// of the entry both public wrappers call ends at that budget. The wait is
+    /// measured from the reply: a zero wait, or one taken from the passed
+    /// request deadline, reports 0ms, and one longer than the shipped budget
+    /// reports more than 1000ms. The original pair stays.
     #[test]
     #[cfg(unix)]
     fn a_bounded_refresh_stops_waiting_for_a_busy_store_at_the_settlement_budget() {
         let result =
-            refresh_after_busy_store(None, REFRESH_SETTLEMENT_BUDGET, StoreRelease::AfterReturn);
+            refresh_after_busy_store(None, BusyRefresh::Shipped, StoreRelease::AfterReturn);
         let error = result
             .refreshed
             .expect_err("a store held past the settlement budget refuses the publication")
