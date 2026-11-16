@@ -609,11 +609,12 @@ pub struct NodeDecl {
     /// time), so a `Period` node carrying one is a declaration this module
     /// judges on the Period rule alone.
     pub throttle_ns: Option<u64>,
-    /// Does this node produce a topic that every consumer in its rank reads
-    /// with `backpressure = block`?
+    /// Does this node produce a topic that a `block` input in its rank reads,
+    /// whatever the topic's other consumers declare?
     ///
     /// The rank's runtime installs a pre-fire check on every producer of such
-    /// a topic (`graph/runtime.rs`, the producer block edges), and the check
+    /// a topic (`graph/runtime.rs`, the producer block edges, by
+    /// `TopicFlow::holds_its_producers`), and the check
     /// holds the node's fire while a consumer's queue is at its declared
     /// depth. It runs after the step's trigger drain has popped, and the
     /// recording keeps no record of its answer, so a step can pop a trigger

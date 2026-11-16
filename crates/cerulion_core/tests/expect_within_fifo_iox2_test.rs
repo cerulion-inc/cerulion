@@ -118,6 +118,7 @@ fn trigger_input(expect_within_ms: Option<u64>) -> InputMeta {
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms,
+        accumulate: false,
         consume: Default::default(),
     }
 }
@@ -164,6 +165,7 @@ fn consumer_only_graph(prefix: &str) -> GraphConfig {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -205,6 +207,7 @@ fn producer_consumer_graph(prefix: &str, producer_type: &str) -> GraphConfig {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -765,6 +768,7 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
                 depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(20),
+                accumulate: false,
                 consume: Default::default(),
             },
             InputMeta {
@@ -774,6 +778,7 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
                 depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(30),
+                accumulate: false,
                 consume: Default::default(),
             },
         ],
@@ -836,10 +841,12 @@ fn a_non_trigger_input_on_a_data_node_is_not_suppressed() {
                     InputDef {
                         name: "trig".to_string(),
                         source: "prod/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "ctx".to_string(),
                         source: CTX_TOPIC.to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

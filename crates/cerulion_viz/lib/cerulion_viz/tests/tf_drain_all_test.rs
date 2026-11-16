@@ -141,6 +141,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
             depth: DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }],
         vec![],
@@ -191,6 +192,7 @@ fn drain_all_consumer_captures_every_queued_tf_frame() {
             inputs: vec![InputDef {
                 name: "tf".to_string(),
                 source: TF_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
