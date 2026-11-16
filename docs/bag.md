@@ -147,11 +147,14 @@ driver's included, the way the next paragraph describes for a process or
 executor unit that cannot attribute the frames. A driver's frames are among
 those compared only where the driver runs beside another writer of the topic,
 its replayed frames, or where one that runs another writer feeds the driver's
-recorded frames from the bag to its nodes, so the topic fails (exit 1) where
-neither holds them. Where a driver's frames and another writer's are published in one
-process or executor unit, one stream cannot tell their sequences apart, so the
-replay stops (exit 5) once a frame skips a sequence the recording holds, and
-otherwise the topic fails (exit 1). Its verdict `NOTE:` line says the topic
+recorded frames from the bag to its nodes. Those fed frames are counted where
+it is the only one that runs a writer of the topic other than a driver, or
+where the bag labels each frame with its writer and every frame carries a wire
+header; where the count leaves the driver's recorded frames out, the topic
+fails (exit 1). Where a driver's frames and another writer's are published in
+one process or executor unit, one stream cannot tell their sequences apart, so
+the replay stops (exit 5) once a frame skips a sequence the recording holds,
+and otherwise the topic fails (exit 1). Its verdict `NOTE:` line says the topic
 was compared over every recorded frame, and `driver_inputs.unattributed_topics`
 names it.
 
@@ -179,7 +182,7 @@ frames such processes or executor units published are counted together
 against every recorded frame of the topic that no attributed writer holds,
 and, once, so are the recorded frames of a driver none of them runs that they
 feed from the bag to their nodes, when the bag labels each frame with its
-writer.
+writer and every frame carries a wire header.
 One of them that, in a replay that does not feed reads by their recorded
 identity, feeds its nodes the other writers' recorded frames compares its
 stream, the frames it feeds included, with every recorded frame of the topic.
