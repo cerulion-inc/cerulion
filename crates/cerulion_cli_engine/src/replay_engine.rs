@@ -18323,9 +18323,9 @@ struct PartitionCounts {
     replayed: usize,
     byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
     /// The most frames this writer published in one recorded step: the
-    /// longest run of equal wire timestamps among its own recorded frames in
-    /// file order ([`writer_bursts`]), 0 for a writer the recording does not
-    /// carry. The ragged-tail window of the writer is its rank's tail width
+    /// longest run of equal wire timestamps among its own recorded frames of
+    /// the replayed window, in file order ([`writer_bursts`]), 0 for a writer
+    /// the recording does not carry. The ragged-tail window of the writer is its rank's tail width
     /// times this ([`tail_extra_ranks`]).
     burst: usize,
 }
