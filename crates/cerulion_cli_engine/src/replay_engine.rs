@@ -1116,14 +1116,20 @@ pub struct ReplayOutcome {
 }
 
 /// The topics a replay took as recorded inputs because an `external` (driver)
-/// node writes them ([`ReplayOutcome::driver_inputs`]). A bag records no node's
-/// trigger policy, so the driver set is the REPLAYED build's: a node this build
-/// declares `external` is named here, and its outputs are inputs, whatever
-/// policy it recorded under. Each topic list is in graph order.
+/// node writes them ([`ReplayOutcome::driver_inputs`]). A recording stamps
+/// each node's driver flag, and the replayed build must declare the same
+/// drivers or the replay is refused; a recording made before the stamp takes
+/// the replayed build's declaration, and [`Self::declared_by`] says which.
+/// Each topic list is in graph order.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DriverInputsReport {
-    /// Every node the replayed build declares `external`, in id order.
+    /// Every driver node, in id order.
     pub nodes: Vec<String>,
+    /// Where [`Self::nodes`] came from: `recording` (the recording's
+    /// `node_external` stamp, which the replayed build matches) or
+    /// `replayed_build` (a recording made before the stamp, so the build's
+    /// own declaration).
+    pub declared_by: DriverSetSource,
     /// The topics only drivers write: recorded inputs, neither compared nor
     /// counted in `topics_checked`, but for one the record-health stamp marks
     /// lossy, which is a `record-side-tap-loss` violation on its own topic.
@@ -1192,11 +1198,15 @@ pub fn render_driver_input_lines(
     topics_checked: usize,
 ) -> Vec<String> {
     let nodes = report.nodes.join(", ");
+    let declared = match report.declared_by {
+        DriverSetSource::Recording => "as the recording declares them",
+        DriverSetSource::ReplayedBuild => "as the replayed build declares them",
+    };
     let mut lines = Vec::new();
     if !report.input_topics.is_empty() {
         lines.push(format!(
             "NOTE: {} topic(s) only external (driver) nodes write are recorded inputs and were \
-             NOT compared (driver nodes, as the replayed build declares them: {nodes}): {}",
+             NOT compared (driver nodes, {declared}: {nodes}): {}",
             report.input_topics.len(),
             report.input_topics.join(", ")
         ));
@@ -1210,8 +1220,7 @@ pub fn render_driver_input_lines(
     if !attributed.is_empty() {
         lines.push(format!(
             "NOTE: {} topic(s) an external (driver) node shares with other writers were \
-             compared over the other writers' frames only (driver nodes, as the replayed build \
-             declares them: {nodes}): {}",
+             compared over the other writers' frames only (driver nodes, {declared}: {nodes}): {}",
             attributed.len(),
             attributed.join(", ")
         ));
@@ -1220,8 +1229,8 @@ pub fn render_driver_input_lines(
         lines.push(format!(
             "NOTE: {} topic(s) an external (driver) node shares with other writers were \
              compared over every recorded frame, the drivers' included, since the replay could \
-             not attribute each recorded frame to its writer (driver nodes, as the replayed build \
-             declares them: {nodes}): {}",
+             not attribute each recorded frame to its writer (driver nodes, {declared}: \
+             {nodes}): {}",
             report.unattributed_topics.len(),
             report.unattributed_topics.join(", ")
         ));
@@ -5176,12 +5185,32 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         Some(read) => read, // the resume path already read it (one read, one warn).
         None => read_record_coverage(&recorded_messages.reader),
     };
-    let classes = classify_topics(
-        &config,
-        &recorded_messages,
-        coverage.as_ref(),
-        &external_node_ids(&factories),
-    )?;
+    // The driver set: the recording's stamp when it carries one, and the
+    //    replayed build must declare exactly those drivers (a node it runs
+    //    the other way is refused here, exit 2, before any pass runs). A
+    //    recording made before the stamp takes the build's own declaration,
+    //    with one warn when that declares a driver, since nothing in the bag
+    //    can confirm the build runs those nodes the way the recording did.
+    let candidate_drivers = external_node_ids(&factories);
+    let (drivers, drivers_declared_by) = resolve_driver_set(
+        recorder.as_ref().and_then(|r| r.driver_stamp.as_ref()),
+        &candidate_drivers,
+    )
+    .map_err(|drifts| ReplayError::DriverSetDrift { drifts })?;
+    if drivers_declared_by == DriverSetSource::ReplayedBuild && !drivers.is_empty() {
+        tracing::warn!(
+            graph = %config.identity(),
+            driver_nodes = drivers.len(),
+            node_ids = %drivers.iter().cloned().collect::<Vec<_>>().join(", "),
+            "replay: this recording does not record which nodes were external (driver) nodes, \
+             so the driver set comes from the build being replayed: the outputs of each node in \
+             `node_ids` are taken as recorded inputs and are not compared, even where the \
+             recording ran that node as an ordinary node. A recording made by this version \
+             records each node's driver flag, and a replay of it refuses a build that changes \
+             one"
+        );
+    }
+    let classes = classify_topics(&config, &recorded_messages, coverage.as_ref(), &drivers)?;
     // What the replay does with the driver topics is logged once the rank
     // plans exist (`log_driver_topic_feeds`): whether a reader is fed depends
     // on which rank it runs in.
@@ -5285,7 +5314,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     log_driver_topic_feeds(&driver_feeds, &best_effort_reason);
     // Carried into the outcome/report (the machine-readable twin of the log
     // lines and the verdict NOTE).
-    let driver_inputs = driver_inputs_report(&config, &classes, &driver_feeds);
+    let driver_inputs = driver_inputs_report(&config, &classes, &driver_feeds, drivers_declared_by);
 
     // What this bag DECLARES its resume covers — or the
     // range a multi-rank lockstep bag DERIVES (rank 0's last boundary target;
@@ -17358,10 +17387,11 @@ pub fn node_external_flags<'a>(
 /// The ids of the replayed build's `external` (driver) nodes: every candidate
 /// whose declared policy is the `external` one ([`is_external_policy`]).
 ///
-/// A node whose metadata cannot be read is NOT counted as a driver, so its
-/// outputs stay compared: a topic leaves the comparison only on the node's own
-/// declaration. The per-pass metadata read already reports such a node
-/// loudly (`collect_pass_node_infos`).
+/// A node whose metadata cannot be read is NOT counted as a driver. On a bag
+/// whose recording stamps its drivers, such a node is refused when the
+/// recording ran it as a driver ([`resolve_driver_set`]); on a bag with no
+/// stamp its outputs stay compared. The per-pass metadata read already
+/// reports such a node loudly (`collect_pass_node_infos`).
 fn external_node_ids(factories: &IndexMap<String, Box<dyn NodeEntry>>) -> BTreeSet<String> {
     let infos: Vec<(String, cerulion_core::graph::NodeInfo)> = factories
         .iter()
@@ -17371,6 +17401,53 @@ fn external_node_ids(factories: &IndexMap<String, Box<dyn NodeEntry>>) -> BTreeS
         .into_iter()
         .filter_map(|(id, external)| external.then_some(id))
         .collect()
+}
+
+/// Where a replay's driver set came from: the `--report` JSON's
+/// `driver_inputs.declared_by`, and the parenthetical of the verdict's driver
+/// `NOTE` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverSetSource {
+    /// The recording's `node_external` stamp, which the replayed build
+    /// matches.
+    Recording,
+    /// The replayed build's declared policies: the recording was made before
+    /// the stamp, so it says nothing about its drivers.
+    ReplayedBuild,
+}
+
+/// The driver set a replay classifies the graph with. PURE.
+///
+/// A stamped recording decides it, and the replayed build must declare
+/// exactly the recorded drivers: a node it runs the other way is a
+/// [`DriverDrift`], every one of them in id order, and the replay is refused
+/// rather than judged on a narrowed or a wrong comparison. With no stamp the
+/// build's own declaration (`candidate`) decides, and the source says so.
+///
+/// [`DriverDrift`]: crate::replay_cmd::DriverDrift
+fn resolve_driver_set(
+    stamp: Option<&DriverStamp>,
+    candidate: &BTreeSet<String>,
+) -> Result<(BTreeSet<String>, DriverSetSource), Vec<crate::replay_cmd::DriverDrift>> {
+    let Some(stamp) = stamp else {
+        return Ok((candidate.clone(), DriverSetSource::ReplayedBuild));
+    };
+    let recorded = stamp.drivers();
+    let drifts: Vec<crate::replay_cmd::DriverDrift> = recorded
+        .symmetric_difference(candidate)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|node| crate::replay_cmd::DriverDrift {
+            node: node.clone(),
+            recorded_external: recorded.contains(node),
+        })
+        .collect();
+    if drifts.is_empty() {
+        Ok((recorded, DriverSetSource::Recording))
+    } else {
+        Err(drifts)
+    }
 }
 
 /// Per graph-produced topic, in graph order, deduplicated: does a node in
@@ -17555,6 +17632,7 @@ fn driver_inputs_report(
     config: &GraphConfig,
     classes: &TopicClasses,
     feeds: &DriverTopicFeeds,
+    declared_by: DriverSetSource,
 ) -> Option<DriverInputsReport> {
     if classes.driver_nodes.is_empty() {
         return None;
@@ -17574,6 +17652,7 @@ fn driver_inputs_report(
     };
     Some(DriverInputsReport {
         nodes: classes.driver_nodes.iter().cloned().collect(),
+        declared_by,
         input_topics: classes.driver.clone(),
         shared_topics: classes.driver_shared.clone(),
         // Which shared topics fell back to the single-stream diff is a fact of
@@ -21298,8 +21377,9 @@ mod driver_topic_tests {
         build_rank_plans, classify_topics, driver_inputs_report, driver_output_topics,
         driver_shared_topics, driver_written_topics, external_node_ids, is_external_policy,
         log_driver_topic_feeds, node_external_flags, plan_driver_topic_feeds,
-        re_executed_output_topics, render_driver_input_lines, CoordinationMode, DriverInputsReport,
-        DriverTopicFeeds, NodeEntry, RecordedMessages, TopicClasses,
+        re_executed_output_topics, render_driver_input_lines, resolve_driver_set, CoordinationMode,
+        DriverInputsReport, DriverSetSource, DriverStamp, DriverTopicFeeds, NodeEntry,
+        RecordedDriverStamp, RecordedMessages, TopicClasses,
     };
     use crate::replay_rank::RankBoundarySummary;
     use cerulion_core::graph::node::{ClosureNodeEntry, MacroPolicy, NodeInfo};
@@ -21828,6 +21908,7 @@ mod driver_topic_tests {
     ) -> DriverInputsReport {
         DriverInputsReport {
             nodes: strings(nodes),
+            declared_by: DriverSetSource::ReplayedBuild,
             input_topics: strings(input),
             shared_topics: strings(shared),
             unattributed_topics: Vec::new(),
@@ -21936,7 +22017,7 @@ mod driver_topic_tests {
             let feeds =
                 plan_driver_topic_feeds(config, &classes, &plans, lock == coordination, fed);
             assert_eq!(
-                driver_inputs_report(config, &classes, &feeds),
+                driver_inputs_report(config, &classes, &feeds, DriverSetSource::ReplayedBuild),
                 want,
                 "{layout}"
             );
@@ -22016,6 +22097,115 @@ mod driver_topic_tests {
             ..report(&["cam"], &[], &["/rig/tf"], &[], &[])
         };
         assert_eq!(render_driver_input_lines(&only, 1), vec![unattributed]);
+    }
+
+    /// A driver set the recording declares is named as the recording's on
+    /// every NOTE that names the drivers; the unfed line names no driver and
+    /// reads the same either way.
+    #[test]
+    fn a_stamped_driver_set_is_named_as_the_recordings() {
+        let inputs = "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs \
+                      and were NOT compared (driver nodes, as the recording declares them: \
+                      cam): /rig/cam/image";
+        let shared = "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                      compared over the other writers' frames only (driver nodes, as the \
+                      recording declares them: cam): /rig/bus";
+        let unattributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
+                            writers were compared over every recorded frame, the drivers' \
+                            included, since the replay could not attribute each recorded \
+                            frame to its writer (driver nodes, as the recording declares \
+                            them: cam): /rig/tf";
+        let unfed = "NOTE: 1 external (driver) topic(s) were not fed to the nodes that read \
+                     them, so those nodes cannot reproduce their recorded outputs: /rig/bus";
+        let stamped = DriverInputsReport {
+            declared_by: DriverSetSource::Recording,
+            unattributed_topics: strings(&["/rig/tf"]),
+            ..report(
+                &["cam"],
+                &["/rig/cam/image"],
+                &["/rig/bus", "/rig/tf"],
+                &["/rig/bus"],
+                &[],
+            )
+        };
+        assert_eq!(
+            render_driver_input_lines(&stamped, 1),
+            vec![inputs, shared, unattributed, unfed]
+        );
+        assert_eq!(
+            serde_json::to_value(&stamped).expect("serializes")["declared_by"],
+            "recording"
+        );
+        assert_eq!(
+            serde_json::to_value(report(&["cam"], &[], &[], &[], &[])).expect("serializes")
+                ["declared_by"],
+            "replayed_build"
+        );
+    }
+
+    /// A stamp admitted for a graph of `nodes` with `drivers` flagged true.
+    fn stamp(nodes: &[&str], drivers: &[&str]) -> DriverStamp {
+        let mut yaml = String::from("prefix: rig\nnodes:\n");
+        for n in nodes {
+            yaml.push_str(&format!("  - id: {n}\n    type: {n}\n"));
+        }
+        let config = parse_graph(&yaml).expect("graph parses");
+        DriverStamp::admit(
+            RecordedDriverStamp::Present(
+                nodes
+                    .iter()
+                    .map(|n| ((*n).to_string(), drivers.contains(n)))
+                    .collect(),
+            ),
+            &config,
+        )
+        .expect("an exact stamp")
+        .expect("a stamp")
+    }
+
+    /// Every arm of the driver-set resolution: an unstamped recording takes the
+    /// build's set (empty or not) and says so; a stamp the build matches is
+    /// the recording's; a stamp the build departs from is refused naming every
+    /// node in id order, both directions in one list.
+    #[test]
+    fn the_driver_set_is_the_recordings_and_a_build_that_departs_is_refused() {
+        use crate::replay_cmd::DriverDrift;
+        let drift = |node: &str, recorded_external: bool| DriverDrift {
+            node: node.to_string(),
+            recorded_external,
+        };
+        assert_eq!(
+            resolve_driver_set(None, &ids(&[])),
+            Ok((ids(&[]), DriverSetSource::ReplayedBuild))
+        );
+        assert_eq!(
+            resolve_driver_set(None, &ids(&["cam"])),
+            Ok((ids(&["cam"]), DriverSetSource::ReplayedBuild))
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["cam", "meter"], &["cam"])), &ids(&["cam"])),
+            Ok((ids(&["cam"]), DriverSetSource::Recording))
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["meter", "src"], &[])), &ids(&[])),
+            Ok((ids(&[]), DriverSetSource::Recording)),
+            "an all-false stamp is a stamp: the recording had no driver"
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["meter", "src"], &[])), &ids(&["src"])),
+            Err(vec![drift("src", false)]),
+            "a build that newly declares a recorded node external is refused"
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["cam", "meter"], &["cam"])), &ids(&[])),
+            Err(vec![drift("cam", true)]),
+            "a build that no longer declares a recorded driver external is refused"
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["a", "z"], &["z"])), &ids(&["a"])),
+            Err(vec![drift("a", false), drift("z", true)]),
+            "both directions at once, in id order"
+        );
     }
 }
 

@@ -1389,10 +1389,12 @@ fn write_bag_with_recorder_json(rec: &Recording, path: &std::path::Path, recorde
 /// the document a recorder made before the stamp wrote, which a replay judges
 /// drivers on by the build it replays.
 ///
-/// The fixtures that go through it record graphs whose builds declare no
-/// `external` node, where a replay classifies a stamped bag and an unstamped
-/// one alike (no driver either way) and an unstamped one with no driver warns
-/// about nothing.
+/// For a graph whose build declares no `external` node a replay classifies a
+/// stamped bag and an unstamped one alike (no driver either way) and warns
+/// about nothing. The driver fixtures that go through it pin the arm an older
+/// recording takes: the build's declaration decides, one warn says so, and the
+/// report says `replayed_build`. A fixture about the stamp states it by hand
+/// ([`stamped_recorder_json`]).
 fn pre_stamp_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec<u8> {
     let mut doc: serde_json::Value =
         serde_json::from_slice(&cerulion_cli_engine::graph_cmd::render_recorder_json(
@@ -1406,6 +1408,23 @@ fn pre_stamp_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec
         .remove("node_external")
         .expect("the production writer stamps the driver flags");
     serde_json::to_vec(&doc).expect("re-render")
+}
+
+/// The `recorder.json` bytes a real recorder writes for `coordination` whose
+/// loaded nodes declare the driver flags `stamp` (node id, `external`), stated
+/// by hand: the production renderer, with a hand-written `node_external`.
+fn stamped_recorder_json(
+    coordination: replay_engine::CoordinationMode,
+    stamp: &[(&str, bool)],
+) -> Vec<u8> {
+    cerulion_cli_engine::graph_cmd::render_recorder_json(
+        std::time::Duration::from_nanos(1_783_092_278_948_123_456),
+        coordination,
+        &stamp
+            .iter()
+            .map(|(id, external)| ((*id).to_string(), *external))
+            .collect(),
+    )
 }
 
 /// [`write_bag`] with an explicit manifest
@@ -1970,13 +1989,25 @@ fn load_inputs(path: &std::path::Path) -> LoadedInputs {
         .node_ids;
     let env = reader.attachment("env.json").unwrap().map(|a| a.data);
     // The recorder identity, read the way the production gate
-    // reads it. A MALFORMED attachment folds to `None` (treated-as-absent —
-    // the shipped `read_recorder_info` posture, warn-never-refuse), so a
-    // crafted-corruption arm cannot accidentally become a parse panic here.
+    // reads it. A MALFORMED attachment folds to `None` (treated-as-absent),
+    // so a crafted-corruption arm cannot accidentally become a parse panic
+    // here. The driver stamp is read and admitted against the bag's graph by
+    // the PRODUCTION functions the gate calls (serde skips the field), and a
+    // stamp the gate would refuse fails the fixture loudly rather than
+    // replaying as a recording with no stamp.
     let recorder = reader
         .attachment("__cerulion/recorder.json")
         .unwrap()
-        .and_then(|a| serde_json::from_slice::<replay_engine::RecorderInfo>(&a.data).ok());
+        .and_then(|a| {
+            let mut info = serde_json::from_slice::<replay_engine::RecorderInfo>(&a.data).ok()?;
+            let doc: serde_json::Value = serde_json::from_slice(&a.data).ok()?;
+            info.driver_stamp = replay_engine::DriverStamp::admit(
+                replay_engine::RecordedDriverStamp::read(doc.as_object()?),
+                &config,
+            )
+            .expect("a fixture's driver stamp describes its graph");
+            Some(info)
+        });
     // Zero-copy recorded index + streamed trace over the SAME mapped bag —
     // mirrors the production `run_replay` gate exit.
     let messages = RecordedMessages::from_reader(reader.clone()).expect("index recorded messages");
@@ -44748,6 +44779,209 @@ fn a_verify_of_a_driver_graph_feeds_the_driver_frames_and_passes() {
     }
 }
 
+/// The camera graph's stamp, stated by hand: the camera ran as a driver, the
+/// meter as an ordinary node.
+fn drv_stamp() -> Vec<u8> {
+    stamped_recorder_json(
+        replay_engine::CoordinationMode::FreeRun,
+        &[("cam", true), ("meter", false)],
+    )
+}
+
+/// A recording whose stamp names its drivers, replayed by the build that
+/// declares the same ones, is classified BY THE RECORDING: `--verify` passes
+/// 1/1 with exit 0 over the same frames as an unstamped one, the NOTE says the
+/// drivers are as the recording declares them, the `--report` says
+/// `declared_by: recording`, and nothing warns that the driver set came from
+/// the build. Both process layouts.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_stamped_driver_bag_whose_build_matches_passes_classified_by_the_recording() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_stamped_single.mcap");
+    ri_bag(&live.rec, &single, drv_stamp());
+    let two_rank = dir.path().join("drv_stamped_two_rank.mcap");
+    ri_two_rank_bag_stamped(&live.rec, &two_rank, |id| id == "meter", true, drv_stamp());
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        let report = dir.path().join(format!("drv_stamped_report_{run}.json"));
+        let (outcome, replayed) = ri_replay_reporting(
+            bag,
+            drv_replay_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: the meter read the recorded frames: {e}"));
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(replay_engine::DriverInputsReport {
+                declared_by: replay_engine::DriverSetSource::Recording,
+                ..drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[], &[])
+            }),
+            "{layout}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).expect("the report is written"))
+                .expect("the report is JSON");
+        assert_eq!(
+            json["driver_inputs"]["declared_by"], "recording",
+            "{layout}: {json}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the recording declares them: cam): \
+                 {DRV_IMAGE}"
+            )],
+            "{layout}: {verdict}"
+        );
+    }
+    logs_assert(|lines: &[&str]| {
+        match cerulion_core::testing::count_at(lines, "WARN", DRV_FALLBACK_WARN) {
+            0 => Ok(()),
+            n => Err(format!("a stamped bag takes no fallback: {n} warn(s)")),
+        }
+    });
+}
+
+/// Two replays of the same stamped bag by the same build write the same
+/// `--report` bytes, `declared_by` included (Replay = Live).
+#[test]
+#[serial]
+fn a_verify_of_a_stamped_driver_graph_is_deterministic() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_stamped_det.mcap");
+    ri_bag(&live.rec, &bag, drv_stamp());
+    let reports: Vec<Vec<u8>> = (0..2)
+        .map(|run| {
+            let report = dir.path().join(format!("drv_stamped_det_{run}.json"));
+            let (outcome, _) = ri_replay_reporting(
+                &bag,
+                drv_replay_factories,
+                replay_engine::ReplayPurpose::Verify,
+                None,
+                None,
+                Some(report.clone()),
+            );
+            assert!(outcome.expect("the replay runs").passed, "run {run}");
+            std::fs::read(&report).expect("the report is written")
+        })
+        .collect();
+    assert_eq!(reports[0], reports[1], "two runs, one report");
+    let json: serde_json::Value = serde_json::from_slice(&reports[0]).expect("JSON");
+    assert_eq!(json["driver_inputs"]["declared_by"], "recording");
+}
+
+/// A node whose metadata cannot be read, as a corrupt library's is.
+struct DrvUnreadableInfo;
+
+impl NodeEntry for DrvUnreadableInfo {
+    fn info(&self) -> cerulion_core::TransportResult<cerulion_core::NodeInfo> {
+        Err(cerulion_core::TransportError::GraphError {
+            reason: "corrupt node info".to_string(),
+        })
+    }
+    fn init(&mut self, _context: cerulion_core::NodeContext) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+}
+
+/// The other direction: the stamp records the camera as a driver and the
+/// replayed build does not declare it external, whether it runs it as a
+/// period node or cannot even read its metadata. The replay is REFUSED
+/// (exit 2) naming the node before any pass runs, so no consumer reads a
+/// frame.
+#[test]
+#[serial]
+fn a_recorded_driver_the_build_does_not_declare_external_is_refused_naming_it() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_driver_lost.mcap");
+    ri_bag(&live.rec, &bag, drv_stamp());
+    let want = "this bag is not replay-grade FOR THIS WORKSPACE: 1 node(s) changed whether they \
+                are external (driver) nodes since the bag was recorded:\n  \
+                - cam: recorded as an external (driver) node; the replayed build does not \
+                declare it external\n\
+                A replay takes a driver's outputs as recorded inputs and compares every other \
+                node's outputs, so it judges each node the way the recording ran it, and it \
+                cannot judge a node the replayed build runs the other way. Re-record the bag \
+                with the current workspace, or check out the recording-era node sources before \
+                replaying.";
+    let period_cam = || {
+        factories(vec![
+            (
+                "cam",
+                Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                    writer: 1.0,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+            (
+                "meter",
+                Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                    gain: DRV_GAIN,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let unreadable_cam = || {
+        factories(vec![
+            ("cam", Box::new(DrvUnreadableInfo) as Box<dyn NodeEntry>),
+            (
+                "meter",
+                Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                    gain: DRV_GAIN,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    for (build, make) in [
+        (
+            "period",
+            &period_cam as &dyn Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+        ),
+        ("unreadable", &unreadable_cam),
+    ] {
+        let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+        match outcome {
+            Err(e @ ReplayError::DriverSetDrift { .. }) => {
+                assert_eq!(e.to_string(), want, "{build}");
+                assert_eq!(e.exit_code(), 2, "{build}");
+            }
+            other => panic!("{build}: expected the refusal, got {other:?}"),
+        }
+        assert!(replayed.is_empty(), "{build}: no consumer read a frame");
+    }
+}
+
 /// A [`replay_engine::DriverInputsReport`] built from hand-written lists,
 /// with no unattributed shared topic.
 fn drv_inputs(
@@ -44760,6 +44994,10 @@ fn drv_inputs(
     let owned = |list: &[&str]| list.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
     replay_engine::DriverInputsReport {
         nodes: owned(nodes),
+        // Every driver fixture that uses this helper writes a bag with no
+        // driver stamp (`ri_free_run_recorder_json`), the arm an older
+        // recording takes; a stamped fixture overrides it.
+        declared_by: replay_engine::DriverSetSource::ReplayedBuild,
         input_topics: owned(input),
         shared_topics: owned(shared),
         unattributed_topics: Vec::new(),
@@ -45136,18 +45374,10 @@ fn drv_reclass_factories(src_entry: Box<dyn NodeEntry>) -> IndexMap<String, Box<
     ])
 }
 
-/// A bag records no node's trigger policy, so the replayed build's
-/// declarations decide which nodes are drivers. A build that declares
-/// `external` a node recorded as a period writer, and changes what it writes,
-/// takes that node's outputs as recorded inputs: its changed frames, which
-/// `--record-out` holds as `(1, k, -1)`, are not compared, the meter is fed
-/// the recorded frames and reproduces its readings, and `--verify` passes
-/// 1/1 with exit 0. What the verdict covered is stated where a reader of the
-/// run sees it: the verdict NOTE and the `--report`'s `driver_inputs` name the
-/// node and its topic. One process and two.
-#[test]
-#[serial]
-fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_verdict() {
+/// The live reclassification run: `src` a period writer publishing
+/// `(1, k, 1_000_000 + 7k)`, the meter reading each and publishing
+/// `(1, k, 10_000_001 + 70k)`, anchored to that hand oracle.
+fn drv_reclass_record() -> RiLive {
     let live = ri_record(drv_reclass_yaml(), || {
         drv_reclass_factories(Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
             writer: 1.0,
@@ -45175,6 +45405,36 @@ fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_ve
             "recorded meter frame {i}"
         );
     }
+    live
+}
+
+/// The build that declares the recorded period writer `src` external.
+fn drv_reclassified_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_reclass_factories(Box::new(DrvReclassifiedNodeEntry::with_state(
+        DrvReclassifiedNode::default(),
+    )))
+}
+
+/// The fallback warn an unstamped recording's replay logs when its build
+/// declares a driver.
+const DRV_FALLBACK_WARN: &str = "the driver set comes from the build being replayed";
+
+/// A recording made BEFORE the driver stamp records no node's policy, so the
+/// replayed build's declarations decide which nodes are drivers. A build that
+/// declares `external` a node recorded as a period writer, and changes what it
+/// writes, takes that node's outputs as recorded inputs: its changed frames,
+/// which `--record-out` holds as `(1, k, -1)`, are not compared, the meter is
+/// fed the recorded frames and reproduces its readings, and `--verify` passes
+/// 1/1 with exit 0. That narrowing cannot be caught on such a bag, so it is
+/// stated where a reader of the run sees it: ONE warn per replay naming the
+/// node, the verdict NOTE, and the `--report`'s `driver_inputs`, whose
+/// `declared_by` is `replayed_build`. One process and two.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_unstamped_bag_whose_build_declares_a_recorded_node_external_warns_and_names_it() {
+    let live = drv_reclass_record();
+    let c = live.rec.messages[DRV_RECLASS_OUT].len();
     let dir = tempfile::tempdir().unwrap();
     let single = dir.path().join("drv_reclass_single.mcap");
     ri_bag(&live.rec, &single, ri_free_run_recorder_json());
@@ -45189,11 +45449,7 @@ fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_ve
         let report = dir.path().join(format!("drv_reclass_report_{run}.json"));
         let (outcome, replayed) = ri_replay_stamped(
             bag,
-            || {
-                drv_reclass_factories(Box::new(DrvReclassifiedNodeEntry::with_state(
-                    DrvReclassifiedNode::default(),
-                )))
-            },
+            drv_reclassified_factories,
             replay_engine::ReplayPurpose::Verify,
             None,
             None,
@@ -45236,6 +45492,7 @@ fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_ve
             json["driver_inputs"],
             serde_json::json!({
                 "nodes": ["src"],
+                "declared_by": "replayed_build",
                 "input_topics": [DRV_RECLASS_OUT],
                 "shared_topics": [],
                 "unattributed_topics": [],
@@ -45254,6 +45511,103 @@ fn a_build_that_declares_a_recorded_node_external_is_named_as_a_driver_in_the_ve
             )],
             "{layout}: {verdict}"
         );
+    }
+    // ONE fallback warn per replay (two replays), each naming the node and
+    // the graph as fields.
+    logs_assert(|lines: &[&str]| {
+        let warns: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains(DRV_FALLBACK_WARN)
+            })
+            .collect();
+        match warns.as_slice() {
+            [a, b]
+                if [a, b].iter().all(|l| {
+                    l.contains("node_ids=src")
+                        && l.contains("driver_nodes=1")
+                        && l.contains("graph=drvx")
+                }) =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected one fallback warn per replay naming src, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// A recording made with the driver stamp says which nodes ran as drivers,
+/// and the replay judges by it: a build that declares `external` the node
+/// the stamp records as an ordinary period writer is REFUSED (exit 2) naming
+/// the node and the way it changed, under `--verify` and the neutral
+/// `--resim all` alike, before any pass runs. No `--report` and no
+/// `--record-out` is written, and no consumer read a frame. One process and
+/// two.
+#[test]
+#[serial]
+fn a_build_that_newly_declares_a_recorded_node_external_is_refused_naming_it() {
+    let live = drv_reclass_record();
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = stamped_recorder_json(
+        replay_engine::CoordinationMode::FreeRun,
+        &[("meter", false), ("src", false)],
+    );
+    let single = dir.path().join("drv_reclass_stamped_single.mcap");
+    ri_bag(&live.rec, &single, stamp.clone());
+    let two_rank = dir.path().join("drv_reclass_stamped_two_rank.mcap");
+    ri_two_rank_bag_stamped(&live.rec, &two_rank, |id| id == "meter", true, stamp);
+    let want = "this bag is not replay-grade FOR THIS WORKSPACE: 1 node(s) changed whether they \
+                are external (driver) nodes since the bag was recorded:\n  \
+                - src: recorded as an ordinary node; the replayed build declares it external\n\
+                A replay takes a driver's outputs as recorded inputs and compares every other \
+                node's outputs, so it judges each node the way the recording ran it, and it \
+                cannot judge a node the replayed build runs the other way. Re-record the bag \
+                with the current workspace, or check out the recording-era node sources before \
+                replaying.";
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        for purpose in [
+            replay_engine::ReplayPurpose::Verify,
+            replay_engine::ReplayPurpose::Resim,
+        ] {
+            let record_out = dir
+                .path()
+                .join(format!("drv_refused_out_{run}_{purpose:?}.mcap"));
+            let report = dir
+                .path()
+                .join(format!("drv_refused_report_{run}_{purpose:?}.json"));
+            let (outcome, replayed) = ri_replay_stamped(
+                bag,
+                drv_reclassified_factories,
+                purpose,
+                None,
+                None,
+                Some(report.clone()),
+                RecordHealthReport::Absent,
+                Some(record_out.clone()),
+            );
+            match outcome {
+                Err(e @ ReplayError::DriverSetDrift { .. }) => {
+                    assert_eq!(e.to_string(), want, "{layout} {purpose:?}");
+                    assert_eq!(e.exit_code(), 2, "{layout} {purpose:?}");
+                }
+                other => panic!("{layout} {purpose:?}: expected the refusal, got {other:?}"),
+            }
+            assert!(!report.exists(), "{layout} {purpose:?}: no report");
+            assert!(
+                !record_out.exists(),
+                "{layout} {purpose:?}: no --record-out"
+            );
+            assert!(
+                replayed.is_empty(),
+                "{layout} {purpose:?}: no consumer read a frame: {replayed:?}"
+            );
+        }
     }
 }
 
@@ -45365,6 +45719,7 @@ fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
             &serde_json::json!(0),
             &serde_json::json!({
                 "nodes": ["cam"],
+                "declared_by": "replayed_build",
                 "input_topics": [DRV_CAM_ONLY_IMAGE],
                 "shared_topics": [],
                 "unattributed_topics": [],
