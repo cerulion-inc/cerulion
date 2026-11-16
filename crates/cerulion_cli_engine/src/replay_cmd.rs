@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, and a read log that cannot be ENFORCED on a graph-produced edge) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, and a read log that cannot be ENFORCED on a graph-produced edge) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |
@@ -154,9 +154,11 @@ const ENV_ATTACHMENT: &str = "env.json";
 pub(crate) const TRACE_MANIFEST_PREFIX: &str = "__cerulion/trace_manifest_rank";
 /// The recorder-host-identity attachment (written by
 /// `graph run --record`). OPTIONAL: absent = a pre-recorder.json bag
-/// (back-compat, silent); malformed = loud WARN; a host arch/os mismatch =
-/// loud WARN. NEVER exit-affecting.
-const RECORDER_ATTACHMENT: &str = "__cerulion/recorder.json";
+/// (back-compat, silent); a host arch/os mismatch = loud WARN. Its CONTRACT
+/// keys (`trace_format`, `coordination`, `node_external`) refuse when
+/// unreadable (see [`read_recorder_info`]). `pub(crate)`:
+/// [`crate::replay_engine::DriverStamp::admit`] names it in its refusal.
+pub(crate) const RECORDER_ATTACHMENT: &str = "__cerulion/recorder.json";
 /// Suffix of a trace-manifest attachment name. (`pub(crate)`: see
 /// [`TRACE_MANIFEST_PREFIX`].)
 pub(crate) const TRACE_MANIFEST_SUFFIX: &str = ".json";
@@ -412,6 +414,47 @@ fn render_schema_drift(drifts: &[SchemaDrift]) -> String {
     s
 }
 
+/// One node whose driver flag the replayed build declares differently from
+/// the recording's `node_external` stamp. Carried by
+/// [`ReplayError::DriverSetDrift`]; the refusal is rendered by
+/// `render_driver_set_drift`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverDrift {
+    /// The node id.
+    pub node: String,
+    /// `true`: the recording ran the node as an `external` (driver) node and
+    /// the replayed build does not declare it external. `false`: the
+    /// recording ran it as an ordinary node and the replayed build declares it
+    /// external.
+    pub recorded_external: bool,
+}
+
+/// Render the [`ReplayError::DriverSetDrift`] refusal: one line per node, in
+/// the order given (node id order), and the remediation pair.
+fn render_driver_set_drift(drifts: &[DriverDrift]) -> String {
+    let mut s = format!(
+        "this bag is not replay-grade FOR THIS WORKSPACE: {} node(s) changed whether they are \
+         external (driver) nodes since the bag was recorded:",
+        drifts.len()
+    );
+    for d in drifts {
+        let line = if d.recorded_external {
+            "recorded as an external (driver) node; the replayed build does not declare it \
+             external"
+        } else {
+            "recorded as an ordinary node; the replayed build declares it external"
+        };
+        s.push_str(&format!("\n  - {}: {line}", d.node));
+    }
+    s.push_str(
+        "\nA replay takes a driver's outputs as recorded inputs and compares every other \
+         node's outputs, so it judges each node the way the recording ran it, and it cannot \
+         judge a node the replayed build runs the other way. Re-record the bag with the \
+         current workspace, or check out the recording-era node sources before replaying.",
+    );
+    s
+}
+
 /// Render [`ReplayError::ReadLogNotEnforceable`]'s sentence.
 ///
 /// A function and not a format string because the EDGE clause is present on
@@ -647,6 +690,18 @@ pub enum ReplayError {
         drifts: Vec<SchemaDrift>,
     },
 
+    /// The replayed build declares a node `external` (driver) that the
+    /// recording's `node_external` stamp ran as an ordinary node, or the
+    /// other way round. A replay judges drivers by the recording, so such a
+    /// node can be judged neither way: it is refused before any pass runs
+    /// (exit 2, not replay-grade FOR THIS WORKSPACE), under `--verify` and the
+    /// neutral `--resim all` alike, never narrowed into a passing comparison.
+    #[error("{}", render_driver_set_drift(.drifts))]
+    DriverSetDrift {
+        /// Every node that changed, in node id order.
+        drifts: Vec<DriverDrift>,
+    },
+
     /// A node's cdylib failed to load during replay. Exit 3.
     #[error("failed to load node cdylib for type `{node_type}`: {reason}")]
     NodeLoad {
@@ -771,6 +826,7 @@ impl ReplayError {
             | ReplayError::BagNoStepBoundaries
             | ReplayError::RecordingInconsistent { .. }
             | ReplayError::SchemaDrift { .. }
+            | ReplayError::DriverSetDrift { .. }
             | ReplayError::StateRestore { .. }
             | ReplayError::RecordOutExists { .. }
             // Both free-run refusals are "this bag is not
@@ -1741,13 +1797,14 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         None
     };
 
-    // 6b. `__cerulion/recorder.json` — OPTIONAL recorder-host identity
-    //     attachment. Absent = silent (pre-recorder.json bags);
-    //     malformed = loud WARN; arch/os mismatch vs THIS host = loud WARN
-    //     (cross-arch float/libm ULP advisory). NEVER exit-affecting.
+    // 6b. `__cerulion/recorder.json`: OPTIONAL recorder-host identity
+    //     attachment. Absent = silent (pre-recorder.json bags); arch/os
+    //     mismatch vs THIS host = loud WARN (cross-arch float/libm ULP
+    //     advisory). Its contract keys are gated below.
     let RecorderRead {
-        info: recorder,
+        info: mut recorder,
         unknown_coordination,
+        driver_stamp,
     } = read_recorder_info(&reader, bag)?;
 
     // 6b'. Trace-format version gate: a bag stamped with a `trace_format`
@@ -1802,6 +1859,16 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                 ),
             });
         }
+    }
+    // 6b'''. The driver stamp (`node_external`): refused when unreadable, and
+    //        checked against the embedded graph (its ros2 entries were taken
+    //        out above) when present. Below the version gate for the same
+    //        reason as the unknown-coordination refusal: a bag from a newer
+    //        Cerulion is named as such first. A validated stamp is what the
+    //        engine classifies drivers by; an absent one leaves the build
+    //        replayed to declare them.
+    if let Some(info) = recorder.as_mut() {
+        info.driver_stamp = replay_engine::DriverStamp::admit(driver_stamp, &config)?;
     }
 
     // 6c. `__cerulion/record_health.json` — OPTIONAL per-recording health stamp
@@ -2111,6 +2178,12 @@ struct RecorderRead {
     /// out rather than refused here so the caller can order it AFTER the
     /// trace-format gate (see the gate block in [`run_replay`]).
     unknown_coordination: Option<String>,
+    /// The `node_external` driver stamp as read, before it is checked against
+    /// the bag's graph. Carried out rather than refused here for the same
+    /// reason as `unknown_coordination`: an unreadable stamp on a bag from a
+    /// NEWER Cerulion is refused by the version gate first, which names the
+    /// cause.
+    driver_stamp: replay_engine::RecordedDriverStamp,
 }
 
 /// Read the OPTIONAL
@@ -2138,7 +2211,8 @@ struct RecorderRead {
 ///   whole-object parse would lose all four to the first bad member, which
 ///   contradicts `RecorderInfo`'s own "a PARTIALLY readable document keeps the
 ///   halves that decoded");
-/// - the CONTRACT half (`trace_format`, `coordination`) REFUSES (exit 2).
+/// - the CONTRACT half (`trace_format`, `coordination`, `node_external`)
+///   REFUSES (exit 2).
 ///
 /// Five arms:
 /// - ABSENT → `info: None`, silently (every pre-recorder.json bag — back-compat,
@@ -2152,6 +2226,10 @@ struct RecorderRead {
 ///   exists for.
 /// - `coordination` present but not a value this binary knows → carried out as
 ///   `unknown_coordination` for the caller to refuse (exit 2) — see the gate.
+/// - `node_external` (each node's driver flag) is carried out as read, and the
+///   caller refuses an unreadable one and checks a readable one against the
+///   graph ([`replay_engine::DriverStamp::admit`]), both after the version
+///   gate.
 /// - otherwise → parsed; warn on an arch/os mismatch vs THIS host (see
 ///   [`warn_on_recorder_host_mismatch`]), and carry the info into the
 ///   outcome/`--report`.
@@ -2171,6 +2249,7 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
                 return Ok(RecorderRead {
                     info: None,
                     unknown_coordination: None,
+                    driver_stamp: replay_engine::RecordedDriverStamp::Absent,
                 })
             }
         };
@@ -2224,6 +2303,11 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
         },
     };
 
+    // CONTRACT key 3: each node's driver flag. ABSENT is a recording made
+    // before the stamp; an unreadable one is carried out and refused by the
+    // caller after the version gate.
+    let driver_stamp = replay_engine::RecordedDriverStamp::read(obj);
+
     // ADVISORY half — lenient PER FIELD, and judged apart from the contract.
     //
     // One whole-object `from_value::<RecorderInfo>` would make
@@ -2250,6 +2334,8 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
         recorded_at_ns: advisory_u64(obj, "recorded_at_ns", &mut unreadable),
         trace_format,
         coordination,
+        // Filled by the gate once the stamp is checked against the graph.
+        driver_stamp: None,
     };
     if !unreadable.is_empty() {
         tracing::warn!(
@@ -2278,6 +2364,7 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
     Ok(RecorderRead {
         info: Some(info),
         unknown_coordination,
+        driver_stamp,
     })
 }
 
@@ -2642,6 +2729,39 @@ mod tests {
     /// here. The outcome-driven exits (0/1/6) have no `ReplayError` variant —
     /// exit 6's pin is the subprocess CLI test
     /// (`crates/cerulion_cli/tests/replay_cli_test.rs`).
+    /// The driver-set refusal names each node and which way it changed, in
+    /// the order handed in (the engine hands node id order), against the
+    /// hand-written text an operator reads.
+    #[test]
+    fn a_driver_set_drift_names_each_node_and_the_way_it_changed() {
+        let err = ReplayError::DriverSetDrift {
+            drifts: vec![
+                DriverDrift {
+                    node: "a".to_string(),
+                    recorded_external: false,
+                },
+                DriverDrift {
+                    node: "z".to_string(),
+                    recorded_external: true,
+                },
+            ],
+        };
+        assert_eq!(
+            err.to_string(),
+            "this bag is not replay-grade FOR THIS WORKSPACE: 2 node(s) changed whether they \
+             are external (driver) nodes since the bag was recorded:\n  \
+             - a: recorded as an ordinary node; the replayed build declares it external\n  \
+             - z: recorded as an external (driver) node; the replayed build does not declare \
+             it external\n\
+             A replay takes a driver's outputs as recorded inputs and compares every other \
+             node's outputs, so it judges each node the way the recording ran it, and it \
+             cannot judge a node the replayed build runs the other way. Re-record the bag with \
+             the current workspace, or check out the recording-era node sources before \
+             replaying."
+        );
+        assert_eq!(err.exit_code(), EXIT_NOT_REPLAY_GRADE);
+    }
+
     #[test]
     fn exit_code_contract_is_stable() {
         let io = || BagError::from(std::io::Error::other("boom"));
@@ -2713,6 +2833,17 @@ mod tests {
             (
                 ReplayError::RecordingInconsistent {
                     detail: "frame 0 timestamp not in boundary set".to_string(),
+                },
+                2,
+            ),
+            // A build whose drivers differ from the recording's: the bag is
+            // not replay-grade FOR THIS WORKSPACE, the SchemaDrift class.
+            (
+                ReplayError::DriverSetDrift {
+                    drifts: vec![DriverDrift {
+                        node: "cam".to_string(),
+                        recorded_external: true,
+                    }],
                 },
                 2,
             ),
@@ -2887,6 +3018,7 @@ mod tests {
             // An explicitly LOCKSTEP bag: what every bag this
             // binary writes today carries.
             coordination: Some(crate::replay_engine::CoordinationMode::Lockstep),
+            driver_stamp: None,
         }
     }
 

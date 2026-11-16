@@ -15,7 +15,9 @@ User-facing recording docs live in `docs/bag.md`.
   (`cerulion trace inspect`).
 - Bags carry attachments under the reserved `__cerulion/` prefix:
   `recorder.json` (host identity: arch/os/version, used by replay's
-  cross-host advisory), `record_health.json` (per-topic drain health),
+  cross-host advisory, plus the contract keys `trace_format`, `coordination`
+  and `node_external`, each native node's driver flag from its loaded
+  metadata), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.
 - The bag's `graph.yaml` attachment is the **effective in-memory graph config
@@ -304,7 +306,9 @@ still reports its zero count).
 - **Every `graph run`** (recorded or not) writes a run directory
   `~/.cerulion/runs/<sanitized-graph>-<run_id>/` (`run.json` plus
   `graph.yaml`/`env.json`/`recorder.json`; directory 0700, files 0600) and
-  announces itself on the `/__cerulion/runs` registry topic. Run-dir
+  announces itself on the `/__cerulion/runs` registry topic. `recorder.json`
+  lands once the nodes load (`run_dir::write_run_recorder`, atomic), before
+  any ring is named in `run.json`; an attach reads `run.json` first. Run-dir
   bookkeeping is never fatal to the run: any failure is exactly one `warn!`;
   on Drop the run announces `Ending` and removes the directory.
 - The run-registry record is one-per-run for its whole life: no

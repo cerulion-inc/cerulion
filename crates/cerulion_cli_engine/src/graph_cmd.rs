@@ -6596,6 +6596,13 @@ pub fn graph_run(
             )
         })
         .flatten();
+    // The run directory's `recorder.json` timestamp, read HERE, beside the rest
+    // of the description, and threaded to the one write each route makes once
+    // its nodes have loaded (the file carries each node's driver flag, which
+    // only the loaded metadata can say).
+    let run_recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     #[cfg(unix)]
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
@@ -6674,20 +6681,11 @@ pub fn graph_run(
                     // Rendered by the SAME pure functions that produce a
                     // `--record` bag's attachments, which is what makes the run
                     // directory and the bag agree by construction rather than
-                    // by two writers being trusted to.
+                    // by two writers being trusted to. `recorder.json` is not
+                    // here: it carries each node's driver flag, so it is
+                    // written once the nodes load (`write_run_recorder_best_effort`).
                     graph_yaml,
                     env_json: render_env_json(record_env, std::env::vars()),
-                    recorder_json: render_recorder_json(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default(),
-                        // The SAME resolved mode the
-                        // recording paths and the worker plans carry — so a
-                        // bag recorded of this run and the run's own directory
-                        // cannot disagree about the contract it ran under
-                        // (`bag_cmd --run` COPIES these bytes verbatim).
-                        resolve_run_coordination(execution_mode),
-                    ),
                 })
             }
             Err(e) => {
@@ -6816,6 +6814,10 @@ pub fn graph_run(
                     .map(crate::run_dir::RunDescriptor::path),
                 #[cfg(not(unix))]
                 None,
+                // The run directory's `recorder.json` timestamp, read with the
+                // rest of the description; the supervisor writes the file once
+                // its nodes load.
+                run_recorded_at,
                 // ONE resolved tag for the whole deployment, so
                 // every rank opens the SAME word (onset agreement is
                 // arithmetic only if the word is shared).
@@ -6890,6 +6892,29 @@ pub fn graph_run(
     // arms are mutually exclusive).
     let factories =
         load_node_factories_from_cache(workspace_root, &config, prefer_release, &cdylib_cache)?;
+    // The run directory's `recorder.json`, now that the nodes have loaded: it
+    // carries each node's driver flag from the LOADED metadata. Written before
+    // either monolith arm declares a trace ring or spawns the window recorder,
+    // so a recorder that finds a ring in `run.json` finds this file unless
+    // the write failed, and then embeds no graph.
+    #[cfg(unix)]
+    if let Some(descriptor) = _run_descriptor.as_ref() {
+        let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
+            indexmap::IndexMap::new();
+        for (id, entry) in &factories {
+            infos.insert(id.clone(), entry.info()?);
+        }
+        write_run_recorder_best_effort(
+            Some(descriptor.path()),
+            run_recorded_at,
+            // The SAME resolved mode the recording paths and the worker plans
+            // carry, so a bag recorded of this run and the run's own directory
+            // cannot disagree about the contract it ran under (`bag_cmd --run`
+            // COPIES these bytes verbatim).
+            resolve_run_coordination(execution_mode),
+            &crate::replay_engine::node_external_flags(&infos),
+        );
+    }
 
     // Workspace schema-name → recipe-3 hash map for the
     // YAML-`schema:`-vs-macro-output divergence warn. Advisory only;
@@ -7324,13 +7349,6 @@ pub fn graph_run(
                 .then(|| {
                     let dir = begin_flashback_plane(workspace_root, graph_name, runtime.config());
                     let topics = write_flashback_topics(&dir, graph_name)?;
-                    // Resolved INSIDE the closure so a run with
-                    // Flashback switched off reads nothing at all.
-                    let handoff = resolve_flashback_handoff(
-                        _run_descriptor
-                            .as_ref()
-                            .map(crate::run_dir::RunDescriptor::path),
-                    );
                     spawn_flashback_recorder(FlashbackSpawnSpec {
                         graph_name,
                         record_cpu,
@@ -7364,7 +7382,12 @@ pub fn graph_run(
                             .as_ref()
                             .and(capture_plane.as_ref())
                             .map(|(tag, _)| tag.as_str()),
-                        handoff: &handoff,
+                        // The spawn reads this directory inside this closure,
+                        // so a run with Flashback switched off reads nothing
+                        // at all.
+                        run_dir: _run_descriptor
+                            .as_ref()
+                            .map(crate::run_dir::RunDescriptor::path),
                         // By design, the monolith arms mint
                         // no trace ring. Their gating clock is
                         // WALL-driven (`live_gating_quantum: None`), so a trace
@@ -11270,6 +11293,10 @@ fn graph_run_supervisor(
     // manifest an attaching `cerulion bag record --run` reads to find the
     // scheduler trace. `None` on a non-Unix host or a degraded run-directory write.
     run_dir: Option<&Path>,
+    // The run directory's `recorder.json` timestamp, read by `graph_run` with
+    // the rest of the description. The file is written HERE, once the nodes
+    // load, because it carries each node's driver flag.
+    run_recorded_at: Duration,
     // The deployment's checkpoint arm tag, RESOLVED by `graph_run`
     // (explicit env, else derived from this run's `run_id`) and stamped from
     // here into every worker plan.
@@ -11455,6 +11482,23 @@ fn graph_run_supervisor(
         )?;
         infos
     };
+    // Each native node's driver flag, from the same LOADED metadata: the
+    // `node_external` key of this run's `recorder.json`, in the run directory
+    // and in any bag `--record` writes. The run directory's copy is written
+    // HERE, before any trace ring is declared in `run.json` and before the
+    // window recorder spawns, so a recorder that finds a ring finds this file
+    // unless the write failed, and then embeds no graph.
+    #[cfg(unix)]
+    let node_external = crate::replay_engine::node_external_flags(&loaded_entry_infos);
+    #[cfg(unix)]
+    write_run_recorder_best_effort(
+        run_dir,
+        run_recorded_at,
+        resolve_run_coordination(execution_mode),
+        &node_external,
+    );
+    #[cfg(not(unix))]
+    let _ = run_recorded_at;
     #[cfg(unix)]
     let record_entry_infos: Option<
         &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
@@ -12799,6 +12843,7 @@ fn graph_run_supervisor(
                 // The mode stamped into every worker plan above:
                 // the bag's `coordination` stamp is its pure map.
                 execution_mode,
+                node_external: &node_external,
                 // The always-on plane's departure ring is what the
                 // recorder's `--ring` set is completed from. `None` (declined or
                 // refused) is unreachable under `--record`: `--no-rings`
@@ -12940,10 +12985,6 @@ fn graph_run_supervisor(
             // the file-stem rule is exactly `config.identity()`.
             let dir = begin_flashback_plane(workspace_root, config.identity(), &config);
             let topics = write_flashback_topics(&dir, config.identity())?;
-            // The same handoff the monolith arm makes. `run_dir`
-            // is this deployment's run directory, threaded in by
-            // `graph_run` (`None` on a degraded run-directory write).
-            let handoff = resolve_flashback_handoff(run_dir);
             spawn_flashback_recorder(FlashbackSpawnSpec {
                 graph_name: config.identity(),
                 record_cpu,
@@ -12982,7 +13023,10 @@ fn graph_run_supervisor(
                 // and a monolith run under a tag whose earlier run was
                 // multi-process.
                 state_tag: armed_tag.as_deref(),
-                handoff: &handoff,
+                // The same run context the monolith arm hands over. `run_dir`
+                // is this deployment's run directory, threaded in by
+                // `graph_run` (`None` on a degraded run-directory write).
+                run_dir,
                 // Only the rings a worker CONFIRMED it created, plus
                 // the departure ring.
                 ring_names: &flashback_ring_names,
@@ -17438,9 +17482,21 @@ fn run_dir_partition_provenance(
 /// when a bag crosses architectures or operating systems (float/libm results
 /// may differ in ULPs across arches, so a byte-mismatch on
 /// transcendental-heavy nodes may be arch skew rather than a regression).
-/// FLAT + minimal by design (a sacred user-facing format): `arch`, `os`,
+/// Minimal by design (a sacred user-facing format): `arch`, `os`,
 /// `cerulion_version`, `recorded_at_ns` (the recording's start timestamp —
-/// the same `now` that stamps the bag filename; no second clock read).
+/// the same `now` that stamps the bag filename; no second clock read), and
+/// three CONTRACT keys a replay applies: `trace_format`, `coordination` and
+/// `node_external`.
+///
+/// `node_external` is each native node's driver flag (`true` where the LOADED
+/// node declares the `external` policy), from
+/// [`crate::replay_engine::node_external_flags`]. A replay judges drivers by
+/// it rather than by the build it replays, and refuses a build whose drivers
+/// differ. The argument is REQUIRED, so no render can leave the key out: an
+/// ABSENT key means exactly "a recording made before the stamp". Every caller
+/// therefore renders AFTER the node libraries load, since the flags come from
+/// the loaded metadata (a source parse would describe the tree, not the build
+/// that runs). The map is a `BTreeMap`, so the key order is the id order.
 ///
 /// `coordination` is stamped EXPLICITLY on every bag this binary
 /// describes — monolith and lockstep routes included — so an ABSENT key means
@@ -17453,9 +17509,10 @@ fn run_dir_partition_provenance(
 ///
 /// ONE function, three callers (`prepare_recording_inputs`, the run
 /// directory, and `bag_cmd`'s `--run` attach, which copies the run directory's
-/// bytes) — the anti-drift contract `run_dir.rs` states. The mode is threaded
-/// in from the caller rather than resolved here, because only the caller knows
-/// which route the run took.
+/// bytes): the anti-drift contract `run_dir.rs` states. The mode and the
+/// driver flags are threaded in from the caller rather than resolved here,
+/// because only the caller knows which route the run took and holds the
+/// loaded nodes.
 ///
 /// `pub` for a fourth caller with the same anti-drift stake: the test suite's
 /// crafted format-4 bags. A
@@ -17467,6 +17524,7 @@ fn run_dir_partition_provenance(
 pub fn render_recorder_json(
     now: Duration,
     coordination: crate::replay_engine::CoordinationMode,
+    node_external: &std::collections::BTreeMap<String, bool>,
 ) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "arch": std::env::consts::ARCH,
@@ -17512,6 +17570,8 @@ pub fn render_recorder_json(
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
+        // Each native node's driver flag, from the loaded metadata.
+        "node_external": node_external,
     }))
     .expect("recorder.json is a static-shape object; serialization cannot fail")
 }
@@ -17960,6 +18020,10 @@ struct RecordingInputSpec<'a> {
     /// the ONE resolution point ([`resolve_run_coordination`]). Stamped into
     /// the bag's `recorder.json`, and through it into the bag's `trace_format`.
     coordination: crate::replay_engine::CoordinationMode,
+    /// Each native node's driver flag, from the LOADED node metadata
+    /// ([`crate::replay_engine::node_external_flags`]). Stamped into the bag's
+    /// `recorder.json` as `node_external`, the record a replay judges drivers by.
+    node_external: &'a std::collections::BTreeMap<String, bool>,
     /// The effective config cloned BEFORE the ros2 split — rendered VERBATIM
     /// as the `graph.yaml` attachment (the bag carries the WHOLE run in
     /// authored node order).
@@ -17976,6 +18040,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         recorded,
         record_env,
         coordination,
+        node_external,
         embed_config,
     } = spec;
     // Wall-clock filename is fine at the CLI layer (NOT the deterministic
@@ -18036,11 +18101,11 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         .map_err(|e| CliError::Validation(format!("recording: write env.json: {e}")))?;
     // recorder.json: the recording host's arch/os/
     // version + the recording's own stamp (`now` reused — no second clock
-    // read). Shared here so single-process AND multi-process recordings both
-    // carry the attachment.
+    // read) + each node's driver flag. Shared here so single-process AND
+    // multi-process recordings both carry the attachment.
     std::fs::write(
         &paths.recorder_json,
-        render_recorder_json(now, coordination),
+        render_recorder_json(now, coordination, node_external),
     )
     .map_err(|e| CliError::Validation(format!("recording: write recorder.json: {e}")))?;
     // graph.yaml: the EFFECTIVE config this run executes, rendered to
@@ -18865,7 +18930,9 @@ fn flashback_switched_off() -> bool {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct FlashbackHandoff {
     /// The effective `graph.yaml` the run executes — what makes a capture
-    /// RE-EXECUTABLE rather than merely viewable.
+    /// RE-EXECUTABLE rather than merely viewable. Not handed over beside the
+    /// run's trace rings when `recorder.json` is missing
+    /// ([`resolve_flashback_handoff`]).
     graph_yaml: Option<std::path::PathBuf>,
     /// The run's environment snapshot.
     env_json: Option<std::path::PathBuf>,
@@ -18892,8 +18959,15 @@ struct FlashbackHandoff {
 /// and bagd would then fail to start. The window is the recorder's own exec, and
 /// the only way to reach it is for the run to end inside it — at which point the
 /// spawn guard is killing the recorder anyway.
+///
+/// `carries_trace` says whether the recorder is handed this run's scheduler
+/// trace rings; [`FlashbackSpawnSpec::handoff`] derives it from the rings the
+/// spawn hands over. Where it is and the directory holds no readable
+/// `recorder.json`, no `graph.yaml` is handed over either
+/// ([`crate::bag_cmd::RunArtifacts::graph_yaml_to_embed`]), so a capture is
+/// viewed rather than re-executed under assumed contract keys.
 #[cfg(unix)]
-fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
+fn resolve_flashback_handoff(run_dir: Option<&Path>, carries_trace: bool) -> FlashbackHandoff {
     let Some(dir) = run_dir else {
         // Not a degradation to report per-file: the run-directory write already logged ONE
         // loud line naming what an undescribed run loses, and repeating it per
@@ -18901,10 +18975,11 @@ fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
         return FlashbackHandoff::default();
     };
     let artifacts = crate::bag_cmd::read_run_artifacts(dir);
-    if !artifacts.unreadable.is_empty() {
+    let unreadable = artifacts.unreadable_for_bag(carries_trace);
+    if !unreadable.is_empty() {
         tracing::warn!(
             dir = %dir.display(),
-            unreadable = ?artifacts.unreadable,
+            unreadable = ?unreadable,
             "flashback: this run's directory is missing artifacts, so a capture of it \
              will carry less than it could — a capture with no graph.yaml can be VIEWED but not \
              re-executed (`cerulion bag play --resim`). `__cerulion/flashback.json` records which \
@@ -18914,7 +18989,7 @@ fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
     let path = |present: bool, name: &str| present.then(|| dir.join(name));
     FlashbackHandoff {
         graph_yaml: path(
-            artifacts.graph_yaml.is_some(),
+            artifacts.graph_yaml_to_embed(carries_trace).is_some(),
             crate::run_dir::RUN_GRAPH_FILE,
         ),
         env_json: path(artifacts.env_json.is_some(), crate::run_dir::RUN_ENV_FILE),
@@ -18958,12 +19033,15 @@ struct FlashbackSpawnSpec<'a> {
     /// in which case there is no ring to find and the recorder is not sent
     /// sweeping for one.
     state_tag: Option<&'a str>,
-    /// **The run context, so a capture describes the run it came
-    /// from.** See [`FlashbackHandoff`] — the recorder expects
-    /// these (`cerulion_bagd::capture::CaptureJob::attachments` is documented as
-    /// "the same attachments the continuous bag carries, so a flashback is as
-    /// self-describing as a recording").
-    handoff: &'a FlashbackHandoff,
+    /// **The run directory a capture's run context is read from, so a capture
+    /// describes the run it came from.** [`FlashbackSpawnSpec::handoff`]
+    /// resolves it into a [`FlashbackHandoff`] against
+    /// [`ring_names`](Self::ring_names); the recorder expects those artifacts
+    /// (`cerulion_bagd::capture::CaptureJob::attachments` is documented as "the
+    /// same attachments the continuous bag carries, so a flashback is as
+    /// self-describing as a recording"). `None` when no run directory was
+    /// written, which already logged its own line.
+    run_dir: Option<&'a Path>,
     /// **The run's SCHEDULER-TRACE rings, by resolved SHM name.**
     ///
     /// This is what makes a capture of a plain `graph run` RE-EXECUTABLE — the
@@ -19000,6 +19078,20 @@ struct FlashbackSpawnSpec<'a> {
     /// recording's bagd would. Consumed on Linux only (see
     /// `spawn_flashback_recorder`).
     record_cpu: RecordCpu,
+}
+
+#[cfg(unix)]
+impl FlashbackSpawnSpec<'_> {
+    /// What this recorder is handed out of [`run_dir`](Self::run_dir).
+    ///
+    /// Whether the recorder carries this run's trace is read off the same
+    /// [`ring_names`](Self::ring_names) its argv hands over, so the graph is
+    /// withheld beside a trace with no `recorder.json`
+    /// ([`resolve_flashback_handoff`]) on every spawn, from the one slice
+    /// that decides both.
+    fn handoff(&self) -> FlashbackHandoff {
+        resolve_flashback_handoff(self.run_dir, !self.ring_names.is_empty())
+    }
 }
 
 /// What `graph run` can truthfully say about its run when it prints its
@@ -19154,8 +19246,14 @@ mod recording_not_started_tests {
 /// continuous bag) but is still REQUIRED by `BagdArgs`; it is placed inside the
 /// flashback directory so that if the mode were ever lost the bag would still
 /// land somewhere deliberate rather than in the operator's CWD.
+///
+/// `handoff` is the run context the spawn resolved for this spec
+/// ([`FlashbackSpawnSpec::handoff`]).
 #[cfg(unix)]
-fn flashback_argv(spec: &FlashbackSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
+fn flashback_argv(
+    spec: &FlashbackSpawnSpec<'_>,
+    handoff: &FlashbackHandoff,
+) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
 
     let mut argv: Vec<OsString> = vec!["bagd".into()];
@@ -19187,18 +19285,18 @@ fn flashback_argv(spec: &FlashbackSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
     // Each is passed only when it was READABLE (see `resolve_flashback_handoff`):
     // bagd reads every `--attach` at startup and a missing file is a LOUD startup
     // failure, so an unconditional path would trade a THIN capture for NO WINDOW.
-    if let Some(p) = spec.handoff.graph_yaml.as_deref() {
+    if let Some(p) = handoff.graph_yaml.as_deref() {
         argv.push("--attach".into());
         argv.push(format!("{GRAPH_YAML_ATTACHMENT}:{}", p.display()).into());
     }
-    if let Some(p) = spec.handoff.env_json.as_deref() {
+    if let Some(p) = handoff.env_json.as_deref() {
         argv.push("--attach".into());
         argv.push(format!("{ENV_JSON_ATTACHMENT}:{}", p.display()).into());
     }
     // The host identity rides its OWN path-only flag, exactly as on the
     // `--record` path — the `__cerulion/` attachment namespace is reserved at
     // bagd's `--attach`, and bagd supplies the name.
-    if let Some(p) = spec.handoff.recorder_json.as_deref() {
+    if let Some(p) = handoff.recorder_json.as_deref() {
         argv.push("--recorder-json".into());
         argv.push(p.into());
     }
@@ -19328,7 +19426,7 @@ fn write_flashback_topics(dir: &Path, graph_name: &str) -> Option<std::path::Pat
 fn spawn_flashback_recorder(spec: FlashbackSpawnSpec<'_>) -> Option<ChildGuard> {
     use std::os::unix::process::CommandExt;
 
-    let argv = flashback_argv(&spec);
+    let argv = flashback_argv(&spec, &spec.handoff());
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -20230,6 +20328,41 @@ fn worker_recording_ring_tag(graph: &str, sup_pid: u32, rank: usize) -> String {
 #[cfg(unix)]
 fn departure_ring_tag(graph: &str, sup_pid: u32) -> String {
     format!("cer_rec_{graph}_{sup_pid}_dep")
+}
+
+/// Write this run's `recorder.json` into its directory, BEST-EFFORT: one warn on
+/// failure, and the run continues.
+///
+/// Called once per run, after the node libraries load (the file carries each
+/// node's driver flag, `node_external`, from the loaded metadata) and before
+/// the run declares any trace ring in `run.json` or spawns its window
+/// recorder. A recorder reads `run.json` first, so one that finds a ring
+/// there finds this file unless this write failed, and then the bag or
+/// capture it takes embeds no graph
+/// (`bag_cmd::RunArtifacts::graph_yaml_to_embed`). `run_dir` is `None` when
+/// no directory was written, which already logged its own line.
+#[cfg(unix)]
+fn write_run_recorder_best_effort(
+    run_dir: Option<&Path>,
+    recorded_at: Duration,
+    coordination: crate::replay_engine::CoordinationMode,
+    node_external: &std::collections::BTreeMap<String, bool>,
+) {
+    let Some(dir) = run_dir else {
+        return;
+    };
+    let bytes = render_recorder_json(recorded_at, coordination, node_external);
+    if let Err(e) = crate::run_dir::write_run_recorder(dir, &bytes) {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "could not write this run's recorder.json, which holds the trace format, \
+             coordination and driver flags a resim judges this run's trace by. The graph runs \
+             normally, but a bag `cerulion bag record --run` or the window recorder takes of \
+             this run that carries its trace carries neither that file nor the graph, so it \
+             can be viewed and not re-executed"
+        );
+    }
 }
 
 /// Declare this run's trace rings into its `run.json`, DEGRADING
@@ -22123,6 +22256,10 @@ struct SupervisorRecordingStart<'a> {
     /// pure map (`resolve_run_coordination`), so the recording describes
     /// exactly the coordination the workers ran under.
     execution_mode: crate::multiprocess::ExecutionMode,
+    /// Each native node's driver flag, from the supervisor's LOADED planning
+    /// metadata (`loaded_entry_infos`), the same metadata the bag's schema
+    /// hashes come from.
+    node_external: &'a std::collections::BTreeMap<String, bool>,
 }
 
 /// Bring the multi-process recording session up, BETWEEN
@@ -22169,6 +22306,7 @@ fn start_supervisor_recording(
         state_tag,
         trace_plane,
         execution_mode,
+        node_external,
     } = start;
 
     // (1) the shared input prep (bag path, ready sentinel, topics-json,
@@ -22198,6 +22336,7 @@ fn start_supervisor_recording(
         // free-ran (same value, same stamp), the default; `Lockstep` means
         // the run opted out with `CERULION_EXECUTION_MODE=lockstep`.
         coordination: resolve_run_coordination(execution_mode),
+        node_external,
     })?;
 
     // (2) bagd's iceoryx2 Config file (the DEFAULT `iox2_` data-plane
@@ -22345,6 +22484,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     for (id, entry) in &factories {
         entry_infos.insert(id.clone(), entry.info()?);
     }
+    // Each node's driver flag for the bag's `recorder.json`, from the same
+    // loaded metadata the runtime is built with.
+    let node_external = crate::replay_engine::node_external_flags(&entry_infos);
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
     let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
@@ -22544,6 +22686,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         // execution-mode variable says (`resolve_run_execution_mode` answers the same
         // for a monolith; the pin asserts the two agree).
         coordination: resolve_run_coordination(MONOLITH_EXECUTION_MODE),
+        // From the metadata this run's runtime was built with (`entry_infos`,
+        // harvested before the build consumed the factories).
+        node_external: &node_external,
     })?;
     let RecordingPaths {
         out: out_path,
@@ -25944,23 +26089,26 @@ process_groups:
                 "/home/u/.cerulion/runs/demo-2a/recorder.json",
             )),
         };
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: Some("cer_run_0000000000000000000000000000002a"),
-            handoff: &handoff,
-            // The run's scheduler-trace rings — one worker ring the
-            // rank CONFIRMED it created, plus the departure ring.
-            ring_names: &[
-                "/cer_rg_0123456789abcdef".to_string(),
-                "/cer_rg_fedcba9876543210".to_string(),
-            ],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: Some("cer_run_0000000000000000000000000000002a"),
+                run_dir: None,
+                // The run's scheduler-trace rings: one worker ring the
+                // rank CONFIRMED it created, plus the departure ring.
+                ring_names: &[
+                    "/cer_rg_0123456789abcdef".to_string(),
+                    "/cer_rg_fedcba9876543210".to_string(),
+                ],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         let expected: Vec<OsString> = [
             "bagd",
@@ -26079,19 +26227,22 @@ process_groups:
     fn the_flashback_argv_passes_no_flag_for_an_artifact_it_was_not_handed() {
         use std::path::Path;
 
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: None,
-            handoff: &FlashbackHandoff::default(),
-            // A run that declined rings, or a shape that mints none.
-            ring_names: &[],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: None,
+                run_dir: None,
+                // A run that declined rings, or a shape that mints none.
+                ring_names: &[],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &FlashbackHandoff::default(),
+        );
         assert!(
             !argv.iter().any(|a| a == "--attach"),
             "a path bagd cannot read is a LOUD startup failure, so an absent artifact must pass \
@@ -26166,18 +26317,21 @@ process_groups:
             env_json: Some(PathBuf::from("/run/env.json")),
             recorder_json: Some(PathBuf::from("/run/recorder.json")),
         };
-        let window = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: Some(&tag),
-            handoff: &handoff,
-            ring_names: &[],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let window = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: Some(&tag),
+                run_dir: None,
+                ring_names: &[],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         // The `--attach` VALUES are `name:path` pairs; taking the name half of
         // each is what compares the two builders' spellings rather than their
@@ -26258,21 +26412,24 @@ process_groups:
             env_json: Some(write("env.json", "{}")),
             recorder_json: Some(write("recorder.json", r#"{"arch":"aarch64","os":"macos"}"#)),
         };
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: dir.path(),
-            topics_json_path: &topics_json,
-            iox2_config_path: None,
-            state_tag: Some("cer_run_0000000000000000000000000000002a"),
-            handoff: &handoff,
-            // The recorder must PARSE `--ring` on this path too — the
-            // always-on spawn hands them over, so a `--ring` the window-only
-            // mode rejected would fail the spawn rather than the trace.
-            ring_names: &["/cer_rg_0123456789abcdef".to_string()],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: dir.path(),
+                topics_json_path: &topics_json,
+                iox2_config_path: None,
+                state_tag: Some("cer_run_0000000000000000000000000000002a"),
+                run_dir: None,
+                // The recorder must PARSE `--ring` on this path too: the
+                // always-on spawn hands them over, so a `--ring` the window-only
+                // mode rejected would fail the spawn rather than the trace.
+                ring_names: &["/cer_rg_0123456789abcdef".to_string()],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         let cmd = cerulion_bagd::BagdArgs::augment_args(clap::Command::new("bagd"));
         let matches = cmd.try_get_matches_from(&argv).unwrap_or_else(|e| {
@@ -26371,7 +26528,7 @@ process_groups:
         put(crate::run_dir::RUN_ENV_FILE);
         put(crate::run_dir::RUN_RECORDER_FILE);
 
-        let full = resolve_flashback_handoff(Some(&run));
+        let full = resolve_flashback_handoff(Some(&run), false);
         assert_eq!(
             full,
             FlashbackHandoff {
@@ -26384,7 +26541,7 @@ process_groups:
         // One artifact gone: the other two still travel. A capture with no host
         // identity is worth strictly more than no capture.
         std::fs::remove_file(run.join(crate::run_dir::RUN_RECORDER_FILE)).expect("remove");
-        let partial = resolve_flashback_handoff(Some(&run));
+        let partial = resolve_flashback_handoff(Some(&run), false);
         assert!(partial.graph_yaml.is_some(), "{partial:?}");
         assert!(partial.env_json.is_some(), "{partial:?}");
         assert!(
@@ -26397,10 +26554,120 @@ process_groups:
         // directory, and therefore nothing to hand over. The window is still
         // spawned — that is the caller's business, and this returns the empty
         // handoff rather than refusing.
-        assert_eq!(resolve_flashback_handoff(None), FlashbackHandoff::default());
         assert_eq!(
-            resolve_flashback_handoff(Some(&dir.path().join("no-such-run"))),
+            resolve_flashback_handoff(None, false),
             FlashbackHandoff::default()
+        );
+        assert_eq!(
+            resolve_flashback_handoff(Some(&dir.path().join("no-such-run")), false),
+            FlashbackHandoff::default()
+        );
+    }
+
+    /// A recorder handed this run's trace rings is handed its graph only beside
+    /// its `recorder.json`. The directory is the one a failed recorder write
+    /// leaves: `graph.yaml` and `env.json`, no `recorder.json`. A capture of it
+    /// would hold a graph and a trace with none of the contract keys a resim
+    /// judges them by, so the graph is not handed over and the capture can be
+    /// viewed but not re-executed. Handed no ring, the recorder still gets the
+    /// graph, and with `recorder.json` present it gets all three.
+    ///
+    /// Driven through the spec both spawns build, so whether the trace rides
+    /// is read off the `ring_names` the argv carries, and the argv the spawn
+    /// builds from that handoff is what is asserted.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_handed_the_trace_gets_no_graph_without_the_recorder_identity() {
+        use std::path::Path;
+
+        fn spec<'a>(run: &'a Path, ring_names: &'a [String]) -> FlashbackSpawnSpec<'a> {
+            FlashbackSpawnSpec {
+                graph_name: "cam",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.cam.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: None,
+                run_dir: Some(run),
+                ring_names,
+                run_id: Some(0x2a),
+            }
+        }
+        // The run context and trace rings the argv hands over, as
+        // `(flag, value)` pairs.
+        let context = |argv: &[std::ffi::OsString]| -> Vec<(String, String)> {
+            argv.windows(2)
+                .filter(|w| w[0] == "--attach" || w[0] == "--recorder-json" || w[0] == "--ring")
+                .map(|w| {
+                    (
+                        w[0].to_string_lossy().into_owned(),
+                        w[1].to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = dir.path().join("cam-2a");
+        std::fs::create_dir_all(&run).expect("run dir");
+        let put = |name: &str| std::fs::write(run.join(name), b"{}").expect("write artifact");
+        put("graph.yaml");
+        put("env.json");
+        let rings = vec![
+            "/cer_rg_0123456789abcdef".to_string(),
+            "/cer_rg_fedcba9876543210".to_string(),
+        ];
+        let graph = format!("graph.yaml:{}", run.join("graph.yaml").display());
+        let env = format!("env.json:{}", run.join("env.json").display());
+
+        let traced = spec(&run, &rings);
+        let handoff = traced.handoff();
+        assert_eq!(
+            handoff,
+            FlashbackHandoff {
+                graph_yaml: None,
+                env_json: Some(run.join("env.json")),
+                recorder_json: None,
+            },
+            "the trace rides, recorder.json does not: no graph"
+        );
+        assert_eq!(
+            context(&flashback_argv(&traced, &handoff)),
+            vec![
+                ("--attach".to_string(), env.clone()),
+                ("--ring".to_string(), rings[0].clone()),
+                ("--ring".to_string(), rings[1].clone()),
+            ],
+            "the argv carries the rings and the env, and no graph"
+        );
+
+        let untraced = spec(&run, &[]);
+        let handoff = untraced.handoff();
+        assert_eq!(
+            context(&flashback_argv(&untraced, &handoff)),
+            vec![
+                ("--attach".to_string(), graph.clone()),
+                ("--attach".to_string(), env.clone()),
+            ],
+            "no trace rides: the graph is viewable and travels"
+        );
+
+        crate::run_dir::write_run_recorder(&run, b"{}").expect("recorder.json");
+        let traced = spec(&run, &rings);
+        let handoff = traced.handoff();
+        assert_eq!(
+            context(&flashback_argv(&traced, &handoff)),
+            vec![
+                ("--attach".to_string(), graph),
+                ("--attach".to_string(), env),
+                (
+                    "--recorder-json".to_string(),
+                    run.join("recorder.json").display().to_string()
+                ),
+                ("--ring".to_string(), rings[0].clone()),
+                ("--ring".to_string(), rings[1].clone()),
+            ],
+            "with recorder.json the trace and its graph travel together"
         );
     }
 
@@ -29573,6 +29840,7 @@ process_groups:
             ],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -29665,6 +29933,7 @@ process_groups:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -29741,6 +30010,7 @@ process_groups:
                 recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
                 record_env: RecordEnvMode::None,
                 coordination: crate::replay_engine::CoordinationMode::Lockstep,
+                node_external: &std::collections::BTreeMap::new(),
             })
             .unwrap();
             assert_eq!(inputs.display_out_path.parent(), Some(directory.as_path()));
@@ -29797,6 +30067,7 @@ process_groups:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         });
         assert!(
             matches!(result, Err(CliError::Validation(message)) if message == "recording: output escaped its directory")
@@ -29828,6 +30099,7 @@ process_groups:
             recorded: &[],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -29925,6 +30197,7 @@ process_groups:
             recorded: &[],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.schema_catalog.clone().expect("built-in bindings");
@@ -29980,6 +30253,7 @@ process_groups:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let text = std::fs::read_to_string(&inputs.graph_yaml)
@@ -30163,6 +30437,7 @@ process_groups:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.graph_yaml.clone();
@@ -30231,28 +30506,42 @@ process_groups:
     }
 
     /// `render_recorder_json` carries EXACTLY
-    /// the five flat fields (a sacred user-facing format — a speculative SIXTH
+    /// seven fields (a sacred user-facing format: a speculative EIGHTH
     /// field fails the count pin), with `arch`/`os` from the compile-time consts,
     /// `recorded_at_ns` equal to the filename-stamp `now` (no second clock), and
     /// `trace_format` = the INTENTIONAL scheduler-trace format version this binary
     /// writes. `trace_format` is the fifth field (the discard-bit-
     /// aware v2) so replay refuses a bag from a newer binary instead of mis-
-    /// decoding the discard bit — the exact-count assert stays (no-speculative-
-    /// extras spirit is preserved; the count moves 4 → 5 for one intentional add).
+    /// decoding the discard bit; `node_external` is the seventh, each node's
+    /// driver flag exactly as the caller handed it. The exact-count assert stays
+    /// (no speculative extras; each count move is one intentional add).
     #[cfg(unix)]
     #[test]
-    fn recorder_json_carries_exactly_the_six_host_fields() {
+    fn recorder_json_carries_exactly_the_seven_fields() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(1_783_092_278_948_123_456);
-        let v: serde_json::Value =
-            serde_json::from_slice(&render_recorder_json(now, CoordinationMode::Lockstep))
-                .expect("valid JSON");
-        let obj = v.as_object().expect("flat object");
+        let flags = std::collections::BTreeMap::from([
+            ("meter".to_string(), false),
+            ("cam".to_string(), true),
+        ]);
+        let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
+            now,
+            CoordinationMode::Lockstep,
+            &flags,
+        ))
+        .expect("valid JSON");
+        let obj = v.as_object().expect("an object");
         assert_eq!(
             obj.len(),
-            6,
-            "exactly six fields (arch/os/cerulion_version/recorded_at_ns + the \
-             trace_format + the coordination stamp) — no speculative extras"
+            7,
+            "exactly seven fields (arch/os/cerulion_version/recorded_at_ns + the \
+             trace_format + the coordination stamp + the driver flags), no speculative extras"
+        );
+        // The seventh field: each native node's driver flag, as a map of node id
+        // to a bool, the key a replay judges drivers by.
+        assert_eq!(
+            v["node_external"],
+            serde_json::json!({"cam": true, "meter": false})
         );
         assert_eq!(v["arch"], std::env::consts::ARCH);
         assert_eq!(v["os"], std::env::consts::OS);
@@ -30307,9 +30596,12 @@ process_groups:
     fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
-        let v: serde_json::Value =
-            serde_json::from_slice(&render_recorder_json(now, CoordinationMode::FreeRun))
-                .expect("valid JSON");
+        let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
+            now,
+            CoordinationMode::FreeRun,
+            &std::collections::BTreeMap::new(),
+        ))
+        .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
@@ -30317,6 +30609,44 @@ process_groups:
         // every consumed frame of a batch is named (`stamp_trace_format`'s
         // hand table pins the whole matrix).
         assert_eq!(v["trace_format"], 9);
+    }
+
+    /// The driver flags render in id order whatever order the nodes arrive in,
+    /// so the same graph and builds give the same bytes (Replay = Live: the
+    /// attachment a recording carries is a pure function of the run).
+    #[cfg(unix)]
+    #[test]
+    fn the_driver_stamp_is_byte_identical_whatever_the_node_order() {
+        use crate::replay_engine::{node_external_flags, CoordinationMode};
+        use cerulion_core::graph::node::MacroPolicy;
+        use cerulion_core::graph::NodeInfo;
+        let cam = NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::External);
+        let meter =
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::Period { period_ms: 5 });
+        let mut forward: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
+        forward.insert("cam".into(), cam.clone());
+        forward.insert("meter".into(), meter.clone());
+        let mut backward: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
+        backward.insert("meter".into(), meter);
+        backward.insert("cam".into(), cam);
+        let now = Duration::from_nanos(7);
+        let render = |infos: &indexmap::IndexMap<String, NodeInfo>| {
+            render_recorder_json(now, CoordinationMode::FreeRun, &node_external_flags(infos))
+        };
+        let a = render(&forward);
+        let b = render(&backward);
+        assert_eq!(a, b, "the node order must not reach the bytes");
+        let expected = format!(
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            std::env::consts::ARCH,
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+        );
+        assert_eq!(
+            String::from_utf8(a).expect("UTF-8"),
+            expected,
+            "the flags render in id order"
+        );
     }
 
     /// The ONE resolution point, and the rule it decides: a
@@ -33735,10 +34065,6 @@ process_groups:
             ),
             graph_yaml: render_effective_graph_yaml(&pre.config).expect("render"),
             env_json: render_env_json(RecordEnvMode::Allowlist, std::env::vars()),
-            recorder_json: render_recorder_json(
-                Duration::from_nanos(42),
-                crate::replay_engine::CoordinationMode::Lockstep,
-            ),
         })
         .expect("run dir");
 
@@ -34926,6 +35252,75 @@ process_groups:
             "…and never from the flag: `!no_rings` is the pre-dispatch intent this write \
              exists to replace, so a correction spelled that way writes back what is \
              already there:\n{helper}"
+        );
+    }
+
+    /// The run directory's `recorder.json` is written AFTER the nodes load (it
+    /// carries each node's driver flag from the loaded metadata) and BEFORE the
+    /// run names any trace ring in `run.json` or spawns its window recorder, on
+    /// both routes.
+    ///
+    /// STRUCTURAL because the hazard is an ordering no behavioural test can
+    /// reach on demand: an attach that reads `run.json` between a ring
+    /// declaration and a later `recorder.json` write copies the rings with no
+    /// driver stamp, and the replay of that bag falls back to the build's own
+    /// declaration. `bag_cmd::read_run_artifacts` reads `run.json` first, so
+    /// this order is what makes a ring imply the stamp wherever the write
+    /// succeeded; a failed write embeds no graph
+    /// (`a_bag_that_carries_the_trace_embeds_no_graph_without_the_recorder_identity`).
+    #[cfg(unix)]
+    #[test]
+    fn the_run_directory_recorder_lands_after_the_nodes_load_and_before_any_ring() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let pos = |body: &str, needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` must still be in the body"))
+        };
+
+        let sup = fn_body(&src, "fn graph_run_supervisor(")
+            .expect("the supervisor fn must still exist; this walk moved with it");
+        assert_eq!(
+            sup.matches("write_run_recorder_best_effort(").count(),
+            1,
+            "exactly ONE run-directory recorder write on the supervisor route"
+        );
+        let write = pos(sup, "write_run_recorder_best_effort(");
+        assert!(
+            pos(sup, "let loaded_entry_infos") < write,
+            "the supervisor stamps from the LOADED metadata, so it writes after the load"
+        );
+        assert!(
+            write < pos(sup, "declare_run_rings_best_effort("),
+            "the supervisor writes recorder.json before it names a ring in run.json"
+        );
+        assert!(
+            write < pos(sup, "spawn_flashback_recorder("),
+            "…and before its window recorder reads the directory"
+        );
+
+        let mono = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        assert_eq!(
+            mono.matches("write_run_recorder_best_effort(").count(),
+            1,
+            "exactly ONE run-directory recorder write on the monolith route"
+        );
+        let write = pos(mono, "write_run_recorder_best_effort(");
+        assert!(
+            pos(mono, "load_node_factories_from_cache(") < write,
+            "the monolith stamps from the LOADED factories, so it writes after the load"
+        );
+        assert!(
+            write < pos(mono, "run_graph_recording(RecordingRun"),
+            "the monolith writes recorder.json before its recording declares the ring"
+        );
+        assert!(
+            write < pos(mono, "spawn_flashback_recorder("),
+            "…and before its window recorder reads the directory"
+        );
+        assert!(
+            !mono.contains("recorder_json:"),
+            "the description no longer carries recorder.json: it is written once the \
+             nodes load"
         );
     }
 

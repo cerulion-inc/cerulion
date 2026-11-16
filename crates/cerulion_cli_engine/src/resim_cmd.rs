@@ -574,6 +574,17 @@ pub struct ResimReport {
     /// an observed difference would otherwise be silently attributed to the
     /// candidate.
     pub input_shortfalls: Vec<(u32, String, u64)>,
+    /// The external (driver) `NOTE:` lines, already rendered by
+    /// `replay_engine::render_driver_input_lines`, the text the verify verdict
+    /// prints: the topics drivers write, which the comparison and
+    /// [`Self::topics_checked`] leave out wholly or in part, and the driver
+    /// topics not fed or not read. Empty for a graph with no driver. Carried as
+    /// rendered lines for the reason [`Self::coordination`] is.
+    pub driver_lines: Vec<String>,
+    /// The comparison left a driver's frames out
+    /// (`DriverInputsReport::leaves_driver_frames_out`), so a match covers
+    /// less than every frame the re-executed graph published.
+    pub driver_frames_uncompared: bool,
 }
 
 impl ResimReport {
@@ -617,6 +628,13 @@ impl ResimReport {
                 .iter()
                 .map(|s| (s.rank, s.node_id.clone(), s.count))
                 .collect(),
+            driver_lines: o.driver_inputs.as_ref().map_or_else(Vec::new, |d| {
+                crate::replay_engine::render_driver_input_lines(d, o.topics_checked)
+            }),
+            driver_frames_uncompared: o
+                .driver_inputs
+                .as_ref()
+                .is_some_and(crate::replay_engine::DriverInputsReport::leaves_driver_frames_out),
         }
     }
 }
@@ -788,6 +806,11 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
         "  re-executed {} step(s), {} produced topic(s)\n",
         report.ticks_replayed, report.topics_checked
     ));
+    // The driver lines qualify the count above them: a topic a driver writes
+    // is a recorded input, left out of it.
+    for line in &report.driver_lines {
+        s.push_str(&format!("  {line}\n"));
+    }
 
     // A Flashback capture's COVERED RANGE, when the bag holds frames
     // beyond it.
@@ -863,7 +886,13 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
         && report.violations.is_empty()
         && report.topics_checked > 0;
 
-    if matched_everything {
+    if matched_everything && report.driver_frames_uncompared {
+        s.push_str(
+            "  observation: the re-executed frames match the recording byte-for-byte, except \
+             the external (driver) frames the NOTE lines above leave out, which were not \
+             compared\n",
+        );
+    } else if matched_everything {
         s.push_str("  observation: the re-executed frames match the recording byte-for-byte\n");
     } else {
         if differing > 0 {
@@ -902,11 +931,14 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
             && report.violations.is_empty()
             && !report.trace_diverged
             && !report.read_log_diverged
+            && !report.driver_frames_uncompared
         {
             // Reached only via `topics_checked == 0`, which the four conjuncts
             // above make true: without the read-log one this line printed
             // "NOTHING was compared" over a run whose read log DID compare and
-            // diverged, under a header that counts the produced topics.
+            // diverged, under a header that counts the produced topics. Where
+            // drivers wrote the frames, the driver NOTE lines already say that
+            // no topic was compared and why.
             s.push_str(
                 "  observation: no produced topic carried a frame, so NOTHING was compared \
                  against the recording\n",
@@ -1779,6 +1811,10 @@ mod tests {
             // arms that are not about them keep rendering what they always did.
             injection_anomalies: vec![],
             input_shortfalls: vec![],
+            // The ordinary shape: a graph with no external (driver) node
+            // renders no driver line and leaves no frame out.
+            driver_lines: vec![],
+            driver_frames_uncompared: false,
         }
     }
 
@@ -2078,6 +2114,61 @@ mod tests {
         let s = render_resim_summary(&clean, Path::new("/tmp/run.mcap"));
         assert!(s.contains("match the recording byte-for-byte"), "{s}");
         assert!(!s.contains("NOTHING was compared"), "{s}");
+    }
+
+    /// The neutral summary prints the external (driver) lines under the count
+    /// they qualify, and its match observation names the driver frames left
+    /// out. With nothing compared, the driver lines say so and the summary
+    /// prints no line of its own claiming no topic carried a frame. A driver
+    /// whose frames were all compared keeps the plain observation.
+    #[test]
+    fn the_neutral_summary_names_the_driver_frames_it_left_out() {
+        let bag = Path::new("/tmp/run.mcap");
+        let input = "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs \
+                     and were NOT compared (driver nodes, as the replayed build declares them: \
+                     cam): /rig/cam/image";
+        let nothing = "NOTE: no topic was compared against the recording: no node other than \
+                       an external (driver) node recorded or replayed a frame";
+        let mut compared = report(true, 0, false);
+        compared.topics_checked = 1;
+        compared.topics_passed = 1;
+        compared.driver_lines = vec![input.to_string()];
+        compared.driver_frames_uncompared = true;
+        let s = render_resim_summary(&compared, bag);
+        let head = format!(
+            "resim (no verdict): /tmp/run.mcap\n  re-executed 10 step(s), 1 produced \
+             topic(s)\n  {input}\n  observation: the re-executed frames match the recording \
+             byte-for-byte, except the external (driver) frames the NOTE lines above leave \
+             out, which were not compared\n  no verdict was made"
+        );
+        assert!(s.starts_with(&head), "{s}");
+        assert_eq!(s.matches("observation:").count(), 1, "{s}");
+
+        let mut capture_only = report(true, 0, false);
+        capture_only.topics_checked = 0;
+        capture_only.topics_passed = 0;
+        capture_only.driver_lines = vec![input.to_string(), nothing.to_string()];
+        capture_only.driver_frames_uncompared = true;
+        let s = render_resim_summary(&capture_only, bag);
+        assert!(s.contains(&format!("  {input}\n  {nothing}\n")), "{s}");
+        assert!(!s.contains("NOTHING was compared"), "{s}");
+        assert!(!s.contains("byte-for-byte"), "{s}");
+
+        let mut all_compared = report(true, 0, false);
+        all_compared.driver_lines = vec!["NOTE: a shared topic compared over every frame".into()];
+        let s = render_resim_summary(&all_compared, bag);
+        assert!(
+            s.contains("  observation: the re-executed frames match the recording byte-for-byte\n"),
+            "{s}"
+        );
+        assert!(!s.contains("except the external (driver) frames"), "{s}");
+
+        let mut crashed = compared.clone();
+        crashed.node_failures = vec![("cam".into(), "tick PANICKED".into())];
+        assert!(
+            !render_resim_summary(&crashed, bag).contains(input),
+            "a crashed run observed nothing, so it names no driver frames"
+        );
     }
 
     /// A DIFFERING topic's violation is reported by the count, not twice. This

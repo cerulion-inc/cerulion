@@ -42,10 +42,28 @@ opens a robot's own command channel in `init`) still does so during a resim,
 so run a resim of such a node only where its devices are safe to drive or
 disconnected.
 
-Re-simulation re-injects only external-source topics and recomputes everything
-else, so re-simulating a `ros2 attach` bag on a desk with no DDS robot produces
-**no output**: its `dds_bridge` node still needs its external DDS inputs. Use
-plain playback to view an attached ROS 2 recording without the robot.
+Re-simulation re-injects only the recorded inputs and recomputes everything
+else. The recorded inputs are the external-source topics and the outputs of
+`external` (driver) nodes: a resim never calls a driver's `external_source()`,
+so the driver has no device to read, and the bag feeds its recorded frames to
+the nodes that read them. The driver still fires on its recorded wakes, so a
+driver whose tick writes its outputs without a device publishes them:
+`--record-out` holds those frames, and the verdict does not compare them,
+except on a shared topic whose frames the replay cannot attribute to their
+writers (see below). Of a free-run recording (the multi-process default) at
+`trace_format` 8 or later, whose reads name their frames, a `--verify` resim
+feeds every such read; a resim without `--verify`, or of an older free-run
+recording, feeds the nodes that ran in another process or executor unit than
+the driver and warns that it does not feed the rest. A lockstep recording
+(`CERULION_EXECUTION_MODE=lockstep`, or `--single-process --record` of a graph
+that is one executor unit) is not supported for a graph with a driver: its
+resim does not fire the driver or feed the nodes that read it, so a warning
+names the drivers and the topics they write and `--verify` reports a schedule
+divergence at the driver's first recorded fire (exit 6); record such a graph
+with the multi-process default. Re-simulating a `ros2 attach` bag on a desk with
+no DDS robot produces **no output**: its `dds_bridge` node is a driver with no
+DDS inputs. Use plain playback to view an attached ROS 2 recording without the
+robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
 what makes it deterministic: a replay matches the live run. Together those two properties mean
 `--resim` cannot drive a viewer.
@@ -72,6 +90,134 @@ and the topics it credited:
 ```
 replay PASS: <bag> (<N> tick(s) replayed, <P>/<M> topic(s) matched byte-for-byte and were credited)
 ```
+
+`<M>` counts the topics the re-executed nodes publish. A driver's outputs are
+recorded inputs and are not compared: the nodes that read them are fed the
+recorded frames, and those nodes' own topics are. A recording records, for
+every node, whether it was an `external` (driver) node (the `node_external`
+key, see "The replay contract a bag declares" below), and a resim judges
+drivers by that record. The build you replay must declare the same drivers:
+when it declares `external` a node the recording ran as an ordinary node, or
+does not declare `external` a node the recording ran as a driver, the resim
+refuses with exit 2 before it runs a step, with or without `--verify`, and
+names each such node and the way it changed. Re-record the bag with the
+current workspace, or check out the recording-era node sources. A bag recorded
+before this record existed carries none, so its drivers are the nodes the
+build you replay declares `external`, and a warning says so: such a build can
+take a node's outputs out of the comparison that the recording ran as an
+ordinary node. A driver topic still fails the run when the bag lost its frames: a record-health
+stamp that counts lost frames on it makes it a `record-side-tap-loss`
+violation, counted in `<M>` (exit 1), and a replay that feeds reads by their
+recorded identity (see "Read identity" below) refuses a recorded read of a
+frame the bag does not hold (exit 2, `read_identity_frame_missing`).
+
+The verdict states what it left out, on a pass and a failure alike, with one
+`NOTE:` line for each of: the topics only drivers write, naming the driver
+nodes; the `multi_publisher_topics` topics a driver shares with other nodes
+that were compared over the other writers' frames; those compared over every
+recorded frame (below); the driver topics this resim did not feed to the nodes that
+read them; the driver topics no node reads; and, on a `0/0` tally, that no
+topic was compared. For the `v4l2_camera` example the first one reads:
+
+```
+NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the recording declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
+```
+
+On a bag recorded before the driver record existed, the parenthetical reads
+`as the replayed build declares them`.
+
+With `--report` the JSON carries the same lists under `driver_inputs`, as
+`nodes`, `input_topics`, `shared_topics`, `unattributed_topics`,
+`unfed_topics` and `unread_topics` (absent for a graph with no driver), and
+`declared_by` says where `nodes` came from: `recording`, or `replayed_build`
+for a bag recorded before the driver record existed.
+`unattributed_topics` holds the shared topics compared over every recorded
+frame, the driver's included (below). A resim without `--verify` prints the same
+`NOTE:` lines under its `re-executed <N> step(s), <M> produced topic(s)` line,
+and when everything it compared matched, its observation says that the
+driver frames those lines leave out were not compared.
+
+A graph whose produced topics are all driver outputs, such as a capture-only
+graph, has nothing to re-compute: its `--verify` passes with `0/0`, and a
+warning and a verdict NOTE say that no topic was compared. A driver topic no
+node reads is neither fed nor compared, and a warning and a verdict NOTE name
+it. On a `multi_publisher_topics` topic a driver shares with other nodes, the
+other writers' frames are compared and the driver's are not, when the replay
+attributes every recorded frame of the topic to its writer, which needs a bag
+that labels each frame with its writer, a wire header on every frame, and at
+most 200000 recorded frames, the verifier's record budget, on the
+`multi_publisher_topics` topics one process or executor unit writes. Each
+writer is then compared in the process or executor unit that runs it, so a
+topic whose writers run in several of them is compared over every frame of
+its other writers, and the driver's frames, those its replayed ticks publish
+and those a resim feeds from the bag to a node that reads the topic, are
+compared nowhere. Otherwise the replay cannot say which frames are the
+driver's, and a warning names the cause: a `--verify` that feeds a node's
+reads of the topic from a bag that labels no writer refuses with exit 2
+(`read_identity_frames_unattributed`) when the topic's reads name more than
+one writer, and otherwise the topic is compared over every recorded frame, the
+driver's included, the way the next paragraph describes for a process or
+executor unit that cannot attribute the frames. A driver's frames are among
+those compared only where the driver runs beside another writer of the topic,
+its replayed frames, or where one that runs another writer feeds the driver's
+recorded frames from the bag to its nodes. In a replay that does not feed reads
+by their recorded identity, those fed frames are counted where it is the only
+one that runs a writer of the topic other than a driver, or where the bag
+labels each frame with its writer and every frame carries a wire header; where
+the count leaves the driver's recorded frames out, the topic fails (exit 1). A
+replay that feeds reads by their recorded identity, a `--verify` of a free-run
+recording at trace format 8 or later, hands the frames a process feeds to its
+nodes on a feed of their own, not on the topic, so they are never counted, and
+the topic fails (exit 1) wherever the driver does not run beside another
+writer of it. Where a driver's frames and another writer's are published in
+one process or executor unit, one stream cannot tell their sequences apart, so
+the replay stops (exit 5) once a frame skips a sequence the recording holds,
+and otherwise the topic fails (exit 1). Its verdict `NOTE:` line says the topic
+was compared over every recorded frame, and `driver_inputs.unattributed_topics`
+names it.
+
+A `multi_publisher_topics` topic whose writers run in several processes or
+executor units is compared in every one of them that runs a writer of the
+topic other than a driver. When the replay attributes every recorded frame of
+the topic to its writer, which needs a bag that labels each frame with its
+writer, a wire header on every frame, and at most 200000 recorded frames, the
+verifier's record budget, on the `multi_publisher_topics` topics one process
+or executor unit writes, each writer is compared in the process or executor
+unit that runs it, and a byte mismatch names it (below). The frames a process
+or executor unit then feeds from the bag to its nodes that read the topic, the
+recorded frames of the writers that run elsewhere, are left out of the
+comparison, so a node that reads only some of them, such as one that reads the
+latest value on a slower period, does not stop the replay. Otherwise a
+`--verify` that feeds a node's reads of the topic from a bag that labels no
+writer refuses with exit 2 (`read_identity_frames_unattributed`) when the
+topic's reads name more than one writer, and a process or executor unit that
+runs a writer of the topic other than a driver and cannot attribute the frames
+compares the frames published on the topic there as one stream, and a byte
+mismatch there names no writer. When it is the only one whose writers
+published frames of the topic, and it fed none of the topic's recorded frames
+to its nodes, its stream is compared with every recorded frame of the topic. Otherwise the
+frames such processes or executor units published are counted together
+against every recorded frame of the topic that no attributed writer holds,
+and, once, so are the recorded frames of a driver none of them runs that any
+process or executor unit feeds from the bag to its nodes, when the bag labels
+each frame with its writer, every frame carries a wire header, and the replay
+does not feed reads by their recorded identity. A replay that feeds them hands
+those frames to its nodes off the topic and counts none, so the topic fails
+(exit 1) there.
+One of them that, in a replay that does not feed reads by their recorded
+identity, feeds its nodes the other writers' recorded frames compares its
+stream, the frames it feeds included, with every recorded frame of the topic.
+One whose stream holds its own writers' frames alone, beside another that
+published frames of the topic, is not compared, since no recorded stream lines
+up with it: when nothing else on the topic fails, the topic is DECLINED,
+counted as checked and not credited, and
+`declined_frame_comparisons` names it with the cause
+`split_topic_frames_unattributed`, the ranks of those processes or executor
+units, and the byte mismatch their stream reads against every recorded frame.
+Where one stream holds the frames of two writers, it cannot tell their
+sequences apart, so the replay stops (exit 5) once a frame skips a sequence
+the recording holds, and otherwise a frame published in another order than
+recorded fails the topic (exit 1).
 
 Data violations (exit 1) print a block instead, also printed beside an exit-3
 node failure or an exit-6 schedule divergence report: a header naming the bag,
@@ -575,7 +721,11 @@ swallow the first positional, so `--run /odom` would look for a run called
 What the bag gains: the run's **effective `graph.yaml`**, its **`env.json`**,
 its **`recorder.json`** (all three copied verbatim out of the run directory) and
 a new `__cerulion/run.json` carrying the run id, the attach instant and
-`attached_mid_run: true`.
+`attached_mid_run: true`. A run that could not write its `recorder.json`, which
+holds the contract a resim judges the trace by, warns, and a bag that carries
+its trace then carries no `graph.yaml` either: the bag's `run.json` names both
+under `artifacts_unreadable`, `graph.yaml` as `withheld`, and the bag can be
+viewed but not re-executed.
 
 | Behaviour | Why |
 |---|---|
@@ -973,13 +1123,15 @@ never as clean coverage.
 ## The replay contract a bag declares
 
 A replay-grade bag (`cerulion graph run --record`) declares, in
-`__cerulion/recorder.json`, the two things re-execution must not guess: the
-trace stream's FORMAT and the run's COORDINATION contract.
+`__cerulion/recorder.json`, the three things re-execution must not guess: the
+trace stream's FORMAT, the run's COORDINATION contract and which nodes ran as
+DRIVERS.
 
 | Key | Answers |
 |---|---|
 | `trace_format` | "Can this binary decode my trace records at all?" A reader refuses a bag stamped ABOVE its own supported version, rather than decoding a stream it does not understand |
 | `coordination` | "Which execution contract was I recorded under?": `lockstep` or `free_run` |
+| `node_external` | "Which of my nodes ran as `external` (driver) nodes?": a map of node id to `true` or `false`, one entry for every node of the recorded graph but its `ros2:` entries, `true` where the loaded node declared the `external` policy. A resim judges drivers by it and refuses a build that declares any node differently (exit 2, naming each node). ABSENT on a bag recorded before the key existed: the build you replay declares the drivers, and a warning says so. A value that is not such a map (`null` included), or one that names a node the embedded graph does not run or leaves one out, is refused with exit 2. A Cerulion older than the key reads the bag and ignores it |
 
 ### The `coordination` contract, and what each reading does
 
