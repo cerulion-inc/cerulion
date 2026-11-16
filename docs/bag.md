@@ -93,11 +93,19 @@ replay PASS: <bag> (<N> tick(s) replayed, <P>/<M> topic(s) matched byte-for-byte
 
 `<M>` counts the topics the re-executed nodes publish. A driver's outputs are
 recorded inputs and are not compared: the nodes that read them are fed the
-recorded frames, and those nodes' own topics are. A node is a driver when the
-build you replay declares it `external`, since a bag does not record a node's
-policy: a build that newly declares a node `external` takes that node's
-outputs as recorded inputs too, and the verdict names it as a driver. A
-driver topic still fails the run when the bag lost its frames: a record-health
+recorded frames, and those nodes' own topics are. A recording records, for
+every node, whether it was an `external` (driver) node (the `node_external`
+key, see "The replay contract a bag declares" below), and a resim judges
+drivers by that record. The build you replay must declare the same drivers:
+when it declares `external` a node the recording ran as an ordinary node, or
+does not declare `external` a node the recording ran as a driver, the resim
+refuses with exit 2 before it runs a step, with or without `--verify`, and
+names each such node and the way it changed. Re-record the bag with the
+current workspace, or check out the recording-era node sources. A bag recorded
+before this record existed carries none, so its drivers are the nodes the
+build you replay declares `external`, and a warning says so: such a build can
+take a node's outputs out of the comparison that the recording ran as an
+ordinary node. A driver topic still fails the run when the bag lost its frames: a record-health
 stamp that counts lost frames on it makes it a `record-side-tap-loss`
 violation, counted in `<M>` (exit 1), and a replay that feeds reads by their
 recorded identity (see "Read identity" below) refuses a recorded read of a
@@ -112,12 +120,17 @@ read them; the driver topics no node reads; and, on a `0/0` tally, that no
 topic was compared. For the `v4l2_camera` example the first one reads:
 
 ```
-NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the replayed build declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
+NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the recording declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
 ```
+
+On a bag recorded before the driver record existed, the parenthetical reads
+`as the replayed build declares them`.
 
 With `--report` the JSON carries the same lists under `driver_inputs`, as
 `nodes`, `input_topics`, `shared_topics`, `unattributed_topics`,
-`unfed_topics` and `unread_topics` (absent for a graph with no driver).
+`unfed_topics` and `unread_topics` (absent for a graph with no driver), and
+`declared_by` says where `nodes` came from: `recording`, or `replayed_build`
+for a bag recorded before the driver record existed.
 `unattributed_topics` holds the shared topics compared over every recorded
 frame, the driver's included (below). A resim without `--verify` prints the same
 `NOTE:` lines under its `re-executed <N> step(s), <M> produced topic(s)` line,
@@ -1098,13 +1111,15 @@ never as clean coverage.
 ## The replay contract a bag declares
 
 A replay-grade bag (`cerulion graph run --record`) declares, in
-`__cerulion/recorder.json`, the two things re-execution must not guess: the
-trace stream's FORMAT and the run's COORDINATION contract.
+`__cerulion/recorder.json`, the three things re-execution must not guess: the
+trace stream's FORMAT, the run's COORDINATION contract and which nodes ran as
+DRIVERS.
 
 | Key | Answers |
 |---|---|
 | `trace_format` | "Can this binary decode my trace records at all?" A reader refuses a bag stamped ABOVE its own supported version, rather than decoding a stream it does not understand |
 | `coordination` | "Which execution contract was I recorded under?": `lockstep` or `free_run` |
+| `node_external` | "Which of my nodes ran as `external` (driver) nodes?": a map of node id to `true` or `false`, one entry for every node of the recorded graph but its `ros2:` entries, `true` where the loaded node declared the `external` policy. A resim judges drivers by it and refuses a build that declares any node differently (exit 2, naming each node). ABSENT on a bag recorded before the key existed: the build you replay declares the drivers, and a warning says so. A value that is not such a map (`null` included), or one that names a node the embedded graph does not run or leaves one out, is refused with exit 2. A Cerulion older than the key reads the bag and ignores it |
 
 ### The `coordination` contract, and what each reading does
 

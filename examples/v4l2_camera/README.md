@@ -161,7 +161,7 @@ cerulion bag play "$BAG" --resim all --verify
 It ends with these two lines:
 
 ```
-NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the replayed build declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
+NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were NOT compared (driver nodes, as the recording declares them: v4l2_camera): /v4l2_camera/v4l2_camera/image
 replay PASS: recordings/v4l2_camera_<timestamp>.mcap (<N> tick(s) replayed, 1/1 topic(s) matched byte-for-byte and were credited)
 ```
 

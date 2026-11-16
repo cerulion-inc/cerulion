@@ -185,8 +185,8 @@ Rules that must not drift:
   renderer writes the run directory's `graph.yaml`, so run dir and bag agree by
   construction; changing one means checking the other.
 - **A driver's outputs are recorded inputs**: `classify_topics` names every produced topic
-  whose every in-graph writer declares `MacroPolicy::External` (`external_node_ids`, read
-  off the candidates' `info()`) in `TopicClasses::driver`. A resim never queries
+  whose every in-graph writer is a driver in `TopicClasses::driver`, the driver set coming
+  from `resolve_driver_set` (below). A resim never queries
   `external_source()`, so the driver fires as recorded with no device; what its tick still
   writes is published and never compared. Its topics stay in `produced` for every
   derivation about what the graph writes (the consistency checks, a cross-rank injector, the
@@ -251,11 +251,22 @@ Rules that must not drift:
   `--report` JSON and the verdict NOTE lines (`render_driver_input_lines`, PASS and FAIL alike)
   carry it, not log text alone; `ResimReport::driver_lines` carries the same lines into the
   neutral summary, whose match observation names the left-out driver frames when
-  `driver_frames_uncompared` (`DriverInputsReport::leaves_driver_frames_out`). The driver set is the candidate's declared policy: the bag
-  records no node's policy, so a candidate that newly declares a node `external` moves that
-  node's outputs out of the diff, and the NOTE and `driver_inputs.nodes` name it. Pinned by
-  `driver_topic_tests` and the driver-graph arms of `replay_engine_test.rs` (the `drv_*`
-  fixtures); `docs/bag.md` states the user-facing rules.
+  `driver_frames_uncompared` (`DriverInputsReport::leaves_driver_frames_out`). The driver set
+  comes from the recording: `recorder.json`'s `node_external` (each native node's flag, from
+  the LOADED `info()` through `replay_engine::is_external_policy`, the predicate the
+  candidate set `external_node_ids` uses too) is read at gate 6b as contract key 3
+  (`RecordedDriverStamp`; unreadable refuses `BagInvalidAttachment` after the version gate)
+  and admitted against the embedded graph's native nodes (`DriverStamp::admit`, the type's
+  only constructor; a node too many or too few refuses `RecordingInconsistent`).
+  `resolve_driver_set` (pure) then classifies from the stamp and refuses
+  `ReplayError::DriverSetDrift` (exit 2, every node in id order, both directions) when the
+  candidate set differs, after `NodeLoad` and the resume refusals, under `--verify` and the
+  neutral resim alike. A bag with no stamp takes the candidate set, with ONE warn when it is
+  non-empty, and `DriverInputsReport::declared_by` (`recording` or `replayed_build`) and the
+  NOTE parenthetical say which. Pinned by `driver_topic_tests`, `driver_stamp_tests`, the
+  stamp arms of `replay_gates_test.rs` and the driver-graph arms of `replay_engine_test.rs`
+  (the `drv_*` fixtures: the unstamped ones pin the older-recording arm, the stamped ones
+  the match and both refusals); `docs/bag.md` states the user-facing rules.
 - **Environment divergence prints once and never changes the exit code.** A resim never
   applies the bag's `env.json`: its nodes read the replay shell's environment, and
   `replay_engine::compare_env_against` compares the two (no `env.json`, no comparison). One
@@ -345,7 +356,12 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   failure is exactly one `warn!`. The write sits after the partition pre-flight and
   before deployment dispatch, and the recorded `process_groups` comes from the RESOLVED
   deployment, never from the config's own flag (the config may not reflect an in-memory
-  derived partition).
+  derived partition). `recorder.json` is the exception: it carries each node's driver flag
+  from the LOADED metadata, so `write_run_recorder_best_effort` writes it once the nodes
+  load (the monolith after `load_node_factories_from_cache`, the supervisor after
+  `loaded_entry_infos`) and before any ring is named in `run.json` or the window recorder
+  spawns; `bag_cmd::read_run_artifacts` reads `run.json` first, so a declared ring implies
+  the file. Source-order pins hold both.
 - **Launch arguments**: `graph run <NAME> [NAME:=VALUE]...` reads the graph through
   `graph_launch_args::graph_read_raw_with_launch_args`, the same read `graph_read_raw` makes
   with no overrides, so every verb sees the resolved graph. The resolution is
