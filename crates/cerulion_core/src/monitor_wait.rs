@@ -69,7 +69,8 @@ use std::time::{Duration, Instant};
 /// - `doorbell`: also wake the park on the producer-rung SHM doorbell the
 ///   instant DATA is published (the data-hop path): `UMONITOR`/`WFE` armed on
 ///   the line where the CPU carries a monitor-wait primitive, a kernel block on
-///   the page's wake word on macOS. IMPLIES
+///   the page's wake word elsewhere (a shared futex on Linux and Android,
+///   os_sync on macOS 14.4 and later). IMPLIES
 ///   `monitor_wait` (the ring wakes the same park). The invariant `doorbell` ⇒
 ///   `monitor_wait` is enforced by [`MonitorWaitPolicy::new`] (the fields are
 ///   private and `new` is the only constructor that takes the flags), so no
