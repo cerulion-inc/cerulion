@@ -1465,8 +1465,10 @@ fn no_tty_default_mp_run_writes_and_announces_its_run_directory() {
         let found = std::fs::read_dir(&runs)
             .ok()
             .and_then(|d| d.filter_map(Result::ok).map(|e| e.path()).next());
+        // `recorder.json` lands once the nodes load, after the rest of the
+        // description, so the wait covers it too.
         if let Some(dir) = found {
-            if dir.join("run.json").exists() {
+            if dir.join("run.json").exists() && dir.join("recorder.json").exists() {
                 break dir;
             }
         }

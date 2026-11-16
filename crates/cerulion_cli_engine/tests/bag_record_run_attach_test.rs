@@ -55,6 +55,10 @@ const DEPARTURE_RANK: u32 = u32::MAX;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The run directory's `recorder.json` every fixture run here carries, with a
+/// driver stamp an attach must copy verbatim.
+const RUN_RECORDER_JSON: &[u8] = br#"{"arch":"test","node_external":{"src0":true}}"#;
+
 fn nanos() -> u128 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -192,7 +196,7 @@ fn publish_run_with_state_consumer(
     }
     std::fs::write(dir.path().join("graph.yaml"), graph).expect("graph.yaml");
     std::fs::write(dir.path().join("env.json"), br#"{"PROBE":"ra"}"#).expect("env.json");
-    std::fs::write(dir.path().join("recorder.json"), br#"{"arch":"test"}"#).expect("recorder.json");
+    std::fs::write(dir.path().join("recorder.json"), RUN_RECORDER_JSON).expect("recorder.json");
     let ring_entries: Vec<serde_json::Value> = rings
         .iter()
         .enumerate()
@@ -597,6 +601,17 @@ fn a_mid_run_attach_records_a_lapped_ring_from_a_complete_step_and_keeps_departu
             "an attached bag must carry `{name}` from the run directory"
         );
     }
+    // The recorder identity is COPIED, driver stamp included: a resim of this
+    // bag judges drivers by the run's own `node_external`.
+    assert_eq!(
+        reader
+            .attachment("__cerulion/recorder.json")
+            .expect("read attachments")
+            .expect("present")
+            .data,
+        RUN_RECORDER_JSON.to_vec(),
+        "an attach copies the run's recorder.json, driver stamp included, byte for byte"
+    );
 
     // ---- CLAIM 6: the trace VERDICT is chosen from what the run
     // actually declared. The call-site `if rings.is_empty()` is pinned here

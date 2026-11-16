@@ -1357,12 +1357,12 @@ fn write_bag_with_coordination(
     path: &std::path::Path,
     coordination: replay_engine::CoordinationMode,
 ) {
-    write_bag_with_recorder_json(rec, path, production_recorder_json(coordination));
+    write_bag_with_recorder_json(rec, path, pre_stamp_recorder_json(coordination));
 }
 
 /// [`write_bag_with_coordination`] with the `recorder.json` supplied verbatim.
 ///
-/// The seam an ARCHIVED-format case needs: `production_recorder_json` stamps
+/// The seam an ARCHIVED-format case needs: `pre_stamp_recorder_json` stamps
 /// [`replay_engine::recorder_stamps_consult_records`] unconditionally, so every
 /// bag this binary writes is format 7 and a format <= 6 bag (the shape older
 /// recorders wrote) is otherwise unreachable from this file.
@@ -1385,12 +1385,27 @@ fn write_bag_with_recorder_json(rec: &Recording, path: &std::path::Path, recorde
 }
 
 /// The `recorder.json` bytes a real recorder writes for `coordination` (see
-/// [`write_bag_with_coordination`]).
-fn production_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec<u8> {
-    cerulion_cli_engine::graph_cmd::render_recorder_json(
-        std::time::Duration::from_nanos(1_783_092_278_948_123_456),
-        coordination,
-    )
+/// [`write_bag_with_coordination`]), WITHOUT the `node_external` driver stamp:
+/// the document a recorder made before the stamp wrote, which a replay judges
+/// drivers on by the build it replays.
+///
+/// The fixtures that go through it record graphs whose builds declare no
+/// `external` node, where a replay classifies a stamped bag and an unstamped
+/// one alike (no driver either way) and an unstamped one with no driver warns
+/// about nothing.
+fn pre_stamp_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec<u8> {
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&cerulion_cli_engine::graph_cmd::render_recorder_json(
+            std::time::Duration::from_nanos(1_783_092_278_948_123_456),
+            coordination,
+            &std::collections::BTreeMap::new(),
+        ))
+        .expect("the production recorder.json parses");
+    doc.as_object_mut()
+        .expect("an object")
+        .remove("node_external")
+        .expect("the production writer stamps the driver flags");
+    serde_json::to_vec(&doc).expect("re-render")
 }
 
 /// [`write_bag`] with an explicit manifest
@@ -1444,7 +1459,7 @@ fn write_bag_coordinated_with_capacities(
         None,
         inputs_json,
         Some(serde_json::json!(0)),
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         None,
         Some(capacities),
@@ -1604,7 +1619,7 @@ fn write_bag_with_annotations(
         None,
         inputs_json,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         publishers,
         None,
         None,
@@ -8384,7 +8399,7 @@ fn write_multi_rank_bag_with_producers(
         path,
         |_| {},
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -8477,7 +8492,7 @@ fn write_multi_rank_bag_coordinated(
         path,
         tweak,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -8509,7 +8524,7 @@ fn write_multi_rank_bag_coordinated_with_staging(
         path,
         tweak,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -8538,7 +8553,7 @@ fn write_multi_rank_bag_coordinated_with_attachments(
         path,
         |_| {},
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -13428,7 +13443,7 @@ fn write_sy_verify_bag(rec: Recording, path: &std::path::Path, edit: impl FnOnce
         rec,
         path,
         edit,
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -14596,7 +14611,7 @@ fn write_stamped_checkpoint_bag(
         Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
         None,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
     );
     bag
 }
@@ -21076,12 +21091,12 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
 
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
-    write_bag_with_recorder_json(&rec, &stamped, production_recorder_json(lockstep));
+    write_bag_with_recorder_json(&rec, &stamped, pre_stamp_recorder_json(lockstep));
     // This bag is recorded BY THIS BINARY, so it stamps 9
     // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
     // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
-    // in this file that is fed by `production_recorder_json`; the arms that
+    // in this file that is fed by `pre_stamp_recorder_json`; the arms that
     // stamp 4, 5 or 6 EXPLICITLY are the ones testing old-format reading.
     assert_eq!(
         recorded_trace_format(&stamped),
@@ -24345,7 +24360,7 @@ fn a_free_run_peer_past_rank_zero_is_deducted_at_its_own_ceiling() {
         // rank 0's own last boundary, which is the whole point of the shape.
         |per_rank| per_rank[0].retain(|r| r.step <= 2),
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         Some(15_000_000),
@@ -25538,7 +25553,7 @@ fn write_stamped_checkpoint_bag_with_deadline(
         Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
         None,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
     );
     bag
 }
@@ -26513,7 +26528,7 @@ fn write_stamped_cp3_bag(
         ])),
         None,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
     );
     bag
 }
@@ -26744,7 +26759,7 @@ fn write_free_run_backlog_bag(
         )),
         None,
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
     );
@@ -29935,7 +29950,7 @@ fn write_sy_bag(
         rec,
         path,
         edit,
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
     )
 }
 
@@ -29956,7 +29971,7 @@ fn write_sy_bag_stamped_inputs_per_rank(
         rec,
         path,
         |_rec| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         Some(inputs),
         None,
     )
@@ -29973,7 +29988,7 @@ fn write_sy_bag_mixed_regime(
         rec,
         path,
         |_rec| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(staging),
     )
@@ -30038,7 +30053,7 @@ fn a_two_rank_free_run_bag_with_per_edge_rims_still_verifies() {
         rec.clone(),
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -30123,7 +30138,7 @@ fn a_two_rank_free_run_resim_does_not_call_a_correct_cross_rank_source_a_typo() 
         rec,
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -30190,7 +30205,7 @@ fn an_unreadable_staging_declaration_declines_under_its_own_cause() {
         rec.clone(),
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -30296,7 +30311,7 @@ fn a_scoped_refusal_still_states_its_evidence_and_remedy() {
         rec.clone(),
         &bag_unnamed,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging_unnamed),
     );
@@ -30339,7 +30354,7 @@ fn a_scoped_refusal_still_states_its_evidence_and_remedy() {
         rec,
         &bag_in_rank,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging_in_rank),
     );
@@ -30404,7 +30419,7 @@ fn a_free_run_bag_naming_a_stage_no_rank_claims_is_still_refused() {
         rec.clone(),
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -33030,9 +33045,8 @@ fn recorder_json_at_trace_format(
     coordination: replay_engine::CoordinationMode,
     trace_format: u32,
 ) -> Vec<u8> {
-    let mut obj: serde_json::Value =
-        serde_json::from_slice(&production_recorder_json(coordination))
-            .expect("the production recorder.json parses");
+    let mut obj: serde_json::Value = serde_json::from_slice(&pre_stamp_recorder_json(coordination))
+        .expect("the production recorder.json parses");
     obj["trace_format"] = serde_json::json!(trace_format);
     serde_json::to_vec(&obj).expect("re-serializing a parsed object cannot fail")
 }
@@ -33133,7 +33147,7 @@ fn write_sy_single_rank_free_run_bag(
         rec,
         path,
         edit,
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
     )
 }
 
@@ -36881,7 +36895,7 @@ fn a_wiring_blocked_topic_with_no_recorded_read_replays_with_the_note() {
         &bag,
         |_| {},
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -37518,7 +37532,7 @@ fn write_sb_bag(
             }
         },
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -39619,7 +39633,7 @@ fn c6_a_finished_pass_holds_no_capture_port_into_the_next_ranks_pass() {
         &bag,
         |_| {},
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -41658,7 +41672,7 @@ fn write_capture_shaped_bag(
         "application/json",
         0,
         0,
-        &production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        &pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
     )
     .unwrap();
     w.write_attachment(
@@ -41942,7 +41956,7 @@ fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
             );
         },
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         Some(15_000_000),
@@ -42340,7 +42354,7 @@ fn ri_ranked_bag_with_labels(
 }
 
 fn ri_free_run_recorder_json() -> Vec<u8> {
-    production_recorder_json(replay_engine::CoordinationMode::FreeRun)
+    pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun)
 }
 
 /// The production `recorder.json` restamped at an older `trace_format`.
@@ -43687,7 +43701,7 @@ fn a_batch_recorded_below_format_nine_replays_clean_under_verify() {
         (
             "format9_lockstep_control",
             false,
-            production_recorder_json(lockstep),
+            pre_stamp_recorder_json(lockstep),
         ),
         (
             "format8_lockstep",
@@ -44360,7 +44374,7 @@ fn ob_multi_writer_bag(path: &std::path::Path, recorder_json: Vec<u8>, two_write
 
 /// The production lockstep `recorder.json`, at this build's trace format.
 fn ob_lockstep_recorder_json() -> Vec<u8> {
-    production_recorder_json(replay_engine::CoordinationMode::Lockstep)
+    pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep)
 }
 
 /// The two multi-writer fixtures: a format 7 free-run bag with one external
@@ -45418,7 +45432,7 @@ fn a_lockstep_recording_of_a_driver_graph_diverges_naming_the_driver() {
     ri_bag(
         &live.rec,
         &bag,
-        production_recorder_json(replay_engine::CoordinationMode::Lockstep),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep),
     );
     let (outcome, replayed) = ri_replay(
         &bag,
@@ -45764,7 +45778,7 @@ fn a_lockstep_recording_of_a_driver_on_a_shared_topic_warns_naming_it() {
     ri_bag(
         &live.rec,
         &bag,
-        production_recorder_json(replay_engine::CoordinationMode::Lockstep),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep),
     );
     let (outcome, _) = ri_replay(
         &bag,

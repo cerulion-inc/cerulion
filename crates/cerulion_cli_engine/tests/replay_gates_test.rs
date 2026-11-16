@@ -1446,7 +1446,9 @@ fn recorder_att(trace_format: Option<u32>) -> Att {
 }
 
 /// A recorder.json rendered by the PRODUCTION writer
-/// (`graph_cmd::render_recorder_json`) for `coordination`.
+/// (`graph_cmd::render_recorder_json`) for `coordination`, with the driver
+/// flags of [`valid_graph_yaml`]'s one node (`pub1`, an ordinary node) stated
+/// by hand.
 ///
 /// Deliberately not hand-built: no production route resolves `FreeRun` until
 /// 2d, so a hand-written free-run attachment is free to drift from what 2d's
@@ -1460,6 +1462,7 @@ fn production_recorder_att(coordination: CoordinationMode) -> Att {
         cerulion_cli_engine::graph_cmd::render_recorder_json(
             std::time::Duration::from_nanos(1_783_092_278_948_123_456),
             coordination,
+            &std::collections::BTreeMap::from([("pub1".to_string(), false)]),
         ),
     )
 }

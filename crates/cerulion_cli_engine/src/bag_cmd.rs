@@ -6520,6 +6520,11 @@ impl RunArtifacts {
 /// may be removing (its `Drop` deletes it), so an unreadable file is a fact to
 /// report, never a reason to abandon a recording that is already the only copy
 /// of what is on the wire.
+///
+/// `run.json` is read FIRST. A run writes its `recorder.json` once its nodes
+/// load and before it declares any trace ring in `run.json`
+/// (`run_dir::write_run_recorder`), so a manifest that names a ring here was
+/// written after the `recorder.json` read below can find.
 pub fn read_run_artifacts(dir: &std::path::Path) -> RunArtifacts {
     let mut out = RunArtifacts::default();
     let slot = |name: &str, into: &mut Option<Vec<u8>>, unreadable: &mut Vec<(String, String)>| {
@@ -6528,6 +6533,11 @@ pub fn read_run_artifacts(dir: &std::path::Path) -> RunArtifacts {
             Err(e) => unreadable.push((name.to_string(), e.to_string())),
         }
     };
+    slot(
+        crate::run_dir::RUN_MANIFEST_FILE,
+        &mut out.run_json,
+        &mut out.unreadable,
+    );
     slot(
         crate::run_dir::RUN_GRAPH_FILE,
         &mut out.graph_yaml,
@@ -6541,11 +6551,6 @@ pub fn read_run_artifacts(dir: &std::path::Path) -> RunArtifacts {
     slot(
         crate::run_dir::RUN_RECORDER_FILE,
         &mut out.recorder_json,
-        &mut out.unreadable,
-    );
-    slot(
-        crate::run_dir::RUN_MANIFEST_FILE,
-        &mut out.run_json,
         &mut out.unreadable,
     );
     out.rings = out
@@ -8973,6 +8978,31 @@ pub fn render_record_summary(summary: &cerulion_bagd::BagdSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `read_run_artifacts` reads `run.json` BEFORE `recorder.json`. A run
+    /// writes its `recorder.json` before it names any trace ring in `run.json`,
+    /// so reading in this order is what makes a manifest that names a ring
+    /// imply the recorder identity (and its driver stamp) is readable. No
+    /// behavioural test can stop a live run between two reads, so the order is
+    /// pinned on the source.
+    #[test]
+    fn read_run_artifacts_reads_the_manifest_before_the_recorder_identity() {
+        let src = include_str!("bag_cmd.rs");
+        let start = src
+            .find("pub fn read_run_artifacts(")
+            .expect("the reader must still exist");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its body ends")];
+        let manifest = body
+            .find("crate::run_dir::RUN_MANIFEST_FILE,")
+            .expect("the reader reads run.json");
+        let recorder = body
+            .find("crate::run_dir::RUN_RECORDER_FILE,")
+            .expect("the reader reads recorder.json");
+        assert!(
+            manifest < recorder,
+            "run.json must be read before recorder.json:\n{body}"
+        );
+    }
 
     fn scan_of(topics: &[(&str, u64)]) -> BagScan {
         BagScan {
@@ -12433,11 +12463,12 @@ nodes:
         assert_eq!(got.env_json.as_deref(), Some(&b"{}"[..]));
         assert!(got.recorder_json.is_none() && got.run_json.is_none());
         let missing: Vec<&str> = got.unreadable.iter().map(|(n, _)| n.as_str()).collect();
+        // In READ order: the manifest first (see `read_run_artifacts`).
         assert_eq!(
             missing,
             vec![
-                crate::run_dir::RUN_RECORDER_FILE,
-                crate::run_dir::RUN_MANIFEST_FILE
+                crate::run_dir::RUN_MANIFEST_FILE,
+                crate::run_dir::RUN_RECORDER_FILE
             ],
             "an artifact that could not be read is NAMED, so a thin bag is \
              explained rather than merely thin"

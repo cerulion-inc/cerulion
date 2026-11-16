@@ -346,6 +346,13 @@ fn mp_record_contracts_under_signal(
         recorder["coordination"], want_coordination,
         "the bag's coordination stamp follows the resolved execution mode: {recorder}"
     );
+    // …and each native node's driver flag, from the supervisor's loaded
+    // metadata: none of these three fixtures declares the `external` policy.
+    assert_eq!(
+        recorder["node_external"],
+        serde_json::json!({"relay": false, "sink": false, "ticker": false}),
+        "the bag names every node's driver flag: {recorder}"
+    );
 
     // (b) per-rank manifests (one per unit, its node ids in config order),
     // no rank past the last unit, and the departure sentinel manifest.
@@ -725,6 +732,22 @@ fn mp_graph_single_process_record_takes_stage1_path() {
     assert!(
         read_manifest(&reader, DEPARTURE_SENTINEL).is_none(),
         "--single-process must NOT produce the departure sentinel manifest"
+    );
+
+    // The monolith route stamps each node's driver flag from its own loaded
+    // factories, the same map the supervisor route writes.
+    let recorder: serde_json::Value = serde_json::from_slice(
+        &reader
+            .attachment("__cerulion/recorder.json")
+            .expect("read attachments")
+            .expect("__cerulion/recorder.json attachment present")
+            .data,
+    )
+    .expect("recorder.json parses as JSON");
+    assert_eq!(
+        recorder["node_external"],
+        serde_json::json!({"relay": false, "sink": false, "ticker": false}),
+        "the single-process bag names every node's driver flag: {recorder}"
     );
 
     // Every record is rank-0 provenance (the single-process ring's header rank).

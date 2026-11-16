@@ -2183,9 +2183,10 @@ fn trace_format_v1() -> u32 {
 ///
 /// A CONST inventory of the binary's own emission set, deliberately NOT a
 /// runtime observation of a particular trace: `render_recorder_json`
-/// stamps a bag's format at recording START, and one of the three
-/// recorder.json producers (`bag_cmd`'s `--run` attach) COPIES a stamp frozen
-/// at run start into a bag whose records are drained later — so a stamp
+/// stamps a bag's format before any of its records is drained (once the
+/// run's nodes load), and one of the three recorder.json producers
+/// (`bag_cmd`'s `--run` attach) COPIES the run directory's stamp, written at
+/// that point, into a bag whose records are drained later, so a stamp
 /// derived from "what this stream turned out to contain" could under-claim on
 /// exactly that path. A static property of the binary cannot.
 const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
@@ -17185,26 +17186,55 @@ fn classify_topics(
     })
 }
 
-/// The ids of the graph's `external` (driver) nodes: every candidate whose
-/// declared policy is [`MacroPolicy::External`], the same policy the runtime
+/// Whether a node's declared policy makes it an `external` (driver) node:
+/// [`MacroPolicy::External`] and nothing else, the one policy the runtime
 /// builds its `External` trigger from.
+///
+/// The recorder stamps each node's driver flag with this predicate
+/// ([`node_external_flags`]) and the replay classifies the build it replays
+/// with it ([`external_node_ids`]), so the two cannot disagree about what a
+/// driver is.
+///
+/// [`MacroPolicy::External`]: cerulion_core::graph::node::MacroPolicy::External
+pub fn is_external_policy(policy: Option<&cerulion_core::graph::node::MacroPolicy>) -> bool {
+    matches!(
+        policy,
+        Some(cerulion_core::graph::node::MacroPolicy::External)
+    )
+}
+
+/// Each node's driver flag, keyed by node id: `true` where the node's loaded
+/// metadata declares the `external` policy ([`is_external_policy`]), `false`
+/// for every other node. This is the `node_external` map a recording's
+/// `__cerulion/recorder.json` carries.
+///
+/// A `BTreeMap`, so the map is in id order whatever order the nodes arrive in
+/// and the rendered attachment is byte-identical for the same graph and
+/// builds.
+pub fn node_external_flags<'a>(
+    infos: impl IntoIterator<Item = (&'a String, &'a cerulion_core::graph::NodeInfo)>,
+) -> BTreeMap<String, bool> {
+    infos
+        .into_iter()
+        .map(|(id, info)| (id.clone(), is_external_policy(info.policy().as_ref())))
+        .collect()
+}
+
+/// The ids of the replayed build's `external` (driver) nodes: every candidate
+/// whose declared policy is the `external` one ([`is_external_policy`]).
 ///
 /// A node whose metadata cannot be read is NOT counted as a driver, so its
 /// outputs stay compared: a topic leaves the comparison only on the node's own
 /// declaration. The per-pass metadata read already reports such a node
 /// loudly (`collect_pass_node_infos`).
-///
-/// [`MacroPolicy::External`]: cerulion_core::graph::node::MacroPolicy::External
 fn external_node_ids(factories: &IndexMap<String, Box<dyn NodeEntry>>) -> BTreeSet<String> {
-    factories
+    let infos: Vec<(String, cerulion_core::graph::NodeInfo)> = factories
         .iter()
-        .filter(|(_, entry)| {
-            matches!(
-                entry.info().ok().and_then(|info| info.policy()),
-                Some(cerulion_core::graph::node::MacroPolicy::External)
-            )
-        })
-        .map(|(id, _)| id.clone())
+        .filter_map(|(id, entry)| entry.info().ok().map(|info| (id.clone(), info)))
+        .collect();
+    node_external_flags(infos.iter().map(|(id, info)| (id, info)))
+        .into_iter()
+        .filter_map(|(id, external)| external.then_some(id))
         .collect()
 }
 
@@ -21022,10 +21052,10 @@ mod restored_sync_heads_tests {
 mod driver_topic_tests {
     use super::{
         build_rank_plans, classify_topics, driver_inputs_report, driver_output_topics,
-        driver_shared_topics, driver_written_topics, external_node_ids, log_driver_topic_feeds,
-        plan_driver_topic_feeds, re_executed_output_topics, render_driver_input_lines,
-        CoordinationMode, DriverInputsReport, DriverTopicFeeds, NodeEntry, RecordedMessages,
-        TopicClasses,
+        driver_shared_topics, driver_written_topics, external_node_ids, is_external_policy,
+        log_driver_topic_feeds, node_external_flags, plan_driver_topic_feeds,
+        re_executed_output_topics, render_driver_input_lines, CoordinationMode, DriverInputsReport,
+        DriverTopicFeeds, NodeEntry, RecordedMessages, TopicClasses,
     };
     use crate::replay_rank::RankBoundarySummary;
     use cerulion_core::graph::node::{ClosureNodeEntry, MacroPolicy, NodeInfo};
@@ -21160,6 +21190,41 @@ mod driver_topic_tests {
         );
         factories.insert("opaque".into(), Box::new(UnreadableInfo));
         assert_eq!(external_node_ids(&factories), ids(&["cam", "lidar"]));
+    }
+
+    /// The recorder's stamp marks exactly the nodes that declare the
+    /// `external` policy, names every node it is handed whatever its policy,
+    /// and is in id order whatever order the nodes arrive in.
+    #[test]
+    fn node_external_flags_mark_only_the_external_policy() {
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("sink".into(), NodeInfo::from_names(vec![], vec![]));
+        infos.insert(
+            "cam".into(),
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::External),
+        );
+        infos.insert(
+            "meter".into(),
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::Period { period_ms: 10 }),
+        );
+        infos.insert(
+            "fuse".into(),
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::DataTrigger {
+                input_name: "image".into(),
+            }),
+        );
+        let flags = node_external_flags(&infos);
+        assert_eq!(
+            flags.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("cam".to_string(), true),
+                ("fuse".to_string(), false),
+                ("meter".to_string(), false),
+                ("sink".to_string(), false),
+            ]
+        );
+        assert!(is_external_policy(Some(&MacroPolicy::External)));
+        assert!(!is_external_policy(None));
     }
 
     /// Every output of a driver is a driver topic, in graph order; the
