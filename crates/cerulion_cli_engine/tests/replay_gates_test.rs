@@ -1958,6 +1958,170 @@ fn a_newer_format_wins_over_the_unknown_coordination_value() {
     assert_eq!(err.exit_code(), 2);
 }
 
+// ── The `node_external` driver stamp (contract key 3) ──────────────
+
+/// A production-shaped recorder.json at this binary's format whose
+/// `node_external` key is `stamp` verbatim (`None`: no key at all).
+fn recorder_att_with_stamp(trace_format: u32, stamp: Option<serde_json::Value>) -> Att {
+    let mut obj = serde_json::json!({
+        "arch": std::env::consts::ARCH,
+        "os": std::env::consts::OS,
+        "cerulion_version": "0.1.0",
+        "recorded_at_ns": 42u64,
+        "trace_format": trace_format,
+        "coordination": "lockstep",
+    });
+    if let Some(v) = stamp {
+        obj["node_external"] = v;
+    }
+    recorder_att_raw(&serde_json::to_vec(&obj).unwrap())
+}
+
+/// A present `node_external` that is not a map of node ids to booleans is
+/// REFUSED (exit 2) naming the key and the value, never read as absent and
+/// never guessed: a list, a non-bool flag, a bare number, and an explicit
+/// `null`, which is a value and not an absence.
+#[test]
+fn an_unreadable_driver_stamp_is_refused() {
+    let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
+    for (name, value, quoted) in [
+        ("list", serde_json::json!(["pub1"]), r#"["pub1"]"#),
+        (
+            "non_bool",
+            serde_json::json!({"pub1": "yes"}),
+            r#"{"pub1":"yes"}"#,
+        ),
+        ("null", serde_json::Value::Null, "null"),
+        ("number", serde_json::json!(42), "42"),
+    ] {
+        let (_dir, path) = tmp_bag(&format!("stamp_{name}.mcap"));
+        let mut atts = replay_grade_attachments(&["node0"]);
+        atts.push(recorder_att_with_stamp(supported, Some(value)));
+        write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+        let err = gate(&path);
+        match &err {
+            ReplayError::BagInvalidAttachment { name: att, reason } => {
+                assert_eq!(att, "__cerulion/recorder.json", "{name}");
+                assert_eq!(
+                    reason,
+                    &format!(
+                        "`node_external` is {quoted}, which is not a map of node ids to true or \
+                         false. It is the key a replay judges external (driver) nodes by, so an \
+                         unreadable value is refused rather than guessed. Re-record the bag, or \
+                         repair the attachment"
+                    ),
+                    "{name}"
+                );
+            }
+            other => panic!("{name}: expected BagInvalidAttachment, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 2, "{name}");
+    }
+}
+
+/// ORDERING: an unreadable stamp on a bag from a NEWER format gets the
+/// version refusal, which names the cause.
+#[test]
+fn an_unreadable_stamp_on_a_newer_format_bag_reports_the_version_first() {
+    let newer = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT + 1;
+    let (_dir, path) = tmp_bag("stamp_newer.mcap");
+    let mut atts = replay_grade_attachments(&["node0"]);
+    atts.push(recorder_att_with_stamp(newer, Some(serde_json::json!(42))));
+    write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+    let err = gate(&path);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert!(
+            detail.contains(&format!("version {newer}")) && detail.contains("NEWER"),
+            "the version refusal is the one served: {detail}"
+        ),
+        other => panic!("expected the version refusal, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A stamp must describe the graph the bag embeds: a stamp naming a node the
+/// graph does not run, or missing one it does, is refused (exit 2) naming
+/// the nodes, rather than half applied.
+#[test]
+fn a_stamp_that_describes_another_graph_is_refused_naming_the_nodes() {
+    let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
+    for (name, stamp, want) in [
+        (
+            "extra",
+            serde_json::json!({"ghost": true, "pub1": false}),
+            "bag internal consistency check failed: recorder.json's `node_external` names \
+             node(s) the embedded graph does not run: ghost",
+        ),
+        (
+            "missing",
+            serde_json::json!({}),
+            "bag internal consistency check failed: recorder.json's `node_external` does not \
+             name node(s) the embedded graph runs: pub1",
+        ),
+    ] {
+        let (_dir, path) = tmp_bag(&format!("stamp_{name}.mcap"));
+        let mut atts = replay_grade_attachments(&["node0"]);
+        atts.push(recorder_att_with_stamp(supported, Some(stamp)));
+        write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+        let err = gate(&path);
+        assert!(
+            matches!(err, ReplayError::RecordingInconsistent { .. }),
+            "{name}: got {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with(want),
+            "{name}: the refusal names the nodes: {err}"
+        );
+        assert_eq!(err.exit_code(), 2, "{name}");
+    }
+}
+
+/// ANTI-TAUTOLOGY for the arms above: a stamp naming exactly the graph's
+/// nodes clears the gate, a `ros2:` entry is never in the stamp (a replay
+/// re-executes native nodes only), and a key this binary does not know is
+/// ignored. Each reaches the downstream node load like every gated bag here.
+#[test]
+fn a_complete_stamp_clears_the_gate_without_a_ros2_entry_or_with_an_unknown_key() {
+    let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
+    let ros2_graph = b"name: replaytest\nprefix: replaytest\nnodes:\n  - id: pub1\n    \
+        type: test_pub\n    outputs:\n      - name: data\n        schema: test/Data\n  \
+        - id: talker\n    ros2: {package: demo_nodes_cpp, executable: talker}\n"
+        .to_vec();
+    let mut unknown_key = serde_json::from_slice::<serde_json::Value>(
+        &recorder_att_with_stamp(supported, Some(serde_json::json!({"pub1": false}))).2,
+    )
+    .unwrap();
+    unknown_key["a_key_from_a_newer_recorder"] = serde_json::json!({"x": 1});
+    for (name, graph, recorder) in [
+        (
+            "exact",
+            valid_graph_yaml(),
+            recorder_att_with_stamp(supported, Some(serde_json::json!({"pub1": false}))),
+        ),
+        (
+            "ros2_entry",
+            ros2_graph,
+            recorder_att_with_stamp(supported, Some(serde_json::json!({"pub1": false}))),
+        ),
+        (
+            "unknown_key",
+            valid_graph_yaml(),
+            recorder_att_raw(&serde_json::to_vec(&unknown_key).unwrap()),
+        ),
+    ] {
+        let (_dir, path) = tmp_bag(&format!("stamp_ok_{name}.mcap"));
+        let mut atts = replay_grade_attachments(&["node0"]);
+        atts[0] = att("graph.yaml", "application/yaml", graph);
+        atts.push(recorder);
+        write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+        let err = gate(&path);
+        assert!(
+            matches!(err, ReplayError::NodeLoad { .. }),
+            "{name}: a stamp that describes the graph clears the gate; got {err:?}"
+        );
+    }
+}
+
 // ── The `--tolerance` PRE-FLIGHT gate (exit 4) ──────────────
 //
 // The tolerance document is parsed + validated AFTER the bag's graph attachment

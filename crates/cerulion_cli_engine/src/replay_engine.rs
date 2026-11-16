@@ -2132,6 +2132,141 @@ pub struct RecorderInfo {
     /// carries the absence, never a sentinel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination: Option<CoordinationMode>,
+    /// Which nodes the recording ran as `external` (driver) nodes: the
+    /// document's `node_external` key, VALIDATED against the bag's own graph
+    /// ([`DriverStamp::admit`]). `None` is a recording made before the stamp.
+    ///
+    /// Never serialized, so the `--report` JSON's `recorder` object is
+    /// unchanged, and never deserialized: serde cannot validate the stamp
+    /// against a graph, so the only way to fill it is the gate's own read
+    /// (`replay_cmd::read_recorder_info` then [`DriverStamp::admit`]), and a
+    /// judge can only ever see a validated one.
+    #[serde(skip)]
+    pub driver_stamp: Option<DriverStamp>,
+}
+
+/// What a `__cerulion/recorder.json` document says about its nodes' driver
+/// flags (its `node_external` key), before it is checked against the bag's
+/// graph ([`DriverStamp::admit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedDriverStamp {
+    /// The key is ABSENT: a recording made before the stamp.
+    Absent,
+    /// A map of node ids to `true` (an `external` node) or `false`.
+    Present(BTreeMap<String, bool>),
+    /// Present but not a map of node ids to booleans (`null` included): the
+    /// value as it appeared, for the refusal to name.
+    Unreadable(String),
+}
+
+impl RecordedDriverStamp {
+    /// Read the `node_external` key off a parsed recorder.json object.
+    ///
+    /// Only an absent key is [`Self::Absent`]: an explicit `null` is
+    /// [`Self::Unreadable`], so a document that carries the key with no usable
+    /// value is refused rather than judged as a recording that predates it.
+    pub fn read(obj: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let Some(value) = obj.get("node_external") else {
+            return Self::Absent;
+        };
+        let Some(map) = value.as_object() else {
+            return Self::Unreadable(value.to_string());
+        };
+        let mut flags = BTreeMap::new();
+        for (id, flag) in map {
+            match flag.as_bool() {
+                Some(external) => {
+                    flags.insert(id.clone(), external);
+                }
+                None => return Self::Unreadable(value.to_string()),
+            }
+        }
+        Self::Present(flags)
+    }
+}
+
+/// A recording's driver flags, checked against the graph the bag embeds: one
+/// flag for every native node of that graph and for nothing else.
+///
+/// The only constructor is [`Self::admit`], so a replay that holds one holds
+/// a stamp that describes the graph it replays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverStamp {
+    flags: BTreeMap<String, bool>,
+}
+
+impl DriverStamp {
+    /// Admit a recording's `node_external` key for `config`, the bag's own
+    /// graph with its `ros2:` entries already taken out (the stamp names
+    /// native nodes only).
+    ///
+    /// # Errors
+    ///
+    /// - [`ReplayError::BagInvalidAttachment`] (exit 2) when the key is present
+    ///   but not a map of node ids to booleans: it is the key a replay judges
+    ///   drivers by, so an unreadable one is refused rather than guessed.
+    /// - [`ReplayError::RecordingInconsistent`] (exit 2) when the map names a
+    ///   node the graph does not run, or does not name one it does: a stamp
+    ///   that describes another graph is refused rather than half applied.
+    pub fn admit(
+        raw: RecordedDriverStamp,
+        config: &GraphConfig,
+    ) -> Result<Option<DriverStamp>, ReplayError> {
+        let flags = match raw {
+            RecordedDriverStamp::Absent => return Ok(None),
+            RecordedDriverStamp::Unreadable(value) => {
+                return Err(ReplayError::BagInvalidAttachment {
+                    name: crate::replay_cmd::RECORDER_ATTACHMENT.to_string(),
+                    reason: format!(
+                        "`node_external` is {value}, which is not a map of node ids to true or \
+                         false. It is the key a replay judges external (driver) nodes by, so an \
+                         unreadable value is refused rather than guessed. Re-record the bag, or \
+                         repair the attachment"
+                    ),
+                })
+            }
+            RecordedDriverStamp::Present(flags) => flags,
+        };
+        let graph: BTreeSet<&str> = config.native_nodes().map(|n| n.id.as_str()).collect();
+        let extra: Vec<&str> = flags
+            .keys()
+            .map(String::as_str)
+            .filter(|id| !graph.contains(id))
+            .collect();
+        if !extra.is_empty() {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "recorder.json's `node_external` names node(s) the embedded graph does not \
+                     run: {}",
+                    extra.join(", ")
+                ),
+            });
+        }
+        let missing: Vec<&str> = graph
+            .iter()
+            .copied()
+            .filter(|id| !flags.contains_key(*id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "recorder.json's `node_external` does not name node(s) the embedded graph \
+                     runs: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+        Ok(Some(DriverStamp { flags }))
+    }
+
+    /// The nodes the recording ran as `external` (driver) nodes, in id order.
+    pub fn drivers(&self) -> BTreeSet<String> {
+        self.flags
+            .iter()
+            .filter(|(_, external)| **external)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
 }
 
 impl RecorderInfo {
@@ -21045,6 +21180,115 @@ mod restored_sync_heads_tests {
             ]),
         )]);
         assert_eq!(restored_sync_heads_by_input(&config, &by_topic), want);
+    }
+}
+
+#[cfg(test)]
+mod driver_stamp_tests {
+    use super::{DriverStamp, RecordedDriverStamp, ReplayError};
+    use cerulion_core::graph::parse_graph;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const TWO: &str = "prefix: rig\n\
+         nodes:\n\
+         \x20 - id: meter\n\
+         \x20   type: meter\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n";
+
+    fn read(doc: &str) -> RecordedDriverStamp {
+        let v: serde_json::Value = serde_json::from_str(doc).expect("valid JSON");
+        RecordedDriverStamp::read(v.as_object().expect("an object"))
+    }
+
+    fn flags(pairs: &[(&str, bool)]) -> BTreeMap<String, bool> {
+        pairs
+            .iter()
+            .map(|(id, f)| ((*id).to_string(), *f))
+            .collect()
+    }
+
+    /// Every shape of the key: absent, a map of booleans, and each unreadable
+    /// value, `null` among them, quoted as it appeared.
+    #[test]
+    fn the_stamp_reads_absent_present_or_unreadable() {
+        assert_eq!(read(r#"{"trace_format":9}"#), RecordedDriverStamp::Absent);
+        assert_eq!(
+            read(r#"{"node_external":{"cam":true,"meter":false}}"#),
+            RecordedDriverStamp::Present(flags(&[("cam", true), ("meter", false)]))
+        );
+        assert_eq!(
+            read(r#"{"node_external":{}}"#),
+            RecordedDriverStamp::Present(BTreeMap::new()),
+            "an empty map is a stamp (a graph with no native node), not an absence"
+        );
+        for (doc, quoted) in [
+            (r#"{"node_external":null}"#, "null"),
+            (r#"{"node_external":42}"#, "42"),
+            (r#"{"node_external":["cam"]}"#, r#"["cam"]"#),
+            (r#"{"node_external":{"cam":"yes"}}"#, r#"{"cam":"yes"}"#),
+        ] {
+            assert_eq!(
+                read(doc),
+                RecordedDriverStamp::Unreadable(quoted.to_string()),
+                "{doc}"
+            );
+        }
+    }
+
+    /// A stamp naming exactly the graph's nodes is admitted and names its
+    /// drivers; an absent one admits nothing; one that names a node too many
+    /// or too few is refused naming it; an unreadable one is refused.
+    #[test]
+    fn a_stamp_is_admitted_only_when_it_describes_the_graph() {
+        let config = parse_graph(TWO).expect("graph parses");
+        let admitted = DriverStamp::admit(
+            RecordedDriverStamp::Present(flags(&[("cam", true), ("meter", false)])),
+            &config,
+        )
+        .expect("an exact stamp is admitted")
+        .expect("and is a stamp");
+        assert_eq!(
+            admitted.drivers(),
+            BTreeSet::from(["cam".to_string()]),
+            "the drivers are the nodes flagged true"
+        );
+        assert_eq!(
+            DriverStamp::admit(RecordedDriverStamp::Absent, &config).expect("absent is fine"),
+            None
+        );
+        match DriverStamp::admit(
+            RecordedDriverStamp::Present(flags(&[
+                ("cam", true),
+                ("meter", false),
+                ("ghost", true),
+            ])),
+            &config,
+        ) {
+            Err(ReplayError::RecordingInconsistent { detail }) => assert_eq!(
+                detail,
+                "recorder.json's `node_external` names node(s) the embedded graph does not \
+                 run: ghost"
+            ),
+            other => panic!("an extra node is refused, got {other:?}"),
+        }
+        match DriverStamp::admit(
+            RecordedDriverStamp::Present(flags(&[("cam", true)])),
+            &config,
+        ) {
+            Err(ReplayError::RecordingInconsistent { detail }) => assert_eq!(
+                detail,
+                "recorder.json's `node_external` does not name node(s) the embedded graph \
+                 runs: meter"
+            ),
+            other => panic!("a missing node is refused, got {other:?}"),
+        }
+        match DriverStamp::admit(RecordedDriverStamp::Unreadable("null".to_string()), &config) {
+            Err(ReplayError::BagInvalidAttachment { name, .. }) => {
+                assert_eq!(name, "__cerulion/recorder.json")
+            }
+            other => panic!("an unreadable stamp is refused, got {other:?}"),
+        }
     }
 }
 
