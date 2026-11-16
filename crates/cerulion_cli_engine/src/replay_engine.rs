@@ -17356,7 +17356,7 @@ fn classify_topics(
 ///
 /// The recorder stamps each node's driver flag with this predicate
 /// ([`node_external_flags`]) and the replay classifies the build it replays
-/// with it ([`external_node_ids`]), so the two cannot disagree about what a
+/// with it (`external_node_ids`), so the two cannot disagree about what a
 /// driver is.
 ///
 /// [`MacroPolicy::External`]: cerulion_core::graph::node::MacroPolicy::External
