@@ -5654,6 +5654,77 @@ fn render_verdict_failing_branch_reports_declined_topics_in_its_summary() {
     assert!(!s.contains(".."), "no doubled period in the row tail: {s}");
 }
 
+/// A topic declined for two causes, a refused read log on rank 0 and frames
+/// rank 1 captured that were not compared, carries a row per cause, and the
+/// verdict counts it as ONE declined topic that did not match, with
+/// divergences withheld, while it lists both rows. Hand oracle.
+#[test]
+#[serial]
+fn render_verdict_counts_a_topic_declined_for_two_causes_once() {
+    use cerulion_cli_engine::replay_engine::{DeclinedFrameComparison, Violation};
+    let outcome = ReplayOutcome {
+        topics_checked: 2,
+        topics_passed: 0,
+        violations: vec![Violation {
+            topic: "/g/real/out".to_string(),
+            class: ViolationClass::MissingTopic,
+            detail: "a genuine violation on an un-steered topic".to_string(),
+        }],
+        declined_frame_comparisons: vec![
+            DeclinedFrameComparison {
+                topic: "/g/bus".to_string(),
+                ranks: vec![0],
+                code: "verifier_declined_census".to_string(),
+                reason: "the read log was refused.".to_string(),
+                matched_under_fallback: false,
+                withheld: Vec::new(),
+            },
+            DeclinedFrameComparison {
+                topic: "/g/bus".to_string(),
+                ranks: vec![1],
+                code: "split_topic_frames_unattributed".to_string(),
+                reason: "these frames were not compared".to_string(),
+                matched_under_fallback: false,
+                withheld: vec![Violation {
+                    topic: "/g/bus".to_string(),
+                    class: ViolationClass::MissingTopic,
+                    detail: "withheld-detail".to_string(),
+                }],
+            },
+        ],
+        ..failing_outcome_skeleton()
+    };
+
+    let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
+    assert!(
+        s.contains(
+            "0/2 topic(s) matched and were credited; 1 DECLINED (0 of them matched under the \
+             fallback, not credited); 1 violation(s):"
+        ),
+        "one declined topic, whatever its rows: {s}"
+    );
+    assert!(
+        s.contains(
+            "NOTE: the frame comparison was DECLINED on 1 topic(s) (0 matched under the \
+             fallback, 1 had divergences withheld)."
+        ),
+        "the NOTE counts the topic once: {s}"
+    );
+    assert!(
+        s.contains(
+            "  - topic /g/bus (rank(s) [0]) [verifier_declined_census]: 0 withheld divergence(s)"
+        ),
+        "the read-log row: {s}"
+    );
+    assert!(
+        s.contains(
+            "  - topic /g/bus (rank(s) [1]) [split_topic_frames_unattributed]: 1 withheld \
+             divergence(s)"
+        ),
+        "the split row: {s}"
+    );
+}
+
 #[test]
 #[serial]
 fn render_verdict_failing_branch_lists_all_classes_in_order() {

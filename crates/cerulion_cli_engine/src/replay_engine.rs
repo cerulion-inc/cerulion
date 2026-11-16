@@ -3522,7 +3522,8 @@ impl ReadLogEnforcement {
 /// frames tolerated as on any topic, and a failure there stands. Such a row
 /// names the ranks whose frames were not compared, withholds the byte verdict and
 /// tolerance rows their one stream reads against every recorded frame, and never
-/// MATCHED under a fallback.
+/// MATCHED under a fallback. A topic a refused read log declines as well carries
+/// both rows, one per cause.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeclinedFrameComparison {
     /// The resolved topic whose comparison was declined.
@@ -3550,15 +3551,20 @@ pub struct DeclinedFrameComparison {
     /// alone.
     pub reason: String,
     /// The violations that were NOT reported as a verdict — verbatim, so nothing
-    /// is hidden by the decline. Empty when the comparison matched, and on a
-    /// `split_topic_frames_unattributed` row whose uncompared frames read no
-    /// byte mismatch and no tolerance row, which never matched.
+    /// is hidden by the decline. Empty when the comparison matched, on a
+    /// read-log row whose compared frames read no divergence beside a
+    /// `split_topic_frames_unattributed` row, and on such a row whose
+    /// uncompared frames read no byte mismatch and no tolerance row; neither of
+    /// the last two matched.
     pub withheld: Vec<Violation>,
     /// `true` when the comparison RAN and found no difference — the topic matched
-    /// under the fallback input stream. On a read-log decline it is always
-    /// `withheld.is_empty()`; carried explicitly so the `--report` JSON states
-    /// the outcome rather than leaving a reader to infer it from an absent
-    /// array. Always `false` on a `split_topic_frames_unattributed` row, whose
+    /// under the fallback input stream. On a read-log decline it is
+    /// `withheld.is_empty()`, and `false` where some passes' frames of a split
+    /// topic were not compared, which the topic's
+    /// `split_topic_frames_unattributed` row beside it names; carried
+    /// explicitly so the `--report` JSON states the outcome rather than leaving
+    /// a reader to infer it from an absent array. Always `false` on a
+    /// `split_topic_frames_unattributed` row, whose
     /// frames were not compared, so such a row can carry an empty `withheld`
     /// without having matched: count a match by this field and withheld
     /// divergences by `withheld`, and a row with neither by its `code`.
@@ -6493,34 +6499,33 @@ fn assemble_outcome(
             None => Vec::new(),
         };
         if !declining.is_empty() {
-            let mut withheld: Vec<Violation> = violations.split_off(before);
-            withheld.extend(
-                split_unjudged
-                    .take()
-                    .map(|u| u.withheld)
-                    .unwrap_or_default(),
-            );
-            let matched_under_fallback = withheld.is_empty();
+            let withheld: Vec<Violation> = violations.split_off(before);
             // The cause is taken from the FIRST declining owner. Where the cause
             // is the whole-rank census decline that is exact — one
             // `VerifierDecline` per pass — and where a rank carries BOTH shapes the
             // table above has already resolved the precedence deterministically, so
             // "first" is a stable choice rather than an iteration accident.
             // `ranks` carries every declining owner.
-            let (code, reason) = declined_ranks
+            let cause = declined_ranks
                 .get(&declining[0])
                 .cloned()
                 .unwrap_or_default();
+            // One row per cause: the read-log row, and beside it a split topic's
+            // `split_topic_frames_unattributed` row where some passes' frames
+            // were not compared, which the read-log row then does not claim to
+            // have matched (`read_log_decline_rows`).
+            let (read_log, split_row) =
+                read_log_decline_rows(topic, declining, cause, withheld, split_unjudged.take());
             // TWO LEVELS, because the two outcomes are not equally interesting: a
             // WITHHELD divergence is something the verdict would have reported and
             // now does not (an operator must see it), while a topic that MATCHED
             // hid nothing and is merely uncredited. One level for both would either
             // bury the first or warn once per topic on every refused bag.
-            if matched_under_fallback {
+            if read_log.matched_under_fallback {
                 tracing::info!(
                     topic = %topic,
-                    ranks = ?declining,
-                    code = %code,
+                    ranks = ?read_log.ranks,
+                    code = %read_log.code,
                     "replay: the frame comparison on this topic MATCHED, but under a \
                      recorded-clock FALLBACK input stream — the read log that steers its \
                      producer's cross-rank inputs was refused — so it is DECLINED rather \
@@ -6533,9 +6538,9 @@ fn assemble_outcome(
             } else {
                 tracing::warn!(
                     topic = %topic,
-                    ranks = ?declining,
-                    code = %code,
-                    withheld = withheld.len(),
+                    ranks = ?read_log.ranks,
+                    code = %read_log.code,
+                    withheld = read_log.withheld.len(),
                     "replay: the frame comparison on this topic is DECLINED, not failed — the \
                      read log that steers its producer's cross-rank input stream was refused, so \
                      the injection fell back to the recorded-clock window and a byte difference \
@@ -6545,14 +6550,11 @@ fn assemble_outcome(
                      binary to make this topic verifiable."
                 );
             }
-            declined_frame_comparisons.push(DeclinedFrameComparison {
-                topic: topic.clone(),
-                ranks: declining,
-                code,
-                reason,
-                matched_under_fallback,
-                withheld,
-            });
+            declined_frame_comparisons.push(read_log);
+            if let Some(row) = split_row {
+                log_split_unattributed_row(&row);
+                declined_frame_comparisons.push(row);
+            }
             // Deliberately NOT counted in `topics_passed`, whichever way it went: it
             // was checked and neither passed nor failed. `topics_checked -
             // topics_passed` is therefore the failed-or-declined count, and the
@@ -6568,28 +6570,9 @@ fn assemble_outcome(
         // the topic fails on that alone.
         if let Some(unjudged) = split_unjudged {
             if violations.len() == before {
-                tracing::warn!(
-                    topic = %topic,
-                    ranks = ?unjudged.ranks,
-                    code = SPLIT_FRAMES_UNATTRIBUTED,
-                    withheld = unjudged.withheld.len(),
-                    "replay: the frame comparison on this `multi_publisher_topics` topic is \
-                     DECLINED, not passed: the processes or executor units in `ranks` could not \
-                     attribute its recorded frames to their writers, and the frames each \
-                     captured, its own writers' alone, have no recorded stream to be compared \
-                     with while another one captured frames of the topic too. It is counted in \
-                     `topics_checked`, never `topics_passed`, and recorded in \
-                     `declined_frame_comparisons`. A bag that labels each frame with its writer, \
-                     within the verifier's record budget, compares each writer where it runs."
-                );
-                declined_frame_comparisons.push(DeclinedFrameComparison {
-                    topic: topic.clone(),
-                    ranks: unjudged.ranks,
-                    code: SPLIT_FRAMES_UNATTRIBUTED.to_string(),
-                    reason: SPLIT_FRAMES_UNATTRIBUTED_REASON.to_string(),
-                    matched_under_fallback: false,
-                    withheld: unjudged.withheld,
-                });
+                let row = split_unattributed_row(topic, unjudged);
+                log_split_unattributed_row(&row);
+                declined_frame_comparisons.push(row);
                 continue;
             }
             tracing::warn!(
@@ -26059,6 +26042,70 @@ const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in sever
      A bag that labels each frame with its writer, within the verifier's record budget, \
      compares each writer where it runs";
 
+/// The [`SPLIT_FRAMES_UNATTRIBUTED`] row of `topic`: the ranks whose frames
+/// [`push_split_violations`] could not judge, and their one-stream verdicts
+/// verbatim. It never MATCHED, since those frames were not compared. PURE.
+fn split_unattributed_row(topic: &str, unjudged: SplitUnjudged) -> DeclinedFrameComparison {
+    DeclinedFrameComparison {
+        topic: topic.to_string(),
+        ranks: unjudged.ranks,
+        code: SPLIT_FRAMES_UNATTRIBUTED.to_string(),
+        reason: SPLIT_FRAMES_UNATTRIBUTED_REASON.to_string(),
+        matched_under_fallback: false,
+        withheld: unjudged.withheld,
+    }
+}
+
+/// The line a [`split_unattributed_row`] is logged with.
+fn log_split_unattributed_row(row: &DeclinedFrameComparison) {
+    tracing::warn!(
+        topic = %row.topic,
+        ranks = ?row.ranks,
+        code = %row.code,
+        withheld = row.withheld.len(),
+        "replay: the frame comparison on this `multi_publisher_topics` topic is \
+         DECLINED, not passed: the processes or executor units in `ranks` could not \
+         attribute its recorded frames to their writers, and the frames each \
+         captured, its own writers' alone, have no recorded stream to be compared \
+         with while another one captured frames of the topic too. It is counted in \
+         `topics_checked`, never `topics_passed`, and recorded in \
+         `declined_frame_comparisons`. A bag that labels each frame with its writer, \
+         within the verifier's record budget, compares each writer where it runs."
+    );
+}
+
+/// The [`DeclinedFrameComparison`] rows of a topic whose producing ranks
+/// `declining` stood down under a refused read log, `(code, reason)` the
+/// cause of the first of them: the read-log row, which withholds
+/// `withheld`, and, where some passes of a split topic captured frames that
+/// were not compared (`split_unjudged`), that topic's
+/// [`split_unattributed_row`] beside it. PURE.
+///
+/// One row per cause, since a row carries one code. The read-log row MATCHED
+/// only when it withholds nothing and every pass's frames of the topic were
+/// compared: a match over the frames compared says nothing of the frames that
+/// were not.
+fn read_log_decline_rows(
+    topic: &str,
+    declining: Vec<u32>,
+    (code, reason): (String, String),
+    withheld: Vec<Violation>,
+    split_unjudged: Option<SplitUnjudged>,
+) -> (DeclinedFrameComparison, Option<DeclinedFrameComparison>) {
+    let read_log = DeclinedFrameComparison {
+        topic: topic.to_string(),
+        ranks: declining,
+        code,
+        reason,
+        matched_under_fallback: withheld.is_empty() && split_unjudged.is_none(),
+        withheld,
+    };
+    (
+        read_log,
+        split_unjudged.map(|u| split_unattributed_row(topic, u)),
+    )
+}
+
 /// How [`push_split_violations`] judges a split topic's counts.
 #[derive(Debug, Clone, Copy)]
 enum SplitCounts {
@@ -30912,13 +30959,26 @@ fn is_read_log_derived_standdown(code: &str) -> bool {
 /// one of them would read "2/3 matched" while all three had in fact matched. The line
 /// says what its numbers mean.
 fn declined_counts(outcome: &ReplayOutcome) -> (usize, usize) {
-    let declined = outcome.declined_frame_comparisons.len();
-    let matched = outcome
-        .declined_frame_comparisons
-        .iter()
-        .filter(|d| d.matched_under_fallback)
-        .count();
+    let (declined, matched, _) = declined_topic_counts(outcome);
     (declined, matched)
+}
+
+/// `(declined, of which matched, of which had divergences withheld)`, counted
+/// in TOPICS. A topic declined for two causes carries a row per cause and
+/// counts once: it matched when every row of it did, and had divergences
+/// withheld when any row of it withholds one.
+fn declined_topic_counts(outcome: &ReplayOutcome) -> (usize, usize, usize) {
+    let mut by_topic: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
+    for d in &outcome.declined_frame_comparisons {
+        let (matched, withheld) = by_topic.entry(d.topic.as_str()).or_insert((true, false));
+        *matched &= d.matched_under_fallback;
+        *withheld |= !d.withheld.is_empty();
+    }
+    (
+        by_topic.len(),
+        by_topic.values().filter(|(matched, _)| *matched).count(),
+        by_topic.values().filter(|(_, withheld)| *withheld).count(),
+    )
 }
 
 /// The verdict's read-log ENFORCEMENT line, newline-terminated, or `None` when
@@ -31135,6 +31195,7 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
     // "never a verdict" described THIS branch, which is the opposite of true —
     // a decline changes what the verdict covers.
     if !outcome.declined_frame_comparisons.is_empty() {
+        let (declined, matched, withheld) = declined_topic_counts(outcome);
         let _ = writeln!(
             s,
             "NOTE: the frame comparison was DECLINED on {} topic(s) ({} matched under the \
@@ -31145,17 +31206,7 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
              topic. Where the replay could not attribute a split topic's frames to their \
              writers, the frames no recorded stream lines up with were not compared. None is \
              counted as passed; none is reported as a violation. Each line names its cause:",
-            outcome.declined_frame_comparisons.len(),
-            outcome
-                .declined_frame_comparisons
-                .iter()
-                .filter(|d| d.matched_under_fallback)
-                .count(),
-            outcome
-                .declined_frame_comparisons
-                .iter()
-                .filter(|d| !d.withheld.is_empty())
-                .count()
+            declined, matched, withheld
         );
         for d in &outcome.declined_frame_comparisons {
             let outcome_phrase = if d.matched_under_fallback {
@@ -37881,6 +37932,100 @@ mod capture_partition_tests {
             judge(&beside_a_partition, Some(2)),
             (vec![], Some((vec![1], vec![]))),
             "a partitioned pass's copies"
+        );
+    }
+
+    /// The `(topic, ranks, code, matched, withheld classes)` of a declined row.
+    type DeclinedRow = (String, Vec<u32>, String, bool, Vec<String>);
+
+    fn declined_row(row: &DeclinedFrameComparison) -> DeclinedRow {
+        (
+            row.topic.clone(),
+            row.ranks.clone(),
+            row.code.clone(),
+            row.matched_under_fallback,
+            row.withheld
+                .iter()
+                .map(|v| class_label(&v.class).to_string())
+                .collect(),
+        )
+    }
+
+    /// A refused read log declines a topic by one row per cause. Where it is
+    /// the only cause the row MATCHED exactly when it withholds nothing. Where a
+    /// split topic's pass also captured frames that were not compared, the
+    /// read-log row never MATCHED, even with nothing withheld on either side,
+    /// and the `split_topic_frames_unattributed` row beside it names that
+    /// pass's rank and withholds its one-stream verdicts. Hand oracles.
+    #[test]
+    fn a_read_log_decline_beside_an_unjudged_split_pass_never_matched() {
+        let cause = || {
+            (
+                "verifier_declined_census".to_string(),
+                "refused".to_string(),
+            )
+        };
+        let missing = || Violation {
+            topic: "/bus".to_string(),
+            class: ViolationClass::MissingMessages {
+                recorded: 4,
+                replayed: 3,
+            },
+            detail: "missing".to_string(),
+        };
+        let rows = |withheld: Vec<Violation>, unjudged: Option<SplitUnjudged>| {
+            let (read_log, split) =
+                read_log_decline_rows("/bus", vec![0], cause(), withheld, unjudged);
+            (declined_row(&read_log), split.as_ref().map(declined_row))
+        };
+        let read_log = |matched: bool, withheld: &[&str]| -> DeclinedRow {
+            (
+                "/bus".to_string(),
+                vec![0],
+                "verifier_declined_census".to_string(),
+                matched,
+                withheld.iter().map(|c| c.to_string()).collect(),
+            )
+        };
+        let split = |withheld: &[&str]| -> DeclinedRow {
+            (
+                "/bus".to_string(),
+                vec![1],
+                "split_topic_frames_unattributed".to_string(),
+                false,
+                withheld.iter().map(|c| c.to_string()).collect(),
+            )
+        };
+
+        assert_eq!(rows(vec![], None), (read_log(true, &[]), None));
+        assert_eq!(
+            rows(vec![missing()], None),
+            (read_log(false, &["missing-messages"]), None)
+        );
+        // Rank 1's frames, a byte-identical prefix, read nothing: still
+        // uncompared, so the read-log row is no match.
+        assert_eq!(
+            rows(
+                vec![],
+                Some(SplitUnjudged {
+                    ranks: vec![1],
+                    withheld: vec![],
+                })
+            ),
+            (read_log(false, &[]), Some(split(&[])))
+        );
+        assert_eq!(
+            rows(
+                vec![missing()],
+                Some(SplitUnjudged {
+                    ranks: vec![1],
+                    withheld: vec![missing()],
+                })
+            ),
+            (
+                read_log(false, &["missing-messages"]),
+                Some(split(&["missing-messages"]))
+            )
         );
     }
 

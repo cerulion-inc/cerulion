@@ -135,7 +135,10 @@ Rules that must not drift:
   bag. Listing is UNCONDITIONAL: a topic that MATCHED under the fallback is
   listed too, with `matched_under_fallback: true`, and is still not credited: a
   match there is evidence the fallback reproduced the frames, not evidence the
-  candidate is correct.
+  candidate is correct. A split topic some of whose passes' frames were not
+  compared is never MATCHED: its read-log row reads `false`, and its
+  `split_topic_frames_unattributed` row beside it names those ranks
+  (`read_log_decline_rows`, one row per cause).
   **The bound on all of this:** the rule rests on a FALLBACK, so a refused read
   log on a rank with
   **nothing injected declines nothing; there is no fallback to withhold**,
