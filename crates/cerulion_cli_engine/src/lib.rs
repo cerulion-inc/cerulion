@@ -94,10 +94,9 @@ pub mod node_metadata;
 mod node_metadata_accumulate;
 mod node_metadata_consume;
 pub mod node_params_info;
-// The `cerulion pair` verb's engine: PURE eid/name resolution ladder + the
-// `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
-// iroh-free; the CPace ceremony lives in the spawned sibling). No `cerulion`
-// verb calls it while `cerulion pair` is a hidden stub.
+// The desk side of the `cerulion pair` verb: PURE eid/name resolution ladder +
+// the `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI
+// stays iroh-free; the CPace ceremony lives in the spawned sibling).
 pub mod pair_cmd;
 // The robot side of code pairing: the decisions of one pairing code's run
 // over the robot-local file handoff and the texts it shows, and on Unix the

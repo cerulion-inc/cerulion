@@ -1128,22 +1128,57 @@ fn a_refused_connect_delivers_connect_session_completed_as_a_failure() {
     assert_eq!(events.len(), 2, "{events:?}");
 }
 
-/// The hidden `pair` stub runs no pairing, so it records its
-/// `cli_command_run` (exit 2) and no domain event.
+/// A domain event is delivered, not only built: a `pair` the CLI refuses
+/// before it resolves or spawns anything lands in the batch as a failure,
+/// next to the command's own `cli_command_run`.
 #[test]
-fn the_hidden_pair_stub_delivers_only_its_command_run() {
+fn a_refused_pair_delivers_pair_completed_as_a_failure() {
     let sink = sink();
     let home = primed_home(&sink);
+    // A positional robot AND `--eid` is refused before any lookup.
     let out = cerulion(
         home.path(),
         &sending(&sink),
         &["pair", "robot", "--eid", "ab"],
     );
-    assert_eq!(out.code, Some(2), "stderr={}", out.stderr);
+    assert_eq!(out.code, Some(1), "stderr={}", out.stderr);
     let events = events_sent(&sink);
+    let pair = the_one(&events, "pair_completed");
+    assert_eq!(pair["properties"]["is_success"], false, "{events:?}");
     let run = the_one(&events, "cli_command_run");
     assert_eq!(run["properties"]["verb"], "pair", "{events:?}");
-    assert_eq!(run["properties"]["exit_code"], 2, "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
+    assert_eq!(events.len(), 2, "{events:?}");
+}
+
+/// `pair --start` has no domain event: a run that cannot start
+/// `cerulion-netd` delivers its own `cli_command_run` and nothing else.
+#[test]
+fn pair_start_delivers_only_its_command_run() {
+    let sink = sink();
+    let home = primed_home(&sink);
+    let machine = tempfile::tempdir().unwrap();
+    let absent = machine.path().join("absent-netd");
+    let socket = machine.path().join("none.sock");
+    let state = machine.path().join("state");
+    let [key, host] = sending(&sink);
+    let out = cerulion(
+        home.path(),
+        &[
+            key,
+            host,
+            ("CERULION_NETD_BIN", absent.to_str().unwrap()),
+            ("CERULION_NETD_SOCK", socket.to_str().unwrap()),
+            ("CERULION_STATE_ROOT", state.to_str().unwrap()),
+        ],
+        &["pair", "--start"],
+    );
+    assert_eq!(out.code, Some(3), "stderr={}", out.stderr);
+    let events = events_sent(&sink);
+    assert!(named(&events, "pair_completed").is_empty(), "{events:?}");
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "pair", "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 3, "{events:?}");
     assert_eq!(events.len(), 1, "{events:?}");
 }
 
@@ -1157,9 +1192,10 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
     let sink = sink();
     let home = primed_home(&sink);
     let [key, host] = sending(&sink);
-    let cases: [(Option<&str>, &[&str]); 8] = [
+    let cases: [(Option<&str>, &[&str]); 9] = [
         (Some("off"), &["graph", "list"]),
         (Some("off"), &["pair", "--start"]),
+        (Some("off"), &["pair", "robot", "--eid", "ab"]),
         (Some(" OFF "), &["graph", "list"]),
         (Some("typo"), &["graph", "list"]),
         (Some("off"), &["viz", "/camera", "--robot", "bench-arm"]),

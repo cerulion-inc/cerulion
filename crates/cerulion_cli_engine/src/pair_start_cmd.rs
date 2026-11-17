@@ -100,7 +100,11 @@ const _: () = assert!(
 );
 
 /// Every `cerulion` command a text of this module names.
-pub const COMMANDS_NAMED: &[&str] = &["cerulion pair --start", "cerulion login"];
+pub const COMMANDS_NAMED: &[&str] = &[
+    "cerulion pair --start",
+    "cerulion login",
+    "cerulion pair --eid <eid>",
+];
 
 /// The first line, before `cerulion-netd` is asked to serve.
 pub const ASKING_LINE: &str = "Asking cerulion-netd to serve this robot for code pairing.";
@@ -616,12 +620,26 @@ pub fn expiry_line(facts: &ArmedFacts) -> String {
     )
 }
 
+/// The stderr line telling the desk how to use the code: with the port when
+/// it is known, so a desk with no internet can dial the robot directly.
+pub fn desk_hint_line(endpoint_id: &[u8; 32], port: Option<u16>) -> String {
+    let eid = hex::encode(endpoint_id);
+    let hint = format!("On the desk, run `cerulion pair --eid {eid}` and type the code.");
+    match port {
+        Some(port) => {
+            format!("{hint} Add `--addr <robot-ip>:{port}` when the desk has no internet.")
+        }
+        None => hint,
+    }
+}
+
 /// The armed lines.
 pub fn armed_report(code: &str, facts: &ArmedFacts, port: Option<u16>) -> Report {
     let mut report = Report::default();
     report.out(&pair_code_stdout(code, facts, port));
     report.err(&code_line(code));
     report.err(&expiry_line(facts));
+    report.err(&desk_hint_line(&facts.endpoint_id, port));
     report.err(WAITING_FOR_DESK_LINE);
     report
 }

@@ -109,7 +109,7 @@ impl VerbFamily for Rcp {
         .map(|refusal| NetworkRefusal::error(refusal, rcp_cmd::EXIT_NETWORK_REFUSED))
     }
 
-    /// The same rule as `connect`.
+    /// The same rule as `connect` and `pair`.
     fn needs_identity(&self, _matches: &ArgMatches) -> bool {
         true
     }

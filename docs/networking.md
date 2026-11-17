@@ -146,7 +146,8 @@ The inspection verbs and `schema info` also stay local under the network
 daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
 parse), opening no discovery session of their own. `cerulion viz --robot`
 refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
-`CERULION_VIZD_NETWORK=off`.
+`CERULION_VIZD_NETWORK=off`, and `cerulion pair` and `cerulion pair --start`
+refuse under `CERULION_NETWORK`.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and

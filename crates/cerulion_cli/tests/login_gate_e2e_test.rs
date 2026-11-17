@@ -602,9 +602,8 @@ fn rcp_without_the_network_switch_stays_behind_the_login_gate() {
 
 #[test]
 fn pair_start_stays_behind_the_login_gate() {
-    // `pair --start` is not the hidden `pair` stub: it serves the network, so
-    // a machine that never signed in is refused by the gate before netd is
-    // asked, and no robot state is made.
+    // `pair --start` serves the network, so a machine that never signed in is
+    // refused by the gate before netd is asked, and no robot state is made.
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
     let state = cwd.path().join("state");
@@ -632,5 +631,26 @@ fn pair_start_stays_behind_the_login_gate() {
     assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
     assert!(stdout.is_empty(), "stdout={stdout}");
     assert!(!state.exists());
+    assert_no_identity_was_written(home.path());
+}
+
+#[test]
+fn desk_pair_stays_behind_the_login_gate() {
+    // The desk side of `cerulion pair` reaches a robot, so a machine that
+    // never signed in is refused by the gate before it resolves the robot.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[("CERULION_NETWORK", "")],
+        &["pair", "bench-arm"],
+    );
+    assert!(
+        stderr.contains(REFUSAL_A_USER_READS),
+        "pair prints the whole refusal a user reads; stderr={stderr}"
+    );
+    assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
     assert_no_identity_was_written(home.path());
 }

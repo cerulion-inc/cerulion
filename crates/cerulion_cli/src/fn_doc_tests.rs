@@ -53,6 +53,11 @@ fn each_pair_dispatch_fn_and_the_signal_handler_carry_their_own_doc() {
             1,
             "/// `cerulion pair --start` where the robot daemons do not build.",
         ),
+        (
+            "fn pair_exit_code(",
+            0,
+            "/// The desk side of `cerulion pair`: resolve and spawn `cerulion-connectd",
+        ),
     ];
     for (signature, nth, first) in cases {
         assert_eq!(
