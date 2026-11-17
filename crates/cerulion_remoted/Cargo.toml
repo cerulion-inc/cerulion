@@ -61,6 +61,7 @@ cerulion_wireclient = { workspace = true }
 # PairingAuthorizer implements cerud's `authz::Authorizer` seam, so cerud's
 # server gates every verb through it.
 cerud = { path = "../cerud" }
+cerulion_ops_proto = { path = "../cerulion_ops_proto" }
 # The act verbs' operations (publish, service call, snapshot, decode one
 # message) on local shared memory, shared with the `cerulion` CLI.
 cerulion_msgio = { path = "../cerulion_msgio" }

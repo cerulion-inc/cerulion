@@ -10,7 +10,7 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
 - `PairingAuthorizer` classifies accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
   Shell/exec: owner + policy; missing file ON, invalid OFF; absent handle denies, immutable hard-off wins.
   Settings: validate bounds first; either OFF wins.
-- Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
+- Bootstrap verifies chassis secret/cert chain/owner grant/CPace witness. Subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
   key, owner, chain, scope, clocks and revocation, preserve the owner row, persist
@@ -23,15 +23,16 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
   TLS: docs/remote_plane.md; paired keys Retry first.
   Trust persistence is fail-closed: store-BEFORE-index, the live binding published
   only after the durable write succeeds. Never reorder (`trust.rs`).
-- Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
+- Pairing bytes: independent hand-serializer vectors (`format_vectors_test.rs`); update encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epochs monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
 - `cerulion_link` framing is NOT cancel-safe: never `select!`; one task per stream.
   connectd mirrors the robot protocol (no production remoted dep): update both,
   pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
-  overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
+- Audit verification: regular files, bounded lines; external witness required.
+- Desk keys: 32 raw bytes; `create_new`, 0600, NEVER overwrite.
+  `~/.cerulion` secrets: `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
