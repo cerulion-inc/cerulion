@@ -5391,6 +5391,10 @@ fn replay_non_utf8_env_child() {
     );
 }
 
+/// How long [`replay_in_child_with_env`] waits for its child before it kills
+/// the child and fails, reporting what the child printed.
+const REPLAY_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Replay `bag` in a re-executed child whose environment adds `vars` (raw
 /// bytes) and return the env divergence entries it printed. Fails unless the
 /// child builds its graph, passes and exits 0.
@@ -5414,13 +5418,46 @@ fn replay_in_child_with_env(
             std::ffi::OsStr::from_bytes(value),
         );
     }
-    let output = cmd.output().expect("spawn the replay child");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the replay child");
+    // Each pipe drains on its own thread, so neither can fill while the other
+    // is read, and a killed child's output is still reported.
+    let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)
+                .expect("read the replay child's pipe to its end");
+            bytes
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().expect("the child's stdout")));
+    let err = drain(Box::new(child.stderr.take().expect("the child's stderr")));
+    let deadline = std::time::Instant::now() + REPLAY_CHILD_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the replay child") {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout_bytes = out.join().expect("the stdout reader");
+    let stderr_bytes = err.join().expect("the stderr reader");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "the replay child did not exit within {REPLAY_CHILD_TIMEOUT:?} and was killed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+    });
     assert!(
-        output.status.success(),
-        "the replay child must build its graph and pass (status {:?})\nstdout:\n{stdout}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "the replay child must build its graph and pass (status {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status.code()
     );
     let line = stdout
         .lines()
