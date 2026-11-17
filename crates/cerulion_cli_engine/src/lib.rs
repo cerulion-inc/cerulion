@@ -50,6 +50,7 @@ pub(crate) mod child_signals;
 // argv + the `cerulion-connectd` sibling-binary path). The CLI stays iroh-free —
 // it spawns the resolved binary.
 pub mod connect_cmd;
+pub mod remote_shell;
 // The `cerulion rcp` verb's PURE resolution: the same robot resolution as
 // `connect`, spawning `cerulion-connectd rcp` with inherited stdio.
 pub mod rcp_cmd;
