@@ -440,6 +440,17 @@ pub(crate) struct TrimmedTrace {
     pub executed_nodes: Vec<String>,
     /// Records the trim discarded as belonging to steps before the resume.
     pub discarded: usize,
+    /// Every frame a kept read consumed, in record order, as the read log
+    /// names it: a read that popped and names a sequence (any read kind but a
+    /// `sample(N)` drop) and each `BatchFrame` record, under the writer the last
+    /// producer annotation of its site before it names (a note the trim
+    /// re-states included). A read whose site has no annotation names no writer
+    /// and is not listed: below trace format 8 only a multi-writer edge
+    /// annotates its reads.
+    ///
+    /// What the capture judge checks the held frames against
+    /// (`cerulion_core::flashback::resim::first_frame_gap`).
+    pub named_frames: Vec<cerulion_core::flashback::resim::NamedFrame>,
     /// Records removed before the trim as belonging to a rank's final,
     /// unfinished step or a step tied to its target
     /// ([`end_at_last_complete_step`]). Zero out of [`trim_to_anchor`] and
@@ -772,6 +783,50 @@ fn writer_key(rec: &TraceRingRecord) -> Option<(WriterKey, u16)> {
     Some(((rec.rank(), rec.node_idx, input, site), kind))
 }
 
+/// Fold one KEPT read-outcome record into [`TrimmedTrace::named_frames`]: an
+/// annotation opens its site's writer run, and a record that consumed a frame
+/// names it under that run's writer.
+///
+/// Consumed is the replay's own reading: a `BatchFrame`, or a read that popped
+/// and names a sequence and is not a `sample(N)` drop (a `Decimated` read names
+/// the last ACCEPTED frame, not one it popped).
+fn name_consumed_frame(
+    named: &mut Vec<cerulion_core::flashback::resim::NamedFrame>,
+    writers: &mut BTreeMap<WriterKey, u64>,
+    key: WriterKey,
+    kind: u16,
+    rec: &TraceRingRecord,
+) {
+    use cerulion_core::trace_ring as tr;
+    let consumed = match kind {
+        tr::READ_OUTCOME_PRODUCER => {
+            writers.insert(key, rec.duration_ns);
+            return;
+        }
+        // Records were dropped at the stage rim, an annotation possibly among
+        // them, so the site's writer is unknown until its next annotation.
+        tr::READ_OUTCOME_TRUNCATED if tr::unpack_read_outcome_popped(rec.duration_ns) > 0 => {
+            writers.remove(&key);
+            return;
+        }
+        tr::READ_OUTCOME_BATCH_FRAME => true,
+        tr::READ_OUTCOME_SERVED
+        | tr::READ_OUTCOME_HELD
+        | tr::READ_OUTCOME_NONE
+        | tr::READ_OUTCOME_DRAINED_BATCH => tr::unpack_read_outcome_popped(rec.duration_ns) > 0,
+        _ => false,
+    };
+    if let (true, Some(&writer), Ok(sequence)) =
+        (consumed, writers.get(&key), u32::try_from(rec.fire_time_ns))
+    {
+        named.push(cerulion_core::flashback::resim::NamedFrame {
+            step: rec.step,
+            writer,
+            sequence,
+        });
+    }
+}
+
 /// The one walk both entry points share — `None` means keep everything.
 ///
 /// # One walk, k cuts
@@ -800,6 +855,9 @@ fn walk(
     // capture names the writer of its first reads without the cut-off history.
     let mut dropped_writer: BTreeMap<WriterKey, u64> = BTreeMap::new();
     let mut first_seen: std::collections::BTreeSet<WriterKey> = std::collections::BTreeSet::new();
+    // The writer the last KEPT annotation of each site names, re-stated notes
+    // included: what a reader of the bag attributes that site's reads to.
+    let mut kept_writer: BTreeMap<WriterKey, u64> = BTreeMap::new();
     for rec in records {
         let rank = rec.rank();
         let anchor_step = anchor_steps.and_then(|m| m.get(&rank).copied());
@@ -858,8 +916,10 @@ fn walk(
                     );
                     note.reserved = rec.reserved;
                     out.records.push(note);
+                    kept_writer.insert(key, token);
                 }
             }
+            name_consumed_frame(&mut out.named_frames, &mut kept_writer, key, kind, &rec);
         }
         if rec.is_departure_boundary() {
             out.departures += 1;
@@ -2172,5 +2232,62 @@ mod tests {
             2,
             "the mutant leaves the first read unattributed"
         );
+    }
+
+    /// The walk names every frame a kept read consumed under the writer its
+    /// site's last kept annotation names, a re-stated note included, and names
+    /// nothing a reader of the bag would not look up.
+    #[test]
+    fn the_walk_names_each_consumed_frame_under_its_sites_writer() {
+        use cerulion_core::flashback::resim::NamedFrame;
+        use cerulion_core::read_outcome::ReadOutcomeKind::{
+            BatchFrame, Decimated, DrainedBatch, Held,
+        };
+        use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
+        let read = |step, kind, seq, popped| {
+            TraceRingRecord::read_outcome(
+                step,
+                1,
+                0,
+                kind,
+                Some(seq),
+                cerulion_core::trace_ring::ReadRun::once(popped),
+                Drain,
+            )
+        };
+        let records = vec![
+            boundary(4, 4_000),
+            note(4, 1, 0, 40, 0xA, Drain),
+            served(4, 1, 0, 40, Drain),
+            boundary(5, 5_000),
+            // The trim re-states 0xA directly before this record.
+            read(5, BatchFrame, 50, 0),
+            read(5, DrainedBatch, 51, 2),
+            // Pops nothing, so nothing is looked up.
+            read(5, Held, 51, 0),
+            // A sample(N) drop names the last ACCEPTED frame, not one it popped.
+            read(5, Decimated, 51, 3),
+            // A site with no annotation names no writer.
+            served(5, 1, 1, 7, Body),
+            note(5, 1, 0, 52, 0xB, Drain),
+            served(5, 1, 0, 52, Drain),
+            // Records dropped at the rim: the next read's writer is unknown.
+            TraceRingRecord::read_outcome_truncated(5, 1, 0, 1, Drain),
+            served(5, 1, 0, 53, Drain),
+        ];
+        let named = |step, writer, sequence| NamedFrame {
+            step,
+            writer,
+            sequence,
+        };
+        let out = trim_to_anchor(records.clone().into_iter(), &cut(4), &nodes());
+        assert_eq!(
+            out.named_frames,
+            vec![named(5, 0xA, 50), named(5, 0xA, 51), named(5, 0xB, 52)]
+        );
+        // Kept whole, the step-4 read is named under its own note.
+        let all = keep_all(records.into_iter(), &nodes());
+        assert_eq!(all.named_frames[0], named(4, 0xA, 40));
+        assert_eq!(all.named_frames.len(), 4);
     }
 }

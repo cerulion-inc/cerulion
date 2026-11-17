@@ -1407,100 +1407,61 @@ mod tests {
     /// says what to do.
     #[test]
     fn the_frame_not_held_reason_names_the_frame_and_the_remedy() {
-        let first_step = |gap: FrameGap| ResimGap::FrameNotHeld {
-            resume_step: 1,
-            gap,
+        let reason = |resume_step, step, sequence, first: Option<u32>| {
+            ResimGap::FrameNotHeld {
+                resume_step,
+                gap: FrameGap {
+                    step,
+                    writer: W,
+                    sequence,
+                    held_from: first.map(|first_sequence| HeldFrom {
+                        topic: "/p/ticker/cmd".to_string(),
+                        first_sequence,
+                    }),
+                },
+            }
+            .reason()
         };
-        let late = first_step(FrameGap {
-            step: 1,
-            sequence: 1,
-            held_from: Some(HeldFrom {
-                topic: "/p/ticker/cmd".to_string(),
-                first_sequence: 3,
-            }),
-            ..late_gap()
-        })
-        .reason();
-        assert!(
-            late.starts_with(
-                "this capture's frames on '/p/ticker/cmd' from writer 42cbecd9a96b9f36 begin at \
-                 sequence 3, but its trace resumes at step 1, whose read of that topic names \
-                 sequence 1, a frame the capture never held: the recorder's taps attached after \
-                 the checkpoint this capture resumes from, which happens to a capture taken in \
-                 the first seconds of a run. `cerulion bag play --resim` cannot re-execute it."
-            ),
-            "{late}"
-        );
-        assert!(
-            late.ends_with(
-                "A capture taken more than one Flashback window into the run \
-                 (`CERULION_FLASHBACK_WINDOW_MS`) resumes from a checkpoint its frames cover, \
-                 and `cerulion graph run --record` records a run from its first step"
-            ),
-            "{late}"
-        );
-        let later = first_step(FrameGap {
-            step: 4,
-            sequence: 2,
-            held_from: Some(HeldFrom {
-                topic: "/p/ticker/cmd".to_string(),
-                first_sequence: 3,
-            }),
-            ..late_gap()
-        })
-        .reason();
-        assert!(
-            later.contains(
-                "resumes at step 1, and its read at step 4 of that topic names sequence 2"
-            ),
-            "a first missing read after the resume step names both steps: {later}"
-        );
-        let from_start = ResimGap::FrameNotHeld {
-            resume_step: 0,
-            gap: FrameGap {
-                step: 0,
-                sequence: 0,
-                ..late_gap()
-            },
-        }
-        .reason();
-        assert!(
-            from_start.contains("taps attached after the run's first step,"),
-            "a from-start capture has no checkpoint to name: {from_start}"
-        );
-        let lost = first_step(FrameGap {
-            step: 4,
-            sequence: 4,
-            held_from: Some(HeldFrom {
-                topic: "/p/ticker/cmd".to_string(),
-                first_sequence: 0,
-            }),
-            ..late_gap()
-        })
-        .reason();
         assert_eq!(
-            lost,
+            reason(1, 1, 1, Some(3)),
+            "this capture's frames on '/p/ticker/cmd' from writer 42cbecd9a96b9f36 begin at \
+             sequence 3, but its trace resumes at step 1, whose read of that topic names sequence \
+             1, a frame the capture never held: the recorder's taps attached after the checkpoint \
+             this capture resumes from, which happens to a capture taken in the first seconds of \
+             a run. `cerulion bag play --resim` cannot re-execute it. The frames, the state and \
+             the trace are in the bag and readable. A capture taken more than one Flashback window \
+             into the run (`CERULION_FLASHBACK_WINDOW_MS`) resumes from a checkpoint its frames \
+             cover, and `cerulion graph run --record` records a run from its first step"
+        );
+        assert_eq!(
+            reason(1, 4, 4, Some(0)),
             "this capture keeps a read at step 4 of '/p/ticker/cmd' that names writer \
              42cbecd9a96b9f36, sequence 4, a frame its window lost: the window recorder could \
              not keep up with that topic. `cerulion bag play --resim` cannot re-execute it. The \
              frames, the state and the trace are in the bag and readable. `cerulion graph run \
              --record` records every frame of a run"
         );
-        let none = first_step(FrameGap {
-            step: 1,
-            sequence: 0,
-            held_from: None,
-            ..late_gap()
-        })
-        .reason();
-        assert!(
-            none.starts_with(
+        for (text, clause) in [
+            // A first missing read after the resume step names both steps.
+            (
+                reason(1, 4, 2, Some(3)),
+                "resumes at step 1, and its read at step 4 of that topic names sequence 2,",
+            ),
+            // A from-start capture has no checkpoint to name.
+            (
+                reason(0, 0, 0, Some(3)),
+                "taps attached after the run's first step,",
+            ),
+            // A writer the capture holds nothing of.
+            (
+                reason(1, 1, 0, None),
                 "this capture holds no frame from writer 42cbecd9a96b9f36, but its trace resumes \
                  at step 1, whose read names that writer's sequence 0, a frame the capture never \
-                 held:"
+                 held: the recorder's taps attached after the checkpoint",
             ),
-            "{none}"
-        );
+        ] {
+            assert!(text.contains(clause), "{clause:?} in {text}");
+        }
     }
 
     /// A capture that passes every arm.
