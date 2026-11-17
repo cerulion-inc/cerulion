@@ -3209,7 +3209,7 @@ mod tests {
         let left = Arc::clone(&panics);
         let look: Arc<dyn Fn(&PairCodeArm) + Send + Sync> = Arc::new(move |arm| {
             if left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 panic!("a look panicked");

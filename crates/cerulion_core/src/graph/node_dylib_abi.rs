@@ -141,6 +141,9 @@ impl DylibNodeEntry {
             if let Some(ports) = author_metadata[direction].as_array_mut() {
                 for port in ports {
                     if let Some(port) = port.as_object_mut() {
+                        if direction == "inputs" {
+                            mark_accumulate_input(port);
+                        }
                         for key in keys {
                             port.remove(*key);
                         }
@@ -376,6 +379,20 @@ impl DylibNodeEntry {
     #[doc(hidden)]
     pub fn leaks_library_on_drop(&self) -> bool {
         self.retain_process
+    }
+}
+
+/// Set an input's `accumulate` key from its stable `accumulate_cap`: `true`
+/// when the library declares a capacity for the input, absent when it
+/// declares none (an absent or null `accumulate_cap`), whatever `accumulate`
+/// key the author metadata carried. The parsed [`NodeInfo`] and the checked
+/// metadata a node inspector re-parses both read the mark from this key.
+// hot-path-alloc-ok-fn: metadata validation only runs during cold library loading.
+fn mark_accumulate_input(port: &mut serde_json::Map<String, serde_json::Value>) {
+    if port.get("accumulate_cap").is_some_and(|cap| !cap.is_null()) {
+        port.insert("accumulate".to_owned(), serde_json::Value::Bool(true));
+    } else {
+        port.remove("accumulate");
     }
 }
 
@@ -1052,6 +1069,41 @@ fn classify(phase: Phase, status: abi::Status, mut reason: String, label: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The input object [`mark_accumulate_input`] leaves for `port`.
+    fn marked(port: &str) -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(port).expect("fixture JSON");
+        mark_accumulate_input(value.as_object_mut().expect("fixture object"));
+        value
+    }
+
+    #[test]
+    fn a_declared_accumulate_capacity_marks_the_input_accumulate() {
+        assert_eq!(
+            marked(r#"{"name":"tf","accumulate_cap":8}"#),
+            serde_json::json!({"name": "tf", "accumulate_cap": 8, "accumulate": true})
+        );
+        // The capacity wins over an author key that says otherwise.
+        assert_eq!(
+            marked(r#"{"name":"tf","accumulate_cap":1,"accumulate":false}"#),
+            serde_json::json!({"name": "tf", "accumulate_cap": 1, "accumulate": true})
+        );
+    }
+
+    #[test]
+    fn an_input_without_a_capacity_carries_no_accumulate_mark() {
+        for port in [
+            r#"{"name":"cmd"}"#,
+            r#"{"name":"cmd","accumulate_cap":null}"#,
+            // An author key with no capacity behind it is dropped.
+            r#"{"name":"cmd","accumulate":true}"#,
+            r#"{"name":"cmd","accumulate_cap":null,"accumulate":true}"#,
+        ] {
+            let value = marked(port);
+            assert_eq!(value.get("accumulate"), None, "{port} -> {value}");
+            assert_eq!(value["name"], "cmd", "{port}: other keys stay");
+        }
+    }
 
     #[test]
     fn android_init_refusal_preserves_the_composed_native_error() {
