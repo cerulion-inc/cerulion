@@ -18,9 +18,10 @@
 //!   code reaches the robot and is refused;
 //! - a claimed request the daemon refuses is answered `refused` with its
 //!   reason, it replaces the code an earlier request armed, and the wire
-//!   `status` counts it;
+//!   `status` counts it, and counts the replaced code withdrawn when no desk
+//!   had paired with it;
 //! - the daemon's stop, on a stop request and when the endpoint closes on its
-//!   own, withdraws a code no desk paired with and the result says `refused`
+//!   own, withdraws a code that has no end yet and the result says `refused`
 //!   with the reason `stopping`;
 //! - while a code is armed and no paired connection is open, the code's own
 //!   hold keeps `serving.hold` taken; an ops session of a desk that is not
@@ -748,10 +749,12 @@ async fn a_claimed_request_the_daemon_refuses_is_answered_refused_and_counted_in
         )
         .into_bytes()
     );
-    // The refusal replaced the paired code, and the status counts it.
+    // The refusal replaced the paired code, and the status counts it; a
+    // paired code is not counted withdrawn.
     let status = wire_status(&desk, s.robot_addr.clone()).await;
     assert_eq!(status.get("pair_code"), None, "{status}");
     assert_eq!(status["pair_code_refused"], 1, "{status}");
+    assert_eq!(status.get("pair_code_withdrawn"), None, "{status}");
 
     // A request that does not parse.
     leave_bytes(&s.remoted, b"cerulion-pair-code-request/2 x\n", 0o600);
@@ -763,6 +766,23 @@ async fn a_claimed_request_the_daemon_refuses_is_answered_refused_and_counted_in
     assert_eq!(status["pair_code_refused"], 2, "{status}");
     assert!(!s.remoted.join(REQUEST_FILE).exists());
     assert!(!s.remoted.join(CLAIMED_FILE).exists());
+
+    // A code with no end yet, replaced by a refused request, is counted
+    // withdrawn in the status next to the refusal.
+    leave_request(&s.remoted);
+    until("the daemon arms the next code", || {
+        result_in(&s.remoted).is_some_and(|r| r.status() == PairCodeStatus::Armed)
+    })
+    .await;
+    leave_bytes(&s.remoted, b"cerulion-pair-code-request/2 x\n", 0o600);
+    until("the result reads refused malformed again", || {
+        result_in(&s.remoted).and_then(|r| r.refusal()) == Some(PairCodeRefusal::Malformed)
+    })
+    .await;
+    let status = wire_status(&desk, s.robot_addr.clone()).await;
+    assert_eq!(status.get("pair_code"), None, "{status}");
+    assert_eq!(status["pair_code_refused"], 3, "{status}");
+    assert_eq!(status["pair_code_withdrawn"], 1, "{status}");
 
     let _ = s.shutdown_tx.send(());
     let _ = bounded("serve join", s.serving).await;

@@ -85,6 +85,14 @@
 //! ([`LAST_WRITE_FAILED_LINE`]) and not written again, and the result file is
 //! removed, so no result names a code that is gone.
 //!
+//! A code withdrawn before its end, by a newer request's code, a refusal, its
+//! own result that could not be written or the stop below, is counted once in
+//! the store ([`SharedCodePairSessions::codes_withdrawn`], in the wire
+//! `status`); a code that reached its end is not counted. The count so far is
+//! logged as `codes_withdrawn` on the line of each arm, on [`REFUSED_LINE`],
+//! which a result that could not be written also logs, and on
+//! [`WITHDRAWN_LINE`].
+//!
 //! A claim, a removal of the handoff files, a serving hold, a write of the
 //! result, a look or a stop that keeps failing (a look fails when it panics,
 //! a stop when it panics or is cancelled before it runs) is logged at warn
@@ -147,12 +155,13 @@ pub const EXHAUSTED_LINE: &str =
 /// window ended and no desk paired.
 pub const EXPIRED_LINE: &str = "cerulion_remoted: the pairing code expired and no desk paired";
 /// The line logged at warn, once for each claimed request that arms no code,
-/// with the `refusal` token, the `reason` and `requests_refused`, the count so
-/// far.
+/// with the `refusal` token, the `reason`, `requests_refused` and
+/// `codes_withdrawn`, the counts so far.
 pub const REFUSED_LINE: &str = "cerulion_remoted: refused a pair-code request; no code is armed \
                                 for it";
-/// The line logged at info, with `failed`, `tries` and `requests_refused`,
-/// when the daemon's stop withdrew a code no desk paired with.
+/// The line logged at info, with `failed`, `tries`, `requests_refused` and
+/// `codes_withdrawn`, when the daemon's stop withdrew a code that had no end
+/// yet.
 pub const WITHDRAWN_LINE: &str = "cerulion_remoted: the daemon stops; the armed pairing code is \
                                   withdrawn and no desk can pair with it";
 /// The line logged at warn, and at debug while suppressed, with `error` and
@@ -558,6 +567,7 @@ impl PairCodeArm {
                 tracing::info!(
                     ttl_s = result.ttl_s(),
                     tries = result.tries(),
+                    codes_withdrawn = self.sessions.codes_withdrawn(),
                     "cerulion_remoted: armed a pairing code from the request on this robot; it \
                      pairs one desk within ttl_s seconds of now, and every desk shares its tries"
                 );
@@ -565,7 +575,8 @@ impl PairCodeArm {
             }
             Err(e) => {
                 // The arm replaced any earlier code, so no code is left that
-                // a result on disk could name.
+                // a result on disk could name. The store counts this code
+                // withdrawn; the refusal's own disarm below finds none.
                 self.sessions.disarm();
                 tracing::error!(
                     error = %e,
@@ -583,10 +594,11 @@ impl PairCodeArm {
 
     /// Refuse a claimed request, whose nonce is `nonce` when it was read, as
     /// `refusal`, `reason` saying why: disarm the code an earlier request
-    /// armed, writing an end it reached that the result does not state yet,
-    /// count the refusal in the store and log it, and answer `refused`. A
-    /// refused result that cannot be written is kept for the next look, and
-    /// the result file is removed meanwhile, so it names no code that is gone.
+    /// armed (the store counts it withdrawn when it had no end), writing an
+    /// end it reached that the result does not state yet, count the refusal
+    /// in the store and log it, and answer `refused`. A refused result that
+    /// cannot be written is kept for the next look, and the result file is
+    /// removed meanwhile, so it names no code that is gone.
     fn refuse(&self, nonce: Option<PairCodeNonce>, refusal: PairCodeRefusal, reason: &str) {
         // The result answers the request claimed last, so a refused one
         // replaces the code an earlier one armed.
@@ -597,6 +609,7 @@ impl PairCodeArm {
             refusal = %refusal.as_str(),
             %reason,
             requests_refused,
+            codes_withdrawn = self.sessions.codes_withdrawn(),
             "{REFUSED_LINE}"
         );
         let result = match PairCodeResult::refused(nonce, self.endpoint_id, &self.policy, refusal) {
@@ -893,6 +906,7 @@ impl PairCodeArm {
                         failed = last.failed,
                         tries = last.tries,
                         requests_refused,
+                        codes_withdrawn = self.sessions.codes_withdrawn(),
                         "{WITHDRAWN_LINE}"
                     );
                     PairCodeState::Refused(PairCodeRefusal::Stopping)
@@ -1732,6 +1746,7 @@ mod tests {
         // code no longer works.
         assert_eq!(f.result(), refused_line(NONCE_HEX, "stopping", 1));
         assert_eq!(f.sessions.requests_refused(), 1);
+        assert_eq!(f.sessions.codes_withdrawn(), 1);
         // No desk can pair any more, and the code holds nothing.
         f.clock.set(T_ARM + RATE);
         assert_refused(pair(&f.sessions, [4; 32], CODE), "no code pairing is armed");
@@ -1744,6 +1759,7 @@ mod tests {
         arm.stop_arming();
         assert_eq!(f.result(), refused_line(NONCE_HEX, "stopping", 1));
         assert_eq!(f.sessions.requests_refused(), 1);
+        assert_eq!(f.sessions.codes_withdrawn(), 1, "a second stop counts none");
         logs_assert(|logs| {
             let withdrawn = lines_with(
                 logs,
@@ -1753,6 +1769,7 @@ mod tests {
                     "failed=1",
                     "tries=3",
                     "requests_refused=1",
+                    "codes_withdrawn=1",
                 ],
             );
             if withdrawn.len() != 1 {
@@ -1985,6 +2002,11 @@ mod tests {
                 "{blocked}: the directory is left"
             );
             assert_eq!(f.sessions.requests_refused(), 1, "{blocked}");
+            assert_eq!(
+                f.sessions.codes_withdrawn(),
+                1,
+                "{blocked}: the code is counted once over its two disarms"
+            );
             assert_eq!(f.arm.report_failures(), 1, "{blocked}: the refused write");
             // Each look tries the refusal again until it is written.
             assert!(
@@ -2016,8 +2038,19 @@ mod tests {
         }
         logs_assert(|logs| {
             let errors = lines_with(logs, &["ERROR", NOT_REMOVED, "pair-code.result"]);
-            if errors.len() != 1 {
-                return Err(format!("removal error lines: {errors:#?}"));
+            let refused = lines_with(
+                logs,
+                &[
+                    "WARN",
+                    REFUSED_LINE,
+                    "refusal=unconfirmed",
+                    "codes_withdrawn=1",
+                ],
+            );
+            if errors.len() != 1 || refused.len() != 2 {
+                return Err(format!(
+                    "removal error lines: {errors:#?}, refusal lines: {refused:#?}"
+                ));
             }
             Ok(())
         });
@@ -2037,9 +2070,10 @@ mod tests {
             f.arm.apply_request(),
             ArmOutcome::Unconfirmed { .. }
         ));
-        // Neither code pairs, and no result is left naming the earlier one
-        // as armed.
+        // Neither code pairs, each is counted withdrawn, and no result is
+        // left naming the earlier one as armed.
         assert_nothing_armed(&f.sessions);
+        assert_eq!(f.sessions.codes_withdrawn(), 2);
         assert_eq!(names(&f.dir), vec![RESULT_STAGING_FILE.to_string()]);
         assert!(matches!(f.arm.report(), ReportOutcome::Failed { .. }));
         // Once the result can be written it answers the newer request.
@@ -2497,6 +2531,7 @@ mod tests {
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn a_newer_request_replaces_the_code_and_its_nonce_in_the_result() {
         let f = fixture();
         leave(&f.dir, &request_line(CODE), 0o600);
@@ -2506,6 +2541,11 @@ mod tests {
         assert_eq!(
             f.result(),
             line("08080808080808080808080808080808", "armed", 0, "- -")
+        );
+        assert_eq!(
+            f.sessions.codes_withdrawn(),
+            1,
+            "the replaced code had no end"
         );
         // The replaced code no longer pairs: the desk sees a wrong code.
         let session = f.sessions.open_session([4; 32]);
@@ -2535,6 +2575,23 @@ mod tests {
         // A code armed by another than this step is not written.
         f.sessions.arm(CODE, PAIR_CODE_POLICY);
         assert_eq!(f.arm.report(), ReportOutcome::Nothing);
+        assert_eq!(
+            f.sessions.codes_withdrawn(),
+            1,
+            "the paired code had an end"
+        );
+        logs_assert(|logs| {
+            let arms = lines_with(logs, &["INFO", ARMED_LINE]);
+            match arms.as_slice() {
+                [first, second]
+                    if first.contains("codes_withdrawn=0")
+                        && second.contains("codes_withdrawn=1") =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!("arm lines: {arms:#?}")),
+            }
+        });
     }
 
     fn lines_with<'a>(logs: &'a [&'a str], needles: &[&str]) -> Vec<&'a str> {
@@ -2626,6 +2683,11 @@ mod tests {
         ));
         assert_eq!(f.result(), refused_line("-", "unreadable", 0));
         assert_eq!(f.sessions.requests_refused(), 2);
+        assert_eq!(
+            f.sessions.codes_withdrawn(),
+            1,
+            "the second refusal found no code armed"
+        );
         // A request armed after that is answered as armed again.
         leave(&f.dir, &request_line(CODE), 0o600);
         assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
@@ -2635,7 +2697,9 @@ mod tests {
             if refused.len() != 2
                 || !refused[0].contains("refusal=malformed")
                 || !refused[0].contains("requests_refused=1")
+                || !refused[0].contains("codes_withdrawn=1")
                 || !refused[1].contains("requests_refused=2")
+                || !refused[1].contains("codes_withdrawn=1")
                 || !refused[1].contains("is not owner-only")
             {
                 return Err(format!("refusal lines: {refused:#?}"));
@@ -2876,6 +2940,85 @@ mod tests {
             ]
         );
         assert_eq!((first.1, first.2, first.3), (3, 1, 0));
+    }
+
+    /// Each way the arm step withdraws the code an earlier request armed.
+    fn withdrawals() -> [(&'static str, Reach); 4] {
+        [
+            ("a newer request", |f| {
+                leave(&f.dir, &request_for(LATER_NONCE, LATER_CODE), 0o600);
+                assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+            }),
+            ("a refused request", |f| {
+                leave(&f.dir, MALFORMED_REQUEST, 0o600);
+                assert!(matches!(f.arm.apply_request(), ArmOutcome::Refused { .. }));
+            }),
+            (
+                "a newer request whose first result cannot be written",
+                |f| {
+                    // A non-empty directory at the staging name refuses the write.
+                    let staging = f.dir.join(RESULT_STAGING_FILE);
+                    std::fs::create_dir(&staging).unwrap();
+                    std::fs::write(staging.join("x"), b"").unwrap();
+                    leave(&f.dir, &request_for(LATER_NONCE, LATER_CODE), 0o600);
+                    assert!(matches!(
+                        f.arm.apply_request(),
+                        ArmOutcome::Unconfirmed { .. }
+                    ));
+                },
+            ),
+            ("the stop", |f| f.arm.stop_arming()),
+        ]
+    }
+
+    #[test]
+    fn a_code_withdrawn_before_its_end_is_counted_once_identically_on_two_runs() {
+        /// For each withdrawal, with the code a request armed left with no
+        /// end and then brought to each end, the withdrawn count after the
+        /// withdrawal, after a stop that follows it and after a disarm once
+        /// the stop is done.
+        fn run() -> Vec<[u64; 3]> {
+            let mut counts = Vec::new();
+            for (path, withdraw) in withdrawals() {
+                let reaches = [None]
+                    .into_iter()
+                    .chain(code_ends().map(|(_, reach, _)| Some(reach)));
+                for reach in reaches {
+                    let f = fixture();
+                    leave(&f.dir, &request_line(CODE), 0o600);
+                    assert_eq!(f.arm.apply_request(), ArmOutcome::Armed, "{path}");
+                    if let Some(reach) = reach {
+                        reach(&f);
+                    }
+                    withdraw(&f);
+                    let withdrawn = f.sessions.codes_withdrawn();
+                    f.arm.stop_arming();
+                    let stopped = f.sessions.codes_withdrawn();
+                    assert_eq!(f.sessions.disarm(), None, "{path}: the stop left no code");
+                    counts.push([withdrawn, stopped, f.sessions.codes_withdrawn()]);
+                }
+            }
+            counts
+        }
+        // Per withdrawal, the code with no end, then paired, exhausted and
+        // expired. Only a code with no end is counted. A newer request's own
+        // code is withdrawn by the stop after it; one whose first result
+        // cannot be written is withdrawn at once and its refusal's disarm
+        // finds no code. A stop after a refusal or a stop, and a disarm with
+        // no code armed, count none.
+        let want: [[[u64; 3]; 4]; 4] = [
+            // A newer request.
+            [[1, 2, 2], [0, 1, 1], [0, 1, 1], [0, 1, 1]],
+            // A refused request.
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            // A newer request whose first result cannot be written.
+            [[2, 2, 2], [1, 1, 1], [1, 1, 1], [1, 1, 1]],
+            // The stop.
+            [[1, 1, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ];
+        let first = run();
+        assert_eq!(first, want.concat());
+        assert_eq!(first, run());
     }
 
     #[test]

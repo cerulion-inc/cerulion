@@ -262,8 +262,9 @@ pub enum WireResponse {
 }
 
 /// The `status` reply payload: one row per demanded topic, the daemon's
-/// count of dropped log lines, the armed pairing code's state and how many
-/// pair-code requests the daemon refused.
+/// count of dropped log lines, the armed pairing code's state, how many
+/// pair-code requests the daemon refused and how many armed codes it withdrew
+/// before their end.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReply {
     /// Per-topic WAN counter rows, sorted by topic.
@@ -285,6 +286,14 @@ pub struct StatusReply {
     /// while none was and from a plane with no code-pairing store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_code_refused: Option<u64>,
+    /// How many armed pairing codes the daemon withdrew before their end since
+    /// it started: a code replaced by a newer request's code or by a refused
+    /// request, one whose own result could not be written, and one its stop
+    /// withdrew ([`SharedCodePairSessions::codes_withdrawn`]). A code that
+    /// paired, was used up or expired is not counted. Absent, and `None`,
+    /// while none was and from a plane with no code-pairing store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code_withdrawn: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
@@ -465,7 +474,8 @@ impl WirePlane {
     }
 
     /// The `status` reply over the demanded `topics`: this process's dropped
-    /// log lines, and the installed store's armed code and refused requests.
+    /// log lines, and the installed store's armed code, refused requests and
+    /// withdrawn codes.
     fn status_reply(&self, topics: Vec<TopicStatus>) -> StatusReply {
         StatusReply {
             topics,
@@ -480,6 +490,11 @@ impl WirePlane {
                 .as_ref()
                 .map(SharedCodePairSessions::requests_refused)
                 .filter(|refused| *refused > 0),
+            pair_code_withdrawn: self
+                .pair_code
+                .as_ref()
+                .map(SharedCodePairSessions::codes_withdrawn)
+                .filter(|withdrawn| *withdrawn > 0),
         }
     }
 
@@ -1300,6 +1315,7 @@ mod tests {
                 log_lines_dropped: None,
                 pair_code: None,
                 pair_code_refused: None,
+                pair_code_withdrawn: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[]}"#
@@ -1310,6 +1326,7 @@ mod tests {
                 log_lines_dropped: Some(7),
                 pair_code: None,
                 pair_code_refused: None,
+                pair_code_withdrawn: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
@@ -1317,10 +1334,11 @@ mod tests {
     }
 
     /// A status reply names the armed pairing code's status, tries and
-    /// failed count once a code is armed, and the refused requests once one
-    /// was, from the store the plane reports. Hand oracle.
+    /// failed count once a code is armed, the refused requests once one was,
+    /// and the withdrawn codes once one was, from the store the plane reports.
+    /// Hand oracle.
     #[test]
-    fn a_status_reply_names_the_armed_codes_state_failed_count_and_refused_requests() {
+    fn a_status_reply_names_the_armed_codes_state_refused_requests_and_withdrawn_codes() {
         use cerulion_pairing::format::PublicKey;
         use cerulion_pairing::pair_code::PAIR_CODE_POLICY;
         let clock = crate::MonotonicClock::fixed(1_000_000_000_000);
@@ -1354,11 +1372,25 @@ mod tests {
             json(&plane),
             r#"{"reply":"status","topics":[],"pair_code":{"status":"expired","tries":3,"failed":1},"pair_code_refused":1}"#
         );
+        // The expired code's disarm withdrew no code.
         sessions.disarm();
         assert_eq!(sessions.count_refused_request(), 2);
         assert_eq!(
             json(&plane),
             r#"{"reply":"status","topics":[],"pair_code_refused":2}"#
+        );
+        // A code replaced with no end is counted withdrawn, and so is one
+        // disarmed with no end.
+        sessions.arm("48213907", PAIR_CODE_POLICY);
+        sessions.arm("48213907", PAIR_CODE_POLICY);
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code":{"status":"armed","tries":3,"failed":0},"pair_code_refused":2,"pair_code_withdrawn":1}"#
+        );
+        sessions.disarm();
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code_refused":2,"pair_code_withdrawn":2}"#
         );
         // A plane with no store reports no code and no count.
         assert_eq!(

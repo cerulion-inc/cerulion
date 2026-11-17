@@ -156,15 +156,18 @@ fn wire_response_parity() {
             failed: 2,
         }),
         pair_code_refused: Some(1),
+        pair_code_withdrawn: Some(2),
     }));
     // A host with no daemon log writer sends no count, no armed code sends no
-    // code state, no refused request sends no refused count, and an older
-    // robot's reply, which has none of these fields, reads as `None` for each.
+    // code state, no refused request sends no refused count, no withdrawn code
+    // sends no withdrawn count, and an older robot's reply, which has none of
+    // these fields, reads as `None` for each.
     cross::<_, robot::WireResponse>(&desk::WireResponse::Status(desk::StatusReply {
         topics: vec![],
         log_lines_dropped: None,
         pair_code: None,
         pair_code_refused: None,
+        pair_code_withdrawn: None,
     }));
     let older = r#"{"reply":"status","topics":[]}"#;
     assert_eq!(
@@ -174,6 +177,7 @@ fn wire_response_parity() {
             log_lines_dropped: None,
             pair_code: None,
             pair_code_refused: None,
+            pair_code_withdrawn: None,
         })
     );
     assert_eq!(
@@ -183,6 +187,20 @@ fn wire_response_parity() {
             log_lines_dropped: None,
             pair_code: None,
             pair_code_refused: None,
+            pair_code_withdrawn: None,
+        })
+    );
+    // A robot that counts refused requests but not withdrawn codes reads as
+    // `None` for the withdrawn count on the desk.
+    let no_withdrawn_count = r#"{"reply":"status","topics":[],"pair_code_refused":1}"#;
+    assert_eq!(
+        serde_json::from_str::<desk::WireResponse>(no_withdrawn_count).unwrap(),
+        desk::WireResponse::Status(desk::StatusReply {
+            topics: vec![],
+            log_lines_dropped: None,
+            pair_code: None,
+            pair_code_refused: Some(1),
+            pair_code_withdrawn: None,
         })
     );
     cross::<_, robot::WireResponse>(&desk::WireResponse::Error {

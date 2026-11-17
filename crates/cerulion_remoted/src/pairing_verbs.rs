@@ -580,6 +580,8 @@ struct SessionsInner {
     hold_until_ns: AtomicU64,
     /// How many pair-code requests the daemon's arm step refused.
     requests_refused: AtomicU64,
+    /// How many armed codes an arm or a disarm dropped before their end.
+    codes_withdrawn: AtomicU64,
     clock: MonotonicClock,
     changed: tokio::sync::Notify,
     /// A pause of the next start's CPace step ([`HeldBuild`]).
@@ -651,6 +653,11 @@ impl HeldBuild {
 /// try ([`CODE_USED`]), so one code pairs one desk, and the other desks'
 /// pending tries are dropped uncounted.
 ///
+/// **A code withdrawn.** An arm that replaces a code with no end yet, and a
+/// disarm that drops one, count it once in
+/// [`SharedCodePairSessions::codes_withdrawn`]; a code that reached its end
+/// counts nothing, and so does a disarm with no code armed.
+///
 /// **Time.** The window and the rate interval are measured on the store's
 /// [`MonotonicClock`], so a step of the wall clock neither stretches nor cuts
 /// them.
@@ -687,6 +694,7 @@ impl SharedCodePairSessions {
             starting: Mutex::new(()),
             hold_until_ns: AtomicU64::new(0),
             requests_refused: AtomicU64::new(0),
+            codes_withdrawn: AtomicU64::new(0),
             clock,
             changed: tokio::sync::Notify::new(),
             #[cfg(any(test, feature = "test-seam"))]
@@ -714,6 +722,26 @@ impl SharedCodePairSessions {
     /// How many pair-code requests the daemon's arm step refused.
     pub fn requests_refused(&self) -> u64 {
         self.0.requests_refused.load(Ordering::Relaxed)
+    }
+
+    /// How many armed codes were withdrawn before their end: replaced by an
+    /// arm, or dropped by a disarm, while no desk had paired, not every try
+    /// had failed and the window had not passed.
+    pub fn codes_withdrawn(&self) -> u64 {
+        self.0.codes_withdrawn.load(Ordering::Relaxed)
+    }
+
+    /// Count the code armed in `st` as withdrawn when it has no end. An arm
+    /// and a disarm call it with the outcome latched, just before they replace
+    /// or drop the code, so each code is counted at most once.
+    fn count_withdrawn(&self, st: &CodeState) {
+        if st
+            .ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.outcome.is_none())
+        {
+            self.0.codes_withdrawn.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Pause the next admitted `code-pair-start` just before its CPace step,
@@ -770,8 +798,9 @@ impl SharedCodePairSessions {
     /// window of `ttl_ns` from now). Replaces any armed code, its tries and
     /// its pending tries, once a right code's row being saved is saved and a
     /// start's CPace step in progress has ended; the rate interval runs on
-    /// from the last admitted try. Returns the new code's state and the
-    /// replaced code's last state, its outcome latched as
+    /// from the last admitted try. A replaced code with no end yet is counted
+    /// in [`SharedCodePairSessions::codes_withdrawn`]. Returns the new code's
+    /// state and the replaced code's last state, its outcome latched as
     /// [`SharedCodePairSessions::disarm`] answers it.
     pub fn arm(&self, code: impl Into<String>, policy: CeremonyConfig) -> CodeArmed {
         let _saving = self.0.saving.lock().unwrap_or_else(PoisonError::into_inner);
@@ -782,6 +811,7 @@ impl SharedCodePairSessions {
             st.generation += 1;
         }
         let replaced = st.snapshot();
+        self.count_withdrawn(&st);
         st.arms += 1;
         st.generation += 1;
         let ledger = CodeLedger {
@@ -814,8 +844,9 @@ impl SharedCodePairSessions {
     /// serving, once a right code's row being saved is saved and a start's
     /// CPace step in progress has ended; the code's last state, its outcome
     /// latched as [`SharedCodePairSessions::snapshot`] does, or `None` when no
-    /// code was armed. A later start is refused with [`NOT_ARMED`], and a
-    /// later finish with [`NO_SESSION`].
+    /// code was armed. A dropped code with no end yet is counted in
+    /// [`SharedCodePairSessions::codes_withdrawn`]. A later start is refused
+    /// with [`NOT_ARMED`], and a later finish with [`NO_SESSION`].
     pub fn disarm(&self) -> Option<CodeSnapshot> {
         let _saving = self.0.saving.lock().unwrap_or_else(PoisonError::into_inner);
         let _starting = self.starting();
@@ -825,6 +856,7 @@ impl SharedCodePairSessions {
             st.generation += 1;
         }
         let last = st.snapshot();
+        self.count_withdrawn(&st);
         if st.ledger.take().is_some() {
             st.generation += 1;
         }
@@ -2404,6 +2436,7 @@ mod tests {
         );
         drop(a_session);
         assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 0));
+        assert_eq!(sessions.codes_withdrawn(), 1, "a code with a try pending");
         clock.set(T0 + RATE);
         new_pairs(&sessions, B);
         assert_eq!(state(&sessions).0.status().as_str(), "paired");
@@ -2438,6 +2471,7 @@ mod tests {
                 0
             )
         );
+        assert_eq!(sessions.codes_withdrawn(), 0, "the code paired first");
         // The new code has no part in the save.
         assert_eq!(state(&sessions), (PairCodeState::Armed, 3, 0));
         sessions.release_hold(later.armed.arm);
@@ -2788,6 +2822,7 @@ mod tests {
             PairCodeState::Paired(PairedDesk::new(A, "lab_desk").unwrap())
         );
         assert_eq!(sessions.snapshot(), None);
+        assert_eq!(sessions.codes_withdrawn(), 0, "the code paired first");
     }
 
     #[test]
@@ -2796,10 +2831,62 @@ mod tests {
         clock.set(T0 + WINDOW + 1);
         let last = sessions.disarm().expect("a code was armed");
         assert_eq!((last.state, last.failed), (PairCodeState::Expired, 0));
+        assert_eq!(
+            sessions.codes_withdrawn(),
+            0,
+            "an expired code is not withdrawn"
+        );
         assert_eq!(sessions.requests_refused(), 0);
         assert_eq!(sessions.count_refused_request(), 1);
         assert_eq!(sessions.count_refused_request(), 2);
         assert_eq!(sessions.requests_refused(), 2);
+        assert_eq!(sessions.codes_withdrawn(), 0, "a refusal withdraws nothing");
+    }
+
+    #[test]
+    fn a_code_dropped_before_its_end_is_counted_withdrawn_once_and_identically_on_two_runs() {
+        use cerulion_pairing::pair_code::PAIR_CODE_POLICY;
+        /// The withdrawn count after each step of one script.
+        fn run() -> Vec<u64> {
+            let (sessions, clock) = armed();
+            let mut seen = vec![sessions.codes_withdrawn()];
+            // A code with a failed try and no end, replaced by an arm.
+            refused(wrong_tag(&sessions, A));
+            sessions.arm(CODE, PAIR_CODE_POLICY);
+            seen.push(sessions.codes_withdrawn());
+            // A paired code, replaced.
+            clock.set(T0 + RATE);
+            pair(&sessions, A).expect("desk A pairs");
+            sessions.arm(CODE, PAIR_CODE_POLICY);
+            seen.push(sessions.codes_withdrawn());
+            // A code whose window passed with no desk acting, replaced.
+            let t1 = T0 + RATE + WINDOW + 1;
+            clock.set(t1);
+            sessions.arm(CODE, PAIR_CODE_POLICY);
+            seen.push(sessions.codes_withdrawn());
+            // A code whose tries all failed, disarmed, then a disarm with
+            // nothing armed.
+            for (i, desk) in [B, C, D].into_iter().enumerate() {
+                clock.set(t1 + RATE * i as u64);
+                refused(wrong_tag(&sessions, desk));
+            }
+            assert_eq!(state(&sessions), (PairCodeState::Exhausted, 3, 3));
+            sessions.disarm().expect("a code was armed");
+            seen.push(sessions.codes_withdrawn());
+            assert_eq!(sessions.disarm(), None);
+            seen.push(sessions.codes_withdrawn());
+            // A code with no try, disarmed, and a second disarm after it.
+            sessions.arm(CODE, PAIR_CODE_POLICY);
+            sessions.disarm().expect("a code was armed");
+            seen.push(sessions.codes_withdrawn());
+            assert_eq!(sessions.disarm(), None);
+            seen.push(sessions.codes_withdrawn());
+            assert_eq!(sessions.requests_refused(), 0, "no refusal is counted");
+            seen
+        }
+        let first = run();
+        assert_eq!(first, vec![0, 1, 1, 1, 1, 1, 2, 2]);
+        assert_eq!(first, run());
     }
 
     #[test]

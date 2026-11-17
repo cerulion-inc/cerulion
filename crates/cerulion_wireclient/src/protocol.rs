@@ -125,8 +125,9 @@ pub enum WireResponse {
 }
 
 /// The `status` reply payload: one row per demanded topic, the robot
-/// daemon's count of dropped log lines, its armed pairing code's state and
-/// how many pair-code requests it refused.
+/// daemon's count of dropped log lines, its armed pairing code's state, how
+/// many pair-code requests it refused and how many armed codes it withdrew
+/// before their end.
 ///
 /// Mirror of `cerulion_remoted::StatusReply`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +149,14 @@ pub struct StatusReply {
     /// does not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_code_refused: Option<u64>,
+    /// How many armed pairing codes the robot daemon withdrew before their
+    /// end since it started: a code replaced by a newer request's code or by
+    /// a refused request, one whose own result could not be written, and one
+    /// the daemon's stop withdrew. A code that paired, was used up or expired
+    /// is not counted. `None` while none was and from a robot that does not
+    /// report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code_withdrawn: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
@@ -382,6 +391,7 @@ mod tests {
                 log_lines_dropped: None,
                 pair_code: None,
                 pair_code_refused: None,
+                pair_code_withdrawn: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[]}"#
@@ -392,6 +402,7 @@ mod tests {
                 log_lines_dropped: Some(7),
                 pair_code: None,
                 pair_code_refused: None,
+                pair_code_withdrawn: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
@@ -399,9 +410,10 @@ mod tests {
     }
 
     /// A status reply names the robot's armed pairing code only when it has
-    /// one, and its refused requests only once one was. Hand oracle.
+    /// one, its refused requests only once one was, and its withdrawn codes
+    /// only once one was. Hand oracle.
     #[test]
-    fn a_status_reply_names_the_armed_pairing_code_and_refused_requests_only_when_there_are() {
+    fn a_status_reply_names_the_code_and_its_refused_and_withdrawn_counts_only_when_there_are() {
         use cerulion_pairing::pair_code::PairCodeStatus;
         let cases = [
             (
@@ -414,6 +426,7 @@ mod tests {
                         failed: 3,
                     }),
                     pair_code_refused: None,
+                    pair_code_withdrawn: None,
                 },
                 r#"{"reply":"status","topics":[],"pair_code":{"status":"exhausted","tries":3,"failed":3}}"#,
             ),
@@ -423,8 +436,19 @@ mod tests {
                     log_lines_dropped: None,
                     pair_code: None,
                     pair_code_refused: Some(2),
+                    pair_code_withdrawn: None,
                 },
                 r#"{"reply":"status","topics":[],"pair_code_refused":2}"#,
+            ),
+            (
+                StatusReply {
+                    topics: vec![],
+                    log_lines_dropped: None,
+                    pair_code: None,
+                    pair_code_refused: None,
+                    pair_code_withdrawn: Some(4),
+                },
+                r#"{"reply":"status","topics":[],"pair_code_withdrawn":4}"#,
             ),
         ];
         for (reply, json) in cases {
