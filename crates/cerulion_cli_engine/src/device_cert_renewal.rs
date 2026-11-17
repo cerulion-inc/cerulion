@@ -719,8 +719,10 @@ fn follows_own(path: &Path, own: &Path) -> bool {
 }
 
 /// The directory entry `path` names: its directory, resolved, and its file
-/// name, so two spellings of one entry compare equal without following the
-/// entry itself.
+/// name as written, so spellings of one entry that differ in their directory
+/// (through a symlinked directory, `.` or `..`) compare equal without following
+/// the entry itself. Names that differ only in case on a case-insensitive
+/// volume still compare unequal.
 fn entry(path: &Path) -> Option<PathBuf> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
