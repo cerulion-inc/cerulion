@@ -234,12 +234,14 @@ struct ConnectCli {
 /// # Exit codes (the machine signal a Studio driver branches on)
 ///
 /// - `0` paired, `1` usage or config error, `2` robot refused (no armed code,
-///   denied, or the window expired), `3` unreachable (dial failure or timeout),
-///   `4` wrong pairing code or attempts exhausted, `130` interrupted (Ctrl-C or
-///   SIGTERM during the ceremony; not paired, unless the robot was already
-///   asked to save this desk and its answer did not arrive in time: then the
-///   robot may have paired this desk, and `cerulion connect --eid <eid>`
-///   connects if it did).
+///   denied, or the window expired), `3` unreachable (dial failure or timeout)
+///   or the robot did not answer after it was asked to save this desk: read
+///   stderr before you retry, `4` wrong pairing code or attempts exhausted,
+///   `130` interrupted (Ctrl-C or SIGTERM during the ceremony; not paired,
+///   unless the robot was already asked to save this desk and its answer did
+///   not arrive in time: then the robot may have paired this desk, and
+///   `cerulion connect --eid <eid>` connects if it did, with the same
+///   `--key-file`, when this pairing used one).
 #[derive(Parser)]
 struct PairCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its

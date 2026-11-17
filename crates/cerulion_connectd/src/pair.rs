@@ -78,8 +78,9 @@ pub const EXIT_USAGE: u8 = 1;
 pub const EXIT_REFUSED: u8 = 2;
 /// The robot could not be reached — the dial failed, the stream dropped, or the
 /// ceremony timed out. Retry (check the robot is on, reachable, running remoted).
-/// A ceremony that timed out after the robot was asked to save this desk is
-/// [`PairError::TimedOutUnconfirmed`]: the robot may have paired this desk.
+/// Exit 3 is also the robot that did not answer after it was asked to save this
+/// desk ([`PairError::TimedOutUnconfirmed`]): the robot may have paired this
+/// desk, so read stderr before you retry.
 pub const EXIT_UNREACHABLE: u8 = 3;
 /// The pairing CODE was wrong (the CPace confirmation did not match) or its
 /// bounded attempts were exhausted. Re-check the code with the robot owner.
@@ -98,14 +99,16 @@ pub const EXIT_INTERRUPTED: u8 = 130;
 /// arrive within the bound the run waits for it.
 pub const INTERRUPTED_UNCONFIRMED: &str = "interrupted after the robot was asked to save this \
      desk, before its answer arrived; the robot may have paired this desk, and `cerulion \
-     connect --eid <eid>` connects if it did";
+     connect --eid <eid>` connects if it did, with the same `--key-file`, when this pairing used \
+     one";
 
 /// The text of [`PairError::TimedOutUnconfirmed`]: the desk-side timeout fired
 /// after the run asked the robot to save this desk, and the robot's answer did
 /// not arrive within the bound the run then waits for it.
 pub const TIMED_OUT_UNCONFIRMED: &str = "the pairing ceremony timed out after the robot was \
      asked to save this desk, before its answer arrived; the robot may have paired this desk, \
-     and `cerulion connect --eid <eid>` connects if it did";
+     and `cerulion connect --eid <eid>` connects if it did, with the same `--key-file`, when \
+     this pairing used one";
 
 // ── error taxonomy ────────────────────────────────────────────────────────────
 
@@ -1192,13 +1195,14 @@ mod tests {
     /// arrive: hand-written, never the const it renders.
     const UNCONFIRMED_TEXT: &str = "interrupted after the robot was asked to save this desk, \
          before its answer arrived; the robot may have paired this desk, and `cerulion connect \
-         --eid <eid>` connects if it did";
+         --eid <eid>` connects if it did, with the same `--key-file`, when this pairing used one";
 
     /// The text of a timed-out run whose `code-pair-finish` answer did not
     /// arrive: hand-written, never the const it renders.
     const TIMED_OUT_UNCONFIRMED_TEXT: &str = "the pairing ceremony timed out after the robot was \
          asked to save this desk, before its answer arrived; the robot may have paired this \
-         desk, and `cerulion connect --eid <eid>` connects if it did";
+         desk, and `cerulion connect --eid <eid>` connects if it did, with the same \
+         `--key-file`, when this pairing used one";
 
     /// Hand-written table: whether the ceremony had sent `code-pair-finish`
     /// when the interrupt resolved, and its own result when the run then

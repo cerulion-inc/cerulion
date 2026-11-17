@@ -106,12 +106,13 @@ const RELEASE_AFTER_THE_TIMEOUT: Duration = Duration::from_millis(500);
 /// arrive: hand-written, never the const it renders.
 const UNCONFIRMED_TEXT: &str = "interrupted after the robot was asked to save this desk, before \
      its answer arrived; the robot may have paired this desk, and `cerulion connect --eid \
-     <eid>` connects if it did";
+     <eid>` connects if it did, with the same `--key-file`, when this pairing used one";
 /// The text of a timed-out run whose `code-pair-finish` answer did not
 /// arrive: hand-written, never the const it renders.
 const TIMED_OUT_UNCONFIRMED_TEXT: &str = "the pairing ceremony timed out after the robot was \
      asked to save this desk, before its answer arrived; the robot may have paired this desk, \
-     and `cerulion connect --eid <eid>` connects if it did";
+     and `cerulion connect --eid <eid>` connects if it did, with the same `--key-file`, when \
+     this pairing used one";
 const T_NOW: u64 = 1_000_000_000_000;
 const CHASSIS: &[u8] = b"pair-e2e-chassis-secret-not-serial-derived";
 const MAC_KEY: &[u8] = b"pair-e2e-firmware-mac-key";
