@@ -17,7 +17,6 @@
 //! supervisor reads as a request to fetch now rather than at the next period.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,6 +24,7 @@ use std::time::{Duration, Instant};
 use cerulion_pairing::verify::{EpochOutcome, EpochSyncWire};
 
 use crate::clock::RemotedClock;
+use crate::owner_only::read_owner_only;
 use crate::trust::SharedTrust;
 
 /// The fetched epoch the sync worker leaves for remoted to apply.
@@ -147,7 +147,7 @@ impl EpochPull {
                 return PullOutcome::Rejected { reason };
             }
         }
-        let outcome = match read_pending(&claimed) {
+        let outcome = match read_owner_only(&claimed, MAX_PENDING_BYTES, "the fetched epoch") {
             Ok(None) => PullOutcome::Nothing,
             Ok(Some(bytes)) => self.apply(&bytes),
             Err(reason) => PullOutcome::Rejected { reason },
@@ -250,50 +250,6 @@ impl EpochPull {
             let _ = tokio::task::spawn_blocking(move || pull.apply_pending()).await;
         }
     }
-}
-
-/// Read `path` when it is a regular, single-link file of at most
-/// [`MAX_PENDING_BYTES`], owned by the owner of its directory, with no group
-/// or other permission bits, in a directory with none either. The file is
-/// opened without following a symbolic link and checked through the open
-/// handle, so a file swapped in after the check is the one read and refused.
-fn read_pending(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not open the fetched epoch: {e}")),
-    };
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let dir_meta = std::fs::symlink_metadata(dir)
-        .map_err(|e| format!("could not inspect the state directory: {e}"))?;
-    if !dir_meta.is_dir() || dir_meta.mode() & 0o077 != 0 {
-        return Err("the state directory is not owner-only".into());
-    }
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("could not inspect the fetched epoch: {e}"))?;
-    if !meta.is_file() || meta.nlink() != 1 {
-        return Err("the fetched epoch is not a regular single-link file".into());
-    }
-    if meta.uid() != dir_meta.uid() || meta.mode() & 0o077 != 0 {
-        return Err("the fetched epoch is not owner-only and owned by this robot's user".into());
-    }
-    if meta.len() > MAX_PENDING_BYTES {
-        return Err(format!(
-            "the fetched epoch is {} bytes, above the {MAX_PENDING_BYTES}-byte bound",
-            meta.len()
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_PENDING_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("could not read the fetched epoch: {e}"))?;
-    Ok(Some(bytes))
 }
 
 fn remove_quietly(path: &Path) {
