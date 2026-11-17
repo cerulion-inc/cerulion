@@ -354,6 +354,31 @@ const ROBOT_PROOF_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// deadline.
 const ROBOT_PROOF_FETCH_BUDGET: Duration = Duration::from_secs(24);
 
+/// The session fallback's bound after the robot-proof fetch: a refresh-lock
+/// wait, a refresh request and an access read, one account request each, and the
+/// refresh's 1 s save: 91 s.
+const SESSION_FALLBACK_BOUND: Duration =
+    Duration::from_secs(3 * cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT.as_secs() + 1);
+
+/// The worker's own bound, 115 s, which the supervisor's 120 s worker deadline
+/// sits above so the deadline never cuts a session refresh in flight.
+const WORKER_BOUND: Duration = Duration::from_secs(115);
+const _: () = assert!(
+    ROBOT_PROOF_FETCH_BUDGET.as_secs() + SESSION_FALLBACK_BOUND.as_secs() <= WORKER_BOUND.as_secs()
+);
+
+/// What a robot-proof request may take at `now`: [`ROBOT_PROOF_REQUEST_TIMEOUT`],
+/// cut to what is left of the fetch's `deadline`, or `None` once nothing is left.
+fn proof_request_timeout(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(ROBOT_PROOF_REQUEST_TIMEOUT))
+}
+
 /// The challenge requests one fetch makes at most: the first and two retries. A
 /// clock refusal names the service's time, and for a replay the next request
 /// time it accepts; a refusal for skew names no next time, so a robot whose
@@ -399,10 +424,8 @@ fn fetch_access_by_robot_proof(
     let client = login_cmd::http_client_bounded(ROBOT_PROOF_REQUEST_TIMEOUT)?;
     let deadline = std::time::Instant::now() + ROBOT_PROOF_FETCH_BUDGET;
     let timeout = || -> CliResult<Duration> {
-        match deadline.checked_duration_since(std::time::Instant::now()) {
-            Some(left) if !left.is_zero() => Ok(left.min(ROBOT_PROOF_REQUEST_TIMEOUT)),
-            _ => Err(refused("the robot-proof fetch ran out of time")),
-        }
+        proof_request_timeout(deadline, std::time::Instant::now())
+            .ok_or_else(|| refused("the robot-proof fetch ran out of time"))
     };
     let id = URL_SAFE_NO_PAD.encode(robot_id);
     let request_challenge = |requested_at: u64| -> CliResult<Answer<RobotAccessChallenge>> {
@@ -873,6 +896,27 @@ fn create_state_root(path: &Path) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proof_request_gets_its_timeout_cut_to_what_is_left_of_the_fetch() {
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(24);
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        assert_eq!(
+            proof_request_timeout(deadline, start),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            proof_request_timeout(deadline, at(16)),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            proof_request_timeout(deadline, at(21)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(proof_request_timeout(deadline, deadline), None);
+        assert_eq!(proof_request_timeout(deadline, at(30)), None);
+    }
 
     #[test]
     fn cached_owner_matches_uuid_mapping_even_with_expired_login() {
