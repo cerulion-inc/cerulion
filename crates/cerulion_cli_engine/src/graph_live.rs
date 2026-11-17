@@ -1268,9 +1268,12 @@ fn write_fires_summary(
 /// Read the fires of `run` from `source` until `window` elapses (`None`:
 /// until `running` clears), writing one row per fire and then the totals.
 ///
-/// The window ends the reading only after an answered ask. A robot that is
-/// not answering when the window ends gets the rest of its silence limit, so
-/// a short window never reports a silent robot as a clean reading.
+/// When the window is spent, one last ask at the deadline reads what the
+/// robot recorded since the previous ask, and full pages are read on until a
+/// short one, so the totals cover the whole window. The window ends the
+/// reading only after such an answered ask. A robot that is not answering
+/// when the window ends gets the rest of its silence limit, so a short window
+/// never reports a silent robot as a clean reading.
 pub fn follow_fires(
     source: &mut dyn FiresSource,
     run: &SelectedRun,
@@ -1310,9 +1313,6 @@ pub fn follow_fires(
                 },
                 FIRES_SILENCE_LIMIT.as_secs()
             ));
-        }
-        if silent_since.is_none() && window.is_some_and(|w| pacer.elapsed() >= w) {
-            break FiresEnd::Window;
         }
         let mut read_on = false;
         let asked_at = pacer.elapsed();
@@ -1370,6 +1370,12 @@ pub fn follow_fires(
                     sanitize_refusal_reason(&reason)
                 ));
             }
+        }
+        // A spent window still asks once more, so the fires recorded since
+        // the previous ask are read before the totals. It ends on the first
+        // answered ask made at or after the deadline that is not a full page.
+        if !read_on && silent_since.is_none() && window.is_some_and(|w| asked_at >= w) {
+            break FiresEnd::Window;
         }
         if !read_on {
             // The ask's own gather window counts toward the interval, so asks
@@ -2976,7 +2982,11 @@ robot bench · run 0x00000000000000000000000000000007 · graph mix · ending · 
         let (stream, end) = result.expect("a clean reading");
         assert_eq!(end, FiresEnd::Window);
         assert_eq!((stream.fires, stream.lost), (3, 1));
-        assert_eq!(source.asked, [None, Some(5119), Some(5121), Some(5124)]);
+        assert_eq!(
+            source.asked,
+            [None, Some(5119), Some(5121), Some(5124), Some(5124)],
+            "the last ask is at the deadline"
+        );
         assert_eq!(
             out,
             "\
@@ -3039,10 +3049,93 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
         result.expect("clean");
         assert_eq!(
             source.asked,
-            [None, Some(0), Some(MAX_FIRES_PER_REPLY as u64)],
-            "the full page is followed by a third request inside one interval"
+            [
+                None,
+                Some(0),
+                Some(MAX_FIRES_PER_REPLY as u64),
+                Some(MAX_FIRES_PER_REPLY as u64)
+            ],
+            "the full page is followed by a third request inside one interval, \
+             then the last ask at the deadline"
         );
         assert_eq!(pacer.sleeps, 2);
+    }
+
+    /// `--for` with quick answers: the last ask is made at the deadline, so
+    /// the fires the robot recorded after the previous ask are printed and
+    /// counted before the totals.
+    #[test]
+    fn follow_fires_reads_once_more_at_the_deadline() {
+        let mut source = scripted(
+            vec![
+                served(2_000_000_000, 0, 0, Vec::new()),
+                served(2_250_000_000, 0, 0, Vec::new()),
+                served(
+                    2_500_000_000,
+                    3,
+                    1,
+                    vec![
+                        fire(2, 2_300_000_000, 10, 0, FireCause::Period, 0, 1),
+                        fire(3, 2_450_000_000, 10, 0, FireCause::Period, 0, 1),
+                    ],
+                ),
+            ],
+            served(2_750_000_000, 3, 0, Vec::new()),
+        );
+        let (result, out, pacer) = follow(&mut source, Some(Duration::from_millis(500)), true);
+        let (stream, end) = result.expect("clean");
+        assert_eq!(end, FiresEnd::Window);
+        assert_eq!(
+            source.asked,
+            [None, Some(0), Some(0)],
+            "the third ask is at 500 ms"
+        );
+        assert_eq!((stream.fires, stream.lost), (2, 1));
+        assert_eq!(pacer.now, Duration::from_millis(500));
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+            .collect();
+        let seqs: Vec<_> = lines[..2].iter().map(|l| l["seq"].clone()).collect();
+        assert_eq!(seqs, [2, 3]);
+        assert_eq!(lines[2]["fires"], 2);
+        assert_eq!(lines[2]["lost"], 1);
+        assert_eq!(lines[2]["elapsed_ms"], 500);
+        assert_eq!(lines[2]["end"], "window");
+    }
+
+    /// A full page at the deadline is read on, without a wait, until a short
+    /// page; only then does the window end the reading.
+    #[test]
+    fn follow_fires_drains_full_pages_at_the_deadline() {
+        let max = MAX_FIRES_PER_REPLY as u64;
+        let page = |first: u64, count: u64| -> Vec<FireRecord> {
+            (first..first + count)
+                .map(|seq| fire(seq, 1_000, 1, 0, FireCause::Period, 0, 1))
+                .collect()
+        };
+        let mut source = scripted(
+            vec![
+                served(2_000, 0, 0, Vec::new()),
+                served(2_000, 0, 0, Vec::new()),
+                served(2_000, max, 0, page(1, max)),
+                served(2_000, 2 * max, 0, page(max + 1, max)),
+                served(2_000, 2 * max + 2, 0, page(2 * max + 1, 2)),
+            ],
+            served(2_000, 2 * max + 2, 0, Vec::new()),
+        );
+        let (result, out, pacer) = follow(&mut source, Some(Duration::from_millis(500)), true);
+        let (stream, end) = result.expect("clean");
+        assert_eq!(end, FiresEnd::Window);
+        assert_eq!(
+            source.asked,
+            [None, Some(0), Some(0), Some(max), Some(2 * max)],
+            "both full pages are read on; the short page ends the reading"
+        );
+        assert_eq!(stream.fires, 2 * max + 2);
+        assert_eq!(out.lines().count() as u64, 2 * max + 3);
+        assert_eq!(pacer.sleeps, 2, "no wait between the pages at the deadline");
+        assert_eq!(pacer.now, Duration::from_millis(500));
     }
 
     /// The run ends: the reading stops with the totals and no error.
@@ -3983,8 +4076,12 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             result.expect("a missed ask, then an answer").1,
             FiresEnd::Window
         );
-        assert_eq!(source.asked.len(), 5, "one ask past the window, answered");
-        assert_eq!(pacer.now, Duration::from_millis(1250));
+        assert_eq!(
+            source.asked.len(),
+            5,
+            "the answered ask at the deadline ends the reading"
+        );
+        assert_eq!(pacer.now, Duration::from_secs(1));
     }
 
     /// An answer resets the silence limit: a robot that misses asks, but
