@@ -31,7 +31,9 @@ use cerulion_core::codegen::unknown_hash::{
     DiagnosisVantage, UnknownHashDiagnosis,
 };
 use cerulion_core::codegen::FrameWalker;
-use cerulion_core::transport::cerulion_q::{format_run_id, parse_run_id, FiresAnswer};
+use cerulion_core::transport::cerulion_q::{
+    format_run_id, parse_run_id, FiresAnswer, FiresOutcome, MAX_FIRES_PER_REPLY,
+};
 use cerulion_core::transport::discovery::{query_robot_catalog, query_robot_schema};
 use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use cerulion_core::transport::liveness::LIVENESS_STREAMING_RECENCY_MS;
@@ -6753,7 +6755,8 @@ struct FollowTiming {
 }
 
 impl FollowTiming {
-    /// Four polls a second, until three seconds after the last ask. The robot
+    /// Four polls a second (a full page is read on at once, see
+    /// [`FireFollowers::follow`]), until three seconds after the last ask. The robot
     /// then stops recording when its own five-second lease runs out. A failed
     /// poll waits two seconds after it returns, the catalog forwarder's
     /// resubscribe backoff.
@@ -6939,6 +6942,15 @@ impl FireFollowers {
     /// The follower thread: poll every interval while the follower is still
     /// the map's entry for its key and its lease holds, then leave the map.
     ///
+    /// A full page ([`MAX_FIRES_PER_REPLY`] fires) means the robot holds more,
+    /// so the next GET goes at once with the page's cursor, as `graph fires`
+    /// reads on. One interval of 512-fire pages caps a follower at 2048 fires a
+    /// second, and a busier run would trail until the robot overwrites what it
+    /// has not read. The burst has no count limit: every GET is one netd round
+    /// trip, and the close, replacement and lease checks still run before each
+    /// one. A full page that does not move the cursor waits the interval, so a
+    /// robot that repeats one page cannot spin the thread.
+    ///
     /// The GET runs with no lock held, so an `activity` for this run answers
     /// from the log while a poll is in flight.
     fn follow(&self, follower: Arc<Mutex<FireFollower>>) {
@@ -6972,10 +6984,21 @@ impl FireFollowers {
             } else {
                 started + self.timing.interval
             };
-            follower
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .fold(polled, fetched_at);
+            let full = matches!(
+                &polled,
+                Ok(FiresAnswer::Reply { reply }) if matches!(
+                    &reply.outcome,
+                    FiresOutcome::Served { fires, .. } if fires.len() >= MAX_FIRES_PER_REPLY
+                )
+            );
+            let moved = {
+                let mut state = follower.lock().unwrap_or_else(|e| e.into_inner());
+                state.fold(polled, fetched_at);
+                state.cursor > cursor
+            };
+            if full && moved {
+                continue;
+            }
             self.pause_until(next_poll, &key, &follower);
         }
     }
@@ -7083,6 +7106,28 @@ mod fire_follower_tests {
         Silent,
         /// netd cannot run the query.
         Failing,
+        /// A run with a backlog: a cursor-less GET and a GET after a cursor
+        /// below `2 * MAX_FIRES_PER_REPLY` each get a full page of the fires
+        /// after it (nodes 0, 1, 2 in turn), then it fires once between polls
+        /// as [`Robot::Firing`] does.
+        Backlog,
+        /// Every GET gets the same full page, `1..=MAX_FIRES_PER_REPLY`.
+        StuckFull,
+    }
+
+    /// The fires `first..=last`, nodes 0, 1, 2 in turn.
+    fn fires_from(first: u64, last: u64) -> Vec<FireRecord> {
+        (first..=last)
+            .map(|seq| FireRecord {
+                seq,
+                at_ns: 88_400 * MS,
+                dur_ns: 38_211,
+                node: (seq % 3) as u16,
+                cause: FireCause::Period,
+                flags: FireFlags(0),
+                wrote: 1,
+            })
+            .collect()
     }
 
     #[derive(Clone)]
@@ -7155,7 +7200,14 @@ mod fire_follower_tests {
                 .unwrap()
                 .push((started, Instant::now()));
             self.ledger.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let page = MAX_FIRES_PER_REPLY as u64;
             let (next, fires) = match (self.robot, after) {
+                (Robot::Backlog, None) => (page, fires_from(1, page)),
+                (Robot::Backlog, Some(cursor)) if cursor < 2 * page => {
+                    (cursor + page, fires_from(cursor + 1, cursor + page))
+                }
+                (Robot::Backlog, Some(cursor)) => (cursor + 1, fires_from(cursor + 1, cursor + 1)),
+                (Robot::StuckFull, _) => (page, fires_from(1, page)),
                 (Robot::Silent, _) => return Ok(FiresAnswer::Silent),
                 (Robot::Failing, _) => return Err("netd is down".to_string()),
                 (Robot::Firing, None) => (5119, Vec::new()),
@@ -7376,6 +7428,81 @@ mod fire_follower_tests {
         let again = followers.ask(key("temi"), None, Instant::now(), &fake);
         assert_eq!(again.state, ActivityState::Starting, "a fresh follower");
         assert_eq!(fake.opened(), 2, "on a fresh connection");
+        followers.close();
+    }
+
+    #[test]
+    fn a_follower_reads_on_at_once_after_a_full_page_and_waits_after_a_short_one() {
+        let timing = FollowTiming {
+            interval: Duration::from_secs(2),
+            lease: Duration::from_secs(30),
+            ..FollowTiming::PRODUCTION
+        };
+        let fake = FiresFake::new(Robot::Backlog);
+        let followers = Arc::new(FireFollowers::new(timing));
+        followers.ask(key("temi"), None, Instant::now(), &fake);
+        let page = MAX_FIRES_PER_REPLY as u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.polls().len() < 3 {
+            assert!(Instant::now() < deadline, "the backlog was not drained");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fake.polls(),
+            vec![
+                ("temi".to_string(), None),
+                ("temi".to_string(), Some(page)),
+                ("temi".to_string(), Some(2 * page)),
+            ],
+            "two full pages are read on with their cursors; the short third waits"
+        );
+        let spans = fake.spans();
+        for i in 1..3 {
+            let gap = spans[i].0.duration_since(spans[i - 1].1);
+            assert!(
+                gap < timing.interval / 4,
+                "poll {i} waited {gap:?} after a full page"
+            );
+        }
+
+        let answer = followers.ask(key("temi"), None, Instant::now(), &fake);
+        assert!(
+            matches!(answer.state, ActivityState::Live { .. }),
+            "{:?}",
+            answer.state
+        );
+        assert_eq!(answer.next, 2 * page + 1);
+        assert_eq!(answer.lost, 0);
+        assert_eq!(answer.fires.len(), crate::activity::MAX_ACTIVITY_FIRES);
+        assert_eq!(answer.fires[0].seq, 2 * page + 1, "newest first");
+        let counts: Vec<(u16, u32)> = answer.nodes.iter().map(|n| (n.node, n.fires)).collect();
+        assert_eq!(counts, vec![(0, 341), (1, 342), (2, 342)], "all 1025 fires");
+        followers.close();
+    }
+
+    #[test]
+    fn a_full_page_that_does_not_move_the_cursor_waits_the_interval() {
+        let timing = FollowTiming {
+            interval: Duration::from_secs(2),
+            lease: Duration::from_secs(30),
+            ..FollowTiming::PRODUCTION
+        };
+        let fake = FiresFake::new(Robot::StuckFull);
+        let followers = Arc::new(FireFollowers::new(timing));
+        followers.ask(key("temi"), None, Instant::now(), &fake);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.polls().len() < 2 {
+            assert!(Instant::now() < deadline, "the follower never read on");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let page = MAX_FIRES_PER_REPLY as u64;
+        assert_eq!(
+            fake.polls(),
+            vec![("temi".to_string(), None), ("temi".to_string(), Some(page))],
+            "the first full page moved the cursor; the repeat of it does not"
+        );
         followers.close();
     }
 
