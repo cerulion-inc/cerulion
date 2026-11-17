@@ -149,7 +149,6 @@ fn a_run_whose_descriptor_cannot_be_written_still_arms_its_plane() {
                 gating: cerulion_cli_engine::run_dir::GatingClock::Wall,
                 graph_yaml: "name: undescribable\n".to_string(),
                 env_json: b"{}".to_vec(),
-                recorder_json: b"{}".to_vec(),
             }
         )
         .is_none(),

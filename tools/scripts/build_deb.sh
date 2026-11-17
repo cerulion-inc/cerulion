@@ -13,11 +13,11 @@
 # ROS 2 nodes). All of them land in /usr/bin so the CLI finds its siblings by
 # its own directory.
 #
-# A release archive also carries install_rust.sh and rustc-version.txt, the
-# compiler bootstrap the tarball installer runs for itself. A package cannot
-# run it: apt installs system wide while rustup writes into one user's home,
-# so the pair ships under /usr/share/cerulion with a /usr/bin wrapper the user
-# runs once, by hand. No maintainer script touches it.
+# A release archive also carries install_rust.sh, the compiler bootstrap the
+# tarball installer runs for itself. A package cannot run it: apt installs
+# system wide while rustup writes into one user's home, so it ships under
+# /usr/share/cerulion with a /usr/bin wrapper the user runs once, by hand. No
+# maintainer script touches it.
 #
 # Env:
 #   CERULION_DEB_ALLOW_MISSING_RMW=1   accept an archive without either shared
@@ -143,13 +143,17 @@ for library in $shipped_libraries; do
     fi
 done
 
-# The compiler bootstrap travels as a pair or not at all: an archive carrying
-# one half is defective, and the tarball installer refuses the same shape.
+# The compiler bootstrap is install_rust.sh alone, run with no arguments. An
+# archive that still carries rustc-version.txt is a 1.x archive, whose helper
+# needs that file as an argument; package it with the build_deb.sh of its own
+# release.
 rust_bootstrap=0
-if [ -f "$archive_dir/install_rust.sh" ] && [ -f "$archive_dir/rustc-version.txt" ]; then
+if [ -e "$archive_dir/rustc-version.txt" ] || [ -L "$archive_dir/rustc-version.txt" ]; then
+    die "archive carries rustc-version.txt, the Rust setup of a 1.x release; package it with the build_deb.sh of that release"
+elif [ -f "$archive_dir/install_rust.sh" ]; then
     rust_bootstrap=1
-elif [ -e "$archive_dir/install_rust.sh" ] || [ -e "$archive_dir/rustc-version.txt" ]; then
-    die "archive carries only part of its Rust setup (install_rust.sh and rustc-version.txt travel together)"
+elif [ -e "$archive_dir/install_rust.sh" ] || [ -L "$archive_dir/install_rust.sh" ]; then
+    die "archive's install_rust.sh is not a regular file"
 fi
 
 stage="$workdir/root"
@@ -181,18 +185,15 @@ printf '{"method":"deb","version":"%s"}\n' "$version" > "$stage/usr/share/ceruli
 chmod 0644 "$stage/usr/share/cerulion/install.json"
 
 # The bootstrap and the wrapper that runs it. The wrapper takes no arguments
-# so the metadata file it passes is the one this package shipped, never a path
-# a caller chose.
+# and runs the helper this package shipped, never a path a caller chose.
 if [ "$rust_bootstrap" -eq 1 ]; then
     mkdir -p "$stage/usr/share/cerulion"
     chmod 0755 "$stage/usr/share/cerulion"
     cp "$archive_dir/install_rust.sh" "$stage/usr/share/cerulion/install_rust.sh"
     chmod 0644 "$stage/usr/share/cerulion/install_rust.sh"
-    cp "$archive_dir/rustc-version.txt" "$stage/usr/share/cerulion/rustc-version.txt"
-    chmod 0644 "$stage/usr/share/cerulion/rustc-version.txt"
     cat > "$stage/usr/bin/cerulion-install-rust" <<'EOF'
 #!/bin/sh
-# Install the Rust compiler that built this release, for building nodes.
+# Install current stable Rust (1.95 or newer), for building nodes.
 # Run it once, as the user who will build nodes: it writes into that user's
 # rustup and Cargo homes and leaves existing rustup defaults alone.
 set -u
@@ -203,7 +204,7 @@ fi
 # The helper speaks for the archive installer, whose failure arms say the
 # Cerulion binaries were left alone. Here the package installed them already
 # and nothing was staged to replace, so say what happened.
-sh /usr/share/cerulion/install_rust.sh /usr/share/cerulion/rustc-version.txt
+sh /usr/share/cerulion/install_rust.sh
 status=$?
 if [ "$status" -ne 0 ]; then
     printf '%s\n' \

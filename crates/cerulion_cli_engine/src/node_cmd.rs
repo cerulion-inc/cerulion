@@ -1216,6 +1216,30 @@ pub fn node_build_with_progress(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
 ) -> CliResult<NodeBuildOutcome> {
+    node_build_with_cargo_dir(
+        workspace_root,
+        node_type,
+        release,
+        on_report,
+        on_cargo_start,
+        None,
+    )
+}
+
+/// [`node_build_with_progress`], running `cargo` from `cargo_dir` when it is
+/// `Some`: the Cargo home `bin` directory
+/// [`check_rust`](crate::rust_setup::check_rust) returns after it installed
+/// Rust there and `PATH` does not find it yet. That directory also goes first
+/// on cargo's `PATH`, so Cargo runs the `rustc` installed beside it. `None`
+/// runs the `cargo` on `PATH`.
+pub fn node_build_with_cargo_dir(
+    workspace_root: &Path,
+    node_type: &str,
+    release: bool,
+    on_report: &mut dyn FnMut(&str),
+    on_cargo_start: &mut dyn FnMut(&str),
+    cargo_dir: Option<&Path>,
+) -> CliResult<NodeBuildOutcome> {
     build_node(
         workspace_root,
         node_type,
@@ -1223,6 +1247,7 @@ pub fn node_build_with_progress(
         on_report,
         on_cargo_start,
         None,
+        cargo_dir,
     )
 }
 
@@ -1261,6 +1286,7 @@ pub fn node_build_streaming(
         on_report,
         on_cargo_start,
         Some((on_message, cancel)),
+        None,
     )
 }
 
@@ -1350,6 +1376,7 @@ fn build_node(
     on_report: &mut dyn FnMut(&str),
     on_cargo_start: &mut dyn FnMut(&str),
     streaming: Option<StreamingBuild<'_>>,
+    cargo_dir: Option<&Path>,
 ) -> CliResult<NodeBuildOutcome> {
     let nodes_dir = workspace_root.join("nodes");
     let node_dir = nodes_dir.join(node_type);
@@ -1433,7 +1460,20 @@ fn build_node(
         warn_unsatisfied_deps(node_type, &tool);
     }
 
-    let mut cmd = std::process::Command::new("cargo");
+    // `check_rust` returns only a directory it already placed on a PATH, so
+    // the join cannot fail for it; a directory that cannot be joined runs the
+    // `cargo` on PATH, which fails with the not-found error below.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut cmd = match cargo_dir
+        .and_then(|dir| Some((dir, crate::rust_setup::path_with_front(dir, &path)?)))
+    {
+        Some((dir, path)) => {
+            let mut cmd = std::process::Command::new(dir.join("cargo"));
+            cmd.env("PATH", path);
+            cmd
+        }
+        None => std::process::Command::new("cargo"),
+    };
     cmd.args(cargo_build_args(node_type, release, &features));
     cmd.current_dir(workspace_root);
     if let Some(python) = &pyo3_python {
@@ -3011,89 +3051,11 @@ mod tests {
         }
     }
 
-    /// Probe runs of a freshly written stub before `wait_until_stub_runs` gives up.
-    #[cfg(unix)]
-    const STUB_PROBE_ATTEMPTS: u32 = 500;
-
-    /// Writes an executable shell stub at `path` and returns once it can be
-    /// executed. A process forked by a concurrent test before its exec holds a
-    /// copy of this write descriptor, and while it does, executing the stub
-    /// fails with ETXTBSY; a probe run (which exits before `body`) is retried
-    /// every 10 ms, at most `STUB_PROBE_ATTEMPTS` times.
+    /// Writes a `/bin/sh` stub running `body` at `path`, and returns once it
+    /// can be executed (see `crate::fresh_executable`).
     #[cfg(unix)]
     fn install_python_stub(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::write(
-            path,
-            format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        wait_until_stub_runs(path);
-    }
-
-    #[cfg(unix)]
-    fn wait_until_stub_runs(path: &Path) {
-        for _ in 0..STUB_PROBE_ATTEMPTS {
-            match std::process::Command::new(path)
-                .env("CERULION_TEST_PROBE", "1")
-                .status()
-            {
-                Ok(status) => {
-                    assert!(
-                        status.success(),
-                        "probe run of {}: {status}",
-                        path.display()
-                    );
-                    return;
-                }
-                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("probe run of {}: {error}", path.display()),
-            }
-        }
-        panic!(
-            "{} stayed busy for {STUB_PROBE_ATTEMPTS} probe runs",
-            path.display()
-        );
-    }
-
-    /// Holds a write descriptor on a stub, the way a concurrently forked child
-    /// does, and checks that running it fails with ETXTBSY and that
-    /// `wait_until_stub_runs` returns only after the descriptor is closed.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn python_stub_install_waits_out_a_held_write_descriptor() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("busy");
-        install_python_stub(&path, "exit 0");
-        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let error = std::process::Command::new(&path)
-            .env("CERULION_TEST_PROBE", "1")
-            .status()
-            .expect_err("a stub open for writing must not run");
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        assert_eq!(
-            error.raw_os_error(),
-            Some(libc::ETXTBSY),
-            "{error} (kernel {})",
-            kernel.trim()
-        );
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let released = std::time::Instant::now();
-            drop(writer);
-            released
-        });
-        wait_until_stub_runs(&path);
-        let returned = std::time::Instant::now();
-        let released = release.join().unwrap();
-        assert!(
-            returned > released,
-            "wait_until_stub_runs returned before the writer closed"
-        );
+        crate::fresh_executable::install_script(path, &format!("#!/bin/sh\n{body}\n"));
     }
 
     #[cfg(unix)]
@@ -4816,6 +4778,51 @@ mod tests {
         );
         assert!(logs_contain("UNPROVEN"));
         assert!(!logs_contain("dependencies are missing"));
+    }
+
+    /// A build handed a Cargo home directory runs that directory's `cargo`,
+    /// with the directory first on its PATH so the `rustc` beside it wins.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_given_a_cargo_dir_runs_its_cargo_with_it_first_on_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        let node = root.join("nodes").join("probe_node");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(
+            node.join("Cargo.toml"),
+            "[package]\nname = \"probe_node\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let dir = tmp.path().join("cargo home").join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = tmp.path().join("record");
+        let cargo = dir.join("cargo");
+        crate::fresh_executable::install_script(
+            &cargo,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$0\" \"${{PATH%%:*}}\" \"$*\" > '{}'\n",
+                record.display()
+            ),
+        );
+
+        node_build_with_cargo_dir(
+            &root,
+            "probe_node",
+            false,
+            &mut |_| {},
+            &mut |_| {},
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!(
+                "{}\n{}\nbuild -p probe_node\n",
+                cargo.display(),
+                dir.display()
+            )
+        );
     }
 
     /// The one spawn error worth a dedicated message: `cargo` itself is not

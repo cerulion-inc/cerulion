@@ -15,16 +15,38 @@ mirror preserves the machine's incoming remote service.
 It is separate from [`docs/networking.md`](networking.md), which covers the LAN
 zenoh gateway (`network:` blocks, `topic list`, mDNS).
 
-**What ships today.** The lease, deadman and e-stop state machine, and the
+**What ships.** The lease, deadman and e-stop state machine, and the
 remote `engage-estop` verb. Engaging the e-stop records the engaged state and
-its engager and sends an `estop` to the robot's `cerulion-rcpd`, again until
-rcpd answers, which closes rcpd's own latch and publishes an e-stop frame to
-the graph; neither stops motion by itself. The engaged state is held in the daemon's memory, so a
-daemon restart clears it, and nothing else does; rcpd's latch, once that
-`estop` closed it, clears only through its `estop_clear` or by deleting its
-latch file and restarting rcpd.
-No verb returns that state yet; a verb or rcp tool call that it refuses says
-so in its error. An `engage-estop` engages the latch, sends that `estop`,
+its engager, refuses the calls listed below, and sends an `estop` to the
+robot's `cerulion-rcpd`, again until rcpd answers that its latch closed. On
+that `estop`, rcpd closes its own latch and publishes an e-stop frame on its
+`journal.calls_topic`. This e-stop stops motion only through the node that
+drives your actuators: write that node to read that topic and stop on a frame
+whose `tool` is `estop`. The frame needs a `cerulion-rcpd` that serves
+`--http` on the loopback address `cerulion-remoted` forwards to
+(127.0.0.1:7801 unless `--rcp-addr` changes it), with the token
+`cerulion-remoted` uses (see [Reaching rcpd from a desk](rcp.md#reaching-rcpd-from-a-desk));
+without one, the attempts fail, `cerulion-remoted` logs the first failure at warn,
+and no frame reaches the graph. The `engage-estop` reply does not wait for
+rcpd or the graph, so confirm the stop on the robot. When rcpd answers,
+`cerulion-remoted` logs a warning whose `graph_acknowledged` field says
+whether a graph node answered the frame within 2 s; an answer does not show
+that motion stopped.
+The engaged state lives in `cerulion-remoted`'s memory and holds while that
+daemon runs. Any exit of the daemon clears it: a crash, a stop or restart of
+`cerulion-netd` (which stops the daemon too) or a restart of the machine.
+After a crash, `cerulion-netd` starts the daemon again, after a wait of at
+least 5 s, only while this machine still serves (a live export or
+`CERULION_NETD_LISTEN`). No verb clears the state or reads it back: while you
+need the e-stop engaged, engage it again after a `cerulion-remoted` restart
+or any reconnect. A verb or rcp tool call that it
+refuses says so in its error. rcpd writes its latch to `<receipts>.estop`, where
+`<receipts>` is its `--receipts` path (see [E-stop](rcp.md#e-stop)), so that
+latch holds across rcpd restarts until its `estop_clear`, or deleting the
+file and restarting rcpd, clears it. If rcpd cannot write the file, it logs
+an error and its e-stop may not survive an rcpd restart: after one, engage
+the e-stop again. An
+`engage-estop` engages the `cerulion-remoted` latch, sends that `estop`,
 then writes a warning to the log, asks Flashback to save a recording
 and returns a reply to the caller; an `estop` over the rcp plane engages
 the latch without that ask.
@@ -34,10 +56,15 @@ It is the one e-stop latch the ops act verbs, `restart` and the
 `cerulion/rcp/1` plane except `estop` are refused, and an `estop` over that
 plane engages it too (see
 [`docs/rcp.md`](rcp.md#one-e-stop-for-the-ops-and-rcp-planes)). `restart`
-reads it before it stops the graph and again before it starts it: an engage
-during the stop means the start command does not run, and an engage after
-the second read does not stop the graph it starts. LAN ingress does not read
-it. An `engage-estop`
+reads it before it stops the graph and again before it starts it, so an
+engage during the stop keeps the graph from starting again. An engage after
+the second read leaves the started graph running, as an engage leaves any
+running graph running. Apart from those refusals and the calls rcpd's latch
+refuses, the e-stop gates no topic data: a graph's nodes and other local
+publishers can keep publishing, and a graph's `ingress:` topics and the
+topics this machine mirrors keep receiving from their producers, including a
+paired producer over the remote plane and, under `CERULION_LAN_ACCESS=open`,
+LAN peers. Stop those producers where they run. An `engage-estop`
 refuses each rcp tool call other than `estop` that the plane has not yet sent
 to the robot's `cerulion-rcpd` (it reads the latch on its open connection to
 rcpd just before each send), then sends an `estop` to rcpd without waiting
@@ -48,8 +75,10 @@ ends before rcpd answers, as at a stop by Ctrl-C or SIGTERM, at error; a kill,
 a crash, the hard-exit deadline or a second stop signal may end it with no
 line. That latch then refuses the mutating calls rcpd holds when the `estop`
 reaches it and has not yet published;
-an `estop` over the rcp plane closes rcpd's own latch too. A robot still needs its own stop path (a hardwired e-stop) to
-stop motion. Only the `cerulion-remoted` daemon serves
+an `estop` over the rcp plane closes rcpd's own latch too. Fit the robot
+with a hardwired e-stop and rely on it for any stop that must not depend on
+the network, Cerulion's daemons or a graph node. Only the `cerulion-remoted`
+daemon serves
 `engage-estop`, `restart`, the act verbs (`topic-publish`, `service-call`,
 `topic-snapshot`, `topic-echo-once`) and the `cerulion/rcp/1` plane: a process
 that hosts the remote plane as a library refuses each of those verbs with an
@@ -59,8 +88,8 @@ host the plane in its own process (see
 paired desk reads its catalog, schemas and topics there and cannot publish
 into the app. The public iroh relays an app or a robot uses by default are for
 development only: run your own relays for a robot in service. The `teleop` verb is classified
-(it needs `CAP_TELEOP` and at least the operator role) but has no handler yet,
-and the daemon does not run the deadman yet. The deadman and renewal rules below
+(it needs `CAP_TELEOP` and at least the operator role) but has no handler,
+and the daemon does not run the deadman. The deadman and renewal rules below
 are the contract a teleop handler runs under.
 
 ## What a desk can do today
@@ -233,9 +262,16 @@ through its own subscriber and sends no such count. Each exit waits at most
 newest 8 are discarded, and one error line counts them if stderr takes it in
 time.
 
-**What this rules out is serialization, not unavailability.** Resource
-exhaustion and network delivery still decide whether a remote `engage-estop`
-arrives. Each session is bounded by a 120 s deadline that closes an
+**A remote e-stop needs a path to the robot.** It does not wait for another
+session to finish. It takes effect only when the network delivers it and
+`cerulion-remoted` is running on the robot, admits the dial (the handshake
+bounds below) and serves the session. After a session panics while it writes
+a receipt, the daemon refuses every new ops session, `engage-estop` included,
+until you restart `cerulion-remoted` on the robot; an `estop` over
+`cerulion rcp` still engages the e-stop meanwhile. For a stop that must not
+depend on the network, Cerulion's daemons or a graph node, fit the robot with
+a hardwired e-stop and rely on it.
+Each session is bounded by a 120 s deadline that closes an
 authenticated-then-stalled connection, which is a per-session resource guard
 rather than a serialization point. At most 32 TLS handshakes are pending, each
 for at most 10 s. Once 16 are pending, an unvalidated address must answer a
@@ -262,12 +298,17 @@ not globally capped.
 
 The lease names its holder, and the e-stop its engager, by a session token,
 and the remote plane uses the TLS-authenticated device key as that token
-(`engage-estop` does today). The key is stable per pairing, unlike the
+(`engage-estop` records its engager by that key). The key is stable per pairing, unlike the
 connection id. A link that drops and reopens inside the deadman window
 re-presents the same identity, so a teleop handler renews the same lease: no
-fresh grant, no re-arbitration, no gap in actuation. An engaged e-stop persists
-across reconnects (the remote plane has no verb that clears it), and a
-different paired device cannot take the floor from the one that engaged it. A
+fresh grant, no re-arbitration, no gap in actuation. An engaged e-stop stays
+engaged across a dropped connection and its reconnect while `cerulion-remoted`
+keeps running, and an engage from a second paired device keeps the first
+engager on record. No verb clears it; any exit of `cerulion-remoted` does: a
+crash, a stop or restart of `cerulion-netd` (which stops `cerulion-remoted`
+too) or a restart of the machine. After a crash, `cerulion-netd` starts it
+again, after a wait of at least 5 s, only while this machine still serves. So while you need the e-stop
+engaged, engage it again after any reconnect. A
 drop **longer** than the window lapses the lease under the deadman contract,
 which is correct: the operator is gone.
 

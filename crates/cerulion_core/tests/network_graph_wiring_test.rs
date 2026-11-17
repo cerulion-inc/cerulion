@@ -164,6 +164,7 @@ fn mixed_graph(
             inputs: vec![InputDef {
                 name: "cmd".to_string(),
                 source: ingress_topic.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         });

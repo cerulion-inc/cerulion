@@ -145,6 +145,7 @@ fn live_graph(obs: Arc<LiveObs>) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/live/cam".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -419,6 +420,7 @@ fn internal_edge_consumer_first_no_spurious_alive() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -544,6 +546,7 @@ fn data_trigger_lost_handler_silent_but_counter_fires() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/live/cam".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -684,6 +687,7 @@ fn multi_publisher_lost_only_on_last_leave() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/live/cam".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

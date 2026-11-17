@@ -159,6 +159,7 @@ fn drop_oldest_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -339,6 +340,7 @@ fn run_discard_interleaved(steps: usize) -> (u64, u64, u64) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -528,6 +530,7 @@ fn block_event_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Bo
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -704,6 +707,7 @@ fn block_event_rearms_after_below_threshold_drain() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -977,6 +981,7 @@ fn overloaded_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
