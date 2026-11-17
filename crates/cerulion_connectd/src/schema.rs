@@ -128,7 +128,7 @@ fn materialize_one(schemas_dir: &Path, doc: &SchemaDoc) -> ConnectResult<Materia
         tracing::warn!(
             path = %shown_path,
             schema = %shown_schema,
-            "cerulion connect: a DIFFERENT local schema already exists at this path — keeping \
+            "cerulion connect: a DIFFERENT local schema already exists at this path; keeping \
              the local file (not overwriting). Remove it to adopt the robot's served version."
         );
         MaterializeOutcome::ConflictKeptLocal(dest.clone())
