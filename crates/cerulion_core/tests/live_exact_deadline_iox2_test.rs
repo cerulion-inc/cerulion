@@ -23,7 +23,13 @@
 //! hundred µs of its deadline, so they run on Linux. macOS has no CPU
 //! monitor-wait primitive and parks in a degraded nap, whose wake on a hosted
 //! runner can land later than the 700 µs this tick leaves in each period;
-//! there the first arm judges delivery and the fire count only.
+//! there the first arm judges delivery and the fire count only. A node that
+//! falls behind its grid catches up in a burst, and a burst longer than the
+//! consumer's queue evicts the oldest frames, so delivery is judged as an
+//! account: every frame published after the warm-up is received or counted by
+//! the consumer's own eviction counter (`backpressure_drop_oldest_count`). On
+//! Linux, where the grid holds, that count is zero and the consumer receives
+//! every frame.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +58,9 @@ const FIRES: usize = 1_000;
 const WARMUP: usize = 100;
 /// The longest the run may take; a stalled loop fails instead of hanging.
 const BUDGET: Duration = Duration::from_secs(6);
+/// The longest the consumer may take to empty its queue, at the warm-up and at
+/// the end; a consumer that never catches up fails instead of hanging.
+const SETTLE_BUDGET: Duration = Duration::from_secs(2);
 /// The most fires closer than half a period to the previous one that a passing
 /// run may have, as a share of all fires: 2 %, where a 1 ms floor gives about
 /// 25 %.
@@ -91,13 +100,15 @@ struct Receiver {
     #[input(trigger)]
     inp: Vector3,
     received: Arc<AtomicU64>,
-    last: f64,
+    /// The producer's number on the last frame received (frames are numbered
+    /// from 1, one per fire).
+    last: Arc<AtomicU64>,
 }
 
 #[cerulion_node_impl]
 impl Receiver {
     fn tick(&mut self) -> Result<(), NodeError> {
-        self.last = self.inp.x;
+        self.last.store(self.inp.x as u64, Ordering::Relaxed);
         self.received.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -119,6 +130,7 @@ fn transport() -> Arc<TransportManager> {
 fn graph(
     ticks: Arc<Mutex<Vec<u64>>>,
     received: Arc<AtomicU64>,
+    last: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let node =
         |id: &str, node_type: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
@@ -176,6 +188,7 @@ fn graph(
         "receiver".to_string(),
         Box::new(ReceiverEntry::with_state(Receiver {
             received,
+            last,
             ..Default::default()
         })),
     );
@@ -188,13 +201,55 @@ fn park_policy() -> cerulion_core::MonitorWaitPolicy {
     cerulion_core::MonitorWaitPolicy::new(true, false, format!("xdl{}", std::process::id()))
 }
 
+/// The delivery account at one step boundary: the producer's fires, the
+/// frames the consumer received, and the frames its queue evicted.
+#[derive(Debug, Clone, Copy)]
+struct Account {
+    fires: u64,
+    received: u64,
+    evicted: u64,
+}
+
+fn fire_count(rt: &GraphRuntime) -> u64 {
+    rt.node_handle("ticker")
+        .expect("ticker handle")
+        .fire_count()
+}
+
+/// Step `rt` until the consumer's queue is empty: the last frame it received
+/// is the producer's last fire, so every earlier frame was received or evicted
+/// and the eviction counter has seen each gap. The account there, or `None`
+/// when the queue does not empty within [`SETTLE_BUDGET`].
+fn settle(rt: &mut GraphRuntime, received: &AtomicU64, last: &AtomicU64) -> Option<Account> {
+    let started = Instant::now();
+    loop {
+        let fires = fire_count(rt);
+        if last.load(Ordering::Relaxed) == fires {
+            return Some(Account {
+                fires,
+                received: received.load(Ordering::Relaxed),
+                evicted: rt
+                    .node_handle("receiver")
+                    .expect("receiver handle")
+                    .backpressure_drop_oldest_count("inp"),
+            });
+        }
+        if started.elapsed() >= SETTLE_BUDGET {
+            return None;
+        }
+        let timeout = rt.live_timeout_for_test();
+        rt.run_live_step_once_for_test(timeout);
+    }
+}
+
 #[test]
 #[serial]
 fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_frame() {
     let transport = transport();
     let ticks = Arc::new(Mutex::new(Vec::with_capacity(FIRES + 64)));
     let received = Arc::new(AtomicU64::new(0));
-    let (config, factories) = graph(Arc::clone(&ticks), Arc::clone(&received));
+    let last = Arc::new(AtomicU64::new(0));
+    let (config, factories) = graph(Arc::clone(&ticks), Arc::clone(&received), Arc::clone(&last));
     let mut rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
         config,
         factories,
@@ -205,26 +260,30 @@ fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_fr
     )
     .expect("build the live graph");
 
-    let fired = |rt: &GraphRuntime| {
-        rt.node_handle("ticker")
-            .expect("ticker handle")
-            .fire_count()
-    };
     let started = Instant::now();
-    // (fires, frames received) at the first step boundary past the warm-up:
-    // the burst the warm-up catches up with can overrun the consumer's queue,
-    // so delivery is judged from here on.
+    // The account once the warm-up has run and the consumer has emptied its
+    // queue: the burst the warm-up catches up with can overrun that queue, and
+    // the eviction counter starts counting only at the first frame it sees, so
+    // delivery is judged from here on.
     let mut at_warmup = None;
     while ticks.lock().expect("tick log").len() < WARMUP + FIRES && started.elapsed() < BUDGET {
         let timeout = rt.live_timeout_for_test();
         rt.run_live_step_once_for_test(timeout);
         if at_warmup.is_none() && ticks.lock().expect("tick log").len() >= WARMUP {
-            at_warmup = Some((fired(&rt), received.load(Ordering::Relaxed)));
+            at_warmup = Some(
+                settle(&mut rt, &received, &last)
+                    .expect("the consumer emptied its queue after the warm-up"),
+            );
         }
     }
-    // One more pass so the last frame reaches the consumer.
-    let timeout = rt.live_timeout_for_test();
-    rt.run_live_step_once_for_test(timeout);
+    let at_end = settle(&mut rt, &received, &last).unwrap_or_else(|| {
+        panic!(
+            "the consumer did not empty its queue within {SETTLE_BUDGET:?}: the last frame it \
+             received is {} of {} published",
+            last.load(Ordering::Relaxed),
+            fire_count(&rt)
+        )
+    });
 
     let all = ticks.lock().expect("tick log").clone();
     assert!(
@@ -236,12 +295,26 @@ fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_fr
     #[cfg(target_os = "linux")]
     assert_on_grid(&all[WARMUP..]);
 
-    let fires = fired(&rt);
-    assert_eq!(fires as usize, all.len(), "every fire logged its tick");
-    let (fires_at, received_at) = at_warmup.expect("the run passed its warm-up");
     assert_eq!(
-        received.load(Ordering::Relaxed) - received_at,
-        fires - fires_at,
+        at_end.fires as usize,
+        all.len(),
+        "every fire logged its tick"
+    );
+    let at_warmup = at_warmup.expect("the run passed its warm-up");
+    let published = at_end.fires - at_warmup.fires;
+    let delivered = at_end.received - at_warmup.received;
+    let evicted = at_end.evicted - at_warmup.evicted;
+    assert_eq!(
+        delivered + evicted,
+        published,
+        "every frame published after the warm-up is received or counted as evicted by the \
+         consumer's queue: {delivered} received, {evicted} evicted, {published} published"
+    );
+    // On its grid the producer never bursts, so the consumer's queue never
+    // overflows and every frame arrives.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        delivered, published,
         "the consumer received every frame the producer published after the warm-up"
     );
 }
@@ -285,7 +358,11 @@ fn after_a_slow_step_the_wait_is_the_time_left_not_a_period() {
     let transport = transport();
     let ticks = Arc::new(Mutex::new(Vec::new()));
     let received = Arc::new(AtomicU64::new(0));
-    let (config, factories) = graph(Arc::clone(&ticks), Arc::clone(&received));
+    let (config, factories) = graph(
+        Arc::clone(&ticks),
+        Arc::clone(&received),
+        Arc::new(AtomicU64::new(0)),
+    );
     let mut rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
         config,
         factories,
