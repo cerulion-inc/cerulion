@@ -1072,14 +1072,14 @@ pub fn init_logging(verbose: bool, quiet_default: bool) {
 }
 
 /// [`init_logging`] for a worker process whose stderr another process passes
-/// through or records: log lines carry colour codes only when stderr is a
-/// terminal.
+/// through or records: log lines carry no colour codes unless stderr is a
+/// terminal, where the formatter's default applies (which honours `NO_COLOR`).
 pub fn init_worker_logging(verbose: bool, quiet_default: bool) {
     use std::io::IsTerminal;
     init_logging_with_colour(
         verbose,
         quiet_default,
-        Some(std::io::stderr().is_terminal()),
+        (!std::io::stderr().is_terminal()).then_some(false),
     );
 }
 

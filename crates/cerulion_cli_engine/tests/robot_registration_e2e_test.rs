@@ -1201,7 +1201,8 @@ fn the_revocation_sync_warns_on_stderr_when_a_due_renewal_cannot_run() {
             .arg("--state-root")
             .arg(&root)
             .env(RENEW_WINDOW_ENV, "2592000")
-            .env_remove("RUST_LOG"),
+            .env_remove("RUST_LOG")
+            .env_remove("NO_COLOR"),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{stderr}");
