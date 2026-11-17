@@ -3469,9 +3469,12 @@ default: loud over silent).
 
 **When the live loop wakes.** Between data events the loop waits for the
 soonest pending fire. A `period_ms` deadline still ahead is waited for
-exactly, so a node fires on its own grid even when a step or a wake ran late;
-a deadline less than 10 µs away waits 10 µs, which costs at most one extra wake
-per fire. A node that is due but cannot fire yet (a Data or Sync backlog, a
+exactly, so a node whose park wakes on time fires on its own grid even after a
+step or a wake ran late; a deadline less than 10 µs away waits 10 µs, which
+costs at most one extra wake per fire. How promptly the park wakes is the
+host's: on macOS the degraded park nap can wake later than the slack a busy
+tick leaves in its period, and such a node can still fall behind its grid and
+catch up with a double fire. A node that is due but cannot fire yet (a Data or Sync backlog, a
 `period_ms` node past its deadline, a `throttle_ms` window, a `block` slot
 waiting for its drain or its `block_timeout_ms` release) is read again at no
 less than a 1 ms poll, so no node is polled faster than once a millisecond,
