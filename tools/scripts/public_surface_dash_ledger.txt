@@ -18,7 +18,7 @@
 1 crates/cerud/src/main.rs
 1 crates/cerud/src/receipt.rs
 1 crates/cerud/src/server.rs
-5 crates/cerulion_accountd/src/api.rs
+4 crates/cerulion_accountd/src/api.rs
 1 crates/cerulion_accountd/src/bin/cerulion-accountd.rs
 24 crates/cerulion_accountd/src/team.rs
 1 crates/cerulion_bag/src/catalog.rs

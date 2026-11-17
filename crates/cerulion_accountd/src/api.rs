@@ -187,9 +187,9 @@ fn parse_sig64_b64(s: &str, field: &'static str) -> Result<Signature> {
 
 /// A JSON body extractor for the PoP-gated endpoints (`POST /v1/devices`,
 /// `POST /v1/robots`, and a robot's own `POST /v1/robots/{robot_id}/access/challenge`
-/// and `POST /v1/robots/{robot_id}/access`). Unlike the stock `Json<T>` extractor — whose
+/// and `POST /v1/robots/{robot_id}/access`). Unlike the stock `Json<T>` extractor, whose
 /// deserialization failure surfaces as a framework-default 422 with a bare serde
-/// string — a parse failure here maps to the crate's STABLE
+/// string, a parse failure here maps to the crate's STABLE
 /// [`AccountdError::BadRequest`] body (`{error:"invalid_request", error_description}`)
 /// that names, from the body type's [`PopBody::HINT`], the fields that endpoint
 /// needs and where its challenge comes from. This keeps a client that omits a proof
@@ -205,7 +205,7 @@ trait PopBody: DeserializeOwned {
 
 /// The hint of the registration endpoints, which prove possession of the key
 /// being registered with a challenge issued to the caller's session.
-const REGISTRATION_POP_HINT: &str = "This endpoint requires a proof of possession — request \
+const REGISTRATION_POP_HINT: &str = "This endpoint requires a proof of possession: request \
      a challenge from POST /v1/devices/challenge, sign it with the key you are \
      registering, and include `pop_challenge` + `pop_signature`.";
 
