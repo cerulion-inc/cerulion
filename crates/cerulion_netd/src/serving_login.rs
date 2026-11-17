@@ -16,6 +16,7 @@ pub const REFUSAL: &str = "serving the network requires a prior login; run `ceru
 const MAX_AUTH_BYTES: u64 = 64 * 1024;
 
 /// A reason that contains no authentication tokens or untrusted JSON text.
+#[cfg(not(feature = "wan"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginProblem {
     /// No login configuration home can be resolved.
@@ -33,6 +34,9 @@ pub enum LoginProblem {
     /// A valid record explicitly says no login has completed.
     NeverLoggedIn,
 }
+
+#[cfg(feature = "wan")]
+pub use cerulion_wireclient::local_identity::LoginProblem;
 
 /// Expiry is deliberately absent from the serving decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,14 +253,7 @@ fn classify(bytes: &[u8]) -> ServingLogin {
 #[doc(hidden)]
 pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, LoginProblem> {
     let limit = max_bytes.checked_add(1).ok_or(LoginProblem::TooLarge)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(|error| {
+    let file = open_read_only(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             LoginProblem::Missing
         } else {
@@ -278,6 +275,18 @@ pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Logi
         return Err(LoginProblem::TooLarge);
     }
     Ok(bytes)
+}
+
+/// Open existing local state without blocking on a special file.
+pub(crate) fn open_read_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
 }
 
 /// Read a durable prior-login identity without HTTP, key creation or token output.

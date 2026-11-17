@@ -36,7 +36,7 @@ One host gateway/zenoh session; NDJSON refcounts; spy wiring pins
 - Bounded same-user `outbound.sock`: shared endpoint/runtime, key/namespace
   gate. Metadata per-call; snapshot selected/held peers. Refusals keep holds; cleanup errors fence.
   Loss retires readers; pre-Ensure Sync retries own none. Postcard owner; one key bind.
-- Identity reads hold auth lock; busy writers refuse. Expiry gates enrollment; durable bindings survive expiry, fenced by account/key changes.
+- Identity: wireclient::local_identity; auth lock, busy refuses. Expiry gates enrollment, not durable binding; account/key changes fence.
 - Releases: debug; operator outcomes: info+. Siblings use `resolve_netd_bin_from` (macOS current_exe uncanonicalized). Discovery never writes peers.json.
 
 ## Tests
