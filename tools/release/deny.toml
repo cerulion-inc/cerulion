@@ -104,6 +104,20 @@ ignore = [
     # cerulion_dds ROS 2 path, so the workspace cannot drop it on its own.
     # Remove this ignore when cerulion-ros2-client drops the dependency.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 via cerulion_dds -> cerulion-ros2-client 0.10.1: unmaintained-class, no vulnerability, no replacement at the verified pin" },
+    # chrono is UNMAINTAINED-class (RUSTSEC-2026-0543), not a vulnerability:
+    # its maintainers announced the end of maintenance, every version is
+    # affected and none is patched. No workspace crate depends on chrono
+    # directly. It reaches us through cerulion-ros2-client 0.10.1 and
+    # cerulion-rustdds 0.14.2 (the cerulion_dds ROS 2 path), rmcp 3.9.0,
+    # schemars 1.2.1 and the arrow crates, so the workspace cannot drop it on
+    # its own. Re-audit on every bump of those crates; remove this ignore when
+    # none of them depends on chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.44, transitive only (cerulion-ros2-client, cerulion-rustdds, rmcp, schemars, arrow): unmaintained-class, no vulnerability, no maintained release to move to" },
+    # humantime is UNMAINTAINED-class (RUSTSEC-2026-0542), declared alongside
+    # chrono's, not a vulnerability. No workspace crate depends on humantime
+    # directly; it reaches us only through zenoh-util 1.10.1 and uhlc 0.8.2
+    # under the zenoh transport. Remove this ignore when zenoh drops it.
+    { id = "RUSTSEC-2026-0542", reason = "humantime 2.3.0 via zenoh-util 1.10.1 and uhlc 0.8.2: unmaintained-class, no vulnerability, no replacement at the zenoh pin" },
 ]
 
 # -----------------------------------------------------------------------------
@@ -367,11 +381,14 @@ unknown-git = "deny"
 # dropping host-built ports), which 0.10.0 answers with ENFILE on the next
 # `shm_open` of that number. It also writes a zero node counter when it creates
 # the global management segment, where 0.10.0 left the counter that goes into
-# every node id as whatever bytes the new segment held.
+# every node id as whatever bytes the new segment held. A listener's event drain
+# empties the trigger before it stores the idle state, where 0.10.0 stored it
+# first, so a notify landing between the two could leave the listener marked
+# notified with nothing to read and no later notify would wake it.
 # The revision also adds Android support: filesystem paths, file-backed named
 # shared memory with private-directory checks, abstract-namespace Unix datagram
 # sockets and POSIX timers for the watchdog. PRUNE this the moment an iceoryx2
-# release carries every change this fork revision adds.
+# release carries all four fixes and the Android support.
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
     "https://github.com/cerulion-inc/iceoryx2",

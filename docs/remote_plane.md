@@ -145,6 +145,18 @@ Every act verb refuses a network mirror and topics under the reserved
 reserved topics produce a usage error. Producer exclusions name the refused
 topic and preserve its remote-access policy context.
 
+An act verb answers in one order. `topic-publish` and `service-call` check the
+e-stop first, so while it is engaged every call is refused with the e-stop
+reason. Each verb then checks its arguments (required keys, numbers, limits
+and that the message or service type is known on the robot), so such a
+malformed request is a usage error whatever the state of the topic. Only then
+does it check the topic's network mirror marker and remote-access policy; the
+message or request text itself is read when the publish or call runs, after
+that check. A marker that is still being torn down, because the producer or
+lease that held it is closing, is opened again up to 20 times, 25 ms apart;
+the request is refused with that reason only if the marker is still being torn
+down after the last one.
+
 While the desk's network kill-switch is engaged (`CERULION_NETWORK=off`),
 `--robot` is refused on the desk before anything is sent to the robot.
 `cerulion rcp` is refused the same way.

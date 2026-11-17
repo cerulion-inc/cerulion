@@ -641,8 +641,13 @@ fn run_gateway_ingress_stays_unmarked_and_readable_in_local_scope() {
     transport
         .register_run_ingress_topic(&topic, hash, slice)
         .unwrap();
-    assert!(!transport.is_network_mirror(&topic).unwrap());
-    assert!(transport.network_mirror_topics().unwrap().is_empty());
+    assert!(!transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert!(transport
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap()
+        .is_empty());
     let lease = transport.acquire_local_topic_lease(&topic).unwrap();
     assert!(transport
         .create_remote_ingress_injector(&topic, hash, slice)
@@ -660,7 +665,9 @@ fn run_gateway_ingress_stays_unmarked_and_readable_in_local_scope() {
     drop(lease);
     transport.unregister_ingress_topic(&topic).unwrap();
     assert!(!network.is_ingress_registered(&topic));
-    assert!(!transport.is_network_mirror(&topic).unwrap());
+    assert!(!transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 }
 
 /// A failed second registration releases only its own publisher and origin,
@@ -682,7 +689,9 @@ fn duplicate_marked_ingress_releases_only_its_own_publisher_and_marker() {
         error.contains("already has a registered network ingress bridge"),
         "{error}"
     );
-    assert!(transport.is_network_mirror(&topic).unwrap());
+    assert!(transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     assert!(transport.acquire_local_topic_lease(&topic).is_err());
 
     // The default data service has two publisher slots. A second owner fitting
@@ -699,8 +708,13 @@ fn duplicate_marked_ingress_releases_only_its_own_publisher_and_marker() {
     assert_eq!(network.ingress_stats(&topic).unwrap().frames, 1);
 
     transport.unregister_ingress_topic(&topic).unwrap();
-    assert!(!transport.is_network_mirror(&topic).unwrap());
-    assert!(transport.network_mirror_topics().unwrap().is_empty());
+    assert!(!transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert!(transport
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap()
+        .is_empty());
     assert!(!network.is_ingress_registered(&topic));
     assert!(network.ingress_stats(&topic).is_none());
     drop(subscriber);
