@@ -6,6 +6,7 @@
 //! refresh a session, prompt, create a key, or write account state.
 
 use std::fs::OpenOptions;
+#[cfg(any(not(feature = "wan"), test))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -215,6 +216,10 @@ pub fn require_serving_authority() -> Result<(), &'static str> {
 
 // Mirror only the mandatory AuthState fields. Unknown fields (including future
 // role values) remain compatible. No Debug implementation may expose tokens.
+// The lean build must retain its existing implementation: wireclient is an
+// optional WAN dependency. WAN builds delegate to the shared reader; tests keep
+// this lean implementation available to pin identical parsing and I/O behavior.
+#[cfg(any(not(feature = "wan"), test))]
 #[derive(Deserialize)]
 struct LoginRecord {
     account_id: String,
@@ -229,7 +234,8 @@ struct LoginRecord {
     _role: Option<serde::de::IgnoredAny>,
 }
 
-fn identity(bytes: &[u8]) -> Result<String, LoginProblem> {
+#[cfg(any(not(feature = "wan"), test))]
+fn lean_identity(bytes: &[u8]) -> Result<String, LoginProblem> {
     let record: LoginRecord = serde_json::from_slice(bytes).map_err(|_| LoginProblem::Malformed)?;
     if record.account_id.trim().is_empty() {
         return Err(LoginProblem::Malformed);
@@ -238,6 +244,17 @@ fn identity(bytes: &[u8]) -> Result<String, LoginProblem> {
         return Err(LoginProblem::NeverLoggedIn);
     }
     Ok(record.account_id)
+}
+
+fn identity(bytes: &[u8]) -> Result<String, LoginProblem> {
+    #[cfg(feature = "wan")]
+    {
+        cerulion_wireclient::local_identity::decode_login_identity(bytes)
+    }
+    #[cfg(not(feature = "wan"))]
+    {
+        lean_identity(bytes)
+    }
 }
 
 fn classify(bytes: &[u8]) -> ServingLogin {
@@ -252,6 +269,30 @@ fn classify(bytes: &[u8]) -> ServingLogin {
 /// Callers must independently verify multi-file snapshot consistency.
 #[doc(hidden)]
 pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, LoginProblem> {
+    #[cfg(feature = "wan")]
+    {
+        cerulion_wireclient::local_identity::read_regular_bounded(path, max_bytes, &open_read_only)
+    }
+    #[cfg(not(feature = "wan"))]
+    {
+        lean_read_regular_bounded(path, max_bytes)
+    }
+}
+
+/// The shared reader receives platform flags from the daemon that already owns them.
+pub(crate) fn open_read_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+#[cfg(any(not(feature = "wan"), test))]
+fn lean_read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, LoginProblem> {
     let limit = max_bytes.checked_add(1).ok_or(LoginProblem::TooLarge)?;
     let file = open_read_only(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -275,18 +316,6 @@ pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Logi
         return Err(LoginProblem::TooLarge);
     }
     Ok(bytes)
-}
-
-/// Open existing local state without blocking on a special file.
-pub(crate) fn open_read_only(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    options.open(path)
 }
 
 /// Read a durable prior-login identity without HTTP, key creation or token output.
