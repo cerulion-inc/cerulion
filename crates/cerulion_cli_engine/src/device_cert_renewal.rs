@@ -655,8 +655,9 @@ pub fn check_reissued(
 enum ConsumerAction {
     /// Stage the reissued certificate at it.
     Replace,
-    /// A symlink already resolving to the reissued certificate, or whose chain
-    /// passes through the CLI's own copy: left as it is.
+    /// A symlink already resolving to the reissued certificate, the CLI's own
+    /// copy under another spelling, or a symlink whose chain passes through it:
+    /// left as it is.
     AlreadyHolds,
     /// Content that is not a certificate for this key and account: left alone.
     Foreign,
@@ -664,8 +665,9 @@ enum ConsumerAction {
 
 /// The one rule every consumer path follows: absent, or holding a certificate
 /// for `key` and `account` (through a symlink too), is replaced, unless it is a
-/// symlink already holding `new` or whose chain passes through `own` (the CLI's
-/// own copy); anything else is left alone.
+/// symlink already holding `new`, or is `own` (the CLI's own copy) under another
+/// spelling or a symlink whose chain passes through it; anything else is left
+/// alone.
 fn consumer_action(
     path: &Path,
     own: &Path,
@@ -693,15 +695,19 @@ fn consumer_action(
 /// Linux.
 const MAX_LINK_HOPS: usize = 40;
 
-/// Whether `path` is a symlink whose chain passes through `own`, the CLI's own
-/// copy: the renewal renames the reissued certificate onto `own`, so such a link
-/// follows it and is left as a link. A link that only shares `own`'s final
-/// target does not follow it: when `own` is itself a symlink, the rename
-/// replaces that link and leaves the shared target with the old certificate.
+/// Whether `path` is `own`, the CLI's own copy, under another spelling (through
+/// a symlinked directory, say), or a symlink whose chain passes through it: the
+/// renewal renames the reissued certificate onto `own`, so either follows it
+/// and is left as it is. A link that only shares `own`'s final target does not
+/// follow it: when `own` is itself a symlink, the rename replaces that link and
+/// leaves the shared target with the old certificate.
 fn follows_own(path: &Path, own: &Path) -> bool {
     let Some(own) = entry(own) else {
         return false;
     };
+    if entry(path).as_ref() == Some(&own) {
+        return true;
+    }
     let mut hop = path.to_path_buf();
     for _ in 0..MAX_LINK_HOPS {
         if !std::fs::symlink_metadata(&hop).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -1125,6 +1131,17 @@ mod tests {
         let follows_own_link = dir.path().join("follows-own-link");
         symlink(&own_link, &follows_own_link).unwrap();
         assert_eq!(via_link(&follows_own_link), ConsumerAction::AlreadyHolds);
+        // The CLI's own copy reached through a symlinked directory is that copy.
+        let aliased = dir.path().join("aliased");
+        symlink(dir.path(), &aliased).unwrap();
+        assert_eq!(
+            via_link(&aliased.join("own-link")),
+            ConsumerAction::AlreadyHolds
+        );
+        assert_eq!(
+            action(&aliased.join("device.cert")),
+            ConsumerAction::AlreadyHolds
+        );
         // Anything else is left alone.
         assert_eq!(action(&at("key", &other_key)), ConsumerAction::Foreign);
         assert_eq!(
@@ -1279,6 +1296,9 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(&cert_path).unwrap(), new);
         assert_eq!(std::fs::read_to_string(&netd_path).unwrap(), new);
+        // Both links became files of their own; the managed file is not
+        // written through them.
+        assert_eq!(std::fs::read_to_string(&managed).unwrap(), old);
         assert!(!consumer_differs(
             &auth_path,
             &read_cached(&cert_path).unwrap()

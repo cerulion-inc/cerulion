@@ -435,9 +435,10 @@ fn fetch_access_by_robot_proof(
             Answer::NotFound => return Ok(ProofFetch::NoRoute),
             Answer::RateLimited => return Ok(ProofFetch::RateLimited),
             Answer::ClockRefused { .. } if attempt == ROBOT_PROOF_CHALLENGE_ATTEMPTS => {
-                return Err(refused(
-                    "the account service refused the robot's request time three times",
-                ))
+                return Err(refused(&format!(
+                    "the account service refused the robot's request time \
+                     {ROBOT_PROOF_CHALLENGE_ATTEMPTS} times"
+                )))
             }
             Answer::ClockRefused {
                 server_time_ns,
