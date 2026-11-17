@@ -6,22 +6,19 @@
 //! SIGINT disposition. Build one node cdylib per CPython minor:
 //! the resulting library has a `libpython` `NEEDED` entry and is not an abi3
 //! extension. This host is intended for deterministic graph ticks, not kHz
-//! Python loops. The input-discipline exports a `#[cerulion_node]` cdylib
-//! carries (input snapshot, trigger drain and refill, Sync head ops) are
-//! exported too, so the scheduler serves a Python node's inputs exactly as a
-//! Rust node's; the state capture and restore exports are not, so a Python
-//! node restarts from `init` like a Rust node that declares no state. A leaked
+//! Python loops. The stable table uses host-owned snapshot, trigger drain
+//! and Sync services, so the scheduler serves Python inputs exactly as Rust
+//! inputs. Python nodes restart from `init` without state capture or restore. A leaked
 //! memoryview of a discarded loan pins one publisher pool slot until Python
 //! releases it.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use backend::{Context as NodeContext, Loan as RawShmLoan, Publishers};
 use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
 use cerulion_core::dynamic::{FrameEncoder, SchemaSet};
-use cerulion_core::graph::node::{AnyPublisher, NodeContext};
-use cerulion_core::transport::publisher::RawShmLoan;
+use cerulion_core::graph::node::NodeContext as NativeContext;
 use cerulion_core::transport::subscriber::RawInputView;
 use cerulion_core::wire::WireHeader;
-use cerulion_core::{SyncHeadOp, SyncOpAnswer};
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -40,7 +37,8 @@ use std::sync::{Once, OnceLock};
 
 pub use cerulion_core;
 
-pub mod abi;
+mod backend;
+pub mod stable;
 
 fn builtin_schemas() -> Vec<MessageSchema> {
     native_ros2_messages::BUILTIN_MSGS
@@ -65,19 +63,32 @@ fn builtin_schemas() -> Vec<MessageSchema> {
 /// (`<workspace>/nodes/<type>`, the first `sys_path` entry), else the cwd.
 fn node_workspace(ctx: &NodeContext, sys_path: &[&str]) -> Result<std::path::PathBuf, String> {
     let explicit = ctx.env_str("CERULION_WORKSPACE", "");
-    if !explicit.is_empty() {
-        return Ok(explicit.into());
-    }
-    if let Some(root) = sys_path
+    resolve_node_workspace(Some(std::path::Path::new(&explicit)), sys_path)
+}
+
+fn workspace_choice<'a>(
+    explicit: Option<&'a std::path::Path>,
+    inferred: Option<&'a std::path::Path>,
+) -> Option<&'a std::path::Path> {
+    explicit
+        .filter(|path| !path.as_os_str().is_empty())
+        .or(inferred)
+}
+
+fn resolve_node_workspace(
+    explicit: Option<&std::path::Path>,
+    sys_path: &[&str],
+) -> Result<std::path::PathBuf, String> {
+    let inferred = sys_path
         .first()
         .map(std::path::Path::new)
         .and_then(std::path::Path::parent)
         .and_then(std::path::Path::parent)
-        .filter(|root| root.join("nodes").is_dir())
-    {
-        return Ok(root.to_path_buf());
+        .filter(|root| root.join("nodes").is_dir());
+    match workspace_choice(explicit, inferred) {
+        Some(root) => Ok(root.to_path_buf()),
+        None => std::env::current_dir().map_err(|error| error.to_string()),
     }
-    std::env::current_dir().map_err(|error| error.to_string())
 }
 
 /// The node's schema set: the built-ins under the workspace's own schemas,
@@ -154,6 +165,7 @@ impl HostCtx {
 enum FrameBacking {
     Sample(RawInputView<'static>),
     Copied(Rc<[u8]>),
+    Plugin(cerulion_core::graph::node_plugin_abi::RawFrameRead),
 }
 
 #[pyclass(unsendable)]
@@ -169,6 +181,7 @@ impl HostFrame {
         match &self.backing {
             FrameBacking::Sample(view) => view,
             FrameBacking::Copied(bytes) => bytes,
+            FrameBacking::Plugin(frame) => frame.bytes(),
         }
     }
 }
@@ -337,7 +350,7 @@ impl HostLoan {
 /// built-in message plus the workspace's) per tick would put thousands of
 /// allocations on the loan path.
 struct HostTickShared {
-    publishers: Cell<*mut indexmap::IndexMap<String, AnyPublisher>>,
+    publishers: Cell<*mut ()>,
     outputs: Rc<HashMap<String, LoanMeta>>,
     schemas: Rc<SchemaSet>,
     active: Cell<bool>,
@@ -347,6 +360,16 @@ struct HostTickShared {
 #[pyclass(unsendable)]
 struct HostTick {
     state: Rc<HostTickShared>,
+}
+
+// Invalidate a retained Python tick handle even if Rust unwinds before normal
+// cleanup; its pointer must never outlive the local publisher borrow.
+struct TickAccessGuard(Rc<HostTickShared>);
+impl Drop for TickAccessGuard {
+    fn drop(&mut self) {
+        self.0.active.set(false);
+        self.0.publishers.set(std::ptr::null_mut());
+    }
 }
 
 #[pymethods]
@@ -367,10 +390,7 @@ impl HostTick {
         // SAFETY: The active flag and null check above are set before the
         // Host releases its mutable publisher borrow. The unsendable pyclass
         // prevents concurrent Python access while this pointer is used.
-        let publishers = unsafe { &mut *publishers_ptr };
-        let publisher = publishers
-            .get_mut(name)
-            .ok_or_else(|| PyValueError::new_err(format!("unknown output '{name}'")))?;
+        let publishers = unsafe { &mut *publishers_ptr.cast::<Publishers<'_>>() };
         let layout = state.schemas.layout(&meta.schema_name).ok_or_else(|| {
             PyValueError::new_err(format!("schema {:?} is not available", meta.schema_name))
         })?;
@@ -386,19 +406,11 @@ impl HostTick {
                 )));
             }
         }
-        let loan = match publisher {
-            AnyPublisher::Ipc(publisher) => publisher
-                .loan_raw_uninit(total)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        };
-        let mut loan = loan;
-        for byte in loan.bytes_uninit_mut() {
-            byte.write(0);
-        }
-        let mut loan = unsafe {
-            // SAFETY: every byte of the exact-size raw loan was initialized.
-            loan.assume_init()
-        };
+        let request =
+            stable::loan_request(layout, meta.schema_hash).map_err(PyValueError::new_err)?;
+        let mut loan = publishers
+            .loan(name, total, request)
+            .map_err(PyRuntimeError::new_err)?;
         let entries = {
             let bytes = loan.bytes_mut();
             encoder
@@ -557,10 +569,6 @@ pub struct Host {
     outputs: Rc<HashMap<String, LoanMeta>>,
     next_sequences: HashMap<String, u32>,
     held_copies: HashMap<String, Rc<[u8]>>,
-    /// The runtime-classified non-trigger inputs the scheduler freezes at each
-    /// step boundary, stored once by `cerulion_node_set_snapshot_inputs` so the
-    /// per-step `cerulion_node_snapshot_inputs` allocates nothing.
-    snapshot_input_names: Vec<String>,
     /// The frame objects of the tick in progress, in input declaration order
     /// (`None` for an input with no frame). Emptied at the end of every tick
     /// and reused, so the steady-state tick pushes without allocating.
@@ -963,6 +971,22 @@ impl Host {
     /// cdylib) is alive in the process; node-directory activation uses the
     /// process-wide Python registry.
     pub fn init(
+        ctx: Box<NativeContext>,
+        module_name: &str,
+        sys_path: &[&str],
+        info: &[u8],
+        first_instance: bool,
+    ) -> Result<Self, String> {
+        Self::init_backend(
+            Box::new(NodeContext::Native(ctx)),
+            module_name,
+            sys_path,
+            info,
+            first_instance,
+        )
+    }
+
+    fn init_backend(
         mut ctx: Box<NodeContext>,
         module_name: &str,
         sys_path: &[&str],
@@ -1053,45 +1077,12 @@ impl Host {
                 outputs: Rc::new(metadata.outputs),
                 next_sequences: HashMap::new(),
                 held_copies: HashMap::new(),
-                snapshot_input_names: Vec::new(),
                 frame_scratch: Vec::new(),
                 warned_threads: false,
             };
             Self::warn_extra_threads(py, &mut host.warned_threads);
             Ok(host)
         })
-    }
-
-    /// Store the non-trigger input names the scheduler freezes at each step
-    /// boundary (`cerulion_node_set_snapshot_inputs`, once per node).
-    pub fn set_snapshot_inputs(&mut self, names: Vec<String>) {
-        self.snapshot_input_names = names;
-    }
-
-    /// Freeze the stored inputs for this step (`cerulion_node_snapshot_inputs`):
-    /// the same `NodeContext::snapshot_inputs` a `#[cerulion_node]` node runs,
-    /// so a periodic Python node reads its last input on a quiet tick instead
-    /// of `None`. Allocates nothing: the names were stored once.
-    pub fn snapshot_inputs(&mut self) {
-        self.ctx.snapshot_inputs(&self.snapshot_input_names);
-    }
-
-    /// Drain a data-trigger input at a step boundary
-    /// (`cerulion_node_drain_trigger_input`).
-    pub fn drain_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
-        self.ctx.drain_trigger_input(input_name)
-    }
-
-    /// Refill a data-trigger input between two fires of one step
-    /// (`cerulion_node_refill_trigger_input`).
-    pub fn refill_trigger_input(&mut self, input_name: &str) -> (u64, Option<u64>) {
-        self.ctx.refill_trigger_input(input_name)
-    }
-
-    /// One Sync head operation on an input (`cerulion_node_sync_head_op`), so a
-    /// `sync_window_ms` Python node reads the aligned set the scheduler chose.
-    pub fn sync_head_op(&mut self, input_name: &str, op: SyncHeadOp) -> SyncOpAnswer {
-        self.ctx.sync_head_op(input_name, op)
     }
 
     /// Run one Python tick and commit its touched outputs.
@@ -1116,48 +1107,22 @@ impl Host {
     /// copy, and the touched-output list crosses back as Python values.
     pub fn tick(&mut self) -> Result<(), String> {
         let clock = self.ctx.clock().clone();
-        let (publishers, subscribers) = self.ctx.split_publishers_subscribers_mut();
-        let publishers_ptr = publishers as *mut _;
+        let (mut publishers, mut subscribers) = self.ctx.split();
+        let publishers_ptr = (&mut publishers as *mut Publishers<'_>).cast::<()>();
         Python::attach(|py| {
             let frames = &mut self.frame_scratch;
             frames.clear();
             let result = (|| -> Result<(), String> {
                 for name in &self.input_names {
-                    let view = match (
-                        subscribers.get_mut(name.as_str()),
-                        self.input_hashes.get(name),
-                    ) {
-                        (Some(subscriber), Some(&schema_hash)) => subscriber
-                            .view_raw_expecting(schema_hash)
-                            .map_err(|error| error.to_string())?,
-                        _ => None,
+                    let backing = match self.input_hashes.get(name) {
+                        Some(&hash) => subscribers.read(name, hash, &mut self.held_copies)?,
+                        None => None,
                     };
-                    let Some(view) = view else {
+                    let Some(backing) = backing else {
                         frames.push(None);
                         continue;
                     };
-                    // The header the frame checks parsed rides the view; the
-                    // schema hash is read from it, not parsed a second time.
-                    let schema_hash = view.schema_hash();
-                    let backing = match view.into_owned() {
-                        Ok(view) => FrameBacking::Sample(view),
-                        Err(held) => {
-                            let cached = self
-                                .held_copies
-                                .get(name)
-                                .filter(|copy| copy.as_ref() == &held[..]);
-                            let copy = match cached {
-                                Some(copy) => Rc::clone(copy),
-                                None => {
-                                    // hot-path-alloc-ok: one copy per distinct held frame.
-                                    let copy: Rc<[u8]> = Rc::from(&held[..]);
-                                    self.held_copies.insert(name.clone(), Rc::clone(&copy));
-                                    copy
-                                }
-                            };
-                            FrameBacking::Copied(copy)
-                        }
-                    };
+                    let schema_hash = self.input_hashes[name];
                     // hot-path-alloc-ok: the frame Python reads is a CPython
                     // object, one per input frame per tick; it wraps the SHM
                     // sample (or the one held copy above) and copies no bytes.
@@ -1182,6 +1147,7 @@ impl Host {
                     active: Cell::new(true),
                     loans: RefCell::new(Vec::new()),
                 });
+                let _access = TickAccessGuard(Rc::clone(&state));
                 let tick = Py::new(
                     py,
                     HostTick {
@@ -1215,6 +1181,10 @@ impl Host {
                 state.active.set(false);
                 state.publishers.set(std::ptr::null_mut());
                 let (touched, tick_error) = match call_result {
+                    Ok(touched) if publishers.pending_failure() => (
+                        touched,
+                        Some("host service failed during Python tick".into()),
+                    ),
                     Ok(touched) => (touched, None),
                     Err(error) => {
                         let mut message = error;
@@ -1300,7 +1270,7 @@ impl Host {
                         if !self.outputs.contains_key(name.as_str()) {
                             return Err(format!("unknown output '{name}'"));
                         }
-                        if publishers.get(name.as_str()).is_none() {
+                        if !publishers.contains(name.as_str()) {
                             return Err(format!("unknown output publisher '{name}'"));
                         }
                     }
@@ -1326,46 +1296,37 @@ impl Host {
                             .outputs
                             .get(&name)
                             .ok_or_else(|| format!("unknown output '{name}'"))?;
-                        // SAFETY: the split context borrow keeps the publishers map
-                        // alive for the duration of this tick.
-                        let publisher = publishers
-                            .get_mut(&name)
-                            .ok_or_else(|| format!("unknown output publisher '{name}'"))?;
-                        // A restored replay seeds the publisher; the first frame
-                        // continues the recorded stream's numbering, as a Rust node's does.
-                        let initial = match publisher {
-                            AnyPublisher::Ipc(publisher) => publisher.initial_sequence(),
+                        let host_stamps = raw_loan.host_stamps();
+                        let sequence = if host_stamps {
+                            None
+                        } else {
+                            let initial = publishers.initial_sequence(&name);
+                            if !self.next_sequences.contains_key(name.as_str()) {
+                                // hot-path-alloc-ok: each native output keys its sequence only on its first publish.
+                                self.next_sequences.insert(name.clone(), initial);
+                            }
+                            Some(self.next_sequences.get_mut(name.as_str()).ok_or_else(|| {
+                                format!("output '{name}' has no sequence counter")
+                            })?)
                         };
-                        if !self.next_sequences.contains_key(name.as_str()) {
-                            // hot-path-alloc-ok: an output's first publish keys its
-                            // sequence counter; every later tick finds the entry.
-                            self.next_sequences.insert(name.clone(), initial);
-                        }
-                        let sequence = self
-                            .next_sequences
-                            .get_mut(name.as_str())
-                            .ok_or_else(|| format!("output '{name}' has no sequence counter"))?;
                         let bytes = raw_loan.bytes_mut();
                         let mut header = WireHeader::read_from_buf(bytes).ok_or_else(|| {
                             format!("output loan '{name}' has an invalid wire header")
                         })?;
                         header.schema_hash = meta.schema_hash;
-                        header.sequence = *sequence;
-                        header.timestamp_ns = clock.now_ns();
+                        if let Some(sequence) = sequence.as_deref() {
+                            header.sequence = *sequence;
+                            header.timestamp_ns = clock.now_ns();
+                        }
                         header.write_to_buf(bytes);
-                        match publisher {
-                            AnyPublisher::Ipc(publisher) => {
-                                publisher
-                                    .send_raw_loan(raw_loan)
-                                    .map_err(|error| error.to_string())?;
+                        let before = committed;
+                        let result = publishers.commit(&name, raw_loan, &mut committed);
+                        if committed > before {
+                            if let Some(sequence) = sequence {
                                 *sequence = sequence.wrapping_add(1);
-                                committed += 1;
-                                publisher.check_subscriber_events();
-                                publisher
-                                    .notify_sent_sample()
-                                    .map_err(|error| error.to_string())?;
                             }
                         }
+                        result?;
                         Ok(())
                     })();
                     if let Err(error) = result {
@@ -1388,11 +1349,6 @@ impl Host {
         })
     }
 
-    pub fn pump_history(&mut self) -> Result<(), String> {
-        self.ctx.pump_history();
-        Ok(())
-    }
-
     pub fn shutdown(&mut self) -> Result<(), String> {
         let result = Python::attach(|py| {
             self.runtime
@@ -1408,6 +1364,7 @@ impl Host {
 #[macro_export]
 macro_rules! export_node {
     (module: $module:literal, sys_path: [$($path:expr),* $(,)?], info: $info:ident) => {
+        $crate::export_stable_node! { module: $module, sys_path: [$($path),*], info: $info }
         static NODES: ::std::sync::Mutex<
             ::std::option::Option<::std::collections::HashMap<u64, $crate::Host>>,
         > = ::std::sync::Mutex::new(::std::option::Option::None);
@@ -1509,17 +1466,6 @@ macro_rules! export_node {
             result.unwrap_or_else(|_| { __set_error("cerulion_node_tick: panic caught by catch_unwind".into()); 2 })
         }
         #[no_mangle]
-        pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                let mut nodes = match NODES.lock() { Ok(v) => v, Err(_) => { __set_error("mutex poisoned".into()); return 3; } };
-                match nodes.as_mut().and_then(|v| v.get_mut(&handle)) {
-                    Some(host) => match host.pump_history() { Ok(()) => 0, Err(error) => { __set_error(error); 1 } },
-                    None => { __set_error(format!("handle {handle} not found")); 4 }
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_pump_history: panic caught by catch_unwind".into()); 2 })
-        }
-        #[no_mangle]
         pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
             let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                 let mut nodes = match NODES.lock() { Ok(v) => v, Err(_) => { __set_error("mutex poisoned".into()); return 3; } };
@@ -1530,97 +1476,48 @@ macro_rules! export_node {
             }));
             result.unwrap_or_else(|_| { __set_error("cerulion_node_shutdown: panic caught by catch_unwind".into()); 2 })
         }
-        // The OPTIONAL input-discipline exports a `#[cerulion_node]` cdylib
-        // also carries. The loader resolves each by presence: the snapshot pair
-        // freezes a periodic node's non-trigger inputs at every step boundary,
-        // the drain/refill pair serves a data-trigger input one frame per fire,
-        // and the head op lets a `sync_window_ms` node read the aligned set the
-        // scheduler chose. Bodies live in `cerulion_pynode::abi`; the wrappers
-        // here add only the catch_unwind the C ABI requires.
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_set_snapshot_inputs(
-            handle: u64,
-            names_ptr: *const u8,
-            names_len: usize,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live byte slice of exactly `names_len` bytes.
-                unsafe { $crate::abi::set_snapshot_inputs(&NODES, __set_error, handle, names_ptr, names_len) }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_set_snapshot_inputs: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_snapshot_inputs(handle: u64) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                $crate::abi::snapshot_inputs(&NODES, __set_error, handle)
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_snapshot_inputs: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_drain_trigger_input(
-            handle: u64,
-            name_ptr: *const u8,
-            name_len: usize,
-            out_popped: *mut u64,
-            out_latest_ts: *mut u64,
-            out_has_ts: *mut i32,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live name slice and its own writable out-slots.
-                unsafe {
-                    $crate::abi::trigger_drain(
-                        &NODES, __set_error, $crate::abi::TriggerDrain::Boundary,
-                        handle, name_ptr, name_len, out_popped, out_latest_ts, out_has_ts,
-                    )
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_drain_trigger_input: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_refill_trigger_input(
-            handle: u64,
-            name_ptr: *const u8,
-            name_len: usize,
-            out_popped: *mut u64,
-            out_latest_ts: *mut u64,
-            out_has_ts: *mut i32,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live name slice and its own writable out-slots.
-                unsafe {
-                    $crate::abi::trigger_drain(
-                        &NODES, __set_error, $crate::abi::TriggerDrain::Refill,
-                        handle, name_ptr, name_len, out_popped, out_latest_ts, out_has_ts,
-                    )
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_refill_trigger_input: panic caught by catch_unwind".into()); -4 })
-        }
-        #[no_mangle]
-        pub extern "C" fn cerulion_node_sync_head_op(
-            handle: u64,
-            name_ptr: *const u8,
-            name_len: usize,
-            op: u32,
-            out_ts: *mut u64,
-            out_kind: *mut i32,
-        ) -> i32 {
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: the host passes a live name slice and its own writable out-slots.
-                unsafe {
-                    $crate::abi::sync_head_op(
-                        &NODES, __set_error, handle, name_ptr, name_len, op, out_ts, out_kind,
-                    )
-                }
-            }));
-            result.unwrap_or_else(|_| { __set_error("cerulion_node_sync_head_op: panic caught by catch_unwind".into()); -4 })
-        }
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::Host;
+
+    #[test]
+    fn workspace_resolution_uses_explicit_then_node_ancestor_then_cwd() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../examples/go2")
+            .canonicalize()
+            .unwrap();
+        let explicit = workspace.parent().unwrap();
+        assert_eq!(
+            super::workspace_choice(Some(explicit), Some(&workspace)),
+            Some(explicit)
+        );
+        assert_eq!(
+            super::workspace_choice(Some(std::path::Path::new("")), Some(&workspace)),
+            Some(workspace.as_path())
+        );
+        assert_eq!(super::workspace_choice(None, None), None);
+        let node = workspace.join("nodes/dds_bridge");
+        let paths = [node.to_str().unwrap()];
+        assert_eq!(
+            super::resolve_node_workspace(Some(&workspace), &[]).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::resolve_node_workspace(None, &paths).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::resolve_node_workspace(Some(std::path::Path::new("")), &paths).unwrap(),
+            workspace
+        );
+        assert_eq!(
+            super::resolve_node_workspace(None, &[]).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+    }
 
     const INFO: &[u8] =
         br#"{"inputs":[],"outputs":[{"name":"out","schema_hash":7}],"policy":{"period_ms":10}}"#;
@@ -1633,6 +1530,35 @@ mod tests {
             module: "abi_value_test",
             sys_path: [],
             info: INFO
+        }
+
+        #[test]
+        fn retained_tick_access_is_invalidated_on_drop_and_unwind() {
+            use std::cell::{Cell, RefCell};
+            use std::collections::HashMap;
+            use std::rc::Rc;
+            for unwind in [false, true] {
+                let state = Rc::new(crate::HostTickShared {
+                    publishers: Cell::new(std::ptr::dangling_mut::<()>()),
+                    outputs: Rc::new(HashMap::new()),
+                    schemas: Rc::new(
+                        cerulion_core::dynamic::SchemaSet::from_schemas(Vec::new())
+                            .unwrap()
+                            .0,
+                    ),
+                    active: Cell::new(true),
+                    loans: RefCell::new(Vec::new()),
+                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _guard = crate::TickAccessGuard(Rc::clone(&state));
+                    if unwind {
+                        panic!("tick access oracle");
+                    }
+                }));
+                assert_eq!(result.is_err(), unwind);
+                assert!(!state.active.get());
+                assert!(state.publishers.get().is_null());
+            }
         }
 
         #[test]

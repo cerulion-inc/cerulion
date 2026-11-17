@@ -67,6 +67,10 @@ impl BearerToken {
     }
 }
 
+/// Socket provenance, retained in the MCP request parts independently of headers.
+#[derive(Clone)]
+pub(crate) struct HttpPeer(pub std::net::SocketAddr);
+
 /// A bound HTTP listener, not yet serving.
 pub struct HttpServer {
     listener: TcpListener,
@@ -143,12 +147,13 @@ impl HttpServer {
             let token = self.token.clone();
             let mcp = self.mcp.clone();
             tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
                     let token = token.clone();
                     let mut mcp = mcp.clone();
                     async move {
                         let header = request.headers().get(AUTHORIZATION).map(|v| v.as_bytes());
                         if token.admits(header) {
+                            request.extensions_mut().insert(HttpPeer(peer));
                             mcp.call(request).await
                         } else {
                             Ok(unauthorized())

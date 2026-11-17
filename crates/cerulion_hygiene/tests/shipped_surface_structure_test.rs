@@ -337,10 +337,7 @@ fn no_source_or_test_file_is_named_after_a_plan_step() {
     let mut found: BTreeSet<String> = BTreeSet::new();
     let mut scanned = 0usize;
     collect_rs_files(&root.join("crates"), &mut |path| {
-        let in_src_or_tests = path
-            .components()
-            .any(|c| c.as_os_str() == "src" || c.as_os_str() == "tests");
-        if !in_src_or_tests {
+        if !in_src_or_tests(&root, path) {
             return;
         }
         scanned += 1;
@@ -376,6 +373,86 @@ fn no_source_or_test_file_is_named_after_a_plan_step() {
         "these names are in this test's list but not in the tree: {gone:?}. A renamed file \
          is the point: delete its line here."
     );
+}
+
+/// Whether `path` sits in a `src` or `tests` directory: a component of its
+/// path BELOW the repository `root` is one of the two. The components of
+/// `root` never count, so a checkout beneath a directory named `src` or
+/// `tests` scans the same files as any other. A path outside `root` is not in
+/// this repository's tree.
+fn in_src_or_tests(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| {
+        rel.components()
+            .any(|c| c.as_os_str() == "src" || c.as_os_str() == "tests")
+    })
+}
+
+#[test]
+fn the_plan_step_scan_judges_a_path_below_the_checkout_root() {
+    const VECTORS: &[(&str, &str, bool)] = &[
+        ("/work/cerulion", "/work/cerulion/crates/x/src/lib.rs", true),
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/x/src/transport/m.rs",
+            true,
+        ),
+        ("/work/cerulion", "/work/cerulion/crates/x/tests/t.rs", true),
+        ("/work/cerulion", "/work/cerulion/crates/x/build.rs", false),
+        // Names that only contain `src` or `tests` are not those directories.
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/x/srcgen/a.rs",
+            false,
+        ),
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/x/contests/a.rs",
+            false,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/src/lib.rs",
+            true,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/tests/t.rs",
+            true,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/build.rs",
+            false,
+        ),
+        (
+            "/work/src/cerulion",
+            "/work/src/cerulion/crates/x/examples/e.rs",
+            false,
+        ),
+        (
+            "/work/tests/cerulion",
+            "/work/tests/cerulion/crates/x/tests/t.rs",
+            true,
+        ),
+        (
+            "/work/tests/cerulion",
+            "/work/tests/cerulion/crates/x/build.rs",
+            false,
+        ),
+        // Outside the root, even with a `src` component of its own.
+        (
+            "/work/src/cerulion",
+            "/work/src/other/crates/x/src/lib.rs",
+            false,
+        ),
+    ];
+    for (root, path, want) in VECTORS {
+        assert_eq!(
+            in_src_or_tests(Path::new(root), Path::new(path)),
+            *want,
+            "in_src_or_tests(root = {root}, path = {path}) should be {want}"
+        );
+    }
 }
 
 fn collect_rs_files(dir: &Path, f: &mut impl FnMut(&Path)) {

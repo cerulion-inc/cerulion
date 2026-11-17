@@ -204,6 +204,28 @@ struct BridgeMappingLite {
     ros_type: String,
 }
 
+/// Raw bridge outputs exist outside GraphTopology. Privacy planning must read
+/// their authoritative mapping names before any worker creates a publisher.
+pub(crate) fn bridge_scope_topics(path: &Path) -> crate::error::CliResult<Vec<String>> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        crate::error::CliError::Validation(format!(
+            "cannot establish local scope for bridge config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let config: BridgeYamlLite = serde_yaml::from_str(&text).map_err(|error| {
+        crate::error::CliError::Validation(format!(
+            "cannot establish local scope for bridge config {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(config
+        .mappings
+        .into_iter()
+        .map(|mapping| mapping.cerulion_topic)
+        .collect())
+}
+
 /// Discover the bridge config path for a run: the [`BRIDGE_CONFIG_ENV`] env var
 /// wins (verbatim — it is what the bridge node itself loads), else the sibling
 /// convention `graphs/<graph_name>.bridge.yaml` IF it exists. `None` ⇒ no bridge
@@ -509,6 +531,7 @@ fn build_schema_serving_inner(
     }
 
     SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas,
         schema_docs,
         schema_hashes,

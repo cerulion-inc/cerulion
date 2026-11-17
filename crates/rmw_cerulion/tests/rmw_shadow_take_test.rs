@@ -18,9 +18,16 @@
 //! the heap is not the sample). The allocation probe pins the OTHER half of
 //! the cost claim, narrowly scoped: the rmw's own take path allocates
 //! NOTHING on the Rust heap at steady state (shadow recycled, pending-take
-//! table pre-reserved). It cannot see the copying take's libc / C++
-//! allocations — those never go through Rust's global allocator — so it is
-//! not offered as the zero-copy proof; the address oracle is.
+//! table pre-reserved). It counts the Rust-heap allocations made by the
+//! thread that opened its window. The take and the return run on that
+//! thread, so an allocation added to either still fails the pin. Every other
+//! thread is outside the probe, including threads that live for the whole
+//! process: the transport's registration republish thread, which the first
+//! rmw publisher starts, re-sends the registration set every
+//! `REG_REPUBLISH_INTERVAL` and allocates while it does. The probe cannot see
+//! the copying take's libc or C++ allocations either, since those never go
+//! through Rust's global allocator, so it is not offered as the zero-copy
+//! proof; the address oracle is.
 //!
 //! The read-only contract is pinned in a CHILD PROCESS: a write through the
 //! forged payload pointer must terminate it by signal (SIGSEGV on Linux,
@@ -32,9 +39,13 @@
 
 use serial_test::serial;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::ffi::CString;
+use std::hint::black_box;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rmw_cerulion::ffi::introspection_cpp::{
     rmw_cerulion_cppstring_construct, rmw_cerulion_cppstring_destruct, rmw_cerulion_cppstring_view,
@@ -47,9 +58,29 @@ use rmw_cerulion::runtime::SubscriptionData;
 use rmw_cerulion::*;
 
 // =====================================================================
-// Allocation probe (Rust global allocator only — see the module docs)
+// Allocation probe (Rust global allocator, measured thread only; see the
+// module docs)
 // =====================================================================
 
+thread_local! {
+    /// `true` only on the thread that called [`CountingAllocator::enable`].
+    ///
+    /// Const-init with a non-`Drop` payload (`Cell<bool>`): a lazy, allocating
+    /// TLS init or a registered destructor touched from inside
+    /// `GlobalAlloc::alloc` would recurse into the allocator. Const-init TLS
+    /// of a plain `Cell<bool>` allocates nothing and registers no destructor
+    /// on first touch.
+    static MEASURED_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Counts the Rust-heap allocations, and the bytes they request, made by the
+/// measured thread while a window is open.
+///
+/// Thread-scoped: `#[serial]` orders test bodies, but not the transport's
+/// background threads, which outlive any one test and allocate on their own
+/// schedule. A process-wide count folds their work into whichever window is
+/// open when they run. An allocation the opening thread makes inside its
+/// window is always counted.
 struct CountingAllocator {
     inner: System,
     count: AtomicU64,
@@ -66,24 +97,38 @@ impl CountingAllocator {
             enabled: AtomicBool::new(false),
         }
     }
+    /// Open a window: mark THIS thread as the measured one, zero both
+    /// counters, and enable counting.
     fn enable(&self) {
+        MEASURED_THREAD.set(true);
         self.count.store(0, Ordering::SeqCst);
         self.bytes.store(0, Ordering::SeqCst);
         self.enabled.store(true, Ordering::SeqCst);
     }
-    /// (allocations, bytes) requested since `enable`.
+    /// Close the window, clearing the global flag and this thread's mark, and
+    /// return the (allocations, bytes) the measured thread requested since
+    /// `enable`.
     fn disable(&self) -> (u64, u64) {
         self.enabled.store(false, Ordering::SeqCst);
+        MEASURED_THREAD.set(false);
         (
             self.count.load(Ordering::SeqCst),
             self.bytes.load(Ordering::SeqCst),
         )
     }
+    /// `true` while a window is open AND this is the thread that opened it.
+    ///
+    /// `try_with`, never `with`: during thread teardown TLS is inaccessible
+    /// and `with` would panic inside the allocator. An inaccessible TLS reads
+    /// as "not the measured thread", so it does not count.
+    fn counting(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed) && MEASURED_THREAD.try_with(Cell::get).unwrap_or(false)
+    }
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.counting() {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.bytes
                 .fetch_add(layout.size() as u64, Ordering::Relaxed);
@@ -94,7 +139,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         unsafe { self.inner.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.counting() {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(new_size as u64, Ordering::Relaxed);
         }
@@ -104,6 +149,77 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator::new();
+
+/// The probe's own contract, against hand-written oracles: an allocation on
+/// the thread that opened the window is counted with its size, an empty
+/// window reads zero, and an allocation another thread makes while the
+/// window is open is not counted.
+#[test]
+#[serial]
+fn the_allocation_probe_counts_only_the_thread_that_opened_the_window() {
+    // Arm 1: the counter counts. One 536-byte allocation on the measured
+    // thread reads (1, 536), so a (0, 0) elsewhere in this binary comes from
+    // a counter that would have seen an allocation.
+    ALLOCATOR.enable();
+    drop(black_box(Vec::<u8>::with_capacity(536)));
+    assert_eq!(
+        ALLOCATOR.disable(),
+        (1, 536),
+        "one 536-byte allocation on the measured thread is counted with its size"
+    );
+
+    // Arm 2: an empty window reads zero.
+    ALLOCATOR.enable();
+    assert_eq!(
+        ALLOCATOR.disable(),
+        (0, 0),
+        "an empty window counts nothing"
+    );
+
+    // Arm 3: another thread allocates inside the window and is not counted.
+    // The helper and both flags are built before the window opens and the
+    // join runs after it closes, so inside the window the measured thread
+    // touches only atomics and `Instant::now`, neither of which allocates.
+    // `finished` is read before `disable`, so true proves the helper's
+    // allocation fell inside the window.
+    const HELPER_CEILING: Duration = Duration::from_secs(30);
+    let go = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let helper = {
+        let go = Arc::clone(&go);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            drop(black_box(Vec::<u8>::with_capacity(536)));
+            done.store(true, Ordering::Release);
+        })
+    };
+    let deadline = Instant::now() + HELPER_CEILING;
+    ALLOCATOR.enable();
+    go.store(true, Ordering::Release);
+    let finished = loop {
+        if done.load(Ordering::Acquire) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::hint::spin_loop();
+    };
+    let got = ALLOCATOR.disable();
+    helper.join().expect("the helper thread panicked");
+    assert!(
+        finished,
+        "the helper did not allocate within the 30 s ceiling, so arm 3 tested nothing"
+    );
+    assert_eq!(
+        got,
+        (0, 0),
+        "an allocation another thread makes inside the window is not counted"
+    );
+}
 
 // =====================================================================
 // Shared scaffolding (crib of rmw_e2e_test.rs)
@@ -923,7 +1039,9 @@ fn cpp_image_loaned_take_aims_data_into_the_held_sample_and_recycles_the_shadow(
         );
 
         // Steady state: the SAME shadow serves the next take, and the rmw's
-        // own take + return path allocates nothing on the Rust heap.
+        // own take + return path allocates nothing on the Rust heap. Both
+        // calls run on this thread, the one that opens the probe's window, so
+        // a transport background thread allocating meanwhile is not counted.
         let o2 = image_oracle(1 << 20, 2);
         publish_image(publisher, &o2);
         ALLOCATOR.enable();

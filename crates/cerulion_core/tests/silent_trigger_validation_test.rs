@@ -50,6 +50,7 @@ fn meta_input(name: &str, trigger: bool) -> InputMeta {
         depth: 1,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     }
 }
@@ -359,6 +360,7 @@ fn validator_inert_when_macro_emits_data_trigger() {
                 inputs: vec![InputDef {
                     name: "count".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

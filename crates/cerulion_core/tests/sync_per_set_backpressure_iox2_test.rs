@@ -30,7 +30,7 @@
 //!
 //! Sample arms publish by hand on a driven `VirtualClock`, so the payload IS the
 //! wire stamp and a recorded set names exactly the frames it observed. Block
-//! arms cannot: the all-block rule requires an IN-GRAPH producer, so their
+//! arms cannot: a `block` input requires an IN-GRAPH producer, so their
 //! stimulus is a `period_ms` node and their oracles are counts, publish totals
 //! and FIFO contiguity — each derived by hand from the contract, never from a
 //! previous run.
@@ -296,7 +296,7 @@ fn the_slot_debt_is_taken_only_by_block_probed_fifo_inputs() {
 // PART 2 — `block` on a per-set Sync TRIGGER, end to end
 // ===========================================================================
 //
-// The all-block rule requires an IN-GRAPH producer (topology validation refuses
+// A `block` input requires an IN-GRAPH producer (topology validation refuses
 // a `block` edge whose topic nobody in the graph publishes — the scheduler can
 // only defer producers it schedules), so these arms cannot publish by hand the
 // way the sample arms do. The stimulus is a `period_ms` node writing a counter,
@@ -411,6 +411,7 @@ fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> No
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs
@@ -940,20 +941,13 @@ fn a_block_regime_on_a_sync_trigger_is_loud_once_and_counted_always() {
     );
 }
 
-/// B5 — the all-block rule is unchanged for Sync: a mixed topic DEGRADES.
-///
-/// `is_all_block` is computed over consumer EDGES with no trigger-kind term, so
-/// a Sync node whose `block` trigger shares its topic with any non-block
-/// consumer degrades to `drop_oldest` exactly as a Data consumer does. Deferring
-/// the producer would starve the non-block sibling, and that reasoning does not
-/// change because one of the consumers happens to align sets.
-///
-/// The control is the counters, not the log: a degraded input gets NO defer
-/// edges (so the producer runs free) and DOES get the eviction detector.
+/// B5: a Sync node's `block` trigger on a MIXED topic keeps its own slot:
+/// with its partner silent the set never completes, the slot fills at depth 4
+/// and the producer is deferred, whatever the plain sibling declares.
 #[test]
 #[serial]
 #[traced_test]
-fn a_block_sync_trigger_sharing_its_topic_with_a_plain_consumer_degrades() {
+fn a_block_sync_trigger_sharing_its_topic_with_a_plain_consumer_still_defers() {
     const STEPS: usize = 20;
     let sets: Sets = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(AtomicU64::new(0));
@@ -995,37 +989,25 @@ fn a_block_sync_trigger_sharing_its_topic_with_a_plain_consumer_degrades() {
         runtime.step(Duration::from_millis(1));
     }
 
-    assert_eq!(
-        runtime
-            .node_handle("feeder")
-            .expect("feeder handle")
-            .fire_count(),
-        STEPS as u64,
-        "the producer is NEVER deferred on a mixed topic — deferring it would \
-         starve the non-block sibling, so every one of its periods fires"
+    let fed = runtime
+        .node_handle("feeder")
+        .expect("feeder handle")
+        .fire_count();
+    assert!(
+        (4..=5).contains(&fed),
+        "the producer stops at the block slot's depth (4) on a mixed topic, got {fed}"
     );
     let fuse = runtime.node_handle("fuse").expect("fuse handle");
-    assert_eq!(
-        fuse.backpressure_block_fires_deferred_count("a"),
-        0,
-        "a degraded input has no defer edges at all"
-    );
-    assert_eq!(
-        events.load(Ordering::Relaxed),
-        0,
-        "and no block event: it is not on the block policy any more"
+    assert!(
+        fuse.backpressure_block_fires_deferred_count("a") >= (STEPS as u64) - 5,
+        "every later step is a block defer"
     );
     logs_assert(|lines: &[&str]| {
-        let hits = count_at_exclusively(
-            lines,
-            "WARN",
-            &["block consumer(s) share this topic with non-block"],
-        )?;
-        if hits != 1 {
-            return Err(format!(
-                "the degrade must be announced exactly once for the topic, \
-                 naming the remedy — got {hits} line(s)"
-            ));
+        if lines
+            .iter()
+            .any(|l| l.contains("block consumer(s) share this topic with non-block"))
+        {
+            return Err("no degrade is announced: nothing degrades".to_string());
         }
         Ok(())
     });

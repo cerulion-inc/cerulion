@@ -55,6 +55,10 @@ const DEPARTURE_RANK: u32 = u32::MAX;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The run directory's `recorder.json` every fixture run here carries, with a
+/// driver stamp an attach must copy verbatim.
+const RUN_RECORDER_JSON: &[u8] = br#"{"arch":"test","node_external":{"src0":true}}"#;
+
 fn nanos() -> u128 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -192,7 +196,7 @@ fn publish_run_with_state_consumer(
     }
     std::fs::write(dir.path().join("graph.yaml"), graph).expect("graph.yaml");
     std::fs::write(dir.path().join("env.json"), br#"{"PROBE":"ra"}"#).expect("env.json");
-    std::fs::write(dir.path().join("recorder.json"), br#"{"arch":"test"}"#).expect("recorder.json");
+    std::fs::write(dir.path().join("recorder.json"), RUN_RECORDER_JSON).expect("recorder.json");
     let ring_entries: Vec<serde_json::Value> = rings
         .iter()
         .enumerate()
@@ -218,6 +222,7 @@ fn publish_run_with_state_consumer(
     let handle = RunHandle::publish_on_config(
         config,
         RunRecord {
+            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             run_started_at_ns: nanos() as u64,
@@ -596,6 +601,17 @@ fn a_mid_run_attach_records_a_lapped_ring_from_a_complete_step_and_keeps_departu
             "an attached bag must carry `{name}` from the run directory"
         );
     }
+    // The recorder identity is COPIED, driver stamp included: a resim of this
+    // bag judges drivers by the run's own `node_external`.
+    assert_eq!(
+        reader
+            .attachment("__cerulion/recorder.json")
+            .expect("read attachments")
+            .expect("present")
+            .data,
+        RUN_RECORDER_JSON.to_vec(),
+        "an attach copies the run's recorder.json, driver stamp included, byte for byte"
+    );
 
     // ---- CLAIM 6: the trace VERDICT is chosen from what the run
     // actually declared. The call-site `if rings.is_empty()` is pinned here
@@ -1614,6 +1630,182 @@ fn an_unreadable_run_manifest_says_the_trace_is_unknown_not_that_none_was_declar
     assert!(
         recorded_trace(&bag).is_empty(),
         "and there really is no trace, or the verdict is a lie"
+    );
+
+    let _ = std::fs::remove_file(&bag);
+}
+
+/// A run whose `recorder.json` could not be read carries its trace and none of
+/// its graph: the bag can be viewed, and it is not re-executed under assumed
+/// contract keys.
+///
+/// The directory is the one a failed `recorder.json` write leaves: `run.json`
+/// names a trace ring, `graph.yaml` and `env.json` are there, `recorder.json`
+/// is not. A graph and a trace together are what a resim re-executes, and
+/// `recorder.json` holds the trace format, coordination and driver flags it
+/// judges them by, so the attach embeds no `graph.yaml` and names it withheld
+/// under `artifacts_unreadable` beside the missing `recorder.json`.
+///
+/// Driven through `bag_record_with_manager` because the decision is made at
+/// its call site: the pure oracles in `bag_cmd` cannot see that call passing
+/// the run's graph through unfiltered, deciding the trace does not ride, or
+/// rendering the run's own unreadable list without the withheld graph.
+#[test]
+fn a_run_whose_recorder_json_is_missing_carries_its_trace_and_no_graph() {
+    let ix = iceoryx_test_config();
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "ra_norecorder_test".into(),
+            clock: Arc::new(VirtualClock::new()),
+            subscriber_buffer_size: 64,
+            network: None,
+        },
+        ix.clone(),
+    )
+    .expect("isolated transport");
+
+    let topic = format!("/{}", unique("ra_norecorder"));
+    // ONE declared ring that really exists, so the bag carries this run's
+    // trace: that is the condition the graph is withheld under. The owner
+    // stays alive for the whole arm, since dropping it unlinks the ring.
+    let ring_tag = short_tag("nr");
+    let mut owner = TraceRingOwner::create(&ring_tag, RING_CAP, 0, &["src"]).expect("ring");
+    let mut ring = owner.producer().expect("the single producer");
+    let run = publish_run(&ix, &[&topic], std::slice::from_ref(&ring_tag));
+
+    let run_dir = {
+        let gathered = cerulion_core::transport::run_registry::gather_runs_on_config(
+            &ix,
+            Duration::from_secs(5),
+        )
+        .expect("gather the run we just published");
+        let rec = gathered
+            .records
+            .iter()
+            .find(|r| r.run_id == run.run_id)
+            .unwrap_or_else(|| panic!("the published run must be gatherable: {gathered:?}"));
+        PathBuf::from(rec.run_dir.clone())
+    };
+    std::fs::remove_file(run_dir.join("recorder.json")).expect("remove recorder.json");
+    assert!(
+        run_dir.join("graph.yaml").exists() && run_dir.join("run.json").exists(),
+        "precondition: only recorder.json is gone, so the graph is read and withheld \
+         rather than missing"
+    );
+
+    let producing = Arc::new(AtomicBool::new(true));
+    let produce_stop = Arc::clone(&producing);
+    let mut publisher = manager
+        .create_publisher(&topic, MaxSliceLen::const_new(256), 0)
+        .expect("producer");
+    let producer = std::thread::spawn(move || {
+        let mut seq = 0u32;
+        while produce_stop.load(Ordering::Relaxed) {
+            publisher.publish_raw(&frame(seq)).expect("publish");
+            seq = seq.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let out_path = std::env::temp_dir().join(format!("{}.mcap", unique("ra_norecorder_bag")));
+    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::clone(&running);
+    let bag_path = out_path.clone();
+    let recorder = std::thread::spawn(move || {
+        bag_record_with_manager(
+            manager,
+            RecordOptions {
+                run: Some(RunTarget::Sole),
+                out: bag_path,
+                ..RecordOptions::default()
+            },
+            stop,
+            &mut Vec::new(),
+        )
+    });
+
+    // The ring is opened at its live cursor before the bag file is created,
+    // so records pushed after the file appears land in the bag.
+    await_condition(
+        "the recorder to create its bag",
+        Duration::from_secs(30),
+        || out_path.exists() || recorder.is_finished(),
+    );
+    if recorder.is_finished() {
+        panic!(
+            "the recorder exited before creating a bag: {:?}",
+            recorder.join()
+        );
+    }
+    ring.push(&boundary(40));
+    ring.push(&fire(40));
+    ring.push(&boundary(41));
+
+    running.store(false, Ordering::Relaxed);
+    let summary = recorder
+        .join()
+        .expect("no panic")
+        .expect("a missing recorder.json must cost the graph, never the recording");
+    producing.store(false, Ordering::Relaxed);
+    producer.join().expect("no panic");
+
+    let bag = summary.bag_paths.first().expect("one bag").clone();
+    let reader = cerulion_bag::BagReader::open(&bag).expect("open");
+    let attached = |name: &str| reader.attachment(name).expect("read attachments").is_some();
+    assert!(
+        !attached("graph.yaml"),
+        "beside a trace with no recorder.json the graph is withheld, so the bag is viewed \
+         rather than re-executed under assumed contract keys"
+    );
+    assert!(
+        !attached("__cerulion/recorder.json"),
+        "the run had no readable recorder.json, so the bag carries none"
+    );
+    assert!(
+        attached("env.json"),
+        "env.json was readable and is attached: the directory was read, and only the \
+         graph was withheld"
+    );
+
+    let run_json = reader
+        .attachment("__cerulion/run.json")
+        .expect("read attachments")
+        .expect("an attached bag carries its run identity");
+    let doc: serde_json::Value = serde_json::from_slice(&run_json.data).expect("valid JSON");
+    assert_eq!(
+        doc["artifacts_unreadable"]["graph.yaml"],
+        serde_json::Value::String(
+            "withheld: this run's recorder.json could not be read, and it holds the trace \
+             format, coordination and driver flags a resim judges the trace by, so the bag \
+             carries no graph and can be viewed but not re-executed"
+                .to_string()
+        ),
+        "the bag names the graph it withholds and why: {}",
+        doc["artifacts_unreadable"]
+    );
+    assert!(
+        doc["artifacts_unreadable"]["recorder.json"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the bag names the recorder.json it could not read: {}",
+        doc["artifacts_unreadable"]
+    );
+
+    assert!(
+        !recorded_payloads(&bag, &topic).is_empty(),
+        "a missing recorder.json costs the graph, not the frames"
+    );
+    assert_eq!(
+        recorded_trace(&bag)
+            .iter()
+            .map(|r| (r.step, r.record_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (40, RECORD_TYPE_STEP_BOUNDARY),
+            (40, RECORD_TYPE_FIRE),
+            (41, RECORD_TYPE_STEP_BOUNDARY),
+        ],
+        "the trace rides: that is the condition the graph is withheld under"
     );
 
     let _ = std::fs::remove_file(&bag);

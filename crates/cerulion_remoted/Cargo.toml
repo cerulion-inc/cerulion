@@ -43,6 +43,7 @@ test-seam = ["cerud/test-seam"]
 # is EXCLUDED from the workspace `default-members` (a plain `cargo build` stays
 # iroh-free); build it via `cargo build -p cerulion_remoted` or `--workspace`.
 cerulion_link = { path = "../cerulion_link" }
+indexmap.workspace = true
 # What the SHM WIRE PLANE takes from core: the listener-less `DataOnlySubscriber`
 # capture tap (`create_data_only_subscriber` / `drain_owned`), the shared
 # `cerulion_q` catalog/demand/schema vocabulary (`CatalogReply`/`SchemaReply` —
@@ -52,7 +53,7 @@ cerulion_link = { path = "../cerulion_link" }
 # zenoh; another reason `remoted` stays out of `default-members`.
 cerulion_core = { path = "../cerulion_core" }
 # Existing local metadata only; this edge must not enable the WAN plane.
-cerulion_netd = { workspace = true, default-features = false }
+cerulion_netd = { workspace = true, default-features = false, features = ["wan"] }
 # `sanitize_peer_text`, the one policy for peer text that enters a log line or
 # an error: the ops e-stop into rcpd logs rcpd's error answers through it.
 cerulion_wireclient = { workspace = true }
@@ -136,6 +137,10 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
+# Genuine loopback relay tests only; server features never enter normal builds.
+iroh-relay = { version = "=1.0.2", features = ["server"] }
+# `SinkExt`/`StreamExt` for iroh-relay's client sink and stream.
+futures-util = { version = "0.3", features = ["sink"] }
 # The loopback accept-gate test drives two endpoints in one runtime; `time`
 # bounds every await so CI can never hang (mirrors cerulion_link's loopback).
 # `sync` powers the `oneshot` shutdown channel the `serve`-loop tests use to stop
@@ -147,7 +152,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 ed25519-dalek = "2"
 # Isolated temp dirs/files for the device-index persistence round-trip tests.
 tempfile = "3"
-# `#[serial]` makes `tests/act_verbs_test.rs` take one lock around the process-global iceoryx2 manager.
+# `#[serial]` makes `tests/act_verbs_test.rs` and `tests/rcp_forward_e2e_test.rs` take one lock around the process-global iceoryx2 manager.
 serial_test = "3"
 # `tests/act_verbs_test.rs` creates a topic's data service with a raw iceoryx2
 # node, with safe overflow disabled. Exact `=0.10.0` like every iceoryx2

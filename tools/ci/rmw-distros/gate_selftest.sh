@@ -88,6 +88,66 @@ case "$(rclpy_timed_out 124 selftest 'rclpy exchange' 600 2>&1)" in *"GATE FAIL"
 ( RMW_GATE_SKIP_SERIAL_SUITE=1; serial_suite_runs x86_64 ) || { echo "SELFTEST FAIL: skip=1 on x86_64 did not run the suite (the by-construction guard failed)"; fail=1; }
 ( RMW_GATE_SKIP_SERIAL_SUITE=0; serial_suite_runs aarch64 ) || { echo "SELFTEST FAIL: skip=0 on aarch64 did not run the suite"; fail=1; }
 ( unset RMW_GATE_SKIP_SERIAL_SUITE; serial_suite_runs aarch64 ) || { echo "SELFTEST FAIL: unset skip on aarch64 did not run the suite"; fail=1; }
-rm -f "$plain" "$plain.c" "$plain.s" "$plain.n"
-[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named, and the serial-suite skip decision pinned on both arches"
+# mono_ms reads a millisecond count off the monotonic clock that never goes backwards. It reads
+# Linux's /proc/uptime, as the lanes do; a host without one (macOS) skips this check.
+if [ -r /proc/uptime ]; then
+    m1="$(mono_ms)"; m2="$(mono_ms)"
+    case "$m1" in '' | *[!0-9]*) echo "SELFTEST FAIL: mono_ms printed '$m1'"; fail=1 ;; esac
+    [ "$m2" -ge "$m1" ] || { echo "SELFTEST FAIL: mono_ms went backwards ($m1 then $m2)"; fail=1; }
+fi
+# 12. The rclcpp talker/listener pair judge (rclcpp_pair_judge, harvest.sh), over crafted logs in
+#     both quoting styles: a clean pair passes; a C++ abort, a Python traceback, an rmw_cerulion
+#     ERROR line, a node that ended before its deadline, too few messages heard, and a number heard
+#     that was never published (with and without any published at all) each red, by name.
+t="$plain.t"; l="$plain.l"
+printf "[INFO] [talker]: Publishing: 'Hello World: 1'\n[INFO] [talker]: Publishing: 'Hello World: 2'\n[INFO] [talker]: Publishing: 'Hello World: 3'\n[INFO] [talker]: Publishing: 'Hello World: 4'\n" > "$t"
+printf ' WARN rmw_cerulion::api::pubsub: requested QoS depth differs\n[INFO] [listener]: I heard: [Hello World: 2]\n[INFO] [listener]: I heard: [Hello World: 3]\n[INFO] [listener]: I heard: [Hello World: 4]\n' > "$l"
+rclcpp_pair_judge "$t" "$l" ok ok 3 selftest > /dev/null || { echo "SELFTEST FAIL: a clean rclcpp pair did not pass"; fail=1; }
+case "$(rclcpp_pair_judge "$t" "$l" ok ok 4 selftest)" in *"GATE FAIL"*"floor 4"*) : ;; *) echo "SELFTEST FAIL: three heard passed a floor of four, or the floor was not named"; fail=1 ;; esac
+for bad_min in 0 00 "" abc; do
+    case "$(rclcpp_pair_judge "$t" "$l" ok ok "$bad_min" selftest)" in *"GATE FAIL"*"not a positive decimal"*) : ;; *) echo "SELFTEST FAIL: a heard floor of '$bad_min' was accepted"; fail=1 ;; esac
+done
+: > "$l.none"
+case "$(rclcpp_pair_judge "$t" "$l.none" ok ok 3 selftest)" in *"GATE FAIL"*"heard 0 distinct"*) : ;; *) echo "SELFTEST FAIL: a listener that heard nothing passed"; fail=1 ;; esac
+printf "Publishing: 'Hello World: %s'\\n" 1 2 3 4 5 6 7 8 > "$t.many"
+case "$(rclcpp_pair_judge "$t.many" "$l" ok ok 3 selftest)" in *"GATE FAIL"*"more than two lost"*) : ;; *) echo "SELFTEST FAIL: three heard of the seven published from the first heard on passed"; fail=1 ;; esac
+# A listener that joined late (heard 6 to 8 of 1 to 8) lost nothing it could have heard.
+printf 'I heard: [Hello World: %s]\n' 6 7 8 > "$l.late"
+rclcpp_pair_judge "$t.many" "$l.late" ok ok 3 selftest > /dev/null || { echo "SELFTEST FAIL: a late-joining listener that heard every later message was refused"; fail=1; }
+case "$(rclcpp_pair_judge "$t" "$l" early ok 3 selftest)" in *"GATE FAIL"*"talker early"*) : ;; *) echo "SELFTEST FAIL: a talker that ended early was not named"; fail=1 ;; esac
+case "$(rclcpp_pair_judge "$t" "$l" ok rc=139 3 selftest)" in *"GATE FAIL"*"listener rc=139"*) : ;; *) echo "SELFTEST FAIL: a listener that crashed at its deadline was not named"; fail=1 ;; esac
+# node_status: a clean stop at the deadline, an early end (even a clean one), and a crash or KILL
+# at the deadline, with the deadline boundary itself counted as reached.
+[ "$(node_status 0 15000 15)" = ok ] || { echo "SELFTEST FAIL: a clean stop at the deadline is not ok"; fail=1; }
+[ "$(node_status 0 14950 15)" = ok ] || { echo "SELFTEST FAIL: a stop within the clock's resolution of the deadline is not ok"; fail=1; }
+[ "$(node_status 0 14949 15)" = early ] || { echo "SELFTEST FAIL: a clean exit before the deadline is not early"; fail=1; }
+[ "$(node_status 134 2000 15)" = early ] || { echo "SELFTEST FAIL: an abort at startup is not early"; fail=1; }
+[ "$(node_status 139 15200 15)" = rc=139 ] || { echo "SELFTEST FAIL: a crash on the way down is not named by its status"; fail=1; }
+[ "$(node_status 137 25000 15)" = rc=137 ] || { echo "SELFTEST FAIL: a KILL after a hang is not named by its status"; fail=1; }
+printf 'I heard: [Hello World: 2]\nI heard: [Hello World: 3]\nI heard: [Hello World: 3]\nI heard: [Hello World: 4]\n' > "$l.dup"
+case "$(rclcpp_pair_judge "$t" "$l.dup" ok ok 3 selftest)" in *"GATE FAIL"*"delivered twice"*) : ;; *) echo "SELFTEST FAIL: a message heard twice was not named"; fail=1 ;; esac
+printf 'Publishing: "Hello World: 0"\nPublishing: "Hello World: 1"\nPublishing: "Hello World: 2"\n' > "$t.py"
+printf 'I heard: [Hello World: 0]\nI heard: [Hello World: 1]\nI heard: [Hello World: 2]\n' > "$l.py"
+rclcpp_pair_judge "$t.py" "$l.py" ok ok 3 selftest > /dev/null || { echo "SELFTEST FAIL: an rclpy talker's double-quoted lines were not read"; fail=1; }
+printf 'I heard: [Hello World: 2]\nI heard: [Hello World: 3]\nI heard: [Hello World: 99]\n' > "$l.stray"
+case "$(rclcpp_pair_judge "$t" "$l.stray" ok ok 3 selftest)" in *"GATE FAIL"*"never published: 99"*) : ;; *) echo "SELFTEST FAIL: a number heard but never published was not named"; fail=1 ;; esac
+: > "$t.none"
+case "$(rclcpp_pair_judge "$t.none" "$l" ok ok 3 selftest)" in *"GATE FAIL"*"never published"*) : ;; *) echo "SELFTEST FAIL: messages heard from a talker that published none passed"; fail=1 ;; esac
+for marker in "terminate called after throwing an instance of 'rclcpp::exceptions::RCLError'" \
+    "Traceback (most recent call last):" \
+    "2026-11-11T19:19:32Z ERROR rmw_cerulion::api::pubsub: frame sizing failed topic=/parameter_events" \
+    "2026-11-11T19:19:32Z ERROR cerulion_core::transport::publisher: publish failed" \
+    "2026-11-11T19:19:32Z  WARN rmw_cerulion::type_bridge: malformed variable entry in wire frame, dropping message"; do
+    { cat "$t"; printf '%s\n' "$marker"; } > "$t.bad"
+    case "$(rclcpp_pair_judge "$t.bad" "$l" ok ok 3 selftest)" in *"GATE FAIL"*"crash or an rmw error"*) : ;; *) echo "SELFTEST FAIL: a talker log carrying '$marker' was not named"; fail=1 ;; esac
+    { cat "$l"; printf '%s\n' "$marker"; } > "$l.bad"
+    case "$(rclcpp_pair_judge "$t" "$l.bad" ok ok 3 selftest)" in *"GATE FAIL"*"crash or an rmw error"*) : ;; *) echo "SELFTEST FAIL: a listener log carrying '$marker' was not named"; fail=1 ;; esac
+done
+# The pair rows: both distros whose C++ introspection leaves a bool sequence without accessors are
+# on the list, and a distro off it is not.
+for d in foxy galactic; do rclcpp_pairs_run "$d" || { echo "SELFTEST FAIL: $d is not on RCLCPP_PAIR_DISTROS"; fail=1; }; done
+rclcpp_pairs_run jazzy && { echo "SELFTEST FAIL: jazzy is on RCLCPP_PAIR_DISTROS"; fail=1; }
+rclcpp_pairs_run fox && { echo "SELFTEST FAIL: a prefix of a listed distro matched"; fail=1; }
+rm -f "$plain" "$plain.c" "$plain.s" "$plain.n" "$t" "$l" "$t.py" "$l.py" "$l.stray" "$t.none" "$t.bad" "$l.bad" "$l.none" "$t.many" "$l.late" "$l.dup"
+[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named, the serial-suite skip decision pinned on both arches, and the rclcpp pair judge's pass and every red path (bad floor, abort, traceback, rmw or core error, malformed frame, early end, crash at the deadline, duplicate, floor, loss, stray number) named, node_status pinned, and the pair rows pinned"
 exit "$fail"

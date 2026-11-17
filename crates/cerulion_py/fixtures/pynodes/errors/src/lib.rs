@@ -4,6 +4,6 @@ static INFO_BYTES: &[u8] = b"{\"inputs\":[{\"name\":\"inp\",\"schema_hash\":5093
 
 cerulion_pynode::export_node! {
     module: "node",
-    sys_path: [env!("CARGO_MANIFEST_DIR")],
+    sys_path: [concat!(env!("CARGO_MANIFEST_DIR"), "/nodes/errors")],
     info: INFO_BYTES
 }

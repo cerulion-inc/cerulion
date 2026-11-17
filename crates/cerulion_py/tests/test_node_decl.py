@@ -517,15 +517,25 @@ def test_rust_period_node_metadata_matches_python_declaration():
 
 def test_fixture_info_bytes_match_python_declarations(monkeypatch):
     root = Path(__file__).parents[1] / "fixtures" / "pynodes"
-    for name in ("counter", "doubler", "errors", "wrongmeta", "varlen"):
-        workspace = root / name
+    fixtures = [
+        (name, root / name, root / name, root / name)
+        for name in ("counter", "doubler", "wrongmeta", "varlen")
+    ]
+    fixtures.append(("errors", root / "errors", root / "errors",
+                     root / "errors" / "nodes" / "errors"))
+    fixtures.extend(
+        (f"shared_{name}", root / "shared", root / "shared" / "nodes" / name,
+         root / "shared" / "nodes" / name)
+        for name in ("counter", "doubler", "errors")
+    )
+    for name, workspace, crate_dir, node_dir in fixtures:
         monkeypatch.setenv("CERULION_WORKSPACE", str(workspace))
         # A fixture's `node.py` imports its sibling `helpers.py` the way the
         # embedded host and `node build` resolve it: from the node directory.
         # Each fixture has its own, so the previous one's must not be served.
-        monkeypatch.syspath_prepend(str(workspace))
+        monkeypatch.syspath_prepend(str(node_dir))
         monkeypatch.delitem(sys.modules, "helpers", raising=False)
-        source = (workspace / "src/lib.rs").read_text()
+        source = (crate_dir / "src/lib.rs").read_text()
         match = re.search(r'static INFO_BYTES: &\[u8\] = b"((?:\\.|[^"])*)\\0";', source)
         assert match, name
         info_text = match.group(1).replace(r"\"", '"').replace(r"\\", "\\")
@@ -538,19 +548,19 @@ def test_fixture_info_bytes_match_python_declarations(monkeypatch):
                 port["schema"] = port_schemas[section][port["name"]]
 
         spec = importlib.util.spec_from_file_location(
-            f"fixture_node_{name}", workspace / "node.py"
+            f"fixture_node_{name}", node_dir / "node.py"
         )
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         # As the embedded host loads a node: its node directory active and
         # `cerulion.msgs` bound to its workspace before `node.py` runs, so
         # each fixture's `Probe` is its own workspace's.
-        cerulion._node._activate_node_dir(str(workspace))
+        cerulion._node._activate_node_dir(str(node_dir))
         try:
             cerulion.msgs._bind_workspace(str(workspace))
             spec.loader.exec_module(module)
         finally:
-            cerulion._node._IMPORTS.forget(str(workspace))
+            cerulion._node._IMPORTS.forget(str(node_dir))
         classes = [
             value
             for value in vars(module).values()

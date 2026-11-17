@@ -81,7 +81,7 @@ pub struct ConnectConfig {
     ///
     /// It is deliberately NOT the robot's own reported catalog identity. The desk dials
     /// an eid it chose and cryptographically authenticates; the cache is filed under the
-    /// desk's own name for that robot (`cerulion pair` pins the name→eid binding in
+    /// desk's own name for that robot (the name→eid pin in
     /// `~/.cerulion/robots.toml`). Keying by peer-supplied text would let the dialed
     /// robot select WHICH cached artifact it receives — e.g. another robot's signed
     /// epoch, whose revoked account/device ids are not its business.

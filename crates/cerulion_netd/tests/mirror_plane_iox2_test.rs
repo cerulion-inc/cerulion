@@ -84,7 +84,7 @@ fn gather_until_absent(manager: &TransportManager, gone: &MirrorRecord, budget: 
 /// Build a network-configured (scouting-off, ingress-only) manager over an
 /// isolated per-test SHM root.
 fn networked_test_manager(node: &str) -> Arc<TransportManager> {
-    TransportManager::init_for_test(
+    let manager = TransportManager::init_for_test(
         TransportConfig {
             node_name: node.to_string(),
             // NetworkConfig::default() is scouting-OFF + robot_identity None —
@@ -94,7 +94,12 @@ fn networked_test_manager(node: &str) -> Arc<TransportManager> {
         },
         iceoryx_test_config(),
     )
-    .expect("init networked test manager")
+    .expect("init networked test manager");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
+    manager
 }
 
 #[test]
@@ -114,7 +119,9 @@ fn ensure_mirror_registers_a_real_shared_mirror_and_release_tears_down() {
     plane
         .ensure_mirror(&key, PROBE_HASH)
         .expect("ensure_mirror registers the shared mirror");
-    assert!(manager.is_network_mirror(&key.topic).unwrap());
+    assert!(manager
+        .is_network_mirror(&key.topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 
     // The mirror is REAL: the local SHM data service now exists at the CANONICAL
     // topic name, so a normal consumer can open it (this is how vizd / topic echo
@@ -177,7 +184,9 @@ fn ensure_mirror_registers_a_real_shared_mirror_and_release_tears_down() {
         !manager.network().expect("net").is_self_ingress(&key.topic),
         "teardown removed the topic from the self_ingress set"
     );
-    assert!(!manager.is_network_mirror(&key.topic).unwrap());
+    assert!(!manager
+        .is_network_mirror(&key.topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     // The mirror provenance was removed — `topic list` no longer folds it into REMOTE.
     assert!(
         gather_until_absent(&manager, &record, Duration::from_secs(5)),

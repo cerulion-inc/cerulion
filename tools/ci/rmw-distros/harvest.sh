@@ -157,3 +157,111 @@ serial_suite_runs() {
     local arch="${1:-$(uname -m)}"
     [ "${RMW_GATE_SKIP_SERIAL_SUITE:-0}" != "1" ] || [ "$arch" = "x86_64" ]
 }
+
+# --- rclcpp talker/listener pairs ------------------------------------------------
+# The rows that run the pairs: the distros whose C++ introspection gives a `bool` sequence no
+# accessor at all, so the bridge reaches it through its compiled shim. Every rclcpp node publishes
+# rcl_interfaces/ParameterEvent at startup, which carries ParameterValue.bool_array_value, so a
+# node there starts at all only through that path. Pinned here, beside its predicate, so
+# gate_selftest.sh proves the list still names both.
+RCLCPP_PAIR_DISTROS="foxy galactic"
+
+# rclcpp_pairs_run <distro>: exit 0 when <distro> is one of RCLCPP_PAIR_DISTROS.
+rclcpp_pairs_run() {
+    case " $RCLCPP_PAIR_DISTROS " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# mono_ms: milliseconds on the monotonic boot clock (/proc/uptime, 10 ms resolution). The wall
+# clock can step backwards under a VM's time sync, which would make a node that ran to its deadline
+# read as having ended early.
+mono_ms() {
+    local up
+    read -r up _ < /proc/uptime
+    echo $((${up%.*} * 1000 + 10#${up#*.} * 10))
+}
+
+# node_status <rc> <ms ran> <deadline secs>: one word for how a node under
+# `timeout --preserve-status -s INT <deadline>` ended, its run time read with mono_ms. "ok" when it
+# ran to its deadline and then exited 0 (a clean shutdown on the SIGINT); "early" when it ended
+# before the deadline, whatever its status; "rc=<n>" when it reached the deadline and exited <n> (a
+# crash on the way down, or the KILL after a hang). The deadline counts as reached 50 ms early, for
+# the clock's resolution.
+node_status() {
+    local rc="$1" ms="$2" deadline="$3"
+    if [ $((ms + 50)) -lt $((deadline * 1000)) ]; then
+        echo early
+    elif [ "$rc" -eq 0 ]; then
+        echo ok
+    else
+        echo "rc=$rc"
+    fi
+}
+
+# rclcpp_pair_judge <talker log> <listener log> <talker status> <listener status> <min heard>
+# <label>: exit 0 when a demo_nodes talker and listener pair ran over rmw_cerulion and the listener
+# heard what the talker said; else print the NAMED reason and return 1. Each status is node_status's
+# word (an rclcpp node that cannot publish its startup ParameterEvent aborts with "terminate called"
+# long before its deadline). The talker's lines read `Publishing: 'Hello World: N'` (rclcpp) or
+# `Publishing: "Hello World: N"` (rclpy) and the listener's `I heard: [Hello World: N]` (both).
+# Passing needs: a positive decimal <min heard>; both statuses "ok"; no abort, Python traceback, ERROR
+# line from rmw_cerulion or cerulion_core (the targets the rmw logs under) or dropped malformed
+# frame in either log; no number heard twice; at least <min heard> numbers heard; no more than two lost of those
+# the talker published from the first one heard on (the listener may join late, and the last one or
+# two can still be in flight at the deadline); and every number heard one the talker published, so
+# a wrong or stale payload reds.
+RCLCPP_PAIR_RED='terminate called|Traceback \(most recent call last\)|ERROR (rmw_cerulion|cerulion_core)|malformed variable entry'
+rclcpp_pair_judge() {
+    local tlog="$1" llog="$2" tstatus="$3" lstatus="$4" min="$5" label="$6"
+    local f published heard n np first stray raw
+    case "$min" in
+        '' | *[!0-9]*)
+            echo "GATE FAIL: $label - the heard floor '$min' is not a positive decimal, so any run would pass it"
+            return 1
+            ;;
+    esac
+    if [ "$((10#$min))" -eq 0 ]; then
+        echo "GATE FAIL: $label - the heard floor '$min' is not a positive decimal, so any run would pass it"
+        return 1
+    fi
+    for f in "$tlog" "$llog"; do
+        if grep -qE "$RCLCPP_PAIR_RED" "$f"; then
+            echo "GATE FAIL: $label - $(basename "$f") shows a crash or an rmw error: $(grep -m1 -E "$RCLCPP_PAIR_RED" "$f")"
+            return 1
+        fi
+    done
+    if [ "$tstatus" != ok ] || [ "$lstatus" != ok ]; then
+        echo "GATE FAIL: $label - a node did not run to its deadline and stop cleanly (talker $tstatus, listener $lstatus)"
+        return 1
+    fi
+    published="$(grep -oE "Publishing: ['\"]Hello World: [0-9]+['\"]" "$tlog" | grep -oE '[0-9]+' | sort -un)"
+    heard="$(grep -oE 'I heard: \[Hello World: [0-9]+\]' "$llog" | grep -oE '[0-9]+' | sort -un)"
+    n=$(printf '%s\n' "$heard" | grep -c .)
+    raw=$(grep -oE 'I heard: \[Hello World: [0-9]+\]' "$llog" | grep -c .)
+    if [ "$raw" -ne "$n" ]; then
+        echo "GATE FAIL: $label - the listener heard $raw messages but only $n distinct ones, so a message was delivered twice"
+        return 1
+    fi
+    if [ "$n" -lt "$min" ]; then
+        echo "GATE FAIL: $label - the listener heard $n distinct messages, floor $min (the talker published $(printf '%s\n' "$published" | grep -c .))"
+        return 1
+    fi
+    first=$(printf '%s\n' "$heard" | head -n1)
+    np=$(printf '%s\n' "$published" | awk -v f="$first" '$1 != "" && $1 >= f' | grep -c .)
+    if [ "$n" -lt $((np - 2)) ]; then
+        echo "GATE FAIL: $label - the listener heard $n of the $np messages published from $first on, more than two lost"
+        return 1
+    fi
+    # The published set goes in through -v (space separated: not every awk takes a newline in a -v
+    # value), not as a first file: an EMPTY first file would make awk read the heard numbers as the
+    # published ones and pass every stray number.
+    stray="$(printf '%s\n' "$heard" | awk -v pub="$(printf '%s\n' "$published" | tr '\n' ' ')" 'BEGIN { n = split(pub, a, " "); for (i = 1; i <= n; i++) p[a[i]] = 1 } $1 != "" && !($1 in p)')"
+    if [ -n "$stray" ]; then
+        echo "GATE FAIL: $label - the listener heard numbers the talker never published: $(printf '%s' "$stray" | tr '\n' ' ')"
+        return 1
+    fi
+    echo "PAIR OK: $label - heard $n distinct messages, every one published ($(printf '%s\n' "$heard" | head -n1) to $(printf '%s\n' "$heard" | tail -n1))"
+    return 0
+}

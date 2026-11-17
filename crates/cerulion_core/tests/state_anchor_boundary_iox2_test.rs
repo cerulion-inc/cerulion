@@ -728,6 +728,7 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -869,6 +870,7 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -994,10 +996,12 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
                 InputDef {
                     name: "a".to_string(),
                     source: EXT_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: EXT_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1145,10 +1149,12 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
                 InputDef {
                     name: "a".to_string(),
                     source: EXT_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: EXT_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1454,6 +1460,7 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -1535,4 +1542,47 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
         InputServiceCursor::Served(0),
         "the newest readable cursor is the good frame's, from before the panic"
     );
+}
+
+#[test]
+fn a_stateless_plugin_does_not_veto_another_nodes_anchor() {
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let prefix = unique("statelessplugin");
+        let ids = vec!["counter".to_owned(), "stateless".to_owned()];
+        let mut config = graph(&prefix, &["counter", "stateless"]);
+        config.nodes[1].outputs.clear();
+        let plugin = cerulion_core::graph::node::DylibNodeEntry::load(
+            &cerulion_core::testing::find_fixture_cdylib("test_node_cdylib"),
+        )
+        .expect("build test_node_cdylib before running this test");
+        assert_eq!(plugin.state_shape(), None);
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("counter".into(), Box::new(CounterEntry::new()));
+        factories.insert("stateless".into(), Box::new(plugin));
+        let mut h = harness_with_config("statelessplugin", config, factories, &ids, RING_RECORDS);
+        h.arm.arm(1, 0);
+        h.runtime.attach_state_arm(Arc::clone(&h.arm));
+        step_n(&mut h.runtime, 1);
+        let events = drain(&h.ring_name);
+        assert!(
+            !skips(&events)
+                .iter()
+                .any(|(_, _, cause)| *cause == SkipCause::Contended),
+            "a null state table must not veto the graph's quiescence probe"
+        );
+        let captured = completes(&events)
+            .into_iter()
+            .filter(|(_, idx, _)| *idx == 0)
+            .collect::<Vec<_>>();
+        let expected = (0..1)
+            .map(|step| (step, 0, counter_anchor_oracle(step + 1, step)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured, expected,
+            "the stateful node's complete anchor must reach the ring"
+        );
+        runs.push(captured);
+    }
+    assert_eq!(runs[0], runs[1]);
 }

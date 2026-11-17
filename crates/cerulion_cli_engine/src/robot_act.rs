@@ -67,8 +67,8 @@ fn call_robot_verb_under(
     let eid = crate::connect_cmd::resolve_eid_with(Some(robot), None, &robots)?;
     let key = crate::connect_cmd::default_connect_key_file()?.ok_or_else(|| {
         VerbError::Usage(format!(
-            "this machine has no paired device key, so robot '{robot}' would refuse it: pair \
-             first with `cerulion pair {robot}`"
+            "this machine has no device key, so robot '{robot}' would refuse it: sign in \
+             first with `cerulion login`, which creates it"
         ))
     })?;
     let bin = crate::connect_cmd::resolve_connectd_bin()?;
@@ -98,7 +98,7 @@ fn call_robot_verb_under(
 
 /// The refusal of an act-verb call while `network` (the `CERULION_NETWORK`
 /// value, `None` = unset) engages the kill-switch, under the run and query
-/// parse that `cerulion pair` and `cerulion viz --robot` use
+/// parse that `cerulion viz --robot` uses
 /// ([`crate::graph_cmd::network_env_kill_from`]): `off` after trimming,
 /// ASCII case-insensitively, engages it, any other non-empty value fails
 /// closed and engages it too, and an empty or whitespace-only value is
@@ -483,7 +483,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_kill_switch_refuses_before_the_helper_is_spawned() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = crate::test_env::env_lock();
         let _env = EnvRestore::take(&["CERULION_HOME", "CERULION_CONNECTD_BIN"]);
         let home = tempfile::tempdir().unwrap();
@@ -494,15 +493,13 @@ mod tests {
             .unwrap();
         let marker = home.path().join("helper-ran");
         let helper = home.path().join("connectd-helper");
-        std::fs::write(
+        crate::fresh_executable::install_script(
             &helper,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf ran > '{}'\nprintf '{{}}'\n",
                 marker.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::env::set_var("CERULION_CONNECTD_BIN", &helper);
         let robot = "ab".repeat(32);
         let args = serde_json::json!({});

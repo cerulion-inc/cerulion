@@ -1,134 +1,182 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Test cdylib whose `cerulion_node_info()` returns CORRUPTED JSON
-//! (unparseable on purpose).
-//!
-//! Used by `cerulion_core/tests/dylib_corrupt_info_test.rs` to prove
-//! that `NodeEntry::info()` propagates the parse failure as
-//! `TransportError::NodeInfoParse` and that `GraphRuntime::build` /
-//! `build_in_process` refuse to construct a runtime containing this
-//! node (load-time failure, not tick-time silence).
-//!
-//! A dedicated fixture (rather than a `CER_FAIL_MODE` arm on
-//! `test_node_failing_cdylib`) is required because that fixture is
-//! macro-generated: its info JSON is assembled once by
-//! `#[cerulion_node]` codegen and the env var is NOT consulted at
-//! info-call time. This crate hand-rolls the ABI v5 surface so the
-//! corrupt bytes sit directly in `.rodata`.
-//!
-//! Everything except `cerulion_node_info()` mirrors `test_node_cdylib`
-//! (the canonical raw-FFI fixture) so `DylibNodeEntry::load()` itself
-//! succeeds — the failure MUST surface at info-parse time, proving the
-//! load-vs-info boundary.
-
-// P12 (the AGENTS.md logging convention): library code never prints — it logs through
-// `tracing`. Scoped `not(test)` so unit tests keep printing diagnostics, and
-// applied at the crate root rather than in `[workspace.lints]` because that
-// table cannot distinguish a lib target from a test binary. Pinned by
-// `cerulion_cli_engine/tests/library_print_ban_test.rs`.
+//! Checked stable table whose immutable metadata is deliberately truncated JSON.
+// A node is a library loaded by the runtime. Use tracing for diagnostics.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use cerulion_core::graph::node_plugin_abi::{HostClient, NodeContext, NodeExports, PluginNode};
+use cerulion_core::node_abi as abi;
 
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
-static NODES: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
-
-/// Deliberately malformed JSON: truncated mid-array, unbalanced braces.
-/// `serde_json` fails with an EOF-class error; the host's
-/// `DylibNodeEntry::info()` must wrap that into
-/// `TransportError::NodeInfoParse` carrying this payload's length and
-/// first-80-bytes prefix.
-static CORRUPT_INFO_BYTES: &[u8] = b"{\"inputs\":[\"velocity_in\",CORRUPTED!!,\"outputs\":[\0";
-
-/// ABI version — must match `cerulion_core::CERULION_ABI_VERSION` so the
-/// loader's version gate passes and the corruption is discovered at
-/// info-parse time, not at symbol-load time. PR-merge: read the const
-/// directly (was a hardcoded `5`) so a future ABI bump never silently
-/// re-strands this fixture behind the loader's version gate.
-#[no_mangle]
-pub extern "C" fn cerulion_abi_version() -> u32 {
-    ::cerulion_core::CERULION_ABI_VERSION
+struct CorruptMetadataFixture {
+    context: Option<NodeContext>,
+    tick_count: u64,
 }
 
-/// ABI v22: tracks `cerulion_core::rustc_fingerprint_cstr()` directly, same
-/// reasoning as `cerulion_abi_version` above.
-#[no_mangle]
-pub extern "C" fn cerulion_rustc_fingerprint() -> *const std::ffi::c_char {
-    ::cerulion_core::rustc_fingerprint_cstr()
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_take_last_error() -> *mut std::ffi::c_char {
-    std::ptr::null_mut()
-}
-
-/// # Safety
-///
-/// Pointer must be one previously returned by `cerulion_take_last_error`
-/// from this same cdylib (allocator pairing requirement); null is also
-/// allowed (no-op).
-#[no_mangle]
-pub unsafe extern "C" fn cerulion_free_error(ptr: *mut std::ffi::c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: per the function-level contract above; this fixture's
-    // take never returns non-null, but defining the free for symmetry
-    // keeps the contract complete.
-    let _ = std::ffi::CString::from_raw(ptr);
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
-    CORRUPT_INFO_BYTES.as_ptr() as *const std::ffi::c_char
-}
-
-/// Initialize a new node instance.
-///
-/// Never reached by the tests (`info` fails first on the
-/// graph-build path), but mirrors `test_node_cdylib`'s ownership
-/// contract: reclaim the host's `Box::into_raw(NodeContext)` via
-/// `Box::from_raw` so a direct-init caller doesn't leak a context.
-#[no_mangle]
-pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
-    // SAFETY: `ctx_ptr` was produced by `Box::into_raw(Box::new(NodeContext))`
-    // in the host's `DylibNodeEntry::init` (cerulion_core/src/graph/node.rs).
-    // Reclaim via `Box::from_raw`; the Box drops at end of this scope.
-    let _ctx = unsafe { Box::from_raw(ctx_ptr as *mut cerulion_core::graph::node::NodeContext) };
-
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let mut guard = NODES.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(handle, 0);
-    handle
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
-    let mut guard = NODES.lock().unwrap();
-    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-        Some(count) => {
-            *count += 1;
-            0
+impl PluginNode for CorruptMetadataFixture {
+    fn create(client: HostClient, params: &[u8]) -> cerulion_core::TransportResult<Self> {
+        let info = cerulion_core::graph::node::DylibNodeEntry::parse_info_json_labeled(
+            std::str::from_utf8(&CORRUPT_INFO_BYTES[..CORRUPT_INFO_BYTES.len() - 1]).map_err(
+                |error| cerulion_core::TransportError::GraphError {
+                    reason: error.to_string(),
+                },
+            )?,
+            "raw node",
+        )
+        .map_err(|reason| cerulion_core::TransportError::GraphError { reason })?;
+        let values = cerulion_core::graph::params::params_from_json(if params.is_empty() {
+            "{}"
+        } else {
+            std::str::from_utf8(params).map_err(|error| {
+                cerulion_core::TransportError::NodeError {
+                    node_id: "metadata fixture".into(),
+                    reason: error.to_string(),
+                }
+            })?
+        })
+        .map_err(|reason| cerulion_core::TransportError::NodeError {
+            node_id: "metadata fixture".into(),
+            reason,
+        })?;
+        cerulion_core::graph::params::resolve_params("metadata fixture", info.params(), &values)
+            .map_err(|reason| cerulion_core::TransportError::NodeError {
+                node_id: "metadata fixture".into(),
+                reason: reason.to_string(),
+            })?;
+        let context = NodeContext::new(client.clone(), &info)?;
+        let rust_log = context.env_opt("RUST_LOG");
+        cerulion_core::graph::node::install_cdylib_stderr_tracing(rust_log.as_deref());
+        if let Some(error) = client.take_failure() {
+            return Err(error);
         }
-        None => 4, // handle not found
+        Ok(Self {
+            context: Some(context),
+            tick_count: 0,
+        })
+    }
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        // Replace this body with application logic over the local context.
+        self.tick_count = self.tick_count.wrapping_add(1);
+        Ok(())
+    }
+    fn shutdown(&mut self) -> cerulion_core::TransportResult<()> {
+        self.context = None;
+        Ok(())
+    }
+    fn state_shape() -> u64 {
+        0
+    }
+    fn capture(
+        &self,
+        _sink: &mut dyn cerulion_core::state::StateSink,
+    ) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+    fn restore(&mut self, payload: &[u8]) -> cerulion_core::TransportResult<()> {
+        if payload.is_empty() {
+            Ok(())
+        } else {
+            Err(cerulion_core::TransportError::GraphError {
+                reason: "raw template declares no restorable state".into(),
+            })
+        }
+    }
+    fn inline_safe(&self) -> bool {
+        true
+    }
+    fn probe(&self) -> bool {
+        true
+    }
+    fn external_source(&mut self) -> cerulion_core::TransportResult<abi::ExternalSourceV1> {
+        Ok(abi::ExternalSourceV1 {
+            fd: -1,
+            kind: abi::external::HOST_DRIVEN,
+            flags: 0,
+        })
     }
 }
 
-#[no_mangle]
-pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
-    let mut guard = NODES.lock().unwrap();
-    match guard.as_mut().and_then(|m| m.remove(&handle)) {
-        Some(_) => 0,
-        None => 4, // handle not found
-    }
+static NODES: std::sync::OnceLock<NodeExports<CorruptMetadataFixture>> = std::sync::OnceLock::new();
+fn nodes() -> &'static NodeExports<CorruptMetadataFixture> {
+    NODES.get_or_init(Default::default)
 }
 
-/// ABI v7: the loader resolves this symbol after the
-/// version gate. This fixture never delivers history (its `info()` is corrupt,
-/// so it never reaches a live graph), so it's a no-op.
-#[no_mangle]
-pub extern "C" fn cerulion_node_pump_history(_handle: u64) -> i32 {
-    0
+unsafe extern "C" fn create(
+    host: *const abi::HostApiV1,
+    context: abi::ContextHandle,
+    params: abi::Bytes,
+    output: *mut abi::NodeHandle,
+) -> abi::Status {
+    // SAFETY: the host lends its immutable checked table, parameters and exclusive
+    // output for this call. NodeExports validates them before any node effect.
+    unsafe { nodes().create(host, context, params, output, 0) }
 }
+unsafe extern "C" fn tick(handle: abi::NodeHandle) -> abi::Status {
+    nodes().tick(handle)
+}
+unsafe extern "C" fn shutdown(handle: abi::NodeHandle) -> abi::Status {
+    nodes().shutdown(handle)
+}
+unsafe extern "C" fn destroy(handle: abi::NodeHandle) -> abi::Status {
+    nodes().destroy(handle)
+}
+unsafe extern "C" fn copy_error(
+    token: u64,
+    target: abi::MutableBytes,
+    required: *mut u64,
+) -> abi::Status {
+    // SAFETY: caller owns bounded writable storage and the output scalar for this
+    // synchronous call. NodeExports checks bounds and copies node-owned text.
+    unsafe { nodes().copy_error(token, target, required) }
+}
+unsafe extern "C" fn query_extension(
+    _id: u64,
+    _version: u32,
+    _output: *mut abi::ExtensionDescriptorV1,
+) -> abi::Status {
+    abi::Status {
+        code: abi::status_code::UNSUPPORTED,
+        ..Default::default()
+    }
+}
+unsafe extern "C" fn external_source(
+    handle: abi::NodeHandle,
+    output: *mut abi::ExternalSourceV1,
+) -> abi::Status {
+    // SAFETY: caller owns the aligned output scalar through this synchronous
+    // query; NodeExports checks it before invoking the local node.
+    unsafe { nodes().external(handle, output) }
+}
+static EXTERNAL: abi::ExternalApiV1 = abi::ExternalApiV1 {
+    header: abi::TableHeaderV1::for_type::<abi::ExternalApiV1>(),
+    describe: external_source,
+};
+static API: std::sync::OnceLock<&'static abi::NodeApiV1> = std::sync::OnceLock::new();
+static METADATA: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+fn node_api() -> *const abi::NodeApiV1 {
+    *API.get_or_init(|| {
+        let metadata = METADATA
+            .get_or_init(|| {
+                std::ffi::CString::new(&CORRUPT_INFO_BYTES[..CORRUPT_INFO_BYTES.len() - 1])
+                    .expect("static corrupt bytes")
+            })
+            .as_bytes();
+        Box::leak(Box::new(abi::NodeApiV1 {
+            header: abi::TableHeaderV1::for_type::<abi::NodeApiV1>(),
+            metadata: abi::Bytes {
+                ptr: metadata.as_ptr(),
+                len: metadata.len() as u64,
+            },
+            required_host_capabilities: 0,
+            capabilities: abi::capability::EXTERNAL,
+            create,
+            tick,
+            shutdown,
+            destroy,
+            copy_error,
+            query_extension,
+            state: std::ptr::null(),
+            external: &EXTERNAL,
+        }))
+    }) as *const _
+}
+cerulion_core::node_abi::export_node_api!(node_api);
+static CORRUPT_INFO_BYTES: &[u8] = b"{\"inputs\":[\"velocity_in\",CORRUPTED!!,\"outputs\":[\0";

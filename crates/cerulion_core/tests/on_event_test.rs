@@ -136,6 +136,7 @@ fn sample_graph(regimes: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<d
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

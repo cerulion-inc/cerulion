@@ -479,7 +479,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -521,7 +521,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "event-listener",
  "futures-lite",
- "rustix 1.1.3",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -536,7 +536,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "futures-core",
  "futures-io",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
@@ -1274,7 +1274,7 @@ dependencies = [
  "test_node_macro_period_panic_cdylib",
  "test_node_macro_relay_rlib",
  "thiserror 2.0.21",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "zenoh",
@@ -1362,7 +1362,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "tempfile",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
 ]
 
@@ -1397,7 +1397,7 @@ dependencies = [
  "proc-macro2",
  "regex",
  "reqwest",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "rustls",
  "serde",
  "serde_json",
@@ -1408,7 +1408,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-test",
  "zenoh",
@@ -1456,6 +1456,7 @@ dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "codegen_fixture_msgs",
  "dirs",
@@ -1546,10 +1547,10 @@ name = "cerulion_hygiene"
 version = "2.0.0"
 dependencies = [
  "libc",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-test",
 ]
@@ -1620,10 +1621,12 @@ dependencies = [
  "ctrlc",
  "ed25519-dalek 2.2.0",
  "hex",
+ "iroh",
  "libc",
  "native_ros2_messages",
  "postcard",
- "rustix 1.1.3",
+ "rustix 1.1.6",
+ "rustls",
  "serde",
  "serde_json",
  "socket2 0.6.5",
@@ -1633,6 +1636,15 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "zenoh",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "libloading",
+ "stabby",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1716,6 +1728,7 @@ dependencies = [
  "cerulion_wireclient",
  "clap",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "getrandom 0.2.17",
  "hex",
  "hmac",
@@ -1723,7 +1736,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iceoryx2",
+ "indexmap 2.14.0",
  "iroh",
+ "iroh-relay",
  "libc",
  "native_ros2_messages",
  "postcard",
@@ -1753,7 +1768,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
  "uuid",
 ]
 
@@ -2366,7 +2381,7 @@ dependencies = [
  "crossterm_winapi",
  "document-features",
  "parking_lot",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "winapi 0.3.9",
 ]
 
@@ -2583,6 +2598,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if 1.0.4",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2793,7 +2822,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3042,7 +3071,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3630,9 +3659,9 @@ checksum = "5491a308e0214554f07a81d8944abe45f552871c12e3c3c6e7e5d354039a6c4c"
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3659,9 +3688,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -3679,9 +3708,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
+checksum = "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
 dependencies = [
  "cfg-if 1.0.4",
  "futures-util",
@@ -3889,7 +3918,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "flatbuffers",
  "iceoryx2-bb-concurrency",
@@ -3909,13 +3938,13 @@ dependencies = [
  "iceoryx2-pal-configuration",
  "serde",
  "tiny-fn",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
 ]
 
 [[package]]
 name = "iceoryx2-bb-concurrency"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-elementary-traits",
  "iceoryx2-pal-concurrency-sync",
@@ -3924,7 +3953,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-container"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-derive-macros",
@@ -3937,7 +3966,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-derive-macros"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-elementary",
  "iceoryx2-bb-elementary-traits",
@@ -3949,7 +3978,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-elementary"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-elementary-traits",
@@ -3961,12 +3990,12 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-elementary-traits"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 
 [[package]]
 name = "iceoryx2-bb-flatbuffers"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "flatbuffers",
  "iceoryx2-bb-container",
@@ -3980,7 +4009,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-linux"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-container",
@@ -3994,7 +4023,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-lock-free"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-derive-macros",
@@ -4006,7 +4035,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-loggers"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-print",
  "iceoryx2-log-types",
@@ -4017,7 +4046,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-memory"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-derive-macros",
@@ -4031,7 +4060,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-posix"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "enum-iterator",
  "iceoryx2-bb-concurrency",
@@ -4051,7 +4080,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-print"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-pal-print",
 ]
@@ -4059,7 +4088,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-system-types"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-container",
  "iceoryx2-bb-derive-macros",
@@ -4074,7 +4103,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-cal"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-container",
@@ -4091,13 +4120,13 @@ dependencies = [
  "serde",
  "sha1_smol",
  "tiny-fn",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
 ]
 
 [[package]]
 name = "iceoryx2-log"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-log-types",
  "iceoryx2-pal-concurrency-sync",
@@ -4106,22 +4135,22 @@ dependencies = [
 [[package]]
 name = "iceoryx2-log-types"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 
 [[package]]
 name = "iceoryx2-pal-concurrency-sync"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 
 [[package]]
 name = "iceoryx2-pal-configuration"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 
 [[package]]
 name = "iceoryx2-pal-os-api"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -4132,7 +4161,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-pal-posix"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -4145,7 +4174,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-pal-print"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
  "iceoryx2-pal-posix",
 ]
@@ -4533,12 +4562,20 @@ version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "291065721ad7c477b972e581bbc528df031dc8eb5e39fe1ff3300ae5dfb157ef"
 dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh-metrics-derive",
  "itoa",
  "n0-error",
  "portable-atomic",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
  "ryu",
  "serde",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -4563,6 +4600,8 @@ dependencies = [
  "blake3",
  "bytes",
  "cfg_aliases",
+ "clap",
+ "dashmap",
  "data-encoding",
  "derive_more",
  "getrandom 0.4.3",
@@ -4583,17 +4622,28 @@ dependencies = [
  "pin-project",
  "postcard",
  "rand 0.10.2",
+ "rcgen",
+ "reloadable-state",
  "reqwest",
  "rustls",
+ "rustls-cert-file-reader",
+ "rustls-cert-reloadable-resolver",
  "rustls-pki-types",
  "serde",
  "serde_bytes",
+ "serde_json",
+ "sha1",
+ "simdutf8",
  "strum 0.28.0",
+ "time",
  "tokio",
  "tokio-rustls",
+ "tokio-rustls-acme",
  "tokio-util",
  "tokio-websockets",
+ "toml 1.0.6+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "url",
  "vergen-gitcl",
  "webpki-roots",
@@ -4606,7 +4656,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4988,9 +5038,9 @@ checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -5655,6 +5705,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "slab",
  "sorted-index-buffer",
  "thiserror 2.0.21",
@@ -5691,7 +5742,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6126,6 +6177,16 @@ checksum = "7011d97b484a5ebdc4b1fdb3b12d5e4bbbea56e9d22b688f2e79e04b65a7d8a6"
 
 [[package]]
 name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
+name = "pem"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
@@ -6459,7 +6520,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.3",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -6741,16 +6802,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6953,7 +7014,7 @@ version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
- "pem",
+ "pem 4.0.0",
  "ring",
  "rustls-pki-types",
  "time",
@@ -7933,6 +7994,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
+name = "reloadable-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dc20ac1418988b60072d783c9f68e28a173fb63493c127952f6face3b40c6e0"
+
+[[package]]
+name = "reloadable-state"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3853ef78d45b50f8b989896304a85239539d39b7f866a000e8846b9b72d74ce8"
+dependencies = [
+ "arc-swap",
+ "reloadable-core",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8234,15 +8312,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.3"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c9e247ccc180c1f61615433868c99f3de3ae256a30a43b49f67c2d9171f34"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
- "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "linux-raw-sys 0.12.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8259,6 +8337,40 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-cert-file-reader"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bb47c2a50fdfdaf95b0ac8b12620fc327da1fd4adbb30d0c56d866b005873ff"
+dependencies = [
+ "rustls-cert-read",
+ "rustls-pki-types",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "rustls-cert-read"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd46e8c5ae4de3345c4786a83f99ec7aff287209b9e26fa883c473aeb28f19d5"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "rustls-cert-reloadable-resolver"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe1baa8a3a1f05eaa9fc55aed4342867f70e5c170ea3bfed1b38c51a4857c0c8"
+dependencies = [
+ "futures-util",
+ "reloadable-state",
+ "rustls",
+ "rustls-cert-read",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8310,7 +8422,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8524,7 +8636,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8734,6 +8846,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if 1.0.4",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -9075,6 +9198,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]
@@ -9285,8 +9409,8 @@ dependencies = [
  "fastrand",
  "getrandom 0.3.4",
  "once_cell",
- "rustix 1.1.3",
- "windows-sys 0.59.0",
+ "rustix 1.1.6",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9303,6 +9427,8 @@ name = "test_node_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+ "serde_json",
 ]
 
 [[package]]
@@ -9325,6 +9451,7 @@ name = "test_node_drain_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9360,6 +9487,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_macro_block_panic_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_macro_blocking_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9381,6 +9516,7 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+ "trybuild",
 ]
 
 [[package]]
@@ -9603,6 +9739,7 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -9610,6 +9747,16 @@ name = "test_node_snapshot_fail_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_stable_abi_cross_compiler"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+ "stabby",
 ]
 
 [[package]]
@@ -9633,6 +9780,13 @@ version = "0.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_unknown_schema_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
 ]
 
 [[package]]
@@ -9832,6 +9986,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls-acme"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1af8573b15fdad8d66da116198cd8fd8d87ff62a67c1c6c3df7f62da1170793f"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "log",
+ "num-bigint",
+ "pem 3.0.6",
+ "proc-macro2",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+ "x509-parser",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9890,6 +10072,21 @@ dependencies = [
  "serde_core",
  "serde_spanned",
  "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.14",
+]
+
+[[package]]
+name = "toml"
+version = "1.0.6+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "399b1124a3c9e16766831c6bba21e50192572cdd98706ea114f9502509686ffc"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.14",
@@ -10176,7 +10373,7 @@ dependencies = [
  "serde_json",
  "target-triple",
  "termcolor",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
 ]
 
 [[package]]
@@ -10185,7 +10382,7 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 0.1.10",
+ "cfg-if 1.0.4",
  "static_assertions",
 ]
 
@@ -10717,7 +10914,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11309,7 +11506,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serde_yaml",
- "toml",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "uhlc",
  "validated_struct",

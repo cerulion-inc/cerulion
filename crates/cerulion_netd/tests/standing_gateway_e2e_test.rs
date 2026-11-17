@@ -132,6 +132,9 @@ fn robot_shaped_plane(tag: &str, id: &str, attempt: usize) -> (Arc<GatewayEgress
         root,
     )
     .expect("init shared gateway G");
+    g.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     (
         Arc::new(GatewayEgressPlane::new_without_mdns_for_test(g)),
         port,
@@ -357,6 +360,7 @@ const WIDGET_TEXT: &str = "int32 count\nfloat64 v\n";
 
 fn widget_serving(topic: &str) -> SchemaServing {
     SchemaServing {
+        egress_qos: Vec::new(),
         topic_schemas: vec![TopicSchema {
             topic: topic.to_string(),
             schema_name: WIDGET_Q.to_string(),
@@ -397,6 +401,7 @@ fn assert_type_resolves_remotely(
         connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
     let mut last_name: Option<String> = None;
     for _ in 0..40 {
@@ -566,6 +571,7 @@ fn a_rebooted_gateway_retains_every_previously_registered_serving() {
             ingress: vec![],
         };
         let gizmo_serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![TopicSchema {
                 topic: gizmo_topic.clone(),
                 schema_name: GIZMO_Q.to_string(),
@@ -670,6 +676,7 @@ fn a_partial_boot_does_not_strand_the_query_surface_on_dropped_maps() {
             ingress: vec![],
         };
         let post_serving = SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![TopicSchema {
                 topic: post_topic.clone(),
                 schema_name: POST_Q.to_string(),
