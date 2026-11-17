@@ -3,10 +3,11 @@
 //!
 //! The switch is forced per runtime through `set_period_park_for_test`, so the
 //! process environment is never touched. Each arm is judged against the host
-//! fact the period-park is gated on: it applies only where the CPU carries a
-//! monitor-wait primitive (and, for an input written from another runtime, the
-//! doorbell has a wake word). On any other host the arm asserts the switch did
-//! nothing, so the binary runs a real test everywhere.
+//! facts the period-park is gated on: it engages only on x86_64, where the CPU
+//! carries a monitor-wait primitive (and, for an input written from another
+//! runtime, the doorbell has a wake word). On any other host, aarch64 included,
+//! the arm asserts the switch did nothing, so the binary runs a real test
+//! everywhere.
 //!
 //! Per-test SHM roots; `#[serial]` because several arms judge wall-clock
 //! timing.
@@ -36,11 +37,16 @@ fn ns(tag: &str) -> String {
     format!("ppk{}{tag}", std::process::id())
 }
 
+/// Does the period-park engage on this host at all? Read from the platform,
+/// not from the code under test: an x86_64 CPU with a monitor-wait primitive.
+fn engages_here() -> bool {
+    cfg!(target_arch = "x86_64") && cerulion_core::monitor_wait::monitor_wait_available()
+}
+
 /// Does the period-park apply to a consumer of a topic written from another
-/// runtime on this host? Read from the platform, not from the code under test.
+/// runtime on this host?
 fn applies_to_a_foreign_consumer() -> bool {
-    cerulion_core::monitor_wait::monitor_wait_available()
-        && cerulion_core::doorbell::wake_word_block_primitive_available()
+    engages_here() && cerulion_core::doorbell::wake_word_block_primitive_available()
 }
 
 fn transport(
@@ -511,7 +517,7 @@ fn a_period_node_under_the_period_park_stays_on_its_grid() {
         "grid: {stats:?}, {doubles} doubles of {}, median gap {med:?}",
         gaps.len()
     );
-    if cerulion_core::monitor_wait::monitor_wait_available() {
+    if engages_here() {
         assert!(
             doubles * 50 <= gaps.len(),
             "{doubles} of {} fires came less than half a period after the previous one",

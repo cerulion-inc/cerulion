@@ -16,8 +16,20 @@
 //! (Principle #7): the step still reads every frame off the iceoryx2 queue. The
 //! arithmetic is pure and integer-only: the same inputs give the same state.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// The period-park engages on x86_64 only, where its arrival prediction is
+/// measured to keep the round trip (Linux with WAITPKG). On aarch64 the
+/// monitor-wait park is `WFE`; there, on a Jetson Orin NX, no data arrival was
+/// ever predicted (the Period side's timer wakes landed late, so arrivals never
+/// looked regular), and the switch stays off with one warning.
+pub(crate) const ENGAGES_ON_THIS_TARGET: bool = cfg!(target_arch = "x86_64");
+
+/// Set once this process has said the switch is on but the target does not
+/// engage it.
+pub(crate) static NOT_ENGAGED_NOTICE: AtomicBool = AtomicBool::new(false);
 
 /// The longest single kernel sleep. A ring on an input topic other than the
 /// armed one is seen at the end of the nap it lands in, at the latest.
@@ -88,6 +100,9 @@ pub(crate) struct Gate {
     pub(crate) park_active: bool,
     /// The host carries a real CPU monitor-wait primitive.
     pub(crate) primitive: bool,
+    /// The target is one the period-park engages on
+    /// ([`ENGAGES_ON_THIS_TARGET`]).
+    pub(crate) engaged_target: bool,
     /// The runtime waits on a barrier word.
     pub(crate) barrier: bool,
     /// The runtime produces on a cross-process `block` edge (a credit word it
@@ -105,14 +120,37 @@ pub(crate) struct Gate {
 /// can end a kernel nap, or has none: a barrier arrival, a credit drain and an
 /// fd readiness cannot, so a park waiting for one keeps running as it does with
 /// the switch off; so does a host with no CPU primitive (its park already
-/// sleeps), and a runtime whose externally written input has no wake word.
+/// sleeps), a target it does not engage on, and a runtime whose externally
+/// written input has no wake word.
 pub(crate) fn admits(g: Gate) -> bool {
     g.on && g.park_active
         && g.primitive
+        && g.engaged_target
         && !g.barrier
         && !g.credit_edges
         && !g.fd_sources
         && (!g.armed_line || g.data_wake)
+}
+
+/// Warn, once per `latch`, that the switch is on but this target does not
+/// engage the period-park. Returns whether it warned.
+pub(crate) fn warn_if_not_engaged(
+    latch: &AtomicBool,
+    on: bool,
+    engaged_target: bool,
+    graph: &str,
+) -> bool {
+    if !on || engaged_target || latch.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!(
+        graph = %graph,
+        target_arch = std::env::consts::ARCH,
+        engages_on = "x86_64",
+        measured = "no data arrival predicted on a Jetson Orin NX (aarch64)",
+        "period park not engaged on this target: arrival prediction is not validated here"
+    );
+    true
 }
 
 fn ewma(old: u64, sample: u64, shift: u32) -> u64 {
@@ -476,12 +514,60 @@ mod tests {
             on: true,
             park_active: true,
             primitive: true,
+            engaged_target: true,
             barrier: false,
             credit_edges: false,
             fd_sources: false,
             armed_line: true,
             data_wake: true,
         }
+    }
+
+    #[test]
+    fn the_period_park_engages_on_x86_64_only() {
+        assert_eq!(ENGAGES_ON_THIS_TARGET, cfg!(target_arch = "x86_64"));
+        assert!(
+            !admits(Gate {
+                engaged_target: false,
+                ..open_gate()
+            }),
+            "a target the period-park does not engage on keeps the plain park"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_switch_on_a_target_it_does_not_engage_warns_once_and_stays_off() {
+        let latch = AtomicBool::new(false);
+        assert!(warn_if_not_engaged(&latch, true, false, "g1"));
+        assert!(
+            !warn_if_not_engaged(&latch, true, false, "g2"),
+            "once per latch"
+        );
+        assert!(
+            !warn_if_not_engaged(&AtomicBool::new(false), false, false, "g3"),
+            "switch off"
+        );
+        assert!(
+            !warn_if_not_engaged(&AtomicBool::new(false), true, true, "g4"),
+            "engaged target"
+        );
+        logs_assert(|lines: &[&str]| {
+            let warned: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("period park not engaged on this target"))
+                .collect();
+            match warned.as_slice() {
+                [line]
+                    if line.contains("WARN")
+                        && line.contains("g1")
+                        && line.contains("target_arch") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("expected one WARN line naming g1, got {other:?}")),
+            }
+        });
     }
 
     #[test]

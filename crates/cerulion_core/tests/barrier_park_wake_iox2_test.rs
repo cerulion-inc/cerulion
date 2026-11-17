@@ -773,7 +773,8 @@ fn the_period_park_stays_off_for_a_barrier_participant() {
     );
     let (control, entries, _) = run(false, "control");
     assert!(entries > 0, "apparatus: the control parked");
-    if cerulion_core::monitor_wait::monitor_wait_available() {
+    // The period-park engages on an x86_64 CPU with a monitor-wait primitive.
+    if cfg!(target_arch = "x86_64") && cerulion_core::monitor_wait::monitor_wait_available() {
         assert!(
             control.blocks > 0,
             "the control's period-park planned its blocks: {control:?}"
