@@ -1,0 +1,38 @@
+ benches/latency/workspace/Cargo.lock | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+diff --git a/benches/latency/workspace/Cargo.lock b/benches/latency/workspace/Cargo.lock
+index 557bcb8..c884e87 100644
+--- a/benches/latency/workspace/Cargo.lock
++++ b/benches/latency/workspace/Cargo.lock
+@@ -248,6 +248,7 @@ version = "2.0.0"
+ dependencies = [
+  "base64 0.22.1",
+  "cerulion_macros",
++ "cerulion_node_abi",
+  "cerulion_pairing",
+  "dirs",
+  "iceoryx2",
+@@ -301,6 +302,15 @@ dependencies = [
+  "toml_edit",
+ ]
+ 
++[[package]]
++name = "cerulion_node_abi"
++version = "2.0.0"
++dependencies = [
++ "libloading",
++ "stabby",
++ "thiserror",
++]
++
+ [[package]]
+ name = "cerulion_pairing"
+ version = "2.0.0"
+@@ -2949,6 +2959,7 @@ version = "72.1.16"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
+ dependencies = [
++ "libloading",
+  "rustversion",
+  "stabby-abi",
+ ]

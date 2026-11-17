@@ -178,14 +178,14 @@ impl Drop for ChildGuard {
 }
 
 /// bagd GRANDCHILD leak guard: bagd runs in its OWN process group, so killing
-/// the run on a mid-window panic orphans it. The relative `--out
-/// recordings/fbresim_` cmdline form is unique to THIS file's graph name (the
+/// the run on a mid-window panic orphans it. The `fbresim_` output file
+/// prefix identifies this file's graph in either output path form (the
 /// sibling suites use `demo_` / `mpdemo_`).
 struct BagdGuard;
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         if let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out recordings/fbresim_"])
+            .args(["-f", "bagd --out (/[^[:space:]]*/)?recordings/fbresim_"])
             .output()
         {
             for pid in String::from_utf8_lossy(&out.stdout)

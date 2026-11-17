@@ -57,7 +57,7 @@ pub const QUEUE_LINES: usize = 4096;
 pub const QUEUE_BYTES: usize = 1 << 20;
 
 /// Test-only: the environment variable that, in a build with the test seam,
-/// sets a smaller line bound for the binary's log queue
+/// sets a line bound of at most [`QUEUE_LINES`] for the binary's log queue
 /// (`test_queue_lines`), from the moment the daemon has logged that it
 /// listens (`shrink_queue_for_test`); the lines before that are queued under
 /// the full bound. A build without the test seam never reads it.
@@ -66,9 +66,11 @@ pub const QUEUE_BYTES: usize = 1 << 20;
 pub const QUEUE_LINES_FOR_TEST_ENV: &str = "CERULION_REMOTED_LOG_QUEUE_LINES_FOR_TEST";
 
 /// Test-only: the line bound a [`QUEUE_LINES_FOR_TEST_ENV`] value sets, which
-/// can only shrink the queue: a positive whole number, at most [`QUEUE_LINES`].
-/// Any other value sets none, so the queue keeps [`QUEUE_LINES`]; no value
-/// leaves it unbounded or with no room. Pure.
+/// can only shrink the queue. A value that parses as a positive `usize`,
+/// whitespace around it trimmed, sets that many lines, clamped to
+/// [`QUEUE_LINES`]: a larger one, up to `usize::MAX`, sets [`QUEUE_LINES`].
+/// Any other value, zero among them, sets none, so the queue keeps
+/// [`QUEUE_LINES`]; no value leaves it unbounded or with no room. Pure.
 #[cfg(feature = "test-seam")]
 pub(crate) fn test_queue_lines(value: &str) -> Option<usize> {
     let lines = value.trim().parse::<usize>().ok()?;
@@ -78,7 +80,7 @@ pub(crate) fn test_queue_lines(value: &str) -> Option<usize> {
 /// Test-only: apply the line bound [`QUEUE_LINES_FOR_TEST_ENV`] sets to the
 /// writer [`start`] installed, if both are there. The daemon calls it right
 /// after it logs that it listens, so a test that waits for that line never
-/// loses it to the smaller bound.
+/// loses it to that bound.
 #[cfg(feature = "test-seam")]
 pub(crate) fn shrink_queue_for_test() {
     let lines = std::env::var(QUEUE_LINES_FOR_TEST_ENV)
@@ -165,8 +167,8 @@ struct Queue {
     /// thread only, before it clears `writing`.
     reported: AtomicU64,
     limits: Limits,
-    /// Test-only: a smaller line bound set once the daemon listens;
-    /// `usize::MAX` for none.
+    /// Test-only: a line bound of at most [`QUEUE_LINES`], set once the daemon
+    /// listens; `usize::MAX` for none.
     #[cfg(feature = "test-seam")]
     test_lines: std::sync::atomic::AtomicUsize,
 }
@@ -200,8 +202,8 @@ impl Queue {
         }
     }
 
-    /// The bounds in force: `limits`, with a test seam's smaller line bound
-    /// once one is set.
+    /// The bounds in force: `limits`, with a test seam's line bound of at most
+    /// [`QUEUE_LINES`] once one is set.
     fn bounds(&self) -> Limits {
         #[cfg(feature = "test-seam")]
         {
@@ -689,7 +691,7 @@ mod tests {
     fn lines_are_written_in_the_order_they_were_handed_over() {
         for _run in 0..2 {
             let sink = Recorded::default();
-            let writer = spawn(Limits::DEFAULT, Box::new(sink.clone())).unwrap();
+            let writer = spawn_bare(Limits::DEFAULT, sink.clone());
             let expected: Vec<String> = (1..=10).map(|n| format!("line {n}\n")).collect();
             for line in &expected {
                 log(&writer, line);
@@ -708,7 +710,7 @@ mod tests {
             lines: 2,
             bytes: 12,
         };
-        let writer = spawn(limits, Box::new(sink.clone())).unwrap();
+        let writer = spawn_bare(limits, sink.clone());
         log(&writer, "in flight\n");
         sink.until_a_write_waits();
         log(&writer, "queued 1\n");
@@ -733,7 +735,7 @@ mod tests {
             fail: true,
             ..Recorded::default()
         };
-        let writer = spawn(Limits::DEFAULT, Box::new(sink.clone())).unwrap();
+        let writer = spawn_bare(Limits::DEFAULT, sink.clone());
         log(&writer, "a\n");
         log(&writer, "b\n");
         assert_eq!(writer.drain(LONG), Drained::Written);
@@ -741,9 +743,37 @@ mod tests {
         assert!(sink.lines().is_empty());
     }
 
+    /// Keeps two `NoSubscriber` dispatchers alive for the rest of the
+    /// process. Once both are registered, tracing-core's one-dispatcher path
+    /// stays off: every later registration, of a callsite or of a dispatcher,
+    /// computes and stores interest under the dispatchers' lock, over every
+    /// live dispatcher. A callsite first reached on a thread with no
+    /// subscriber is then cached as sometimes, not never, whenever a capture
+    /// is live, so the capture is still asked whether its event is enabled.
+    /// It must be called before a thread with no subscriber of its own first
+    /// reaches a callsite a capture reads: `spawn_bare` calls it before it
+    /// starts a writer thread, and `formatted_into` before it makes its
+    /// subscriber, so before any thread its `f` starts.
+    fn keep_two_dispatchers() {
+        static KEPT: OnceLock<[tracing::Dispatch; 2]> = OnceLock::new();
+        KEPT.get_or_init(|| {
+            std::array::from_fn(|_| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            })
+        });
+    }
+
+    /// A writer whose thread writes to `sink` with no subscriber of its own,
+    /// started after `keep_two_dispatchers`.
+    fn spawn_bare(limits: Limits, sink: Recorded) -> LogWriter {
+        keep_two_dispatchers();
+        spawn(limits, Box::new(sink)).unwrap()
+    }
+
     /// `f` under a subscriber of this thread that formats into `writer`, with
-    /// no time and no color, at debug.
+    /// no time and no color, at debug, made after `keep_two_dispatchers`.
     fn formatted_into<R>(writer: &LogWriter, f: impl FnOnce() -> R) -> R {
+        keep_two_dispatchers();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(writer.clone())
             .with_ansi(false)
@@ -771,6 +801,83 @@ mod tests {
         LogWriter {
             inner: Arc::new(Inner { queue }),
         }
+    }
+
+    /// Set in the environment of the child process the test below runs alone
+    /// in.
+    const ALONE_ENV: &str = "CERULION_TEST_LOG_WRITER_ALONE";
+    /// The full name of the test below, which the child runs with `--exact`.
+    const ALONE_TEST: &str = "log_writer::tests::\
+        a_callsite_first_reached_on_a_thread_with_no_subscriber_still_writes_its_line";
+
+    /// Runs alone in a child process of this test binary, so no other test's
+    /// dispatcher is live there: a thread with no subscriber reaches the
+    /// callsite first, and the line is still written. The parent waits at
+    /// most `LONG` for the child and kills it past that.
+    #[test]
+    fn a_callsite_first_reached_on_a_thread_with_no_subscriber_still_writes_its_line() {
+        if std::env::var_os(ALONE_ENV).is_some() {
+            let writer = unstarted(Limits::DEFAULT);
+            let line =
+                || tracing::warn!("cerulion_remoted: a line first reached with no subscriber");
+            formatted_into(&writer, || {
+                // A thread with no subscriber registers the callsite first.
+                std::thread::spawn(line).join().unwrap();
+                line();
+            });
+            let queued: Vec<Vec<u8>> = writer.inner.queue.lock().lines.iter().cloned().collect();
+            assert_eq!(
+                queued,
+                [b" WARN cerulion_remoted: a line first reached with no subscriber\n".to_vec()],
+                "the line was not written: its callsite was cached as never"
+            );
+            return;
+        }
+        /// The child, killed and reaped when dropped, so a panic here leaves
+        /// no child running.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ALONE_TEST, "--test-threads=1"])
+                .env(ALONE_ENV, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let until = Instant::now() + LONG;
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= until {
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // The child has exited, so each pipe reads to its end.
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        io::Read::read_to_string(&mut child.0.stdout.take().unwrap(), &mut stdout).unwrap();
+        io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut stderr).unwrap();
+        let Some(status) = status else {
+            panic!("the child ran past {LONG:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        };
+        assert!(
+            status.success(),
+            "the child failed with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child did not run exactly this test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 
     #[test]
@@ -1000,7 +1107,7 @@ mod tests {
 
     #[test]
     fn the_drain_returns_at_once_when_nothing_is_queued() {
-        let writer = spawn(Limits::DEFAULT, Box::new(Recorded::default())).unwrap();
+        let writer = spawn_bare(Limits::DEFAULT, Recorded::default());
         let since = Instant::now();
         assert_eq!(writer.drain(LONG), Drained::Written);
         assert!(since.elapsed() < Duration::from_secs(5));
@@ -1010,7 +1117,7 @@ mod tests {
     fn a_drain_behind_a_blocked_write_discards_the_queue_and_queues_its_count() {
         let sink = Recorded::default();
         sink.shut();
-        let writer = spawn(Limits::DEFAULT, Box::new(sink.clone())).unwrap();
+        let writer = spawn_bare(Limits::DEFAULT, sink.clone());
         log(&writer, "in flight\n");
         sink.until_a_write_waits();
         let queued: Vec<String> = (1..=10).map(|n| format!("queued {n}\n")).collect();

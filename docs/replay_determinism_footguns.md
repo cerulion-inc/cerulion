@@ -220,11 +220,12 @@ rank**: one runtime per rank, one at a time, each driven to its OWN recorded
 `STEP_BOUNDARY` targets, because a free-run run's ranks share only the GO epoch
 and cross-rank equality does not hold by design.
 
-The verdict says which contract it applied, on both surfaces, always:
+The `--report` JSON's `coordination` block always says which contract the
+replay applied (`{"mode": "free_run" | "lockstep", "inferred": true | false}`).
+The terminal, on both surfaces (`--verify` and a bare `--resim`), prints a line
+only when the contract was inferred, because the bag carries no stamp:
 
 ```text
-coordination: free_run (per-rank boundary streams + read-log agreement; cross-rank lockstep equality not applicable)
-coordination: lockstep
 coordination: lockstep (inferred: no coordination stamp)
 ```
 
@@ -252,8 +253,9 @@ ASSERT on the partial order the read log does record (credit conservation must
 hold under SOME legal interleave). Loud on violation, never a gate.
 
 **Scope.** A bag can carry a cross-process `block` edge: plan time accepts a
-CREDITABLE split (one in-graph producer, no non-`block` consumers), the
-supervisor mints the edge a cross-process credit word, and `graph run --record`
+CREDITABLE split (exactly one in-graph producer, one word per split `block`
+consumer) whose split `block` input sets no `block_timeout_ms`, the supervisor
+mints the edge a cross-process credit word, and `graph run --record`
 of that deployment writes one.
 
 **Replay REFUSES that bag, at exit 5.** `replay_engine` builds each rank's

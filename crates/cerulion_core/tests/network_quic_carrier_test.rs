@@ -78,7 +78,7 @@ fn frame(seq: u64) -> Vec<u8> {
 
 /// A listener on `locator` presenting `cert` / `key`, with `/q/be` best effort.
 fn producer(locator: &str, cert: &Path, key: &Path) -> NetworkManager {
-    NetworkManager::new(NetworkConfig {
+    let manager = NetworkManager::new(NetworkConfig {
         listen_endpoints: vec![locator.to_string()],
         tls: Some(NetworkTls {
             certificate: Some(cert.to_path_buf()),
@@ -91,19 +91,23 @@ fn producer(locator: &str, cert: &Path, key: &Path) -> NetworkManager {
             send_queue: None,
         }],
         ..NetworkConfig::default()
-    })
+    });
+    manager.set_lan_access(cerulion_core::LanAccess::Open);
+    manager
 }
 
 /// A connector dialling `locator` that trusts `anchor`.
 fn consumer(locator: &str, anchor: &Path) -> NetworkManager {
-    NetworkManager::new(NetworkConfig {
+    let manager = NetworkManager::new(NetworkConfig {
         connect_endpoints: vec![locator.to_string()],
         tls: Some(NetworkTls {
             root_ca: Some(anchor.to_path_buf()),
             ..NetworkTls::default()
         }),
         ..NetworkConfig::default()
-    })
+    });
+    manager.set_lan_access(cerulion_core::LanAccess::Open);
+    manager
 }
 
 struct Pair {
@@ -251,6 +255,8 @@ fn quic_mixed_rel_puts_each_topic_at_its_effective_reliability() {
                 ..NetworkConfig::default()
             }),
         };
+        p.producer.set_lan_access(cerulion_core::LanAccess::Open);
+        p.consumer.set_lan_access(cerulion_core::LanAccess::Open);
         p.producer.session().expect("a quic/ listener opens");
         let marker = |r: &str| match r {
             "best_effort" => Reliability::BestEffort,
@@ -358,6 +364,7 @@ fn quic_tls_path_that_does_not_exist_fails_the_open_naming_it() {
         }),
         ..NetworkConfig::default()
     });
+    m.set_lan_access(cerulion_core::LanAccess::Open);
     let err = m
         .session()
         .expect_err("missing root_ca refuses the open")
@@ -380,6 +387,7 @@ fn quic_tls_file_without_a_pem_block_fails_the_open_naming_it() {
         }),
         ..NetworkConfig::default()
     });
+    m.set_lan_access(cerulion_core::LanAccess::Open);
     let err = m
         .session()
         .expect_err("a non-PEM file refuses the open")

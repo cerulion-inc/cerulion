@@ -171,6 +171,7 @@ impl NodeEntry for NoReadTriggerConsumer {
                 depth: 10,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(30),
+                accumulate: false,
                 consume: Default::default(),
             }],
             Vec::new(),
@@ -230,6 +231,7 @@ impl NodeEntry for DrainExpectConsumer {
                 depth: 10,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: Some(30),
+                accumulate: false,
                 consume: Default::default(),
             }],
             Vec::new(),
@@ -291,6 +293,7 @@ fn consumer_def(id: &str, node_type: &str) -> NodeDef {
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: "prod/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }

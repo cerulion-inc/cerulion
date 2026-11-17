@@ -1,54 +1,203 @@
-// A node is a LIBRARY the runtime loads — log with `tracing`,
-// never `println!`. (Your own #[cfg(test)] tests may print.)
+// A node is a library loaded by the runtime. Use tracing for diagnostics.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use cerulion_core::graph::node_plugin_abi::{HostClient, NodeContext, NodeExports, PluginNode};
+use cerulion_core::node_abi as abi;
 
 struct RawFfiTemplateState {
+    context: Option<NodeContext>,
+    client: HostClient,
     tick_count: u64,
 }
 
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
-static NODES: Mutex<Option<HashMap<u64, RawFfiTemplateState>>> = Mutex::new(None);
-
-thread_local! {
-    static LAST_ERROR: ::std::cell::RefCell<Option<::std::ffi::CString>> = const { ::std::cell::RefCell::new(None) };
-}
-
-fn __cer_set_last_error(msg: ::std::string::String) {
-    let cstring = ::std::ffi::CString::new(msg.replace('\0', "\\0"))
-        .unwrap_or_else(|_| ::std::ffi::CString::new("error message contained nul byte").unwrap());
-    LAST_ERROR.with(|cell| {
-        *cell.borrow_mut() = Some(cstring);
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_abi_version() -> u32 {
-    ::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_rustc_fingerprint() -> *const ::std::ffi::c_char {
-    ::cerulion_core::rustc_fingerprint_cstr()
-}
-
-// KEEP THIS. The host loader calls it before init so a stock-iceoryx2
-// build of this library is refused at load on Android (see docs/android.md).
-// A raw-FFI library without this export does not load on Android.
-#[no_mangle]
-pub extern "C" fn cerulion_node_platform_check() -> i32 {
-    match ::cerulion_core::graph::node::cdylib_platform_check() {
-        ::std::result::Result::Ok(()) => 0,
-        ::std::result::Result::Err(error) => {
-            __cer_set_last_error(::std::format!("node library: {error}"));
-            1
+impl PluginNode for RawFfiTemplateState {
+    fn create(client: HostClient, _params: &[u8]) -> cerulion_core::TransportResult<Self> {
+        let info = cerulion_core::graph::node::DylibNodeEntry::parse_info_json_labeled(
+            std::str::from_utf8(&INFO_BYTES[..INFO_BYTES.len() - 1]).map_err(|error| {
+                cerulion_core::TransportError::GraphError {
+                    reason: error.to_string(),
+                }
+            })?,
+            "raw node",
+        )
+        .map_err(|reason| cerulion_core::TransportError::GraphError { reason })?;
+        let context = NodeContext::new(client.clone(), &info)?;
+        let rust_log = context.env_opt("RUST_LOG");
+        cerulion_core::graph::node::install_cdylib_stderr_tracing(rust_log.as_deref());
+        cerulion_core::tracing::warn!(
+            "raw node template contains no application logic; implement tick before running"
+        );
+        if let Some(error) = client.take_failure() {
+            return Err(error);
         }
+        Ok(Self {
+            context: Some(context),
+            client,
+            tick_count: 0,
+        })
+    }
+    fn flush_deferred(&self) -> cerulion_core::TransportResult<()> {
+        self.client.flush_deferred()
+    }
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        // Replace this body with application logic over the local context.
+        self.tick_count = self.tick_count.wrapping_add(1);
+        Ok(())
+    }
+    fn shutdown(&mut self) -> cerulion_core::TransportResult<()> {
+        if let Some(context) = &self.context {
+            context.shutdown_signal().request();
+        }
+        self.context = None;
+        Ok(())
+    }
+    fn state_shape() -> u64 {
+        0
+    }
+    fn capture(
+        &self,
+        _sink: &mut dyn cerulion_core::state::StateSink,
+    ) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+    fn restore(&mut self, payload: &[u8]) -> cerulion_core::TransportResult<()> {
+        if payload.is_empty() {
+            Ok(())
+        } else {
+            Err(cerulion_core::TransportError::GraphError {
+                reason: "raw template declares no restorable state".into(),
+            })
+        }
+    }
+    fn inline_safe(&self) -> bool {
+        true
+    }
+    fn probe(&self) -> bool {
+        true
+    }
+    fn external_source(&mut self) -> cerulion_core::TransportResult<abi::ExternalSourceV1> {
+        Ok(abi::ExternalSourceV1 {
+            fd: -1,
+            kind: abi::external::HOST_DRIVEN,
+            flags: 0,
+        })
     }
 }
 
+static NODES: std::sync::OnceLock<NodeExports<RawFfiTemplateState>> = std::sync::OnceLock::new();
+fn nodes() -> &'static NodeExports<RawFfiTemplateState> {
+    NODES.get_or_init(Default::default)
+}
+
+unsafe extern "C" fn create(
+    host: *const abi::HostApiV1,
+    context: abi::ContextHandle,
+    params: abi::Bytes,
+    output: *mut abi::NodeHandle,
+) -> abi::Status {
+    // SAFETY: the host lends its immutable checked table, parameters and exclusive
+    // output for this call. NodeExports validates them before any node effect.
+    unsafe { nodes().create(host, context, params, output, 0) }
+}
+unsafe extern "C" fn tick(handle: abi::NodeHandle) -> abi::Status {
+    nodes().tick(handle)
+}
+unsafe extern "C" fn shutdown(handle: abi::NodeHandle) -> abi::Status {
+    nodes().shutdown(handle)
+}
+unsafe extern "C" fn destroy(handle: abi::NodeHandle) -> abi::Status {
+    nodes().destroy(handle)
+}
+unsafe extern "C" fn copy_error(
+    token: u64,
+    target: abi::MutableBytes,
+    required: *mut u64,
+) -> abi::Status {
+    // SAFETY: caller owns bounded writable storage and the output scalar for this
+    // synchronous call. NodeExports checks bounds and copies node-owned text.
+    unsafe { nodes().copy_error(token, target, required) }
+}
+unsafe extern "C" fn query_extension(
+    _id: u64,
+    _version: u32,
+    _output: *mut abi::ExtensionDescriptorV1,
+) -> abi::Status {
+    abi::Status {
+        code: abi::status_code::UNSUPPORTED,
+        ..Default::default()
+    }
+}
+unsafe extern "C" fn external_source(
+    handle: abi::NodeHandle,
+    output: *mut abi::ExternalSourceV1,
+) -> abi::Status {
+    // SAFETY: caller owns the aligned output scalar through this synchronous
+    // query; NodeExports checks it before invoking the local node.
+    unsafe { nodes().external(handle, output) }
+}
+static EXTERNAL: abi::ExternalApiV1 = abi::ExternalApiV1 {
+    header: abi::TableHeaderV1::for_type::<abi::ExternalApiV1>(),
+    describe: external_source,
+};
+unsafe extern "C" fn state_shape(output: *mut u64) -> abi::Status {
+    // SAFETY: exclusive host scalar is borrowed synchronously; NodeExports
+    // checks alignment before writing the node's declared shape.
+    unsafe { nodes().shape(output) }
+}
+unsafe extern "C" fn capture_state(
+    handle: abi::NodeHandle,
+    sink: *const abi::StateSinkV1,
+    capacity: u64,
+) -> abi::Status {
+    // SAFETY: the checked host sink and its context remain live only for this
+    // synchronous capture, including every borrowed encoder byte span.
+    unsafe { nodes().capture(handle, sink, capacity) }
+}
+unsafe extern "C" fn restore_state(handle: abi::NodeHandle, payload: abi::Bytes) -> abi::Status {
+    // SAFETY: initialized host bytes stay borrowed for this call; NodeExports
+    // validates the span before the node-local decoder reads it.
+    unsafe { nodes().restore(handle, payload) }
+}
+unsafe extern "C" fn inline_safe(handle: abi::NodeHandle, output: *mut u32) -> abi::Status {
+    // SAFETY: caller owns the aligned exclusive result slot through this query.
+    unsafe { nodes().inline_safe(handle, output) }
+}
+unsafe extern "C" fn probe(handle: abi::NodeHandle) -> abi::Status {
+    nodes().probe(handle)
+}
+static STATE: abi::StateApiV1 = abi::StateApiV1 {
+    header: abi::TableHeaderV1::for_type::<abi::StateApiV1>(),
+    shape: state_shape,
+    capture: capture_state,
+    restore: restore_state,
+    inline_safe,
+    probe,
+};
+static API: std::sync::OnceLock<&'static abi::NodeApiV1> = std::sync::OnceLock::new();
+static METADATA: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+fn node_api() -> *const abi::NodeApiV1 {
+    *API.get_or_init(|| {
+        let metadata = METADATA.get_or_init(__cer_raw_wire_metadata).as_bytes();
+        Box::leak(Box::new(abi::NodeApiV1 {
+            header: abi::TableHeaderV1::for_type::<abi::NodeApiV1>(),
+            metadata: abi::Bytes {
+                ptr: metadata.as_ptr(),
+                len: metadata.len() as u64,
+            },
+            required_host_capabilities: abi::capability::STATE,
+            capabilities: abi::capability::STATE | abi::capability::EXTERNAL,
+            create,
+            tick,
+            shutdown,
+            destroy,
+            copy_error,
+            query_extension,
+            state: &STATE,
+            external: &EXTERNAL,
+        }))
+    }) as *const _
+}
+cerulion_core::node_abi::export_node_api!(node_api);
 // CERULION:INFO_START
 static INFO_BYTES: &[u8] = b"{\"inputs\":[],\"outputs\":[]}\0";
 
@@ -58,181 +207,11 @@ pub extern "C" fn cerulion_node_info() -> *const std::ffi::c_char {
     // Casting *const u8 to *const c_char is safe: identical layout, valid and 'static.
     INFO_BYTES.as_ptr() as *const std::ffi::c_char
 }
+
+fn __cer_raw_wire_metadata() -> std::ffi::CString {
+    let base = std::ffi::CStr::from_bytes_with_nul(INFO_BYTES)
+        .expect("static metadata has one trailing NUL");
+    cerulion_core::graph::node_plugin_abi::raw_metadata(base, &[], &[])
+        .expect("raw schema facts match declared ports")
+}
 // CERULION:INFO_END
-
-// =================================================================
-// NOTE TO USERS REPLACING THE PLACEHOLDER BODY
-// =================================================================
-// The template's tick body is a no-op counter (`tick_count += 1`) and
-// CANNOT FAIL. As a result, this raw-FFI template DOES NOT EMIT:
-//   - `init failed: {e}` / `tick failed: {e}` Err-propagation wiring
-//     (the placeholder body has no `Result<_, _>` return).
-//   - `std::panic::catch_unwind(...)` panic-safety wrapper around
-//     init/tick/shutdown (the placeholder body cannot panic).
-//
-// If your real logic CAN return Err OR CAN panic, you MUST either:
-//   1. Migrate to `#[cerulion_node]` (drop `--raw-ffi` from
-//      `cerulion node create`) — the recommended path; the macro
-//      carries full panic-safety + Err propagation with no extra wiring.
-//   2. Hand-roll the equivalent wiring in every entry point below:
-//      wrap the body in `catch_unwind`, and on the error path call
-//      `__cer_set_last_error(format!("init failed: {}", e))` before
-//      returning the matching non-success code.
-//
-// Unwinding across the FFI boundary aborts the process (and was
-// undefined behaviour on older toolchains pre-Rust-1.71). Either way,
-// a panic must NOT cross the cdylib boundary back into the host.
-// Failing to translate Err to LAST_ERROR silently strips the diagnostic
-// — the host falls back to a generic "no detail provided" message that
-// is nearly impossible to debug from operator logs.
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
-    if ctx_ptr.is_null() {
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_init: NodeContext pointer was null",
-        ));
-        return 0;
-    }
-    // SAFETY: `ctx_ptr` is a `NodeContext` the runtime boxed and handed to
-    // this cdylib. Ownership transferred with it — the runtime will not free
-    // it — so pairing with `Box::from_raw` is required to avoid leaking one
-    // `NodeContext` per init call. This placeholder body doesn't use
-    // transport, so dropping the context at end of scope is the correct
-    // behavior. A node written with `#[cerulion_node]` instead STORES the
-    // boxed context so it can publish / subscribe — and so should you, once
-    // this node does real work.
-    let ctx = unsafe {
-        ::std::boxed::Box::from_raw(ctx_ptr as *mut ::cerulion_core::graph::node::NodeContext)
-    };
-
-    // KEEP THIS, and keep it in `init`. A cdylib statically links its OWN
-    // copy of `iceoryx2-log`, whose level is a private static: the host
-    // process setting `IOX2_LOG_LEVEL` does NOTHING for this copy, so
-    // without this call iceoryx2 logs from THIS node at its crate default
-    // (`Info`) no matter what you configured. That is not cosmetic — a node
-    // logging at `Info` on a busy robot can emit thousands of lines a second
-    // and fill the disk. The value comes from the node's FROZEN env
-    // snapshot, never live `std::env`, so replay stays deterministic; empty
-    // means unset, which leaves Cerulion's default (`error`). Nodes written
-    // with `#[cerulion_node]` get this generated for them.
-    {
-        let iox2_log = ctx.env_str("IOX2_LOG_LEVEL", "");
-        ::cerulion_core::iceoryx_logger::init_iceoryx_log_level(if iox2_log.is_empty() {
-            ::std::option::Option::None
-        } else {
-            ::std::option::Option::Some(iox2_log.as_str())
-        });
-    }
-
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut guard) = NODES.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(handle, RawFfiTemplateState { tick_count: 0 });
-        handle
-    } else {
-        // Mutex poisoned: do NOT recover via `into_inner()` — a panic
-        // while holding the lock can leave per-node state inconsistent.
-        // Surface code + LAST_ERROR; let the host decide to restart.
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_init: NODES mutex poisoned",
-        ));
-        0
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
-    if let Ok(mut guard) = NODES.lock() {
-        match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-            Some(state) => {
-                state.tick_count += 1;
-                0
-            }
-            None => {
-                __cer_set_last_error(format!("cerulion_node_tick: handle {} not found", handle));
-                4
-            }
-        }
-    } else {
-        // Mutex poisoned: do NOT recover via `into_inner()` — see init.
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_tick: NODES mutex poisoned",
-        ));
-        3
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
-    if let Ok(mut guard) = NODES.lock() {
-        match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-            Some(_state) => {
-                // Placeholder node has no publishers — nothing to re-pump.
-                0
-            }
-            None => {
-                __cer_set_last_error(format!(
-                    "cerulion_node_pump_history: handle {} not found",
-                    handle
-                ));
-                4
-            }
-        }
-    } else {
-        // Mutex poisoned: do NOT recover via `into_inner()` — see init.
-        __cer_set_last_error(::std::string::String::from(
-            "cerulion_node_pump_history: NODES mutex poisoned",
-        ));
-        3
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
-    let mut guard = match NODES.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            // Mutex poisoned: do NOT recover via `into_inner()` — see init.
-            __cer_set_last_error(::std::string::String::from(
-                "cerulion_node_shutdown: NODES mutex poisoned",
-            ));
-            return 3;
-        }
-    };
-    match guard.as_mut().and_then(|m| m.remove(&handle)) {
-        Some(_node) => 0,
-        None => {
-            __cer_set_last_error(format!(
-                "cerulion_node_shutdown: handle {} not found (already shut down or never registered)",
-                handle
-            ));
-            4
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn cerulion_take_last_error() -> *mut std::ffi::c_char {
-    LAST_ERROR.with(|cell| match cell.borrow_mut().take() {
-        Some(cstr) => cstr.into_raw(),
-        None => std::ptr::null_mut(),
-    })
-}
-
-/// # Safety
-///
-/// `ptr` must be a pointer previously returned by
-/// `cerulion_take_last_error` from this same cdylib (allocator pairing
-/// requirement). Null is permitted and is a no-op. Calling with any
-/// other pointer is undefined behaviour.
-#[no_mangle]
-pub unsafe extern "C" fn cerulion_free_error(ptr: *mut std::ffi::c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: pointer originated from `CString::into_raw` in
-    // `cerulion_take_last_error`. Reclaiming via `from_raw`
-    // returns ownership and the CString drops here.
-    let _ = ::std::ffi::CString::from_raw(ptr);
-}

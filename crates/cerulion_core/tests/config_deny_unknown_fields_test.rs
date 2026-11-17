@@ -369,6 +369,17 @@ const PORT_ENTRY_SCAN: WarnScope = WarnScope {
 /// pre-authorisation for future drift.
 const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
     (
+        "cerulion_core/src/graph/node_dylib_abi.rs", "PortFact",
+        Classification::ExemptWithReason,
+        "generated internal ABI wire facts share the canonical author metadata; the canonical parser reports unknown author fields and this view must ignore unrelated port fields",
+    ),
+    (
+        "cerulion_core/src/graph/node_dylib_abi.rs", "PortFacts",
+        Classification::ExemptWithReason,
+        "generated ABI metadata envelope has author policy and params fields parsed by the canonical parser; this partial view extracts only validated wire facts",
+    ),
+
+    (
         "cerulion_cli_engine/src/graph_cmd.rs",
         "GatewayZenohMode",
         Classification::ExemptWithReason,
@@ -437,6 +448,13 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
         },
         "`#[serde(untagged)]` — cannot deny (see `InputJson`); its unknown keys \
          are reported against `LEGAL_OUTPUT_KEYS` by the same walk",
+    ),
+    (
+        "cerulion_core/src/graph/config.rs",
+        "InputBackpressure",
+        Classification::ExemptWithReason,
+        "NO NAMED FIELDS to deny: a unit-variant enum (`block` / `drop_oldest`), so \
+         serde's variant matcher already rejects an unknown VALUE loudly",
     ),
     (
         "cerulion_core/src/graph/node.rs",

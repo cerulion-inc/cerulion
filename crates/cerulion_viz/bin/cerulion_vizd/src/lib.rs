@@ -62,6 +62,8 @@ pub mod runs;
 pub mod sample;
 pub mod telemetry;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub use daemon::ProvenanceGatherHold;
 pub use daemon::{
     start_on_socket, start_with_demand_plane, start_with_planes, ControlSocket, DemandPlane,
     NetdDemandPlane, RunningDaemon, DEFAULT_POLL_INTERVAL, MAX_REQUEST_LINE_BYTES,

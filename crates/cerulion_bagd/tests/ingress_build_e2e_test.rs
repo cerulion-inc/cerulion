@@ -1100,6 +1100,7 @@ fn a_bound_run_ending_mid_build_is_recorded_as_such_not_as_an_interruption() {
     let run = RunHandle::publish_on_config(
         &mgr.iox_config(),
         RunRecord {
+            remote_visible: true,
             run_id,
             graph_name: "go2_attach".to_string(),
             run_dir: std::env::temp_dir().to_string_lossy().into_owned(),

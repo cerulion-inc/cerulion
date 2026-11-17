@@ -364,6 +364,9 @@ fn run_tf_cross_manager_flow(tag: &str, plan: &[(u64, Vec<u8>)]) -> Vec<Received
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init manager A");
+        a.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         // The producer publisher creates the topic's SHM service (the gateway
         // taps it). Created BEFORE the gateway boots.
         let a_pub = a
@@ -410,6 +413,10 @@ fn run_tf_cross_manager_flow(tag: &str, plan: &[(u64, Vec<u8>)]) -> Vec<Received
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager B");
+    b_transport
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
 
     // B's local subscriber first (connected before the ingress publisher's
     // first re-injected send), then the one-call ingress wiring keyed on the
@@ -672,6 +679,10 @@ network:
             cerulion_core::testing::iceoryx_test_config(),
         )
         .expect("init manager A");
+        mgr_a
+            .network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         let mut factories_a: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
         factories_a.insert("broadcaster".to_string(), Box::new(TfSourceEntry::new()));
         // Compute A's gateway plan from the parsed YAML block BEFORE the build
@@ -750,6 +761,10 @@ network:
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init manager B");
+    mgr_b
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let seen_tf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let seen_static = Arc::new(Mutex::new(Vec::<u8>::new()));
     let mut factories_b: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
