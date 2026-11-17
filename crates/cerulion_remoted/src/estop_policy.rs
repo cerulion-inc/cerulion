@@ -36,7 +36,8 @@ pub(crate) enum AfterAnswer {
     /// No engage arrived after the answered attempt began: the delivery ends.
     Done,
     /// An engage arrived after the answered attempt began: the delivery sends
-    /// the `estop` once more.
+    /// the `estop` once more, or, when it ends first, its mark logs that the
+    /// `estop` owed to that engage was not sent.
     Again,
 }
 

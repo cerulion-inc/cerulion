@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -96,8 +97,15 @@ def test_host_pynode_loans_builtin_output_without_workspace_schemas():
         text=True,
         env=_node_env("builtin"),
     )
-    assert result.stdout.splitlines() == [
-        "node_info={\"inputs\":[],\"outputs\":[{\"name\":\"out\",\"schema_hash\":15293913555552287199,\"max_slice_len_default\":64,\"promise_within_ms\":null,\"wire_fixed_size\":24}],\"policy\":{\"period_ms\":1}}",
+    lines = result.stdout.splitlines()
+    assert json.loads(lines[0].removeprefix("node_info=")) == {
+        "inputs": [],
+        "outputs": [{"name": "out", "schema_hash": 15293913555552287199,
+                     "max_slice_len_default": 64, "promise_within_ms": None,
+                     "wire_fixed_size": 24}],
+        "policy": {"period_ms": 1},
+    }
+    assert lines[1:] == [
         "tick=0 code=0 out=000000000000f83f00000000000000c0000000000000d03f",
         "shutdown code=0",
     ]
@@ -232,14 +240,14 @@ def test_two_node_types_share_one_process():
     # Both fixtures import a sibling `helpers.py` of their own inside tick();
     # the doubler's lines below are its own helper's arithmetic, so a host that
     # served the counter's cached `helpers` to the doubler would print 1 and 3.
-    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
-    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_counter" + DYLIB)
+    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_doubler" + DYLIB)
     result = subprocess.run(
         [FIXTURE, "host-pynode", counter, "2", "--also", doubler],
         check=True,
         capture_output=True,
         text=True,
-        env=_node_env("counter"),
+        env=_shared_node_env(),
     )
     ticks = [line for line in result.stdout.splitlines() if line.startswith("tick=")]
     assert ticks == [
@@ -291,12 +299,120 @@ def test_extra_thread_warning_is_latched():
     assert result.stderr.count("additional threads") == 1
 
 
+def test_stable_python_adapter_delivers_oracle_frames_and_host_sequences():
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
+    expected = [
+        "tick=0 code=0 out=0100000000000000 seq=41",
+        "tick=1 code=0 out=0300000000000000 seq=42",
+        "tick=2 code=0 out=0500000000000000 seq=43",
+    ]
+    for _ in range(2):
+        result = subprocess.run([FIXTURE, "host-pynode", counter, "3", "--seed", "41"],
+                                capture_output=True, text=True, check=True, env=_node_env("counter"))
+        metadata = _bootstrap_metadata("counter")
+        assert metadata["inputs"][0]["schema_hash"] == 15583965953746584896
+        assert metadata["inputs"][0]["wire_fixed_size"] == 8
+        assert metadata["inputs"][0]["variable_count"] == 0
+        assert metadata["inputs"][0]["alignment"] == 8
+        assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == expected
+
+
+class _Status(ctypes.Structure):
+    _fields_ = [("error", ctypes.c_uint64), ("code", ctypes.c_uint32), ("kind", ctypes.c_uint32)]
+
+
+class _TableHeader(ctypes.Structure):
+    _fields_ = [("layout_id", ctypes.c_uint64), ("size_bytes", ctypes.c_uint32), ("major", ctypes.c_uint32)]
+
+
+class _Bytes(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_uint64)]
+
+
+class _NodeApi(ctypes.Structure):
+    _fields_ = [("header", _TableHeader), ("metadata", _Bytes),
+                ("required", ctypes.c_uint64), ("capabilities", ctypes.c_uint64)] + [
+                    (name, ctypes.c_void_p) for name in
+                    ("create", "tick", "shutdown", "destroy", "copy_error", "query_extension", "state", "external")]
+
+
+def _bootstrap_metadata(name, env=None):
+    # A fresh process resolves workspace schemas before the metadata OnceLock
+    # is initialized; the in-process ctypes tests deliberately have no workspace.
+    path = os.path.join(PYNODE_DIR, "release", f"libcerulion_pynode_{name}{DYLIB}")
+    script = """
+import ctypes, runpy, sys
+namespace = runpy.run_path(sys.argv[1])
+library = ctypes.CDLL(sys.argv[2])
+library.cerulion_node_api_v1.restype = ctypes.POINTER(namespace["_NodeApi"])
+api = library.cerulion_node_api_v1().contents
+assert api.header.major == 1
+assert api.header.size_bytes == ctypes.sizeof(namespace["_NodeApi"])
+print(ctypes.string_at(api.metadata.ptr, api.metadata.len).decode())
+"""
+    result = subprocess.run([sys.executable, "-c", script, __file__, path],
+                            check=True, capture_output=True, text=True,
+                            env=env or _node_env(name), timeout=60)
+    return json.loads(result.stdout)
+
+
+def _shared_node_env():
+    env = _node_env("shared")
+    for name, schema_hash, fixed_size in (
+        ("shared_counter", 15583965953746584896, 8),
+        ("shared_doubler", 9549963880961276720, 4),
+        ("shared_errors", 9549963880961276720, 4),
+    ):
+        metadata = _bootstrap_metadata(name, env)
+        for direction in ("inputs", "outputs"):
+            for port in metadata[direction]:
+                assert (port["schema_hash"], port["wire_fixed_size"],
+                        port["variable_count"], port["alignment"]) == (
+                            schema_hash, fixed_size, 0, 8
+                        ), (name, direction, port)
+    return env
+
+
+def test_python_maintenance_exports_are_absent():
+    library = _counter_library()
+    for name in ("pump_history", "set_snapshot_inputs", "snapshot_inputs",
+                 "drain_trigger_input", "refill_trigger_input", "sync_head_op"):
+        assert not hasattr(library, f"cerulion_node_{name}")
+
+
+def test_stable_python_bootstrap_refuses_null_host_and_stale_handles():
+    library = _counter_library()
+    library.cerulion_node_api_v1_stabbied_v3_report.restype = ctypes.c_void_p
+    assert library.cerulion_node_api_v1_stabbied_v3_report()
+    assert library.cerulion_node_api_v1_stabbied_v3
+    library.cerulion_node_api_v1.restype = ctypes.POINTER(_NodeApi)
+    pointer = library.cerulion_node_api_v1()
+    assert pointer
+    api = pointer.contents
+    assert api.header.major == 1
+    assert api.header.size_bytes == ctypes.sizeof(_NodeApi)
+    assert api.header.layout_id != 0
+    assert api.capabilities == api.required == 0
+    assert api.state is None and api.external is None
+    raw_metadata = ctypes.string_at(api.metadata.ptr, api.metadata.len)
+    assert b"\0" not in raw_metadata
+    assert json.loads(raw_metadata)["retain_process"] is True
+    create = ctypes.CFUNCTYPE(_Status, ctypes.c_void_p, ctypes.c_uint64, _Bytes,
+                              ctypes.POINTER(ctypes.c_uint64))(api.create)
+    handle = ctypes.c_uint64(999)
+    assert create(None, 1, _Bytes(None, 0), ctypes.byref(handle)).code == 5
+    assert handle.value == 0
+    for name in ("tick", "shutdown", "destroy"):
+        operation = ctypes.CFUNCTYPE(_Status, ctypes.c_uint64)(getattr(api, name))
+        assert operation(0).code == operation(999).code == 4
+
+
 def _counter_library():
     path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
     library = ctypes.CDLL(path)
     library.cerulion_node_init.argtypes = [ctypes.c_void_p]
     library.cerulion_node_init.restype = ctypes.c_uint64
-    for name in ("cerulion_node_tick", "cerulion_node_pump_history", "cerulion_node_shutdown"):
+    for name in ("cerulion_node_tick", "cerulion_node_shutdown"):
         function = getattr(library, name)
         function.argtypes = [ctypes.c_uint64]
         function.restype = ctypes.c_int
@@ -322,8 +438,6 @@ def test_counter_abi_error_arms_report_stable_codes_and_errors():
     assert _last_error(library).startswith("cerulion_node_init: NodeContext pointer was null")
     assert library.cerulion_node_shutdown(999) == 4
     assert _last_error(library).startswith("handle 999 not found")
-    assert library.cerulion_node_pump_history(999) == 4
-    assert _last_error(library).startswith("handle 999 not found")
 
 
 def test_shutdown_exception_reports_error_code():
@@ -338,14 +452,14 @@ def test_interleaved_node_types_each_import_their_own_helpers():
     # schedules them, and each tick imports `helpers` afresh: the counter's
     # tick after the doubler's must still get the counter's helper (2n+1), the
     # doubler's after the counter's its own (2n).
-    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
-    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_counter" + DYLIB)
+    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_doubler" + DYLIB)
     result = subprocess.run(
         [FIXTURE, "host-pynode", counter, "2", "--also", doubler, "--interleave"],
         check=True,
         capture_output=True,
         text=True,
-        env=_node_env("counter"),
+        env=_shared_node_env(),
     )
     assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
         "tick=0 code=0 out=0100000000000000",
@@ -364,13 +478,13 @@ def test_shutdown_runs_with_the_node_types_own_helpers():
     # last and the counter shuts down first. The harness prints one
     # `shutdown` line per node, so two `code=0` lines prove both hooks ran
     # and returned.
-    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
-    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_doubler" + DYLIB)
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_counter" + DYLIB)
+    doubler = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_doubler" + DYLIB)
     result = subprocess.run(
         [FIXTURE, "host-pynode", counter, "2", "--also", doubler, "--interleave"],
         capture_output=True,
         text=True,
-        env=_node_env("counter"),
+        env=_shared_node_env(),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     lines = result.stdout.splitlines()
@@ -413,9 +527,9 @@ def test_variable_length_output_is_written_through_element_counts():
     ]
 
 
-def test_snapshot_exports_hold_the_last_input_on_quiet_ticks():
+def test_host_snapshots_hold_the_last_input_on_quiet_ticks():
     # The scheduler freezes a periodic node's inputs at every step boundary
-    # through the snapshot exports; with one input frame and three ticks the
+    # through host-owned snapshots; with one input frame and three ticks the
     # node reads that frame on every tick. Without the freeze (the control
     # run) the quiet ticks read None and publish nothing.
     counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
@@ -446,9 +560,9 @@ def test_snapshot_exports_hold_the_last_input_on_quiet_ticks():
     ]
 
 
-def test_sync_head_exports_fill_and_probe_each_input():
-    # The loader resolves the trigger drain and Sync head-op exports by
-    # presence: a boundary fill on a tick with a new frame answers Head and the
+def test_host_sync_heads_fill_and_probe_each_input():
+    # Host-owned trigger drain and Sync head operations inspect each port:
+    # a boundary fill on a tick with a new frame answers Head and the
     # tick reads that frame; a quiet tick answers Nothing and reads nothing.
     counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
     result = subprocess.run(
@@ -505,9 +619,9 @@ def test_a_cached_foreign_module_does_not_shadow_a_node_types_sibling(tmp_path):
     foreign = tmp_path / "foreign"
     foreign.mkdir()
     (foreign / "helpers.py").write_text("def transform(value):\n    return value * 1000\n")
-    errors = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
-    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_counter" + DYLIB)
-    env = _node_env("errors")
+    errors = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_errors" + DYLIB)
+    counter = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_shared_counter" + DYLIB)
+    env = _shared_node_env()
     env["CERULION_PYNODE_CASE"] = "import_foreign_helpers"
     env["CERULION_PY_PATH"] = os.pathsep.join([str(foreign), env["CERULION_PY_PATH"]])
     result = subprocess.run(
@@ -548,3 +662,63 @@ def test_failed_init_invalidates_a_retained_context():
     assert "RuntimeError: fixture init failure" in result.stderr
     assert "stale context answered" not in result.stderr
     assert "tick=0 code=0 out=00000000" in result.stdout, result.stdout
+
+
+def test_escaped_python_memoryview_survives_destroy_and_never_reuses_its_lease():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "retain_after_destroy"
+    result = subprocess.run([FIXTURE, "host-pynode-pinned", path],
+                            capture_output=True, text=True,
+                            env=env, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "pinned after_destroy=1 outstanding=1 refused=9" in result.stdout
+    assert "pinned after_unload=1 bytes=d4c3b2a1 outstanding=1" in result.stdout
+
+
+def test_python_node_error_reason_crosses_the_stable_slot_exactly():
+    result = _run("errors", "retain_loan", ticks=1)
+    assert result.returncode == 0, result.stderr
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=1 err=output loan 'out' retained a buffer export at tick end out_frames=0"
+    ]
+
+
+def test_baked_node_directory_finds_workspace_schemas_without_the_variable():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env.pop("CERULION_WORKSPACE", None)
+    env["CERULION_PYNODE_CASE"] = "workspace_fallback"
+    for _ in range(2):
+        result = subprocess.run([FIXTURE, "host-pynode", path, "2"],
+                                capture_output=True, text=True, env=env, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+            "tick=0 code=0 out=00000000", "tick=1 code=0 out=01000000"
+        ]
+        assert "panicked" not in result.stderr
+
+
+def test_stale_metadata_uses_the_init_diagnostic_without_a_bootstrap_panic():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_wrongmeta" + DYLIB)
+    result = subprocess.run([FIXTURE, "host-pynode", path, "1"],
+                            capture_output=True, text=True, env=_node_env("wrongmeta"), timeout=60)
+    assert result.returncode != 0
+    assert ("node metadata is stale for output 'out': INFO schema_hash "
+            "5093796653891464802, declaration 5093796653891464803; run `cerulion node build`"
+            in result.stderr)
+    assert "panicked" not in result.stderr
+
+
+def test_unwired_python_outputs_allow_init_and_two_graph_ticks():
+    path = os.path.join(PYNODE_DIR, "release", "libcerulion_pynode_errors" + DYLIB)
+    env = _node_env("errors")
+    env["CERULION_PYNODE_CASE"] = "unwired_output"
+    result = subprocess.run([FIXTURE, "host-pynode", path, "2", "--unwired-outputs"],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "unwired publisher_none=1" in result.stdout
+    assert [line for line in result.stdout.splitlines() if line.startswith("tick=")] == [
+        "tick=0 code=0 out=", "tick=1 code=0 out="
+    ]
+    assert "shutdown code=0" in result.stdout

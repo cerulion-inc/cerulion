@@ -170,11 +170,13 @@ impl Rank {
     /// Push warm-up anchors until the recorder has provably ADOPTED this ring,
     /// then push the ORACLE anchor and wait for that one to be consumed too.
     ///
-    /// A discovered ring is opened at the LIVE cursor (`open_at_live`) — the only
-    /// sound attach to a segment a live rank is writing into, since its head
-    /// anchor is partial by construction. The consequence is that anchors pushed
-    /// BEFORE the open are outside the recording's window, so a test that pushed
-    /// once up front would be asserting on records the recorder was right to skip.
+    /// The open policy decides which pushes a recording can hold: a from-start
+    /// recorder opens a discovered ring from record 0 and keeps every anchor, a
+    /// mid-run attach opens it at the LIVE cursor and skips the ones pushed
+    /// before the open. Pushing the oracle after adoption makes the arms that use
+    /// this helper hold under either policy; the policy itself is pinned by
+    /// `a_from_start_recorder_keeps_the_anchor_a_rank_published_before_discovery`
+    /// and its mid-run control.
     ///
     /// The rendezvous is the ring's own read cursor: `free_records` returns to
     /// full capacity exactly when the consumer's cursor has caught up with the
@@ -464,6 +466,144 @@ fn an_unarmed_recorder_adopts_nothing_even_with_the_rings_present() {
         state_coverage(&out).is_none(),
         "…and no state_coverage.json at all, so an ordinary bag stays byte-identical"
     );
+}
+
+// ===========================================================================
+// THE OPEN POLICY: from start unless the recorder attached mid-run
+// ===========================================================================
+
+/// One run of the open-policy pair: a rank arms and publishes ONE anchor at
+/// step 0 before the recorder exists, exactly as a `graph run --record` worker
+/// does (its step-0 anchor lands before the recorder's first discovery sweep),
+/// then the recorder discovers the ring and finalizes.
+///
+/// The rendezvous is the ring's own read cursor (`await_caught_up`): a
+/// from-start open catches up by DRAINING the anchor, a live-cursor open by
+/// jumping over it, so either way the recorder has provably adopted the ring
+/// before shutdown, and the only difference left between the two arms is the
+/// open policy.
+fn record_an_anchor_published_before_discovery(
+    label: &str,
+    attached_mid_run: bool,
+) -> (Vec<u8>, Vec<Vec<u8>>, StateCoverage) {
+    let mgr = make_manager(16);
+    let topic = unique_topic(label);
+    let out = unique_out(label);
+    let ready = unique_out(&format!("{label}_ready"));
+    let tag = unique_ring_tag(label);
+
+    let mut cfg = base_cfg(out.clone(), &topic, ready.clone());
+    cfg.state_ring_discovery_tag = Some(tag.clone());
+    cfg.attached_mid_run = attached_mid_run;
+    let _plane = graph_plane(&tag, 100);
+    let mut r0 = Rank::arm(&tag, 0, "n0");
+    let oracle = r0.anchor(0);
+
+    let mut pubr = publisher(&mgr, &topic, 4096);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handle = spawn_bagd(mgr.clone(), cfg, shutdown.clone());
+    assert!(wait_for_file(&ready, Duration::from_secs(10)), "bagd ready");
+    pubr.publish_raw(&build_frame(HASH, 0, 1_000, b"payload"))
+        .expect("publish");
+    assert!(
+        r0.await_caught_up(DISCOVERY_DEADLINE),
+        "the recorder must adopt the ring (its read cursor reaches the producer's)"
+    );
+    finish(handle, &shutdown);
+
+    let cov = state_coverage(&out).expect("an armed recording carries state_coverage.json");
+    (oracle, state_records(&out), cov)
+}
+
+/// A recorder present from the run's start keeps the anchor a rank published
+/// before the discovery sweep found its ring, so a bag of a run shorter than one
+/// anchor cadence still holds a complete step-0 anchor for every node and its
+/// checkpoint coverage is complete.
+///
+/// Opening a discovered ring at the live cursor instead dropped that anchor, so
+/// every `graph run --record` shorter than the cadence (15 s by default) wrote a
+/// bag whose nodes had NO anchor and warned "checkpoint coverage INCOMPLETE" on a
+/// correct run.
+#[test]
+#[serial_test::serial]
+fn a_from_start_recorder_keeps_the_anchor_a_rank_published_before_discovery() {
+    let (oracle, got, cov) = record_an_anchor_published_before_discovery("disc_from_start", false);
+
+    assert_eq!(
+        got,
+        vec![oracle],
+        "the step-0 anchor published before discovery must be the bag's one state record"
+    );
+    let node = &cov.nodes["n0"];
+    assert_eq!(node.anchors_complete, 1, "{cov:?}");
+    assert_eq!(node.last_complete_step, Some(0), "{cov:?}");
+    assert_eq!(
+        cov.head_records_discarded, 0,
+        "a ring read from record 0 discards no head records: {cov:?}"
+    );
+    assert!(!cov.attached_mid_run);
+    assert_eq!(cov.ranks_discovered, vec![0]);
+    assert_eq!(
+        cov.incomplete_reasons(),
+        Vec::new(),
+        "every node has an anchor, so the coverage is complete: {cov:?}"
+    );
+}
+
+/// Control: a MID-RUN attach still opens a discovered ring at its live cursor, so
+/// the same pre-discovery anchor is NOT in the bag and the verdict stays loud: a
+/// node with no anchor in a mid-run bag cannot be resumed from it.
+#[test]
+#[serial_test::serial]
+fn a_mid_run_attach_still_opens_a_discovered_ring_at_its_live_cursor() {
+    let (oracle, got, cov) = record_an_anchor_published_before_discovery("disc_mid_run", true);
+
+    assert!(
+        !got.contains(&oracle),
+        "an anchor published before a mid-run attach is outside its window"
+    );
+    assert!(got.is_empty(), "nothing was published after the attach");
+    assert!(cov.attached_mid_run);
+    assert_eq!(
+        cov.ranks_discovered,
+        vec![0],
+        "the ring was adopted, so the missing anchor is the open policy's doing"
+    );
+    assert_eq!(cov.nodes["n0"].anchors_complete, 0, "{cov:?}");
+    assert_eq!(
+        cov.incomplete_reasons(),
+        vec![cerulion_bagd::IncompleteReason::NodesWithoutAnchor],
+        "{cov:?}"
+    );
+}
+
+/// Determinism: two from-start recordings of the same hand-built anchor write
+/// the same state record and the same per-node coverage.
+///
+/// The ring names, tags and run ids differ per run by construction (each run
+/// gets a unique tag), so the comparison is over the fields a run does not name:
+/// the anchor bytes are compared against each run's own oracle, which carries its
+/// run id, and the coverage tallies against each other.
+#[test]
+#[serial_test::serial]
+fn two_from_start_recordings_of_one_anchor_agree() {
+    let (oracle_a, got_a, cov_a) = record_an_anchor_published_before_discovery("disc_det_a", false);
+    let (oracle_b, got_b, cov_b) = record_an_anchor_published_before_discovery("disc_det_b", false);
+    assert_eq!(got_a, vec![oracle_a]);
+    assert_eq!(got_b, vec![oracle_b]);
+    let tally = |c: &StateCoverage| {
+        let n = &c.nodes["n0"];
+        (
+            c.records,
+            c.head_records_discarded,
+            n.anchors_complete,
+            n.anchors_torn,
+            n.bytes,
+            n.last_complete_step,
+        )
+    };
+    assert_eq!(tally(&cov_a), tally(&cov_b));
+    assert_eq!(tally(&cov_a), (1, 0, 1, 0, 16, Some(0)));
 }
 
 // ===========================================================================
@@ -1106,12 +1246,10 @@ fn a_retained_ring_adoption_is_delivered_at_finalization_not_stranded() {
 
     // The rank arms LATE, is discovered, and its adoption is retained every sweep.
     let mut r1 = Rank::arm(&tag, 1, "n1");
-    // The ORACLE is pushed only after discovery has had time to open the ring. A
-    // discovered ring is opened AT THE LIVE CURSOR (the only sound attach to a segment
-    // a live rank is writing), so an anchor pushed before that open is deliberately
-    // outside the recording's window — the recorder would be RIGHT to skip it, and
-    // asserting on it would be asserting the wrong contract. Generous, and a LIVENESS
-    // bound only: more load means fewer sweeps in the window, never more.
+    // The ORACLE is pushed only after discovery has had time to open the ring, so
+    // the arm is about the retained hand-over and not about the open policy (a
+    // from-start recorder would keep an earlier anchor too). Generous, and a
+    // LIVENESS bound only: more load means fewer sweeps in the window, never more.
     std::thread::sleep(Duration::from_millis(1_500));
     let oracle = r1.anchor(11);
     std::thread::sleep(Duration::from_millis(500));
@@ -1245,8 +1383,8 @@ fn a_hand_off_the_channel_never_carried_still_reaches_the_bags_coverage() {
 
     // Rank 0 arms late and is discovered — its ADOPTION is retained.
     let mut r0 = Rank::arm(&tag, 0, "n0");
-    // The oracle is pushed only after discovery has opened the ring at its live
-    // cursor (same reasoning as the sibling arm above).
+    // The oracle is pushed only after discovery has opened the ring (same
+    // reasoning as the sibling arm above).
     std::thread::sleep(Duration::from_millis(1_500));
     let oracle = r0.anchor(13);
 

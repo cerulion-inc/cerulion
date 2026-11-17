@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A running eye beside a played recording. `bag play --resim` publishes the
-//! graph's asks and wrist frames from a transport whose node name begins
-//! `cerulion_replay_`, stamped by its replay clock at the recorded times, and
-//! `bag play` re-publishes recorded frames byte for byte from the node
-//! `cerulion_bag_play`, on the topics the eye reads. The eye tells them by
-//! their publisher's node, so however their stamps fall against the host
-//! clock (an hour back, an hour ahead, or a replay clock sweeping through
-//! now as an unpaced resim does), a played ask gets no request, no answer
+//! A running eye beside a played recording. `bag play` re-publishes recorded
+//! frames byte for byte from the node `cerulion_bag_play`, on the topics the
+//! eye reads. A publisher there whose node name begins `cerulion_replay_`,
+//! the name a resim's transport takes, reads as a replay too; the test drives
+//! one stamped by a replay clock at recorded times (a real resim runs on a
+//! private shared-memory namespace and never reaches the eye). The eye
+//! tells them by their publisher's node, so however their stamps fall
+//! against the host clock (an hour back, an hour ahead, or a replay clock
+//! sweeping through now), a played ask gets no request, no answer
 //! frame and no receipt with Jev on or off, and a played frame is never
 //! held. A live ask beside them is answered, and so is a live gate whose
 //! clock runs 2 s behind the host's, as a run resumed after a pause stamps.

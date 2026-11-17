@@ -6,6 +6,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
 
 ## Invariants
 
+- Exclude `/bagd/status` until reap; conflict: `--status-period-ms 0`. Display: no I/O.
 - bagd NEVER evicts: both `room == 0` arms in the tap drain WAIT. The loss
   boundary is the topic's own provisioned SHM queue depth, not recorder policy.
 - ONE write mode: payloads are copied into the MCAP chunk arena at drain, so
@@ -24,9 +25,8 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   over `connect_existing`) and verifies every served doc by recomputing its
   hash against the wire before naming a channel - a mismatch records
   `Unresolved`, never a wrong name.
-- A message emitted from code that cannot know which verb invoked it
-  (`cerulion bag record` vs `cerulion bagd`) names NO flag - the two verbs
-  spell their schema-wait/settle levers differently.
+- Code that cannot distinguish `cerulion bag record` from `cerulion bagd`
+  names NO flag: their schema-wait/settle flags differ.
 
 ## Testing
 
@@ -53,8 +53,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   co-tenant topics; the only bounds are `DISCOVERY_MAX_TAPS` + the env switch.
 - MULTI-PROCESS trace rings ride `!no_rings`, not `record` (single-process ones ride
   `--record`); either way read `run.json`/`trace_rings`, never infer one from the run shape.
-- Mid-run ring attach MUST use `open_at_live`; plain `open` refuses a lapped
-  ring. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
-
+- Mid-run attach MUST use `open_at_live` (`open` refuses a lapped ring); a from-start recorder
+  opens EVERY state ring with `open`. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
 Deep reference: docs/internals/recording.md - read before touching drain
 pacing, discovery/settle, coverage fields, or run binding.

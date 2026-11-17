@@ -217,6 +217,8 @@ TF_EXCLUDE=""
 TARGETS=(
     "crates/cerulion_core/src/transport|$TRANSPORT_EXCLUDE"
     "crates/cerulion_core/src/graph|$GRAPH_EXCLUDE"
+    "crates/cerulion_core/src/graph/node_plugin_abi|"
+    "crates/cerulion_core/src/graph/node_host_abi|"
     "crates/cerulion_core/src/scheduler|$SCHEDULER_EXCLUDE"
     "crates/cerulion_tf/src|$TF_EXCLUDE"
 )

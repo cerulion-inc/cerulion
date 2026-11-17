@@ -197,55 +197,39 @@ The module doc in `src/registry.rs` is the authority; the load-bearing facts:
 
 ## Generated cdylib FFI and ABI coupling
 
-`src/codegen.rs` emits the cdylib entry points (behind the `cdylib` feature). The
-loader side is `DylibNodeEntry` in `crates/cerulion_core/src/graph/node.rs`.
+`plugin_codegen.rs` also emits the optional checked `cerulion_node_api_v1`
+bootstrap with node-local lifecycle, state and external-source tables.
+`plugin_impl.rs` adapts the common rewritten init/tick/helper methods to
+`graph::node_plugin_abi` ports. Parameter defaults, metadata and trigger policy
+share the native emitters; both port directions include checked schema, fixed
+size, variable count and alignment facts.
 
-| Symbol | Role |
+Stable instances hold copied host callbacks and integer port/lease identities.
+The host retains transport, clocks, queues and sessions. Local schema writers
+publish only after the common success gate arms them. An adaptive spill is an
+explicit synchronous payload copy; the original lease stays live until the
+writer drops, then receives `SPILL_RELEASE`. Ordinary receive leases stay outside
+the callback view until the callback returns, so copied fixed readers remain
+valid after an early view drop. Accumulator views borrow the host's frozen fire
+batch. State sinks borrow chunks synchronously; accumulator
+records use the same canonical encoding as native state.
+
+`src/plugin_codegen.rs` emits the stable tables behind the node crate's `cdylib`
+feature. The loader is `DylibNodeEntry` in `graph/node_dylib_abi.rs`.
+
+| Boundary | Role |
 |---|---|
-| `cerulion_abi_version` | Returns `TransportKind::cdylib_abi_version()`: `CERULION_ABI_VERSION` for cross-process nodes, with the transport id above bit 16 for in-process nodes. A host built before the transport id rejects an in-process node as an ABI mismatch; a missing symbol is rejected. |
-| `cerulion_rustc_fingerprint` | Must return `RUSTC_FINGERPRINT` (ABI v22); the loader hard-rejects a mismatch or a missing symbol, checked immediately after `cerulion_abi_version`, because two different rustc releases can agree on every struct size and offset the ABI check proves and still encode a niche-holding `Option::None` differently. |
-| `cerulion_node_info` | Node metadata JSON (ports, policy, capabilities). Parsed host-side into `PolicyJson`; corrupt JSON refuses the load. |
-| `cerulion_node_init` / `cerulion_node_tick` / `cerulion_node_shutdown` / `cerulion_node_pump_history` | Lifecycle. Shared return-code semantics below. |
-| `cerulion_node_external_source` | External-trigger source classification (external nodes). |
-| `cerulion_node_set_snapshot_inputs` / `cerulion_node_snapshot_inputs` | OPTIONAL input-hold capability pair. |
-| `cerulion_node_drain_trigger_input` | OPTIONAL unified trigger-drain capability. |
-| `cerulion_node_probes_trigger_input` | OPTIONAL, handle-less `() -> i32`, read once at load as `NodeEntry::probes_trigger_input`. A positive return beside `cerulion_node_sync_head_op` declares that op code 0 of that export answers a `consume = latest` Data trigger input read through two subscribers from the subscriber the tick reads; the macro returns 1. Absent, zero or negative, or without the head-op export, the input is not probed: it fires on every counted arrival and the graph build names it. |
-| `cerulion_node_init_with_params` | OPTIONAL: `cerulion_node_init` plus the node's resolved `params:` as one UTF-8 JSON object (`params_to_json`). Shares one body with `cerulion_node_init`; the host calls it instead of the plain init when the node carries params, so values land before the user's `init`. A cdylib without it loads unchanged; `params:` on such a node is refused at graph build, and a cdylib whose info JSON declares params without exporting it is refused when its info is read (`DylibNodeEntry::info`). |
-| `cerulion_take_last_error_kind` | OPTIONAL typed error kind: the `NodeErrorKind` wire code of the last error (`0` = none), read by the host after a code-1 / handle-0 return so a node error arrives as `TransportError::NodeFailed`. Absent: the error stays the untyped `NodeError` (and a `Fatal` does not stop the node). |
+| `cerulion_node_api_v1_stabbied_v3` and report | Checked discovery of the complete immutable NodeApiV1 and its frozen Stabby identity. |
+| `NodeApiV1` | Create, tick, shutdown, destroy and scoped error-copy callbacks. Metadata carries ports, policy, retention and pre-init inline safety. |
+| `StateApiV1` | State shape, capture, restore, inline safety and quiescence probe. Null means the node declares no state table. |
+| `ExternalApiV1` | External-source description and history pumping. |
+| `HostApiV1` | Host-owned transport loans, terminal releases, spill, state observation, clock and raw publishers. |
 
-Return-code semantics (part of the ABI; the host and the replay verdicts classify on
-them structurally, never on message text): `0` success; `1` tick returned `Err`; `2`
-panic caught by `catch_unwind`; `3` the cdylib's node-registry mutex or the instance's own lock is poisoned; `4`
-handle not found. The macros convert a user `NodeError` at the boundary with
-`NodeError::into_transport`, which keeps its kind; the `NodeErrorKind` wire codes are
-part of the same contract (never renumber one).
-
-**The ABI rule**: any change to a generated FFI signature or to these return-code
-semantics MUST bump `CERULION_ABI_VERSION` (`crates/cerulion_core/src/lib.rs`; name the
-constant, never its value, in docs and comments). Without the bump, every deployed
-cdylib built against the old shape loads against the new host and skews silently; with
-it, the loader refuses loudly (`abi_version_mismatch_test`). New OPTIONAL symbols are
-additive and need NO bump; **symbol presence is the capability gate**: the loader
-probes for the symbol and degrades to the non-capable path when absent, which also
-structurally scopes each capability to macro-generated cdylibs (raw-FFI nodes simply
-lack the export).
-
-Policy coupling: the two generation paths must stay in lockstep. The in-process path
-chains `.with_policy(::…::MacroPolicy::…)` in `gen_zero_copy_node_entry_impl`; the
-cdylib path hand-builds the `policy_json` arm in `gen_cdylib`, round-tripped through
-`PolicyJson` (`crates/cerulion_core/src/graph/node.rs`) at load. A policy variant added to
-only one emitter ships a node that silently degrades to the data-trigger fallback (with
-a host warn) on the other path, so a policy change updates BOTH emitters and the
-round-trip tests that cover them; the change-surface checklist is in
-`crates/cerulion_macros/AGENTS.md`.
-
-Node-side environment: the generated `cerulion_node_init` installs a cdylib-local
-stderr `tracing` subscriber and applies `IOX2_LOG_LEVEL` from the node's frozen env
-snapshot. A cdylib statically links its OWN copy of the core stack, so host-process
-logging/config never reaches it; any hand-written raw-FFI `cerulion_node_init` must do
-the same, and a repo-walk test enforces it
-(`every_hand_written_cdylib_init_applies_the_iox2_log_level` in
-`crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs`).
+The loader ignores compiler provenance and legacy symbols. An older supported
+minor loads when it needs only available capabilities; a different boundary
+major or complete layout is refused with a rebuild instruction. Native error
+kinds and phase labels cross in Status plus scoped error tokens; no Rust owner
+or allocator crosses. See [Node ABI](node-abi.md) for the exact contract.
 
 ## Trybuild suite and regen
 
@@ -307,3 +291,13 @@ Further siblings (`macro_lifecycle_test`, `macro_shim_methods_test`,
 the `cdylib_*` policy/QoS/event files) each state their serial requirement and fixture
 prereqs in their file header; run serial binaries individually with
 `-- --test-threads=1`, never the whole workspace at once.
+
+The embedded Python `export_node!` uses the same stable export adapter with
+node-local Python context and buffer owners. The native and stable backends
+share input validation, touched-output preflight and tick failure cleanup.
+Stable frame reads pin host leases, and writable buffer exports retain their
+loan until released; dynamic variable frames use the explicit adaptive spill
+callback. The host supplies sequence and clock stamps. Python metadata requires
+process retention because CPython caches node-local pyclass code and retained
+memoryviews may still hold leases after a failed tick. Python nodes advertise
+no state or external-source capability and restart from init.

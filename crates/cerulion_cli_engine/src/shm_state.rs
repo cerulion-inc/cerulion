@@ -1467,6 +1467,28 @@ fn record_failure(report: &mut ShmStateReport, message: String) {
     }
 }
 
+/// Remove one state file of a namespace no process uses, and the object it
+/// names, in the order `cerulion clean` reclaims one: the object first, then
+/// the file, so a failure to unlink the object leaves the file that names it.
+/// A file with no content names no object (`shm_open` writes the file before
+/// it creates the object), so only the file goes. Content that does not parse
+/// names nothing to unlink, and the file stays.
+///
+/// No pid or age evidence is taken: the caller is the evidence. A resim calls
+/// this for the namespace of the slot whose lock it holds, once that namespace
+/// holds no node.
+pub fn remove_unused_state_file(path: &Path, probe: &dyn SystemProbe) -> Result<(), String> {
+    let read = read_state_file(path).map_err(|reason| format!("{}: {reason:?}", path.display()))?;
+    match parse_real_shm_name(&read.content) {
+        Ok(real) => probe
+            .unlink_shm_object(&real.name)
+            .map_err(|err| format!("{}: {err}", real.name))?,
+        Err(UnparsableReason::Empty) => {}
+        Err(reason) => return Err(format!("{}: {reason:?}", path.display())),
+    }
+    std::fs::remove_file(path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
 /// The GRACEFUL-EXIT reclamation: one budgeted [`ScanMode::Reclaim`]
 /// walk, run when a `cerulion graph run` is over.
 ///
@@ -4498,5 +4520,74 @@ mod tests {
             probe.unlink_shm_object(&missing_name).is_ok(),
             "an already-absent object is the same outcome as one we just removed"
         );
+    }
+
+    /// A resim's reclaim of a namespace no process uses: the object a state
+    /// file names is unlinked, then the file goes. No pid evidence is taken,
+    /// so a creator the probe reads ALIVE does not hold the file back.
+    #[test]
+    fn an_unused_state_file_goes_after_the_object_it_names() {
+        let dir = tempdir("shm_unused_named");
+        let path = write_state_file(&dir, "cer_resim_00000005_seg", "4242_1700000000_123456_7");
+        let probe = FakeProbe::all_alive();
+        assert_eq!(remove_unused_state_file(&path, &probe), Ok(()));
+        assert_eq!(
+            probe.unlinked(),
+            vec!["4242_1700000000_123456_7".to_string()]
+        );
+        assert!(!path.exists(), "the state file goes after its object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file with no content names no object: only the file goes, whatever
+    /// its age.
+    #[test]
+    fn an_empty_unused_state_file_goes_alone() {
+        let dir = tempdir("shm_unused_empty");
+        let path = dir.join(format!("cer_resim_00000005_seg{SHM_STATE_SUFFIX}"));
+        std::fs::write(&path, b"").expect("write an empty state file");
+        let probe = FakeProbe::all_alive();
+        assert_eq!(remove_unused_state_file(&path, &probe), Ok(()));
+        assert_eq!(
+            probe.unlinked(),
+            Vec::<String>::new(),
+            "no object to unlink"
+        );
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An object that cannot be unlinked keeps the file that names it, so the
+    /// object is never stranded under a name nothing resolves.
+    #[test]
+    fn an_unused_state_file_whose_object_cannot_be_unlinked_stays() {
+        let dir = tempdir("shm_unused_unlink_fails");
+        let path = write_state_file(&dir, "cer_resim_00000005_seg", "4242_1700000000_123456_7");
+        let probe = FakeProbe::all_alive().failing_unlink("4242_1700000000_123456_7", "EACCES");
+        assert_eq!(
+            remove_unused_state_file(&path, &probe),
+            Err("4242_1700000000_123456_7: EACCES".to_string())
+        );
+        assert!(path.exists(), "the file stays with its object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content that does not parse names nothing to unlink, and a path that is
+    /// not a regular file is never opened: both stay, and nothing is unlinked.
+    #[test]
+    fn an_unparsable_or_irregular_unused_state_file_stays() {
+        let dir = tempdir("shm_unused_refused");
+        let forged = dir.join(format!("cer_resim_00000005_forged{SHM_STATE_SUFFIX}"));
+        std::fs::write(&forged, b"../etc/passwd").expect("write forged content");
+        let directory = dir.join(format!("cer_resim_00000005_dir{SHM_STATE_SUFFIX}"));
+        std::fs::create_dir(&directory).expect("create a directory with a state-file name");
+        let probe = FakeProbe::all_alive();
+        let forged_err = remove_unused_state_file(&forged, &probe).expect_err("unparsable");
+        assert!(forged_err.contains("NotFourSegments"), "{forged_err}");
+        let dir_err = remove_unused_state_file(&directory, &probe).expect_err("not a file");
+        assert!(dir_err.contains("NotARegularFile"), "{dir_err}");
+        assert!(forged.exists() && directory.exists());
+        assert_eq!(probe.unlinked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

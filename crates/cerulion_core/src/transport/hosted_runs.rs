@@ -48,6 +48,7 @@ pub struct HostedRun {
 /// withdraw its replacement.
 #[derive(Debug)]
 struct Slot {
+    remote_visible: bool,
     generation: u64,
     live: Arc<AtomicBool>,
     fires: Option<Arc<FireTap>>,
@@ -140,6 +141,7 @@ impl HostedRuns {
     /// the whole reply when one entry fails those checks.
     pub fn host(&self, run_id: u128, run: HostedRun) -> HostedRunGuard {
         let HostedRun { entry, live, fires } = run;
+        let remote_visible = super::run_artifacts::remote_visible(&entry);
         let RunEntry {
             run_id: entry_run_id,
             graph_name,
@@ -184,6 +186,7 @@ impl HostedRuns {
         slots.runs.insert(
             run_id,
             Slot {
+                remote_visible,
                 generation,
                 live,
                 fires,
@@ -207,6 +210,9 @@ impl HostedRuns {
         let slots = self.lock();
         let mut served = HostedServe::default();
         for slot in slots.runs.values() {
+            if !slot.remote_visible {
+                continue;
+            }
             match &slot.served {
                 Ok(entry) => {
                     let mut entry = entry.clone();
@@ -227,10 +233,12 @@ impl HostedRuns {
     /// return the rows the tap holds after `cursor`, at most
     /// [`MAX_FIRES_PER_REPLY`]. The slot is looked up under the lock and the tap
     /// is read after the lock is released, so a slow read never holds up a host
-    /// starting or withdrawing a run.
+    /// starting or withdrawing a run. A local-only run, which the `runs` verb
+    /// hides, is unknown here too.
     pub(crate) fn serve_fires(&self, run_id: u128, cursor: Cursor) -> FiresOutcome {
         let tap = match self.lock().runs.get(&run_id) {
             None => return FiresOutcome::UnknownRun,
+            Some(slot) if !slot.remote_visible => return FiresOutcome::UnknownRun,
             Some(slot) => match &slot.fires {
                 None => return FiresOutcome::NotServed,
                 Some(tap) => Arc::clone(tap),
@@ -366,6 +374,30 @@ mod tests {
     #[test]
     fn an_empty_slot_serves_nothing() {
         assert_eq!(HostedRuns::default().served(), HostedServe::default());
+    }
+
+    #[test]
+    fn local_only_hosted_runs_are_hidden_even_when_an_artifact_is_invalid() {
+        let runs = HostedRuns::default();
+        let mut private = entry(RUN_A, "private", 1);
+        private.run_json = "{\"network\":\"off\"}".into();
+        private.graph_yaml.clear();
+        let _private = runs.host(
+            RUN_A,
+            HostedRun {
+                entry: private,
+                live: Arc::new(AtomicBool::new(true)),
+                fires: None,
+            },
+        );
+        let (public, _) = run(RUN_B, "public", true);
+        let _public = runs.host(RUN_B, public);
+        for _ in 0..2 {
+            let reply = runs.served();
+            assert!(reply.undescribable.is_empty());
+            assert_eq!(reply.entries.len(), 1);
+            assert_eq!(reply.entries[0].graph_name, "public");
+        }
     }
 
     #[test]
@@ -733,6 +765,28 @@ mod tests {
                 runs.serve_fires(RUN_A, Cursor::Now),
                 FiresOutcome::NotServed
             );
+        }
+
+        #[test]
+        fn a_local_only_hosted_run_serves_no_fires() {
+            let runs = HostedRuns::default();
+            let clock = Arc::new(VirtualClock::new());
+            let tap = tap_on(clock);
+            let mut private = entry(RUN_A, "private", 1);
+            private.run_json = "{\"network\":\"off\"}".into();
+            let _guard = runs.host(
+                RUN_A,
+                HostedRun {
+                    entry: private,
+                    live: Arc::new(AtomicBool::new(true)),
+                    fires: Some(Arc::clone(&tap)),
+                },
+            );
+            assert_eq!(
+                runs.serve_fires(RUN_A, Cursor::Now),
+                FiresOutcome::UnknownRun
+            );
+            assert!(!tap.stats().armed, "a hidden run's tap stays disarmed");
         }
 
         #[test]

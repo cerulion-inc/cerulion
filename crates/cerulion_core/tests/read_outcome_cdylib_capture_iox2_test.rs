@@ -172,6 +172,7 @@ fn cdylib_non_trigger_input_read_outcomes_reach_the_real_ring() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "out".to_string(),

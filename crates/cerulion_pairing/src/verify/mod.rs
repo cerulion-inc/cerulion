@@ -15,6 +15,12 @@ mod store;
 pub use access::{AccessRow, EpochOutcome, OwnershipState, PairingSource};
 pub use store::TrustStore;
 
+/// Verify a persisted state frame's HMAC-SHA256 in constant time. The caller
+/// bounds the frame and validates its format only after this succeeds.
+pub fn verify_persisted_mac(mac_key: &[u8], framed: &[u8], tag: &[u8]) -> bool {
+    crate::crypto::ct_eq(&crate::crypto::hmac_sha256(mac_key, framed), tag)
+}
+
 use crate::format::{
     AccountId, Delegation, PrincipalKind, PublicKey, Scope, SignedAccessGrant, SignedDeviceCert,
     SignedEpoch, SignedGrant, SignedIntermediateCert,
