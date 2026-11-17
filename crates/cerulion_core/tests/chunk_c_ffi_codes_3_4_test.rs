@@ -177,8 +177,8 @@ unsafe fn take_last_error(
 ///   phase 4: third tick → still code 3 (poison persists, no
 ///            auto-recovery).
 ///   phase 5: a second instance initializes and shuts down cleanly;
-///            pump_history and shutdown on the poisoned instance return
-///            code 3 with entrypoint-specific LAST_ERROR, and the handle is
+///            shutdown on the poisoned instance returns code 3 with
+///            entrypoint-specific LAST_ERROR, and the handle is
 ///            gone after its shutdown (code 4).
 ///
 /// Mirrors `chunk_c_ffi_error_test.rs::cdylib_shutdown_handle_zero_returns_code_4`
@@ -204,11 +204,12 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
         unsafe { lib.get(b"cerulion_node_tick") }.expect("cerulion_node_tick export");
     let shutdown_fn: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> =
         unsafe { lib.get(b"cerulion_node_shutdown") }.expect("cerulion_node_shutdown export");
-    // The new ABI-v7 pump entrypoint participates in the
-    // same poison cascade as tick and shutdown.
-    let pump_history_fn: libloading::Symbol<unsafe extern "C" fn(u64) -> i32> =
-        unsafe { lib.get(b"cerulion_node_pump_history") }
-            .expect("cerulion_node_pump_history export");
+    // Maintenance is host-owned; no obsolete foreign pump entry may remain.
+    // SAFETY: lookup retains the live fixture library and never calls a symbol.
+    assert!(
+        unsafe { lib.get::<unsafe extern "C" fn(u64) -> i32>(b"cerulion_node_pump_history") }
+            .is_err()
+    );
     let take_last_error_fn: libloading::Symbol<unsafe extern "C" fn() -> *mut std::ffi::c_char> =
         unsafe { lib.get(b"cerulion_take_last_error") }.expect("cerulion_take_last_error export");
     let free_error_fn: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_char)> =
@@ -379,25 +380,6 @@ fn cdylib_ffi_codes_3_and_4_full_lifecycle() {
     assert_eq!(
         sibling_down, 0,
         "phase 5: the second instance must shut down cleanly; got {sibling_down}"
-    );
-
-    let pump_under_poison = unsafe { pump_history_fn(handle) };
-    assert_eq!(
-        pump_under_poison, 3,
-        "phase 5: pump_history on the poisoned instance must return code 3; got {pump_under_poison}"
-    );
-    let pump_msg = unsafe {
-        take_last_error(
-            &take_last_error_fn,
-            &free_error_fn,
-            "phase 5 pump_history under poison",
-        )
-    };
-    assert!(
-        pump_msg.contains("cerulion_node_pump_history")
-            && pump_msg.contains("node instance mutex poisoned"),
-        "phase 5: pump-under-poison LAST_ERROR must name the pump_history entrypoint and the \
-         instance lock; got: {pump_msg}"
     );
 
     // Shutdown takes the entry out of the registry, then refuses to run the

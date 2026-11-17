@@ -352,7 +352,7 @@ for recommendation in cerulion-archive-keyring build-essential git curl; do
 done
 printf '%s\n' 'build_deb toolchain recommendations passed'
 
-# The compiler bootstrap. The archives above carry neither half, so they are
+# The compiler bootstrap. The archives above carry no helper, so they are
 # the control: no bootstrap files under /usr/share/cerulion (only the install
 # marker), no wrapper.
 if printf '%s\n' "$rmw_contents" | grep -Fq './usr/bin/cerulion-install-rust'; then
@@ -376,38 +376,50 @@ printf '%s\n' 'bsd' > "$bootstrap_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$bootstrap_root/THIRD-PARTY-LICENSES.md"
 printf '%s\n' 'not a real shared object' > "$bootstrap_root/librmw_cerulion.so"
 printf '%s\n' 'not a real hook either' > "$bootstrap_root/libcerulion_heaphook.so"
-printf '%s\n' 'release: 1.93.0' > "$bootstrap_root/rustc-version.txt"
+# A 1.x archive pairs its helper with rustc-version.txt, an argument the
+# wrapper below never passes. Either shape that carries the file is refused,
+# so a package never ships a wrapper its own helper rejects.
 bootstrap_archive="$workdir/cerulion-0.1.2-x86_64-unknown-linux-gnu.tar.gz"
-tar -czf "$bootstrap_archive" -C "$workdir" \
-    cerulion-0.1.2-x86_64-unknown-linux-gnu
-if env -u CERULION_DEB_ALLOW_MISSING_RMW "$script_dir/build_deb.sh" \
-    "$bootstrap_archive" amd64 "$workdir/half-bootstrap-debs" \
-    >"$workdir/half-bootstrap-output" 2>"$workdir/half-bootstrap-error"; then
-    printf '%s\n' 'error: archive with half a Rust setup was packaged' >&2
-    exit 1
-fi
-grep -Fq 'carries only part of its Rust setup' "$workdir/half-bootstrap-error" || {
-    cat "$workdir/half-bootstrap-error" >&2
-    printf '%s\n' 'error: half Rust setup had the wrong diagnostic' >&2
-    exit 1
-}
+for legacy_shape in metadata-only pair; do
+    printf '%s\n' 'release: 1.93.0' > "$bootstrap_root/rustc-version.txt"
+    if [ "$legacy_shape" = pair ]; then
+        printf '%s\n' '#!/bin/sh' > "$bootstrap_root/install_rust.sh"
+    fi
+    rm -f "$bootstrap_archive"
+    tar -czf "$bootstrap_archive" -C "$workdir" \
+        cerulion-0.1.2-x86_64-unknown-linux-gnu
+    if env -u CERULION_DEB_ALLOW_MISSING_RMW "$script_dir/build_deb.sh" \
+        "$bootstrap_archive" amd64 "$workdir/legacy-bootstrap-debs" \
+        >"$workdir/legacy-bootstrap-output" 2>"$workdir/legacy-bootstrap-error"; then
+        printf 'error: archive with the 1.x Rust setup (%s) was packaged\n' "$legacy_shape" >&2
+        exit 1
+    fi
+    grep -Fq 'carries rustc-version.txt, the Rust setup of a 1.x release' \
+        "$workdir/legacy-bootstrap-error" || {
+        cat "$workdir/legacy-bootstrap-error" >&2
+        printf 'error: 1.x Rust setup (%s) had the wrong diagnostic\n' "$legacy_shape" >&2
+        exit 1
+    }
+done
 
-printf '%s\n' '#!/bin/sh' > "$bootstrap_root/install_rust.sh"
+rm "$bootstrap_root/rustc-version.txt"
 rm -f "$bootstrap_archive"
 tar -czf "$bootstrap_archive" -C "$workdir" \
     cerulion-0.1.2-x86_64-unknown-linux-gnu
 bootstrap_deb=$(env -u CERULION_DEB_ALLOW_MISSING_RMW "$script_dir/build_deb.sh" \
     "$bootstrap_archive" amd64 "$workdir/bootstrap-debs")
 bootstrap_contents=$(dpkg-deb --fsys-tarfile "$bootstrap_deb" | tar -tvf -)
-for payload in install_rust.sh rustc-version.txt; do
-    printf '%s\n' "$bootstrap_contents" |
-        grep -Eq "^-rw-r--r-- .* \./usr/share/cerulion/$payload\$" || {
-        printf '%s\n' "$bootstrap_contents" >&2
-        printf 'error: %s is not shipped read-only under /usr/share/cerulion\n' \
-            "$payload" >&2
-        exit 1
-    }
-done
+printf '%s\n' "$bootstrap_contents" |
+    grep -Eq '^-rw-r--r-- .* \./usr/share/cerulion/install_rust\.sh$' || {
+    printf '%s\n' "$bootstrap_contents" >&2
+    printf '%s\n' 'error: install_rust.sh is not shipped read-only under /usr/share/cerulion' >&2
+    exit 1
+}
+if printf '%s\n' "$bootstrap_contents" | grep -Fq 'rustc-version.txt'; then
+    printf '%s\n' "$bootstrap_contents" >&2
+    printf '%s\n' 'error: the package still ships rustc-version.txt' >&2
+    exit 1
+fi
 printf '%s\n' "$bootstrap_contents" |
     grep -Eq '^-rwxr-xr-x .* \./usr/bin/cerulion-install-rust$' || {
     printf '%s\n' "$bootstrap_contents" >&2
@@ -417,9 +429,9 @@ printf '%s\n' "$bootstrap_contents" |
 bootstrap_wrapper=$(dpkg-deb --fsys-tarfile "$bootstrap_deb" |
     tar -xOf - ./usr/bin/cerulion-install-rust)
 printf '%s\n' "$bootstrap_wrapper" |
-    grep -Fq '/usr/share/cerulion/install_rust.sh /usr/share/cerulion/rustc-version.txt' || {
+    grep -Fxq 'sh /usr/share/cerulion/install_rust.sh' || {
     printf '%s\n' "$bootstrap_wrapper" >&2
-    printf '%s\n' 'error: the Rust wrapper does not run the shipped pair' >&2
+    printf '%s\n' 'error: the Rust wrapper does not run the shipped helper with no arguments' >&2
     exit 1
 }
 # The helper's failure arms say the Cerulion binaries were left alone, which

@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/free_context_helper.rs:16:32
+   |
+16 |         self.count = configure(ctx);
+   |                      --------- ^^^ expected `&NodeContext`, found `&mut PluginNodeContext`
+   |                      |
+   |                      arguments to this function are incorrect
+   |
+   = note:      expected reference `&cerulion_core::NodeContext`
+           found mutable reference `&mut cerulion_core::graph::node_plugin_abi::context::PluginNodeContext`
+note: function defined here
+  --> tests/ui/free_context_helper.rs:12:4
+   |
+12 | fn configure(ctx: &NodeContext) -> u64 { ctx.env("COUNT", 7_u64) }
+   |    ^^^^^^^^^ -----------------

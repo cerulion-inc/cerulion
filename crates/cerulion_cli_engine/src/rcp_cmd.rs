@@ -44,7 +44,7 @@ pub struct RcpArgs {
 /// The refusal of `cerulion rcp` while the kill-switch is engaged, `None`
 /// when it is not. `flag` is the `--network` value and `env` the
 /// `CERULION_NETWORK` value (`None` = not given), each read under the parse
-/// `cerulion pair` and `--robot` use ([`network_env_kill_from`]): `off` after
+/// `--robot` uses ([`network_env_kill_from`]): `off` after
 /// trimming, ASCII case-insensitively, engages it, any other non-empty value
 /// fails closed and engages it too, and an empty value is unset. The refusal
 /// names the value; it comes before the robot is resolved, the device key is

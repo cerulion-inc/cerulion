@@ -33,6 +33,15 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static MUTATE_GAIN: AtomicBool = AtomicBool::new(false);
+
+/// Toggle the fixture's parameter mutation before its next tick.
+#[no_mangle]
+pub extern "C" fn cerulion_test_set_param_mutation(enabled: u32) {
+    MUTATE_GAIN.store(enabled != 0, Ordering::Relaxed);
+}
 
 use cerulion_core::prelude::*;
 use native_ros2_messages::geometry_msgs::Quaternion;
@@ -41,6 +50,8 @@ use native_ros2_messages::geometry_msgs::Quaternion;
 struct StateProbeNode {
     #[output]
     out: Quaternion,
+    #[param(default = 1.0)]
+    gain: f64,
     counter: u64,
     label: String,
     history: Vec<f64>,
@@ -67,6 +78,9 @@ impl StateProbeNode {
         self.out.z = self.label.len() as f64;
         self.out.w = (self.handle + self.tags.len() as u64) as f64;
         self.counter += 1;
+        if MUTATE_GAIN.load(Ordering::Relaxed) {
+            self.gain = -self.gain;
+        }
         Ok(())
     }
 }

@@ -84,6 +84,10 @@ fn setup_with_network(base: &str) -> (Arc<TransportManager>, String) {
         ix,
     )
     .expect("init_for_test with network");
+    transport
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     (transport, format!("/ingress/{base}/{id}"))
 }
 
@@ -157,6 +161,7 @@ fn test_ingress_reinjects_frame_byte_identical() {
         .expect("ingress publisher");
 
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.register_ingress(&topic, expected_hash, ingress_pub)
         .expect("register ingress");
 
@@ -208,6 +213,7 @@ fn test_ingress_schema_mismatch_not_delivered() {
         .expect("ingress publisher");
 
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.register_ingress(&topic, expected_hash, ingress_pub)
         .expect("register ingress");
 
@@ -368,6 +374,7 @@ fn test_ingress_delivery_is_deterministic() {
             .create_ingress_publisher(&topic, MaxSliceLen::const_new(256))
             .expect("ingress publisher");
         let mgr = NetworkManager::new(NetworkConfig::default());
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         mgr.register_ingress(&topic, hash, ingress_pub)
             .expect("register ingress");
 
@@ -544,6 +551,10 @@ fn test_teardown_releases_services_without_hang() {
         ix.clone(),
     )
     .expect("init_for_test with network");
+    transport
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
 
     transport
         .register_ingress_topic(&topic, 0xABCD, MaxSliceLen::const_new(256))
@@ -630,8 +641,13 @@ fn run_gateway_ingress_stays_unmarked_and_readable_in_local_scope() {
     transport
         .register_run_ingress_topic(&topic, hash, slice)
         .unwrap();
-    assert!(!transport.is_network_mirror(&topic).unwrap());
-    assert!(transport.network_mirror_topics().unwrap().is_empty());
+    assert!(!transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert!(transport
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap()
+        .is_empty());
     let lease = transport.acquire_local_topic_lease(&topic).unwrap();
     assert!(transport
         .create_remote_ingress_injector(&topic, hash, slice)
@@ -649,7 +665,9 @@ fn run_gateway_ingress_stays_unmarked_and_readable_in_local_scope() {
     drop(lease);
     transport.unregister_ingress_topic(&topic).unwrap();
     assert!(!network.is_ingress_registered(&topic));
-    assert!(!transport.is_network_mirror(&topic).unwrap());
+    assert!(!transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 }
 
 /// A failed second registration releases only its own publisher and origin,
@@ -671,7 +689,9 @@ fn duplicate_marked_ingress_releases_only_its_own_publisher_and_marker() {
         error.contains("already has a registered network ingress bridge"),
         "{error}"
     );
-    assert!(transport.is_network_mirror(&topic).unwrap());
+    assert!(transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     assert!(transport.acquire_local_topic_lease(&topic).is_err());
 
     // The default data service has two publisher slots. A second owner fitting
@@ -688,8 +708,13 @@ fn duplicate_marked_ingress_releases_only_its_own_publisher_and_marker() {
     assert_eq!(network.ingress_stats(&topic).unwrap().frames, 1);
 
     transport.unregister_ingress_topic(&topic).unwrap();
-    assert!(!transport.is_network_mirror(&topic).unwrap());
-    assert!(transport.network_mirror_topics().unwrap().is_empty());
+    assert!(!transport
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert!(transport
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap()
+        .is_empty());
     assert!(!network.is_ingress_registered(&topic));
     assert!(network.ingress_stats(&topic).is_none());
     drop(subscriber);
@@ -719,6 +744,7 @@ fn test_multi_topic_concurrent_ingress_isolation() {
         .expect("ingress pub B");
 
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.register_ingress(&topic_a, hash_a, pub_a)
         .expect("register A");
     mgr.register_ingress(&topic_b, hash_b, pub_b)
@@ -823,6 +849,7 @@ fn test_reinject_failure_is_counted_and_latch_warns_once() {
     ingress_pub.fault_inject_publish_raw_after(0);
 
     let mgr = NetworkManager::new(NetworkConfig::default());
+    mgr.set_lan_access(cerulion_core::LanAccess::Open);
     mgr.register_ingress(&topic, hash, ingress_pub)
         .expect("register ingress");
 
@@ -1003,7 +1030,7 @@ fn test_paired_lan_ingress_delivers_nothing_and_closing_stops_delivery() {
         .create_ingress_publisher(&topic, MaxSliceLen::const_new(64))
         .expect("ingress publisher");
     let mgr = Arc::new(NetworkManager::new(NetworkConfig::default()));
-    mgr.set_lan_access(LanAccess::Paired);
+    assert_eq!(mgr.lan_access(), LanAccess::Paired);
     mgr.register_ingress(&topic, hash, ingress_pub)
         .expect("register ingress");
 
@@ -1070,8 +1097,8 @@ fn test_paired_receive_callback_refuses_and_counts_every_lan_frame() {
         .create_ingress_publisher(&topic, MaxSliceLen::const_new(64))
         .expect("ingress publisher");
     let mgr = NetworkManager::new(NetworkConfig::default());
+    assert_eq!(mgr.lan_access(), LanAccess::Paired);
     mgr.set_retain_ingress_subscriber_for_test(true);
-    mgr.set_lan_access(LanAccess::Paired);
     mgr.register_ingress(&topic, hash, ingress_pub)
         .expect("register ingress");
 

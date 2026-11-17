@@ -222,6 +222,7 @@ impl RunFixture {
         std::fs::write(path.join("recorder.json"), b"{}").expect("recorder.json");
 
         let record = RunRecord {
+            remote_visible: true,
             run_id,
             supervisor_pid: std::process::id(),
             // Wall clock, like the production spec's `run_started_at_ns`.
@@ -444,7 +445,6 @@ fn a_production_minted_run_record_is_gatherable_by_a_netd_shaped_host() {
             gating: cerulion_cli_engine::run_dir::GatingClock::Wall,
             graph_yaml: "name: prod\nprefix: prod\nnodes: []\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         },
     )
     .expect("the production run-descriptor path");

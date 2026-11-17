@@ -21,6 +21,10 @@ The release installer and the Homebrew and Debian packages already place
 `cerulion-netd` beside the `cerulion` binary; see the
 [installation guide](https://docs.cerulion.com/cerulion/installation).
 
+Automatic serving needs `cerulion-remoted` beside `cerulion-netd`: the release
+installer and Debian package place it. From a source checkout, install it with
+`cargo install --locked --path crates/cerulion_remoted`.
+
 ## Running it
 
 You normally never start it by hand. The first command that needs a remote topic
@@ -28,9 +32,16 @@ spawns it detached, and a demand-started daemon exits once its clients have been
 idle for the grace period (30 seconds by default). A daemon started with a
 listen address stays available for remote clients.
 
-On a robot that should be discoverable, run it as a standing service with a
-listen address. That also raises the `_cerulion._tcp` mDNS beacon that
-`cerulion topic list` browses:
+The first network-enabled run that registers egress starts the authenticated
+remote server automatically. It needs a saved login or an established robot
+pairing, and no listen address. Expired saved logins preserve offline serving.
+A query-only desk starts no server. The last serving registration's release or
+disconnect reaps the server after active shell/exec work, an owed e-stop delivery
+and its latch have cleared. Shutdown sends SIGTERM and waits for graceful cleanup
+before a bounded forced reap. Local-only operation starts no server.
+
+For an explicit legacy LAN listener, run a standing service with a listen
+address. That also raises the `_cerulion._tcp` mDNS beacon:
 
 ```bash
 CERULION_NETD_LISTEN=tcp/0.0.0.0:7683 cerulion-netd

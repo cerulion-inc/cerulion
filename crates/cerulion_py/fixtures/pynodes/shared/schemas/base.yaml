@@ -1,0 +1,7 @@
+schemas:
+  Probe:
+    fields:
+      int64 value: {}
+  UInt32Probe:
+    fields:
+      uint32 value: {}

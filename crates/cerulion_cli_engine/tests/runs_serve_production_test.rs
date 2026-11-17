@@ -93,6 +93,10 @@ fn gateway_on_the_global_namespace(tag: &str) -> GatewayRuntime {
         iceoryx2::config::Config::global_config().clone(),
     )
     .expect("gateway host manager on the global namespace");
+    manager
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     GatewayRuntime::new(
         manager,
         GatewayPlan {
@@ -145,7 +149,6 @@ fn a_run_written_by_the_production_descriptor_is_served_with_its_artifacts_verba
         gating: cerulion_cli_engine::run_dir::GatingClock::Wall,
         graph_yaml: graph_yaml.to_string(),
         env_json: b"{}".to_vec(),
-        recorder_json: b"{}".to_vec(),
     })
     .expect("the production run-descriptor path");
     assert!(
@@ -258,7 +261,6 @@ fn a_run_that_ended_leaves_no_trace_in_the_served_answer() {
         gating: cerulion_cli_engine::run_dir::GatingClock::Wall,
         graph_yaml: "name: ending\nprefix: ending\nnodes: []\n".to_string(),
         env_json: b"{}".to_vec(),
-        recorder_json: b"{}".to_vec(),
     })
     .expect("the production run-descriptor path");
     let want = format_run_id(descriptor.run_id());

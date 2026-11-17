@@ -142,10 +142,10 @@ unsafe extern "C" fn vecbool_resize(field: *mut c_void, size: usize) {
 }
 
 /// A C++ typesupport for a one-member `bool[]` type, with `size_function` and
-/// `resize_function` but NO `assign_function`: the shape every distro before
-/// Humble has by construction (its generator emits no `assign` for
-/// `std::vector<bool>` and leaves `get`/`get_const` null), and the shape a
-/// hand fixture reaches on any era by leaving the accessor unset.
+/// `resize_function` but NO `assign_function`: a shape no rosidl generator
+/// emits (Foxy and Galactic leave every accessor of a `bool` sequence null,
+/// which the bridge fills through its compiled shim; Humble on emit `assign`),
+/// so it is the member that stays unwritable on every era.
 fn cpp_bool_seq_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
     cpp_ts(cpp_members(
         "rmw_mismatch::msg",
@@ -214,9 +214,9 @@ fn cpp_ts(members: *const CppMessageMembers) -> *const ffi::rosidl_message_type_
     }))
 }
 
-/// The pre-Humble `bool[]` member: the element COUNT is readable and the
-/// container resizes, and no element can be written, because the C++
-/// generator emits no `assign` for `std::vector<bool>`.
+/// The unwritable `bool[]` member: the element COUNT is readable and the
+/// container resizes, and no element can be written, because it has no
+/// `assign` accessor and is not the all-null shape the shim fills.
 fn cpp_unwritable_bool_member() -> CppMessageMember {
     let mut flags = cpp_member("flags", ROS_TYPE_BOOLEAN, 0, true);
     flags.size_function = Some(vecbool_size);
@@ -363,8 +363,7 @@ fn c_nested_service_ts(unique: &str) -> *const ffi::rosidl_service_type_support_
 
 /// A type the LOANED take serves: one FORGEABLE `uint8[]` (unbounded,
 /// primitive, never bool, so the forged take aims its `std::vector` triplet
-/// at the held sample) beside the nested `bool[]` no build before Humble can
-/// write. Without the forgeable member `can_loan_take` is false and the
+/// at the held sample) beside the nested unwritable `bool[]`. Without the forgeable member `can_loan_take` is false and the
 /// loaned take is never reached at all.
 #[repr(C)]
 struct CppLoanable {
@@ -584,14 +583,13 @@ fn raw_frame(schema_hash: u64, sequence: u32, payload_len: usize) -> Vec<u8> {
 /// A member this build's C++ typesupport gives no way to WRITE refuses the
 /// frame with the MEMBER NAMED, before anything is written.
 ///
-/// A `bool[]` needs the member's `assign` accessor: `std::vector<bool>` is
-/// bit-packed, so there is no element address to copy into. Before Humble the
-/// C++ generator emits no `assign` (and leaves `get`/`get_const` null), so a
-/// Foxy subscriber on a `bool[]` topic can never decode a frame a rclpy or
-/// C-typesupport publisher puts there. What the user must be told is which
-/// member and why, not that the wire is malformed, which is what the generic
-/// entry refusal says and which sends an operator to redeploy both ends for a
-/// limit of this build that no redeploy changes.
+/// A `bool[]` needs the member's `assign` accessor, or the all-null shape the
+/// compiled shim fills as a `std::vector<bool>`: the vector is bit-packed, so
+/// there is no element address to copy into. A member with neither can never
+/// decode a frame a rclpy or C-typesupport publisher puts on its topic. What
+/// the user must be told is which member and why, not that the wire is
+/// malformed, which is what the generic entry refusal says and which sends an
+/// operator to redeploy both ends for a limit that no redeploy changes.
 ///
 /// Oracles, three of them, all hand-written here:
 /// * the WHOLE `reason=` value, typed out in this test rather than read back
@@ -729,6 +727,185 @@ fn a_bool_member_this_build_cannot_write_is_refused_with_the_member_named() {
         });
 
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+// The shim's `std::vector<bool>` fixture helpers (the production operations
+// are reached only through the bridge).
+use rmw_cerulion::ffi::introspection_cpp::{
+    rmw_cerulion_vector_bool_construct, rmw_cerulion_vector_bool_destruct,
+    rmw_cerulion_vector_bool_get, rmw_cerulion_vector_bool_size, rmw_cerulion_vector_bool_sizeof,
+};
+
+extern "C" {
+    fn free(p: *mut c_void);
+}
+
+/// Storage for one REAL `std::vector<bool>`, the whole C++ message of a
+/// one-member `{ bool[] flags }` type.
+#[repr(C, align(16))]
+struct VecBoolSlot([u8; 64]);
+
+impl VecBoolSlot {
+    /// Construct in place (the slot must already sit where it is used).
+    unsafe fn construct(&mut self, elems: &[u8]) {
+        assert!(rmw_cerulion_vector_bool_sizeof() <= 64);
+        rmw_cerulion_vector_bool_construct(
+            self.0.as_mut_ptr() as *mut c_void,
+            elems.as_ptr(),
+            elems.len(),
+        );
+    }
+    unsafe fn bools(&self) -> Vec<bool> {
+        let at = self.0.as_ptr() as *const c_void;
+        (0..rmw_cerulion_vector_bool_size(at))
+            .map(|i| rmw_cerulion_vector_bool_get(at, i))
+            .collect()
+    }
+    unsafe fn destruct(&mut self) {
+        rmw_cerulion_vector_bool_destruct(self.0.as_mut_ptr() as *mut c_void);
+    }
+}
+
+/// The positive twin of the refusal above: a C++ `bool[]` member with NO
+/// accessor at all, the shape the Foxy and Galactic generator emits (for
+/// `rcl_interfaces/ParameterValue.bool_array_value` in every rclcpp node's
+/// startup `ParameterEvent`), is published and taken through the rmw.
+///
+/// Three producers reach the C++ subscription, each with its elements typed
+/// out here as the oracle: a hand-built frame (`1 0 1`, offset table entry
+/// typed out), a C-typesupport publisher, which writes a `bool[]` as plain
+/// bytes the way rclpy does (`true false true true`), and a C++ publisher
+/// with the accessorless member (`false true true false true`). A
+/// C-typesupport subscription on the same topic takes the C++ publisher's
+/// frame too, so the C++ side's bytes are what the C side reads. Nothing is
+/// refused: the census is empty and the decode-failure counter stays 0.
+#[test]
+#[serial]
+#[traced_test]
+fn an_accessorless_bool_member_is_published_and_taken_through_the_rmw() {
+    unsafe {
+        let suffix = unique_suffix();
+        let name = format!("ShimFlags{suffix}");
+        let cpp = cpp_ts(cpp_members(
+            "rmw_mismatch::msg",
+            &name,
+            std::mem::size_of::<VecBoolSlot>(),
+            vec![cpp_member("flags", ROS_TYPE_BOOLEAN, 0, true)],
+            None,
+            None,
+        ));
+        let mut c_flags = member("flags", ROS_TYPE_BOOLEAN, 0);
+        c_flags.is_array_ = true;
+        let c = make_message_ts(
+            "rmw_mismatch__msg",
+            &name,
+            std::mem::size_of::<CBoolSeq>(),
+            vec![c_flags],
+        );
+        let (_, node, _opts) = setup_node(&format!("node_{suffix}"));
+        let topic = CString::new(format!("/rmw_mismatch/shim/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let cpp_sub = rmw_create_subscription(node, cpp, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!cpp_sub.is_null());
+        let c_sub = rmw_create_subscription(node, c, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!c_sub.is_null());
+
+        let mut dst = VecBoolSlot([0; 64]);
+        dst.construct(&[1, 1, 1, 1]);
+        let take_cpp = |dst: &mut VecBoolSlot| -> Vec<bool> {
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    cpp_sub,
+                    dst as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            assert!(taken, "the C++ subscription takes the frame");
+            dst.bools()
+        };
+        let take_c = || -> Vec<bool> {
+            let mut out: CBoolSeq = std::mem::zeroed();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    c_sub,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            assert!(taken, "the C subscription takes the frame");
+            let got = std::slice::from_raw_parts(out.data, out.size).to_vec();
+            free(out.data as *mut c_void);
+            got
+        };
+
+        // 1. A hand-built frame on the subscription's topic.
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        let msl = cerulion_core::wire::MaxSliceLen::try_new(4096).expect("slice len");
+        let mut raw_pub = rt
+            .transport
+            .create_publisher_simple(&cerulion_topic(cpp_sub), msl)
+            .expect("raw publisher");
+        let payload = [8u8, 0, 0, 0, 3, 0, 0, 0, 1, 0, 1];
+        let mut frame = raw_frame(expected_schema_hash(cpp_sub), 0, payload.len());
+        let mut header = cerulion_core::wire::WireHeader::read_from_buf(&frame).expect("header");
+        header.offset_table_count = 1;
+        header.write_to_buf(&mut frame[..cerulion_core::wire::WireHeader::SIZE]);
+        frame[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(&payload);
+        raw_pub.publish_raw(&frame).expect("publish the hand frame");
+        assert_eq!(take_cpp(&mut dst), vec![true, false, true]);
+        assert_eq!(take_c(), vec![true, false, true]);
+        drop(raw_pub);
+
+        // 2. A C-typesupport publisher.
+        let c_pub = rmw_create_publisher(node, c, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!c_pub.is_null());
+        let mut bools = [true, false, true, true];
+        let msg = c_bool_sequence(&mut bools);
+        assert_eq!(
+            rmw_publish(
+                c_pub,
+                &msg as *const _ as *const c_void,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        assert_eq!(take_cpp(&mut dst), vec![true, false, true, true]);
+        assert_eq!(take_c(), vec![true, false, true, true]);
+        assert_eq!(rmw_destroy_publisher(node, c_pub), RMW_RET_OK);
+
+        // 3. A C++ publisher with the accessorless member.
+        let cpp_pub = rmw_create_publisher(node, cpp, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!cpp_pub.is_null());
+        let mut src = VecBoolSlot([0; 64]);
+        src.construct(&[0, 1, 1, 0, 1]);
+        assert_eq!(
+            rmw_publish(
+                cpp_pub,
+                &src as *const _ as *const c_void,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK,
+            "the startup publish of a Foxy rclcpp node"
+        );
+        assert_eq!(take_cpp(&mut dst), vec![false, true, true, false, true]);
+        assert_eq!(take_c(), vec![false, true, true, false, true]);
+        assert_eq!(decode_failure_count(cpp_sub), 0, "nothing was refused");
+        src.destruct();
+        dst.destruct();
+
+        assert_eq!(rmw_destroy_publisher(node, cpp_pub), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, c_sub), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, cpp_sub), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }
@@ -1540,8 +1717,9 @@ fn the_loaned_take_refuses_a_nested_unwritable_member_and_keeps_its_shadow() {
 /// anything into the caller's request message.
 ///
 /// The producer is a real client on the C typesupport, which writes a
-/// `bool[]` as plain bytes and needs no accessor: exactly the pair a user
-/// hits, an rclpy or C node calling a C++ server on a build before Humble.
+/// `bool[]` as plain bytes and needs no accessor: the pair such a refusal is
+/// about, an rclpy or C node calling a C++ server whose `bool[]` member has
+/// no way in (a shape no generator emits, held here to pin the refusal).
 /// The two typesupports carry the same package, type names, member names
 /// and field types, so they agree on the wire schema hash and the frame
 /// reaches the server's take.

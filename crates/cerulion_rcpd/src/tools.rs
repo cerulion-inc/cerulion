@@ -566,6 +566,17 @@ impl ToolHost {
             let receipt = self.record(name, &digest, ReceiptOutcome::Error("invalid_args".into()));
             return refusal("invalid_args", &reason, receipt.as_ref(), class);
         }
+        let remote_scope = if crate::caller::remote().is_some() {
+            match self.journal.remote_scope() {
+                Ok(scope) => scope,
+                Err(error) => {
+                    let receipt = self.record(name, &digest, ReceiptOutcome::Denied);
+                    return refusal("local_only", &error.to_string(), receipt.as_ref(), class);
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let _serial = self.call_lock.lock().await;
         let call_id = self.next_call_id();
         let frame = Journal::frame(call_id, name, &args_value);
@@ -617,7 +628,10 @@ impl ToolHost {
             None
         };
         let timeout = Duration::from_millis(spec.timeout_ms);
-        let answer = self.journal.call(call_id, frame, timeout, mutating).await;
+        let answer = self
+            .journal
+            .call_with_scope(call_id, frame, timeout, mutating, remote_scope)
+            .await;
         let outcome = match &answer {
             Ok(_) => ReceiptOutcome::Ok,
             Err(e) => ReceiptOutcome::Error(journal_class(e).to_string()),

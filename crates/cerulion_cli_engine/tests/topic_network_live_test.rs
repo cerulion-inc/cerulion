@@ -78,6 +78,7 @@ fn remote_discovery_over_loopback_finds_advertised_topics() {
             listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -147,6 +148,7 @@ fn remote_discovery_finds_announced_topics() {
             listen_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -223,6 +225,7 @@ fn remote_discovery_catalog_get_enriches_with_catalog_only_topics() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -326,6 +329,7 @@ fn remote_discovery_catalog_union_preserves_announce_only_topics() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -420,7 +424,8 @@ fn endpoint_less_discovery_opens_isolated_and_returns_empty() {
 }
 
 /// An ISOLATED transient resolve (no peer, no locators,
-/// scouting off) must report `DiscoveryNotConverged`, NOT `NoProducer`.
+/// scouting off) reports `DiscoveryNotConverged` with Open access, or
+/// `LanNotQueried` with Paired access, never `NoProducer`.
 ///
 /// This is the CALL-SITE pin for `classify_transient_miss`. `NoProducer` routes to
 /// "topic 'X' not found locally or on any discovered robot", i.e. an assertion about
@@ -444,7 +449,17 @@ fn an_isolated_transient_resolve_is_not_converged_never_a_false_absence() {
     // isolated, so nothing can answer.
     let resolved = resolve_remote_ingress_target_with_opts("/nobody", &[], &[], false, None);
     match resolved {
-        RemoteResolve::DiscoveryNotConverged => {}
+        RemoteResolve::Ambiguous { candidates } => {
+            panic!("isolated session has no candidates: {candidates:?}")
+        }
+        RemoteResolve::DiscoveryNotConverged => assert_eq!(
+            cerulion_core::transport::demand_authorizer::LanAccess::from_env(),
+            cerulion_core::transport::demand_authorizer::LanAccess::Open
+        ),
+        RemoteResolve::LanNotQueried => assert_eq!(
+            cerulion_core::transport::demand_authorizer::LanAccess::from_env(),
+            cerulion_core::transport::demand_authorizer::LanAccess::Paired
+        ),
         RemoteResolve::NoProducer => panic!(
             "an isolated resolve read NO robot's catalog — reporting NoProducer makes the CLI \
              claim the topic is absent from every discovered robot, which is exactly the \
@@ -500,6 +515,7 @@ fn announce_presence_surfaces_a_robots_row_over_loopback() {
             robot_identity: Some("e2e".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -601,6 +617,7 @@ fn bare_identity_token_alone_surfaces_a_zero_topic_row() {
             robot_identity: Some("bare".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -672,6 +689,7 @@ fn bounded_connect_never_stalls_on_a_black_hole_locator() {
             robot_identity: Some("bh".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -752,6 +770,7 @@ fn tarpit_ladder_candidate_does_not_sink_the_gather() {
             robot_identity: Some("tarpit".to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -866,6 +885,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -927,6 +947,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // HAND oracle frame: Widget { x: 3.5, y: -7.25 } — a fixed-only frame is the
@@ -1038,6 +1059,7 @@ fn catalog_verb_carries_per_topic_schema_name() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -1079,6 +1101,7 @@ fn catalog_verb_carries_per_topic_schema_name() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let dsession = desk.session().expect("desk session");
     for _ in 0..40 {
         if let Some(catalog) = query_robot_catalog(dsession, robot, Duration::from_millis(300)) {
@@ -1108,6 +1131,7 @@ fn bind_listening_robot(robot: &str, base: u16) -> (NetworkManager, u16) {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             return (mgr, port);
         }
@@ -1176,6 +1200,7 @@ fn schema_verb_serves_package_less_yaml_type() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // Fetch the BARE name over the 1-chunk `schema/{Name}` selector.
@@ -1298,6 +1323,7 @@ fn schema_verb_nested_custom_frame_decodes_via_fetched_dependency() {
         gossip_scouting: false,
         ..NetworkConfig::default()
     });
+    desk.set_lan_access(cerulion_core::LanAccess::Open);
     let session = desk.session().expect("desk session");
 
     // HAND oracle frame: Widget { scale: 1.5, gadget: Gadget { count: 42 } }.
@@ -1703,6 +1729,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -1899,6 +1926,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -2012,8 +2040,10 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
             resolve_remote_ingress_target_with_opts(custom_topic, &connect, &[], false, None);
         if matches!(known, RemoteResolve::Found(_)) {
             let custom_label = match &custom {
+                RemoteResolve::Ambiguous { .. } => "Ambiguous",
                 RemoteResolve::Found(_) => "Found",
                 RemoteResolve::NoProducer => "NoProducer",
+                RemoteResolve::LanNotQueried => "LanNotQueried",
                 // Unreachable on THIS path (an explicit `--connect` locator
                 // bypasses netd entirely — see `use_netd_query_plane` — so the
                 // transient resolve never reports a netd discovery state), but the
@@ -2084,6 +2114,7 @@ fn a_runtime_builtin_row_named_through_hash_bindings_resolves_found_locally() {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;

@@ -485,7 +485,9 @@ reports `published`, the pong node `forwarded`, the sink node
 `received` / `skipped` / `measured` (the per-node `RTT_DELIVERY`
 lines), and the host runtime prints its per-input `drop_oldest`
 eviction counters ("live loop delivery telemetry", one line per
-data-trigger input, per process).
+data-trigger input, per process). Those counters are `info` lines,
+which `graph run` hides by default, so the harness runs it with
+`RUST_LOG=error,cerulion=info` unless `RUST_LOG` is already exported.
 
 The **no-silent-loss reading** of those lines is:
 
@@ -762,7 +764,11 @@ log against them):
   (`PITFALLS.md` #13). The workspace runner rebuilds the `cerulion` CLI
   binary and the node cdylibs from one checkout in the same pass, which
   is also the guard against binary↔cdylib iceoryx2 version skew
-  (`PITFALLS.md` #15).
+  (`PITFALLS.md` #15). The `cerulion-netd` gateway every leg spawns is
+  built in the CLI's own cargo invocation
+  (`cargo build -p cerulion_cli -p cerulion_netd --release`): a CLI-only
+  build leaves no daemon beside the binary, and the leg fails before its
+  first sample.
 - **Clean transport state between cells and sizes:**
   `rm -rf /tmp/iceoryx2/{services,nodes}`, `/dev/shm/iox2_*` (and the
   zenoh/iceoryx-v1 segment patterns on ROS 2 hosts). POSIX SHM segments
