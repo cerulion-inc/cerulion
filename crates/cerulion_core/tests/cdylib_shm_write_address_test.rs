@@ -512,6 +512,7 @@ fn run_probe_graph(probe: Box<dyn NodeEntry>, prefix: &str, steps: usize) -> Run
                 inputs: vec![InputDef {
                     name: "probe".to_string(),
                     source: "probe/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

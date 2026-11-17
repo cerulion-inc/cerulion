@@ -30,17 +30,21 @@ saves only when the cache policy opts that namespace in.
 ## Period park lanes
 
 `Period park (x86_64 Linux)` and `Period park (aarch64 Linux)` build, lint and
-test `rmw_cerulion` with `--features period-park`, one on `ubuntu-latest` and
-one on the hosted `ubuntu-24.04-arm` runner, on every run of the CI workflow:
-pull requests, merge-queue runs, pushes to `main` and manual runs. Each leg runs
-clippy with `-D warnings` over all targets with the feature on and off, then
-over the bare lib with and without it (the only build of the lib without
-`test-seams`), then the crate's tests serially with the feature on. The aarch64
-leg then runs the tests again with default features, since no other job tests
-the default build on aarch64 Linux. The steps run when the path classifier
+test the period-learned park of `rmw_cerulion` (cfg `cerulion_period_park`),
+one on `ubuntu-latest` and one on the hosted `ubuntu-24.04-arm` runner, on every
+run of the CI workflow: pull requests, merge-queue runs, pushes to `main` and
+manual runs. Every Linux aarch64 build carries the park; on x86_64 only
+`--features period-park` does. Each leg runs clippy with `-D warnings` over all
+targets with the feature on and off, then over the bare lib with and without it
+(the only build of the lib without `test-seams`), then the crate's tests
+serially with the feature on. On the aarch64 leg the feature on and off compile
+the same park, so there those steps differ only in the cfg rule's own test. The aarch64 leg then runs the tests again with
+default features and `CERULION_RMW_PERIOD_PARK=0`, which turns the learned park
+off at run time, since no other job tests the one-rung idle park that the
+switch restores on aarch64 Linux. The steps run when the path classifier
 selects `rmw_cerulion`. This is the only job that runs clippy on Linux aarch64,
 where `c_char` is `u8` rather than `i8`, so an `as` cast between `c_char` and
-`u8` lints there and nowhere else. It is not a required context (see
+`u8` lints there and nowhere else. Both legs are required contexts (see
 `tools/ci/required_contexts.txt`). Its cache namespaces are `period-park-X64`
 and `period-park-ARM64`; the default save policy is restore-only until they are
 opted in.
@@ -305,7 +309,7 @@ enforces.
 | `the_robot_demo_workspace_is_rerun_free` | Any `examples/go2` crate takes a rerun dependency of any kind. Read from that workspace's committed manifests and lockfile, so dev edges, build edges and every platform count. |
 | `the_robot_workspace_reader_sees_normal_and_dev_packages` | The lockfile reader stops seeing `go2_tf`, or the manifest reader stops seeing `tempfile`, which `dds_bridge` declares only under `[dev-dependencies]`. A dev edge is how the Rerun SDK reached the robot the one time it did, so that is the arm worth a control of its own. |
 | `the_dds_stack_is_confined_to_cerulion_dds` | A second workspace member declares a DDS dependency, or the default build reaches the DDS stack along a route that avoids `cerulion_dds`. |
-| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, `cerulion_ops_proto` anything but serde, serde_json and thiserror, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
+| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, `cerulion_ops_proto` anything but serde, serde_json, thiserror and base64, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
 | `the_confined_crates_reach_nothing_they_forbid` | `cerulion_pairing` reaches iroh or rerun, `cerud` reaches iceoryx2 or zenoh, or `cerulion_link` reaches `cerulion_core`. |
 | `the_permissive_crates_reach_no_agpl_crate` | A workspace crate licensed `MIT OR Apache-2.0` reaches an AGPL workspace crate over normal or build edges, or one of the four documented permissive crates stops declaring that license. A control requires the same check to report `cerud` under `cerulion_remoted`. |
 | `the_heavy_members_stay_out_of_default_members` | One of the eleven deliberate `default-members` exclusions is back in the default set, or a member left the default set with no row saying why. Checked in both directions, and each row names what a plain build would gain. |
@@ -414,6 +418,33 @@ string, the public-surface gate's own fixture) is recorded in `NOT_AN_INVOCATION
 its reason, and a line there that stops matching fails too. `cerulion --version` is not
 an invocation for this purpose: clap answers it above the gate.
 
+`CERULION_LOGIN_GATE=off` switches off the command-wide check and nothing else.
+Serving the network is a second rule the variable does not reach. These need a
+saved login on the machine (an expired one counts):
+
+- a real-clock `graph run` or `node run` that offers topics to the network: under
+  the permissive default (no `network:` block, or one with `mode: disabled` or no
+  `mode:`), any graph with a producer or a `ros2:` node; under an enabled
+  `network:` block (`mode: peer` or `mode: client`), one that lists egress topics;
+- a `ros2 attach` that is not a dry run;
+- a `cerulion-netd` started with `CERULION_NETD_LISTEN`.
+
+Without one they refuse with
+`` serving the network requires a prior login; run `cerulion login` ``. The runs
+and `ros2 attach` also accept a saved robot pairing; the netd listener does not.
+A job with no account keeps a `graph run` or `node run` on the runner with
+`--network off` (also spelled `--local`) or `CERULION_NETWORK=off`, and a
+`ros2 attach` with `CERULION_NETWORK=off` (it has no `--network` flag); a
+`graph run` under `--time-source virtual` or `external` is inert too. The release
+install smoke and the perception replay demo both pass `--network off`. The seeded
+login below satisfies the serving rule as well, and a run under it then serves for
+real. The workspace latency harness runs its real-clock legs under the permissive
+default (its backtoback leg passes `--time-source virtual` and stays inert), and the
+cross-host harness's `cerulion-tcp` and `cerulion-quic` stacks give each machine a
+`network:` block that lists egress topics. Both harnesses therefore need a
+signed-in machine for those legs, and the cross-host harness needs a login on each
+of its two machines.
+
 A job that wants a machine WITH an account instead seeds one:
 `tools/ci/seed_test_login.sh <dir>` writes the `auth.json` a real sign-in writes,
 and `CERULION_HOME=<dir>` points the gate at it. The file's shape is pinned
@@ -503,6 +534,25 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 `demos-go2`, `netd-wan`, `docs`, `deps` (cargo-deny,
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
+
+`examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
+`Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
+runtime; floor 13), ahead of any build step that could rewrite one, so a dependency change under
+`crates/` that is not carried into those lockfiles fails there. Refresh one with
+`cargo metadata --format-version 1 --manifest-path <dir>/Cargo.toml > /dev/null`. That is not a
+minimal edit: it adds every crate the manifests now require at its newest compatible version, and
+where a path crate's dependencies changed it can re-point a dependency edge of a crate already
+locked (onto another locked major version of `syn`, for example). Read its diff: keep each added
+package and each move the new requirements force (an exact `=` pin or a raised minimum in a
+crate manifest, directly or through the moved crate's own dependencies); restore a changed line
+of an already-locked package only when its old version still satisfies every requirement (an
+edge re-pointed onto another locked version, or a newer version cargo picked on its own); then
+confirm with `cargo metadata --locked`. The
+Android sample runtime's lockfile, seeded from the root one, takes each added registry crate at
+the version the root `Cargo.lock` ships (the Python wheel's does the same for the iceoryx2
+family). `cargo update -p <crate> --precise <root version>` sets that version, but it re-resolves
+the same way and can re-point more edges, so diff the result against the stale file and the root
+`Cargo.lock` again.
 
 Five Linux jobs run on push / `workflow_dispatch` only and never
 on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `fuzz`, `miri` and

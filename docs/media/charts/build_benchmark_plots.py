@@ -72,7 +72,8 @@ RMW_SAME_CELL = 'jazzy_cerulion_shm_loan_be1_chrt0'
 RMW_SAME_LEDGER = HERE/'rmw-same-harness-point-ledger.json'
 HEROES_STOCK_ROS2_CELL = 'jazzy_stock_rclcpp_chrt0'
 JETSON = RESULTS/'9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx'
-MAC = RESULTS/'0b7bc3994f78e232-2026-09-17-fixed100-apple-m4'
+MAC = RESULTS/'446db2afb7d26dbc-2026-11-13-fixed100-apple-m4'
+MAC_BUILD, MAC_OS = 'Cerulion 2.0.0', 'macOS 27.2.1'
 EXPECTED_SIZES = [64,256,1024,4096,16384,65536,262144,1048576,4194304,16777216]
 SIZE_LABELS = ['64 B','256 B','1 KiB','4 KiB','16 KiB','64 KiB','256 KiB','1 MiB','4 MiB','16 MiB']
 COLORS = dict(multi='#2563EB', single='#089D9E', stock='#D36B26', composed='#74708C', zenoh='#B58900',
@@ -301,13 +302,13 @@ def floor_row_p50_range(path):
     return [int(r['round_trip_p50_ns']) for r in rows]
 x86_floor=floor_row_p50_range(HEROES/'iox2-rerun/results_iox2_chrt0.csv')
 jetson_floor=floor_row_p50_range(JETSON/'results_iox2_chrt0.csv')
-mac_floor_rows=csv_rows(MAC/'results_iox2_chrt0.csv')
-assert all(r['iterations']=='0' and r['round_trip_p50_ns']=='' for r in mac_floor_rows), 'Mac floor row unexpectedly populated'
-record_source(MAC/'results_iox2_chrt0.csv',role='Mac raw iceoryx2 floor row: empty (fixed 100 Hz not sustained), so no Mac floor is cited')
+assert not (MAC/'results_iox2_chrt0.csv').exists(), 'Mac package carries a raw iceoryx2 row: cite its floor like the Jetson one'
+assert all(t in (MAC/'PROVENANCE.txt').read_text() for t in (MAC_BUILD,MAC_OS)), 'Mac footnote build or OS missing from the package provenance'
+record_source(MAC/'PROVENANCE.txt',role='Mac build and OS named in the platform footnote')
 
 def us(ns): return ns/1000
 def fmt_range_us(values_ns):
-    return f'{us(min(values_ns)):.1f} to {us(max(values_ns)):.1f} µs'
+    return f'{us(min(values_ns)):.2f} to {us(max(values_ns)):.2f} µs'
 def date_of(package_dir):
     m=re.search(r'(\d{4}-\d{2}-\d{2})',package_dir.name); return m.group(1)
 
@@ -727,7 +728,8 @@ jet_elev=[a-b for s in (jet_split,jet_mono) for a,b in zip(p50s(s),jetson_floor,
 x86_elev=[a-b for s in (x86_split,x86_mono) for a,b in zip(p50s(s),x86_floor,strict=True)]
 mixed_cells=[(SIZE_LABELS[EXPECTED_SIZES.index(x)],platform_short[i//2],platforms[i]['display_label']) for x,i,v in strip_cells(platforms)[2]]
 assert all(v=='mixed' for _,_,v in strip_cells(platforms)[2])
-jet_date=date_of(JETSON); mac_date=date_of(MAC); assert jet_date==mac_date
+mac_date=date_of(MAC)
+assert all((p['repetitions'],p['samples'])==(5,10000) for s in platforms for p in s['points']), 'subtitle says k=5, footnote 10,000 samples'
 subtitle=['Same payload sweep on three machines  ·  colour = platform, line style = run shape',
           'STOCK  ·  recorder ON  ·  fixed 100 Hz  ·  k=5']
 def signed_range(values):
@@ -737,8 +739,8 @@ def signed_range(values):
 foot=[
     'Commanded 100 Hz; five sessions, 10,000 samples per point. Always-on recording included. Payload fill excluded.',
     'Jetson: NV Power Mode 40 W, governor schedutil, CPU clock capped at 1.4976 GHz (hardware max 1.984 GHz).',
-    f'Mac: multi-process on macOS waits on a bounded spin plus a sleep-and-recheck, so its round trip sits near {us(sorted(p50s(mac_split))[5]):.0f} µs ({fmt_range_us(p50s(mac_split))} p50); '
-    f'single-process ({fmt_range_us(p50s(mac_mono))} p50) is the representative Mac number.',
+    f'Mac: {MAC_BUILD} on {MAC_OS}, measured {mac_date}, a later build than the x86-64 and Jetson rows. A multi-process consumer wakes on the publish. '
+    f'Multi-process p50 {fmt_range_us(p50s(mac_split))}, single-process p50 {fmt_range_us(p50s(mac_mono))}.',
 ]
 strip_pt=0
 legend_top,key_top,top_pt=header_height(len(subtitle),legend_rows=2)
@@ -749,10 +751,6 @@ for i,(series,color,style) in enumerate(zip(platforms,six_colors,six_styles,stri
 pl_floor=min(us(f['floor_ns']) for s_ in platforms for f in s_['v5']['floor'])
 ymin_pl=1.5 if pl_floor>=1.7 else 1
 payload_axis(ax,strip);latency_axis(ax,ymin_pl,300,[t for t in (1,2,3,10,30,100,300) if t>=ymin_pl])
-xm=EXPECTED_SIZES[4]; ym=us(p50s(mac_split)[4]); ytop=us(max(p['p99_ns'] for p in mac_split['points']))
-ax.annotate('lower Mac latencies coming soon',xy=(xm,ym),xytext=(xm,ytop*1.35),ha='center',va='bottom',
-            fontsize=SIZE['footnote']+1,color=COLORS['mac'],fontweight='bold',
-            arrowprops=dict(arrowstyle='-',color=COLORS['mac'],lw=.9,alpha=.7,shrinkB=4),zorder=20)
 ends=end_labels(ax,[(us(s['points'][-1]['p50_ns']),c,fmt_value(s['points'][-1]['p50_ns'])) for s,c in zip(platforms,six_colors,strict=True)])
 platform_handles=[Line2D([],[],color=c,lw=2.2,marker='o',markersize=6.4,markerfacecolor=c,markeredgecolor='white',markeredgewidth=.9) for c in platform_colors]
 shape_handles=[Line2D([],[],color=KEY_INK,lw=2.2,linestyle=s) for s in (DASH['solid'],DASH['dashed'])]

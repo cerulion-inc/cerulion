@@ -182,6 +182,7 @@ fn snap_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -365,6 +366,7 @@ fn fire_gating_skips_snapshot_on_non_fire_steps() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -583,10 +585,12 @@ fn run_dual(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u64)> {
                     InputDef {
                         name: "inp_plain".to_string(),
                         source: "producer_plain/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp_block".to_string(),
                         source: "producer_block/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
@@ -804,6 +808,7 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -816,6 +821,7 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -829,6 +835,7 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "trig_b/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -842,10 +849,12 @@ fn run_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64, u6
                     InputDef {
                         name: "trig".to_string(),
                         source: "trig_a/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "plain".to_string(),
                         source: "qsib/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
@@ -1025,6 +1034,7 @@ fn run_sample(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u64)> {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1308,6 +1318,7 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -1320,6 +1331,7 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -1333,6 +1345,7 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "trig_b/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -1346,14 +1359,17 @@ fn run_sync_trig_plain(prefix: &str, warmup: u32, measured: u32) -> Vec<(u64, u6
                     InputDef {
                         name: "trig_a".to_string(),
                         source: "trig_a/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "trig_b".to_string(),
                         source: "trig_b/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "plain".to_string(),
                         source: "qsib/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

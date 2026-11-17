@@ -1778,7 +1778,12 @@ impl PermissiveShmProbe {
             return ProbeVerdict::NotPermissive;
         }
 
-        if !matches!(manager.is_network_mirror(&canonical), Ok(false)) {
+        // Runs inside the demand's session callback: never waits for a mirror
+        // marker being torn down.
+        if !matches!(
+            manager.is_network_mirror(&canonical, super::TeardownWait::Never),
+            Ok(false)
+        ) {
             self.record_loop_refusal(&canonical, "network mirror belongs to its source robot");
             return ProbeVerdict::LoopRefused;
         }
@@ -2185,9 +2190,13 @@ fn catalog_serve_decision(
         let Some(manager) = probe.upgrade() else {
             return cerulion_q::CatalogReply::refused(robot, "producer policy is unavailable");
         };
-        reply
-            .entries
-            .retain(|entry| manager.remote_topic_allowed(&entry.topic).unwrap_or(false));
+        // A catalog GET runs on the session's callback: a listing never waits
+        // for a policy marker being torn down.
+        reply.entries.retain(|entry| {
+            manager
+                .remote_topic_allowed(&entry.topic, super::TeardownWait::Never)
+                .unwrap_or(false)
+        });
     }
     reply
 }
@@ -2301,8 +2310,12 @@ fn schema_serve_decision(
         );
         bindings.sort();
         bindings.dedup();
+        // A schema GET runs on the session's callback: never waits for a
+        // policy marker being torn down.
         let visible = bindings.iter().any(|(topic, root)| {
-            manager.remote_topic_allowed(topic).unwrap_or(false)
+            manager
+                .remote_topic_allowed(topic, super::TeardownWait::Never)
+                .unwrap_or(false)
                 && (root == requested
                     || cerulion_q::collect_schema_closure(root, &docs).is_some_and(|closure| {
                         closure.iter().any(|doc| doc.qualified == requested)

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,10 +89,8 @@ async fn fixture_with(inspector: Option<PathBuf>, timeout: Duration) -> Fixture 
 /// An executable shell script under the temp dir; the daemon runs it as
 /// `<script> --inspect-node <cdylib>`, so the library path is `$2`.
 fn inspector_script(body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = unique_path("inspector").with_extension("sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    fresh_executable::install_script(&path, &format!("#!/bin/sh\n{body}\n"));
     path
 }
 

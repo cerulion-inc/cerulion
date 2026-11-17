@@ -31,8 +31,9 @@ env:
   IOX2_LOG_LEVEL: error
   # The smoke job runs an installed `cerulion` directly, not through cargo, so
   # it does not pick up the workspace cargo configuration. The login gate is on
-  # in every build; this is how this repository's own runs pass it without an
-  # account.
+  # in every build; this switches off its command-wide check so this
+  # repository's own runs pass it without an account. Serving the network is a
+  # separate rule this does not cover, so the smoke's `graph run` stays local.
   CERULION_LOGIN_GATE: "off"
   # The release under test: the pushed tag, or the tag a smoke-only dispatch
   # names. Job-level `if:` cannot read `env`, so those read `inputs.smoke_tag`.
@@ -787,8 +788,10 @@ jobs:
           cerulion node build sensor
           cerulion graph create perception
           cerulion node stage sensor -g perception
+          # `--network off` keeps the run on this runner: a run that serves the
+          # network needs a saved login, and this runner has none.
           set +e
-          "$CERULION_TIMEOUT_COMMAND" 60s cerulion graph run perception
+          "$CERULION_TIMEOUT_COMMAND" 60s cerulion graph run perception --network off
           status=$?
           set -e
           if [ "$status" -ne 124 ]; then

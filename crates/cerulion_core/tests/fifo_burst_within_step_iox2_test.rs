@@ -134,6 +134,7 @@ fn recording_consumer(seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
             depth: CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }],
         vec![],
@@ -612,6 +613,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
                 inputs: vec![InputDef {
                     name: "trigger_in".to_string(),
                     source: "/fbwsc/ext".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "cmd".to_string(),
@@ -630,6 +632,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "fwd/cmd".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1071,10 +1074,12 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: CTX_TOPIC.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1181,6 +1186,7 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
                 consume: Default::default(),
             }],
             vec![],
@@ -1232,6 +1238,7 @@ fn record_node() -> NodeDef {
         inputs: vec![InputDef {
             name: "in".to_string(),
             source: "consumer/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }
@@ -1257,10 +1264,12 @@ fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRunt
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: CTX_TOPIC.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1311,6 +1320,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
                 inputs: vec![InputDef {
                     name: "tick_in".to_string(),
                     source: "ping/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "ctx".to_string(),
@@ -1330,10 +1340,12 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: "ctxsrc/ctx".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1421,6 +1433,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
                 consume: Default::default(),
             }],
             vec![],
@@ -1469,10 +1482,12 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: "/fbwsCollapse/ctx".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1492,6 +1507,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "collapsed/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1542,6 +1558,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "ping/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1577,6 +1594,7 @@ fn external_source_graph(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/fbws/ext".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

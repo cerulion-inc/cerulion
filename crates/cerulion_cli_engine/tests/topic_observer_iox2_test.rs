@@ -23,6 +23,10 @@
 //! cargo test -p cerulion_cli_engine --test topic_observer_iox2_test -- --test-threads=1
 //! ```
 
+#[cfg(unix)]
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -1084,7 +1088,6 @@ fn echo_under_a_progress_free_event_flood_shows_no_phantom_frames_but_still_show
 fn explicit_local_echo_reads_unknown_schema_without_remote_fallback() {
     use cerulion_cli_engine::topic_cmd::{topic_echo_with_scope, TopicScope};
     use iceoryx2::service::port_factory::PortFactory as _;
-    use std::os::unix::fs::PermissionsExt;
     struct StopOnFrame {
         output: Vec<u8>,
         running: Arc<AtomicBool>,
@@ -1105,12 +1108,10 @@ fn explicit_local_echo_reads_unknown_schema_without_remote_fallback() {
     let _socket = EnvGuard::set("CERULION_NETD_SOCK", socket.to_str().unwrap());
     let binary = root.path().join("netd-start-detector");
     let marker = root.path().join("netd-started");
-    std::fs::write(
+    fresh_executable::install_script(
         &binary,
         "#!/bin/sh\n: > \"$CERULION_LOCAL_TEST_START_MARKER\"\nexit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     // The production binary-selection seam runs a real child if reached. This
     // detector has a control proving it can record that forbidden side effect.
     assert!(std::process::Command::new(&binary)
@@ -1219,17 +1220,14 @@ fn local_observers_refuse_marked_mirrors_with_absent_or_failed_attribution() {
         topic_info_with_scope, TopicScope,
     };
     use cerulion_core::wire::MaxSliceLen;
-    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("netd.sock");
     let marker = root.path().join("netd-started");
     let binary = root.path().join("netd-start-detector");
-    std::fs::write(
+    fresh_executable::install_script(
         &binary,
         "#!/bin/sh\n: > \"$CERULION_LOCAL_TEST_START_MARKER\"\nexit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     // Positive control: the forbidden startup seam would actually record a start.
     assert!(std::process::Command::new(&binary)
         .env("CERULION_LOCAL_TEST_START_MARKER", &marker)

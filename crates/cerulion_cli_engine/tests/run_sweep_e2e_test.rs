@@ -867,7 +867,6 @@ fn start_descriptor(name: &str) -> cerulion_cli_engine::run_dir::RunDescriptor {
             gating: cerulion_cli_engine::run_dir::GatingClock::Wall,
             graph_yaml: "nodes: {}\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         },
     )
     .expect("descriptor")

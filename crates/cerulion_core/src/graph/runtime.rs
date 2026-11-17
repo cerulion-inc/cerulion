@@ -20,14 +20,15 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
 use crate::barrier::{MappedBarrier, WaitOutcome};
 use crate::clock::{Clock, VirtualClock};
 use crate::error::{InertReason, TransportError, TransportResult};
+use crate::fire_tap::{FireBody, FireCause, FireFlags, FireTap, FireTapConfig};
 use crate::read_outcome::{FireBurstBound, StageBurstBound, SyncTriggerShape};
 // Gated with its only consumer, `read_outcome_stage_capacities` — see that
 // Now a PRODUCTION type — the manifest writer's row shape.
@@ -230,6 +231,15 @@ pub struct CreditBinding {
     /// the edge (which ranks produce on it, in what order), and this process's
     /// own subgraph cannot see the other producers at all.
     pub producer_slot: Option<crate::credit::ProducerSlot>,
+    /// The edge's producer node id(s), named by the consumer half's release
+    /// event when the consumer node stops, and by the refusal of
+    /// `block_timeout_ms` on the bound input.
+    ///
+    /// A binding carries no `block_timeout_ms`: the producer's half builds
+    /// its defer edge with no timeout, so a cross-process word is never
+    /// forgiven, and graph load refuses the key on an input bound to a
+    /// mapped word.
+    pub producer_nodes: Vec<String>,
 }
 
 /// Everything a MULTI-PROCESS worker's build needs that its own
@@ -286,6 +296,13 @@ pub struct CrossProcessWiring<'a> {
     /// built at least as deep as. `None` on every build but a replay pass,
     /// which builds a bag-fed input as deep as its recorded schedule fills it.
     pub(crate) input_depth_floors: Option<&'a std::collections::BTreeMap<(String, String), usize>>,
+    /// The paced-topic warnings this build logs. `None` (every single-process
+    /// build): the build derives them from its own topology, which is the
+    /// whole graph. `Some(list)` (a multi-process worker): it logs exactly
+    /// `list`, the warnings its supervisor derived from the whole graph for
+    /// the topics whose producer node this worker builds, because the
+    /// worker's own topology holds only its subgraph's consumers.
+    pub(crate) paced_topic_warnings: Option<&'a [super::topology::PacedTopicWarning]>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -297,6 +314,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_topics: None,
             sibling_consumed_topics: None,
             input_depth_floors: None,
+            paced_topic_warnings: None,
         }
     }
 
@@ -314,6 +332,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_topics: None,
             sibling_consumed_topics: None,
             input_depth_floors: None,
+            paced_topic_warnings: None,
         }
     }
 
@@ -331,6 +350,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_topics: None,
             sibling_consumed_topics: None,
             input_depth_floors: None,
+            paced_topic_warnings: None,
         }
     }
 
@@ -367,6 +387,18 @@ impl<'a> CrossProcessWiring<'a> {
         self.input_depth_floors
             .and_then(|floors| floors.get(&(node.to_string(), input.to_string())))
             .map_or(declared, |floor| declared.max(*floor))
+    }
+
+    /// Log exactly `warnings` as this build's paced-topic warnings, in place of
+    /// the ones its own topology would give. Chained onto one of the
+    /// constructors above: a multi-process worker passes its plan's list, and
+    /// a replay pass passes an empty one, so a replay logs none.
+    pub fn with_paced_topic_warnings(
+        mut self,
+        warnings: &'a [super::topology::PacedTopicWarning],
+    ) -> Self {
+        self.paced_topic_warnings = Some(warnings);
+        self
     }
 
     /// Name the topics a SIBLING group PRODUCES for this worker, the inbound
@@ -1664,6 +1696,53 @@ struct BlockDeferEdge {
     /// so a multi-producer topic opens ONE stall regime rather than one per
     /// producer for the same stalled consumer.
     stall: Option<Arc<CreditStallWatch>>,
+    /// The topic the edge reads (release-event attribution).
+    topic: Arc<str>,
+    /// The `block_timeout_ms` clock for this consumer's slot, shared by every
+    /// in-graph producer of the edge like `armed`.
+    stall_clock: Arc<crate::scheduler::block::StallCell>,
+    /// The edge's `block_timeout_ms` in ns; `None` when it declares none.
+    timeout_ns: Option<u64>,
+    /// Whether the wait sizing may hold the producer until this slot's free
+    /// wakes the loop ([`crate::scheduler::block::slot_hold`]). `true` on a
+    /// local edge, whose consumer drains on this level loop. `false` on an
+    /// edge a credit binding wires (a mapped word on every multi-process
+    /// worker): the producer keeps the floor re-evaluation, which paces the
+    /// edge's `CreditStallWatch` count.
+    may_wait: bool,
+}
+
+/// One `block` slot a consumer node holds, kept by that node's tick callback
+/// so the callback can release it when the node stops for good.
+struct HeldBlockSlot {
+    word: crate::credit::CreditWord,
+    counters: Arc<BackpressureCounters>,
+    topic: Arc<str>,
+    consumer_input: Arc<str>,
+    /// The producer node id(s), comma-joined, for the release event.
+    producers: Arc<str>,
+}
+
+/// Release every `block` slot `consumer` holds: called by its tick callback
+/// when the node stops for good (a fatal error, or a host-side panic that
+/// poisons the entry). A tick panic a node library catches is not a stop:
+/// the node keeps draining, so its slots stay armed. Sticky, idempotent per
+/// slot, and one loud event per slot released. A slot held across processes
+/// is the shared word, so the producer in the other process stops waiting too.
+fn release_held_block_slots(consumer: &str, slots: &[HeldBlockSlot]) {
+    for slot in slots {
+        if slot.word.release_slot() {
+            emit_block_slot_release(
+                &slot.producers,
+                consumer,
+                &slot.consumer_input,
+                &slot.topic,
+                &slot.counters,
+                crate::scheduler::block::ReleaseReason::ConsumerDied,
+                0,
+            );
+        }
+    }
 }
 
 /// How many CONSECUTIVE deferred pre-fire evaluations with
@@ -1676,9 +1755,9 @@ struct BlockDeferEdge {
 /// machine was, and this warn rides a path a replay re-executes. The cost is
 /// that the detection LATENCY is producer-rate-dependent — a 1 kHz producer
 /// reaches it in about a second, a 10 Hz one in about a minute and a half. That
-/// is acceptable because the condition it reports is PERMANENT (a consumer that
-/// stopped draining a `block` edge never restarts it; the policy is
-/// wedge-and-warn), so the warn is late, never wrong.
+/// is acceptable because the condition it reports is long-lived (a consumer that
+/// stopped draining a `block` edge does not restart on its own), so the warn is
+/// late, never wrong. `block_timeout_ms` is the bounded release for this case.
 ///
 /// What makes the signal sharp is that the predicate is MOTION, not occupancy:
 /// a consumer draining at ANY rate at all bumps `wake_seq` on every freeing
@@ -1881,6 +1960,11 @@ struct CreditParkEdge {
     /// advance test. Written once per park by the live-loop thread; atomic only
     /// because `monitor_wait_block` takes `&self`.
     baseline_seq: std::sync::atomic::AtomicU32,
+    /// Was this edge at or over threshold when the live loop sized its wait?
+    /// The park takes this into `baseline_full`, so a drain landing between
+    /// the sizing and the park entry wakes the park instead of being absorbed
+    /// into its baseline. Cleared by the park that reads it.
+    sized_full: std::sync::atomic::AtomicBool,
 }
 
 /// The retained, READ-ONLY half of one `block` consumer edge —
@@ -1902,6 +1986,8 @@ struct BlockCreditEdge {
     /// its input on exactly the shape it was added for.
     outstanding: crate::credit::CreditWord,
     depth: u64,
+    /// The edge declares `block_timeout_ms`.
+    block_timeout: bool,
 }
 
 /// A snapshot of ONE `block` edge's credit — the observable the
@@ -1941,6 +2027,9 @@ pub struct BlockCredit<'a> {
     /// know which rows can pair up. This is that marker; within one process the
     /// records are still one-per-consumer-edge and cannot double-count.
     pub mapped: bool,
+    /// Does this edge declare `block_timeout_ms`? Such an edge can be
+    /// forgiven live, so [`Self::conservation_broken`] does not judge it.
+    pub block_timeout: bool,
 }
 
 impl BlockCredit<'_> {
@@ -1969,9 +2058,14 @@ impl BlockCredit<'_> {
     /// content of the check and lives one line away from [`Self::is_saturated`],
     /// whose comparison is the other one. Never a verdict — see
     /// `cerulion_cli_engine::replay_rederive`'s conservation rule.
+    ///
+    /// Never `true` for an edge that declares `block_timeout_ms`: a live
+    /// timeout release forgives the count, so the recording legally publishes
+    /// past `depth` on that edge, and a replay (which bypasses the gate, and so
+    /// the release) cannot tell when it did.
     #[must_use]
     pub fn conservation_broken(&self) -> bool {
-        self.outstanding > self.depth
+        !self.block_timeout && self.outstanding > self.depth
     }
 }
 
@@ -1994,6 +2088,162 @@ impl BlockCredit<'_> {
 #[must_use]
 pub fn throttle_defers(prior_fires: u64, now_ns: u64, last_fire_ns: u64, throttle_ns: u64) -> bool {
     prior_fires > 0 && now_ns.saturating_sub(last_fire_ns) < throttle_ns
+}
+
+/// The `block` half of a producer's pre-fire gate: judge every block
+/// consumer's slot with [`crate::scheduler::block::judge_slot`] and defer iff
+/// one is full. A slot whose `block_timeout_ms` passed is forgiven here, with
+/// its loud event; a stopped consumer releases its own slots
+/// (`release_held_block_slots`).
+fn block_edges_defer(producer: &str, edges: &[BlockDeferEdge], now_ns: u64) -> bool {
+    use crate::scheduler::block::{judge_slot, ReleaseReason, SlotReading, SlotVerdict};
+    let mut deferred = false;
+    for e in edges {
+        // Read, judge and forgive under the slot's stall-cell lock. Every
+        // producer of the topic shares the cell, so a second producer judges
+        // the mark this one stored, never the one it replaced, and one stall
+        // releases the slot once. Graph load refuses `block_timeout_ms` on a
+        // topic with several producers and on a cross-process edge, and a
+        // mapped defer edge is built with no timeout, so only a one-producer
+        // local slot times out.
+        let (reading, verdict, forgiven) = e.stall_clock.update(|mark| {
+            let reading = SlotReading::of(&e.outstanding, e.threshold);
+            let (verdict, next) = judge_slot(reading, mark, now_ns, e.timeout_ns);
+            let forgiven = match verdict {
+                SlotVerdict::TimedOut { .. } => {
+                    if crate::oracle_mutant::active("block_shared_release") {
+                        edges
+                            .iter()
+                            .map(|other| other.outstanding.forgive_outstanding())
+                            .fold(0, u64::max)
+                    } else {
+                        e.outstanding.forgive_outstanding()
+                    }
+                }
+                SlotVerdict::Room | SlotVerdict::Released | SlotVerdict::Full => 0,
+            };
+            (next, (reading, verdict, forgiven))
+        });
+        match verdict {
+            SlotVerdict::Full => {
+                // `e.stall` (Some only on a mapped edge) warns once per regime
+                // when the peer's credit has not moved across
+                // `CREDIT_STALL_UNMOVED_OBSERVATIONS` deferred evaluations.
+                if let Some(stall) = &e.stall {
+                    stall.observe_deferred(reading.wake_seq);
+                }
+                // The deferred-fire count is unconditional; the warn rides the
+                // edge's once-per-regime trigger (`armed.swap` returns the
+                // prior state: `true` opens a regime and warns loud).
+                let fire = e.armed.swap(false, Ordering::AcqRel);
+                if fire {
+                    e.counters.open_block_regime();
+                }
+                record_backpressure_event_n(
+                    &e.consumer_node,
+                    &e.consumer_input,
+                    BackpressurePolicy::Block,
+                    &e.counters,
+                    1,
+                    fire,
+                );
+                deferred = true;
+            }
+            SlotVerdict::TimedOut { held_ns } => {
+                // Zero: the consumer drained every counted frame between the
+                // reading and the release, so nothing was released.
+                if forgiven != 0 {
+                    emit_block_slot_release(
+                        producer,
+                        &e.consumer_node,
+                        &e.consumer_input,
+                        &e.topic,
+                        &e.counters,
+                        ReleaseReason::Timeout,
+                        held_ns,
+                    );
+                }
+                if let Some(stall) = &e.stall {
+                    stall.observe_below_threshold();
+                }
+            }
+            SlotVerdict::Room | SlotVerdict::Released => {
+                // Below threshold: re-arm so the next regime warns loud again,
+                // and close any open stall regime.
+                e.armed.store(true, Ordering::Release);
+                if let Some(stall) = &e.stall {
+                    stall.observe_below_threshold();
+                }
+            }
+        }
+    }
+    deferred
+}
+
+/// The wait-sizing read of a producer's `block` slots: when the producer can
+/// next fire ([`crate::scheduler::block::node_hold`]). Reads the same words and
+/// stall marks [`block_edges_defer`] judges, and writes neither.
+fn block_edges_hold(edges: &[BlockDeferEdge]) -> crate::scheduler::block::BlockHold {
+    use crate::scheduler::block::{node_hold, slot_hold, SlotReading};
+    node_hold(edges.iter().map(|e| {
+        slot_hold(
+            SlotReading::of(&e.outstanding, e.threshold),
+            e.stall_clock.load(),
+            e.timeout_ns,
+            e.may_wait,
+        )
+    }))
+}
+
+/// The loud event for one released `block` slot: the consumer input's
+/// `block_slot_releases_count`, and a `warn!` naming the producer, the
+/// consumer, the edge and the reason. A consumer that times out over and over
+/// warns at the first release and at every power of ten after it (the count
+/// is in each line); the rest log at `debug!`.
+fn emit_block_slot_release(
+    producer: &str,
+    consumer_node: &str,
+    consumer_input: &str,
+    topic: &str,
+    counters: &BackpressureCounters,
+    reason: crate::scheduler::block::ReleaseReason,
+    held_ns: u64,
+) {
+    let releases = counters
+        .block_slot_releases_count
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    if is_power_of_ten(releases) {
+        tracing::warn!(
+            producer = %producer,
+            consumer_node = %consumer_node,
+            consumer_input = %consumer_input,
+            topic = %topic,
+            reason = reason.as_str(),
+            held_ms = held_ns / 1_000_000,
+            releases,
+            "`block` slot released: the producer no longer waits on this consumer input. \
+             Frames the consumer has not drained may now be evicted from its queue"
+        );
+    } else {
+        tracing::debug!(
+            producer = %producer,
+            consumer_node = %consumer_node,
+            consumer_input = %consumer_input,
+            topic = %topic,
+            reason = reason.as_str(),
+            releases,
+            "`block` slot released again"
+        );
+    }
+}
+
+/// `1, 10, 100, …`.
+fn is_power_of_ten(mut n: u64) -> bool {
+    while n >= 10 && n.is_multiple_of(10) {
+        n /= 10;
+    }
+    n == 1
 }
 
 /// The composed pre-fire decision — the ONE place the throttle
@@ -3395,11 +3645,201 @@ struct LivePaceAnchor {
     gating_ns: u64,
 }
 
+/// Nodes a fire tap can index: record `node` is a `u16` and so is the tap's
+/// node count. Nodes past it run unrecorded.
+const FIRE_NODE_LIMIT: usize = u16::MAX as usize;
+
+/// What the tick callback's `catch_unwind` around `NodeEntry::tick` returns.
+type TickResult = std::thread::Result<TransportResult<()>>;
+
+/// How a recorded tick ended.
+enum TickOutcome {
+    Ok,
+    Err,
+    Panicked,
+}
+
+impl TickOutcome {
+    fn of(result: &TickResult) -> Self {
+        match result {
+            Ok(Ok(())) => Self::Ok,
+            // A node library catches its own panic and returns this variant.
+            Ok(Err(TransportError::NodeTickPanicked { .. })) | Err(_) => Self::Panicked,
+            Ok(Err(_)) => Self::Err,
+        }
+    }
+}
+
+/// An armed tick, started before the tick runs, with the tap that admitted it.
+struct FireStart<'t> {
+    tap: &'t FireTap,
+    node: u16,
+    at_ns: u64,
+    started: Instant,
+    counted: bool,
+}
+
+/// The installed fire tap and, per recorded node, whether that node's entry
+/// reported its commit counts at install. A tick asks only those entries.
+struct FireInstall {
+    tap: Arc<FireTap>,
+    reports_writes: Box<[bool]>,
+}
+
+/// One node's fire recording, moved into its tick callback at build. It
+/// reads no clock and asks the entry nothing until a reader arms the tap.
+struct FireSite {
+    tap: Arc<OnceLock<FireInstall>>,
+    node: Option<u16>,
+    cause: FireCause,
+    flags: u8,
+}
+
+/// One node's output commit counts around a recorded tick.
+struct FireCounts {
+    before: Box<[u32]>,
+    after: Box<[u32]>,
+}
+
+impl FireCounts {
+    // hot-path-alloc-ok-fn: cold: graph build sizes each node's two count buffers once
+    fn new(outputs: usize) -> Self {
+        Self {
+            before: vec![0; outputs].into_boxed_slice(),
+            after: vec![0; outputs].into_boxed_slice(),
+        }
+    }
+}
+
+impl FireSite {
+    fn new(
+        tap: Arc<OnceLock<FireInstall>>,
+        index: usize,
+        trigger: &TopologyTrigger,
+        outputs: usize,
+    ) -> Self {
+        let mut flags = 0;
+        if matches!(
+            trigger,
+            TopologyTrigger::Data {
+                ambiguous: true,
+                ..
+            }
+        ) {
+            flags |= FireFlags::TRIGGER_AMBIGUOUS;
+        }
+        if outputs > 64 {
+            flags |= FireFlags::WROTE_TRUNCATED;
+        }
+        Self {
+            tap,
+            node: (index < FIRE_NODE_LIMIT).then_some(index as u16),
+            cause: FireCause::try_from(trigger.cause()).unwrap_or(FireCause::Unknown),
+            flags,
+        }
+    }
+
+    /// `None` while disarmed. The commit-count probe is entry code, so the
+    /// caller runs this inside the tick's `catch_unwind`.
+    #[inline]
+    fn start(&self, counts: &mut FireCounts, entry: &dyn NodeEntry) -> Option<FireStart<'_>> {
+        let node = self.node?;
+        let installed = self.tap.get()?;
+        let at_ns = installed.tap.armed_now()?;
+        let counted = installed.reports_writes.get(usize::from(node)) == Some(&true)
+            && entry.output_commit_counts(&mut counts.before);
+        Some(FireStart {
+            tap: &installed.tap,
+            node,
+            at_ns,
+            started: Instant::now(),
+            counted,
+        })
+    }
+
+    /// Record `start`'s tick and return its result. A panic in the after
+    /// count is entry code panicking in this callback, so it becomes the
+    /// tick's panic unless the tick already panicked.
+    fn record(
+        &self,
+        start: FireStart<'_>,
+        counts: &mut FireCounts,
+        entry: &dyn NodeEntry,
+        result: TickResult,
+    ) -> TickResult {
+        let elapsed = start.started.elapsed();
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start.counted && entry.output_commit_counts(&mut counts.after)
+        }));
+        let (counted, result) = match probed {
+            Ok(counted) => (counted, result),
+            Err(payload) => (false, result.and(Err(payload))),
+        };
+        let writes = counted.then_some((&*counts.before, &*counts.after));
+        start.tap.push(self.body(
+            start.node,
+            start.at_ns,
+            elapsed,
+            TickOutcome::of(&result),
+            writes,
+        ));
+        result
+    }
+
+    /// The record of one armed tick. `writes` holds the commit counts before
+    /// and after it, `None` when the entry could not report them.
+    fn body(
+        &self,
+        node: u16,
+        at_ns: u64,
+        elapsed: Duration,
+        outcome: TickOutcome,
+        writes: Option<(&[u32], &[u32])>,
+    ) -> FireBody {
+        let mut flags = self.flags
+            | match outcome {
+                TickOutcome::Ok => 0,
+                TickOutcome::Err => FireFlags::TICK_ERROR,
+                TickOutcome::Panicked => FireFlags::PANICKED,
+            };
+        let dur_ns = match u32::try_from(elapsed.as_nanos()) {
+            Ok(dur_ns) => dur_ns,
+            Err(_) => {
+                flags |= FireFlags::DURATION_SATURATED;
+                u32::MAX
+            }
+        };
+        let mut wrote = 0_u64;
+        match writes {
+            Some((before, after)) => {
+                for (bit, (before, after)) in before.iter().zip(after).take(64).enumerate() {
+                    if before != after {
+                        wrote |= 1 << bit;
+                    }
+                }
+            }
+            None => flags |= FireFlags::WROTE_UNKNOWN,
+        }
+        FireBody {
+            at_ns,
+            dur_ns,
+            node,
+            cause: self.cause,
+            flags: FireFlags(flags),
+            wrote,
+        }
+    }
+}
+
 pub struct GraphRuntime {
     config: GraphConfig,
     scheduler: Scheduler,
     handles: IndexMap<String, NodeHandle>,
     topology_nodes: Vec<TopologyNode>,
+    /// Empty until [`Self::install_fire_tap`]; every tick callback holds a clone.
+    fire_tap: Arc<OnceLock<FireInstall>>,
+    /// The gating clock, which also stamps each node's in-tick marker.
+    fire_clock: Arc<dyn Clock>,
     /// Per capture-time Sync node, its trigger topics and the per-input
     /// capture states its sync ops share. Read only by
     /// [`Self::restore_sync_input_timestamps`], which seeds each input's
@@ -5528,6 +5968,7 @@ impl GraphRuntime {
         let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
+        let fire_tap: Arc<OnceLock<FireInstall>> = Arc::new(OnceLock::new());
         // Exit-3 widening: one shared PANIC-CLASS failure record per
         // node (first reason wins), written by the tick callback at the catch
         // site / on the structural FFI variant, read post-run via
@@ -5606,6 +6047,13 @@ impl GraphRuntime {
             supports_sync_capture_stamps.insert(id.clone(), entry.supports_sync_capture_stamps());
             probes_trigger_input.insert(id.clone(), entry.probes_trigger_input());
         }
+        // The graph's per-input `backpressure:` / `depth:` keys, written into
+        // the metadata every later reader of `input_meta` consults.
+        super::topology::apply_input_backpressure_overrides(
+            &config,
+            &mut entry_infos,
+            super::topology::MissingInputMeta::Refuse,
+        )?;
         // A `#[cerulion_node]` node needs a publisher for every output it
         // declares, and the graph creates one only for each output its YAML
         // lists: refuse an unlisted output now, before any transport resource
@@ -5700,6 +6148,24 @@ impl GraphRuntime {
         // to the earlier path (incl. the algebraic-cycle diagnostic,
         // which now lives in `resolve_levels`).
         let levels = super::topology::resolve_levels(&config, &topology, &trigger_edges)?;
+        // One warning per topic whose `block` consumers pace its `drop_oldest`
+        // and `sample(N)` consumers, logged once here at load and never from a
+        // step. A planning build is torn down before any of its nodes runs, so
+        // it logs none; the worker that runs the producer logs its plan's.
+        if purpose == BuildPurpose::Execution {
+            let derived;
+            let paced: &[super::topology::PacedTopicWarning] =
+                match cross_process.paced_topic_warnings {
+                    Some(planned) => planned,
+                    None => {
+                        derived = topology.paced_topic_warnings();
+                        &derived
+                    }
+                };
+            for warning in paced {
+                warning.log(config.identity());
+            }
+        }
 
         // CHAIN FUSION, resolved once and logged once. The decision is the
         // `CERULION_FUSE_CHAINS` seam; the census beside it says which edges
@@ -6099,14 +6565,13 @@ impl GraphRuntime {
             });
         }
 
-        // `block` wiring (zero-copy): for every ALL-block topic,
-        // mint one shared `outstanding` counter per consumer edge. The
+        // `block` wiring (zero-copy): for every topic with a `block`
+        // consumer, mint one shared `outstanding` counter per `block` consumer
+        // edge. The
         // producer's publisher increments it on send; the consumer's
         // subscriber decrements it on drain; the producer's pre-fire check
-        // reads it to defer the moment any consumer queue is full. A MIXED
-        // topic (block + non-block consumers) degrades its block consumers
-        // to native drop_oldest (deferring would starve the non-block
-        // sibling — decision K) and installs nothing.
+        // reads it to defer the moment any `block` consumer queue is full.
+        // The topic's non-`block` consumers get no counter.
         let sub_buf = transport.subscriber_buffer_size();
         // Per-topic iceoryx2 service config + per-input
         // queue depth, both derived from the topology so every open site of
@@ -6734,6 +7199,9 @@ impl GraphRuntime {
         // subscriber needs to fire its block event.
         type BlockWiring = (crate::credit::CreditWord, u64, Arc<BackpressureCounters>);
         let mut sub_block_by_input: HashMap<(String, String), BlockWiring> = HashMap::new();
+        // The `block` slots each consumer node holds, handed to that node's
+        // tick callback (see `release_held_block_slots`).
+        let mut held_block_slots: HashMap<String, Vec<HeldBlockSlot>> = HashMap::new();
         // producer node → its block defer edges (for the pre-fire closure).
         let mut producer_block_edges: HashMap<String, Vec<BlockDeferEdge>> = HashMap::new();
         // (consumer node, input, counters) to register into the scheduler so
@@ -6844,7 +7312,7 @@ impl GraphRuntime {
         )> = Vec::new();
         for flow in topology.topics() {
             // `sample(N)` gates are per-consumer and work on ANY topic — wire
-            // them first, before the all-block early-continue below.
+            // them first, before the no-`block`-consumer early-continue below.
             for edge in &flow.consumers {
                 if let BackpressurePolicy::Sample(interval_ms) = edge.policy {
                     let counters = Arc::new(BackpressureCounters::new());
@@ -6859,22 +7327,17 @@ impl GraphRuntime {
                     ));
                 }
             }
-            if !flow.is_all_block() {
-                if flow.has_block_consumer() {
-                    tracing::warn!(
-                        topic = %flow.topic,
-                        "block consumer(s) share this topic with non-block consumer(s); \
-                         deferring the producer would starve the non-block sibling, so the \
-                         block consumer(s) degrade to drop_oldest (iceoryx2 native). Give the \
-                         block consumer its own topic to get true flow control."
-                    );
-                }
-                continue;
+            // Every `block` consumer gets its own slot, whatever the topic's
+            // other consumers declare: they hold no slot and the producer's
+            // deferral never consults them.
+            if !flow.holds_its_producers() {
+                continue; // a producer-less `block` edge is refused by validate
             }
-            if flow.producers.is_empty() {
-                continue; // validated unreachable: all-block ⇒ has a producer
-            }
-            for edge in &flow.consumers {
+            for edge in flow
+                .consumers
+                .iter()
+                .filter(|c| matches!(c.policy, BackpressurePolicy::Block))
+            {
                 // An edge the PLAN binds to a cross-process credit
                 // word is wired ONCE, by the injection pass below, from the
                 // MAPPED word. Skipping it here (rather than letting both run)
@@ -6915,6 +7378,12 @@ impl GraphRuntime {
                         ),
                     })?;
                 let outstanding = crate::credit::CreditWord::local(word_depth);
+                // Each in-graph producer of the topic publishes through its own
+                // connection, which iceoryx2 gives a queue of `depth` frames. A
+                // topic takes at most 16 publishers (the `multi_publisher_topics`
+                // ceiling), so the count fits a `u32`.
+                outstanding
+                    .set_connections(u32::try_from(flow.producers.len()).unwrap_or(u32::MAX));
                 let counters = Arc::new(BackpressureCounters::new());
                 // One warn edge-trigger per consumer edge, shared
                 // by every producer of the topic (see `BlockDeferEdge::armed`).
@@ -6938,6 +7407,17 @@ impl GraphRuntime {
                 // before any connection can overflow; lossless, Principle
                 // #6) rather than per-connection-exact.
                 let threshold = edge.depth;
+                let stall_clock = Arc::new(crate::scheduler::block::StallCell::default());
+                held_block_slots
+                    .entry(edge.node_id.clone())
+                    .or_default()
+                    .push(HeldBlockSlot {
+                        word: outstanding.clone(),
+                        counters: Arc::clone(&counters),
+                        topic: Arc::from(flow.topic.as_str()),
+                        consumer_input: Arc::from(edge.input.as_str()),
+                        producers: Arc::from(flow.producers.join(",").as_str()),
+                    });
                 pub_block_by_topic
                     .entry(flow.topic.clone())
                     .or_default()
@@ -6967,6 +7447,12 @@ impl GraphRuntime {
                             // so there is no peer whose silence needs
                             // reporting (see `CreditStallWatch`).
                             stall: None,
+                            topic: Arc::from(flow.topic.as_str()),
+                            stall_clock: Arc::clone(&stall_clock),
+                            timeout_ns: edge
+                                .block_timeout_ms
+                                .map(|ms| ms.saturating_mul(1_000_000)),
+                            may_wait: true,
                         });
                 }
                 // Retain the READ-ONLY half of this consumer edge
@@ -6980,6 +7466,7 @@ impl GraphRuntime {
                     consumer_input: edge.input.clone(),
                     outstanding: outstanding.clone(),
                     depth: threshold as u64,
+                    block_timeout: edge.block_timeout_ms.is_some(),
                 });
                 block_counter_registrations.push((
                     edge.node_id.clone(),
@@ -6997,11 +7484,11 @@ impl GraphRuntime {
         //
         //   * on the PRODUCER's worker `subgraph_for` dropped the consumer
         //     node, so the topic's flow has producers and NO consumers ⇒
-        //     `is_all_block()` is false ⇒ the whole branch is skipped ⇒ the
-        //     producer never defers;
-        //   * on the CONSUMER's worker the producer is gone, so the flow reads
-        //     all-block with `producers.is_empty()` ⇒ the `continue` above
-        //     skips it ⇒ the drain never decrements.
+        //     `holds_its_producers()` is false ⇒ the whole branch is skipped ⇒
+        //     the producer never defers;
+        //   * on the CONSUMER's worker the producer is gone, so the flow has a
+        //     `block` consumer and no producer ⇒ the `continue` above skips it
+        //     ⇒ the drain never decrements.
         //
         // So each half is INJECTED from the plan the supervisor stamped, never
         // inferred from the local view. The word both halves operate on is the
@@ -7150,28 +7637,6 @@ impl GraphRuntime {
                         ),
                     });
                 }
-                // A locally MIXED topic degrades its `block` consumers to
-                // `drop_oldest` (deferring the producer would starve the
-                // non-block sibling — the rule the wiring loop above applies).
-                // A bound edge on such a topic would defer the peer producer on
-                // behalf of a consumer that is meanwhile DROPPING, which is
-                // both halves of the mixed-topic rule broken at once: the
-                // sibling starves AND the "lossless" edge loses.
-                if !flow.is_some_and(|f| f.is_all_block()) {
-                    return Err(TransportError::GraphError {
-                        reason: format!(
-                            "graph '{}': the plan binds a cross-process `block` credit word to \
-                             '{}.{}' on topic '{}', but that topic is MIXED in this process — it \
-                             carries at least one non-`block` consumer, so its `block` consumers \
-                             degrade to drop_oldest and no producer may be deferred on their \
-                             behalf. Give the `block` consumer its own topic",
-                            config.identity(),
-                            binding.consumer_node,
-                            binding.consumer_input,
-                            binding.topic
-                        ),
-                    });
-                }
                 sub_block_by_input.insert(
                     (
                         binding.consumer_node.clone(),
@@ -7179,6 +7644,16 @@ impl GraphRuntime {
                     ),
                     (word.clone(), binding.depth, Arc::clone(&counters)),
                 );
+                held_block_slots
+                    .entry(binding.consumer_node.clone())
+                    .or_default()
+                    .push(HeldBlockSlot {
+                        word: word.clone(),
+                        counters: Arc::clone(&counters),
+                        topic: Arc::from(binding.topic.as_str()),
+                        consumer_input: Arc::from(binding.consumer_input.as_str()),
+                        producers: Arc::from(binding.producer_nodes.join(",").as_str()),
+                    });
                 // KNOWN GAP, stated where it is created rather than in a doc
                 // nobody reads at the right moment: these counters are
                 // registered on the CONSUMER's `NodeHandle`
@@ -7229,6 +7704,14 @@ impl GraphRuntime {
                     .entry(binding.topic.clone())
                     .or_default()
                     .push(word.clone());
+                // Each producer of the edge publishes through its own
+                // connection into the consumer's input (at most 16, so the
+                // count fits a `u32`). Only this half publishes, so only this
+                // half reads the count.
+                word.set_connections(
+                    u32::try_from(binding.producer_nodes.len().max(producers.len()))
+                        .unwrap_or(u32::MAX),
+                );
                 // The slot must be present on a producer
                 // binding. It is not derivable here — this process's subgraph
                 // cannot see the edge's other producers — and a missing one
@@ -7270,15 +7753,18 @@ impl GraphRuntime {
                 // predicate and the kernel-block arm are ALL skipped by the
                 // same one check, and the switch costs one cached atomic load
                 // per build instead of a branch per recheck.
-                if stall.is_some() && crate::credit::credit_wake_enabled() {
+                let parks = stall.is_some() && crate::credit::credit_wake_enabled();
+                if parks {
                     credit_park_edges.push(CreditParkEdge {
                         word: word.clone(),
                         slot,
                         threshold: binding.depth,
                         baseline_full: std::sync::atomic::AtomicBool::new(false),
                         baseline_seq: std::sync::atomic::AtomicU32::new(0),
+                        sized_full: std::sync::atomic::AtomicBool::new(false),
                     });
                 }
+                let stall_clock = Arc::new(crate::scheduler::block::StallCell::default());
                 for producer in producers {
                     producer_block_edges
                         .entry(producer.clone())
@@ -7291,6 +7777,13 @@ impl GraphRuntime {
                             consumer_input: Arc::from(binding.consumer_input.as_str()),
                             armed: Arc::clone(&armed),
                             stall: stall.clone(),
+                            topic: Arc::from(binding.topic.as_str()),
+                            stall_clock: Arc::clone(&stall_clock),
+                            // A cross-process word is never forgiven: no
+                            // timeout, and the producer is freed only by the
+                            // peer's drain or the slot's release.
+                            timeout_ns: None,
+                            may_wait: false,
                         });
                 }
             }
@@ -7307,6 +7800,7 @@ impl GraphRuntime {
                 consumer_input: binding.consumer_input.clone(),
                 outstanding: word,
                 depth: binding.depth,
+                block_timeout: false,
             });
         }
         if !cross_process.credit_bindings.is_empty() {
@@ -7573,7 +8067,7 @@ impl GraphRuntime {
                 }
                 // `block`: register this topic's consumer
                 // outstanding counters so every send mirrors into their
-                // queue-depth atomics. No-op unless the topic is all-block.
+                // queue-depth atomics. No-op unless the topic has a `block` consumer.
                 if let Some(counters) = pub_block_by_topic.get(&topic) {
                     if output.history_size > 0 {
                         tracing::warn!(
@@ -7902,8 +8396,7 @@ impl GraphRuntime {
                     // an `#[on_event(input = "...")]` handler (with a `BackpressureEvent`
                     // parameter) on this input fires when iceoryx2 reclaims the oldest
                     // on overflow. `block` inputs are lossless (deferred), so they get
-                    // no eviction detector; a block input DEGRADED to drop_oldest on a
-                    // mixed topic is not in `sub_block_by_input`, so it correctly lands here.
+                    // no eviction detector.
                     let counters = Arc::new(BackpressureCounters::new());
                     subscriber.register_drop_oldest_probe(
                         Arc::clone(&counters),
@@ -8884,6 +9377,10 @@ impl GraphRuntime {
             fatal_records.insert(node_def.id.clone(), Arc::clone(&fatal_record));
             let fatal_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             fatal_stops.insert(node_def.id.clone(), Arc::clone(&fatal_stop));
+            // The `block` slots this node holds as a consumer, released by the
+            // callback when the node stops for good.
+            let held_slots: Vec<HeldBlockSlot> =
+                held_block_slots.remove(&node_def.id).unwrap_or_default();
             // SITE (b): this node's half of the shared
             // ledger, plus a closure-OWNED latch so the poison arm reports the
             // TRANSITION rather than the state. The latch is a plain `bool`
@@ -8892,6 +9389,68 @@ impl GraphRuntime {
             // lines up is a plain value.
             let node_death_for_callback = Arc::clone(&node_death);
             let mut node_death_reported = false;
+            // Trigger policy comes from the macro side only. Graph
+            // YAML no longer carries a `policy:` block.
+            // When a cdylib declares no `MacroPolicy`,
+            // the runtime falls back to `Data` (fires on any input
+            // arrival), which is a defensible default for ad-hoc
+            // closure-only graphs but worth surfacing at warn-level
+            // so operators notice unintended triggering on unrelated
+            // input deliveries. The
+            // `validate_no_silent_data_trigger` check already rejects the
+            // worst combo (silent never-fire with a
+            // `#[input(trigger)]` field).
+            let policy = match macro_policy {
+                Some(macro_p) => {
+                    tracing::debug!(node_id = %node_def.id, ?macro_p, "using macro-declared policy");
+                    macro_policy_to_trigger(
+                        macro_p,
+                        &node_def.id,
+                        &node_def.inputs,
+                        &entry_info.input_meta,
+                        &config.prefix,
+                    )
+                }
+                None => {
+                    tracing::warn!(
+                        node_id = %node_def.id,
+                        "no macro-declared policy; defaulting to Data trigger \
+                         (fires on any input arrival). Add a macro attribute \
+                         (`period_ms`, `sync_window_ms`, `unbounded_sync`, \
+                         `external`) or an `#[input(trigger)]` field to \
+                         silence this warning."
+                    );
+                    TriggerPolicy::Data
+                }
+            };
+            let trigger = match &policy {
+                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
+                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+                },
+                TriggerPolicy::Data => {
+                    // Without a declared trigger input the node has no drain
+                    // binding, so no input arrival signals it; only the host's
+                    // `signal_data` does.
+                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
+                    TopologyTrigger::Data {
+                        topics: data_trigger_topic.into_iter().collect(),
+                        ambiguous,
+                    }
+                }
+                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
+                    topics: inputs.clone(),
+                    window_ns: window
+                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
+                },
+                TriggerPolicy::External => TopologyTrigger::External,
+            };
+            let fire = FireSite::new(
+                Arc::clone(&fire_tap),
+                topology_nodes.len(),
+                &trigger,
+                node_def.outputs.len(),
+            );
+            let mut fire_counts = FireCounts::new(node_def.outputs.len());
             let callback = Box::new(move || match entry_for_callback.lock() {
                 Ok(mut e) => {
                     // Catch the unwind to RECORD the panic reason
@@ -8906,8 +9465,18 @@ impl GraphRuntime {
                     // AssertUnwindSafe: the payload is resumed immediately —
                     // any torn `&mut` state unwinds exactly as it did without
                     // the intermediate catch.
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
+                    // The fire tap's commit-count probes are entry code too:
+                    // they run under this catch or `FireSite::record`'s, so a
+                    // probe panic takes the panic arm below.
+                    let mut fire_start = None;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fire_start = fire.start(&mut fire_counts, &**e);
+                        e.tick()
+                    }));
+                    let result = match fire_start {
+                        Some(start) => fire.record(start, &mut fire_counts, &**e, result),
+                        None => result,
+                    };
                     match result {
                         Err(payload) => {
                             record_first_reason(
@@ -8929,38 +9498,32 @@ impl GraphRuntime {
                                 &node_id_for_log,
                                 crate::scheduler::NodeDeathCause::EntryPoisoned,
                             );
+                            release_held_block_slots(&node_id_for_log, &held_slots);
                             std::panic::resume_unwind(payload);
                         }
                         Ok(Err(err)) => {
                             // STRUCTURAL panic-class classification:
-                            // only the dedicated variant counts — it is minted
-                            // exclusively by `DylibNodeEntry::tick` for the
-                            // cdylib FFI panic/poisoned codes (2/3). A
-                            // deterministic tick `Err` is NORMAL execution
-                            // (legal live behavior — Replay = Live) and is
-                            // never recorded as a panic, no matter what its
-                            // message says.
+                            // only the dedicated variant counts. It is minted
+                            // for a tick a node library reports as panicked
+                            // (`DylibNodeEntry::tick`). A deterministic tick
+                            // `Err` is NORMAL execution (legal live behavior,
+                            // Replay = Live) and is never recorded as a panic,
+                            // no matter what its message says.
                             if let TransportError::NodeTickPanicked { reason, .. } = &err {
                                 record_first_reason(&panic_record, reason);
-                                // The SHIPPING node shape, and
-                                // until now it was recorded by NEITHER mint site.
-                                // A cdylib catches its own panic behind the FFI
-                                // and returns it as an `Err` (codes 2/3), so
+                                // A node library catches a tick panic in its own
+                                // instance gate and returns it as an `Err`, so
                                 // nothing unwinds through the host's entry guard:
-                                // the poison arm never runs, and the callback
-                                // returns cleanly so `fire_node_into` resets
-                                // `consecutive_panics` and the circuit breaker
-                                // never opens either. Every node built by
-                                // `cerulion node build` is a cdylib, so producer
-                                // 2 was inert on real robots.
-                                //
-                                // TERMINAL by the same argument as the host-side
-                                // poison: code 2 leaves the cdylib's own `NODES`
-                                // mutex poisoned, after which every later tick
-                                // returns code 3 forever. The STRUCTURAL variant
-                                // is what gates this — a plain `NodeError` is
-                                // ordinary tick failure and must never be read as
-                                // a death (Replay = Live).
+                                // the poison arm above never runs, and the
+                                // callback returns cleanly, so `fire_node_into`
+                                // resets `consecutive_panics` and the circuit
+                                // breaker never opens. The gate recovers and the
+                                // node keeps firing and draining, so its `block`
+                                // slots stay armed: a release is sticky
+                                // (`CreditShared::release_slot`) and would leave
+                                // a live consumer's edge lossy for the rest of
+                                // the run. The death ledger records the panic
+                                // once.
                                 latch_node_death(
                                     &mut node_death_reported,
                                     &node_death_for_callback,
@@ -8985,6 +9548,7 @@ impl GraphRuntime {
                                         &node_id_for_log,
                                         crate::scheduler::NodeDeathCause::FatalError,
                                     );
+                                    release_held_block_slots(&node_id_for_log, &held_slots);
                                     tracing::error!(
                                         node_id = %node_id_for_log,
                                         kind = %kind,
@@ -9072,64 +9636,10 @@ impl GraphRuntime {
                         &node_id_for_log,
                         crate::scheduler::NodeDeathCause::EntryPoisoned,
                     );
+                    release_held_block_slots(&node_id_for_log, &held_slots);
                 }
             });
 
-            // Trigger policy comes from the macro side only — graph
-            // YAML no longer carries a `policy:` block.
-            // When a cdylib declares no `MacroPolicy`,
-            // the runtime falls back to `Data` (fires on any input
-            // arrival), which is a defensible default for ad-hoc
-            // closure-only graphs but worth surfacing at warn-level
-            // so operators notice unintended triggering on unrelated
-            // input deliveries. The
-            // `validate_no_silent_data_trigger` check already rejects the
-            // worst combo (silent never-fire with a
-            // `#[input(trigger)]` field).
-            let policy = match macro_policy {
-                Some(macro_p) => {
-                    tracing::debug!(node_id = %node_def.id, ?macro_p, "using macro-declared policy");
-                    macro_policy_to_trigger(
-                        macro_p,
-                        &node_def.id,
-                        &node_def.inputs,
-                        &entry_info.input_meta,
-                        &config.prefix,
-                    )
-                }
-                None => {
-                    tracing::warn!(
-                        node_id = %node_def.id,
-                        "no macro-declared policy; defaulting to Data trigger \
-                         (fires on any input arrival). Add a macro attribute \
-                         (`period_ms`, `sync_window_ms`, `unbounded_sync`, \
-                         `external`) or an `#[input(trigger)]` field to \
-                         silence this warning."
-                    );
-                    TriggerPolicy::Data
-                }
-            };
-            let trigger = match &policy {
-                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
-                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
-                },
-                TriggerPolicy::Data => {
-                    // Without a declared trigger input the node has no drain
-                    // binding, so no input arrival signals it; only the host's
-                    // `signal_data` does.
-                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
-                    TopologyTrigger::Data {
-                        topics: data_trigger_topic.into_iter().collect(),
-                        ambiguous,
-                    }
-                }
-                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
-                    topics: inputs.clone(),
-                    window_ns: window
-                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
-                },
-                TriggerPolicy::External => TopologyTrigger::External,
-            };
             topology_nodes.push(TopologyNode {
                 id: node_def.id.clone(),
                 node_type: node_def.node_type.clone(),
@@ -9395,7 +9905,8 @@ impl GraphRuntime {
         // edge for.
         let block_gate_replay_bypass = Arc::new(AtomicBool::new(false));
         for node_id in prefire_node_ids {
-            let edges = producer_block_edges.remove(&node_id).unwrap_or_default();
+            let edges: Arc<[BlockDeferEdge]> =
+                Arc::from(producer_block_edges.remove(&node_id).unwrap_or_default());
             // The throttle gate reads the scheduler's CANONICAL last_fire_ns
             // + fire_count via the node's handle (no second source of truth),
             // so it gates on the last ACTUAL fire.
@@ -9420,7 +9931,23 @@ impl GraphRuntime {
             if let Some((throttle_ns, _)) = &throttle {
                 scheduler.set_throttle_ns(&node_id, *throttle_ns)?;
             }
+            // The wait sizing's read of the same slots, so a held producer
+            // waits for its release deadline or its wake instead of the 1 ms
+            // floor. Installed in the same iteration as the pre-fire check,
+            // and silent under the same replay bypass.
+            if !edges.is_empty() {
+                let hold_edges = Arc::clone(&edges);
+                let hold_bypass = Arc::clone(&block_gate_replay_bypass);
+                scheduler.set_block_hold(&node_id, move || {
+                    if hold_bypass.load(Ordering::Relaxed) {
+                        crate::scheduler::block::BlockHold::Clear
+                    } else {
+                        block_edges_hold(&hold_edges)
+                    }
+                })?;
+            }
             let replay_bypass = Arc::clone(&block_gate_replay_bypass);
+            let producer: Arc<str> = Arc::from(node_id.as_str());
             scheduler.set_pre_fire_check(&node_id, move |now_ns| {
                 // throttle: defer if the node fired within the last N ms.
                 // fire_count == 0 ⇒ never fired ⇒ allow (no prior fire to
@@ -9445,77 +9972,7 @@ impl GraphRuntime {
                 // `compose_pre_fire_decision`.
                 let bypass = replay_bypass.load(Ordering::Relaxed);
                 compose_pre_fire_decision(throttle_deferred, bypass, || {
-                    // block: defer if any consumer queue is full.
-                    let mut deferred = false;
-                    for e in &edges {
-                        // `outstanding()` is the `Acquire` load the
-                        // raw atomic did, on whichever word backs this edge —
-                        // a LOCAL heap word or the peer-shared SHM page.
-                        //
-                        // Obligation (b) is now COVERED,
-                        // here. On a MAPPED edge a consumer that is alive but
-                        // has stopped draining pins the word FULL, and the
-                        // OCCUPANCY reading cannot tell that apart from a
-                        // merely busy consumer — but the word's wake EPOCH can:
-                        // a consumer draining at any rate at all bumps it on
-                        // every freeing drain. `e.stall` (Some only on a mapped
-                        // edge) watches exactly that, and warns once per regime
-                        // when the credit has not moved across
-                        // `CREDIT_STALL_UNMOVED_OBSERVATIONS` consecutive
-                        // deferred evaluations. See `CreditStallWatch`.
-                        if e.outstanding.outstanding() >= e.threshold {
-                            if let Some(stall) = &e.stall {
-                                stall.observe_deferred(e.outstanding.wake_seq_snapshot());
-                            }
-                            // The `block_fires_deferred_count` bump is
-                            // UNCONDITIONAL, but the warn rides this edge's once-per-
-                            // regime trigger — `armed.swap(false)` returns the PRIOR
-                            // state: `true` = first deferred step of a regime (warn
-                            // loud), `false` = sustained (already warned this regime →
-                            // `debug!`). A below-threshold observation (else arm)
-                            // re-arms, so the NEXT regime warns loud again. This
-                            // mirrors the consumer-side `BlockProbe` event rearm RULE
-                            // (below-threshold re-arms) on SEPARATE per-edge state —
-                            // both read the same shared `outstanding`/threshold, so
-                            // the two regimes open/close together (transient one-step
-                            // phase skew possible; the unconditional counter is the
-                            // truth either way). `block` is DESIGNED lossless
-                            // backpressure —
-                            // a consumer at threshold is a legitimate steady state —
-                            // NOT a data-loss event; the producer simply doesn't fire
-                            // this step.
-                            let fire = e.armed.swap(false, Ordering::AcqRel);
-                            // A regime OPENED: count it at the transition, before
-                            // and independent of the emission below, so the count
-                            // is what the loud regime-opening warns are compared
-                            // against where the sustained `debug!` repeats are
-                            // compiled out (`release_max_level_info`).
-                            if fire {
-                                e.counters.open_block_regime();
-                            }
-                            record_backpressure_event_n(
-                                &e.consumer_node,
-                                &e.consumer_input,
-                                BackpressurePolicy::Block,
-                                &e.counters,
-                                1,
-                                fire,
-                            );
-                            deferred = true;
-                        } else {
-                            // Below threshold — re-arm so the next regime's first
-                            // deferred step warns loud again (edge rearm).
-                            e.armed.store(true, Ordering::Release);
-                            // The peer is plainly
-                            // draining, so close any open stall regime. This is
-                            // the anti-tautology half — without it a stall warn
-                            // could survive a recovered consumer.
-                            if let Some(stall) = &e.stall {
-                                stall.observe_below_threshold();
-                            }
-                        }
-                    }
-                    deferred
+                    block_edges_defer(&producer, &edges, now_ns)
                 })
             })?;
         }
@@ -9980,6 +10437,8 @@ impl GraphRuntime {
             scheduler,
             handles,
             topology_nodes,
+            fire_tap,
+            fire_clock: clock_dyn,
             sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
@@ -11427,8 +11886,10 @@ impl GraphRuntime {
                 // the resume side rather than the sharper "drain-to-latest"
                 // — both keep the whole band, so only the note's wording
                 // differs. (The format itself CAN say `Some({})`, and the
-                // reader rules for it are pinned; the carrier just has no
-                // node worth spending 4 bytes per anchor to say it about.)
+                // reader rules for it are pinned. A RUNNING node's section
+                // never says it; a stopped node's version-5 section always
+                // carries a table, empty when this leaves `None`, because a
+                // later tail follows it.)
                 state.input_service = self.service_cursors.get(id.as_str()).map(|cursors| {
                     cursors
                         .iter()
@@ -14563,7 +15024,10 @@ impl GraphRuntime {
         // epoch advance left to see.
         for e in &self.credit_park_edges {
             let seq = e.word.wake_seq_snapshot();
-            let full = e.word.outstanding() >= e.threshold;
+            let sized_full = e
+                .sized_full
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            let full = e.word.outstanding() >= e.threshold || sized_full;
             e.baseline_seq
                 .store(seq, std::sync::atomic::Ordering::Release);
             e.baseline_full.store(
@@ -15588,6 +16052,13 @@ impl GraphRuntime {
         const LIVELINESS_SWEEP_NS: u64 = 250_000_000;
         const MIN_TIMEOUT_NS: u64 = 1_000_000;
         let now_ns = self.live_deadline_now_ns();
+        // Read BEFORE the wait is sized: a drain of a mapped edge that lands
+        // between this read and the park entry must still wake the park
+        // (`CreditParkEdge::sized_full`).
+        for e in &self.credit_park_edges {
+            e.sized_full
+                .store(e.word.outstanding() >= e.threshold, Ordering::Release);
+        }
         let next_fire_ns = self.scheduler.ns_until_next_fire(now_ns);
         let mut wake_ns = next_fire_ns.unwrap_or(LIVELINESS_SWEEP_NS);
         // Under a FIXED-quantum gating clock a step advances gating by exactly
@@ -17739,8 +18210,9 @@ impl GraphRuntime {
         self.scheduler.is_replay_driven()
     }
 
-    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return or by the
-    /// consecutive-panic breaker, so it will not fire again in this run? See
+    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return, by the
+    /// consecutive-panic breaker or by [`Self::restore_stopped_nodes`], so it
+    /// will not fire again in this run? See
     /// [`crate::scheduler::Scheduler::is_node_disabled`]. The replay engine
     /// reads it after each step to learn where a re-executed node stopped.
     pub fn is_node_stopped(&self, node_id: &str) -> bool {
@@ -18206,6 +18678,7 @@ impl GraphRuntime {
             outstanding: e.outstanding.outstanding(),
             depth: e.depth,
             mapped: e.outstanding.is_mapped(),
+            block_timeout: e.block_timeout,
         })
     }
 
@@ -18347,6 +18820,71 @@ impl GraphRuntime {
         }
     }
 
+    /// Keep each node in `ids` stopped on a runtime about to resume, as a
+    /// recording's framework sections state it
+    /// ([`crate::state_restore::NodeFrameworkState::stopped`]). Called after
+    /// the build and before the first [`Self::step`], like every other
+    /// restore seam.
+    ///
+    /// The node fires no more and this run records no failure for it
+    /// ([`Self::node_fatal_errors`] does not name it); see
+    /// [`crate::scheduler::Scheduler::restore_stopped_nodes`].
+    ///
+    /// Each `block` slot such a node holds as a consumer is then released, as
+    /// the node's live stop released it, so a producer it paced is not held
+    /// at depth by a consumer that will never drain. The release is SILENT:
+    /// no warning, and no `backpressure_block_slot_releases_count` bump. The
+    /// recorded run counted and announced that release when the node stopped,
+    /// and this run restores the stop rather than performing it again.
+    ///
+    /// # Errors
+    ///
+    /// Nothing changes on either refusal.
+    ///
+    /// * [`TransportError::GraphError`] once this runtime has collected its
+    ///   external sources (it has run a live session), as
+    ///   [`Self::restore_node_states`] refuses.
+    /// * [`TransportError::NodeNotFound`] for an id this graph does not hold.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    pub fn restore_stopped_nodes(
+        &mut self,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> TransportResult<()> {
+        if self.external_sources_collected {
+            return Err(TransportError::GraphError {
+                reason: format!(
+                    "graph '{}': a stop restore was attempted on a runtime that has already \
+                     collected its external sources (it has run a live session), so the stop \
+                     would land part way through a run rather than before its first step. Fix: \
+                     restore on a FRESHLY BUILT runtime (restore runs after the build and before \
+                     the first step)",
+                    self.config.identity()
+                ),
+            });
+        }
+        self.scheduler.restore_stopped_nodes(ids)?;
+        self.release_block_slots_held_by(ids);
+        Ok(())
+    }
+
+    /// Release every `block` slot a node in `ids` holds as a consumer, with no
+    /// event and no counter bump.
+    ///
+    /// Called only after `Scheduler::restore_stopped_nodes` has accepted
+    /// `ids`, so every id names a node this runtime runs. For such a node,
+    /// each retained `block_credit_edges` entry whose consumer it is holds a
+    /// clone of the word its tick callback holds in a `HeldBlockSlot`, so this
+    /// releases exactly the slots `release_held_block_slots` releases on a
+    /// live stop. A cross-process word is the shared page, so the producer in
+    /// the other process stops waiting too.
+    fn release_block_slots_held_by(&self, ids: &std::collections::BTreeSet<String>) {
+        for edge in &self.block_credit_edges {
+            if ids.contains(&edge.consumer_node) {
+                edge.outstanding.release_slot();
+            }
+        }
+    }
+
     /// Raise each capture-time trigger input's capture high-water AND the
     /// scheduler's wire-stamp epoch high-water for it to the recorded stamp.
     ///
@@ -18451,6 +18989,69 @@ impl GraphRuntime {
             version: RUN_TOPOLOGY_VERSION,
             nodes: self.topology_nodes.clone(),
         }
+    }
+
+    /// Install this runtime's fire tap and return it. Later calls return the
+    /// first tap and ignore `config`.
+    ///
+    /// Record `node` is the index into [`Self::run_topology`]'s nodes, and the
+    /// tap's `in_tick` reads each node's in-tick marker. Installing also asks
+    /// every entry whether it can report its output commits, which
+    /// `run_topology` then reports as `reports_writes`. An entry that reports
+    /// no writes here, its probe panicking included, is not asked again: its
+    /// fires carry `WROTE_UNKNOWN` and it keeps ticking. Ticks record nothing
+    /// until a reader arms the tap with [`FireTap::serve`].
+    // hot-path-alloc-ok-fn: cold: a run host installs telemetry once, outside node execution
+    pub fn install_fire_tap(&mut self, config: FireTapConfig) -> Arc<FireTap> {
+        if let Some(installed) = self.fire_tap.get() {
+            return Arc::clone(&installed.tap);
+        }
+        let mut counts = Vec::new();
+        for node in &mut self.topology_nodes {
+            counts.clear();
+            counts.resize(node.outputs.len(), 0);
+            let Some(entry) = self.nodes.get(&node.id) else {
+                node.reports_writes = false;
+                continue;
+            };
+            // The guard lives outside the catch, so a probe panic poisons
+            // nothing and the node's tick callback still takes its lock.
+            let entry = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                entry.output_commit_counts(&mut counts)
+            }));
+            node.reports_writes = probed.unwrap_or_else(|payload| {
+                tracing::warn!(
+                    node_id = %node.id,
+                    error = %panic_payload_msg(payload.as_ref()),
+                    "node's output commit-count probe panicked; it reports no writes"
+                );
+                false
+            });
+        }
+        let recorded = self.topology_nodes.len().min(FIRE_NODE_LIMIT);
+        let in_tick = self.topology_nodes[..recorded]
+            .iter()
+            .map(|node| match self.handles.get(&node.id) {
+                Some(handle) => handle.in_tick_marker(),
+                None => Arc::new(AtomicU64::new(0)),
+            })
+            .collect();
+        let installed = FireInstall {
+            tap: Arc::new(FireTap::new(
+                config,
+                recorded as u16,
+                in_tick,
+                Arc::clone(&self.fire_clock),
+            )),
+            reports_writes: self.topology_nodes[..recorded]
+                .iter()
+                .map(|node| node.reports_writes)
+                .collect(),
+        };
+        Arc::clone(&self.fire_tap.get_or_init(|| installed).tap)
     }
 
     /// Shutdown the graph runtime.
@@ -20777,6 +21378,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
 
@@ -20832,6 +21434,7 @@ mod tests {
                         .map(|(n, s)| InputDef {
                             name: n.to_string(),
                             source: s.to_string(),
+                            ..Default::default()
                         })
                         .collect(),
                     outputs: vec![],
@@ -20855,6 +21458,7 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }
     }
@@ -21015,11 +21619,13 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
         let wired = |name: &str| InputDef {
             name: name.to_string(),
             source: format!("src_{name}/out"),
+            ..Default::default()
         };
 
         // DECLARED: cam + lidar are triggers, config is not. WIRED: cam and
@@ -21084,11 +21690,13 @@ mod tests {
             depth: 1,
             backpressure: crate::graph::node::BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
         let wired = |name: &str, source: &str| InputDef {
             name: name.to_string(),
             source: source.to_string(),
+            ..Default::default()
         };
         let out = |name: &str| OutputDef {
             name: name.to_string(),
@@ -21474,6 +22082,7 @@ mod tests {
             inputs: vec![crate::graph::config::InputDef {
                 name: "self_loop".to_string(),
                 source: "looper/out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![crate::graph::config::OutputDef {
                 name: "out".to_string(),
@@ -21532,6 +22141,7 @@ mod tests {
             inputs: vec![crate::graph::config::InputDef {
                 name: "count".to_string(),
                 source: "src/out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         };
@@ -21930,6 +22540,21 @@ mod tests {
             "a node with nothing to say costs only the v1 header"
         );
 
+        // A node that states only its stop takes the v2 header (the 16 bytes
+        // above plus the section's `u32` length: 20) and the 43-byte version-5
+        // section.
+        let stopped = NodeFrameworkState {
+            stopped: true,
+            ..Default::default()
+        };
+        assert!(!stopped.is_empty());
+        assert_eq!(crate::state_restore::ANCHOR_BLOB_V2_HEADER_SIZE, 20);
+        assert_eq!(
+            anchor_framing_bytes(std::slice::from_ref(&stopped)),
+            20 + 43,
+            "a stopped node with nothing else to state costs the v2 header and 43 bytes"
+        );
+
         // A node WITH a section takes the v2 header plus the section's own length,
         // and that length grows with the input NAMES — which is the whole point.
         let short = NodeFrameworkState {
@@ -21947,6 +22572,7 @@ mod tests {
             input_service: None,
             sync_capture_high_water: Default::default(),
             sync_epoch_floor: None,
+            stopped: false,
         };
         let short_bytes = anchor_framing_bytes(std::slice::from_ref(&short));
         let wide_bytes = anchor_framing_bytes(std::slice::from_ref(&wide));
@@ -22011,5 +22637,86 @@ mod tests {
         // `GraphRuntime::block_credits`.
         assert_eq!(compose_probe(false, true, true), (false, false));
         assert_eq!(compose_probe(false, true, false), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod fire_site_tests {
+    use super::{FireSite, TickOutcome, TopologyTrigger};
+    use crate::fire_tap::{FireBody, FireCause, FireFlags};
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+
+    /// `u32::MAX` nanoseconds, the longest duration a record holds exactly.
+    const DUR_MAX_NS: u32 = 4_294_967_295;
+
+    fn period_site(outputs: usize) -> FireSite {
+        FireSite::new(
+            Arc::new(OnceLock::new()),
+            2,
+            &TopologyTrigger::Period {
+                interval_ns: 1_000_000,
+            },
+            outputs,
+        )
+    }
+
+    fn body(elapsed: Duration, outcome: TickOutcome, writes: Option<(&[u32], &[u32])>) -> FireBody {
+        period_site(writes.map_or(0, |(before, _)| before.len()))
+            .body(2, 7, elapsed, outcome, writes)
+    }
+
+    fn writes<'a>(before: &'a [u32], after: &'a [u32]) -> Option<(&'a [u32], &'a [u32])> {
+        Some((before, after))
+    }
+
+    #[test]
+    fn a_tick_past_the_duration_column_saturates_and_says_so() {
+        let fits = body(
+            Duration::from_nanos(4_294_967_295),
+            TickOutcome::Ok,
+            writes(&[0], &[0]),
+        );
+        assert_eq!((fits.dur_ns, fits.flags.0), (DUR_MAX_NS, 0));
+
+        let over = body(
+            Duration::from_nanos(4_294_967_296),
+            TickOutcome::Ok,
+            writes(&[0], &[0]),
+        );
+        assert_eq!(
+            (over.dur_ns, over.flags.0),
+            (DUR_MAX_NS, FireFlags::DURATION_SATURATED)
+        );
+
+        let hour = body(Duration::from_secs(3600), TickOutcome::Panicked, None);
+        assert_eq!(
+            (hour.dur_ns, hour.flags.0, hour.wrote),
+            (
+                DUR_MAX_NS,
+                FireFlags::DURATION_SATURATED | FireFlags::PANICKED | FireFlags::WROTE_UNKNOWN,
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn each_changed_count_sets_its_output_bit() {
+        let fire = body(
+            Duration::from_nanos(10),
+            TickOutcome::Err,
+            writes(&[4, 9, 0], &[5, 9, 2]),
+        );
+        assert_eq!(
+            (
+                fire.at_ns,
+                fire.dur_ns,
+                fire.node,
+                fire.cause,
+                fire.flags.0,
+                fire.wrote
+            ),
+            (7, 10, 2, FireCause::Period, FireFlags::TICK_ERROR, 0b101)
+        );
     }
 }
