@@ -17077,8 +17077,9 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
 /// a JSON key must be text. In [`RecordEnvMode::Allowlist`] and
 /// [`RecordEnvMode::All`] a value that is not valid UTF-8 is stored as
 /// `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, its FNV-1a 64 hash
-/// over the raw bytes. A warning names each variable left out, and each value
-/// the mode would have recorded verbatim.
+/// over the raw bytes. A warning names each variable left out, and each
+/// variable whose value the mode would otherwise have recorded verbatim; no
+/// warning prints a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordEnvMode {
     /// The DEFAULT: record every variable NAME; record VALUES only for names
@@ -17431,7 +17432,7 @@ pub(crate) fn render_env_json(
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnvJsonArtifact {
-    /// The run directory's `env.json`, written on every run.
+    /// The run directory's `env.json`.
     RunDirectory,
     /// A `--record` bag's `env.json` attachment.
     Recording,

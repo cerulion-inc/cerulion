@@ -616,8 +616,8 @@ fn read_live_run_env_json(home: &Path) -> Vec<u8> {
 /// directory and the bag carry the same `env.json`: each such value as its
 /// FNV-1a 64 hash over the raw bytes, marked `utf8: false`, and no key for the
 /// name. Each of the three places that reads the environment (the graph build,
-/// the run directory's `env.json`, the bag's) warns once, naming the variables
-/// and never a value.
+/// the run directory's `env.json`, the bag's) prints each of its warnings
+/// once, naming the variables and never a value.
 #[test]
 #[serial]
 fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run_directory() {
