@@ -3,11 +3,10 @@
 //!
 //! The switch is forced per runtime through `set_period_park_for_test`, so the
 //! process environment is never touched. Each arm is judged against the host
-//! facts the period-park is gated on: it engages only on x86_64, where the CPU
-//! carries a monitor-wait primitive (and, for an input written from another
-//! runtime, the doorbell has a wake word). On any other host, aarch64 included,
-//! the arm asserts the switch did nothing, so the binary runs a real test
-//! everywhere.
+//! facts the period-park is gated on: it engages only where the CPU carries a
+//! monitor-wait primitive (and, for an input written from another runtime, the
+//! doorbell has a wake word). On any other host the arm asserts the switch did
+//! nothing, so the binary runs a real test everywhere.
 //!
 //! Per-test SHM roots; `#[serial]` because several arms judge wall-clock
 //! timing.
@@ -38,9 +37,9 @@ fn ns(tag: &str) -> String {
 }
 
 /// Does the period-park engage on this host at all? Read from the platform,
-/// not from the code under test: an x86_64 CPU with a monitor-wait primitive.
+/// not from the code under test: a CPU with a monitor-wait primitive.
 fn engages_here() -> bool {
-    cfg!(target_arch = "x86_64") && cerulion_core::monitor_wait::monitor_wait_available()
+    cerulion_core::monitor_wait::monitor_wait_available()
 }
 
 /// Does the period-park apply to a consumer of a topic written from another

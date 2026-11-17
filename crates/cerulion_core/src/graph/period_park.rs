@@ -19,13 +19,6 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// The period-park engages on x86_64 only, where its arrival prediction is
-/// measured to keep the round trip (Linux with WAITPKG). On aarch64 the
-/// monitor-wait park is `WFE`; there, on a Jetson Orin NX, no data arrival was
-/// ever predicted (the Period side's timer wakes landed late and the arrivals
-/// never looked regular), so the switch stays off there and says why.
-pub(crate) const ENGAGES_ON_THIS_TARGET: bool = cfg!(target_arch = "x86_64");
-
 /// The longest single kernel sleep. A ring on an input topic other than the
 /// armed one is seen at the end of the nap it lands in, at the latest.
 pub(crate) const NAP: Duration = Duration::from_micros(100);
@@ -95,9 +88,6 @@ pub(crate) struct Gate {
     pub(crate) park_active: bool,
     /// The host carries a real CPU monitor-wait primitive.
     pub(crate) primitive: bool,
-    /// The target is one the period-park engages on
-    /// ([`ENGAGES_ON_THIS_TARGET`]).
-    pub(crate) engaged_target: bool,
     /// The runtime waits on a barrier word.
     pub(crate) barrier: bool,
     /// The runtime produces on a cross-process `block` edge (a credit word it
@@ -112,13 +102,11 @@ pub(crate) struct Gate {
 }
 
 /// Why a requested period-park does not engage: the first [`Gate`] term that
-/// fails, in declaration order: first the target and the host's CPU, then the
-/// run's park policy, then this runtime's wiring, where a wake the park waits
-/// for cannot end a kernel nap.
+/// fails, in declaration order: first the host's CPU, then the run's park
+/// policy, then this runtime's wiring, where a wake the park waits for cannot
+/// end a kernel nap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotEngaged {
-    /// Not a target it engages on ([`ENGAGES_ON_THIS_TARGET`]).
-    TargetNotValidated,
     /// No CPU monitor-wait primitive: the park already sleeps.
     NoMonitorWaitPrimitive,
     /// The monitor-wait park is off.
@@ -137,7 +125,6 @@ impl NotEngaged {
     /// The `reason` field value.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            NotEngaged::TargetNotValidated => "target_not_validated",
             NotEngaged::NoMonitorWaitPrimitive => "no_monitor_wait_primitive",
             NotEngaged::ParkOff => "park_off",
             NotEngaged::Barrier => "barrier",
@@ -152,9 +139,7 @@ impl NotEngaged {
 /// [`NotEngaged`], or `None` when every term holds. The switch is not a term:
 /// with it off there is nothing to refuse.
 pub(crate) fn refusal(g: Gate) -> Option<NotEngaged> {
-    if !g.engaged_target {
-        Some(NotEngaged::TargetNotValidated)
-    } else if !g.primitive {
+    if !g.primitive {
         Some(NotEngaged::NoMonitorWaitPrimitive)
     } else if !g.park_active {
         Some(NotEngaged::ParkOff)
@@ -572,7 +557,6 @@ mod tests {
             on: true,
             park_active: true,
             primitive: true,
-            engaged_target: true,
             barrier: false,
             credit_edges: false,
             fd_sources: false,
@@ -582,16 +566,8 @@ mod tests {
     }
 
     /// Each refusing term, alone, against a hand-written reason.
-    fn one_refusal_per_term() -> [(Gate, NotEngaged, &'static str); 7] {
+    fn one_refusal_per_term() -> [(Gate, NotEngaged, &'static str); 6] {
         [
-            (
-                Gate {
-                    engaged_target: false,
-                    ..open_gate()
-                },
-                NotEngaged::TargetNotValidated,
-                "target_not_validated",
-            ),
             (
                 Gate {
                     primitive: false,
@@ -668,25 +644,24 @@ mod tests {
             on: true,
             park_active: false,
             primitive: false,
-            engaged_target: false,
             barrier: true,
             credit_edges: true,
             fd_sources: true,
             armed_line: true,
             data_wake: false,
         };
-        assert_eq!(refusal(all_fail), Some(NotEngaged::TargetNotValidated));
+        assert_eq!(refusal(all_fail), Some(NotEngaged::NoMonitorWaitPrimitive));
         let host_ok = Gate {
-            engaged_target: true,
+            primitive: true,
             ..all_fail
         };
-        assert_eq!(refusal(host_ok), Some(NotEngaged::NoMonitorWaitPrimitive));
+        assert_eq!(refusal(host_ok), Some(NotEngaged::ParkOff));
         assert_eq!(
             refusal(Gate {
-                primitive: true,
+                park_active: true,
                 ..host_ok
             }),
-            Some(NotEngaged::ParkOff)
+            Some(NotEngaged::Barrier)
         );
         assert_eq!(
             refusal(Gate {

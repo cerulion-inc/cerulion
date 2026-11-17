@@ -14261,10 +14261,9 @@ impl GraphRuntime {
             .unwrap_or_else(|| super::period_park::env_mode().on())
     }
 
-    /// Does the period-park apply to this park block? Only on a target it
-    /// engages on (x86_64), and only where every wake the park waits for can
-    /// end a kernel nap, or has none: the monitor-wait park is active and real
-    /// on this host, no barrier or credit word is waited on,
+    /// Does the period-park apply to this park block? Only where every wake the
+    /// park waits for can end a kernel nap, or has none: the monitor-wait park
+    /// is active and real on this host, no barrier or credit word is waited on,
     /// no external fd is polled, and a data input written from outside this
     /// runtime (an armed line) is covered by the doorbell wake word. With no
     /// armed line every input is written by this runtime's own nodes inside its
@@ -14287,7 +14286,6 @@ impl GraphRuntime {
             on: self.period_park_on(),
             park_active: self.park_active(),
             primitive: crate::monitor_wait::monitor_wait_available(),
-            engaged_target: super::period_park::ENGAGES_ON_THIS_TARGET,
             barrier: self.barrier_participant.is_some(),
             credit_edges: !self.credit_park_edges.is_empty(),
             fd_sources,
