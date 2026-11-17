@@ -1,6 +1,6 @@
 # cerulion_remoted
 
-One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
+One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + ops/1; pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
 - Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
@@ -9,6 +9,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` classifies accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
   Shell/exec: owner + policy; missing file ON, invalid OFF; absent handle denies, immutable hard-off wins.
+  Settings: validate bounds first; either OFF wins.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
@@ -25,9 +26,9 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
-- `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
-  task per stream. connectd mirrors the robot protocol (no production remoted dep);
-  `protocol_parity_test.rs` gates parity: change both.
+- `cerulion_link` framing is NOT cancel-safe: never `select!`; one task per stream.
+  connectd mirrors the robot protocol (no production remoted dep): update both,
+  pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
 - Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
@@ -48,4 +49,4 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   e2e: loopback iroh and relays only, bounded awaits.
 - remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
-Read docs/internals/remote-access.md before verb, trust, wire, pairing and epoch edits.
+Before verb/trust/wire/pairing/epoch edits: docs/internals/remote-access.md.
