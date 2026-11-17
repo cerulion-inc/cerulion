@@ -192,6 +192,18 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Session framing**: `session_io` owns one reader and one writer task per
+  stream. Client lengths are checked before allocation and complete frames are
+  validated before queueing. Stream arguments require a static lifetime rather
+  than a reusable borrow. A cancelled or failed task discards its stream; failure
+  also releases write completion and frame intake before waiting on event capacity.
+  Bounded caller queues provide backpressure; conversion into a driver's event
+  enum requires no intermediate task or channel. Server serialization, writes
+  and flush share one deadline per frame. Completion means all local frames
+  flushed and bounded stream shutdown was attempted, not that the peer received
+  or validated them. Authentication, session ownership and watchdogs remain
+  the caller's responsibility.
+
 - **Session context**: `session_context::{SessionContext, SessionLimits}` holds
   transport-supplied identity, callbacks and unchanged resource limits. Its limits
   re-export the type used by `RemotedConfig::remote_shell_limits`; defaults and

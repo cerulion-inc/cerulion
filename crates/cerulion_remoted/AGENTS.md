@@ -26,7 +26,7 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1; pairing
 - Pairing bytes: independent hand-serializer vectors (`format_vectors_test.rs`); update encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epochs monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
-- `cerulion_link` framing is NOT cancel-safe: never `select!`; one task per stream.
+- link/session_io: one stream/task; never select!; cancel drops stream; bound I/O.
   connectd mirrors the robot protocol (no production remoted dep): update both,
   pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).

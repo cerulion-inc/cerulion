@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- The remoted library provides owned session framing tasks. Client frames are bounded and validated before delivery, writes have per-frame deadlines, and cancellation discards the affected stream.
 - The remoted library exposes session context validation and resource defaults. Validation refuses malformed shell/exec parameters, unauthenticated callers and invalid timing bounds before work, without invoking callbacks or changing configured limits.
 - The remoted library exposes durable recording checkpoints. A checkpoint syncs the existing file before returning its commitment, refuses an unstarted recording, and permanently refuses further writes after a sync failure.
 - The remoted library writes private session audit files with reserved terminal-event capacity. Refused events preserve the prior commitment, boundary events are synced, and I/O failure permanently refuses further writes.

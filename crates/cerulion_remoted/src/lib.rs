@@ -119,6 +119,7 @@ pub mod remote_session;
 pub mod robot_settings;
 pub mod serving_hold;
 pub mod session_context;
+pub mod session_io;
 #[cfg(unix)]
 pub mod session_recording;
 pub mod session_work;
