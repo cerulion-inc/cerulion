@@ -44,6 +44,8 @@
 //!   the whole graph; without the key such a
 //!   consumer that stops for good still has its slot released;
 //! - a consumer node that stops with a fatal error has its slot released;
+//! - a consumer node restored stopped before the first step has its slot
+//!   released with no release counted, and its producer is never held;
 //! - a node library `block` consumer whose tick panics keeps its slot: on one
 //!   frame, every other frame reaches downstream in order and the producer
 //!   stays paced; on every frame, the producer is paced, never held;
@@ -2185,14 +2187,7 @@ fn a_consumer_of_a_shared_topic_that_stops_releases_its_slot() {
 
 #[test]
 fn a_consumer_that_stops_with_a_fatal_error_releases_its_slot() {
-    let mut rt = build(config(
-        "bsr_fatal",
-        vec![
-            node("producer", "producer", vec![], vec![output("out")]),
-            node("dies", "fatal_block", vec![input("producer/out")], vec![]),
-        ],
-    ))
-    .expect("build");
+    let mut rt = build(fatal_consumer_graph("bsr_fatal")).expect("build");
     for step in 0..STEPS {
         if step == 9 {
             rt.trigger_external("dies").expect("trigger");
@@ -2205,6 +2200,62 @@ fn a_consumer_that_stops_with_a_fatal_error_releases_its_slot() {
         produced >= 85,
         "the producer resumes after the consumer stops (fires {produced}; held it would stay near 4)"
     );
+}
+
+/// The graph of [`a_consumer_that_stops_with_a_fatal_error_releases_its_slot`].
+fn fatal_consumer_graph(prefix: &str) -> GraphConfig {
+    config(
+        prefix,
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node("dies", "fatal_block", vec![input("producer/out")], vec![]),
+        ],
+    )
+}
+
+/// The fatal consumer restored stopped before step 0, as a resumed run past
+/// its stop restores it: its slot is released as its fatal return released
+/// it, so the producer fires on every step and nothing is counted against the
+/// slot. The release is silent: no release is counted, because the recorded
+/// run counted it. Marking the restored consumer fires nothing.
+///
+/// The control is the same graph with the consumer neither restored nor
+/// marked. A consumer that never fires drains nothing, which is what a stop
+/// without the release would leave: the armed slot holds the producer at
+/// depth 2.
+#[test]
+fn a_restored_stop_releases_the_consumers_block_slot_as_its_fatal_return_did() {
+    let mut rt = build(fatal_consumer_graph("bsr_restored")).expect("build");
+    rt.restore_stopped_nodes(&["dies".to_string()].into_iter().collect())
+        .expect("dies is in the graph");
+    for step in 0..STEPS {
+        if step == 9 {
+            rt.trigger_external("dies").expect("trigger");
+        }
+        rt.step(Duration::from_millis(10));
+    }
+    assert_eq!(fires(&rt, "producer"), STEPS, "the producer is never held");
+    assert_eq!(
+        outstanding(&rt, "dies"),
+        0,
+        "a released slot counts no publish"
+    );
+    assert_eq!(releases(&rt, "dies"), 0, "the restore's release is silent");
+    assert_eq!(fires(&rt, "dies"), 0, "the mark fires nothing");
+    assert!(rt.is_node_stopped("dies"));
+    assert!(
+        rt.node_fatal_errors().is_empty(),
+        "{:?}",
+        rt.node_fatal_errors()
+    );
+
+    let mut held = build(fatal_consumer_graph("bsr_unrestored")).expect("build");
+    for _ in 0..STEPS {
+        held.step(Duration::from_millis(10));
+    }
+    assert_eq!(fires(&held, "producer"), 2, "held at depth 2");
+    assert_eq!(outstanding(&held, "dies"), 2);
+    assert_eq!(releases(&held, "dies"), 0);
 }
 
 /// `period_ms = 10`, publishes `x = 1000 + n`: every frame is one the panic

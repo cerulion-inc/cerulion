@@ -17997,8 +17997,9 @@ impl GraphRuntime {
         self.scheduler.is_replay_driven()
     }
 
-    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return or by the
-    /// consecutive-panic breaker, so it will not fire again in this run? See
+    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return, by the
+    /// consecutive-panic breaker or by [`Self::restore_stopped_nodes`], so it
+    /// will not fire again in this run? See
     /// [`crate::scheduler::Scheduler::is_node_disabled`]. The replay engine
     /// reads it after each step to learn where a re-executed node stopped.
     pub fn is_node_stopped(&self, node_id: &str) -> bool {
@@ -18602,6 +18603,69 @@ impl GraphRuntime {
         for (node_id, floor) in per_node {
             if self.sync_capture_ports.contains_key(node_id) {
                 self.scheduler.restore_sync_epoch_floor(node_id, *floor);
+            }
+        }
+    }
+
+    /// Keep each node in `ids` stopped on a runtime about to resume, as a
+    /// recording's framework sections state it
+    /// ([`crate::state_restore::NodeFrameworkState::stopped`]). Called after
+    /// the build and before the first [`Self::step`], like every other
+    /// restore seam.
+    ///
+    /// The node fires no more and this run records no failure for it
+    /// ([`Self::node_fatal_errors`] does not name it); see
+    /// [`crate::scheduler::Scheduler::restore_stopped_nodes`].
+    ///
+    /// Each `block` slot such a node holds as a consumer is then released, as
+    /// the node's live stop released it, so a producer it paced is not held
+    /// at depth by a consumer that will never drain. The release is SILENT:
+    /// no warning, and no `backpressure_block_slot_releases_count` bump. The
+    /// recorded run counted and announced that release when the node stopped,
+    /// and this run restores the stop rather than performing it again.
+    ///
+    /// # Errors
+    ///
+    /// Nothing changes on either refusal.
+    ///
+    /// * [`TransportError::GraphError`] once this runtime has collected its
+    ///   external sources (it has run a live session), as
+    ///   [`Self::restore_node_states`] refuses.
+    /// * [`TransportError::NodeNotFound`] for an id this graph does not hold.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    pub fn restore_stopped_nodes(
+        &mut self,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> TransportResult<()> {
+        if self.external_sources_collected {
+            return Err(TransportError::GraphError {
+                reason: format!(
+                    "graph '{}': a stop restore was attempted on a runtime that has already \
+                     collected its external sources (it has run a live session), so the stop \
+                     would land part way through a run rather than before its first step. Fix: \
+                     restore on a FRESHLY BUILT runtime (restore runs after the build and before \
+                     the first step)",
+                    self.config.identity()
+                ),
+            });
+        }
+        self.scheduler.restore_stopped_nodes(ids)?;
+        self.release_block_slots_held_by(ids);
+        Ok(())
+    }
+
+    /// Release every `block` slot a node in `ids` holds as a consumer, with no
+    /// event and no counter bump.
+    ///
+    /// Each retained `block_credit_edges` word is a clone of the word the
+    /// consumer's tick callback holds in its `HeldBlockSlot`s, so this releases
+    /// exactly the slots `release_held_block_slots` releases on a live stop. A
+    /// cross-process word is the shared page, so the producer in the other
+    /// process stops waiting too.
+    fn release_block_slots_held_by(&self, ids: &std::collections::BTreeSet<String>) {
+        for edge in &self.block_credit_edges {
+            if ids.contains(&edge.consumer_node) {
+                edge.outstanding.release_slot();
             }
         }
     }
@@ -22196,6 +22260,21 @@ mod tests {
             anchor_framing_bytes(&[empty.clone(), empty.clone()]),
             2 * crate::state_restore::ANCHOR_BLOB_HEADER_SIZE as u64,
             "a node with nothing to say costs only the v1 header"
+        );
+
+        // A node that states only its stop takes the v2 header (the 16 bytes
+        // above plus the section's `u32` length: 20) and the 43-byte version-5
+        // section.
+        let stopped = NodeFrameworkState {
+            stopped: true,
+            ..Default::default()
+        };
+        assert!(!stopped.is_empty());
+        assert_eq!(crate::state_restore::ANCHOR_BLOB_V2_HEADER_SIZE, 20);
+        assert_eq!(
+            anchor_framing_bytes(std::slice::from_ref(&stopped)),
+            20 + 43,
+            "a stopped node with nothing else to state costs the v2 header and 43 bytes"
         );
 
         // A node WITH a section takes the v2 header plus the section's own length,
