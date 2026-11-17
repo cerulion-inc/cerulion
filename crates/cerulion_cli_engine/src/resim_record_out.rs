@@ -48,10 +48,10 @@
 //! overwritten. The engine creates it only after the bag's whole-run checks,
 //! so a bag those checks refuse leaves no file. A run that does not finish (a
 //! refused or aborted pass, a write error) removes the partial file instead of
-//! leaving an unfinalized bag behind. The writer is abandoned before the file
-//! is removed, so it logs no warning about a bag that is being deleted. A
-//! removal that fails logs one warning that the file is left at the
-//! `--record-out` path.
+//! leaving an unfinalized bag behind. A run that stops before the sink's
+//! `finalize` abandons the writer first, so it logs no warning about a bag
+//! that is being deleted. A removal that fails logs one warning
+//! that the file is left at the `--record-out` path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -172,8 +172,8 @@ struct Inner {
 pub(crate) struct RecordOut {
     path: PathBuf,
     inner: Mutex<Inner>,
-    /// Set by [`Self::finalize`]; an unfinalized sink abandons its writer and
-    /// removes its file on drop.
+    /// Set by [`Self::finalize`]; an unfinalized sink abandons the writer it
+    /// still holds and removes its file on drop.
     finalized: AtomicBool,
 }
 

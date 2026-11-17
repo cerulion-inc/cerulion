@@ -43201,7 +43201,7 @@ fn a_verify_refused_before_its_first_step_writes_no_output_bag() {
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn a_verify_refused_at_its_first_pass_writes_no_output_bag() {
+fn a_verify_refused_at_its_first_pass_leaves_no_output_bag() {
     let dir = tempfile::tempdir().unwrap();
     let bag = ri_evict_bag(dir.path());
     let _budget = replay_engine::override_frame_index_record_budget(1);
