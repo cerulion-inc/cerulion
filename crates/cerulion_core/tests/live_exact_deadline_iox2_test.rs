@@ -20,10 +20,10 @@
 //! because the assertions are about wall-clock timing.
 //!
 //! The grid and wait-sizing assertions need a park that wakes within a few
-//! hundred µs of its deadline, so they run on Linux. On macOS the park is the
-//! degraded `os_sync` nap, whose wake on a hosted runner can land later than
-//! the 700 µs this tick leaves in each period; there the first arm judges
-//! delivery and the fire count only.
+//! hundred µs of its deadline, so they run on Linux. macOS has no CPU
+//! monitor-wait primitive and parks in a degraded nap, whose wake on a hosted
+//! runner can land later than the 700 µs this tick leaves in each period;
+//! there the first arm judges delivery and the fire count only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
