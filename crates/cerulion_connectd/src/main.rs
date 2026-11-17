@@ -1273,8 +1273,11 @@ mod tests {
     #[test]
     fn record_end_logs_its_line_then_writes_the_token_only_on_an_unconfirmed_end() {
         use std::sync::{Arc, Mutex};
+        /// One row: the end, what it leaves at the path, and whether the file
+        /// existed as each of its lines was logged.
+        type Row = (PairEnd, Option<&'static [u8]>, &'static [bool]);
         let token = b"unconfirmed\n".as_slice();
-        let cases: [(PairEnd, Option<&[u8]>, &[bool]); 5] = [
+        let cases: [Row; 5] = [
             (PairEnd::Paired, None, &[]),
             (PairEnd::NotPaired, None, &[]),
             (PairEnd::InterruptedUnconfirmed, Some(token), &[false]),
