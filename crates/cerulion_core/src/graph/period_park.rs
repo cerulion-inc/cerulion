@@ -408,13 +408,16 @@ impl State {
         }
     }
 
-    /// A kernel nap asked to end at `target` returned at `woke`.
-    pub(crate) fn note_kernel_sleep(&mut self, target: Instant, woke: Instant) {
+    /// A kernel nap asked to end at `target` returned at `woke`; `rang` says
+    /// whether the armed line rang since the park began. A nap that returned
+    /// early without a ring (a signal or a spurious wake ends the kernel wait
+    /// too) teaches the lead nothing and is not a data cut.
+    pub(crate) fn note_kernel_sleep(&mut self, target: Instant, woke: Instant, rang: bool) {
         self.stats.kernel_sleeps += 1;
         if woke >= target {
             self.lead
                 .observe(woke.duration_since(target).as_nanos() as u64);
-        } else {
+        } else if rang {
             self.stats.kernel_sleeps_cut_by_data += 1;
         }
     }
@@ -769,12 +772,29 @@ mod tests {
         let t0 = Instant::now();
         let mut st = State::default();
         let seed = st.lead;
-        st.note_kernel_sleep(t0, t0 - Duration::from_micros(30));
+        st.note_kernel_sleep(t0, t0 - Duration::from_micros(30), true);
         assert_eq!(st.lead, seed, "a ring cut the nap: no overshoot sample");
         assert_eq!(st.stats.kernel_sleeps_cut_by_data, 1);
-        st.note_kernel_sleep(t0, t0 + Duration::from_micros(50));
+        st.note_kernel_sleep(t0, t0 + Duration::from_micros(50), true);
         assert_ne!(st.lead, seed);
         assert_eq!(st.stats.kernel_sleeps, 2);
+        assert_eq!(
+            st.stats.kernel_sleeps_cut_by_data, 1,
+            "a nap that ran to its end is not cut, ring or not"
+        );
+    }
+
+    #[test]
+    fn a_nap_that_ended_early_without_a_ring_is_not_a_data_cut() {
+        let t0 = Instant::now();
+        let mut st = State::default();
+        let seed = st.lead;
+        st.note_kernel_sleep(t0, t0 - Duration::from_micros(30), false);
+        assert_eq!(
+            (st.stats.kernel_sleeps, st.stats.kernel_sleeps_cut_by_data),
+            (1, 0)
+        );
+        assert_eq!(st.lead, seed, "an early return carries no overshoot sample");
     }
 
     #[test]
@@ -809,7 +829,7 @@ mod tests {
         st.note_timer_wake(t0, t0 + Duration::from_micros(9));
         let entry = st.stats;
         st.plan(t0, t0 + Duration::from_millis(1));
-        st.note_kernel_sleep(t0, t0 + Duration::from_micros(40));
+        st.note_kernel_sleep(t0, t0 + Duration::from_micros(40), false);
         let session = st.stats.since(entry);
         assert_eq!(
             session,

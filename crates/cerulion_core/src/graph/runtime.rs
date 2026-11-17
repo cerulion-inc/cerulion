@@ -15218,7 +15218,15 @@ impl GraphRuntime {
                             }
                         };
                         if napped {
-                            st.note_kernel_sleep(target, std::time::Instant::now());
+                            // A signal ends the kernel wait early too, so an
+                            // early return is a data cut only if the armed
+                            // line rang.
+                            let rang = primary_expected.is_some_and(|expected| {
+                                self.armed_primary_topic()
+                                    .and_then(|t| self.doorbell_registry.as_ref()?.bell(t))
+                                    .is_some_and(|bell| bell.seq() != expected)
+                            });
+                            st.note_kernel_sleep(target, std::time::Instant::now(), rang);
                             self.park_slices
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             period_park_last = if before_window {
