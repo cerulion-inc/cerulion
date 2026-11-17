@@ -1761,11 +1761,13 @@ jobs:
         run: |
           echo "selection: skipped cerulion_android (selected: $SELECTED)"
 
-  # THE `period-park` FEATURE OF `rmw_cerulion`, built, linted and tested on
-  # both Linux architectures. Every other job builds `rmw_cerulion` with its
-  # default features, so the code behind the feature in
-  # `src/api/guard_wait.rs` (the predicted wait and its doorbell tests) is
-  # built nowhere else.
+  # THE PERIOD-LEARNED PARK OF `rmw_cerulion` (cfg `cerulion_period_park`),
+  # built, linted and tested on both Linux architectures. Every Linux aarch64
+  # build carries it; anywhere else only the `period-park` feature does. Every
+  # other job builds `rmw_cerulion` with its default features on x86_64 Linux or
+  # macOS, where the cfg is off, so the code behind it in
+  # `src/api/guard_wait.rs` (the predicted wait and its doorbell tests) is built
+  # nowhere else.
   #
   # TWO LEGS, one per architecture, because the code differs between them: the
   # park's monitor wait is `WFE` on aarch64 and `UMWAIT` on x86_64 (when the
@@ -1778,10 +1780,16 @@ jobs:
   # feature on; `cargo clippy -p rmw_cerulion` with no `--all-targets` is the
   # only build of the lib without it.
   #
-  # THE DEFAULT BUILD is tested on the aarch64 leg as well. With the feature
-  # on, a regular publisher takes the predicted wait, so the feature run does
-  # not cover the default idle park (`WFE`) that every aarch64 Linux build
-  # ships; the test shards cover the default build on x86_64.
+  # On the aarch64 leg the default-feature clippy steps compile the same cfg as
+  # the feature steps (only the cfg rule's own test reads the feature there);
+  # both legs keep one step list.
+  #
+  # THE DEFAULT BUILD is tested on the aarch64 leg as well, with
+  # `CERULION_RMW_PERIOD_PARK=0`. On aarch64 the default build carries the
+  # learned park just as the feature build does, and a regular publisher takes
+  # the predicted wait, so only the switched-off run covers the one-rung idle
+  # park (`WFE`) that the switch restores; the test shards cover the default
+  # build on x86_64.
   #
   # Serial (`--test-threads=1`) for the same reason as the shard step: the
   # tests touch the iceoryx2 singleton.
@@ -1870,10 +1878,12 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
         run: cargo test -p rmw_cerulion --features period-park -- --test-threads=1
 
-      - name: rmw_cerulion tests, default features (serial)
+      - name: rmw_cerulion tests, default features, learned park off (serial)
         if: >-
           matrix.arch == 'aarch64'
           && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        env:
+          CERULION_RMW_PERIOD_PARK: "0"
         run: cargo test -p rmw_cerulion -- --test-threads=1
 
       - name: selection marker, rmw_cerulion
