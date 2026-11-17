@@ -39,36 +39,59 @@ impl Write for ScriptedStream {
     }
 }
 
-const ACK: &[u8] = br#"{"type":"ack","chosen_version":1,"server_name":"robot"}"#;
+const HELLO: &[u8] = br#"{"min_version":1,"max_version":2}"#;
+const ACK: &[u8] = br#"{"type":"ack","chosen_version":2,"server_name":"robot"}"#;
+const LEGACY_ACK: &[u8] = br#"{"type":"ack","chosen_version":1,"server_name":"robot"}"#;
 const PAIRED: &[u8] =
     br#"{"status":"ok","id":0,"result":{"paired":true,"account":"owner","source":"strong_chain"}}"#;
 
 #[test]
 fn certificate_exchange_writes_one_versioned_pair_request() {
-    let mut stream = ScriptedStream::replies(&[ACK, PAIRED]);
-    pair_encoded(&mut stream, "0123", "owner").unwrap();
-    // Literal envelope oracle: this test isolates framing from certificate crypto.
-    let hello = br#"{"min_version":1,"max_version":1}"#;
-    let request = br#"{"id":0,"verb":"pair","args":{"owner_certificate_postcard":"0123"}}"#;
-    let mut expected = Vec::new();
-    for bytes in [hello.as_slice(), request.as_slice()] {
-        expected.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        expected.extend_from_slice(bytes);
+    for ack_bytes in [LEGACY_ACK, ACK] {
+        let mut stream = ScriptedStream::replies(&[ack_bytes, PAIRED]);
+        pair_encoded(&mut stream, "0123", "owner").unwrap();
+        // Literal envelope oracle: this test isolates framing from certificate crypto.
+        let request = br#"{"id":0,"verb":"pair","args":{"owner_certificate_postcard":"0123"}}"#;
+        let mut expected = Vec::new();
+        for bytes in [HELLO, request.as_slice()] {
+            expected.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            expected.extend_from_slice(bytes);
+        }
+        assert_eq!(stream.output, expected);
     }
-    assert_eq!(stream.output, expected);
+}
+
+#[test]
+fn owner_handshake_matches_the_shared_ordinary_ops_protocol() {
+    for (ack_bytes, expected_version) in [(LEGACY_ACK, 1), (ACK, 2)] {
+        let mut stream = ScriptedStream::replies(&[ack_bytes, PAIRED]);
+        pair_encoded(&mut stream, "0123", "owner").unwrap();
+        let bytes = cerulion_ops_proto::read_frame(&mut Cursor::new(stream.output)).unwrap();
+        let hello: cerulion_ops_proto::Hello = cerulion_ops_proto::decode(&bytes).unwrap();
+        assert_eq!(hello, cerulion_ops_proto::Hello::current());
+        assert_eq!(hello.session, cerulion_ops_proto::SessionKind::Ops);
+        let ack: cerulion_ops_proto::HandshakeReply =
+            cerulion_ops_proto::decode(ack_bytes).unwrap();
+        assert!(matches!(
+            ack,
+            cerulion_ops_proto::HandshakeReply::Ack { chosen_version, .. }
+                if chosen_version == expected_version
+        ));
+    }
 }
 
 #[test]
 fn handshake_refusal_or_wrong_version_never_sends_pair() {
     for reply in [
-        br#"{"type":"ack","chosen_version":2,"server_name":"robot"}"#.as_slice(),
-        br#"{"type":"reject","server_min":2,"server_max":2,"message":"unsupported"}"#,
-        br#"{"type":"ack","chosen_version":1,"chosen_version":2,"server_name":"robot"}"#,
+        br#"{"type":"ack","chosen_version":0,"server_name":"unsupported"}"#.as_slice(),
+        br#"{"type":"ack","chosen_version":3,"server_name":"robot"}"#,
+        br#"{"type":"reject","server_min":1,"server_max":1,"message":"unsupported"}"#,
+        br#"{"type":"ack","chosen_version":2,"chosen_version":1,"server_name":"robot"}"#,
         b"invalid JSON",
     ] {
         let mut stream = ScriptedStream::replies(&[reply]);
         assert!(pair_encoded(&mut stream, "0123", "owner").is_err());
-        assert_eq!(&stream.output[4..], br#"{"min_version":1,"max_version":1}"#);
+        assert_eq!(&stream.output[4..], HELLO);
     }
 }
 
@@ -113,11 +136,7 @@ fn peer_refusal_text_is_sanitized_at_the_boundary() {
 #[test]
 fn oversize_prefix_is_rejected_before_reading_or_allocating_its_body() {
     let mut stream = ScriptedStream {
-        input: Cursor::new(
-            ((OWNER_PAIR_MAX_FRAME_BYTES + 1) as u32)
-                .to_be_bytes()
-                .to_vec(),
-        ),
+        input: Cursor::new((64 * 1024 + 1_u32).to_be_bytes().to_vec()),
         output: Vec::new(),
     };
     assert!(matches!(
@@ -138,7 +157,7 @@ fn oversized_requests_and_truncated_replies_fail_without_another_request() {
         ),
         Err(ConnectError::Protocol(_))
     ));
-    assert_eq!(&stream.output[4..], br#"{"min_version":1,"max_version":1}"#);
+    assert_eq!(&stream.output[4..], HELLO);
     for truncated in [vec![], vec![0, 0], vec![0, 0, 0, 3, b'{']] {
         let mut stream = ScriptedStream {
             input: Cursor::new(truncated),
@@ -184,5 +203,59 @@ fn transport_error_text_is_sanitized_and_write_failures_propagate() {
         assert!(matches!(error, ConnectError::Io(_)));
         assert!(!error.to_string().contains('\u{1b}'));
         assert!(!error.to_string().contains('\n'));
+    }
+}
+
+#[test]
+fn changed_identity_after_ack_writes_only_hello_and_never_pair() {
+    for ack_bytes in [LEGACY_ACK, ACK] {
+        let mut stream = ScriptedStream::replies(&[ack_bytes, PAIRED]);
+        let mut checks = 0;
+        let result = pair_encoded_with_check(&mut stream, "0123", "owner", || {
+            checks += 1;
+            Err(ConnectError::Protocol("identity changed".into()))
+        });
+        assert!(
+            matches!(result, Err(ConnectError::Protocol(message)) if message == "identity changed")
+        );
+        assert_eq!(checks, 1);
+        let mut expected = (HELLO.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(HELLO);
+        assert_eq!(stream.output, expected);
+        // Only the acknowledgement was consumed: no pairing reply or request exists.
+        assert_eq!(stream.input.position(), 4 + ack_bytes.len() as u64);
+    }
+}
+
+#[test]
+fn identity_guard_runs_once_only_after_a_supported_ack() {
+    for ack_bytes in [LEGACY_ACK, ACK] {
+        let mut stream = ScriptedStream::replies(&[ack_bytes, PAIRED]);
+        let mut checks = 0;
+        pair_encoded_with_check(&mut stream, "0123", "owner", || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checks, 1);
+        let request = br#"{"id":0,"verb":"pair","args":{"owner_certificate_postcard":"0123"}}"#;
+        let mut expected = Vec::new();
+        for bytes in [HELLO, request.as_slice()] {
+            expected.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            expected.extend_from_slice(bytes);
+        }
+        assert_eq!(stream.output, expected);
+    }
+    for reply in [
+        br#"{"type":"ack","chosen_version":0,"server_name":"unsupported"}"#.as_slice(),
+        br#"{"type":"reject","server_min":2,"server_max":2,"message":"denied"}"#,
+        b"invalid JSON",
+    ] {
+        let mut stream = ScriptedStream::replies(&[reply]);
+        let result = pair_encoded_with_check(&mut stream, "0123", "owner", || {
+            panic!("identity guard ran without a supported Ack")
+        });
+        assert!(result.is_err());
+        assert_eq!(&stream.output[4..], HELLO);
     }
 }

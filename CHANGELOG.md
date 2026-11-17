@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `cerulion_wireclient::owner_pair::present_owner_certificate_checked` accepts an identity check after the ordinary ops handshake and before sending a certificate. A failed check sends no pairing request. Owner-pair clients negotiate ordinary ops versions 1 through 2.
 - `cerulion_wireclient::local_identity` provides locked account and machine-key reads, with a separate full-proof snapshot. Identity-only reads do not open certificates. Netd shares the full reader while retaining its prior-login and durable-pairing rules.
 - `cerulion_ops_proto::ExecClient` provides an argv-only session state machine with independent stdout and stderr capture limits, recording checkpoint consistency checks, partial progress after interruption, and a single completed result after a valid exit. Callers own authentication, transport, deadlines and witness persistence; a lost connection must not trigger automatic command replay.
 - The ops handshake carries an explicit session kind and negotiates version 2 while retaining version 1 for ordinary verbs. The ordinary client rejects an acknowledgement outside its offered or supported range, and ordinary ops services refuse shell and exec sessions before acknowledgement. Rust callers constructing `cerulion_ops_proto::Hello` or its `cerud::protocol` re-export must add `session: SessionKind::Ops` for ordinary verbs, or use `Hello::current()`.

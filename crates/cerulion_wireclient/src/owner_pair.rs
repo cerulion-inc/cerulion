@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Bounded owner-certificate exchange on an already authenticated ops stream.
 //!
-//! This client mirrors the small version-1 ops envelope so publishable desk
+//! This client mirrors the version-1 and version-2 ops envelope so publishable desk
 //! crates do not depend on the robot server. Integration tests exercise it against
-//! that server. The caller owns transport deadlines and must close a timed-out
-//! connection; a partially read frame must never be reused.
+//! that server and pin the handshake against the shared protocol. Omitting the
+//! session field selects ordinary ops. The caller owns transport deadlines and
+//! must close a timed-out connection; a partially read frame must never be reused.
 
 use std::io::{Read, Write};
 
@@ -17,6 +18,9 @@ use crate::{ConnectError, ConnectResult};
 
 /// Maximum request or reply payload for the certificate-only pairing exchange.
 pub const OWNER_PAIR_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+const OWNER_PAIR_MIN_PROTOCOL_VERSION: u16 = 1;
+const OWNER_PAIR_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Serialize)]
 struct Hello {
@@ -85,32 +89,58 @@ pub fn present_owner_certificate<S: Read + Write>(
     stream: &mut S,
     presentation: &OwnerCertificatePresentationWire,
 ) -> ConnectResult<()> {
+    present_owner_certificate_checked(stream, presentation, || Ok(()))
+}
+
+/// Present a certificate only after a fresh caller-owned identity check.
+///
+/// `before_pair` runs exactly once after a supported ops acknowledgement and
+/// immediately before the pairing request is written. A failed check sends no
+/// pairing request. It must not write to the stream or wait for network I/O;
+/// callers can reread their existing locked account/key store here. The caller
+/// still owns the connection deadline and must discard the stream on failure.
+pub fn present_owner_certificate_checked<S: Read + Write>(
+    stream: &mut S,
+    presentation: &OwnerCertificatePresentationWire,
+    before_pair: impl FnOnce() -> ConnectResult<()>,
+) -> ConnectResult<()> {
     let bytes = presentation
         .to_postcard()
         .map_err(|e| ConnectError::DeviceCert(e.to_string()))?;
-    pair_encoded(
+    pair_encoded_with_check(
         stream,
         &hex::encode(bytes),
         &hex::encode(presentation.device_cert.cert.account.0),
+        before_pair,
     )
 }
 
+#[cfg(test)]
 fn pair_encoded<S: Read + Write>(
     stream: &mut S,
     presentation_hex: &str,
     expected_account: &str,
 ) -> ConnectResult<()> {
+    pair_encoded_with_check(stream, presentation_hex, expected_account, || Ok(()))
+}
+
+fn pair_encoded_with_check<S: Read + Write>(
+    stream: &mut S,
+    presentation_hex: &str,
+    expected_account: &str,
+    before_pair: impl FnOnce() -> ConnectResult<()>,
+) -> ConnectResult<()> {
     write_json(
         stream,
         &Hello {
-            min_version: 1,
-            max_version: 1,
+            min_version: OWNER_PAIR_MIN_PROTOCOL_VERSION,
+            max_version: OWNER_PAIR_PROTOCOL_VERSION,
         },
     )?;
     match read_json::<HandshakeReply>(stream)? {
-        HandshakeReply::Ack {
-            chosen_version: 1, ..
-        } => {}
+        HandshakeReply::Ack { chosen_version, .. }
+            if (OWNER_PAIR_MIN_PROTOCOL_VERSION..=OWNER_PAIR_PROTOCOL_VERSION)
+                .contains(&chosen_version) => {}
         HandshakeReply::Ack { chosen_version, .. } => {
             return Err(ConnectError::Protocol(format!(
                 "ops server selected unsupported version {chosen_version}"
@@ -123,6 +153,7 @@ fn pair_encoded<S: Read + Write>(
             )));
         }
     }
+    before_pair()?;
     write_json(
         stream,
         &PairRequest {
