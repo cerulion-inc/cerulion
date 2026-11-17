@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use cerulion_ops_proto::recording::{RecordingEvent, RecordingPayload, RecordingWitness};
 
-const MAX_RECORDING_EVENT_BYTES: usize = 2 * cerulion_ops_proto::session::MAX_SESSION_FRAME_BYTES;
+use super::MAX_RECORDING_EVENT_BYTES;
 
 /// List witnesses from complete recordings, skipping valid unfinished prefixes.
 /// The caller still verifies each witness against its receipt or the desk's

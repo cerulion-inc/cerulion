@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use cerulion_ops_proto::recording::{RecordingChain, RecordingPayload, RecordingWitness};
 
+use crate::remote_session::MAX_RECORDING_EVENT_BYTES;
+
 // Maximum serialized Exit line, including its newline: u64 sequence/timestamp,
 // an i32 status, the longest reason, and two 64-byte hex hashes. Independent
 // wire-vector tests pin every reason and status shape against this bound.
@@ -99,7 +101,9 @@ impl RecordingFile {
 
     /// Append an event before forwarding it, reserving space for the final Exit.
     ///
-    /// Invalid or over-budget events leave the file and commitment unchanged.
+    /// Invalid, oversized or over-budget events leave the file and commitment
+    /// unchanged. Each serialized line, including its newline, must fit the
+    /// recording readers' event limit.
     /// I/O errors may leave uncommitted bytes in the file; discard the writer and
     /// retain an earlier durable witness instead of retrying that event.
     pub fn append(
@@ -129,6 +133,12 @@ impl RecordingFile {
             .map_err(io::Error::other)?;
         let mut bytes = serde_json::to_vec(&event)?;
         bytes.push(b'\n');
+        if bytes.len() > MAX_RECORDING_EVENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recording event is oversized",
+            ));
+        }
         let total = self
             .bytes
             .checked_add(bytes.len() as u64)

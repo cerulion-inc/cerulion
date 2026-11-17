@@ -185,6 +185,102 @@ fn invalid_start_and_backwards_time_do_not_change_the_commitment() {
 }
 
 #[test]
+fn oversized_identity_fields_are_refused_before_any_file_or_chain_change() {
+    let directory = private_directory();
+    let mut file =
+        RecordingFile::create(directory.path(), "test-session".into(), 8 * 1024 * 1024).unwrap();
+    let path = directory.path().join("test-session.jsonl");
+    let initial = file.witness();
+    for (principal_id, account_id) in [
+        ("p".repeat(2_097_153), None),
+        ("owner".into(), Some("a".repeat(2_097_153))),
+        // JSON escaping, not the input string length, determines the line size.
+        ("\"".repeat(1_048_576), None),
+    ] {
+        assert_eq!(
+            file.append(
+                100,
+                RecordingPayload::Started {
+                    session_id: "test-session".into(),
+                    principal_id,
+                    account_id,
+                    session: SessionKind::Exec(ExecRequest {
+                        argv: vec!["/bin/true".into()],
+                    }),
+                },
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(file.witness(), initial);
+        assert_eq!(file.bytes, 0);
+        assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+    // Refusal is healthy and cannot advance the timestamp.
+    file.append(1, start_with_principal("owner".into()))
+        .unwrap();
+    file.append(2, exit()).unwrap();
+    crate::remote_session::verify_recording_file(&path, &file.witness()).unwrap();
+}
+
+#[test]
+fn exact_event_size_boundary_stays_readable_by_all_file_readers() {
+    assert_eq!(MAX_RECORDING_EVENT_BYTES, 2_097_152);
+    // Independent wire skeleton: changing either 64-byte hash changes its bytes,
+    // never its length. All other event fields are literal, including the newline.
+    let prefix = r#"{"sequence":0,"timestamp_micros":1,"payload":{"type":"started","session_id":"test-session","principal_id":""#;
+    let suffix = concat!(
+        r#"","session":{"type":"exec","argv":["/bin/true"]}},"previous_hash":""#,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        r#"","hash":""#,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "\"}\n"
+    );
+    let exact_principal_bytes = 2_097_152 - prefix.len() - suffix.len();
+    for extra in [-1_isize, 0, 1] {
+        let directory = private_directory();
+        let path = directory.path().join("test-session.jsonl");
+        let mut file =
+            RecordingFile::create(directory.path(), "test-session".into(), 8 * 1024 * 1024)
+                .unwrap();
+        let initial = file.witness();
+        let principal = "p".repeat(exact_principal_bytes.checked_add_signed(extra).unwrap());
+        let result = file.append(1, start_with_principal(principal));
+        if extra == 1 {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(file.witness(), initial);
+            assert!(std::fs::read(&path).unwrap().is_empty());
+            continue;
+        }
+        assert_eq!(result.unwrap(), AppendOutcome::Appended);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            2_097_152_u64.checked_add_signed(extra as i64).unwrap()
+        );
+        let prefix_witness = file.witness();
+        crate::remote_session::verify_recording_prefix_file(&path, &prefix_witness).unwrap();
+        file.append(2, exit()).unwrap();
+        crate::remote_session::verify_recording_file(&path, &file.witness()).unwrap();
+        assert_eq!(
+            crate::remote_session::list_recordings(directory.path()).unwrap(),
+            vec![file.witness()]
+        );
+    }
+}
+
+fn start_with_principal(principal_id: String) -> RecordingPayload {
+    RecordingPayload::Started {
+        session_id: "test-session".into(),
+        principal_id,
+        account_id: None,
+        session: SessionKind::Exec(ExecRequest {
+            argv: vec!["/bin/true".into()],
+        }),
+    }
+}
+
+#[test]
 fn write_failure_is_sticky_even_after_the_file_handle_becomes_writable() {
     let directory = private_directory();
     let mut file = recorder(directory.path());

@@ -195,8 +195,9 @@ Load-bearing boundary contracts:
 - **Recording file writes**: Unix `session_recording::RecordingFile` creates a
   private audit file without overwriting existing paths. Session IDs are single
   filename components and the Started event must name that ID. Appends preview
-  the hash chain before the byte-cap decision, reserving room for Exit. A refused
-  event leaves the file and commitment unchanged; a write or sync error poisons
+  the hash chain before the byte-cap decision, reserving room for Exit. Serialized
+  lines, including their newline, must fit the same event limit as both readers.
+  A refused event leaves the file and commitment unchanged; a write or sync error poisons
   the writer and may leave uncommitted bytes. Started and Exit are synced before
   success. Ordinary events need a separate durable flush before their witness
   is advertised. Callers run blocking file work away from async executor threads
