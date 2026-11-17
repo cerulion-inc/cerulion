@@ -112,9 +112,9 @@ pub(crate) struct Gate {
 }
 
 /// Why a requested period-park does not engage: the first [`Gate`] term that
-/// fails, in declaration order. A target it does not engage on and a host
-/// without a CPU primitive come first; the rest are this runtime's own wiring,
-/// where a wake the park waits for cannot end a kernel nap.
+/// fails, in declaration order: first the target and the host's CPU, then the
+/// run's park policy, then this runtime's wiring, where a wake the park waits
+/// for cannot end a kernel nap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotEngaged {
     /// Not a target it engages on ([`ENGAGES_ON_THIS_TARGET`]).
