@@ -63,6 +63,7 @@
 //! reported by `ros2` itself after the exec — verbatim forwarding means the
 //! native tool owns its argument surface.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
@@ -170,36 +171,32 @@ pub enum DeliveryRequest {
 
 /// Split the LEADING delivery flags (`--record-deliveries <DIR>`,
 /// `--replay-deliveries <LOG>`, either also as `--flag=value`) off `args`.
-/// Everything from the first other token on is returned verbatim. Pure: no
-/// filesystem or environment access.
+/// Everything from the first other token on is returned verbatim, and a path
+/// keeps its bytes as given, UTF-8 or not. Pure: no filesystem or environment
+/// access.
 ///
 /// Refused (usage, exit 2): a flag without a value (or with a value that
 /// starts with `-`, which is the next flag, not a path), a flag given twice,
 /// both flags, and `--replay-deliveries` on `launch`.
 pub fn split_delivery_flags(
     verb: Ros2NativeVerb,
-    args: &[String],
-) -> CliResult<(Option<DeliveryRequest>, Vec<String>)> {
+    args: &[OsString],
+) -> CliResult<(Option<DeliveryRequest>, Vec<OsString>)> {
     let mut req: Option<DeliveryRequest> = None;
     let mut i = 0;
     while i < args.len() {
-        let token = args[i].as_str();
-        let (flag, inline) = match token.split_once('=') {
-            Some((f, v)) => (f, Some(v)),
-            None => (token, None),
+        let Some((flag, inline)) = delivery_flag_token(&args[i]) else {
+            break;
         };
         let record = flag == RECORD_DELIVERIES_FLAG;
-        if !record && flag != REPLAY_DELIVERIES_FLAG {
-            break;
-        }
         let value = match inline {
-            Some(v) => v.to_string(),
+            Some(v) => v,
             None => {
                 i += 1;
                 args.get(i).cloned().unwrap_or_default()
             }
         };
-        if value.is_empty() || value.starts_with('-') {
+        if value.is_empty() || value.as_encoded_bytes().starts_with(b"-") {
             return Err(CliError::Validation(format!(
                 "{DELIVERY_FLAG_USAGE_PREFIX} {flag} needs a value: {}",
                 if record {
@@ -234,12 +231,42 @@ pub fn split_delivery_flags(
     Ok((req, args[i..].to_vec()))
 }
 
+/// The delivery flag `token` spells, with its inline `=value` when it has one,
+/// or `None` for any other token. Matched on bytes, so an inline value that is
+/// not UTF-8 is still split off whole.
+fn delivery_flag_token(token: &OsStr) -> Option<(&'static str, Option<OsString>)> {
+    let bytes = token.as_encoded_bytes();
+    [RECORD_DELIVERIES_FLAG, REPLAY_DELIVERIES_FLAG]
+        .into_iter()
+        .find_map(
+            |flag| match bytes.strip_prefix(flag.as_bytes())?.split_first() {
+                None => Some((flag, None)),
+                Some((b'=', value)) => Some((flag, Some(os_string_from_bytes(value)))),
+                Some(_) => None,
+            },
+        )
+}
+
+/// The bytes after a delivery flag's `=`, as the argument held them.
+#[cfg(unix)]
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStrExt as _;
+    OsStr::from_bytes(bytes).to_os_string()
+}
+
+/// Non-Unix stub: `cerulion ros2` runs on Unix only (see [`exec_ros2`]), so
+/// this only has to stay total; bytes that are not UTF-8 are replaced.
+#[cfg(not(unix))]
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    String::from_utf8_lossy(bytes).into_owned().into()
+}
+
 /// The child env pair a delivery request stages, with its path made absolute
 /// (the node's working directory is `ros2`'s choice, not ours). Refuses a
 /// replay log that is not a file, and an ambient value of the OTHER variable
 /// (the rmw would refuse both set; the launcher says so before anything
 /// starts).
-pub fn delivery_child_env(req: &DeliveryRequest) -> CliResult<(String, String)> {
+pub fn delivery_child_env(req: &DeliveryRequest) -> CliResult<(String, OsString)> {
     let absolute = |p: &Path| -> CliResult<PathBuf> {
         std::path::absolute(p).map_err(|e| {
             CliError::Validation(format!(
@@ -261,7 +288,7 @@ pub fn delivery_child_env(req: &DeliveryRequest) -> CliResult<(String, String)> 
             }
             Ok((
                 DELIVERY_LOG_CHILD_ENV.to_string(),
-                absolute(dir)?.display().to_string(),
+                absolute(dir)?.into_os_string(),
             ))
         }
         DeliveryRequest::Replay(log) => {
@@ -282,14 +309,19 @@ pub fn delivery_child_env(req: &DeliveryRequest) -> CliResult<(String, String)> 
                     log.display()
                 )));
             }
-            Ok((REPLAY_CHILD_ENV.to_string(), log.display().to_string()))
+            Ok((REPLAY_CHILD_ENV.to_string(), log.into_os_string()))
         }
     }
 }
 
 /// One line for the operator about a staged record or replay, or `None`.
 pub fn delivery_notice(plan: &Ros2Plan) -> Option<String> {
-    let value = |k: &str| plan.env.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+    let value = |k: &str| {
+        plan.env
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| Path::new(v).display())
+    };
     if let Some(dir) = value(DELIVERY_LOG_CHILD_ENV) {
         return Some(format!(
             "cerulion: recording the deliveries of every ROS 2 process into {dir} (one \
@@ -1248,10 +1280,12 @@ pub struct Ros2Plan {
     /// The program to exec (always `"ros2"` in production; tests point it at
     /// a fixture script to prove env staging + exit-code transparency).
     pub program: String,
-    /// The native verb token followed by the forwarded args, verbatim.
-    pub args: Vec<String>,
-    /// Env pairs to overlay onto the child environment.
-    pub env: Vec<(String, String)>,
+    /// The native verb token followed by the forwarded args, verbatim: an
+    /// argument that is not valid UTF-8 keeps its bytes.
+    pub args: Vec<OsString>,
+    /// Env pairs to overlay onto the child environment. A value is an
+    /// `OsString` because a delivery-log path keeps its bytes as given.
+    pub env: Vec<(String, OsString)>,
     /// TOCTOU guard: every file the launcher
     /// inspected and then names to the child, with the identity it had
     /// when inspected. The launcher validates by READING these paths and
@@ -1426,7 +1460,7 @@ pub fn stage_ament_prefix_under(state_dir: &Path, lib_dir: &Path) -> CliResult<P
 /// failure rather than the refusal — a genuinely prior fact, with no
 /// filesystem left behind either way.
 #[cfg(unix)]
-pub fn plan_ros2_passthrough(verb: Ros2NativeVerb, args: &[String]) -> CliResult<Ros2Plan> {
+pub fn plan_ros2_passthrough(verb: Ros2NativeVerb, args: &[OsString]) -> CliResult<Ros2Plan> {
     let lib_dir = resolve_lib_dir()?;
     // The delivery flags lead; the adopt-take refusal is decided on what
     // follows them, still before anything is staged.
@@ -1443,7 +1477,7 @@ pub fn plan_ros2_passthrough(verb: Ros2NativeVerb, args: &[String]) -> CliResult
 /// and what the engine's arms drive) while production can answer earlier.
 /// Both render the IDENTICAL message: the prefix path comes from
 /// [`ament_prefix_path`], which is what the staging would have produced.
-pub fn refuse_adopt_take_if_requested(args: &[String], lib_dir: &Path) -> CliResult<()> {
+pub fn refuse_adopt_take_if_requested(args: &[OsString], lib_dir: &Path) -> CliResult<()> {
     if split_adopt_take_flag(args).0 {
         let prefix = ament_prefix_path(lib_dir);
         return Err(refuse_adopt_take_under_the_ros2_cli(
@@ -1462,7 +1496,7 @@ pub fn refuse_adopt_take_if_requested(args: &[String], lib_dir: &Path) -> CliRes
 /// [`ROS2_PRELOAD_ENV`]'s contract.
 pub fn build_ros2_passthrough_plan(
     verb: Ros2NativeVerb,
-    args: &[String],
+    args: &[OsString],
     lib_dir: &Path,
     ament_prefix: &Path,
 ) -> CliResult<Ros2Plan> {
@@ -1485,7 +1519,7 @@ pub fn build_ros2_passthrough_plan(
 /// scheme will re-enable.
 pub fn build_ros2_passthrough_plan_for_host(
     verb: Ros2NativeVerb,
-    args: &[String],
+    args: &[OsString],
     lib_dir: &Path,
     ament_prefix: &Path,
     host: HostAbi,
@@ -1518,7 +1552,7 @@ pub fn build_ros2_passthrough_plan_for_host(
 #[cfg(feature = "test-seams")]
 pub fn build_ros2_passthrough_plan_skipping_the_two_hop_refusal_for_test(
     verb: Ros2NativeVerb,
-    args: &[String],
+    args: &[OsString],
     lib_dir: &Path,
     ament_prefix: &Path,
     host: HostAbi,
@@ -1740,7 +1774,7 @@ fn refuse_adopt_take_under_the_ros2_cli(lib_dir: &Path, ament_prefix: Option<&Pa
 /// `build_ros2_passthrough_plan_skipping_the_two_hop_refusal_for_test`.
 fn build_plan_with_adopt_gate(
     verb: Ros2NativeVerb,
-    args: &[String],
+    args: &[OsString],
     lib_dir: &Path,
     ament_prefix: &Path,
     host: HostAbi,
@@ -2004,8 +2038,8 @@ fn build_plan_with_adopt_gate(
         env.push((ADOPT_TAKE_CHILD_ENV.to_string(), "1".to_string()));
     }
     let mut full_args = Vec::with_capacity(1 + forwarded.len());
-    full_args.push(verb.as_str().to_string());
-    full_args.extend(forwarded.iter().cloned());
+    full_args.push(OsString::from(verb.as_str()));
+    full_args.extend(forwarded);
     // TOCTOU guard: record what every file the
     // launcher validated resolved to, so `exec_ros2` can refuse if it is
     // no longer the same object. The sweep covers every path handed to
@@ -2059,7 +2093,7 @@ fn build_plan_with_adopt_gate(
     Ok(Ros2Plan {
         program: "ros2".to_string(),
         args: full_args,
-        env,
+        env: env.into_iter().map(|(k, v)| (k, v.into())).collect(),
         inspected,
     })
 }
@@ -2465,11 +2499,8 @@ fn verify_inspected(plan: &Ros2Plan) -> Result<(), CliError> {
 /// preserving the pass-through guarantee (a later `--adopt-take` belongs to
 /// ros2's argument surface and ros2 rejects it loudly, never silently).
 /// Repeats are idempotent.
-pub fn split_adopt_take_flag(args: &[String]) -> (bool, Vec<String>) {
-    let leading = args
-        .iter()
-        .take_while(|a| a.as_str() == ADOPT_TAKE_FLAG)
-        .count();
+pub fn split_adopt_take_flag(args: &[OsString]) -> (bool, Vec<OsString>) {
+    let leading = args.iter().take_while(|a| *a == ADOPT_TAKE_FLAG).count();
     (leading > 0, args[leading..].to_vec())
 }
 

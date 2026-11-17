@@ -672,12 +672,14 @@ fn fixture() -> Fixture {
     }
 }
 
-fn args(list: &[&str]) -> Vec<String> {
-    list.iter().map(|s| s.to_string()).collect()
+fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
+    list.iter().map(std::ffi::OsString::from).collect()
 }
 
-fn env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+fn env_value<'a, V: AsRef<std::ffi::OsStr>>(env: &'a [(String, V)], key: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_ref().to_str().expect("a test-staged value is UTF-8"))
 }
 
 // ── Pass-through plan oracles (env-touching → #[serial]) ────────────────────
@@ -3895,7 +3897,7 @@ fn exec_of_nonexistent_program_returns_notfound() {
     use cerulion_cli_engine::ros2_cmd::{exec_ros2, Ros2Plan};
     let plan = Ros2Plan {
         program: "/nonexistent/cerulion-test/ros2".to_string(),
-        args: vec!["run".to_string()],
+        args: vec!["run".into()],
         env: vec![],
         inspected: vec![],
     };
@@ -3947,7 +3949,7 @@ fn a_validated_library_replaced_before_exec_is_refused() {
     ];
     let plan = |inspected: Vec<InspectedFile>| Ros2Plan {
         program: "/nonexistent/cerulion-test/ros2".to_string(),
-        args: vec!["run".to_string()],
+        args: vec!["run".into()],
         env: vec![],
         inspected,
     };
