@@ -14278,7 +14278,7 @@ impl GraphRuntime {
             credit_edges: !self.credit_park_edges.is_empty(),
             fd_sources: sources
                 .iter()
-                .any(|(s, _)| !matches!(s, waitset::WaitSource::Listener(_))),
+                .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
             armed_line: self.has_armed_line(),
             data_wake: self.data_wake_rung(),
         })

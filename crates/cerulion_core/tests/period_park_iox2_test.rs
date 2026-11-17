@@ -490,7 +490,10 @@ fn ticker_run(tag: &str, period_park: bool, fires: usize) -> (Vec<u64>, Vec<f64>
 
 /// Under the period-park a 1 kHz node still fires on its grid: after its
 /// start-up catch-up, almost no fire lands less than half a period after the
-/// previous one and the median gap is the period.
+/// previous one and the median gap is the period. Judged where the
+/// period-park applies; on any other host the live loop's own grid is
+/// `live_exact_deadline_iox2_test`'s, and this arm asserts the switch did
+/// nothing.
 #[test]
 #[serial]
 fn a_period_node_under_the_period_park_stays_on_its_grid() {
@@ -508,16 +511,16 @@ fn a_period_node_under_the_period_park_stays_on_its_grid() {
         "grid: {stats:?}, {doubles} doubles of {}, median gap {med:?}",
         gaps.len()
     );
-    assert!(
-        doubles * 50 <= gaps.len(),
-        "{doubles} of {} fires came less than half a period after the previous one",
-        gaps.len()
-    );
-    assert!(
-        med >= Duration::from_micros(850) && med <= Duration::from_micros(1_150),
-        "the median gap is {med:?}"
-    );
     if cerulion_core::monitor_wait::monitor_wait_available() {
+        assert!(
+            doubles * 50 <= gaps.len(),
+            "{doubles} of {} fires came less than half a period after the previous one",
+            gaps.len()
+        );
+        assert!(
+            med >= Duration::from_micros(850) && med <= Duration::from_micros(1_150),
+            "the median gap is {med:?}"
+        );
         assert!(
             stats.blocks > 0 && stats.kernel_sleeps > 0 && stats.timer_wakes > 0,
             "{stats:?}"
