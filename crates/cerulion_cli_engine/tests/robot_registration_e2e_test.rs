@@ -31,6 +31,10 @@ use cerulion_cli_engine::error::CliError;
 use cerulion_cli_engine::{login_cmd, robot_cmd};
 use serial_test::serial;
 
+/// The stop flag of a revocation sync nothing stops.
+#[cfg(unix)]
+static NOT_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ===========================================================================
 // harness (self-contained, mirrors login_flow_e2e_test.rs)
 // ===========================================================================
@@ -930,7 +934,8 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
     // Refused loudly where no robot registration exists.
     let unregistered = home_path.join("not-a-robot");
     std::fs::create_dir(&unregistered).unwrap();
-    let err = robot_bootstrap::sync_epoch(&unregistered, &mut Vec::new()).unwrap_err();
+    let err =
+        robot_bootstrap::sync_epoch(&unregistered, &mut Vec::new(), &NOT_STOPPING).unwrap_err();
     assert!(
         err.to_string().contains("no robot registration exists"),
         "{err}"
@@ -941,7 +946,7 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
     let robot_id: [u8; 32] = hex::decode(&prepared.robot_id).unwrap().try_into().unwrap();
     // Nothing revoked yet: no epoch, nothing written.
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":null,\"version\":1}\n"
@@ -959,7 +964,7 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
     )
     .unwrap();
     // Refused while the remote-plane state is not provisioned; never created.
-    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap_err();
+    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap_err();
     assert!(err.to_string().contains("not provisioned"), "{err}");
     assert!(!root.join("remoted").exists());
     {
@@ -970,7 +975,7 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
             .unwrap();
     }
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"

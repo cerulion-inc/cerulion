@@ -41,6 +41,10 @@ use cerulion_cli_engine::{account_cmd, auth, login_cmd, owner_certificate, robot
 use cerulion_pairing::format::SignedDeviceCert;
 use serial_test::serial;
 
+/// The stop flag of a revocation sync nothing stops.
+#[cfg(unix)]
+static NOT_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const DAY_NS: u64 = 86_400 * 1_000_000_000;
 
 // ===========================================================================
@@ -606,7 +610,7 @@ fn the_robot_fetches_its_revocations_with_its_key_and_no_login_session() {
     let (root, robot_id, revoked) = registered_robot(&desk);
     lapse_the_session(&desk);
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -639,7 +643,7 @@ fn the_robot_falls_back_to_its_login_session_where_the_service_has_no_robot_rout
         false,
     ));
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -652,7 +656,7 @@ fn the_robot_falls_back_to_its_login_session_where_the_service_has_no_robot_rout
     // With the session lapsed as well, the sync fails and the last epoch stays.
     let before = std::fs::read(root.join("remoted").join("epoch.pending")).unwrap();
     lapse_the_session(&desk);
-    assert!(robot_bootstrap::sync_epoch(&root, &mut Vec::new()).is_err());
+    assert!(robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).is_err());
     assert_eq!(
         std::fs::read(root.join("remoted").join("epoch.pending")).unwrap(),
         before
@@ -673,7 +677,7 @@ fn a_rate_limited_robot_fails_its_run_without_using_its_login() {
         false,
     ));
     let mut out = Vec::new();
-    let err = robot_bootstrap::sync_epoch(&root, &mut out).unwrap_err();
+    let err = robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap_err();
     // A failed run, so the supervisor backs off and counts it.
     assert!(err.to_string().contains("429"), "{err}");
     assert!(out.is_empty(), "no worker result line");
@@ -703,7 +707,7 @@ fn a_refused_robot_proof_falls_back_to_the_login_session() {
         false,
     ));
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -727,7 +731,7 @@ fn a_challenge_naming_another_robot_is_never_signed() {
         format!(r#"{{"challenge":"issued-elsewhere","robot_id":"{other}","expires_in":300}}"#),
         false,
     ));
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     // No signed read: the robot refused the challenge and used its session.
     assert_eq!(access_requests(&desk), (1, 0, 1));
 }
@@ -778,7 +782,7 @@ fn a_refused_request_time_is_retried_once_at_the_time_the_service_names() {
     ));
     lapse_the_session(&desk);
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -801,7 +805,7 @@ fn a_robot_whose_clock_is_far_behind_the_service_fetches_after_one_retry() {
         .store(wall_ns() + 600 * 1_000_000_000, Ordering::SeqCst);
     lapse_the_session(&desk);
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -811,7 +815,7 @@ fn a_robot_whose_clock_is_far_behind_the_service_fetches_after_one_retry() {
     // service's time, which is later than the one it accepted last.
     desk.clock.fetch_add(1_000_000_000, Ordering::SeqCst);
     desk.log.lock().unwrap().clear();
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     assert_eq!(access_requests(&desk), (2, 1, 0));
 }
 
@@ -898,7 +902,7 @@ fn the_robot_worker_renews_a_due_certificate_after_its_fetch() {
     let before = desk.cert_text();
     let _due = desk.due_on_the_wall_clock();
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -936,8 +940,8 @@ fn a_robot_whose_login_has_lapsed_tries_a_renewal_at_most_once_an_hour() {
     let before = desk.cert_text();
     let _due = desk.due_on_the_wall_clock();
     lapse_the_session(&desk);
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     // Both runs fetch by the robot's key; only the first tries the session for
     // the renewal, fails, and records it, so the second asks nothing.
     assert_eq!(access_requests(&desk), (2, 2, 0));
@@ -1076,7 +1080,7 @@ fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetche
     let (root, _robot_id, revoked) = registered_robot(&desk);
     // A first fetch: the service accepts this machine's request time.
     lapse_the_session(&desk);
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     assert_eq!(access_requests(&desk), (1, 1, 0));
     // The service's clock two minutes behind the request time it accepted, so
     // that time was ahead of it; and this machine's next request refused for
@@ -1092,7 +1096,7 @@ fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetche
     ));
     desk.log.lock().unwrap().clear();
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -1104,4 +1108,63 @@ fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetche
     // The skew refusal, the retry at the service's time refused as a replay,
     // the retry at the next time it names, and one signed read; no session.
     assert_eq!(access_requests(&desk), (3, 1, 0));
+}
+
+#[test]
+#[serial]
+fn a_sync_told_to_stop_tries_no_login_session_after_its_robot_proof_fails() {
+    let desk = desk();
+    let (root, _robot_id, _revoked) = registered_robot(&desk);
+    // A stale session with a live refresh token: the fallback would refresh it.
+    let mut stale = desk.state.clone();
+    stale.expires_at_ns = 1;
+    auth::write_to(&desk.home.join("auth.json"), &stale).unwrap();
+    desk.overrides.lock().unwrap().push((
+        "/access/challenge ".into(),
+        403,
+        r#"{"error":"proof_of_possession_failed","error_description":"refused"}"#.into(),
+        false,
+    ));
+    let stopping = std::sync::atomic::AtomicBool::new(true);
+    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &stopping).unwrap_err();
+    assert!(err.to_string().contains("netd is stopping"), "{err}");
+    // The proof fetch in flight ran; no refresh, no session read.
+    assert_eq!(access_requests(&desk), (1, 0, 0));
+    assert!(!desk
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("/v1/auth/refresh")));
+    assert_eq!(
+        auth::load_from(&desk.home.join("auth.json"))
+            .state()
+            .unwrap(),
+        &stale
+    );
+}
+
+#[test]
+#[serial]
+fn a_sync_told_to_stop_during_its_fetch_starts_no_certificate_renewal() {
+    let desk = desk();
+    let (root, _robot_id, revoked) = registered_robot(&desk);
+    let before = desk.cert_text();
+    let _due = desk.due_on_the_wall_clock();
+    let stopping = std::sync::atomic::AtomicBool::new(true);
+    let mut out = Vec::new();
+    robot_bootstrap::sync_epoch(&root, &mut out, &stopping).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"epoch\":1,\"version\":1}\n"
+    );
+    assert_eq!(
+        pending_epoch(&root).signed_epoch.epoch_data.revoked_devices,
+        vec![cerulion_pairing::format::PublicKey(revoked)]
+    );
+    assert_eq!(access_requests(&desk), (1, 1, 0));
+    // Due, but not renewed and not counted as a failure: the next sync renews.
+    assert_eq!(desk.registrations(), 0);
+    assert_eq!(desk.cert_text(), before);
+    assert!(!desk.failure_recorded());
 }

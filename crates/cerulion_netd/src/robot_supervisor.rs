@@ -479,8 +479,10 @@ fn epoch_sync_period_from_env() -> Duration {
 
 /// The environment variable setting how long a netd shutdown waits for a
 /// running revocation fetch to finish before stopping it, in whole seconds from
-/// 5 to 120. A longer wait lets a session refresh in flight publish its
-/// rotated token pair; it also lengthens a shutdown that lands during a fetch.
+/// 5 to 120. The stop first sends the fetch SIGTERM, after which it starts no
+/// session refresh or certificate renewal. A longer wait lets a session refresh
+/// in flight publish its rotated token pair; it also lengthens a shutdown that
+/// lands during a fetch.
 /// A shutdown with no fetch running, or with one that ends sooner, does not
 /// wait. The robot server is stopped before this wait, and netd's hard-exit
 /// deadline (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
@@ -648,13 +650,24 @@ impl EpochSync {
         }
     }
 
-    /// Shutdown: wait for a running fetch to exit, for at most the stop grace,
-    /// then stop it (dropping the child kills and reaps it). Returns as soon as
-    /// the worker exits, and at once when none is running.
+    /// Shutdown: tell a running fetch the stop began (SIGTERM, on which it starts
+    /// no session refresh or certificate renewal and finishes only an exchange in
+    /// flight), wait for it to exit for at most the stop grace, then stop it
+    /// (dropping the child kills and reaps it). Returns as soon as the worker
+    /// exits, and at once when none is running.
     fn stop(&mut self) {
         let Some((mut child, _)) = self.child.take() else {
             return;
         };
+        if !matches!(child.0.try_wait(), Ok(None)) {
+            return;
+        }
+        if let Err(error) = send_sigterm(child.0.id()) {
+            tracing::warn!(
+                error = %error,
+                "could not tell the robot revocation sync that netd is stopping; waiting within its stop grace"
+            );
+        }
         let until = Instant::now() + self.stop_grace;
         while Instant::now() < until {
             if !matches!(child.0.try_wait(), Ok(None)) {

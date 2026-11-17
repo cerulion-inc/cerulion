@@ -442,6 +442,50 @@ fn an_overdue_epoch_sync_worker_is_killed_and_counts_as_a_failure() {
 }
 
 #[test]
+fn a_stop_signals_the_running_revocation_sync_and_returns_once_it_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("cerulion");
+    let log = dir.path().join("signals.log");
+    // A worker that records the stop signal, ends its own wait and exits.
+    install_script(
+        &script,
+        &format!(
+            "#!/bin/sh\ntrap 'echo stopping >> \"{log}\"; kill $wait_for; exit 0' TERM\n\
+             sleep 30 &\nwait_for=$!\necho ready >> \"{log}\"\nwait $wait_for\n",
+            log = log.display()
+        ),
+    );
+    let t0 = Instant::now();
+    let mut sync = EpochSync::new(
+        script,
+        dir.path().join("state"),
+        DEFAULT_EPOCH_SYNC_PERIOD,
+        MAX_EPOCH_SYNC_STOP_GRACE,
+        t0,
+    );
+    sync.poll(t0);
+    assert!(sync.child.is_some());
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("ready"))
+        && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stopping = Instant::now();
+    sync.stop();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "ready\nstopping\n",
+        "the worker was told the stop began"
+    );
+    assert!(
+        stopping.elapsed() < MAX_EPOCH_SYNC_STOP_GRACE / 2,
+        "the stop returned when the worker exited, not at the end of its grace"
+    );
+    assert!(sync.child.is_none());
+}
+
+#[test]
 fn the_server_loop_runs_the_revocation_sync_while_the_server_lives() {
     let dir = tempfile::tempdir().unwrap();
     let (cli, log) = fake_worker(dir.path(), 0);

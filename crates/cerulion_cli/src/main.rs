@@ -1164,9 +1164,22 @@ fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
     cerulion_cli_engine::robot_bootstrap::run(state_root, &mut std::io::stdout().lock())
 }
 
+/// The revocation sync netd runs for a registered robot. netd's stop sends it
+/// SIGTERM: the handler only sets `stopping`, so an exchange in flight finishes
+/// inside netd's stop grace and nothing new starts after it.
 #[cfg(unix)]
 fn robot_sync_epoch(state_root: &std::path::Path) -> CliResult<()> {
-    cerulion_cli_engine::robot_bootstrap::sync_epoch(state_root, &mut std::io::stdout().lock())
+    let stopping = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stopping);
+    if let Err(e) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+        // Without the handler, netd's stop signal ends the sync at once.
+        eprintln!("warning: the revocation sync cannot watch for netd's stop signal: {e}");
+    }
+    cerulion_cli_engine::robot_bootstrap::sync_epoch(
+        state_root,
+        &mut std::io::stdout().lock(),
+        &stopping,
+    )
 }
 
 fn run(cli: Cli) -> CliResult<()> {

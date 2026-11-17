@@ -130,6 +130,10 @@ const REMOTED_SUBDIR: &str = "remoted";
 /// processes). Afterwards, while time remains inside the supervisor's worker
 /// deadline, it renews a device certificate that is due.
 ///
+/// Once `stopping` is set (netd's stop has begun), the sync starts no session
+/// fallback, session refresh or renewal; an exchange already in flight
+/// finishes, inside netd's stop grace.
+///
 /// The stored login is checked locally in both cases: it must name the
 /// registration's owner, though its session may have lapsed.
 ///
@@ -137,8 +141,13 @@ const REMOTED_SUBDIR: &str = "remoted";
 ///
 /// Refuses loudly when no robot registration exists under `state_root`, when
 /// the login is not the registration's owner, when the robot route answers 429,
-/// or when both fetches fail; a failure changes nothing on the robot.
-pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
+/// when both fetches fail, or when the fallback is needed after `stopping` is
+/// set; a failure changes nothing on the robot.
+pub fn sync_epoch(
+    state_root: &Path,
+    out: &mut impl Write,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> CliResult<()> {
     let started = std::time::Instant::now();
     trusted_root(state_root)?;
     let bundle_path = state_root.join(BUNDLE_FILE);
@@ -187,7 +196,7 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
                  service, or one that does not know this robot); fetching revocations with \
                  this machine's login session"
             );
-            fetch_access_by_session(&robot_id_b64, &mut session)?
+            fetch_access_by_session(&robot_id_b64, &mut session, stopping)?
         }
         Err(e) => {
             tracing::warn!(
@@ -195,7 +204,7 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
                 "the robot-key revocation fetch failed; fetching with this machine's \
                  login session instead"
             );
-            fetch_access_by_session(&robot_id_b64, &mut session)?
+            fetch_access_by_session(&robot_id_b64, &mut session, stopping)?
         }
     };
     let epoch = match account_cmd::epoch_cache_artifact_from(&access)? {
@@ -229,8 +238,12 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
     )
     .map_err(|_| refused("could not encode the worker result"))?;
     writeln!(out)?;
-    if started.elapsed() <= WORKER_RENEWAL_START_LIMIT {
-        renew_device_cert(session);
+    if is_stopping(stopping) {
+        tracing::info!(
+            "netd is stopping; the device certificate renewal waits for the next revocation sync"
+        );
+    } else if started.elapsed() <= WORKER_RENEWAL_START_LIMIT {
+        renew_device_cert(session, stopping);
     } else {
         tracing::info!(
             "no time left in this revocation sync to renew the device certificate; the next \
@@ -240,13 +253,25 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
     Ok(())
 }
 
+/// Whether netd's stop has begun ([`sync_epoch`]'s `stopping`).
+fn is_stopping(stopping: &std::sync::atomic::AtomicBool) -> bool {
+    stopping.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The session fallback of [`sync_epoch`]: the robot's access state over this
 /// machine's login session, which is kept in `session` for the renewal after it.
+/// Not started once `stopping` is set.
 fn fetch_access_by_session(
     robot_id: &str,
     session: &mut Option<String>,
+    stopping: &std::sync::atomic::AtomicBool,
 ) -> CliResult<account_cmd::RobotAccess> {
-    let token = account_cmd::require_session_unrenewed()?;
+    if is_stopping(stopping) {
+        return Err(refused(
+            "netd is stopping; revocations were not synced and the login session was not tried",
+        ));
+    }
+    let token = account_cmd::require_session_unrenewed(Some(stopping))?;
     let access = account_cmd::fetch_robot_access(&token, robot_id)?;
     *session = Some(token);
     Ok(access)
@@ -273,12 +298,20 @@ const WORKER_RENEWAL_REFRESH_BUDGET: Duration = Duration::from_secs(30);
 /// session when the fetch did not need one (refreshed within
 /// [`WORKER_RENEWAL_REFRESH_BUDGET`]). Nothing is requested unless the
 /// certificate is due; a failure is one warning, and the next attempt waits an
-/// hour.
-fn renew_device_cert(session: Option<String>) {
+/// hour. Nothing is requested once `stopping` is set.
+fn renew_device_cert(session: Option<String>, stopping: &std::sync::atomic::AtomicBool) {
     if !crate::device_cert_renewal::is_due_now() {
         return;
     }
-    match session.map_or_else(worker_session, Ok) {
+    let session = session.map_or_else(|| worker_session(stopping), Ok);
+    // A stop that began during the refresh is no failure: nothing is recorded.
+    if is_stopping(stopping) {
+        tracing::info!(
+            "netd is stopping; the device certificate renewal waits for the next revocation sync"
+        );
+        return;
+    }
+    match session {
         Ok(token) => crate::device_cert_renewal::renew_if_due(&token),
         Err(e) => {
             crate::device_cert_renewal::record_failure();
@@ -288,9 +321,13 @@ fn renew_device_cert(session: Option<String>) {
 }
 
 /// This machine's session for a renewal in the worker: refreshed when stale,
-/// within [`WORKER_RENEWAL_REFRESH_BUDGET`], on this thread.
-fn worker_session() -> CliResult<String> {
-    login_cmd::refresh_session_if_stale_within(WORKER_RENEWAL_REFRESH_BUDGET)?;
+/// within [`WORKER_RENEWAL_REFRESH_BUDGET`], on this thread, unless `stopping`
+/// is set.
+fn worker_session(stopping: &std::sync::atomic::AtomicBool) -> CliResult<String> {
+    login_cmd::refresh_session_if_stale_unless_stopping(
+        Some(WORKER_RENEWAL_REFRESH_BUDGET),
+        stopping,
+    )?;
     auth::load()
         .state()
         .filter(|s| s.logged_in_ever && s.session_is_valid(auth::now_unix_ns()))

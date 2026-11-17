@@ -477,17 +477,23 @@ pub fn sync_robot_epoch_to_cache_at(
 /// ([`crate::device_cert_renewal::renew_if_due`]); a renewal failure is logged,
 /// holds the next attempt back for an hour, and never fails this call.
 pub fn require_session() -> CliResult<String> {
-    let session = require_session_unrenewed()?;
+    let session = require_session_unrenewed(None)?;
     #[cfg(unix)]
     crate::device_cert_renewal::renew_if_due(&session);
     Ok(session)
 }
 
 /// [`require_session`] without the device-certificate renewal, for a caller that
-/// schedules the renewal itself.
-pub(crate) fn require_session_unrenewed() -> CliResult<String> {
+/// schedules the renewal itself; with `stopping`, a stale session is not
+/// refreshed once it is set.
+pub(crate) fn require_session_unrenewed(
+    stopping: Option<&std::sync::atomic::AtomicBool>,
+) -> CliResult<String> {
     // Best-effort refresh if the session is stale (never fatal on its own).
-    let _ = login_cmd::refresh_session_if_stale();
+    let _ = match stopping {
+        Some(stopping) => login_cmd::refresh_session_if_stale_unless_stopping(None, stopping),
+        None => login_cmd::refresh_session_if_stale(),
+    };
     let loaded = crate::auth::load();
     let now = now_ns();
     match loaded.state() {
