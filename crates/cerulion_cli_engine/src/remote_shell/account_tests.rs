@@ -553,3 +553,386 @@ fn account_routes_match_a_literal_lowercase_hex_oracle() {
     };
     assert!(set_account_epoch_route(&mut malformed, &rows[0]).is_err());
 }
+
+// Bound owned loopback request/response setup and shutdown if a regression stops HTTP progress.
+const ACCESS_GATE_BOUND: Duration = Duration::from_secs(5);
+
+struct AccessGate {
+    url: String,
+    address: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
+    requests: mpsc::Receiver<()>,
+    done: mpsc::Receiver<Result<Option<u16>, String>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AccessGate {
+    fn start(upstream: &str, path: String, on_access: impl FnOnce() + Send + 'static) -> Self {
+        use std::io::{Read, Write};
+        let upstream: std::net::SocketAddr =
+            upstream.strip_prefix("http://").unwrap().parse().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let (requested, requests) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = (|| -> Result<Option<u16>, String> {
+                let (mut client, _) = listener.accept().map_err(|e| e.to_string())?;
+                if stopped.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                let deadline = std::time::Instant::now() + ACCESS_GATE_BOUND;
+                let remaining = || {
+                    deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .filter(|duration| !duration.is_zero())
+                        .ok_or_else(|| "access gate exceeded its request deadline".to_owned())
+                };
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    if header.len() >= 16 * 1024 {
+                        return Err("access request headers exceeded the fixture bound".into());
+                    }
+                    client
+                        .set_read_timeout(Some(remaining()?))
+                        .map_err(|e| e.to_string())?;
+                    let mut byte = [0];
+                    client.read_exact(&mut byte).map_err(|e| e.to_string())?;
+                    header.push(byte[0]);
+                }
+                let header = std::str::from_utf8(&header).map_err(|e| e.to_string())?;
+                let mut lines = header.split("\r\n");
+                if lines.next() != Some(format!("GET {path} HTTP/1.1").as_str()) {
+                    return Err("the engine did not fetch the selected robot's access route".into());
+                }
+                requested.send(()).map_err(|e| e.to_string())?;
+                // The real request has left the engine. Mutate only now, before forwarding it.
+                on_access();
+                let mut server = std::net::TcpStream::connect_timeout(&upstream, remaining()?)
+                    .map_err(|e| e.to_string())?;
+                server
+                    .set_write_timeout(Some(remaining()?))
+                    .map_err(|e| e.to_string())?;
+                let mut forwarded = format!("GET {path} HTTP/1.1\r\n");
+                for line in lines.filter(|line| !line.is_empty()) {
+                    if !line
+                        .split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("connection"))
+                    {
+                        forwarded.push_str(line);
+                        forwarded.push_str("\r\n");
+                    }
+                }
+                forwarded.push_str("Connection: close\r\n\r\n");
+                server
+                    .write_all(forwarded.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let mut response = Vec::new();
+                loop {
+                    server
+                        .set_read_timeout(Some(remaining()?))
+                        .map_err(|e| e.to_string())?;
+                    let mut chunk = [0; 4096];
+                    let count = server.read(&mut chunk).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&chunk[..count]);
+                    if response.len() > 1024 * 1024 {
+                        return Err("account response exceeded the fixture bound".into());
+                    }
+                }
+                let status = std::str::from_utf8(&response)
+                    .map_err(|e| e.to_string())?
+                    .split_whitespace()
+                    .nth(1)
+                    .ok_or("account response had no status")?
+                    .parse::<u16>()
+                    .map_err(|e| e.to_string())?;
+                client
+                    .set_write_timeout(Some(remaining()?))
+                    .map_err(|e| e.to_string())?;
+                client.write_all(&response).map_err(|e| e.to_string())?;
+                Ok(Some(status))
+            })();
+            let _ = finished.send(result);
+        });
+        Self {
+            url: format!("http://{address}"),
+            address,
+            stop,
+            requests,
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) -> Option<u16> {
+        let result = self
+            .done
+            .recv_timeout(ACCESS_GATE_BOUND * 3)
+            .expect("access gate did not finish");
+        self.thread.take().unwrap().join().unwrap();
+        result.expect("access gate did not forward the real account response")
+    }
+}
+
+impl Drop for AccessGate {
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake accept when cancellation correctly prevented any request.
+        let _ = std::net::TcpStream::connect_timeout(&self.address, ACCESS_GATE_BOUND);
+        let completed = self.done.recv_timeout(ACCESS_GATE_BOUND * 3);
+        if completed.is_ok() || matches!(completed, Err(mpsc::RecvTimeoutError::Disconnected)) {
+            let joined = self.thread.take().unwrap().join();
+            if !std::thread::panicking() {
+                joined.expect("access gate thread panicked");
+            }
+        } else if !std::thread::panicking() {
+            panic!("access gate did not stop within its owned I/O bounds");
+        }
+    }
+}
+
+#[test]
+fn engine_network_refusal_precedes_account_http_identity_and_helper() {
+    let _env_lock = crate::test_env::env_lock();
+    for switch in ["CERULION_NETWORK", "CERULION_NETD_NETWORK"] {
+        let fixture = Fixture::new();
+        let auth_before = std::fs::read(fixture.home.path().join("auth.json")).unwrap();
+        let key_before = std::fs::read(fixture.home.path().join("desk.key")).unwrap();
+        let gate = AccessGate::start(&fixture._server.url, "/v1/robots".into(), || {});
+        let service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", Some(OsStr::new(&gate.url)));
+        let blocked = EnvGuard::set(switch, Some(OsStr::new("off")));
+        let command = ["printf", "%s", "a b", "", "--no-network"]
+            .map(str::to_owned)
+            .to_vec();
+        for operation in [
+            Operation::Shell,
+            Operation::Exec(command.clone()),
+            Operation::Policy { enabled: None },
+            Operation::Policy {
+                enabled: Some(true),
+            },
+            Operation::Policy {
+                enabled: Some(false),
+            },
+        ] {
+            // Bypass CLI dispatch: removing prepare's check must make this fail.
+            assert!(
+                matches!(
+                    prepare("owned-robot", &operation, false),
+                    Err(CliError::RemoteShellNetworkRefused(_))
+                ),
+                "prepare did not refuse {operation:?} under {switch}=off"
+            );
+            assert!(
+                matches!(
+                    run(
+                        "owned-robot".into(),
+                        operation.clone(),
+                        false,
+                        Arc::new(AtomicBool::new(true)),
+                    ),
+                    Err(CliError::RemoteShellNetworkRefused(_))
+                ),
+                "run did not refuse {operation:?} under {switch}=off"
+            );
+            assert!(matches!(
+                gate.requests.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            fixture.assert_no_pairing_or_helper();
+            assert!(!fixture.home.path().join("identity").exists());
+            assert!(!fixture.home.path().join("epochs").exists());
+            assert_eq!(
+                std::fs::read(fixture.home.path().join("auth.json")).unwrap(),
+                auth_before
+            );
+            assert_eq!(
+                std::fs::read(fixture.home.path().join("desk.key")).unwrap(),
+                key_before
+            );
+        }
+
+        // The same live HTTP sentinel and seeded identity must work when enabled.
+        drop(blocked);
+        let prepared = prepare("owned-robot", &Operation::Exec(command), false).unwrap();
+        gate.requests.recv_timeout(ACCESS_GATE_BOUND).unwrap();
+        assert_eq!(gate.finish(), Some(200));
+        drop(service); // Epoch refresh uses the existing account server directly.
+        assert_eq!(spawn_bounded(prepared).unwrap(), 78);
+        let recorded = std::fs::read(&fixture.marker).unwrap();
+        assert!(recorded.ends_with(b"\0"));
+        let argv = std::str::from_utf8(&recorded)
+            .unwrap()
+            .split_terminator('\0')
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "remote-exec");
+        let separator = argv.iter().position(|arg| *arg == "--").unwrap();
+        assert_eq!(
+            &argv[separator + 1..],
+            &["printf", "%s", "a b", "", "--no-network"]
+        );
+        std::fs::remove_file(&fixture.marker).unwrap();
+        fixture.assert_no_pairing_or_helper();
+    }
+}
+
+#[test]
+fn cancellation_before_epoch_sync_issues_no_access_request_or_helper() {
+    let _env_lock = crate::test_env::env_lock();
+    let fixture = Fixture::new();
+    let prepared = prepare("owned-robot", &Operation::Shell, false).unwrap();
+    let gate = AccessGate::start(
+        &fixture._server.url,
+        format!(
+            "/v1/robots/{}/access",
+            URL_SAFE_NO_PAD.encode(fixture.robot_id)
+        ),
+        || panic!("cancelled invocation issued epoch HTTP"),
+    );
+    let _service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", Some(OsStr::new(&gate.url)));
+    assert_eq!(
+        prepared.spawn(Arc::new(AtomicBool::new(false))).unwrap(),
+        130
+    );
+    assert!(matches!(
+        gate.requests.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    fixture.assert_no_pairing_or_helper();
+}
+
+#[test]
+fn identity_and_cancellation_changes_during_real_epoch_http_prevent_helper_spawn() {
+    let _env_lock = crate::test_env::env_lock();
+    for change in ["session", "account", "key", "cancel", "session-and-refusal"] {
+        let fixture = Fixture::new();
+        let prepared = prepare("owned-robot", &Operation::Shell, false).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let changed_running = Arc::clone(&running);
+        let auth_path = fixture.home.path().join("auth.json");
+        let key_path = fixture.home.path().join("identity/device.key");
+        let mut changed_state = fixture.state.clone();
+        let original_token = fixture.state.session_token.clone();
+        let app = Arc::clone(&fixture.app);
+        let gate = AccessGate::start(
+            &fixture._server.url,
+            format!(
+                "/v1/robots/{}/access",
+                URL_SAFE_NO_PAD.encode(fixture.robot_id)
+            ),
+            move || match change {
+                "cancel" => changed_running.store(false, Ordering::SeqCst),
+                "key" => std::fs::write(key_path, [0x74; 32]).unwrap(),
+                "account" => {
+                    changed_state.account_id = URL_SAFE_NO_PAD.encode([0x75; 32]);
+                    auth::write_to(&auth_path, &changed_state).unwrap();
+                }
+                _ => {
+                    changed_state.session_token = "replacement-session".into();
+                    auth::write_to(&auth_path, &changed_state).unwrap();
+                    if change == "session-and-refusal" {
+                        app.db
+                            .revoke_session_by_token_hash(&cerulion_accountd::hash_token(
+                                &original_token,
+                            ))
+                            .unwrap();
+                    }
+                }
+            },
+        );
+        let _service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", Some(OsStr::new(&gate.url)));
+        let result = spawn_bounded_with_running(prepared, running);
+        assert_eq!(
+            gate.finish(),
+            Some(if change == "session-and-refusal" {
+                401
+            } else {
+                200
+            })
+        );
+        if change == "cancel" {
+            assert_eq!(result.unwrap(), 130);
+        } else {
+            assert!(result.is_err(), "accepted changed {change}");
+        }
+        fixture.assert_no_pairing_or_helper();
+    }
+}
+
+#[test]
+fn no_epoch_and_refused_refresh_still_spawn_with_the_canonical_cache_key() {
+    let _env_lock = crate::test_env::env_lock();
+    for refuse in [false, true] {
+        let fixture = Fixture::new();
+        let prepared = prepare(
+            "owned-robot",
+            &Operation::Exec(vec!["printf".into(), "hello".into()]),
+            false,
+        )
+        .unwrap();
+        let cache = crate::account_cmd::resolve_epoch_cache_path(&fixture.route()).unwrap();
+        let previous = if refuse {
+            fixture
+                .app
+                .db
+                .add_revocation(
+                    &fixture.robot_id,
+                    cerulion_accountd::RevocationTarget::Device([0x76; 32]),
+                    auth::now_unix_ns(),
+                )
+                .unwrap();
+            assert_eq!(
+                crate::account_cmd::sync_robot_epoch_to_cache(
+                    &fixture.state.session_token,
+                    &URL_SAFE_NO_PAD.encode(fixture.robot_id),
+                    &fixture.route()
+                )
+                .unwrap(),
+                Some(1)
+            );
+            Some(std::fs::read(&cache).unwrap())
+        } else {
+            None
+        };
+        let app = Arc::clone(&fixture.app);
+        let token = fixture.state.session_token.clone();
+        let gate = AccessGate::start(
+            &fixture._server.url,
+            format!(
+                "/v1/robots/{}/access",
+                URL_SAFE_NO_PAD.encode(fixture.robot_id)
+            ),
+            move || {
+                if refuse {
+                    app.db
+                        .revoke_session_by_token_hash(&cerulion_accountd::hash_token(&token))
+                        .unwrap();
+                }
+            },
+        );
+        let _service = EnvGuard::set("CERULION_ACCOUNT_SERVICE", Some(OsStr::new(&gate.url)));
+        assert_eq!(spawn_bounded(prepared).unwrap(), 78);
+        assert_eq!(gate.finish(), Some(if refuse { 401 } else { 200 }));
+        let args = std::fs::read(&fixture.marker).unwrap();
+        let args = std::str::from_utf8(&args)
+            .unwrap()
+            .split_terminator('\0')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(value(&args, "--robot-name"), Some(fixture.route().as_str()));
+        match previous {
+            Some(bytes) => assert_eq!(std::fs::read(cache).unwrap(), bytes),
+            None => assert!(!cache.exists()),
+        }
+        std::fs::remove_file(&fixture.marker).unwrap();
+        fixture.assert_no_pairing_or_helper();
+    }
+}

@@ -575,6 +575,57 @@ mod tests {
         assert!(session_plan(paired(), &Operation::Policy { enabled: None }, false, &path).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn account_epoch_route_is_set_before_literal_command_flags() {
+        use cerulion_pairing::format::{PublicKey, RobotId};
+        let robot = account_robots::AccountRobot {
+            robot_id: RobotId(std::array::from_fn(|index| index as u8)),
+            hostname: "account-name".into(),
+            endpoint: account_robots::RobotEndpoint::Known(PublicKey([0x42; 32])),
+        };
+        let route = "account:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let command = vec![
+            "printf".to_owned(),
+            "--robot-name".into(),
+            "literal-route".into(),
+            String::new(),
+            "--owner-account".into(),
+        ];
+        for existing_pin in [false, true] {
+            let mut connection = paired();
+            if !existing_pin {
+                connection.argv.drain(3..5);
+            }
+            set_account_epoch_route(&mut connection, &robot).unwrap();
+            let plan = session_plan(
+                connection,
+                &Operation::Exec(command.clone()),
+                false,
+                Path::new("w"),
+            )
+            .unwrap();
+            let separator = plan.argv.iter().position(|arg| arg == "--").unwrap();
+            let options = &plan.argv[..separator];
+            assert_eq!(
+                options
+                    .iter()
+                    .filter(|arg| arg.as_str() == "--robot-name")
+                    .count(),
+                1
+            );
+            let index = options
+                .iter()
+                .position(|arg| arg == "--robot-name")
+                .unwrap();
+            assert_eq!(options[index + 1], route);
+            assert_eq!(&plan.argv[separator + 1..], command);
+        }
+        let mut malformed = paired();
+        malformed.argv = vec!["connect".into(), "--robot-name".into()];
+        assert!(set_account_epoch_route(&mut malformed, &robot).is_err());
+    }
+
     #[test]
     fn policy_change_and_inspection_use_the_owner_switch() {
         for (enabled, expected) in [(false, "off"), (true, "on")] {
