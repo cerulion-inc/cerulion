@@ -30,17 +30,21 @@ saves only when the cache policy opts that namespace in.
 ## Period park lanes
 
 `Period park (x86_64 Linux)` and `Period park (aarch64 Linux)` build, lint and
-test `rmw_cerulion` with `--features period-park`, one on `ubuntu-latest` and
-one on the hosted `ubuntu-24.04-arm` runner, on every run of the CI workflow:
-pull requests, merge-queue runs, pushes to `main` and manual runs. Each leg runs
-clippy with `-D warnings` over all targets with the feature on and off, then
-over the bare lib with and without it (the only build of the lib without
-`test-seams`), then the crate's tests serially with the feature on. The aarch64
-leg then runs the tests again with default features, since no other job tests
-the default build on aarch64 Linux. The steps run when the path classifier
+test the period-learned park of `rmw_cerulion` (cfg `cerulion_period_park`),
+one on `ubuntu-latest` and one on the hosted `ubuntu-24.04-arm` runner, on every
+run of the CI workflow: pull requests, merge-queue runs, pushes to `main` and
+manual runs. Every Linux aarch64 build carries the park; on x86_64 only
+`--features period-park` does. Each leg runs clippy with `-D warnings` over all
+targets with the feature on and off, then over the bare lib with and without it
+(the only build of the lib without `test-seams`), then the crate's tests
+serially with the feature on. On the aarch64 leg the feature on and off compile
+the same park, so there those steps differ only in the cfg rule's own test. The aarch64 leg then runs the tests again with
+default features and `CERULION_RMW_PERIOD_PARK=0`, which turns the learned park
+off at run time, since no other job tests the one-rung idle park that the
+switch restores on aarch64 Linux. The steps run when the path classifier
 selects `rmw_cerulion`. This is the only job that runs clippy on Linux aarch64,
 where `c_char` is `u8` rather than `i8`, so an `as` cast between `c_char` and
-`u8` lints there and nowhere else. It is not a required context (see
+`u8` lints there and nowhere else. Both legs are required contexts (see
 `tools/ci/required_contexts.txt`). Its cache namespaces are `period-park-X64`
 and `period-park-ARM64`; the default save policy is restore-only until they are
 opted in.

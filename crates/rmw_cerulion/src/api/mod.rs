@@ -48,7 +48,7 @@ mod guard_wait;
 mod init;
 mod misc;
 mod node;
-#[cfg(any(test, feature = "period-park"))]
+#[cfg(any(test, cerulion_period_park))]
 mod period_learner;
 mod pubsub;
 mod services;
