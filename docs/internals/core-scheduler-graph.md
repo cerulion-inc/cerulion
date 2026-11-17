@@ -348,9 +348,10 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   the 1 ms poll floor, and nothing pending waits the 250 ms liveliness cap. A 1 ms floor
   on a deadline less than 1 ms ahead would start each late fire's next wait late, so a
   1 kHz node would drift until it skipped a slot and double-fired. Pins:
-  `live_exact_deadline_iox2_test` (every frame received or counted as evicted on every
-  host, every frame received on Linux; the grid and wait arms on Linux, since the
-  degraded macOS nap can wake later than a busy tick's slack), the
+  `live_exact_deadline_iox2_test` (the wait sizing on a controlled clock; every frame
+  received or counted as evicted on every host, every frame received on Linux),
+  `exact_deadline_grid_latency_test` (the grid and the wait after a slow step against
+  wall time, release only, on Linux, in the `test-latency` job), the
   held-producer poll rate in
   `credit_block_iox2_test`, and the `live_wait_tests` oracle.
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
