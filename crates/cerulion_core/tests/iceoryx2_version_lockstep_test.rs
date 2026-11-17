@@ -258,8 +258,8 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
 /// Scoped to manifests that patch and lockfiles that resolve from git: the
 /// bench workspaces and the examples other than `aspire_arm` and `basic_timer`
 /// resolve the family from crates.io today and are governed by the version arm,
-/// not this one. If the root carries no iceoryx2 patch (the fix landed
-/// upstream), no other manifest may carry one.
+/// not this one. If the root carries no iceoryx2 patch (every change the fork
+/// adds landed upstream), no other manifest may carry one.
 #[test]
 fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -298,10 +298,10 @@ fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
         return;
     };
     // A walk that stops short of the deepest patched manifests passes every
-    // assert below without reading them: the root, `crates/cerulion_py`, the
-    // Android runtime, `examples/aspire_arm`, `examples/basic_timer` and the
-    // nine Python node fixtures under `crates/cerulion_py/fixtures/pynodes`
-    // each carry a copy of the root block.
+    // assert below without reading them. Fourteen manifests patch: the root
+    // block and its copies in `crates/cerulion_py`, the Android runtime,
+    // `examples/aspire_arm`, `examples/basic_timer` and the nine Python node
+    // fixtures under `crates/cerulion_py/fixtures/pynodes`.
     assert!(
         patched.len() >= 14,
         "the manifest walk found only {} manifests that patch iceoryx2, so a stale copy \
@@ -453,17 +453,17 @@ fn iceoryx2_sources(text: &str) -> BTreeSet<(String, String)> {
     sources
 }
 
-/// Fixture workspaces that CI builds from their manifest alone, with no
-/// committed lockfile (`.gitignore` keeps every `Cargo.lock` out but the ones it
-/// names). A build of one resolves the rev its manifest names, which the
-/// equality arm checks, and a lockfile a local build left there is not part of
-/// the tree, so the lockfile pairing skips them.
+/// Fixture workspaces that CI builds from their manifest alone: no `Cargo.lock`
+/// is committed under these roots, and the root `.gitignore` ignores one a local
+/// build leaves there. A build of one resolves the rev its manifest names, which
+/// the equality arm checks, so the lockfile pairing skips them.
 const UNLOCKED_FIXTURE_ROOTS: &[&str] = &["crates/cerulion_py/fixtures/pynodes/"];
 
 /// How deep the manifest walk descends below the directory it starts from: the
 /// deepest committed manifest that patches iceoryx2 sits seven directories
 /// below the repository root
-/// (`crates/cerulion_py/fixtures/pynodes/shared/nodes/<name>/`).
+/// (`crates/cerulion_py/fixtures/pynodes/shared/nodes/<name>/`), and the walk
+/// reads one level deeper than that.
 const MANIFEST_WALK_DEPTH: usize = 8;
 
 /// Every `Cargo.toml` under `dir`, nested members included, skipping build
