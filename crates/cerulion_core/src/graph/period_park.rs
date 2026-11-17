@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 /// The period-park engages on x86_64 only, where its arrival prediction is
 /// measured to keep the round trip (Linux with WAITPKG). On aarch64 the
 /// monitor-wait park is `WFE`; there, on a Jetson Orin NX, no data arrival was
-/// ever predicted (the Period side's timer wakes landed late, so arrivals never
-/// looked regular), and the switch stays off with one warning.
+/// ever predicted (the Period side's timer wakes landed late and the arrivals
+/// never looked regular), and the switch stays off with one warning.
 pub(crate) const ENGAGES_ON_THIS_TARGET: bool = cfg!(target_arch = "x86_64");
 
 /// Set once this process has said the switch is on but the target does not
