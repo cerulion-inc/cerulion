@@ -2316,8 +2316,8 @@ impl Scheduler {
             // A node that is DUE but THROTTLE-DEFERRED
             // cannot run until its rate cap expires, so its real deadline is
             // the LATER of the two. Without this the arms above report
-            // `Some(0)` for the whole throttle window — the node is due by
-            // every signal the scheduler can see — and the loop polls at its
+            // `Some(0)` for the whole throttle window (the node is due by
+            // every signal the scheduler can see), and the loop polls at its
             // 1 ms floor, deciding to defer again each time.
             //
             // `max`, not "replace": the throttle bounds when the node MAY

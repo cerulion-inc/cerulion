@@ -2964,7 +2964,8 @@ pub(crate) fn live_wait_ns(
             .max(LIVE_DEADLINE_FLOOR_NS)
     });
     // The boundary caps the poll too. Beside a deadline ahead that never
-    // matters: the exact half is already no later than the boundary.
+    // changes the wait: a boundary below the poll caps the exact half as well,
+    // whose 10 µs floor sits below the poll's 1 ms floor.
     let polled = next.poll_ns.map(|poll| {
         quantum_boundary_ns
             .map_or(poll, |boundary| poll.min(boundary))
