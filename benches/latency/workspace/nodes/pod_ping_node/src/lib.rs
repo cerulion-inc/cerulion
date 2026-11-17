@@ -79,6 +79,10 @@ pub struct PodPingNode {
     ticked: bool,
 }
 
+/// A sentinel no environment value can equal (NUL is not permitted in an env
+/// string), so "absent" and "present but empty" are told apart.
+const PAYLOAD_SIZE_UNSET: &str = "\u{0}unset";
+
 /// The sweep-point size, read so that a PRESENT but unparseable value is a
 /// refusal rather than a silent 64.
 ///
@@ -89,12 +93,8 @@ pub struct PodPingNode {
 /// guard exists to make exactly that impossible, so it must not have a
 /// door through its own input. An ABSENT var still means 64 (the pinned
 /// sweep's first size, and what the build script bakes unset).
-fn payload_size_from_env(node: &str, ctx: &NodeContext) -> Result<usize, NodeError> {
-    // A sentinel no environment value can equal (NUL is not permitted in
-    // an env string), so "absent" and "present but empty" are told apart.
-    const UNSET: &str = "\u{0}unset";
-    let raw = ctx.env_str("CER_BENCH_PAYLOAD_SIZE", UNSET);
-    if raw == UNSET {
+fn payload_size_from_env(node: &str, raw: &str) -> Result<usize, NodeError> {
+    if raw == PAYLOAD_SIZE_UNSET {
         return Ok(64);
     }
     raw.parse::<usize>().map_err(|_| NodeError::InvalidInput {
@@ -110,7 +110,10 @@ fn payload_size_from_env(node: &str, ctx: &NodeContext) -> Result<usize, NodeErr
 #[cerulion_node_impl]
 impl PodPingNode {
     fn init(&mut self, ctx: &mut NodeContext) -> Result<(), NodeError> {
-        self.payload_size = payload_size_from_env("pod_ping_node", ctx)?;
+        self.payload_size = payload_size_from_env(
+            "pod_ping_node",
+            &ctx.env_str("CER_BENCH_PAYLOAD_SIZE", PAYLOAD_SIZE_UNSET),
+        )?;
         // Baked-size mislabel guard (see the module header): the fixed
         // array length is a compile-time property, so the ONLY valid
         // run is one where the baked wire size equals the size label.

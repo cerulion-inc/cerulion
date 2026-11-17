@@ -38,6 +38,7 @@ pub struct HostedRun {
 /// withdraw its replacement.
 #[derive(Debug)]
 struct Slot {
+    remote_visible: bool,
     generation: u64,
     live: Arc<AtomicBool>,
     /// The entry minted again through [`RunEntry::new`], or the reason it could
@@ -129,6 +130,7 @@ impl HostedRuns {
     /// the whole reply when one entry fails those checks.
     pub fn host(&self, run_id: u128, run: HostedRun) -> HostedRunGuard {
         let HostedRun { entry, live } = run;
+        let remote_visible = super::run_artifacts::remote_visible(&entry);
         let RunEntry {
             run_id: entry_run_id,
             graph_name,
@@ -173,6 +175,7 @@ impl HostedRuns {
         slots.runs.insert(
             run_id,
             Slot {
+                remote_visible,
                 generation,
                 live,
                 served,
@@ -195,6 +198,9 @@ impl HostedRuns {
         let slots = self.lock();
         let mut served = HostedServe::default();
         for slot in slots.runs.values() {
+            if !slot.remote_visible {
+                continue;
+            }
             match &slot.served {
                 Ok(entry) => {
                     let mut entry = entry.clone();
@@ -321,6 +327,29 @@ mod tests {
     #[test]
     fn an_empty_slot_serves_nothing() {
         assert_eq!(HostedRuns::default().served(), HostedServe::default());
+    }
+
+    #[test]
+    fn local_only_hosted_runs_are_hidden_even_when_an_artifact_is_invalid() {
+        let runs = HostedRuns::default();
+        let mut private = entry(RUN_A, "private", 1);
+        private.run_json = "{\"network\":\"off\"}".into();
+        private.graph_yaml.clear();
+        let _private = runs.host(
+            RUN_A,
+            HostedRun {
+                entry: private,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let (public, _) = run(RUN_B, "public", true);
+        let _public = runs.host(RUN_B, public);
+        for _ in 0..2 {
+            let reply = runs.served();
+            assert!(reply.undescribable.is_empty());
+            assert_eq!(reply.entries.len(), 1);
+            assert_eq!(reply.entries[0].graph_name, "public");
+        }
     }
 
     #[test]

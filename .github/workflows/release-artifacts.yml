@@ -31,8 +31,9 @@ env:
   IOX2_LOG_LEVEL: error
   # The smoke job runs an installed `cerulion` directly, not through cargo, so
   # it does not pick up the workspace cargo configuration. The login gate is on
-  # in every build; this is how this repository's own runs pass it without an
-  # account.
+  # in every build; this switches off its command-wide check so this
+  # repository's own runs pass it without an account. Serving the network is a
+  # separate rule this does not cover, so the smoke's `graph run` stays local.
   CERULION_LOGIN_GATE: "off"
   # The release under test: the pushed tag, or the tag a smoke-only dispatch
   # names. Job-level `if:` cannot read `env`, so those read `inputs.smoke_tag`.
@@ -130,7 +131,9 @@ jobs:
     # rmw build's wall time and nothing else.
     needs: rmw
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 45
+    # The x86_64-apple-darwin leg runs past 45 minutes on macos-15-intel: its
+    # release build, cargo-about install and license inventory.
+    timeout-minutes: 90
     env:
       # The compiler of every leg: the runner's toolchain on macOS and the
       # toolchain the Linux build container installs.
@@ -151,7 +154,7 @@ jobs:
           - target: x86_64-apple-darwin
             runs_on: macos-15-intel
           - target: aarch64-apple-darwin
-            runs_on: macos-14
+            runs_on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -197,8 +200,7 @@ jobs:
       # `container:`), so every other step of the matrix, the macOS legs
       # included, runs on the runner as before. The container is native to
       # the runner's architecture. The script installs RELEASE_TOOLCHAIN and
-      # writes target/<TARGET>/release/, with the `rustc -vV` of the compiler
-      # that built them in rustc-version.txt, where the steps below read it.
+      # writes target/<TARGET>/release/, where the steps below read it.
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
@@ -224,7 +226,6 @@ jobs:
               ;;
             *)
               cargo build --release --locked "${packages[@]}" --target "$TARGET"
-              rustc -vV > "target/$TARGET/release/rustc-version.txt"
               ;;
           esac
 
@@ -301,7 +302,6 @@ jobs:
           cp "target/$TARGET/release/cerulion-connectd" "$stage/cerulion-connectd"
           cp "target/$TARGET/release/cerulion-remoted" "$stage/cerulion-remoted"
           cp tools/scripts/install_rust.sh "$stage/install_rust.sh"
-          cp "target/$TARGET/release/rustc-version.txt" "$stage/rustc-version.txt"
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
@@ -620,7 +620,7 @@ jobs:
           - target: x86_64-apple-darwin
             runs_on: macos-15-intel
           - target: aarch64-apple-darwin
-            runs_on: macos-14
+            runs_on: macos-15
     steps:
       - name: Checkout release source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -788,8 +788,10 @@ jobs:
           cerulion node build sensor
           cerulion graph create perception
           cerulion node stage sensor -g perception
+          # `--network off` keeps the run on this runner: a run that serves the
+          # network needs a saved login, and this runner has none.
           set +e
-          "$CERULION_TIMEOUT_COMMAND" 60s cerulion graph run perception
+          "$CERULION_TIMEOUT_COMMAND" 60s cerulion graph run perception --network off
           status=$?
           set -e
           if [ "$status" -ne 124 ]; then

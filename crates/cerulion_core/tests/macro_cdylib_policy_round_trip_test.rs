@@ -26,6 +26,111 @@ use cerulion_core::graph::node::{DylibNodeEntry, MacroPolicy, NodeEntry};
 use cerulion_core::message::ShmMessage;
 use native_ros2_messages::geometry_msgs::Vector3;
 
+const HELPER_CHILD: &str = "CER_STABLE_HELPER_CHILD";
+const HELPER_EVENTS: &str = "CER_STABLE_HELPER_EVENTS";
+const HELPER_CONTEXT_STOP: &str = "CER_STABLE_HELPER_CONTEXT_STOP";
+
+// The child owns its SHM singleton; parent metadata tests remain parallel-safe.
+#[test]
+#[ignore]
+fn helper_shutdown_child() {
+    if std::env::var(HELPER_CHILD).as_deref() != Ok("1") {
+        return;
+    }
+    let path = cerulion_core::testing::find_fixture_cdylib_same_profile(
+        "test_node_nondeterministic_cdylib",
+    );
+    let entry = DylibNodeEntry::load(&path).expect("stable helper fixture");
+    let mut graph = cerulion_core::graph::parse_graph(
+        "prefix: shutdownhelper\nnodes:\n  - id: helper\n    type: helper\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n        max_slice_len: 64\n",
+    )
+    .expect("helper graph");
+    graph.prefix = format!("shutdownhelper{}", std::process::id());
+    let mut entries: indexmap::IndexMap<String, Box<dyn NodeEntry>> = indexmap::IndexMap::new();
+    entries.insert("helper".into(), Box::new(entry));
+    let mut runtime = cerulion_core::graph::GraphRuntime::build_for_test(
+        graph,
+        entries,
+        std::sync::Arc::new(cerulion_core::clock::VirtualClock::new()),
+        8,
+    )
+    .expect("live helper context");
+    runtime.step(std::time::Duration::from_millis(50));
+    let events = std::path::PathBuf::from(std::env::var(HELPER_EVENTS).expect("event path"));
+    let context_stop = std::env::var(HELPER_CONTEXT_STOP).as_deref() == Ok("1");
+    loop {
+        let observed = std::fs::read(&events).unwrap_or_default();
+        if (context_stop && observed == [1, 2]) || (!context_stop && observed == [1]) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if context_stop {
+        assert!(
+            runtime.shutdown_requested(),
+            "context request reaches host too"
+        );
+    } else {
+        runtime.shutdown_signal().request();
+    }
+    runtime.shutdown_all_nodes();
+    assert_eq!(
+        std::fs::read(&events).expect("joined helper events"),
+        [1, 2, 3]
+    );
+    std::fs::write(events, [1, 2, 3, 4]).expect("graph shutdown returned");
+}
+
+#[test]
+fn stable_helper_shutdown_joins_after_host_and_context_requests() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const BOUND: Duration = Duration::from_secs(30);
+    for context_stop in [false, true] {
+        for _ in 0..2 {
+            let directory = tempfile::tempdir().expect("isolated helper events");
+            let events = directory.path().join("events.bin");
+            let mut child = Command::new(std::env::current_exe().expect("child executable"))
+                .args([
+                    "--exact",
+                    "helper_shutdown_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(HELPER_CHILD, "1")
+                .env(HELPER_EVENTS, &events)
+                .env(HELPER_CONTEXT_STOP, if context_stop { "1" } else { "0" })
+                .env("RUST_LOG", "off")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("helper child");
+            let start = Instant::now();
+            while child.try_wait().expect("child status").is_none() {
+                if start.elapsed() >= BOUND {
+                    child.kill().expect("kill only this spawned child");
+                    let output = child.wait_with_output().expect("reap helper child");
+                    panic!(
+                        "helper shutdown exceeded bound: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let output = child.wait_with_output().expect("helper child output");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(events).expect("helper exit observed"),
+                [1, 2, 3, 4]
+            );
+        }
+    }
+}
+
 /// Locate a cdylib produced by the workspace build. The fixture crates
 /// are workspace members, so `cargo test` triggers their build
 /// transitively.
@@ -227,5 +332,21 @@ fn cdylib_input_meta_carries_schema_hash_matching_in_process_twin() {
         <Vector3 as ShmMessage>::SCHEMA_HASH,
         "the cdylib input schema_hash must equal the in-process Vector3 \
          SCHEMA_HASH const (macro-emission ↔ FFI ↔ host-parse parity)"
+    );
+}
+
+/// A `#[cerulion_node]` cdylib's info JSON carries
+/// `"publisher_for_every_output":true`, and the host parse keeps it. Without
+/// the key the host reads `false`, so the graph build does not refuse an
+/// output the node declares and its graph does not list, and the node then
+/// fails every tick. This test fails if `gen_cdylib` drops the key.
+#[test]
+fn cdylib_info_marks_a_macro_node_as_needing_a_publisher_for_every_output() {
+    let path = find_cdylib("test_node_macro_cdylib");
+    let node = DylibNodeEntry::load(&path).expect("load macro cdylib");
+    let info = node.info().expect("info should parse");
+    assert!(
+        info.publisher_for_every_output(),
+        "the macro cdylib info JSON must carry \"publisher_for_every_output\":true"
     );
 }

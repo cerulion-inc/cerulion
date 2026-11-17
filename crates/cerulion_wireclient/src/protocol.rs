@@ -33,8 +33,12 @@ pub struct StreamPreamble {
 /// A control-stream request (desk → robot), length-prefixed JSON. The `verb` tag
 /// dispatches; each verb is answered with a [`WireResponse`].
 ///
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Mirror of `cerulion_remoted::WireRequest` (the `#[serde(tag = "verb")]`
-/// snake_case shape must stay byte-identical — pinned by the parity test).
+/// snake_case shape stays byte-identical, pinned by the parity test).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum WireRequest {
@@ -44,6 +48,9 @@ pub enum WireRequest {
     Demand {
         /// The canonical absolute topic to stream.
         topic: String,
+        /// Canonical graph import; absent/false preserves observer queue semantics.
+        #[serde(default, skip_serializing_if = "is_false")]
+        graph_ingress: bool,
     },
     /// Drop the tap for `topic` (its uni stream ends).
     Undemand {
@@ -116,13 +123,19 @@ pub enum WireResponse {
     },
 }
 
-/// The `status` reply payload: one row per demanded topic.
+/// The `status` reply payload: one row per demanded topic, and the robot
+/// daemon's count of dropped log lines.
 ///
 /// Mirror of `cerulion_remoted::StatusReply`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReply {
     /// Per-topic WAN counter rows, sorted by topic.
     pub topics: Vec<TopicStatus>,
+    /// The log lines the robot's `cerulion-remoted` dropped since it started:
+    /// lines its log queue refused or its writes to stderr lost. `None` from a
+    /// robot or host that does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_lines_dropped: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
@@ -131,6 +144,9 @@ pub struct StatusReply {
 /// test fails if the robot's shape drifts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicStatus {
+    /// New frames refused while the producer's reliable queue was full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wan_refused: Option<u64>,
     /// The canonical absolute topic name.
     pub topic: String,
     /// Frames written to QUIC by the robot.
@@ -284,6 +300,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&WireRequest::Demand {
+                graph_ingress: false,
                 topic: "/imu".to_string()
             })
             .unwrap(),
@@ -343,12 +360,35 @@ mod tests {
         );
     }
 
+    /// A status reply names `log_lines_dropped` only when it has a count.
+    /// Hand oracle.
+    #[test]
+    fn a_status_reply_names_its_log_count_only_when_it_has_one() {
+        assert_eq!(
+            serde_json::to_string(&WireResponse::Status(StatusReply {
+                topics: vec![],
+                log_lines_dropped: None,
+            }))
+            .unwrap(),
+            r#"{"reply":"status","topics":[]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WireResponse::Status(StatusReply {
+                topics: vec![],
+                log_lines_dropped: Some(7),
+            }))
+            .unwrap(),
+            r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
+        );
+    }
+
     /// Every request variant round-trips through JSON.
     #[test]
     fn wire_request_round_trips() {
         for req in [
             WireRequest::Catalog,
             WireRequest::Demand {
+                graph_ingress: false,
                 topic: "/a".to_string(),
             },
             WireRequest::Undemand {

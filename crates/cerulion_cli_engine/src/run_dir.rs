@@ -113,8 +113,12 @@ pub const RUN_GRAPH_FILE: &str = "graph.yaml";
 /// The env snapshot, byte-identical to the bag's `env.json` attachment.
 pub const RUN_ENV_FILE: &str = "env.json";
 
-/// The recording host's identity, byte-identical to the bag's
-/// `__cerulion/recorder.json` attachment.
+/// The recording host's identity and the run's replay contract keys,
+/// byte-identical to the bag's `__cerulion/recorder.json` attachment.
+///
+/// Written by [`write_run_recorder`] once the run's nodes load, not with the
+/// rest of the description: it carries each node's driver flag, which only the
+/// loaded node metadata can say.
 pub const RUN_RECORDER_FILE: &str = "recorder.json";
 
 /// How this run's `process_groups:` came to be — the partition
@@ -181,9 +185,10 @@ impl NetworkPostureLabel {
 
 /// The inputs [`start_run_descriptor`] needs.
 ///
-/// The three artifact bodies arrive ALREADY RENDERED, by the callers' own
-/// renderers (`render_effective_graph_yaml` / `render_env_json` /
-/// `render_recorder_json`). That is the anti-drift property, stated precisely:
+/// The two artifact bodies arrive ALREADY RENDERED, by the callers' own
+/// renderers (`render_effective_graph_yaml` / `render_env_json`; the third,
+/// `render_recorder_json`, feeds [`write_run_recorder`] once the nodes load).
+/// That is the anti-drift property, stated precisely:
 /// the run directory and a `--record` bag carry the same bytes because they are
 /// produced by the same pure function, not because two writers are believed to
 /// agree.
@@ -258,8 +263,6 @@ pub struct RunDescriptorSpec<'a> {
     pub graph_yaml: String,
     /// The env snapshot, serialized.
     pub env_json: Vec<u8>,
-    /// The recording host descriptor, serialized.
-    pub recorder_json: Vec<u8>,
 }
 
 /// A live run's on-disk description PLUS its registry writer.
@@ -1916,7 +1919,7 @@ fn write_artifact(dir: &Path, name: &str, bytes: &[u8]) -> CliResult<()> {
 }
 
 /// Test-only fault seam: when armed, the LAST artifact write fails, leaving the
-/// directory and its first three files behind — the exact partial state
+/// directory and its first two files behind: the exact partial state
 /// [`start_run_descriptor`]'s cleanup exists for, and the one no ordinary input
 /// can produce (every artifact is rendered in memory before any write).
 #[cfg(test)]
@@ -1936,12 +1939,11 @@ fn fault_inject_manifest_write() -> impl Drop {
     Guard
 }
 
-/// Write the four artifacts. Split out so [`start_run_descriptor`] can wrap
+/// Write the three artifacts. Split out so [`start_run_descriptor`] can wrap
 /// every one of their failures in ONE cleanup arm.
 fn write_run_artifacts(dir: &Path, spec: &RunDescriptorSpec<'_>, run_id: u128) -> CliResult<()> {
     write_artifact(dir, RUN_GRAPH_FILE, spec.graph_yaml.as_bytes())?;
     write_artifact(dir, RUN_ENV_FILE, &spec.env_json)?;
-    write_artifact(dir, RUN_RECORDER_FILE, &spec.recorder_json)?;
     #[cfg(test)]
     if FAULT_MANIFEST_WRITE.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(CliError::Validation(format!(
@@ -1954,6 +1956,42 @@ fn write_run_artifacts(dir: &Path, spec: &RunDescriptorSpec<'_>, run_id: u128) -
         RUN_MANIFEST_FILE,
         &render_run_manifest(spec, run_id, dir),
     )
+}
+
+/// Write this run's `recorder.json` ([`RUN_RECORDER_FILE`]) into `run_dir`,
+/// ATOMICALLY: a sibling file renamed over the name, so a recorder reading the
+/// directory sees the whole document or none, never a partial one.
+///
+/// A separate write from [`start_run_descriptor`]'s, because the document
+/// carries each node's driver flag (`node_external`), which only the LOADED
+/// node metadata can say, and the description is written before any node
+/// loads. The caller writes it once the nodes load and BEFORE it declares any
+/// trace ring ([`declare_run_rings`]): a recorder reads `run.json` first
+/// (`bag_cmd::read_run_artifacts`), so one that finds a ring there finds this
+/// file unless this write failed.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error, naming the file. Callers treat it as a
+/// DEGRADE: the run executes normally, and a bag or capture a later recorder
+/// takes of it carries no `recorder.json` and, where it carries the trace, no
+/// graph either (`bag_cmd::RunArtifacts::graph_yaml_to_embed`), so it can be
+/// viewed and not re-executed.
+pub fn write_run_recorder(run_dir: &Path, bytes: &[u8]) -> CliResult<()> {
+    let tmp_name = format!("{RUN_RECORDER_FILE}.tmp");
+    let tmp_path = run_dir.join(&tmp_name);
+    let path = run_dir.join(RUN_RECORDER_FILE);
+    if let Err(e) = write_artifact(run_dir, &tmp_name, bytes) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(CliError::Validation(format!(
+            "cannot write `{}`: {e}",
+            path.display()
+        )));
+    }
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        CliError::Validation(format!("cannot write `{}`: {e}", path.display()))
+    })
 }
 
 /// Best-effort removal of a run directory whose write failed part way.
@@ -2053,6 +2091,10 @@ pub fn start_run_descriptor(spec: RunDescriptorSpec<'_>) -> CliResult<RunDescrip
     }
 
     let handle = match RunHandle::publish(RunRecord {
+        remote_visible: !matches!(
+            spec.network,
+            NetworkPostureLabel::Off | NetworkPostureLabel::Inert
+        ),
         run_id,
         supervisor_pid: std::process::id(),
         run_started_at_ns: spec.run_started_at_ns,
@@ -2196,13 +2238,13 @@ mod tests {
             ),
             graph_yaml: graph_yaml.to_string(),
             env_json: br#"{"PATH":"/usr/bin"}"#.to_vec(),
-            recorder_json: br#"{"arch":"aarch64"}"#.to_vec(),
         }
     }
 
-    /// THE run-directory oracle: the four artifacts land, each byte-identical
+    /// THE run-directory oracle: the three artifacts land, each byte-identical
     /// to what the caller rendered, and `run.json` reads back as a hand-written
-    /// object.
+    /// object. `recorder.json` is NOT among them: it lands later, byte for byte,
+    /// through [`write_run_recorder`].
     ///
     /// The manifest is a FORMAT surface a future `bag record --run` parses, so
     /// it is asserted field by field rather than by round-tripping it through
@@ -2236,9 +2278,20 @@ mod tests {
             std::fs::read(dir.join(RUN_ENV_FILE)).expect("env.json"),
             br#"{"PATH":"/usr/bin"}"#.to_vec()
         );
+        assert!(
+            !dir.join(RUN_RECORDER_FILE).exists(),
+            "the description is written before any node loads, so it carries no \
+             recorder.json: that file holds each node's driver flag"
+        );
+        write_run_recorder(&dir, br#"{"arch":"aarch64","node_external":{"cam":true}}"#)
+            .expect("recorder.json");
         assert_eq!(
             std::fs::read(dir.join(RUN_RECORDER_FILE)).expect("recorder.json"),
-            br#"{"arch":"aarch64"}"#.to_vec()
+            br#"{"arch":"aarch64","node_external":{"cam":true}}"#.to_vec()
+        );
+        assert!(
+            !dir.join(format!("{RUN_RECORDER_FILE}.tmp")).exists(),
+            "the atomic write leaves no sibling behind"
         );
 
         let manifest: serde_json::Value =
@@ -2362,7 +2415,7 @@ mod tests {
     /// every other arm green — the sibling arms all drive
     /// `start_run_descriptor` and would not notice. This one asserts the whole
     /// contract through the entry `graph_run` actually calls: a descriptor is
-    /// built, the directory carries its four artifacts, and the run is
+    /// built, the directory carries its three artifacts, and the run is
     /// ANNOUNCED.
     #[test]
     fn the_run_path_entry_point_writes_and_announces_with_no_recording_in_sight() {
@@ -2373,12 +2426,7 @@ mod tests {
         let descriptor = begin_run_descriptor(spec("name: plain\n", false))
             .expect("a plain run must still be described");
         let dir = descriptor.path().to_path_buf();
-        for name in [
-            RUN_MANIFEST_FILE,
-            RUN_GRAPH_FILE,
-            RUN_ENV_FILE,
-            RUN_RECORDER_FILE,
-        ] {
+        for name in [RUN_MANIFEST_FILE, RUN_GRAPH_FILE, RUN_ENV_FILE] {
             assert!(dir.join(name).exists(), "`{name}` must be written");
         }
         assert!(
@@ -2423,6 +2471,7 @@ mod tests {
 
         let descriptor = start_run_descriptor(spec("name: solo\n", false)).expect("run dir");
         let dir = descriptor.path();
+        write_run_recorder(dir, b"{}").expect("recorder.json");
 
         let dir_mode = std::fs::metadata(dir)
             .expect("stat dir")
@@ -2462,7 +2511,7 @@ mod tests {
     /// This arm covers the EARLIEST failure — a `runs/` root that cannot hold a
     /// directory at all, so `create_run_dir` itself fails and the property is
     /// that nothing was left behind on the way out. The LATER, genuinely
-    /// partial state (directory created, three artifacts written, the fourth
+    /// partial state (directory created, two artifacts written, the third
     /// failing) is the sibling arm
     /// `a_failure_after_the_directory_exists_still_removes_it`, which reaches
     /// it through the `fault_inject_manifest_write` seam.
@@ -2506,8 +2555,8 @@ mod tests {
     /// The arm the read-only-root case cannot reach: the directory IS
     /// created and a LATER artifact write fails.
     ///
-    /// Injected at the LAST artifact (`fault_inject_manifest_write`), so three
-    /// files land and the fourth fails — the run id is minted inside the call,
+    /// Injected at the LAST artifact (`fault_inject_manifest_write`), so two
+    /// files land and the third fails: the run id is minted inside the call,
     /// so the directory's name cannot be poisoned from outside, and every
     /// artifact is rendered in memory before any write, so no ordinary input
     /// reaches this state either.
@@ -2536,6 +2585,21 @@ mod tests {
             leftovers.is_empty(),
             "the partially-written run directory must be removed; found {leftovers:?}"
         );
+    }
+
+    /// A `recorder.json` that cannot be written is an error naming the file,
+    /// and leaves neither it nor its sibling behind: the directory is gone, as
+    /// a run that ended under the writer leaves it.
+    #[test]
+    fn a_recorder_write_into_a_missing_directory_names_the_file_and_leaves_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gone = tmp.path().join("ended-run");
+        let err = write_run_recorder(&gone, b"{}").expect_err("no directory to write into");
+        assert!(
+            format!("{err}").contains(RUN_RECORDER_FILE),
+            "the error must name the artifact that failed; got: {err}"
+        );
+        assert!(!gone.exists(), "nothing was created: {gone:?}");
     }
 
     /// A run with NO home to write to still RUNS: the error is returned to
@@ -2609,7 +2673,6 @@ mod tests {
             gating: GatingClock::Wall,
             graph_yaml: "nodes: {}\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         };
         let bytes = render_run_manifest(&spec, spec.run_id, tmp.path());
         std::fs::write(tmp.path().join(RUN_MANIFEST_FILE), &bytes).expect("seed");
@@ -2687,7 +2750,6 @@ mod tests {
             gating: GatingClock::Wall,
             graph_yaml: "name: percept\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         };
 
         let none: serde_json::Value =
@@ -2755,7 +2817,6 @@ mod tests {
             gating: GatingClock::Wall,
             graph_yaml: "name: percept\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         };
         std::fs::write(
             tmp.path().join(RUN_MANIFEST_FILE),
@@ -3058,7 +3119,6 @@ mod tests {
             gating: GatingClock::Wall,
             graph_yaml: "prefix: /p\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         };
         let manifest = render_run_manifest(&spec, 0xabc, tmp.path());
         std::fs::write(tmp.path().join(RUN_MANIFEST_FILE), &manifest).expect("seed");
@@ -3122,7 +3182,6 @@ mod tests {
             gating: GatingClock::Quantum,
             graph_yaml: "prefix: /p\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         };
         std::fs::write(
             tmp.path().join(RUN_MANIFEST_FILE),

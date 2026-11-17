@@ -1,8 +1,7 @@
 # cerulion_py - agent guide
 
 PyO3 wheel: raw zero-copy Python client over the Cerulion transport.
-Standalone cargo workspace (root `Cargo.toml` excludes it; it has its own
-`Cargo.lock` and target dir; cargo-deny uses `tools/release/deny.toml`).
+Standalone workspace: own lock/target; deny uses `tools/release/deny.toml`.
 **iceoryx2 must match the root workspace at 0.10.0 from the patched fork, mirrored in this
 manifest's `[patch.crates-io]`, and zenoh must stay at 1.8.0** in `Cargo.lock`: after manifest edits run
 `cargo update --workspace --offline`, never `cargo generate-lockfile`.
@@ -14,8 +13,8 @@ export RUSTUP_TOOLCHAIN=1.95.0          # everything in this workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo deny --config ../../tools/release/deny.toml check advisories licenses bans sources
-maturin develop --release               # in a venv with maturin
-cargo test -p cerulion_py_fixtures    # runs the unit tests shared via src/align.rs
+maturin develop --release               # in a venv
+cargo test -p cerulion_py_fixtures
 cargo build --release -p cerulion_py_fixtures
 cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_py_fixture \
   python -m pytest -p no:cacheprovider <abs>/crates/cerulion_py/tests -q
@@ -34,10 +33,9 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
 - Held frames hold borrowed slots (`max_borrowed_samples`, default 2); `release()`
   defers while views live. `BorrowLimitExceeded` is the symptom of hoarding.
 - Error mapping lives in `src/errors.rs`: every `TransportError` variant is enumerated; keep it exhaustive.
-- PyO3 buffer protocol (`__getbuffer__`/`__releasebuffer__`, `libc::poll`, `assume_init`) are the only
-  unsafe blocks; each carries a SAFETY comment. New unsafe needs maintainer approval (root `AGENTS.md`: Ask first).
+- Buffer protocol/poll/assume_init unsafe sites carry SAFETY arguments; new sites need approval.
 - Facade (`python/cerulion/_api.py`) owns Python ergonomics; `src/` owns transport semantics.
-  Non-contiguous or non-byte buffers are rejected as `TypeError` at the facade.
+  The facade rejects non-contiguous/non-byte buffers as `TypeError`.
 - Typed layer (`SchemaSet`, `Layout`, `Message`, `Frame.view()`): read-only NumPy views on receive,
   writable views on loans. `string[]` / `Type[]` are pre-framed BYTES only on publish/loan; loan views
   are block-scoped (a live export at `with`-exit discards the loan: `EncodeError`); a set mutation that
@@ -47,13 +45,15 @@ cd /tmp && CERULION_PY_FIXTURE=<abs>/crates/cerulion_py/target/release/cerulion_
   with its `helpers`), else the process default. Views are `_view()`-built `schemas.message_type(name)`
   instances; never construct `Message(...)` directly. Built-in `<pkg>.py`/`.pyi` and `__init__.pyi` are
   GENERATED (`_stubs.write_builtin_stubs`, pinned by `test_msgs.py`): regenerate after corpus/renderer edits.
-- `crates/cerulion_pynode` embeds ONE CPython per node process (GIL-serialized; no
-  Python threads, `fork`, or signal handlers) and exports the snapshot, trigger-drain
-  and Sync head-op ABI symbols a `#[cerulion_node]` cdylib does. `fixtures/pynodes/*`
-  are separate cdylib workspaces (own `[patch.crates-io]`): rebuild after any change.
-
-## Layout
+- Embedded nodes use ONE CPython per process (GIL serialized; no Python threads, fork or
+  signal handlers). Rebuild `fixtures/pynodes/*` separate cdylib workspaces after changes.
 
 `src/` (native module: session, publisher, subscriber, frame, typed, bag, errors), `python/cerulion/`
 (facade), `fixtures/` (Rust interop binary), `tests/` (pytest), `scripts/` (e2e). User doc:
 `../../docs/python.md` - its code blocks are executed by `tests/test_docs.py`.
+
+Stable export details and per-site safety: `../../docs/internals/node-abi.md`.
+Python objects stay local; raw leases/spill retain native preflight and publish order.
+Metadata retains code/context for process lifetime (CPython caches code/escaped views).
+No state/external capabilities; diagnostics preserve exact text plus host classification.
+Escaped views pin lifetime; deferred releases flush before Python; host owns maintenance.

@@ -142,14 +142,7 @@ pub unsafe extern "C" fn cerulion_free_error(ptr: *mut std::ffi::c_char) {
     let _ = std::ffi::CString::from_raw(ptr);
 }
 
-#[no_mangle]
-pub extern "C" fn cerulion_node_init(ctx_ptr: *mut u8) -> u64 {
-    // SAFETY: `ctx_ptr` came from `Box::into_raw(Box::new(NodeContext))` in the
-    // host's `DylibNodeEntry::init`; reclaim it so each init does not leak one
-    // context.
-    let ctx = unsafe { Box::from_raw(ctx_ptr as *mut cerulion_core::graph::node::NodeContext) };
-    drop(ctx);
-
+fn create_local() -> u64 {
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let mut guard = NODES.lock().expect("NODES");
     guard.get_or_insert_with(HashMap::new).insert(handle, 0);
@@ -169,6 +162,17 @@ pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
     // not a contrived shape; it is the common one.
     if std::env::var("STATE_TICK_MODE").as_deref() == Ok("fail_silent") {
         return 9;
+    }
+    match std::env::var("STATE_TICK_MODE").as_deref() {
+        Ok("fail_empty") => {
+            set_last_error(String::new());
+            return 9;
+        }
+        Ok("fail_long") => {
+            set_last_error(format!("full reason:{}:end", "x".repeat(1024 * 1024 + 17)));
+            return 9;
+        }
+        _ => {}
     }
     let mut guard = NODES.lock().expect("NODES");
     match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
@@ -364,3 +368,275 @@ pub unsafe extern "C" fn cerulion_node_restore_state(
         None => -2,
     }
 }
+
+// The adversarial encoder intentionally bypasses NodeExports' sink backstop:
+// otherwise the SDK would repair the lie before the host can observe it. Only
+// checked C records and borrowed spans cross; all state and text stay here.
+use cerulion_core::node_abi as abi;
+struct ErrorRow {
+    scope: u64,
+    token: u64,
+    text: Option<String>,
+}
+static ERRORS: Mutex<Vec<ErrorRow>> = Mutex::new(Vec::new());
+static NEXT_ERROR: AtomicU64 = AtomicU64::new(1);
+fn status(code: u32) -> abi::Status {
+    abi::Status {
+        code,
+        ..Default::default()
+    }
+}
+fn translated(scope: u64, code: i32) -> abi::Status {
+    let text = LAST_ERROR.lock().expect("error slot").take();
+    if code == 0 {
+        return status(abi::status_code::OK);
+    }
+    if code == -6 {
+        return status(abi::status_code::BUFFER_TOO_SMALL);
+    }
+    let mut result = status(abi::status_code::FAILED);
+    if let Some(text) = text {
+        let token = NEXT_ERROR.fetch_add(1, Ordering::Relaxed);
+        let mut rows = ERRORS.lock().expect("error rows");
+        if let Some(row) = rows.iter_mut().find(|row| row.scope == scope) {
+            row.token = token;
+            row.text = Some(text);
+        } else {
+            rows.push(ErrorRow {
+                scope,
+                token,
+                text: Some(text),
+            });
+        }
+        result.error = token;
+    }
+    result
+}
+fn guarded(call: impl FnOnce() -> abi::Status) -> abi::Status {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(_) => status(abi::status_code::PANICKED),
+    }
+}
+fn aligned<T>(ptr: *const T) -> bool {
+    !ptr.is_null() && (ptr as usize).is_multiple_of(std::mem::align_of::<T>())
+}
+fn valid_span(ptr: *const u8, len: u64) -> bool {
+    len <= isize::MAX as u64
+        && (len == 0 || !ptr.is_null())
+        && (ptr as usize).checked_add(len as usize).is_some()
+}
+unsafe extern "C" fn stable_create(
+    host: *const abi::HostApiV1,
+    context: abi::ContextHandle,
+    params: abi::Bytes,
+    output: *mut abi::NodeHandle,
+) -> abi::Status {
+    guarded(|| {
+        if !aligned(output) || !valid_span(params.ptr, params.len) {
+            return status(abi::status_code::INVALID_ARGUMENT);
+        }
+        // SAFETY: aligned exclusive caller output lives for the whole call.
+        unsafe {
+            output.write(abi::NodeHandle::default());
+        }
+        // SAFETY: caller retains the checked host table/context for the instance;
+        // the maintained client validates identity before invoking a callback.
+        if unsafe { cerulion_core::graph::node_plugin_abi::HostClient::connect(host, context, 0) }
+            .is_err()
+        {
+            return status(abi::status_code::INVALID_ARGUMENT);
+        }
+        let value = create_local();
+        // SAFETY: same exclusive output, after local node-owned allocation.
+        unsafe {
+            output.write(abi::NodeHandle { value });
+        }
+        status(abi::status_code::OK)
+    })
+}
+unsafe extern "C" fn stable_tick(handle: abi::NodeHandle) -> abi::Status {
+    guarded(|| {
+        *LAST_ERROR.lock().unwrap() = None;
+        translated(handle.value, cerulion_node_tick(handle.value))
+    })
+}
+unsafe extern "C" fn stable_shutdown(handle: abi::NodeHandle) -> abi::Status {
+    guarded(|| {
+        if NODES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|rows| rows.contains_key(&handle.value))
+        {
+            status(abi::status_code::OK)
+        } else {
+            status(abi::status_code::INVALID_HANDLE)
+        }
+    })
+}
+unsafe extern "C" fn stable_destroy(handle: abi::NodeHandle) -> abi::Status {
+    guarded(|| {
+        let code = cerulion_node_shutdown(handle.value);
+        ERRORS
+            .lock()
+            .unwrap()
+            .retain(|row| row.scope != handle.value);
+        if code == 0 {
+            status(abi::status_code::OK)
+        } else {
+            status(abi::status_code::INVALID_HANDLE)
+        }
+    })
+}
+unsafe extern "C" fn stable_shape(output: *mut u64) -> abi::Status {
+    guarded(|| {
+        if !aligned(output) {
+            return status(abi::status_code::INVALID_ARGUMENT);
+        }
+        *LAST_ERROR.lock().unwrap() = None;
+        // SAFETY: caller owns the checked aligned scalar through this query.
+        translated(0, unsafe { cerulion_node_state_shape(output) })
+    })
+}
+struct SinkBridge(abi::StateSinkV1);
+extern "C" fn forward_sink(context: *mut std::ffi::c_void, bytes: *const u8, len: usize) -> i32 {
+    // SAFETY: capture passes a live exclusive node-local bridge; the encoder's
+    // initialized chunk and host sink context remain borrowed synchronously.
+    let result = unsafe {
+        let bridge = &*context.cast::<SinkBridge>();
+        (bridge.0.write)(
+            bridge.0.context,
+            abi::Bytes {
+                ptr: bytes,
+                len: len as u64,
+            },
+        )
+    };
+    if result.code == abi::status_code::OK {
+        0
+    } else {
+        -6
+    }
+}
+unsafe extern "C" fn stable_capture(
+    handle: abi::NodeHandle,
+    sink: *const abi::StateSinkV1,
+    capacity: u64,
+) -> abi::Status {
+    guarded(|| {
+        if !aligned(sink) {
+            return status(abi::status_code::INVALID_ARGUMENT);
+        }
+        // SAFETY: caller retains initialized concrete sink, callback and context
+        // through the synchronous capture; the copied record owns no allocation.
+        let mut bridge = SinkBridge(unsafe { sink.read() });
+        *LAST_ERROR.lock().unwrap() = None;
+        translated(
+            handle.value,
+            cerulion_node_capture_state(
+                handle.value,
+                Some(forward_sink),
+                (&mut bridge as *mut SinkBridge).cast(),
+                capacity,
+            ),
+        )
+    })
+}
+unsafe extern "C" fn stable_restore(handle: abi::NodeHandle, payload: abi::Bytes) -> abi::Status {
+    guarded(|| {
+        if !valid_span(payload.ptr, payload.len) {
+            return status(abi::status_code::INVALID_ARGUMENT);
+        }
+        *LAST_ERROR.lock().unwrap() = None;
+        // SAFETY: caller retains initialized bounded payload bytes throughout
+        // restore; the local decoder copies only its counter into node state.
+        translated(handle.value, unsafe {
+            cerulion_node_restore_state(handle.value, payload.ptr, payload.len as usize)
+        })
+    })
+}
+unsafe extern "C" fn stable_inline(handle: abi::NodeHandle, output: *mut u32) -> abi::Status {
+    if !aligned(output) {
+        return status(abi::status_code::INVALID_ARGUMENT);
+    }
+    // SAFETY: checked exclusive scalar is live through this query.
+    unsafe {
+        output.write(1);
+    }
+    // SAFETY: only a scalar handle crosses; shutdown checks membership without
+    // dropping state, and guarded contains every local registry panic.
+    unsafe { stable_shutdown(handle) }
+}
+unsafe extern "C" fn stable_probe(handle: abi::NodeHandle) -> abi::Status {
+    // SAFETY: scalar membership query retains every local owner.
+    unsafe { stable_shutdown(handle) }
+}
+unsafe extern "C" fn stable_error(
+    token: u64,
+    output: abi::MutableBytes,
+    required: *mut u64,
+) -> abi::Status {
+    guarded(|| {
+        if !aligned(required) || !valid_span(output.ptr, output.len) {
+            return status(abi::status_code::INVALID_ARGUMENT);
+        }
+        let mut rows = ERRORS.lock().unwrap();
+        let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.token == token && row.text.is_some())
+        else {
+            return status(abi::status_code::INVALID_HANDLE);
+        };
+        let text = row.text.as_ref().unwrap();
+        // SAFETY: caller owns nonoverlapping output and length scalar, lending
+        // bounded writable storage. Text remains node-owned until complete copy.
+        unsafe {
+            required.write(text.len() as u64);
+            if output.len < text.len() as u64 {
+                return status(abi::status_code::BUFFER_TOO_SMALL);
+            }
+            if !text.is_empty() {
+                std::ptr::copy_nonoverlapping(text.as_ptr(), output.ptr, text.len());
+            }
+        }
+        row.text = None;
+        status(abi::status_code::OK)
+    })
+}
+unsafe extern "C" fn stable_extension(
+    _: u64,
+    _: u32,
+    _: *mut abi::ExtensionDescriptorV1,
+) -> abi::Status {
+    status(abi::status_code::UNSUPPORTED)
+}
+static STATE: abi::StateApiV1 = abi::StateApiV1 {
+    header: abi::TableHeaderV1::for_type::<abi::StateApiV1>(),
+    shape: stable_shape,
+    capture: stable_capture,
+    restore: stable_restore,
+    inline_safe: stable_inline,
+    probe: stable_probe,
+};
+static API: abi::NodeApiV1 = abi::NodeApiV1 {
+    header: abi::TableHeaderV1::for_type::<abi::NodeApiV1>(),
+    metadata: abi::Bytes {
+        ptr: INFO_BYTES.as_ptr(),
+        len: INFO_BYTES.len() as u64 - 1,
+    },
+    required_host_capabilities: 0,
+    capabilities: abi::capability::STATE,
+    create: stable_create,
+    tick: stable_tick,
+    shutdown: stable_shutdown,
+    destroy: stable_destroy,
+    copy_error: stable_error,
+    query_extension: stable_extension,
+    state: &STATE,
+    external: std::ptr::null(),
+};
+fn stable_api() -> *const abi::NodeApiV1 {
+    &API
+}
+cerulion_core::node_abi::export_node_api!(stable_api);

@@ -52,21 +52,13 @@ Three nodes forming a reactive pipeline:
   usually too old). `cerulion node build` compiles your nodes with your
   own `cargo`.
 
-  Build the nodes below with the same compiler that built the `cerulion` binary you
-  installed above: a node cdylib built by a different rustc release is refused at
-  load, loudly. A downloaded release binary is pinned to the exact rustc that built
-  it, named in the archive's `rustc-version.txt` (Rust 1.93.0 for the 1.0.0
-  binaries), and the README's [Install](../../README.md#install) section gives the
-  `RUSTUP_TOOLCHAIN=` step for that case. On Homebrew and apt, run
-  `cerulion-install-rust` once to install that compiler, then put
-  `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. Building this workspace from
-  source needs Rust 1.95 or newer. The workspace you create in step 1 also
-  records that compiler in its own `rust-toolchain.toml` when a matching rustup
-  toolchain is already installed, so the builds below select it with no environment
-  variable; when the CLI cannot verify a match it warns, leaves your environment's
-  compiler in charge, and never changes your rustup default. A CLI you built
-  yourself already matches, as long as you do not switch your default toolchain
-  part way through.
+  Build the nodes below with Rust 1.95 or newer. Native libraries use a stable
+  boundary, so their compiler need not match the CLI. The installer above
+  installs current stable Rust when no Rust 1.95 or newer is there. On Homebrew
+  and apt, `cerulion-install-rust` does the same; put `${CARGO_HOME:-$HOME/.cargo}/bin` on your PATH. If Rust is still
+  missing when you create a workspace or build a node, the CLI offers to install
+  it. A new workspace names no compiler, so it uses the one your environment
+  selects.
 
 Every step below is a `cerulion` verb. You never run `cargo` yourself and you never
 write a `main`: a node is a library the runtime loads, and the graph file is the
@@ -77,7 +69,8 @@ only place wiring lives.
 ## Complete starter source
 
 To read and run complete scanner and controller implementations before writing
-new node types, choose the route for your installed CLI.
+new node types, choose the route for your installed CLI. The 2.0.0 CLI includes
+`--starter`, so it takes the second route; the first is for a 1.0.0 install.
 
 ### Released CLI 1.0.0
 
@@ -156,8 +149,9 @@ wording depends on how the CLI was installed (see **Dependency selection** below
 
 > **Note:** One-shot CLI commands print only their output by default; operational
 > `INFO` log lines are suppressed. Pass `-v` (or set `RUST_LOG=info`) to see the
-> structured `tracing` breadcrumbs, e.g. `INFO workspace created ...`. Long-running
-> commands like `cerulion graph run` keep their `INFO` lifecycle lines by default.
+> structured `tracing` breadcrumbs, e.g. `INFO workspace created ...`.
+> `cerulion graph run` and `bag play` print their result, any warning and your
+> nodes' own log lines by default; `RUST_LOG=info` shows their lifecycle lines.
 
 **What was generated:**
 
@@ -694,9 +688,13 @@ Staged 'safety_controller' into graph 'obstacle_avoidance'
 Staged 'drive_base' into graph 'obstacle_avoidance'
 ```
 
-Each is preceded by a `WARN overwriting an existing graph file` line that names a
-`.bak` path. That is expected: the verb rewrites the graph file and keeps the
-previous version beside it as `graphs/obstacle_avoidance.yaml.bak`.
+While every byte of the graph file is what `graph create` and `node stage`
+would write for its prefix and nodes, each stage rewrites it with no warning and
+no backup. After a hand edit the CLI would not write the same way (a comment, a
+blank line, reordered keys), the next `node stage` prints a
+`WARN overwriting an existing graph file` line and keeps the previous version
+beside it as `graphs/obstacle_avoidance.yaml.bak`. Either way, staging keeps
+every line you wrote.
 
 ### Read the graph YAML
 
@@ -821,22 +819,17 @@ the graph does not start.
 
 **Expected output:** the supervisor spawns one worker process
 per group, waits for each worker's READY, starts the recorder, then releases them
-together. Representative lines (timestamps, pids and paths vary; long lines are
-cut at `...`):
+together, and says so in one line. Representative lines (the ranges vary):
 
 ```
-INFO graph validation complete graph=obstacle_avoidance
-INFO spawned worker process group=grp_lidar_sensor pid=... nodes=1
-INFO worker READY observed group=grp_lidar_sensor ready=...
-INFO spawned worker process group=grp_safety_controller pid=... nodes=1
-INFO worker READY observed group=grp_safety_controller ready=...
-INFO spawned worker process group=grp_drive_base pid=... nodes=1
-INFO worker READY observed group=grp_drive_base ready=...
-INFO spawned bagd recorder graph=obstacle_avoidance pid=... bag=recordings/obstacle_avoidance_<timestamp>.mcap
-INFO all workers spawned + READY ...
+graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es); press Ctrl+C to stop
 INFO safety_controller: emergency stop range=0.4970099925994873 stop_count=1
 INFO safety_controller: emergency stop range=0.41373515129089355 stop_count=2
 ```
+
+Each step of the bring-up (worker spawned, worker READY, recorder started) is
+logged at `info`, which `graph run` does not print by default; run it with
+`RUST_LOG=info` to see them.
 
 The graph is now running as three free-running worker processes. The `lidar_sensor`
 publishes at 10 Hz, the `safety_controller` reacts to each reading (the
@@ -845,15 +838,12 @@ simulated obstacle comes within half a meter), and the `drive_base` receives
 velocity commands, all through **zero-copy shared memory**, with a crash in any
 one group contained to its own process.
 
-> **Warnings you will see on this first run, and what they mean.**
-> - `WARN absolute source is inside this graph's own prefix namespace but matches
->   no declared output` (twice per consuming worker) suggests a misspelled
->   `source:`. Nothing is misspelled: in a multi-process run each worker sees only
->   its own part of the graph, so its upstream looks external to it.
-> - `WARN network egress OPEN BY DEFAULT`: with no `network:` block, the topics
->   are visible to other Cerulion machines on your LAN. `--network off` keeps a
->   run local-only. The first networked run also starts the shared `cerulion-netd`
->   daemon and says so; it exits by itself when idle.
+> **Networking on this first run.**
+> Networking uses paired access by default, with no open-access warning.
+> Unpaired LAN peers cannot read topics or publish into graph ingress through
+> the zenoh plane. The first networked run starts the shared `cerulion-netd`
+> daemon. Explicit `CERULION_LAN_ACCESS=open` permits unpaired
+> LAN access and prints a warning; unset it to restore paired access.
 
 Leave it running and open a second terminal.
 
@@ -877,7 +867,7 @@ TOPIC
 /demo/lidar_sensor/scan
 /demo/safety_controller/cmd_vel
 1 internal topic hidden (--all shows it)
-remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)
+remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)
 ```
 
 The hidden topic is `/bagd/status`, the recorder's own status channel (it is
@@ -889,7 +879,7 @@ TOPIC
 /bagd/status  internal
 /demo/lidar_sensor/scan
 /demo/safety_controller/cmd_vel
-remote: none discovered in 500 ms (a robot off the LAN needs --connect tcp/<host>:7683)
+remote: none discovered in 500 ms (sign in with the robot's account using cerulion login; account and paired robots are reached automatically)
 ```
 
 The `remote:` line is the LAN discovery half of the verb; with no other
@@ -913,19 +903,19 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
+# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.5
 y: 0.0
 z: 0.0
 ---
-# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
+# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
 z: 0.0
 ---
-# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
@@ -943,10 +933,10 @@ wire header:
   jitter (100.027 ms then 100.009 ms in the capture above) instead of landing on
   exact multiples. What makes the Step 7 replay exact is not a tidy clock but
   the recorded posture: every step boundary is written into the bag and replayed
-  from there. `CERULION_EXECUTION_MODE=lockstep` opts into the other shape,
-  where every rank advances the same 100 ms quantum behind a shared barrier, so
-  its stamps are logical quantum values counted from zero instead of readings
-  that carry the run's jitter.
+  from there. The deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out gives
+  the other shape, where every rank advances the same 100 ms quantum behind a
+  shared barrier, so its stamps are logical quantum values counted from zero
+  instead of readings that carry the run's jitter.
 - `schema`: the layout-sensitive schema hash (see the wire-format footnote below)
 - `size`: total wire size (header + payload)
 
@@ -1030,17 +1020,21 @@ and press **Ctrl+C**. The workers drain, the recorder finalizes the bag, and the
 run prints where it went:
 
 ```
-INFO live loop delivery telemetry node_id=lidar_sensor fires=387
-INFO live loop delivery telemetry node_id=safety_controller input=scan fires=387 drop_oldest=0
-INFO live loop delivery telemetry node_id=drive_base input=cmd_vel fires=387 drop_oldest=0
-...
 recording written to recordings/obstacle_avoidance_<timestamp>.mcap
 ```
 
-The telemetry lines are the run's own delivery account: how often each node
-fired, and how many queued frames its inputs lost. `drop_oldest=0` on both
-inputs means no frame was evicted from a full queue. To check what actually
-crossed, read the recorded frames of the topic itself.
+With `RUST_LOG=info` set, the run also prints its own delivery account before
+that line:
+
+```
+INFO live loop delivery telemetry node_id=lidar_sensor fires=387
+INFO live loop delivery telemetry node_id=safety_controller input=scan fires=387 drop_oldest=0
+INFO live loop delivery telemetry node_id=drive_base input=cmd_vel fires=387 drop_oldest=0
+```
+
+They say how often each node fired, and how many queued frames its inputs lost.
+`drop_oldest=0` on both inputs means no frame was evicted from a full queue. To
+check what actually crossed, read the recorded frames of the topic itself.
 
 The bag is a standard MCAP file that holds the frames, the graph, the environment
 and the scheduler's trace. `cerulion bag info` summarizes it:
@@ -1057,7 +1051,7 @@ frames: 774 across 2 topic(s); span 38.600s
 
 TOPIC                                       FRAMES   MAX BYTES  SCHEMA
 /demo/lidar_sensor/scan                        387        1361  sensor_msgs/LaserScan
-/demo/safety_controller/cmd_vel                387          56  geometry_msgs/Vector3
+/demo/safety_controller/cmd_vel                387          64  geometry_msgs/Vector3
 ...
 ```
 
@@ -1076,9 +1070,21 @@ It ends with:
 replay PASS: recordings/obstacle_avoidance_<timestamp>.mcap (387 tick(s) replayed, 2/2 topic(s) matched byte-for-byte and were credited)
 ```
 
-and exits 0. (It may also print `WARNING: env divergence` lines for shell
-variables such as `SHLVL` that differ between the two terminals. They are
-advisory; the verdict is the `replay PASS` line and the exit code.)
+and exits 0. The re-execution runs in your shell's environment, and the bag
+holds a record of the environment the recording ran in, so the two are
+compared. Variables that only your shell or terminal sets, such as `SHLVL`,
+often differ between two terminals, and a difference like that is counted in one
+line above the verdict:
+
+```
+NOTE: 1 other environment variable differs from the recording. Cerulion does not read it to decide what the re-execution runs, so it matters only if code in one of your nodes reads it. Run with -v to list it.
+```
+
+That line is information. A line that starts with
+`WARNING: environment variable` names a variable that Cerulion, the dynamic
+linker or the Python interpreter reads, such as a `CERULION_` setting, so the
+re-execution may not match the recorded run: set that variable as it was when
+you recorded before you trust the result.
 
 ### Change the controller, and verify again
 
@@ -1100,12 +1106,13 @@ This time the verdict is a divergence, and the exit code is 1:
 ```
 FRAME-CONTENT DIVERGENCE: recordings/obstacle_avoidance_<timestamp>.mcap
   387 tick(s) replayed; 1/2 topic(s) matched and were credited; 1 violation(s):
-  - /demo/safety_controller/cmd_vel [byte-mismatch]: frame 0 differs at byte 38 on '/demo/safety_controller/cmd_vel' (recorded 56 B, replayed 56 B)
+  - /demo/safety_controller/cmd_vel [byte-mismatch]: frame 0 on '/demo/safety_controller/cmd_vel' differs at x: recorded 0.5, replayed 0.25 (recorded 64 B, replayed 64 B)
   Topics passed: 1/2
 ```
 
-On the same sensor inputs, the changed controller commands a different speed. The
-scan topic still matches, because the sensor did not change. That is the loop:
+On the same sensor inputs, the changed controller commands a different speed: the
+line names the field that changed, `x`, with the recorded and the replayed value.
+The scan topic still matches, because the sensor did not change. That is the loop:
 record once on the robot, then check every later change against the recording
 before it reaches the robot again. In CI the nonzero exit is the gate.
 
@@ -1227,11 +1234,19 @@ contributes name-only, and a layout change inside such a target is not caught.
   from Step 3a). If two instances need different policies, make them two
   node types. Stage the second instance with its own id:
   `cerulion node stage lidar_sensor -g obstacle_avoidance -i rear_sensor`.
+  The command writes the entry with its outputs. Each instance lists the
+  `scan` output that `lidar_sensor` declares:
   ```yaml
   - id: front_sensor
     type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
   - id: rear_sensor
     type: lidar_sensor
+    outputs:
+      - name: scan
+        schema: sensor_msgs/LaserScan
   ```
 
 - **QoS deadlines:** Independent of trigger policy, every port + the node
@@ -1268,9 +1283,9 @@ contributes name-only, and a layout change inside such a target is not caught.
   recording and playback in full.
 
 - **Visualize it:** `cerulion viz` attaches the live topics to the viz daemon and
-  [Cerulion Studio](../../README.md#studio-for-your-computer) connects to that
-  same daemon and renders them. Nothing is added to the graph for either. Name
-  the topics you want, or pass none to attach every decodable local topic:
+  Cerulion Studio connects to that same daemon and renders them. Nothing is
+  added to the graph for either. Name the topics you want, or pass none to
+  attach every decodable local topic:
 
   ```bash
   cerulion viz /demo/lidar_sensor/scan /demo/safety_controller/cmd_vel

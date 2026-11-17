@@ -20,6 +20,9 @@
 //!   daemon PROCESS, hermetically (no robot). It mutates process env, so it holds a
 //!   file-local env mutex.
 
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
@@ -788,15 +791,12 @@ fn client_spawns_a_real_daemon_when_none_is_running() {
 // `attach_remote`, so that is a user-visible failure, not a test artifact.
 // --------------------------------------------------------------------------
 
-/// Write an executable `sh` script into `dir` and return its path — a stand-in
-/// "cerulion-netd" binary for [`NETD_BIN_ENV`]. Unix-only, like the whole crate
-/// (the control seam is a `UnixStream`).
+/// Write an executable `sh` script into `dir` and return its path once it can
+/// be executed: a stand-in "cerulion-netd" binary for [`NETD_BIN_ENV`].
+/// Unix-only, like the whole crate (the control seam is a `UnixStream`).
 fn write_fake_daemon(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, body).expect("write fake daemon script");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod fake daemon script");
+    fresh_executable::install_script(&path, body);
     path
 }
 
@@ -1755,6 +1755,7 @@ fn client_query_catalog_and_schema_round_trip_against_a_real_daemon() {
         version: 1,
         robot: "ubuntu".to_string(),
         entries: vec![CatalogEntry {
+            egress_qos: None,
             topic: "/tf".to_string(),
             schema_hash: Some(7),
             schema_name: Some("tf2_msgs/TFMessage".to_string()),

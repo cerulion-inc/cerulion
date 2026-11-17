@@ -1,8 +1,7 @@
 # cerulion_macros - agent notes
 
-Proc-macro crate: `#[cerulion_node]` (struct side: parse, validate, codegen, cdylib FFI)
-and `#[cerulion_node_impl]` (tick-body rewriter). Its tests are token-level, so a
-codegen/rewriter change runs `cargo test -p cerulion_core` AND `cargo test -p cerulion`.
+Node-author proc macros; token tests alone do not prove codegen behavior.
+Codegen/rewriter changes run core and cerulion tests with root serial discipline.
 
 ## Invariants
 - Generated runtime paths start at `#__cer_root` (`crate_root::root()`), never at
@@ -14,10 +13,9 @@ codegen/rewriter change runs `cargo test -p cerulion_core` AND `cargo test -p ce
   on the freshest frames. Sync means nothing under 2 `#[input(trigger)]` ports: 0 is a compile
   error; exactly 1 is ACCEPTED by the validator and the graph build degrades the node to a data
   trigger with a `warn` (`sync_attr_1_trigger_warn_test.rs`). A plain `#[input]` never gates a fire.
-- Any change to a generated cdylib FFI signature or its return-code semantics bumps
-  `CERULION_ABI_VERSION` (`crates/cerulion_core/src/lib.rs`) - the loader hard-rejects a
-  mismatch, so an unbumped change breaks every deployed cdylib at load. New OPTIONAL
-  symbols are additive with no bump; symbol presence is the capability gate.
+- Stable table IDs, layouts and status meanings are frozen in `cerulion_node_abi`.
+  Generated code uses the same checked boundary as Python; changes to frozen
+  shapes require a new boundary major and a loud loader refusal.
 - A trigger-policy surface change updates ALL of, together: `MacroPolicy` + `PolicyJson`
   (`crates/cerulion_core/src/graph/node.rs`), BOTH emitters (`gen_cdylib`'s `policy_json` arm
   AND `gen_zero_copy_node_entry_impl`'s `.with_policy(...)` chain in `src/codegen.rs`),
@@ -27,6 +25,8 @@ codegen/rewriter change runs `cargo test -p cerulion_core` AND `cargo test -p ce
   from one parsed list, so the in-process and cdylib paths cannot disagree (internals doc).
 - Keep internal modules `mod`, never `pub mod` - a `proc-macro = true` crate may export
   only its macros; `pub mod` is a hard compile error.
+- Stable context helpers belong in the annotated impl; data-only helpers are unchanged.
+  Writers drop before release, including SPILL_RELEASE after copied spill.
 - Macro error paths re-emit the original struct alongside the `compile_error!` - keep
   that, or one real diagnostic cascades into pages of "cannot find type" noise.
 
@@ -56,4 +56,5 @@ codegen/rewriter change runs `cargo test -p cerulion_core` AND `cargo test -p ce
   preserves `100_000`/`0xff`/type suffixes, which `str::parse::<u64>()` rejects, and a
   swallowed parse error silently drops the user's policy.
 
+Stable maintenance; link cdylibs before pushing.
 Deep reference: docs/internals/macros.md (grammar, rewriter, root, FFI, trybuild).

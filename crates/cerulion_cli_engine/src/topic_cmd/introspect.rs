@@ -853,7 +853,8 @@ fn write_topic_list(
     err: &mut dyn Write,
 ) -> CliResult<()> {
     let mirrors = super::gather_mirror_identities()?;
-    let (local, streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    let (local, mut streaming) = super::partition_local_topics(super::topic_list()?, &mirrors);
+    streaming.retain(|stream| show_all || !stream.topic.starts_with("/__cerulion/observers/"));
     let shown = types == TypeColumn::Shown;
     let walker = shown.then(|| super::local_walker_from_workspace(schemas_dir));
     let local_section = match &walker {
@@ -872,13 +873,39 @@ fn write_topic_list(
     out.flush()?;
     // The account directory is a remote source: every scope that skips the
     // remote query (`--no-network`, `--local`, the kill switch) skips it too.
-    let account_rows = match &remote {
-        Some(_) => account_robot_rows(err)?,
-        None => String::new(),
+    #[cfg(unix)]
+    let directory = if remote.is_some() {
+        crate::account_robot_access::automatic::discover()?
+    } else {
+        Default::default()
     };
+    #[cfg(unix)]
+    if !directory.diagnostics.is_empty() {
+        writeln!(
+            err,
+            "cerulion topic list: {}",
+            directory.diagnostics.join("; ")
+        )?;
+    }
+    #[cfg(unix)]
+    let account_rows =
+        crate::account_robot_access::automatic::render_robots(&directory.robots, show_all);
+    #[cfg(not(unix))]
+    let account_rows = String::new();
     let remote_section = |disc: &super::RemoteDiscovery,
                           had_endpoints: bool,
                           catalogs: &[cerulion_core::CatalogReply]| {
+        #[cfg(unix)]
+        if !directory.robots.is_empty() {
+            return crate::account_robot_access::automatic::render_listing(
+                &directory.robots,
+                disc,
+                catalogs,
+                &streaming,
+                show_all,
+                shown,
+            );
+        }
         match &walker {
             Some(walker) => render_remote_typed_topics_section_with_robot_rows(
                 disc,
@@ -898,7 +925,7 @@ fn write_topic_list(
     if let Some(opts) = remote {
         // `--scan` is the sole producer of a `true` scan, so the subnet
         // sweep never runs on a default listing.
-        match super::query_remote_topics_and_catalogs(&opts, scan) {
+        match super::query_lan_topics_and_catalogs(&opts, scan) {
             Ok((disc, catalogs)) => {
                 write!(
                     out,
@@ -913,7 +940,7 @@ fn write_topic_list(
     // Mirror and account rows are independent of LAN discovery, so they print
     // when the query was skipped or failed; neither is evidence of an empty
     // LAN, so no none-discovered line is written for them.
-    if !streaming.is_empty() {
+    if !streaming.is_empty() || !account_rows.is_empty() {
         write!(
             out,
             "{}",
@@ -927,23 +954,6 @@ fn write_topic_list(
         )?;
     }
     Ok(())
-}
-
-/// The account directory's `ROBOTS` rows, rendered and sanitized; diagnostics
-/// and a failed listing are `cerulion topic list:` lines on `err`
-/// ([`crate::account_robot_access::listing_rows`]).
-#[cfg(unix)]
-fn account_robot_rows(err: &mut dyn Write) -> CliResult<String> {
-    Ok(crate::account_robot_access::listing_rows(
-        "cerulion topic list",
-        err,
-    )?)
-}
-
-/// No account directory client off Unix.
-#[cfg(not(unix))]
-fn account_robot_rows(_err: &mut dyn Write) -> CliResult<String> {
-    Ok(String::new())
 }
 
 /// What `topic find` found.
@@ -1098,15 +1108,33 @@ pub fn topic_type_with_scope(
 ) -> CliResult<String> {
     let (_transport, subscriber, source) =
         super::ensure_topic_available(topic, schemas_dir, None, scope)?;
+    type_observed(topic, schemas_dir, scope, subscriber, source)
+}
+
+pub(super) fn type_observed(
+    topic: &str,
+    schemas_dir: Option<&Path>,
+    scope: TopicScope,
+    subscriber: super::ScopedSubscriber,
+    source: TopicSource,
+) -> CliResult<String> {
+    subscriber.check_remote()?;
     let wait = match &source {
         TopicSource::Remote { .. } => REMOTE_FRAME_WAIT,
         TopicSource::Local => LOCAL_FRAME_WAIT,
     };
-    let hash = match first_schema_hash(&subscriber, wait) {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return Err(silent_topic_error(topic, wait)),
-        Err(e) => return Err(receive_failed_error(topic, &e)),
+    let deadline = Instant::now() + wait;
+    let hash = loop {
+        subscriber.check_remote()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match first_schema_hash(&subscriber, remaining.min(super::OBSERVER_HEARTBEAT)) {
+            Ok(Some(hash)) => break hash,
+            Ok(None) if remaining.is_zero() => return Err(silent_topic_error(topic, wait)),
+            Ok(None) => {}
+            Err(error) => return Err(receive_failed_error(topic, &error)),
+        }
     };
+    subscriber.check_remote()?;
     let local_walker = super::local_walker_from_workspace(schemas_dir);
     let mut ty = TopicType::of_hash(hash, &[&local_walker]);
     if matches!(ty, TopicType::Unnamed(_)) {
@@ -1204,6 +1232,17 @@ pub fn topic_bw_with_scope(
             Err(_) if super::interrupted_before_observing(Some(running.as_ref())) => return Ok(()),
             Err(e) => return Err(e),
         };
+    bw_observed(topic, running, writer, window, subscriber, source)
+}
+
+pub(super) fn bw_observed(
+    topic: &str,
+    running: Arc<AtomicBool>,
+    writer: &mut dyn Write,
+    window: NonZeroUsize,
+    subscriber: super::ScopedSubscriber,
+    source: TopicSource,
+) -> CliResult<()> {
     let source_desc = super::observer_source_description(&source);
     // The one allocation of the loop: the full window, before any frame.
     let mut ring: VecDeque<BwFrame> = VecDeque::with_capacity(window.get());
@@ -1214,6 +1253,7 @@ pub fn topic_bw_with_scope(
     let mut idle_churn: u32 = 0;
 
     while running.load(Ordering::Relaxed) {
+        subscriber.check_remote()?;
         let until_report = super::HZ_REPORT_INTERVAL.saturating_sub(last_report.elapsed());
         let wait = until_report.min(super::OBSERVER_HEARTBEAT);
         let wait_started = Instant::now();
@@ -2071,6 +2111,7 @@ mod tests {
 
     fn entry(topic: &str, name: Option<&str>, hash: Option<u64>) -> cerulion_core::CatalogEntry {
         cerulion_core::CatalogEntry {
+            egress_qos: None,
             topic: topic.to_string(),
             schema_hash: hash,
             schema_name: name.map(str::to_string),

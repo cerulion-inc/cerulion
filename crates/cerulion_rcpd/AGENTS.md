@@ -5,7 +5,7 @@ HTTP) serving `robot://graph`, `robot://state/{name}` and the manifest's tools.
 User reference: docs/rcp.md.
 
 ## Invariants
-
+- Remote graph/state, journals and external eyes respect producer scope; cached private state stays private. Journal admission survives cancellation through the answer; emergency-stop operations remain independent.
 - Deny by default: the callable tools are the manifest's `tools`, `estop`, and
   `estop_clear` under `limits.estop_clear: agent`. Any other name is receipted
   `denied` and never reaches the graph. Built-in names cannot be declared.
@@ -18,16 +18,16 @@ User reference: docs/rcp.md.
 - `estop` closes the latch before anything that can await and publishes on the
   journal's urgent queue; it never waits on `call_lock`.
 - `estop_clear` reads the `engages` counter, then takes `call_lock`; inside
-  `latch_io` (a std mutex never held across an await) it refuses
-  (`estop_overtaken`) if an `estop` bumped the counter since, else writes
-  `intent`, deletes the file and opens the latch; then it journals a
-  LATCH-GATED frame, so an `estop` that lands first stays the graph's last
-  frame (`estop_overtaken`). `estop` re-closes the latch, writes its file and
-  `intent`, and queues its urgent frame inside `latch_io`, so the receipt log
-  and the calls topic order engages and clears as they took effect (the
-  journal publishes every queued urgent frame before a normal one). An
-  undeletable file leaves the latch closed (`clear_failed`); an unreadable
-  one at start counts as present.
+  `latch_io` (a std mutex held across no await and no rcpd log line, only the
+  lines cerud logs while rotating) it refuses (`estop_overtaken`) if an `estop`
+  bumped the counter since, else writes `intent`, deletes the file and opens
+  the latch; then it journals a LATCH-GATED frame, so an `estop` that lands
+  first stays the graph's last frame (`estop_overtaken`). `estop` re-closes the
+  latch, writes its file and `intent`, and queues its urgent frame inside
+  `latch_io`, so the receipt log and the calls topic order engages and clears
+  as they took effect (the journal publishes every queued urgent frame before a
+  normal one). An undeletable file leaves the latch closed (`clear_failed`); an
+  unreadable one at start counts as present.
 - The journal's `gate` reads the latch, then drops a latch-gated request whose
   caller dropped its reply (a cancelled MCP request); estop and read frames
   always publish.

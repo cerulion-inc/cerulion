@@ -4,6 +4,7 @@
 //! e2e). Cribbed from `ops_loopback_test.rs`: two REAL iroh endpoints on loopback
 //! (direct dial, no relay unless a test injects one), the robot hosting the REAL
 //! `cerud::OpsServer` via `OpsServing`, a `cerud::OpsClient` on the desk side.
+//! The real-binary stderr helpers live in `stderr_pipe` (Unix only).
 //!
 //! Every key is derived from a fixed seed (Principle #13: deterministic fixtures,
 //! never fake data) and every oracle is HAND-BUILT (a real cert chain, real
@@ -11,6 +12,9 @@
 //! never a self-compare.
 
 #![allow(dead_code)] // each test file uses a subset of these helpers.
+
+#[cfg(unix)]
+pub mod stderr_pipe;
 
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};

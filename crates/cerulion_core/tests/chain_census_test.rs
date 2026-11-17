@@ -124,6 +124,7 @@ impl Spec {
                 depth: 10,
                 backpressure: *backpressure,
                 expect_within_ms: None,
+                accumulate: false,
                 consume: Default::default(),
             })
             .collect();

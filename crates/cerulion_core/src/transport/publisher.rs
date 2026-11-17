@@ -154,6 +154,58 @@ const SELF_DRAIN_IDLE_REARM: Duration = Duration::from_millis(250);
 /// is untouched, because the count moves and arms 64.
 const SELF_DRAIN_IDLE_CALLS: u8 = 2;
 
+/// A test seam inside a frame's send window, installed only through
+/// `CerulionPublisher::set_block_send_hook_for_test` (feature
+/// `test-helpers`). A publisher built by the runtime holds none, and each send
+/// then pays two branches, one before `send()` and one after.
+#[doc(hidden)]
+pub enum BlockSendHook {
+    /// Runs on the publishing thread right after `send()` returns `Ok`, before
+    /// the publish path does anything else. The frame is already in every
+    /// connected consumer's queue at that point, so a closure that pops it and
+    /// records the drain is the consumer in another process that pops the frame
+    /// while the producer is still inside its publish.
+    AfterSend(Box<dyn FnMut() + Send + Sync>),
+    /// Fires once: the next send is counted on every block word, then its
+    /// sample is released unsent and the send reports an error, as a `send()`
+    /// that reached no queue does. The hook clears itself when it fires.
+    FailNextSend,
+}
+
+/// One `block` consumer's credit word on a publisher, and the take-back of
+/// the frame [`CerulionPublisher::send_counted`] is sending on it.
+///
+/// Every count before `send()` stores its
+/// [`PublishUndo`](crate::credit::PublishUndo) in `pending`, `None` on a
+/// released slot, and a send that errs takes it and hands it to
+/// [`CreditShared::record_unpublished`](crate::credit::CreditShared::record_unpublished).
+/// The store is unconditional, so the token a take-back reads is always the
+/// one its own send's count returned.
+#[derive(Debug)]
+pub(crate) struct BlockCountSlot {
+    word: crate::credit::CreditWord,
+    pending: Option<crate::credit::PublishUndo>,
+}
+
+/// Why [`CerulionPublisher::send_counted`] sent nothing. Either arm has
+/// already taken the frame's `block` count back.
+#[derive(Debug)]
+pub(crate) enum SendFailure {
+    /// iceoryx2's `send()` returned this error.
+    Send(iceoryx2::port::SendError),
+    /// [`BlockSendHook::FailNextSend`] released the sample unsent.
+    Refused,
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Send(e) => write!(f, "{e}"),
+            Self::Refused => f.write_str("the send was refused by the test seam"),
+        }
+    }
+}
+
 /// Zero-copy publisher for a single topic.
 ///
 /// Holds an iceoryx2 data publisher, an event notifier (to signal subscribers),
@@ -278,6 +330,10 @@ pub struct CerulionPublisher {
     /// `TransportError::Publish` instead of `sample.send()`. Production:
     /// a single bool, one branch, always `false`. Setter is test-gated.
     fault_inject_send_raw_loan: bool,
+    /// The send-window test seam ([`BlockSendHook`]). Always `None` in
+    /// production; the field is unconditional so host and node libraries agree
+    /// on the layout, and only its setter is test-gated.
+    block_send_hook: Option<BlockSendHook>,
     /// "Loud failure" signal:
     /// counter of frames LOST during `OutputProxy::Drop`'s overflow
     /// re-loan path (incremented when `send_overflow_frame` returns Err).
@@ -332,17 +388,17 @@ pub struct CerulionPublisher {
     /// the publisher, not the recorder tap.
     frames_dropped_send_fail: std::sync::atomic::AtomicU64,
     /// `block`: one shared outstanding counter per
-    /// `block`-policy consumer of this publisher's topic. Each is the
-    /// deterministic mirror of that consumer's iceoryx2 queue depth —
-    /// incremented here on every successful publish (the frame enters
-    /// every subscriber's queue), decremented on the consumer's
-    /// [`CerulionSubscriber`] drain. The producer's scheduler pre-fire
-    /// check reads these to defer the moment any consumer's queue is
-    /// full. Empty unless the graph runtime wired this publisher's topic
-    /// as all-`block` (mixed topics degrade to native drop_oldest and
-    /// install no counter). The frame is never buffered or copied here —
-    /// this is a plain atomic mirror, not a data path.
-    block_outstanding: Vec<crate::credit::CreditWord>,
+    /// `block`-policy consumer of this publisher's topic, each in a
+    /// [`BlockCountSlot`] beside the take-back of the frame being sent. Each
+    /// word is the deterministic mirror of that consumer's iceoryx2 queue
+    /// depth, incremented here before every send makes a frame visible (and
+    /// taken back when the send fails, see [`Self::send_counted`]),
+    /// decremented on the consumer's [`CerulionSubscriber`] drain. The
+    /// producer's scheduler pre-fire check reads these to defer the moment any
+    /// consumer's queue is full. One slot per `block` consumer of the topic;
+    /// the topic's other consumers hold none. The frame is never buffered or
+    /// copied here: this is a plain atomic mirror, not a data path.
+    block_outstanding: Vec<BlockCountSlot>,
     /// Shared `last_publish_ns` anchor for this output's
     /// `#[output(promise_within_ms = N)]` watchdog. `Some` only when the
     /// graph runtime wired a watchdog on this output; the same
@@ -661,6 +717,7 @@ impl CerulionPublisher {
             fault_inject_publish_raw_after: None,
             fault_inject_send_overflow_frame_after: None,
             fault_inject_send_raw_loan: false,
+            block_send_hook: None,
             frames_dropped_overflow: std::sync::atomic::AtomicU64::new(0),
             frames_dropped_invariant_violation: std::sync::atomic::AtomicU64::new(0),
             frames_dropped_send_fail: std::sync::atomic::AtomicU64::new(0),
@@ -817,11 +874,14 @@ impl CerulionPublisher {
 
     /// `block`: register one consumer's outstanding counter. The
     /// graph runtime calls this once per `block` consumer of this
-    /// publisher's topic (all-`block` topics only). The same `Arc` is
-    /// shared into that consumer's [`CerulionSubscriber`] (drain
-    /// decrement) and the producer's pre-fire check (fullness read).
+    /// publisher's topic; the topic's other consumers register none. The
+    /// same word is shared into that consumer's [`CerulionSubscriber`]
+    /// (drain decrement) and the producer's pre-fire check (fullness read).
     pub(crate) fn register_block_outstanding(&mut self, counter: crate::credit::CreditWord) {
-        self.block_outstanding.push(counter);
+        self.block_outstanding.push(BlockCountSlot {
+            word: counter,
+            pending: None,
+        });
     }
 
     /// Wire this output's `#[output(promise_within_ms = N)]`
@@ -936,8 +996,8 @@ impl CerulionPublisher {
     /// `Acquire` load sees the write. Reads `clock.now_ns()` — the same
     /// deterministic source the scheduler uses.
     ///
-    /// Called from every successful-send site, alongside
-    /// [`Self::record_block_published`] — there are **FOUR** direct callers, and
+    /// Called from every successful-send site, after
+    /// [`Self::send_counted`] returns `Ok`. There are **FOUR** direct callers, and
     /// a new send path MUST call this too or its frames will silently fail to
     /// reset the watchdog:
     ///   1. `publish_raw` (raw-FFI re-publish path) — pinned by
@@ -1008,19 +1068,77 @@ impl CerulionPublisher {
         self.publisher.backpressure_strategy()
     }
 
-    /// `block`: record that one frame was published to this topic
-    /// — bump every registered consumer's outstanding counter (each
-    /// subscriber's queue just gained one sample). Called on every
-    /// successful send (steady-state + overflow re-send). A no-op (empty
-    /// vec) unless the topic was wired all-`block`. `Release` so the
-    /// producer's pre-fire `Acquire` load sees a consistent depth.
-    pub(crate) fn record_block_published(&self) {
-        for counter in &self.block_outstanding {
-            // `record_published` IS the `fetch_add(1, Release)`
-            // of the block credit — on whichever word backs the
-            // edge, so a split edge's producer bumps the SHARED page and its
-            // peer consumer's drain sees the same count.
-            counter.record_published();
+    /// Send one finished frame, counting it on every `block` word BEFORE the
+    /// push makes it visible. Every send path of this publisher goes through
+    /// here: `OutputProxy`'s drop, [`Self::send_overflow_frame`],
+    /// [`Self::send_raw_loan`] and [`Self::publish_raw`], each after every
+    /// early return that sends nothing.
+    ///
+    /// The count comes first because a consumer in another process can pop the
+    /// frame and record its drain the instant iceoryx2's queue push publishes
+    /// it, which happens inside `send()`. A drain that ran before the count
+    /// would saturate at 0 and the count would then leave the word one frame
+    /// above an empty queue (see [`crate::credit::CreditShared::record_published`]).
+    ///
+    /// `Ok(n)` keeps the count for every `n`, `0` included: under iceoryx2's
+    /// default `Warn` degradation a corrupted connection is pushed and then
+    /// left out of `n`, so `n` never proves a consumer's queue missed the
+    /// frame. `Err` takes the count back ([`Self::record_block_unpublished`]):
+    /// with safe overflow on and the default degradation, `send()` errs only
+    /// before it delivers to any connection.
+    #[inline]
+    pub(crate) fn send_counted(
+        &mut self,
+        sample: iceoryx2::sample_mut::SampleMut<CerService, [u8], ()>,
+    ) -> Result<usize, SendFailure> {
+        self.record_block_published();
+        let sent = if matches!(self.block_send_hook, Some(BlockSendHook::FailNextSend)) {
+            self.block_send_hook = None;
+            // Dropping the sample releases its slot without sending it.
+            drop(sample);
+            Err(SendFailure::Refused)
+        } else {
+            sample.send().map_err(SendFailure::Send)
+        };
+        match sent {
+            Ok(recipients) => {
+                if let Some(BlockSendHook::AfterSend(hook)) = &mut self.block_send_hook {
+                    hook();
+                }
+                Ok(recipients)
+            }
+            Err(failure) => {
+                self.record_block_unpublished();
+                Err(failure)
+            }
+        }
+    }
+
+    /// `block`: count one frame on every registered consumer's word and
+    /// store each count's take-back in its slot. Called only by
+    /// [`Self::send_counted`], before the send. A no-op (empty vec) unless the
+    /// topic has a `block` consumer. `Release` so the producer's pre-fire
+    /// `Acquire` load sees a consistent depth.
+    fn record_block_published(&mut self) {
+        for slot in &mut self.block_outstanding {
+            // `record_published_with_undo` IS the `Release` RMW of the block
+            // credit, on whichever word backs the edge, so a split edge's
+            // producer bumps the SHARED page and its peer consumer's drain
+            // sees the same count. Stored unconditionally: a released slot
+            // stores `None` over any token an earlier send left.
+            slot.pending = slot.word.record_published_with_undo();
+        }
+    }
+
+    /// `block`: take back the count [`Self::record_block_published`] took on
+    /// every registered consumer's word, for a send that reached no queue,
+    /// with the token each count stored. Called only by
+    /// [`Self::send_counted`], on its `Err` arm.
+    fn record_block_unpublished(&mut self) {
+        for slot in &mut self.block_outstanding {
+            if let Some(undo) = slot.pending.take() {
+                slot.word.record_unpublished(undo);
+            }
         }
     }
 
@@ -1117,6 +1235,14 @@ impl CerulionPublisher {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn fault_inject_send_raw_loan(&mut self) {
         self.fault_inject_send_raw_loan = true;
+    }
+
+    /// Testing-only: install the send-window seam on every send path of this
+    /// publisher. Replaces any hook installed before.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn set_block_send_hook_for_test(&mut self, hook: BlockSendHook) {
+        self.block_send_hook = Some(hook);
     }
 
     /// The history depth this publisher's service ACTUALLY
@@ -1492,6 +1618,128 @@ impl CerulionPublisher {
             writer,
             ProxyPublisher::Iceoryx2(self),
         ))
+    }
+
+    /// Host-private native loan for a checked plugin descriptor.
+    ///
+    /// Keeps the adaptive capacity and initializes only the wire prefix, as
+    /// `loan_proxy` does. The native owner stays in the host lease arena.
+    #[doc(hidden)]
+    pub(crate) fn loan_plugin_frame(
+        &mut self,
+        layout: super::plugin_lease::PluginWireLayout,
+    ) -> TransportResult<RawShmLoan> {
+        let prefix = layout
+            .prefix_len()
+            .ok_or_else(|| TransportError::InvalidTransportConfig {
+                reason: "plugin wire prefix or alignment is invalid".to_string(),
+            })?;
+        if prefix > self.max_slice_len.get() {
+            return Err(TransportError::BufferTooSmall {
+                topic: self.topic.to_string(),
+                needed: prefix as usize,
+                available: self.max_slice_len.get() as usize,
+            });
+        }
+        self.check_subscriber_events();
+        if self.fault_inject_loan_fail_next {
+            self.fault_inject_loan_fail_next = false;
+            self.bump_discard_signal();
+            return Err(TransportError::LoanCapacity {
+                topic: self.topic.to_string(),
+            });
+        }
+        let capacity = if layout.variable_fields == 0 {
+            prefix
+        } else {
+            self.adaptive_loan_size(prefix)
+        };
+        let mut loan = self
+            .loan_raw_uninit(capacity as usize)
+            .inspect_err(|_| self.bump_discard_signal())?;
+        let mut header_bytes = [0; WireHeader::SIZE];
+        WireHeader {
+            schema_hash: layout.schema_hash,
+            total_size: capacity,
+            offset_table_offset: WireHeader::SIZE as u32 + layout.fixed_size,
+            offset_table_count: layout.variable_fields,
+            sequence: self.sequence(),
+            timestamp_ns: self.clock.now_ns(),
+            step_tag: crate::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut header_bytes);
+        let bytes = loan.bytes_uninit_mut();
+        for byte in &mut bytes[..prefix as usize] {
+            byte.write(0);
+        }
+        for (dst, src) in bytes.iter_mut().zip(header_bytes) {
+            dst.write(src);
+        }
+        // SAFETY: this is the same native mapping and prefix initialization
+        // as loan_proxy. Every mapping byte has an OS-defined value; only the
+        // initialized prefix is interpreted before the trusted plugin writes
+        // its payload. Host finish validates offset ranges and total_size and
+        // never sends an incomplete/abandoned loan. No lifetime is extended.
+        Ok(unsafe { loan.assume_init_shm_defined() })
+    }
+
+    /// Commit an already validated plugin loan through native accounting.
+    /// Header timestamp is the loan stamp; sequence is consumed here only.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_frame(
+        &mut self,
+        mut loan: RawShmLoan,
+        mut header: WireHeader,
+        total_size: u32,
+    ) -> TransportResult<()> {
+        header.total_size = total_size;
+        header.sequence = self.commit_sequence();
+        header.write_to_buf(loan.bytes_mut());
+        if let Err(error) = self.send_raw_loan(loan) {
+            self.record_send_fail_drop();
+            return Err(error);
+        }
+        self.record_payload_size(total_size);
+        self.complete_plugin_output(header.schema_hash, false);
+        if let Err(error) = self.notify_sent_sample() {
+            tracing::trace!(topic = %self.topic, error = %error, "plugin output notification failed after delivery");
+        }
+        Ok(())
+    }
+
+    /// Commit the explicitly advertised adaptive-spill exception.
+    /// Payload remains node-owned for this synchronous copy into a new loan.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_spill(
+        &mut self,
+        mut header: WireHeader,
+        payload: &[u8],
+    ) -> TransportResult<()> {
+        header.total_size = (WireHeader::SIZE + payload.len()) as u32;
+        header.sequence = self.commit_sequence();
+        let mut bytes = [0; WireHeader::SIZE];
+        header.write_to_buf(&mut bytes);
+        if let Err(error) = self.send_overflow_frame(&bytes, payload) {
+            self.record_payload_size(header.total_size);
+            self.record_dropped_overflow_frame();
+            return Err(error);
+        }
+        self.complete_plugin_output(header.schema_hash, true);
+        Ok(())
+    }
+
+    fn complete_plugin_output(&mut self, schema_hash: u64, spill: bool) {
+        if let Some(suppressed) = self.record_output_complete() {
+            if spill {
+                super::output_proxy::log_spill_output_recovered(
+                    self.topic(),
+                    schema_hash,
+                    suppressed,
+                );
+            } else {
+                super::output_proxy::log_output_recovered(self.topic(), schema_hash, suppressed);
+            }
+        }
     }
 
     /// Best-effort `SentSample` notification — exposed for `OutputProxy::Drop`,
@@ -2044,15 +2292,16 @@ impl CerulionPublisher {
         // [0..WireHeader::SIZE) for the header and [WireHeader::SIZE..total_size)
         // for the payload).
         let sample = unsafe { sample.assume_init() };
-        sample.send().map_err(|e| TransportError::Publish {
-            topic: self.topic.to_string(),
-            reason: format!("{}", e),
-        })?;
+        // `block`: counted inside `send_counted`, before the frame becomes
+        // visible. The overflow re-send is mutually exclusive with the
+        // steady-state send (OutputProxy::drop `return`s after the overflow
+        // arm), so exactly one of them counts per published frame.
+        self.send_counted(sample)
+            .map_err(|e| TransportError::Publish {
+                topic: self.topic.to_string(),
+                reason: format!("{}", e),
+            })?;
 
-        // `block`: the overflow re-send is mutually exclusive with
-        // the steady-state send (OutputProxy::drop `return`s after the
-        // overflow arm), so exactly one of them bumps per published frame.
-        self.record_block_published();
         // A frame went out — reset the output's
         // `promise_within_ms` watchdog (no-op unless one is wired).
         self.record_promise_within_published();
@@ -2145,16 +2394,18 @@ impl CerulionPublisher {
             .sample
             .take()
             .expect("RawShmLoan sent twice (impossible: send consumes)");
-        let recipients = sample.send().map_err(|e| TransportError::Publish {
-            topic: self.topic.to_string(),
-            reason: format!("{}", e),
-        })?;
-        // `block` invariant: `send_raw_loan` is a 4th
-        // send path, and every frame entering subscriber queues MUST bump the
-        // outstanding mirror, else a future `block` topic publishing via the
-        // flatten-into-loan path would silently overflow (Principle #6).
-        // No-op (empty `block_outstanding` vec) unless the topic is all-block.
-        self.record_block_published();
+        // `block` invariant: `send_raw_loan` is a 4th send path, and every
+        // frame entering subscriber queues MUST be counted on the outstanding
+        // mirror, else a `block` topic publishing via the flatten-into-loan
+        // path would silently overflow (Principle #6). `send_counted` counts
+        // before the frame becomes visible; a no-op (empty
+        // `block_outstanding` vec) unless the topic has a `block` consumer.
+        let recipients = self
+            .send_counted(sample)
+            .map_err(|e| TransportError::Publish {
+                topic: self.topic.to_string(),
+                reason: format!("{}", e),
+            })?;
         // A frame went out — reset the output's `promise_within_ms` watchdog
         // (no-op unless one is wired), symmetric with `publish_raw`.
         self.record_promise_within_published();
@@ -2223,13 +2474,15 @@ impl CerulionPublisher {
         // `assume_init`, satisfying iceoryx2's contract that the consumer
         // observes only initialised memory.
         let sample = unsafe { sample.assume_init() };
-        let recipients = sample.send().map_err(|e| TransportError::Publish {
-            topic: self.topic.to_string(),
-            reason: format!("{}", e),
-        })?;
+        let recipients = self
+            .send_counted(sample)
+            .map_err(|e| TransportError::Publish {
+                topic: self.topic.to_string(),
+                reason: format!("{}", e),
+            })?;
 
         // `block`: every frame that
-        // enters every subscriber's queue MUST bump the outstanding mirror —
+        // enters every subscriber's queue MUST be counted on the outstanding mirror,
         // including frames sent via `publish_raw`. Without this, a `block`
         // producer publishing through `ctx.publisher_mut("out").publish_raw(..)`
         // would enqueue frames the mirror never counts, so the scheduler
@@ -2241,13 +2494,50 @@ impl CerulionPublisher {
         // `publish_raw`, so history-replayed frames are NOT counted by this
         // mirror; the graph build warns against `block` + `history_size > 0`
         // for exactly this reason. This counts live sends + genuine raw-FFI
-        // re-publishes only.)
-        // No-op (empty `block_outstanding` vec) unless the topic is all-block.
-        self.record_block_published();
+        // re-publishes only.) `send_counted` above took the count before the
+        // frame became visible; a no-op (empty `block_outstanding` vec)
+        // unless the topic has a `block` consumer.
         // A frame went out — reset the output's
         // `promise_within_ms` watchdog (no-op unless one is wired).
         self.record_promise_within_published();
 
+        self.complete_raw_publish(data);
+
+        Ok(recipients)
+    }
+
+    /// Publish a fully initialized exact raw frame without replacing its stamps.
+    #[doc(hidden)]
+    pub(crate) fn commit_plugin_raw_frame(
+        &mut self,
+        mut loan: RawShmLoan,
+    ) -> TransportResult<usize> {
+        let mut header = [0; WireHeader::SIZE];
+        header.copy_from_slice(&loan.bytes_mut()[..WireHeader::SIZE]);
+        let recipients = self
+            .send_raw_loan(loan)
+            .inspect_err(|_| self.record_send_fail_drop())?;
+        self.complete_raw_publish(&header);
+        Ok(recipients)
+    }
+
+    /// Loan an exact-size raw ingress frame. Header is initialized for validation;
+    /// the caller must overwrite its complete initialized frame before finishing.
+    #[doc(hidden)]
+    pub(crate) fn loan_plugin_raw_frame(&mut self, size: u32) -> TransportResult<RawShmLoan> {
+        let mut loan = self.loan_raw_uninit(size as usize)?;
+        for byte in &mut loan.bytes_uninit_mut()[..WireHeader::SIZE] {
+            byte.write(0);
+        }
+        // SAFETY: POSIX SHM supplies defined mapping bytes, as in loan_proxy.
+        // The prefix is initialized, the host retains the native owner, and the
+        // trusted raw caller initializes its complete frame before finish. Shape
+        // validation refuses an unwritten/malformed header; no lifetime extends.
+        Ok(unsafe { loan.assume_init_shm_defined() })
+    }
+
+    // Preserve the existing raw publish trace/notify effects in one shared path.
+    fn complete_raw_publish(&mut self, data: &[u8]) {
         // Regime A: record the publish into the trace
         // (when attached). Parsing 24 bytes of WireHeader is cheap
         // relative to the iceoryx2 send that just completed.
@@ -2314,8 +2604,6 @@ impl CerulionPublisher {
             // off-gate arm is the pin: its producer publishes exactly this way.
             self.unannounced_publish.store(true, Ordering::Relaxed);
         }
-
-        Ok(recipients)
     }
 
     /// Non-blocking check for subscriber events.
@@ -2872,47 +3160,54 @@ impl RawShmLoanUninit {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
-    use crate::abi_layout::abi_pin_struct;
-    vec![abi_pin_struct!(CerulionPublisher {
-        topic,
-        publisher,
-        notifier,
-        listener,
-        last_listener_count,
-        self_drains_armed,
-        next_self_drain_rearm,
-        sequence,
-        initial_sequence,
-        clock,
-        max_slice_len,
-        history_size,
-        provisioned_history_size,
-        sizer,
-        trace,
-        fault_inject_publish_raw_after,
-        fault_inject_send_overflow_frame_after,
-        fault_inject_send_raw_loan,
-        frames_dropped_overflow,
-        frames_dropped_invariant_violation,
-        frames_dropped_send_fail,
-        block_outstanding,
-        promise_within_last_publish_ns,
-        doorbell,
-        event_service,
-        notify_elision_expected,
-        notify_elided_count,
-        notify_gate_last_elided,
-        notify_on_publish_raw,
-        unannounced_publish,
-        resweep_notify_count,
-        notify_delivery_latch,
-        notify_undelivered_shared,
-        discard_signal,
-        replay_suppress,
-        fault_inject_loan_fail_next,
-        discard_latch,
-        output_discard_shared
-    })]
+    use crate::abi_layout::{abi_pin_enum, abi_pin_struct};
+    vec![
+        abi_pin_enum!(BlockSendHook {
+            BlockSendHook::AfterSend(_),
+            BlockSendHook::FailNextSend
+        }),
+        abi_pin_struct!(CerulionPublisher {
+            topic,
+            publisher,
+            notifier,
+            listener,
+            last_listener_count,
+            self_drains_armed,
+            next_self_drain_rearm,
+            sequence,
+            initial_sequence,
+            clock,
+            max_slice_len,
+            history_size,
+            provisioned_history_size,
+            sizer,
+            trace,
+            fault_inject_publish_raw_after,
+            fault_inject_send_overflow_frame_after,
+            fault_inject_send_raw_loan,
+            block_send_hook,
+            frames_dropped_overflow,
+            frames_dropped_invariant_violation,
+            frames_dropped_send_fail,
+            block_outstanding,
+            promise_within_last_publish_ns,
+            doorbell,
+            event_service,
+            notify_elision_expected,
+            notify_elided_count,
+            notify_gate_last_elided,
+            notify_on_publish_raw,
+            unannounced_publish,
+            resweep_notify_count,
+            notify_delivery_latch,
+            notify_undelivered_shared,
+            discard_signal,
+            replay_suppress,
+            fault_inject_loan_fail_next,
+            discard_latch,
+            output_discard_shared
+        }),
+    ]
 }
 
 #[cfg(test)]

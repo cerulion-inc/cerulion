@@ -55,7 +55,10 @@ struct BagdGuard(&'static str);
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         if let Ok(out) = Command::new("pgrep")
-            .args(["-f", &format!("bagd --out recordings/{}_", self.0)])
+            .args([
+                "-f",
+                &format!("bagd --out (/[^[:space:]]*/)?recordings/{}_", self.0),
+            ])
             .output()
         {
             for pid in String::from_utf8_lossy(&out.stdout)

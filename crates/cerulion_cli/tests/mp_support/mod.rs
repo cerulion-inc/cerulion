@@ -543,7 +543,7 @@ impl BagdGuard {
 /// with no match, which is the ordinary empty answer and not an error.
 fn bagd_pids() -> Vec<i32> {
     let out = Command::new("pgrep")
-        .args(["-f", "bagd --out recordings/mpdemo_"])
+        .args(["-f", "bagd --out (/[^[:space:]]*/)?recordings/mpdemo_"])
         .output()
         .expect("run pgrep to find bagd daemons");
     match out.status.code() {

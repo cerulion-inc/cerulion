@@ -79,6 +79,11 @@ use std::path::{Path, PathBuf};
 mod era_check;
 use era_check::{check_distro_claim, observed_era_label, DistroClaimVerdict};
 
+// Which builds carry the period-learned park: SHARED with the crate's tests
+// (`src/period_park_cfg.rs`), which pin the same rule this script emits.
+#[path = "src/period_park_cfg.rs"]
+mod period_park_cfg;
+
 /// Every doc comment bindgen lifts from the ROS headers is wrapped in a
 /// `text` code fence, so the doxygen text ships verbatim on the generated
 /// bindings while rustdoc never reads an indented line of it as a Rust
@@ -268,7 +273,21 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=src/ffi/vendored_bindings.rs");
     println!("cargo:rerun-if-changed=src/era_check.rs");
+    println!("cargo:rerun-if-changed=src/period_park_cfg.rs");
     println!("cargo:rerun-if-changed=shim/cppstring_shim.cpp");
+
+    // The period-learned park in `rmw_wait`: `cerulion_period_park` on every
+    // Linux aarch64 build, and on any other build with the `period-park`
+    // feature. Cargo reruns this script when the feature set or the target
+    // changes.
+    println!("cargo:rustc-check-cfg=cfg(cerulion_period_park)");
+    if period_park_cfg::period_park_compiled(
+        env::var_os("CARGO_FEATURE_PERIOD_PARK").is_some(),
+        &env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+        &env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default(),
+    ) {
+        println!("cargo:rustc-cfg=cerulion_period_park");
+    }
 
     // Declare every capability cfg up front (both paths) so the
     // `unexpected_cfgs` lint knows the names; emission below is

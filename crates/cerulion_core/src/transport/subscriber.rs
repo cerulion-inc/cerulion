@@ -44,7 +44,9 @@ use crate::scheduler::{
 };
 use crate::wire::WireHeader;
 
+use super::drain_clip_latch::{DrainClipLatch, DrainClipReport};
 use super::events::PubSubEvent;
+use super::failure_regime_latch::RegimeDecision;
 use super::input_view::InputView;
 use super::shm_sample::SampleHandle;
 use super::CerService;
@@ -195,9 +197,10 @@ struct BlockProbe {
     /// producer is being deferred on this consumer's behalf.
     threshold: u64,
     /// Shared counters — `block_fires_deferred_count` is maintained by the
-    /// PRODUCER pre-fire; the event only reads it. (No `node_id`: this probe
-    /// never warns/bumps — the producer's defer already does both — so it
-    /// needs no attribution beyond `input`.)
+    /// PRODUCER pre-fire; the event only reads it. (No `node_id`: the probe
+    /// bumps none of these counters, the producer's defer warns and bumps, and
+    /// the probe's own warning, the clipped-drain report of `drain_clips`,
+    /// carries the input's `topic`.)
     counters: Arc<BackpressureCounters>,
     input: Arc<str>,
     /// Edge-trigger latch: a below-threshold drain rearms; the first
@@ -210,6 +213,13 @@ struct BlockProbe {
     /// (see the sibling probes' field docs for the rationale).
     regime_count: u64,
     buffer_capacity: usize,
+    /// Flood suppression for drains that removed more frames than the word
+    /// had queued, its forgiven backlog included, which its saturating
+    /// subtraction clipped at 0
+    /// ([`CerulionSubscriber::block_drains_clipped`]). Every drain
+    /// records through `&self`, so the latch sits in a `RefCell`; the
+    /// subscriber is used from one thread at a time (it is `Send`, not `Sync`).
+    drain_clips: std::cell::RefCell<DrainClipLatch>,
 }
 
 /// The single backpressure probe installed on an input.
@@ -234,7 +244,7 @@ enum BackpressureProbe {
     /// spot what iceoryx2 reclaimed on overflow.
     DropOldest(DropOldestProbe),
     /// `block` consumer-side event probe (see [`BlockProbe`]): installed on
-    /// `block` consumers on all-`block` topics; holds the shared
+    /// `block` consumers; holds the shared
     /// `outstanding` mirror (each drain decrements it, saturating) plus the
     /// threshold + edge state to fire the consumer's event at the defer
     /// line.
@@ -523,6 +533,25 @@ fn classify_gap(base_seq: u32, first_seq: u32) -> GapClass {
 
 /// An inbound iceoryx2 sample (slice payload, no user header).
 type InboundSample = Sample<CerService, [u8], ()>;
+
+fn check_plugin_frame(
+    topic: &str,
+    frame: &[u8],
+    header: &WireHeader,
+    layout: Option<super::plugin_lease::PluginWireLayout>,
+) -> TransportResult<()> {
+    if let Some(layout) = layout {
+        if !layout.accepts(frame, header.total_size)
+            || frame.as_ptr().align_offset(layout.alignment as usize) != 0
+        {
+            return Err(TransportError::Deserialization {
+                topic: topic.to_string(),
+                reason: "plugin frame prefix, offset table or alignment is invalid".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// A validated, zero-copy raw input frame.
 ///
@@ -876,6 +905,10 @@ pub struct DataOnlySubscriber {
     /// `dead_code = deny` satisfied without an `allow`.
     #[cfg(any(test, feature = "test-helpers"))]
     fault_inject_receive_after: Option<u32>,
+    // After the data port: a remote tap retains policy through port teardown.
+    remote_lease: Option<super::egress_scope::RemoteTopicLease>,
+    // Export taps retain local source identity until their data port drops.
+    local_lease: Option<super::mirror_origin::LocalObservationLease>,
 }
 
 impl DataOnlySubscriber {
@@ -899,9 +932,19 @@ impl DataOnlySubscriber {
             subscriber,
             max_borrowed_samples,
             data_service,
+            remote_lease: None,
+            local_lease: None,
             #[cfg(any(test, feature = "test-helpers"))]
             fault_inject_receive_after: None,
         }
+    }
+
+    pub(crate) fn hold_remote_lease(&mut self, lease: super::egress_scope::RemoteTopicLease) {
+        self.remote_lease = Some(lease);
+    }
+
+    pub(crate) fn hold_local_lease(&mut self, lease: super::mirror_origin::LocalObservationLease) {
+        self.local_lease = Some(lease);
     }
 
     /// The receive-queue depth this tap was ACTUALLY created
@@ -983,6 +1026,17 @@ impl DataOnlySubscriber {
     pub fn publisher_count(&self) -> u32 {
         use iceoryx2::prelude::PortFactory as _;
         self.data_service.dynamic_config().number_of_publishers() as u32
+    }
+
+    /// The native service's publisher capacity, fixed when the service is created.
+    ///
+    /// Principle #4: a declared graph import requires capacity one so a second
+    /// writer cannot join after admission. A live count of one does not establish
+    /// that invariant on a multi-publisher service. This static read allocates no
+    /// memory and opens no additional port.
+    pub fn max_publishers(&self) -> usize {
+        use iceoryx2::prelude::PortFactory as _;
+        self.data_service.static_config().max_publishers()
     }
 
     /// Returns the topic name.
@@ -1214,6 +1268,29 @@ struct DrainOutcome {
     /// a decimated Empty from a genuinely-empty queue; nothing on the
     /// serve/accounting path reads it.
     decimated: bool,
+    /// True iff the surviving `Sample` is a frame a `block_timeout_ms`
+    /// release forgave: its pop paid the forgiven backlog
+    /// ([`survivor_forgiven`]). A slot that holds it records it as held
+    /// forgiven ([`CerulionSubscriber::reconcile_block_slot_debt`], or
+    /// [`CerulionSubscriber::restate_replaced_block_head`] when it replaces a
+    /// skipped head). False for every other slot and on an input with no
+    /// `block` probe.
+    forgiven: bool,
+    // Host ABI observation only; never changes the native read-log decision.
+    withheld: bool,
+}
+
+/// Is the last of `removed` frames a drain took off the queue a forgiven
+/// one, given that the drain paid `paid` frames of the forgiven backlog? The
+/// backlog is the oldest frames of the queue and a drain pays it first, so
+/// the frames it paid are the first ones removed, and the last one removed
+/// (the drain's survivor) is forgiven only when every removed frame was.
+/// `removed == 0` has no survivor.
+pub(crate) fn survivor_forgiven(removed: u64, paid: u64) -> bool {
+    if crate::oracle_mutant::active("block_forgiven_hold_counted") {
+        return false;
+    }
+    removed != 0 && paid >= removed
 }
 
 impl DrainOutcome {
@@ -1230,6 +1307,8 @@ impl DrainOutcome {
             popped: 0,
             latest_ts: None,
             decimated: false,
+            forgiven: false,
+            withheld: true,
         }
     }
 }
@@ -1518,16 +1597,21 @@ pub struct CerulionSubscriber {
     /// So a frame ENTERING a slot re-credits the mirror by 1 and a frame
     /// LEAVING one (served, skipped, death-discarded, or dropped with the
     /// subscriber) debits it — the decrement MOVES from pop time to slot-exit
-    /// time for exactly the frames that sit in a slot. Everything that does
-    /// not land in a slot (decimated, junk-skipped, `Empty`, `Err`, a
-    /// drain-to-latest drop) keeps the plain pop-time decrement: those frames
-    /// have left the world.
+    /// time for exactly the frames that sit in a slot. A frame whose pop paid
+    /// the backlog a `block_timeout_ms` release forgave enters as held
+    /// forgiven instead and re-credits nothing, so after a release the
+    /// producer keeps room for `depth` frames published after it. Everything
+    /// that does not land in a slot (decimated, junk-skipped, `Empty`, `Err`,
+    /// a drain-to-latest drop) keeps the plain pop-time decrement: those
+    /// frames have left the world.
     ///
     /// It is maintained by ONE method, [`Self::reconcile_block_slot_debt`],
     /// which RE-DERIVES it from the slots rather than counting `+1`/`-1` at
     /// each site: the invariant `debt == (frozen is Sample) + (next_head is
     /// Some)` is then the implementation instead of an assertion a new call
-    /// site has to remember. Nonzero only on a `block`-probed
+    /// site has to remember. A skipped head the queue's refill replaces leaves
+    /// the debt unchanged, and [`Self::restate_replaced_block_head`] moves the
+    /// word for that one case. Nonzero only on a `block`-probed
     /// [`ConsumeMode::EachFifo`] input, which today means a per-set Sync
     /// trigger (a `Data` trigger unifies only under `DropOldest`, and a
     /// `block` non-trigger input is excluded from the step-boundary snapshot).
@@ -2366,7 +2450,7 @@ impl CerulionSubscriber {
     }
 
     /// `block`: install the consumer-side probe. Called by the graph
-    /// runtime for `block` consumers on all-`block` topics. The `outstanding`
+    /// runtime for `block` consumers. The `outstanding`
     /// `Arc` is the same one registered on the producer's publisher (publish
     /// increment) + its pre-fire check (fullness read); `counters` is the same
     /// set the producer bumps on defer (the event only reads it).
@@ -2396,6 +2480,7 @@ impl CerulionSubscriber {
             regime_started_ns: 0,
             regime_count: 0,
             buffer_capacity,
+            drain_clips: std::cell::RefCell::new(DrainClipLatch::new()),
         }));
     }
 
@@ -2458,27 +2543,121 @@ impl CerulionSubscriber {
 
     /// `block`: decrement the outstanding mirror by the number of
     /// samples just removed from the iceoryx2 queue (saturating — the
-    /// mirror must never underflow). No-op unless `block` is wired.
+    /// mirror must never underflow). `emptied` when the drain's last
+    /// `receive()` returned no sample, so the queue is empty on every
+    /// connection: the drain then goes through
+    /// [`CreditWord::record_drained_to_empty`](crate::credit::CreditWord::record_drained_to_empty),
+    /// which also zeroes a local word's queued count and backlog. No-op
+    /// unless `block` is wired.
+    ///
+    /// A drain that removed frames reports what its RMW clipped
+    /// ([`Drained::clipped`](crate::credit::Drained::clipped), `0` on a
+    /// released slot) through [`Self::report_block_drain`]; an empty drain
+    /// (`removed == 0`) reports nothing, so an idle poll never reads as a drain
+    /// the word counted in full.
+    ///
+    /// Returns how many of the `removed` frames paid the backlog a
+    /// `block_timeout_ms` release forgave
+    /// ([`Drained::paid`](crate::credit::Drained::paid)), which
+    /// [`survivor_forgiven`] reads; `0` with no `block` probe.
     #[inline]
-    fn record_block_drained(&self, removed: u64) {
-        if removed == 0 {
-            return;
+    fn record_block_drained(&self, removed: u64, emptied: bool) -> u64 {
+        if removed == 0 && !emptied {
+            return 0;
         }
         if let Some(counter) = self.block_probe().map(|p| &p.outstanding) {
-            // Saturating: an interleaving non-drain removal (history
-            // replay on a late joiner) could otherwise drive the mirror
-            // below zero. Clamping keeps "outstanding == 0" the floor.
-            //
-            // `record_drained` IS that saturating `try_update`,
-            // and it additionally RINGS the word's wake epoch. Ringing is not
-            // decoration on a split edge: freeing credit is precisely the event
-            // a credit-blocked producer in another process parks for, and a
-            // decrement that did not ring would leave it asleep until its next
-            // slice — the wedge the wake word exists to prevent. On a LOCAL
-            // word nobody can be parked, so the ring is a `wake_seq` bump plus
-            // a `parked`-mask read and no syscall.
-            counter.record_drained(removed);
+            let drained = if emptied {
+                counter.record_drained_to_empty(removed)
+            } else {
+                // Saturating: an interleaving non-drain removal (history
+                // replay on a late joiner) could otherwise drive the mirror
+                // below zero. Clamping keeps "outstanding == 0" the floor.
+                //
+                // `record_drained` IS that saturating `try_update`,
+                // and it additionally RINGS the word's wake epoch. Ringing is not
+                // decoration on a split edge: freeing credit is precisely the event
+                // a credit-blocked producer in another process parks for, and a
+                // decrement that did not ring would leave it asleep until its next
+                // slice: the wedge the wake word exists to prevent. On a LOCAL
+                // word nobody can be parked, so the ring is a `wake_seq` bump plus
+                // a `parked`-mask read and no syscall.
+                counter.record_drained(removed)
+            };
+            if removed != 0 {
+                self.report_block_drain(drained.clipped);
+            }
+            return drained.paid;
         }
+        0
+    }
+
+    /// `block`: report one drain through the probe's [`DrainClipLatch`].
+    /// `clipped` is the drain's
+    /// [`Drained::clipped`](crate::credit::Drained::clipped): how many more
+    /// frames it removed than its word had as forgiven backlog and queued
+    /// count, the ones the subtraction could not take off once the word
+    /// reached 0. The first clipping drain of a regime warns, repeats
+    /// log at `debug!` and are counted, the drain that takes the running total
+    /// to each decade warns with a line of its own, and the clean drain that
+    /// completes the regime's closing run logs one recovery line when the
+    /// regime counted a repeat. A no-op unless a block probe is installed.
+    #[inline]
+    fn report_block_drain(&self, clipped: u64) {
+        let Some(probe) = self.block_probe() else {
+            return;
+        };
+        let mut clips = probe.drain_clips.borrow_mut();
+        let report = clips.observe(clipped);
+        let total_failures = clips.total_failures();
+        drop(clips);
+        let decision = match report {
+            DrainClipReport::Quiet => return,
+            DrainClipReport::Recovered { suppressed } => {
+                tracing::info!(
+                    topic = %self.topic,
+                    suppressed_count = suppressed,
+                    total_failures,
+                    "block credit drains match the word's count again"
+                );
+                return;
+            }
+            DrainClipReport::Clipped(decision) => decision,
+        };
+        match decision {
+            RegimeDecision::Loud => tracing::warn!(
+                topic = %self.topic,
+                total_failures,
+                "block credit drain removed frames its word never counted, so the word reads \
+                 below the queue and the producer can overrun the declared depth; look for a \
+                 writer outside the graph or `history_size` on this block topic"
+            ),
+            RegimeDecision::StillFailing { suppressed, .. } => tracing::warn!(
+                topic = %self.topic,
+                total_failures,
+                suppressed_count = suppressed,
+                "block credit drains still remove frames their word never counted"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                topic = %self.topic,
+                total_failures,
+                suppressed_count = suppressed,
+                "block credit drain clipped at zero again"
+            ),
+        }
+    }
+
+    /// `block`: how many drains of this input removed more frames than their
+    /// word had queued, its forgiven backlog included: drains of frames the
+    /// word never counted (see
+    /// [`crate::credit::CreditShared::record_drained`]). A drain of a released
+    /// slot ([`crate::credit::CreditShared::release_slot`]) is not one. A
+    /// running total, never reset. `0` unless this input is wired `block`.
+    /// Hidden from the documented API: tests and the runtime read it, and a
+    /// user sees the same condition through the clip report's warning lines.
+    #[doc(hidden)]
+    pub fn block_drains_clipped(&self) -> u64 {
+        self.block_probe()
+            .map_or(0, |probe| probe.drain_clips.borrow().total_failures())
     }
 
     /// Re-state this input's `block` occupancy from the SLOTS, after
@@ -2498,30 +2677,40 @@ impl CerulionSubscriber {
     /// The mirror moves in the SAME direction the frames did:
     ///
     /// * a frame that entered a slot was already decremented at its pop, so the
-    ///   mirror is credited back by 1 — occupancy did not fall, it moved;
+    ///   mirror is credited back by 1: occupancy did not fall, it moved; the
+    ///   word counts it as held, apart from its queued frames. When
+    ///   `forgiven_entering` says the entering frame's pop paid the backlog a
+    ///   `block_timeout_ms` release forgave, one entering frame is recorded as
+    ///   held forgiven instead, in the same RMW: it counted nothing before its
+    ///   pop and counts nothing in the slot;
     /// * a frame that left a slot really has been consumed, so the mirror is
     ///   debited (saturating — `outstanding == 0` is the floor, and a lost
     ///   decrement must never be able to wrap it to `u64::MAX` and defer the
-    ///   producer forever).
+    ///   producer forever). The word pays its held forgiven frames first: they
+    ///   are older than any counted frame a slot holds.
     ///
-    /// Every credit can only push `outstanding` UP, i.e. defer the producer
-    /// EARLIER, so the failure direction is conservative: Principle #6 tightens
-    /// rather than loosens.
+    /// No credit ever pushes `outstanding` DOWN, so a credit can only defer
+    /// the producer EARLIER, and the failure direction is conservative:
+    /// Principle #6 tightens rather than loosens.
     ///
     /// MEASURED REDUNDANCY, recorded because it is easy to mistake for coverage.
-    /// The call at the boundary fill is TOTAL on its own: it runs every level
-    /// boundary and re-derives from the slots, so it repairs whatever any other
-    /// site missed before the producer next reads the mirror (its `decide` runs
-    /// at an earlier level of the FOLLOWING step). Deleting the serve exit, the
-    /// discard exits, or both leaves every end-to-end arm green and fails
-    /// only the subscriber walk, which observes
-    /// between transitions. So the other four calls do not buy correctness at a
-    /// boundary; they buy the invariant holding CONTINUOUSLY, which is what the
-    /// debug assert rests on and what any mid-step reader of `outstanding` sees
-    /// (the consumer's own block event samples it pre-drain). Deleting the
-    /// boundary ENTRY call is a different matter and is observable end to end:
-    /// on a starved input no other site runs at all, so nothing repairs it and
-    /// the producer publishes `depth + 1`.
+    /// The call at the boundary fill runs every level boundary and re-derives
+    /// from the slots, so it repairs a missed slot COUNT before the producer
+    /// next reads the mirror (its `decide` runs at an earlier level of the
+    /// FOLLOWING step). Deleting the serve exit, the discard exits, or both
+    /// leaves every end-to-end arm green and fails only the subscriber walks,
+    /// which observe between transitions. So those calls buy the invariant
+    /// holding CONTINUOUSLY, which is what the debug assert rests on and what
+    /// any mid-step reader of `outstanding` sees (the consumer's own block
+    /// event samples it pre-drain), with one exception a re-derivation cannot
+    /// repair: a head replaced in its slot leaves the count equal to the debt,
+    /// so only [`Self::restate_replaced_block_head`], which
+    /// [`Self::sync_discard_head`] calls after its refill's pop, makes the word
+    /// pay a held forgiven head and count a refill published after the
+    /// release. Deleting the boundary ENTRY
+    /// call is a different matter and is observable end to end: on a starved
+    /// input no other site runs at all, so nothing repairs it and the producer
+    /// publishes `depth + 1`.
     ///
     /// A no-op unless a `block` probe is installed AND the input is per-message
     /// FIFO. Both guards are load-bearing rather than defensive: `sample(N)` and
@@ -2529,7 +2718,12 @@ impl CerulionSubscriber {
     /// [`ConsumeMode::Latest`] input's `frozen` slot is the step-boundary
     /// snapshot, whose accounting contract is pinned elsewhere and is not this
     /// feature's to change.
-    fn reconcile_block_slot_debt(&mut self) {
+    ///
+    /// `forgiven_entering` is the entering frame's [`DrainOutcome::forgiven`]
+    /// at a slot ENTRY site (the trigger fill and refill, the descent's peek,
+    /// the refill of a skipped head that held no frame) and `false` at every
+    /// exit-only site, where no frame enters.
+    fn reconcile_block_slot_debt(&mut self, forgiven_entering: bool) {
         if self.consume_mode != ConsumeMode::EachFifo || self.block_probe().is_none() {
             debug_assert_eq!(
                 self.block_slot_debt, 0,
@@ -2545,19 +2739,59 @@ impl CerulionSubscriber {
         }
         if let Some(probe) = self.block_probe() {
             if held > debt {
-                // The credit-BACK direction — the same
-                // `fetch_add(Release)` this site wrote inline, through the
-                // word's own API so a mapped edge moves the SHARED page.
-                probe.outstanding.record_published_n(u64::from(held - debt));
+                // The credit-BACK direction, through the word's own API so a
+                // mapped edge moves the SHARED page. `record_slot_held` counts
+                // the frames as held rather than queued: they are out of the
+                // queue, and the word's eviction bound reads the queue alone.
+                // A frame whose pop paid the forgiven backlog goes to the held
+                // forgiven count in the same RMW. A mapped word is never
+                // forgiven, so its pops pay nothing and every frame is counted.
+                let entering = held - debt;
+                let forgiven = entering.min(u8::from(forgiven_entering));
+                probe
+                    .outstanding
+                    .record_slot_held(u64::from(entering - forgiven), u64::from(forgiven));
             } else {
                 // The RELEASE direction really frees a slot, so it goes through
-                // `record_drained` and therefore RINGS the wake word — a
-                // decrement that freed room without ringing would leave a
-                // cross-process producer parked on room that already exists.
-                probe.outstanding.record_drained(u64::from(debt - held));
+                // `record_slot_freed`, which RINGS the wake word: a decrement
+                // that freed room without ringing would leave a cross-process
+                // producer parked on room that already exists. A held frame a
+                // timeout release forgave is paid off first.
+                probe.outstanding.record_slot_freed(u64::from(debt - held));
             }
         }
         self.block_slot_debt = held;
+    }
+
+    /// The one slot move [`Self::reconcile_block_slot_debt`] cannot see: in
+    /// [`Self::sync_discard_head`] the queue's refill took the skipped head's
+    /// slot, so the slot count still equals the debt. Called after the
+    /// refill's pop, it restates the head's exit and the refill's entry in
+    /// ONE RMW
+    /// ([`CreditShared::record_slot_replaced`](crate::credit::CreditShared::record_slot_replaced)):
+    /// the word pays the skipped frame (a held forgiven one first) and holds
+    /// the refill, held forgiven when `forgiven_entering` says its pop paid
+    /// the backlog a `block_timeout_ms` release forgave. A counted frame for
+    /// a counted one stores and rings nothing, so on a word no release
+    /// forgave (every mapped word) the skip is the refill's pop alone, and
+    /// the refill's drain read the slot with the skipped head still counted.
+    /// The debt is unchanged. Same guards as the re-derivation.
+    fn restate_replaced_block_head(&mut self, forgiven_entering: bool) {
+        if self.consume_mode != ConsumeMode::EachFifo || self.block_probe().is_none() {
+            debug_assert_eq!(
+                self.block_slot_debt, 0,
+                "block slot debt is only ever taken on a block-probed EachFifo input"
+            );
+            return;
+        }
+        debug_assert_eq!(
+            self.block_slot_debt,
+            1 + u8::from(self.next_head.is_some()),
+            "a replaced head leaves the slot count equal to the debt"
+        );
+        if let Some(probe) = self.block_probe() {
+            probe.outstanding.record_slot_replaced(forgiven_entering);
+        }
     }
 
     /// Testing-only public wrappers over the four per-set head ops
@@ -3363,6 +3597,10 @@ impl CerulionSubscriber {
         let removals = std::cell::Cell::new(0u64);
         let mut newest_seq: Option<u32> = None;
         let mut newest_origin: Option<UniquePublisherId> = None;
+        // Set by each real `receive()`: whether it returned no sample. A stop
+        // at the pop bound does not touch it, so it reads `true` at the end
+        // only when the queue was seen empty.
+        let emptied = std::cell::Cell::new(false);
         // The `block` mirror MUST be decremented for every popped sample even
         // if `receive()` errors mid-drain — `drain_with_block_accounting`
         // guarantees that, then propagates the error below (AFTER the staging,
@@ -3388,10 +3626,12 @@ impl CerulionSubscriber {
                     }
                     self.fault_inject_receive_after.set(Some(remaining - 1));
                 }
-                sub.receive().map_err(|e| TransportError::Receive {
+                let received = sub.receive().map_err(|e| TransportError::Receive {
                     topic: topic.clone(),
                     reason: format!("{}", e),
-                })
+                })?;
+                emptied.set(received.is_none());
+                Ok(received)
             },
             // Every received sample is removed from the iceoryx2 queue
             // (whether or not it survives `deliver_raw_frame`'s filter) — the
@@ -3447,7 +3687,9 @@ impl CerulionSubscriber {
                     self.record_service_cursor_from(&header);
                 }
             },
-            |removed| self.record_block_drained(removed),
+            |removed| {
+                self.record_block_drained(removed, emptied.get());
+            },
         );
         // Stage the PARTIAL batch BEFORE propagating
         // a mid-drain Err — the frames delivered so far really reached the
@@ -3599,7 +3841,7 @@ impl CerulionSubscriber {
     /// slot and do not advance the service cursor.
     #[must_use = "raw input view must be checked"]
     pub fn view_raw(&mut self) -> TransportResult<Option<RawInputView<'_>>> {
-        self.view_raw_checked(None)
+        self.view_raw_checked(None, None)
     }
 
     /// [`Self::view_raw`] that also requires the frame's schema hash to equal
@@ -3610,12 +3852,23 @@ impl CerulionSubscriber {
         &mut self,
         schema_hash: u64,
     ) -> TransportResult<Option<RawInputView<'_>>> {
-        self.view_raw_checked(Some(schema_hash))
+        self.view_raw_checked(Some(schema_hash), None)
+    }
+
+    /// Host-owned plugin read through the same queue/frozen/held selection.
+    /// Schema prefix and offsets are checked before advancing the service cursor.
+    #[doc(hidden)]
+    pub fn view_plugin_frame(
+        &mut self,
+        layout: super::plugin_lease::PluginWireLayout,
+    ) -> TransportResult<Option<RawInputView<'_>>> {
+        self.view_raw_checked(Some(layout.schema_hash), Some(layout))
     }
 
     fn view_raw_checked(
         &mut self,
         schema_hash: Option<u64>,
+        plugin_layout: Option<super::plugin_lease::PluginWireLayout>,
     ) -> TransportResult<Option<RawInputView<'_>>> {
         // THE shared frame checks (`validate_wire_frame_raw`, the untyped core
         // of the typed path's `validate_wire_frame`), so the raw and typed
@@ -3638,6 +3891,7 @@ impl CerulionSubscriber {
                     sample.payload(),
                     schema_hash,
                 )?;
+                check_plugin_frame(&self.topic, sample.payload(), &header, plugin_layout)?;
                 Ok(Some(RawInputView {
                     inner: RawInputViewInner::Held(&sample.payload()[..payload.end]),
                     header,
@@ -3650,6 +3904,7 @@ impl CerulionSubscriber {
                     sample.payload(),
                     schema_hash,
                 )?;
+                check_plugin_frame(&self.topic, sample.payload(), &header, plugin_layout)?;
                 // Only a frame that passed every check is served, so only then
                 // does the cursor advance: a rejected frame is re-offered.
                 self.record_service_cursor_from(&header);
@@ -3848,7 +4103,7 @@ impl CerulionSubscriber {
         // node made of it. The LIVE arm above pops and serves inside this one
         // call and never touched a slot, so re-deriving finds nothing to
         // release and the pop-time decrement stands unchanged.
-        self.reconcile_block_slot_debt();
+        self.reconcile_block_slot_debt(false);
         slot
     }
 
@@ -4008,6 +4263,10 @@ impl CerulionSubscriber {
         // are still valid). `Cell` because the recording closure and this
         // function both need it, immutably.
         let removed_in_drain = std::cell::Cell::new(0u64);
+        // How many of those frames paid the backlog a `block_timeout_ms`
+        // release forgave, as the `block` word's drain RMW returned it: the
+        // survivor is forgiven only when all of them did ([`survivor_forgiven`]).
+        let paid_in_drain = std::cell::Cell::new(0u64);
         // If ANY drained frame is undersized (no
         // readable wire sequence), the per-stream firsts may not be the
         // true oldest → gaps would inflate. Track it and skip eviction
@@ -4046,6 +4305,10 @@ impl CerulionSubscriber {
         // fire, so the returned `popped` (the trigger's signal count)
         // excludes them. Always 0 on the latest-wins drain.
         let junk_skipped = std::cell::Cell::new(0u64);
+        // Set by each real `receive()`: whether it returned no sample. A stop
+        // at the pop bound does not touch it, so it reads `true` at the end
+        // only when the queue was seen empty.
+        let emptied = std::cell::Cell::new(false);
         // The pop position of the next probed frame, the index into `fed`.
         let mut probed = 0usize;
         let drain_result = drain_with_block_accounting(
@@ -4066,10 +4329,12 @@ impl CerulionSubscriber {
                     }
                     fault_inject = Some(remaining - 1);
                 }
-                sub.receive().map_err(|e| TransportError::Receive {
+                let received = sub.receive().map_err(|e| TransportError::Receive {
                     topic: topic.clone(),
                     reason: format!("{}", e),
-                })
+                })?;
+                emptied.set(received.is_none());
+                Ok(received)
             },
             |sample| {
                 if probing {
@@ -4142,7 +4407,7 @@ impl CerulionSubscriber {
             },
             |removed| {
                 removed_in_drain.set(removed);
-                self.record_block_drained(removed);
+                paid_in_drain.set(self.record_block_drained(removed, emptied.get()));
             },
         );
         self.fault_inject_receive_after.set(fault_inject);
@@ -4171,6 +4436,8 @@ impl CerulionSubscriber {
                 popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                 latest_ts: None,
                 decimated: false,
+                forgiven: false,
+                withheld: false,
             };
         }
         // `drop_oldest` (EXACT PER PUBLISHER STREAM):
@@ -4593,6 +4860,8 @@ impl CerulionSubscriber {
                             popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                             latest_ts: None,
                             decimated: true,
+                            forgiven: false,
+                            withheld: false,
                         };
                     }
                 }
@@ -4633,6 +4902,8 @@ impl CerulionSubscriber {
                     popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                     latest_ts,
                     decimated: false,
+                    forgiven: survivor_forgiven(removed_in_drain.get(), paid_in_drain.get()),
+                    withheld: false,
                 }
             }
             None => DrainOutcome {
@@ -4640,6 +4911,8 @@ impl CerulionSubscriber {
                 popped: removed_in_drain.get().saturating_sub(junk_skipped.get()),
                 latest_ts: None,
                 decimated: false,
+                forgiven: false,
+                withheld: false,
             },
         }
     }
@@ -5035,6 +5308,7 @@ impl CerulionSubscriber {
         // Pop EXACTLY one, in FIFO order, with the same accounting-once pass
         // every other read on this input runs.
         let outcome = self.drain_one_with_accounting();
+        let forgiven = outcome.forgiven;
         match outcome.slot {
             FrozenSlot::Sample(sample) => {
                 let ts = wire_timestamp_ns(sample.payload());
@@ -5080,8 +5354,9 @@ impl CerulionSubscriber {
                 // SLOT ENTRY: the descent has taken a frame OUT of the
                 // queue to learn its stamp and is holding it. Its pop already
                 // decremented the mirror; re-derive so the producer keeps
-                // counting it as unserved.
-                self.reconcile_block_slot_debt();
+                // counting it as unserved, or as held forgiven when its pop
+                // paid the forgiven backlog.
+                self.reconcile_block_slot_debt(forgiven);
                 Ok(ts)
             }
             FrozenSlot::Empty => {
@@ -5167,11 +5442,13 @@ impl CerulionSubscriber {
         // close any held-head regime, exactly as a served head would. The
         // re-offer streak is a "nobody is reading this" heuristic, and a head
         // the matcher skipped is a head that will never be read.
+        let skipped = matches!(self.frozen, Some(FrozenSlot::Sample(_)));
         self.frozen = None;
         self.note_head_served();
         // R-promote's sibling: the staged next IS the FIFO-correct new head,
         // and it is already ACCOUNTED FOR (the `NeedStamp` pop decremented the
-        // mirror), so this hand-off touches the block accounting not at all.
+        // mirror and its entry restated the debt), so this hand-off touches the
+        // block accounting not at all.
         if let Some(promoted) = self.next_head.take() {
             let ts = wire_timestamp_ns(promoted.payload());
             // With the format-5 role definition: the promotion DOES record, and it is the
@@ -5209,7 +5486,7 @@ impl CerulionSubscriber {
             // SLOT EXIT (the skipped head only): the promotion itself
             // moves a frame BETWEEN slots and changes nothing, so the net here
             // is exactly the one frame this op discarded.
-            self.reconcile_block_slot_debt();
+            self.reconcile_block_slot_debt(false);
             return Ok(ts);
         }
         // Nothing staged (an `Advance` the gate reached without a `NeedStamp`,
@@ -5280,11 +5557,19 @@ impl CerulionSubscriber {
                 FrozenSlot::Err(_) | FrozenSlot::Held => {}
             }
         }
-        let ts = outcome.latest_ts;
+        let (ts, forgiven) = (outcome.latest_ts, outcome.forgiven);
+        let refilled = matches!(outcome.slot, FrozenSlot::Sample(_));
         self.frozen = Some(outcome.slot);
-        // The skipped head EXITED and a refill may have ENTERED — one
-        // re-derivation settles both, whichever way they net out.
-        self.reconcile_block_slot_debt();
+        if skipped && refilled {
+            // SLOT REPLACED: the refill took the skipped head's slot, so the
+            // slot count equals the debt and a re-derivation sees nothing.
+            // One RMW restates both, after the refill's pop.
+            self.restate_replaced_block_head(forgiven);
+        } else {
+            // The skipped head EXITED, or a refill ENTERED a head that held
+            // no frame: one re-derivation settles it.
+            self.reconcile_block_slot_debt(forgiven);
+        }
         Ok(ts)
     }
 
@@ -5317,12 +5602,35 @@ impl CerulionSubscriber {
         // there is normally nothing to release — but a slot state is a fact and
         // this is the one write that can overwrite a `Sample` without serving
         // it, so it restates the debt rather than assuming its own precondition.
-        self.reconcile_block_slot_debt();
+        self.reconcile_block_slot_debt(false);
     }
 
     /// The ONE drain-and-account body both trigger sites share, so the pop path
     /// (and its read-outcome record) cannot drift between them.
     fn drain_for_trigger(&mut self, site: TriggerDrainSite) -> (u64, Option<u64>) {
+        let (popped, stamp, _) = self.drain_for_trigger_observed(site);
+        (popped, stamp)
+    }
+
+    /// Same trigger drain with its existing admission cause made explicit.
+    /// Does not consult the read plan twice or change native recording sites.
+    pub(crate) fn plugin_trigger_drain(
+        &mut self,
+        site: SyncAlignSite,
+    ) -> (u64, Option<u64>, bool, bool) {
+        let (popped, stamp, withheld) = self.drain_for_trigger_observed(match site {
+            SyncAlignSite::Boundary => TriggerDrainSite::Boundary,
+            SyncAlignSite::Refill => TriggerDrainSite::Refill,
+        });
+        (
+            popped,
+            stamp,
+            withheld,
+            matches!(self.frozen, Some(FrozenSlot::Err(_))),
+        )
+    }
+
+    fn drain_for_trigger_observed(&mut self, site: TriggerDrainSite) -> (u64, Option<u64>, bool) {
         // Per-message FIFO (the data-trigger default): an UNSERVED frozen
         // head must never be overwritten. Two ways a fire can fail to
         // consume the head this boundary froze, unified by ONE rule:
@@ -5407,10 +5715,10 @@ impl CerulionSubscriber {
                         // finds the head still frozen is the SAME observation the
                         // boundary already counted this step, not a new one.
                         self.note_head_reoffered();
-                        (1, head_ts)
+                        (1, head_ts, false)
                     }
                     // "Nothing new behind the head you are still holding."
-                    TriggerDrainSite::Refill => (0, None),
+                    TriggerDrainSite::Refill => (0, None, false),
                 };
             }
         }
@@ -5435,7 +5743,7 @@ impl CerulionSubscriber {
             (ConsumeMode::Latest, Some(FrozenSlot::Sample(sample))) => {
                 if site == TriggerDrainSite::Refill {
                     self.frozen = Some(FrozenSlot::Sample(sample));
-                    return (0, None);
+                    return (0, None, false);
                 }
                 Some(sample)
             }
@@ -5519,8 +5827,8 @@ impl CerulionSubscriber {
             // Reaching here means the previous head was SERVED (the
             // re-offer guard above returns while it is not), so this restates
             // the debt after that exit; the promotion is slot-to-slot.
-            self.reconcile_block_slot_debt();
-            return (1, ts);
+            self.reconcile_block_slot_debt(false);
+            return (1, ts, false);
         }
         // Freeze the FIFO HEAD — one frame per boundary drain, older frames
         // stay queued for the following steps' drains (the scheduler fires
@@ -5637,18 +5945,24 @@ impl CerulionSubscriber {
                 // what this boundary popped.
                 let ts = wire_timestamp_ns(held.payload());
                 self.frozen = Some(FrozenSlot::Sample(held));
-                return (1, ts);
+                return (1, ts, false);
             }
             // A newer frame (or a drain error, surfaced as before) replaces
             // it: dropping `held` releases the superseded sample.
         }
-        let (popped, latest_ts) = (outcome.popped, outcome.latest_ts);
+        let (popped, latest_ts, forgiven, withheld) = (
+            outcome.popped,
+            outcome.latest_ts,
+            outcome.forgiven,
+            outcome.withheld,
+        );
         self.frozen = Some(outcome.slot);
         // SLOT ENTRY: a `Sample` frozen here is held UNSERVED until a
-        // tick reads it, so it stays the producer's occupancy. `Empty` / `Err`
+        // tick reads it, so it stays the producer's occupancy, or is held
+        // forgiven when its pop paid the forgiven backlog. `Empty` / `Err`
         // hold no frame and re-derive to nothing.
-        self.reconcile_block_slot_debt();
-        (popped, latest_ts)
+        self.reconcile_block_slot_debt(forgiven);
+        (popped, latest_ts, withheld)
     }
 
     /// One more boundary went by with the SAME unserved FIFO head.
@@ -6064,7 +6378,7 @@ impl Drop for CerulionSubscriber {
         // is the one failure mode that outlives the object holding it.
         self.frozen = None;
         self.next_head = None;
-        self.reconcile_block_slot_debt();
+        self.reconcile_block_slot_debt(false);
         // Best-effort notification — Drop must not panic
         let _ = self
             .notifier
@@ -6157,7 +6471,8 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             armed,
             regime_started_ns,
             regime_count,
-            buffer_capacity
+            buffer_capacity,
+            drain_clips
         }),
         abi_pin_struct!(StreamObservation {
             id,
@@ -6186,6 +6501,28 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drain's survivor is forgiven only when the drain removed a frame
+    /// and paid the forgiven backlog for every frame it removed, as
+    /// `(removed, paid)`: the paid frames are the first ones removed.
+    #[test]
+    fn the_survivor_is_forgiven_only_when_every_removed_frame_was() {
+        for (removed, paid, forgiven) in [
+            (0, 0, false),
+            (1, 0, false),
+            (1, 1, true),
+            (2, 1, false),
+            (2, 2, true),
+            (3, 5, true),
+            (u64::MAX, 65_535, false),
+        ] {
+            assert_eq!(
+                survivor_forgiven(removed, paid),
+                forgiven,
+                "removed {removed}, paid {paid}"
+            );
+        }
+    }
 
     /// The capacity a HAND-MINTED drain stage in this module stands
     /// in for. A wired stage's capacity is DERIVED from its edge's graph facts;

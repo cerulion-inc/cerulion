@@ -95,10 +95,6 @@ const VIZ_ROBOT: &[&str] = &[
     "Error: cerulion viz --robot bench-arm: remote visualization is disabled by ",
     "; unset CERULION_NETWORK to attach a robot's topics (local topics need no --robot)",
 ];
-const PAIR: &[&str] = &[
-    "Error: cerulion pair reaches the robot over the network, which ",
-    " disables; unset CERULION_NETWORK to pair",
-];
 const CONNECT: &[&str] = &["warning: cerulion connect: network kill-switch engaged \
                             (--network off / CERULION_NETWORK=off), refusing to connect; \
                             exiting cleanly"];
@@ -174,15 +170,6 @@ pub(crate) static CASES: &[Case] = &[
         },
     },
     Case {
-        verb: &["pair"],
-        argv: &["pair", "bench-arm"],
-        expect: Expect::Refused {
-            code: 1,
-            says: PAIR,
-            by: By::Network,
-        },
-    },
-    Case {
         verb: &["connect"],
         argv: &["connect", "bench-arm"],
         expect: Expect::Refused {
@@ -216,6 +203,33 @@ pub(crate) static CASES: &[Case] = &[
             code: 2,
             says: RCP_FLAG,
             by: By::Flag,
+        },
+    },
+    Case {
+        verb: &["topic", "echo"],
+        argv: &["topic", "echo", "/camera", "--robot", "bench-arm"],
+        expect: Expect::Refused {
+            code: 2,
+            says: &["Error: --robot bench-arm reaches the robot over the network, which ", " disables; unset CERULION_NETWORK to call its topic-echo verb (without --robot the command runs on this machine)"],
+            by: By::Network,
+        },
+    },
+    Case {
+        verb: &["topic", "hz"],
+        argv: &["topic", "hz", "/camera", "--robot", "bench-arm"],
+        expect: Expect::Refused {
+            code: 2,
+            says: &["Error: --robot bench-arm reaches the robot over the network, which ", " disables; unset CERULION_NETWORK to call its topic-hz verb (without --robot the command runs on this machine)"],
+            by: By::Network,
+        },
+    },
+    Case {
+        verb: &["topic", "info"],
+        argv: &["topic", "info", "/camera", "--robot", "bench-arm"],
+        expect: Expect::Refused {
+            code: 2,
+            says: &["Error: --robot bench-arm reaches the robot over the network, which ", " disables; unset CERULION_NETWORK to call its topic-info verb (without --robot the command runs on this machine)"],
+            by: By::Network,
         },
     },
     // ---- the same verbs without --robot are not refused ----
@@ -393,6 +407,17 @@ pub(crate) static CASES: &[Case] = &[
         expect: Expect::Runs {
             code: 2,
             says: "`cerulion ros attach` has moved",
+        },
+    },
+    // The hidden `pair` stub reaches no robot: it refuses every spelling
+    // with the same text, switch or no switch, and never meets the gate.
+    Case {
+        verb: &["pair"],
+        argv: &["pair", "bench-arm"],
+        expect: Expect::Runs {
+            code: 2,
+            says: "Error: code pairing is not available in this release; robots on your \
+                   account are reached by signing in with `cerulion login`",
         },
     },
     // ---- not spawned by the sweep ----

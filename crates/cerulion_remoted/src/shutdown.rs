@@ -310,8 +310,8 @@ pub(crate) fn close_endpoint_for_test(endpoint: &cerulion_link::Endpoint) {
 }
 
 /// The environment variable that sets, in milliseconds, how long the binary's
-/// exit waits for its log line in place of its 100 ms; a value that is not a
-/// positive whole number keeps the 100 ms.
+/// exit waits for its queued log lines in place of its 100 ms; a value that is
+/// not a positive whole number keeps the 100 ms.
 #[cfg(feature = "test-seam")]
 #[doc(hidden)]
 pub const EXIT_LOG_GRACE_FOR_TEST_ENV: &str = "CERULION_REMOTED_EXIT_LOG_GRACE_MS_FOR_TEST";

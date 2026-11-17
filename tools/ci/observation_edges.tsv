@@ -28,12 +28,15 @@ cerulion_bagd	cerulion_cli_engine	crate-path	crates/cerulion_bagd/tests/state_an
 cerulion_bagd	cerulion_core	crate-path	crates/cerulion_bagd/tests/state_anchor_partial_scan_test.rs
 cerulion_cli	all	unattributable	crates/cerulion_cli/tests/mp_supervisor_box_test.rs
 cerulion_cli	all	whole-tree	crates/cerulion_cli/tests/config_home_test.rs
+cerulion_cli	cerulion_cli_engine	crate-path	crates/cerulion_cli/tests/fresh_executable_test.rs
 cerulion_cli	cerulion_core	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_discovery	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_heaphook	dlopen	crates/cerulion_cli/tests/ros2_run_e2e_test.rs
 cerulion_cli	cerulion_hygiene	crate-path	crates/cerulion_cli/tests/config_home_test.rs
+cerulion_cli	cerulion_netd	crate-path	crates/cerulion_cli/tests/fresh_executable_test.rs
 cerulion_cli	cerulion_telemetry	crate-path	crates/cerulion_cli/tests/config_home_test.rs
 cerulion_cli	cerulion_viz	crate-path	crates/cerulion_cli/tests/config_home_test.rs
+cerulion_cli	cerulion_wsd	crate-path	crates/cerulion_cli/tests/fresh_executable_test.rs
 cerulion_cli	rmw_cerulion	dlopen	crates/cerulion_cli/tests/doctor_cli_test.rs
 cerulion_cli_engine	all	whole-tree	crates/cerulion_cli_engine/tests/block_colocation_adoption_test.rs
 cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/shm_state.rs
@@ -47,7 +50,7 @@ cerulion_core	all	whole-tree	crates/cerulion_core/tests/cdylib_iox2_log_level_te
 cerulion_core	cerulion_bag	crate-path	crates/cerulion_core/tests/state_record_framing_scan_test.rs
 cerulion_core	cerulion_bagd	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs
 cerulion_core	cerulion_cli	crate-path	crates/cerulion_core/tests/upstream_waivers_test.rs
-cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
+cerulion_core	cerulion_cli_engine	crate-path	crates/cerulion_core/tests/doc_attachment_discipline_test.rs
 cerulion_core	cerulion_macros	crate-path	crates/cerulion_core/tests/cdylib_iox2_log_level_test.rs
 cerulion_core	go2_tf_source	crate-path	crates/cerulion_core/tests/dynamic_generated_parity_test.rs
 cerulion_hygiene	all	whole-tree	crates/cerulion_hygiene/tests/crate_license_texts_test.rs
