@@ -191,7 +191,11 @@ async fn server_frames_match_literal_wire_bytes_and_flush_before_completion() {
     }
 }
 
-async fn rejected_write<W: AsyncWrite + Unpin>(writer: W, frame: ServerFrame, timeout: Duration) {
+async fn rejected_write<W: AsyncWrite + Unpin + 'static>(
+    writer: W,
+    frame: ServerFrame,
+    timeout: Duration,
+) {
     let (frames, receiver) = mpsc::channel(1);
     frames.send(frame).await.unwrap();
     drop(frames);
@@ -261,4 +265,90 @@ async fn peer_closure_after_the_header_refuses_the_body_without_completion() {
 async fn a_stalled_write_reaches_its_deadline_without_completion() {
     let (writer, _peer) = duplex(1);
     rejected_write(writer, started(), Duration::from_millis(1)).await;
+}
+
+#[tokio::test]
+async fn terminal_read_failures_close_the_stream_before_waiting_on_a_full_event_queue() {
+    for (bytes, reason) in [
+        (vec![], ExitReason::Disconnected),
+        (vec![0, 0], ExitReason::Disconnected),
+        (vec![0, 0, 0, 2, b'{'], ExitReason::Disconnected),
+        (u32::MAX.to_be_bytes().to_vec(), ExitReason::ProtocolError),
+        (frame(b"{"), ExitReason::ProtocolError),
+    ] {
+        let (mut peer, reader) = duplex(bytes.len().max(1));
+        peer.write_all(&bytes).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let (events, mut observations) = mpsc::channel(1);
+        events
+            .send(SessionIoEvent::Client(ClientFrame::Close))
+            .await
+            .unwrap();
+        let task = tokio::spawn(read_client(reader, events));
+        let mut output = Vec::new();
+        within(peer.read_to_end(&mut output)).await.unwrap();
+        assert!(output.is_empty());
+        assert_eq!(observations.len(), 1);
+        assert!(!task.is_finished());
+        assert_eq!(
+            observations.recv().await,
+            Some(SessionIoEvent::Client(ClientFrame::Close))
+        );
+        assert_eq!(
+            within(observations.recv()).await,
+            Some(SessionIoEvent::Failed(reason))
+        );
+        within(task).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_writes_release_completion_and_frame_queue_before_error_backpressure() {
+    for oversized in [false, true] {
+        let (writer, mut peer) = duplex(1);
+        let (frames, receiver) = mpsc::channel(1);
+        frames
+            .send(if oversized {
+                ServerFrame::Error {
+                    message: "x".repeat(MAX_SESSION_FRAME_BYTES),
+                }
+            } else {
+                started()
+            })
+            .await
+            .unwrap();
+        let (events, mut observations) = mpsc::channel(1);
+        events
+            .send(SessionIoEvent::Client(ClientFrame::Close))
+            .await
+            .unwrap();
+        let (done, completed) = oneshot::channel();
+        let task = tokio::spawn(write_server(
+            writer,
+            receiver,
+            events,
+            Duration::from_millis(1),
+            done,
+        ));
+        assert!(within(completed).await.is_err());
+        within(frames.closed()).await;
+        let mut output = Vec::new();
+        within(peer.read_to_end(&mut output)).await.unwrap();
+        if oversized {
+            assert!(output.is_empty());
+        } else {
+            assert_eq!(output, [0]);
+        }
+        assert_eq!(observations.len(), 1);
+        assert!(!task.is_finished());
+        assert_eq!(
+            observations.recv().await,
+            Some(SessionIoEvent::Client(ClientFrame::Close))
+        );
+        assert_eq!(
+            within(observations.recv()).await,
+            Some(SessionIoEvent::Failed(ExitReason::Disconnected))
+        );
+        within(task).await.unwrap();
+    }
 }

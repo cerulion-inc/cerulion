@@ -194,7 +194,9 @@ Load-bearing boundary contracts:
 
 - **Session framing**: `session_io` owns one reader and one writer task per
   stream. Client lengths are checked before allocation and complete frames are
-  validated before queueing. A cancelled or failed task discards its stream.
+  validated before queueing. Stream arguments require a static lifetime rather
+  than a reusable borrow. A cancelled or failed task discards its stream; failure
+  also releases write completion and frame intake before waiting on event capacity.
   Bounded caller queues provide backpressure; conversion into a driver's event
   enum requires no intermediate task or channel. Server serialization, writes
   and flush share one deadline per frame. Completion means all local frames
