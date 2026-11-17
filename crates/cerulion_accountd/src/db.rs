@@ -205,6 +205,21 @@ pub struct RobotRow {
     pub created_at_ns: u64,
 }
 
+/// What [`Db::issue_robot_pop_challenge`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobotChallengeIssue {
+    /// Stored and counted.
+    Issued,
+    /// The request time is not later than the robot's latest accepted one,
+    /// which this names; nothing changed.
+    Replayed {
+        /// The robot's latest accepted request time, Unix nanoseconds.
+        last_request_ns: u64,
+    },
+    /// The robot's window is spent; nothing changed.
+    Limited,
+}
+
 /// A stored access-list revocation epoch. The account service owns the
 /// per-robot epoch; the robot syncs the latest one + applies it via
 /// `TrustStore::apply_epoch`. Ids are decoded from the flat 32*N-byte blobs.
@@ -1421,6 +1436,109 @@ impl Db {
         Ok(n == 1)
     }
 
+    // -- robot access challenges ----------------------------------------------
+
+    /// Issue a robot access challenge for a request the caller has verified as
+    /// signed by the robot's key at `requested_at_ns`: refused uncounted when that
+    /// time is not later than the robot's latest accepted request
+    /// ([`RobotChallengeIssue::Replayed`]) or when the robot has had `limit`
+    /// challenges in its fixed window of `window_ns`, reset once the window is
+    /// that old ([`RobotChallengeIssue::Limited`]); else the hash is stored. One
+    /// transaction on the locked connection, so concurrent issues for one robot
+    /// are decided one at a time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_robot_pop_challenge(
+        &self,
+        challenge_hash: &str,
+        robot_id: &[u8; 32],
+        requested_at_ns: u64,
+        expires_at_ns: u64,
+        now_ns: u64,
+        window_ns: u64,
+        limit: u32,
+    ) -> Result<RobotChallengeIssue> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current: Option<(i64, i64, i64)> = tx
+            .query_row(
+                "SELECT window_start_ns, issued, last_request_ns FROM robot_pop_rate WHERE robot_id = ?1",
+                params![&robot_id[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let last_request = current.map_or(0, |(_, _, last)| last as u64);
+        if requested_at_ns <= last_request {
+            return Ok(RobotChallengeIssue::Replayed {
+                last_request_ns: last_request,
+            });
+        }
+        let (start, issued) = match current {
+            Some((start, issued, _)) if (start as u64).saturating_add(window_ns) > now_ns => {
+                (start as u64, issued as u64)
+            }
+            _ => (now_ns, 0),
+        };
+        if issued >= u64::from(limit) {
+            return Ok(RobotChallengeIssue::Limited);
+        }
+        tx.execute(
+            "INSERT INTO robot_pop_rate (robot_id, window_start_ns, issued, last_request_ns) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (robot_id) DO UPDATE SET window_start_ns = ?2, issued = ?3, last_request_ns = ?4",
+            params![
+                &robot_id[..],
+                start as i64,
+                (issued + 1) as i64,
+                requested_at_ns as i64
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO robot_pop_challenges (challenge_hash, robot_id, expires_at_ns, consumed, created_at_ns) \
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![challenge_hash, &robot_id[..], expires_at_ns as i64, now_ns as i64],
+        )?;
+        tx.commit()?;
+        Ok(RobotChallengeIssue::Issued)
+    }
+
+    /// Whether `challenge_hash` is an unspent, unexpired challenge issued to
+    /// `robot_id`. Spends nothing.
+    pub fn robot_pop_challenge_live(
+        &self,
+        challenge_hash: &str,
+        robot_id: &[u8; 32],
+        now_ns: u64,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let live: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM robot_pop_challenges \
+                 WHERE challenge_hash = ?1 AND consumed = 0 AND expires_at_ns > ?2 AND robot_id = ?3",
+                params![challenge_hash, now_ns as i64, &robot_id[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(live.is_some())
+    }
+
+    /// Atomically SPEND a robot access challenge: one conditional UPDATE guarded by
+    /// `consumed = 0`, `expires_at_ns > now` and `robot_id = the spending robot`.
+    /// `false` covers unknown, spent, expired and another robot's challenge.
+    pub fn consume_robot_pop_challenge(
+        &self,
+        challenge_hash: &str,
+        robot_id: &[u8; 32],
+        now_ns: u64,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE robot_pop_challenges SET consumed = 1 \
+             WHERE challenge_hash = ?1 AND consumed = 0 AND expires_at_ns > ?2 AND robot_id = ?3",
+            params![challenge_hash, now_ns as i64, &robot_id[..]],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Opportunistic housekeeping: delete expired device codes, magic links
     /// (expired OR already consumed), and OAuth flows so these tables do not grow
     /// unbounded. Best-effort — invoked on a frequent entry point (`device/start`).
@@ -1443,6 +1561,10 @@ impl Db {
         )?;
         deleted += conn.execute(
             "DELETE FROM device_challenges WHERE expires_at_ns <= ?1 OR consumed = 1",
+            params![now],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM robot_pop_challenges WHERE expires_at_ns <= ?1 OR consumed = 1",
             params![now],
         )?;
         Ok(deleted)
@@ -1701,6 +1823,64 @@ mod tests {
                 .unwrap(),
             "an unknown challenge is rejected"
         );
+    }
+
+    #[test]
+    fn a_robot_challenge_is_rate_windowed_single_use_robot_bound_and_swept() {
+        use RobotChallengeIssue::{Issued, Limited};
+        let replayed = |last| RobotChallengeIssue::Replayed {
+            last_request_ns: last,
+        };
+        let db = Db::open_in_memory().unwrap();
+        let (r1, r2) = ([0x44u8; 32], [0x55u8; 32]);
+        let later = NOW + 1_000_000_000_000;
+        let window = 100;
+        let at = std::cell::Cell::new(10u64);
+        let issue = |h: &str, robot: &[u8; 32], now: u64| {
+            at.set(at.get() + 1);
+            db.issue_robot_pop_challenge(h, robot, at.get(), later, now, window, 2)
+                .unwrap()
+        };
+        assert_eq!(issue("a", &r1, NOW), Issued);
+        assert_eq!(issue("b", &r1, NOW + 1), Issued);
+        // The limit: nothing stored for the refused one.
+        assert_eq!(issue("c", &r1, NOW + 2), Limited);
+        assert!(!db.robot_pop_challenge_live("c", &r1, NOW).unwrap());
+        // Another robot has its own budget.
+        assert_eq!(issue("d", &r2, NOW + 2), Issued);
+        // Window boundary: still the same window 1 ns before, a new one at.
+        assert_eq!(issue("e", &r1, NOW + window - 1), Limited);
+        assert_eq!(issue("f", &r1, NOW + window), Issued);
+        // A request time not later than the robot's latest is a replay, uncounted.
+        let last = at.get();
+        assert_eq!(
+            db.issue_robot_pop_challenge("g", &r1, last, later, NOW + window, window, 2)
+                .unwrap(),
+            replayed(last)
+        );
+        assert_eq!(
+            db.issue_robot_pop_challenge("g", &r1, last - 1, later, NOW + window, window, 2)
+                .unwrap(),
+            replayed(last)
+        );
+        assert_eq!(
+            db.issue_robot_pop_challenge("g", &r1, last + 1, later, NOW + window, window, 2)
+                .unwrap(),
+            Issued
+        );
+        // Live only for its own robot, until spent or expired.
+        assert!(db.robot_pop_challenge_live("a", &r1, NOW).unwrap());
+        assert!(!db.robot_pop_challenge_live("a", &r2, NOW).unwrap());
+        assert!(!db.robot_pop_challenge_live("a", &r1, later).unwrap());
+        // Bound to the robot, single use, expiry-gated.
+        assert!(!db.consume_robot_pop_challenge("a", &r2, NOW).unwrap());
+        assert!(db.consume_robot_pop_challenge("a", &r1, NOW).unwrap());
+        assert!(!db.consume_robot_pop_challenge("a", &r1, NOW).unwrap());
+        assert!(!db.robot_pop_challenge_live("a", &r1, NOW).unwrap());
+        assert!(!db.consume_robot_pop_challenge("b", &r1, later).unwrap());
+        // The sweep removes the spent and the expired.
+        db.sweep_expired(later).unwrap();
+        assert!(!db.consume_robot_pop_challenge("b", &r1, NOW).unwrap());
     }
 
     #[test]

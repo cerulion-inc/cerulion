@@ -91,6 +91,26 @@ CREATE TABLE IF NOT EXISTS device_challenges (
     created_at_ns  INTEGER NOT NULL
 );
 
+-- Robot access challenges: a robot signs one with its registered transport key
+-- to read its own access epoch (`POST /v1/robots/{id}/access`) without a
+-- session. Single use, bound to one robot, time-bounded; only the SHA-256 of the
+-- bearer is stored.
+CREATE TABLE IF NOT EXISTS robot_pop_challenges (
+    challenge_hash TEXT PRIMARY KEY,            -- SHA-256(challenge bearer)
+    robot_id       BLOB NOT NULL,               -- the robot the challenge was issued to
+    expires_at_ns  INTEGER NOT NULL,
+    consumed       INTEGER NOT NULL DEFAULT 0,  -- single-use (CAS to 1 on spend)
+    created_at_ns  INTEGER NOT NULL
+);
+-- Per-robot fixed rate window over robot access challenges, and the latest
+-- signed request time the robot presented (a later request must be later).
+CREATE TABLE IF NOT EXISTS robot_pop_rate (
+    robot_id        BLOB PRIMARY KEY,
+    window_start_ns INTEGER NOT NULL,
+    issued          INTEGER NOT NULL,
+    last_request_ns INTEGER NOT NULL
+);
+
 -- ===================== DORMANT (A2 / A4 / A7) =====================
 
 CREATE TABLE IF NOT EXISTS orgs (
