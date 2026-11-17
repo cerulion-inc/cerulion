@@ -613,12 +613,14 @@ fn multi_level_dag_pushes_one_boundary_per_step_not_per_level() {
     relay.inputs = vec![cerulion_core::graph::config::InputDef {
         name: "inp".to_string(),
         source: "src/out".to_string(),
+        ..Default::default()
     }];
     let mut sink = src_def("sink");
     sink.node_type = "ring_sink".to_string();
     sink.inputs = vec![cerulion_core::graph::config::InputDef {
         name: "inp".to_string(),
         source: "relay/out".to_string(),
+        ..Default::default()
     }];
     sink.outputs = vec![];
     let _ = &mut src;

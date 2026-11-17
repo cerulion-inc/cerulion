@@ -363,7 +363,10 @@ had to be redone.
 **Fix:** **rebuild always, unconditionally, immediately before
 measuring**: the binary AND the cdylibs, from the same checkout, in the
 same pass. Every runner in this suite does; if you drive a binary by
-hand, `cargo build --release` first, every time. Also remove stale
+hand, `cargo build --release` first, every time. A plain `cargo build`
+does not build the `cerulion-netd` gateway a serving `cerulion graph run`
+spawns from beside itself; build the pair with
+`cargo build -p cerulion_cli -p cerulion_netd --release`. Also remove stale
 debug-profile cdylibs before workspace runs: the CLI's freshest-wins
 cdylib resolution can pick a stale debug artifact over your fresh
 release one.

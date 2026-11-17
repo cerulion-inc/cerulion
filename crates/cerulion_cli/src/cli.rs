@@ -673,8 +673,10 @@ pub enum Commands {
     /// each channel's wire schema hash from the first message; configured
     /// schema resolution can add names and definitions. That is enough to
     /// inspect and play back the bag. Re-executing a bag (`bag play --resim`)
-    /// also needs the run's graph, environment and scheduler trace, which
-    /// `graph run --record` supplies to this same recorder.
+    /// also needs the run's graph and scheduler trace, which
+    /// `graph run --record` supplies to this same recorder with a record of
+    /// the run's environment; a resim compares that record and never applies
+    /// it.
     //
     // BOXED: `BagdArgs` is by far the widest variant here (it is the recorder's
     // whole argv surface), and growing it by one `Option<String>` (`--run-id`)
@@ -1398,17 +1400,21 @@ pub enum NodeAction {
         /// microseconds with `CERULION_CPU_DMA_LOCK_US=N`. Linux-only.
         #[arg(long = "no-cpu-dma-lock")]
         no_cpu_dma_lock: bool,
-        /// Hard opt-out from the live-loop CPU monitor-wait park; no
-        /// environment variable can re-enable it. Without this flag, on the
-        /// live (real or external) clock the park turns on automatically when
-        /// the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64 WFE): it replaces the blocking wait with a shallow per-core
-        /// park (no deep idle state), cutting the wake latency after an idle
-        /// period at a small per-core power cost (and it suppresses the global
-        /// C-state cap). That automatic choice is tunable with
-        /// `CERULION_MONITOR_WAIT` and `CERULION_DOORBELL` (`"1"` forces it on,
-        /// `"0"` disables it), but only when this flag is absent. No effect on
-        /// other targets, where the loop blocks normally.
+        /// Hard opt-out from the live-loop monitor-wait park, on every target;
+        /// no environment variable can re-enable it. Without this flag the park
+        /// is on by default everywhere.
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
+        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// per-core park (no deep idle state), cutting the wake latency after an
+        /// idle period at a small per-core power cost; elsewhere it is a bounded
+        /// park that never busy-spins. This flag restores the blocking wait on
+        /// every target, and on Linux the automatic C-state cap the park stands
+        /// in for. The default is tunable: `CERULION_MONITOR_WAIT=0` turns the
+        /// park off on every target and `=1` forces it on; `CERULION_DOORBELL=0`
+        /// drops the data doorbell and leaves the park as the other settings
+        /// resolve it, and `CERULION_DOORBELL=1` asks for the doorbell and, only
+        /// where a monitor-wait primitive exists, turns the park back on over
+        /// `CERULION_MONITOR_WAIT=0`.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
         /// Keep this run on this machine: no network gateway, session,
@@ -1476,10 +1482,10 @@ pub enum GraphAction {
         time_source: TimeSource,
         /// Skip the pre-flight validation REPORT (not validation as such).
         ///
-        /// The graph topology, the macro trigger wiring and the node libraries
-        /// are re-checked unconditionally when the graph is built, so this flag
-        /// cannot get a run past those: it moves you from one refusal to an
-        /// identical one.
+        /// The graph topology, the input queues, the node params, the macro
+        /// trigger wiring and the node libraries are re-checked unconditionally
+        /// when the graph is built, so this flag cannot get a run past those:
+        /// it moves you from one refusal to an identical one.
         ///
         /// What it does still skip is the `schema:` family: a NON-EMPTY value
         /// that names no resolvable schema, contradicts the producing node's
@@ -1533,17 +1539,22 @@ pub enum GraphAction {
         /// `CERULION_CPU_DMA_LOCK_US=N`. Linux-only.
         #[arg(long = "no-cpu-dma-lock")]
         no_cpu_dma_lock: bool,
-        /// Hard opt-out from the live-loop CPU monitor-wait park; no
-        /// environment variable can re-enable it. Without this flag, on the
-        /// live (real or external) clock the park turns on automatically when
-        /// the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64 WFE): it replaces the blocking wait with a shallow per-core
-        /// park (no deep idle state), cutting the wake latency after an idle
-        /// period at a small per-core power cost (and it suppresses the global
-        /// C-state cap). That automatic choice is tunable with
-        /// `CERULION_MONITOR_WAIT` and `CERULION_DOORBELL` (`"1"` forces it on,
-        /// `"0"` disables it), but only when this flag is absent. No effect
-        /// under `--time-source virtual` (the poll loop never parks).
+        /// Hard opt-out from the live-loop monitor-wait park, on every target;
+        /// no environment variable can re-enable it. Without this flag, on the
+        /// live (real or external) clock the park is on by default everywhere.
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
+        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// per-core park (no deep idle state), cutting the wake latency after an
+        /// idle period at a small per-core power cost; elsewhere it is a bounded
+        /// park that never busy-spins. This flag restores the blocking wait on
+        /// every target, and on Linux the automatic C-state cap the park stands
+        /// in for. The default is tunable: `CERULION_MONITOR_WAIT=0` turns the
+        /// park off on every target and `=1` forces it on; `CERULION_DOORBELL=0`
+        /// drops the data doorbell and leaves the park as the other settings
+        /// resolve it, and `CERULION_DOORBELL=1` asks for the doorbell and, only
+        /// where a monitor-wait primitive exists, turns the park back on over
+        /// `CERULION_MONITOR_WAIT=0`. A single-process `--time-source
+        /// virtual` run never parks, so the flag has no effect there.
         #[arg(long = "no-monitor-wait")]
         no_monitor_wait: bool,
         /// Record the run to an MCAP bag.
@@ -3556,7 +3567,7 @@ mod time_source_flag_tests {
     }
 
     /// Bare `graph run g` leaves `no_monitor_wait` false (park
-    /// auto-on for the live path where the primitive exists).
+    /// auto-on for the live path on every target).
     #[test]
     fn graph_run_no_monitor_wait_defaults_false() {
         let cli = Cli::try_parse_from(["cerulion", "graph", "run", "g"])
@@ -3572,8 +3583,9 @@ mod time_source_flag_tests {
     }
 
     /// `--no-monitor-wait` coexists with `--time-source virtual` (the
-    /// flag is independent of the clock selection; the park is live-only so it
-    /// is a no-op under virtual, but the flag must still parse).
+    /// flag is independent of the clock selection; a single-process virtual run
+    /// never parks, a multi-process one parks its workers, and the flag must
+    /// parse for both).
     #[test]
     fn graph_run_no_monitor_wait_coexists_with_virtual() {
         let cli = Cli::try_parse_from([
@@ -3604,7 +3616,7 @@ mod time_source_flag_tests {
 
     /// `--no-monitor-wait` coexists with `--time-source external` —
     /// the opt-out is honored on the live `External` clock (whose default would
-    /// otherwise arm the park where the primitive exists).
+    /// otherwise arm the park).
     #[test]
     fn graph_run_no_monitor_wait_coexists_with_external() {
         let cli = Cli::try_parse_from([

@@ -21,6 +21,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod fresh_executable;
 mod mp_support;
 use mp_support::*;
 
@@ -225,16 +226,10 @@ fn guard_with_a_late_worker(
     // matchable argv happens BEFORE the script's first line runs, so the file
     // existing implies the pid is already matchable. The witness is conservative
     // in the right direction, never ahead of the thing it stands for.
-    std::fs::write(
+    fresh_executable::install_script(
         &worker,
         "#!/bin/sh\n: > \"$CER_WORKER_ARRIVED\"\nsleep 30\n",
-    )
-    .expect("write the worker script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     // THE NEEDLE MUST NOT APPEAR IN THE SUPERVISOR'S OWN ARGV, so the worker path
     // and the witness path travel in the ENVIRONMENT rather than in `-c`.
     //

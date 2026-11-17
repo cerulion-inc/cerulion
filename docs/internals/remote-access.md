@@ -45,8 +45,9 @@ the same entry instead of running the daemon.
   once for both hosts. A library host
   (`RemotePlane::new`) refuses the daemon-only verbs by name with
   `unsupported_host`: `restart` (it restarts a systemd unit), `engage-estop`
-  (it engages the daemon's control lease and incident capture; a host that served
-  it would report an e-stop that stops nothing), and the act verbs
+  (it engages the daemon's control lease, sends an `estop` to rcpd and asks for
+  an incident capture; a library host has neither that lease nor an rcpd
+  link), and the act verbs
   `topic-publish`, `service-call`, `topic-snapshot` and `topic-echo-once` (they
   run on the process's transport singleton and the daemon's schema directory, and
   the two that send are gated by the daemon's e-stop, which a library host does
@@ -392,7 +393,7 @@ The demand GET loop does not consult the posture: it keeps sending GETs while
 paired, and each GET's selector names one ingress topic it demands. The
 remote plane's wire protocol does not carry writes from a desk:
 `cerulion/wire/2` moves frames from robot to desk only, and the `teleop` verb
-has no handler yet (see `docs/remote_plane.md`). Its re-inject seam is the
+has no handler (see `docs/remote_plane.md`). Its re-inject seam is the
 desk-side path that copies robot frames into the desk's own shared memory; it
 does not consult the LAN posture and it is not a write path to the robot. A desk
 writes the robot's topics and services over the ops plane instead (§5.1):
@@ -422,7 +423,7 @@ binds each session to its pairing key over an authenticated transport and
 authorizes each peer and each demanded topic, with revocation. Its wire protocol
 carries the observe direction only (robot to desk topic data). The teleop
 command direction is classified (`teleop` needs `CAP_TELEOP`) but has no
-handler, so no verb takes the control lease or runs under the deadman yet. The
+handler, so no verb takes the control lease or runs under the deadman. The
 ops protocol still runs the verbs the robot registers (for example `restart` and
 `engage-estop`), the act verbs among them (§5.1): with `CAP_TELEOP` and
 role ≥ OPERATOR a desk publishes a message on a robot topic (`topic-publish`) or
@@ -444,7 +445,7 @@ snapshot (`topic-snapshot`).
   refused to a row whose principal is cloud whether the allow-from-cloud switch
   is on or off (class `NonCloud`: the authorizer refuses it before dispatch, so
   the refusal is receipted `Denied`); `estop-status` needs `CAP_OBSERVE` AND the
-  VIEWER role or higher; no host registers either e-stop verb yet, so a caller
+  VIEWER role or higher; no host registers either e-stop verb, so a caller
   the authorizer admits gets `unknown_verb`; an UNCLASSIFIED verb is DENIED,
   never fail-open. Lower `Role` value = higher privilege.
 - **The pairing subject is always the authenticated device key**, never read
@@ -1412,6 +1413,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_connectd/tests/reinject_e2e_test.rs` | Full connect session: dial → demand → reader → desk-SHM re-inject, hand-oracle frames |
 | `crates/cerulion_connectd/tests/pair_e2e_test.rs` | Desk CPace ceremony against a real remoted ops plane; trust verified from disk; each refusal text of the robot's code-pairing store maps to its desk exit class (every try failed and a wrong code are a code mismatch; a used code, a throttled try, every try taken by a desk still pairing, an expired window, no armed code and no try in progress are refusals); against a robot that accepts the ops stream and never answers, the desk-side ceremony timeout returns as unreachable and the robot sees the desk close the connection with code 0; a desk interrupted while the robot holds its admitted `code-pair-start` returns as interrupted, and once the hold is let go the robot counts that try failed within 5 s, under the 30 s QUIC idle timeout, with no row written; an interrupt that resolves while a paired desk waits for its endpoint close leaves the run paired, with the desk key's own account and the code-paired row on disk; an interrupt that resolves while the robot holds a right code's row save, after the desk sent `code-pair-finish`, leaves the run paired once the save is let go, with the code-paired row on disk; one whose save stays held past the 3 s the run waits returns exit 130 with the text that the robot may have paired the desk, and the robot pairs it once the save is let go; a 3 s desk-side ceremony timeout that fires while the robot holds that save leaves the run paired once the save is let go within the 3 s the run then waits, and one whose save stays held past both returns exit 3 with the text that the robot may have paired the desk, and the robot pairs it once the save is let go |
 | `crates/cerulion_connectd/tests/pair_interrupt_e2e_test.rs` | The real `cerulion-connectd pair` with stdin a pipe held open: with no code written, SIGINT and SIGTERM after the desk key line each end it with exit 130 within 2 s, log the signal caught and print nothing on stdout; a code written on the pipe reaches a test robot that accepts the ops stream and never answers, and SIGINT there ends it with exit 130 within 2 s after exactly the `pairing:` line, the robot seeing the connection closed with code 0 within 5 s of the reap; a stdin closed with no code is exit 1 |
+| `crates/cerulion_connectd/tests/connect_interrupt_e2e_test.rs` | The real `cerulion-connectd connect` and the real `cerulion connect`, streaming from a test robot with stdin a pipe held open: SIGINT to the helper, a closed stdin, and SIGINT or SIGTERM to `cerulion connect` each end the run with exit 0 within 2 s, with the robot's catalog on stdout. The `cerulion connect` arms need `cargo build -p cerulion_cli` first, which puts `cerulion` beside `cerulion-connectd` |
 | `cerulion_wireclient` in-module tests | Dial-config parsers, epoch push decisions + cache-path pins, reply classification |
 | `crates/cerud/tests/*` | Protocol/authz/receipt/lease/deploy/verbs oracles + the constants doc pins |
 | `crates/cerulion_ops_proto/tests/wire_golden_test.rs` | Every `cerulion/ops/1` message type encodes to, and decodes from, a golden frame built from JSON text |

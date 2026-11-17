@@ -186,6 +186,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "/tf".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -217,6 +218,7 @@ fn cross_graph_listed_topic_both_publish_and_flow() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         }],
         vec![],
@@ -374,6 +376,7 @@ fn block_input_meta() -> InputMeta {
         depth: 2,
         backpressure: BackpressurePolicy::Block,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     }
 }
@@ -444,6 +447,7 @@ fn block_all_graph(obs: BlockAllObs) -> (GraphConfig, IndexMap<String, Box<dyn N
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "/tf".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -692,6 +696,7 @@ fn block_defers_all_in_graph_producers_on_listed_topic() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "/tf".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -826,6 +831,7 @@ fn per_stream_eviction_counting_tracks_loose_cap() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "/tf".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -998,6 +1004,7 @@ fn listed_topic_rejects_depth_above_shared_ceiling_at_build() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "/tf".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1066,6 +1073,7 @@ fn listed_topic_rejects_single_graph_subscriber_overflow_at_build() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/tf".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         });
@@ -1170,6 +1178,7 @@ fn quiet_listed_graph_with(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/tf".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         });
@@ -1302,6 +1311,7 @@ fn listed_provisioning_warns_and_infos_are_pinned() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/ext/imu".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `cerulion graph validate` reads each node library ONCE.
 //!
-//! Two checks read a library through the caller's inspector: the network
-//! ingress gate (per node) and the params check (per type). A library's
+//! Checks read a library through the caller's inspector: the per-node read
+//! the input backpressure check and the network ingress gate share, and the
+//! params check (per type). A library's
 //! static initialization and teardown run on every in-process read, so a
 //! second read is a second run of them. This drives the real validate entry
 //! point over a two-node graph of one type with an ingress block and counts

@@ -297,10 +297,12 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
                     InputDef {
                         name: "inp".to_string(),
                         source: "producer/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "aux".to_string(),
                         source: "producer/aux_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],
