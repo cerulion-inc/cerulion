@@ -991,10 +991,11 @@ fn connect_exit_code(command: Commands) -> ExitCode {
     }
 }
 
-/// clap's refusal of the command line, printed and exited as clap prints it,
-/// except one: an argument that is not valid UTF-8 in a text field. clap's
-/// line for that names no argument, so the refusal from [`not_utf8_args`]
-/// prints in its place, with clap's usage-error code, 2.
+/// A clap parse error (a usage error, or `--help` / `--version` output),
+/// printed and exited as clap does it, except an argument that is not valid
+/// UTF-8 in a text field: clap's line for that names no argument, so the
+/// refusal from [`not_utf8_args`] prints in its place, with clap's usage-error
+/// code, 2.
 fn exit_on_parse_error(e: clap::Error) -> ExitCode {
     if e.kind() == clap::error::ErrorKind::InvalidUtf8 {
         let args: Vec<OsString> = std::env::args_os().skip(1).collect();
