@@ -893,8 +893,8 @@ fn frame_not_held_reason(resume_step: u64, gap: &FrameGap) -> String {
         sequence,
         held_from,
     } = gap;
-    let readable = "`cerulion bag play --resim` cannot re-execute it. The frames, the state and \
-                    the trace are in the bag and readable.";
+    let readable = "`cerulion bag play --resim all --verify` cannot judge it. The frames, the \
+                    state and the trace are in the bag and readable.";
     let read = if *step == resume_step {
         "whose read".to_string()
     } else {
@@ -905,32 +905,39 @@ fn frame_not_held_reason(resume_step: u64, gap: &FrameGap) -> String {
     } else {
         "the checkpoint this capture resumes from"
     };
-    let late = |lead: String| {
+    let late = |lead: String, frames: &str| {
         format!(
-            "{lead}, a frame the capture never held: the recorder's taps attached after \
-             {attached_after}, which happens to a capture taken in the first seconds of a run. \
-             {readable} {FRAMES_BEGIN_LATE_REMEDY}"
+            "{lead}, a frame the capture never held: its frames {frames} start later than \
+             {attached_after}, because the recorder's taps attached after it, as in a capture \
+             taken in the first seconds of a run, or because the window let them go. {readable} \
+             {FRAMES_BEGIN_LATE_REMEDY}"
         )
     };
     match held_from {
         Some(HeldFrom {
             topic,
             first_sequence,
-        }) if sequence < first_sequence => late(format!(
-            "this capture's frames on '{topic}' from writer {writer:016x} begin at sequence \
-             {first_sequence}, but its trace resumes at step {resume_step}, {read} of that topic \
-             names sequence {sequence}"
-        )),
+        }) if sequence < first_sequence => late(
+            format!(
+                "this capture's frames on '{topic}' from writer {writer:016x} begin at sequence \
+                 {first_sequence}, but its trace resumes at step {resume_step}, {read} of that \
+                 topic names sequence {sequence}"
+            ),
+            "on that topic",
+        ),
         Some(HeldFrom { topic, .. }) => format!(
             "this capture keeps a read at step {step} of '{topic}' that names writer \
              {writer:016x}, sequence {sequence}, a frame its window lost: the window recorder \
              could not keep up with that topic. {readable} `cerulion graph run --record` records \
              every frame of a run"
         ),
-        None => late(format!(
-            "this capture holds no frame from writer {writer:016x}, but its trace resumes at step \
-             {resume_step}, {read} names that writer's sequence {sequence}"
-        )),
+        None => late(
+            format!(
+                "this capture holds no frame from writer {writer:016x}, but its trace resumes at \
+                 step {resume_step}, {read} names that writer's sequence {sequence}"
+            ),
+            "from that writer",
+        ),
     }
 }
 
@@ -1426,10 +1433,11 @@ mod tests {
             reason(1, 1, 1, Some(3)),
             "this capture's frames on '/p/ticker/cmd' from writer 42cbecd9a96b9f36 begin at \
              sequence 3, but its trace resumes at step 1, whose read of that topic names sequence \
-             1, a frame the capture never held: the recorder's taps attached after the checkpoint \
-             this capture resumes from, which happens to a capture taken in the first seconds of \
-             a run. `cerulion bag play --resim` cannot re-execute it. The frames, the state and \
-             the trace are in the bag and readable. A capture taken more than one Flashback window \
+             1, a frame the capture never held: its frames on that topic start later than the \
+             checkpoint this capture resumes from, because the recorder's taps attached after it, \
+             as in a capture taken in the first seconds of a run, or because the window let them \
+             go. `cerulion bag play --resim all --verify` cannot judge it. The frames, the state \
+             and the trace are in the bag and readable. A capture taken more than one Flashback window \
              into the run (`CERULION_FLASHBACK_WINDOW_MS`) resumes from a checkpoint its frames \
              cover, and `cerulion graph run --record` records a run from its first step"
         );
@@ -1437,9 +1445,9 @@ mod tests {
             reason(1, 4, 4, Some(0)),
             "this capture keeps a read at step 4 of '/p/ticker/cmd' that names writer \
              42cbecd9a96b9f36, sequence 4, a frame its window lost: the window recorder could \
-             not keep up with that topic. `cerulion bag play --resim` cannot re-execute it. The \
-             frames, the state and the trace are in the bag and readable. `cerulion graph run \
-             --record` records every frame of a run"
+             not keep up with that topic. `cerulion bag play --resim all --verify` cannot judge \
+             it. The frames, the state and the trace are in the bag and readable. `cerulion graph \
+             run --record` records every frame of a run"
         );
         for (text, clause) in [
             // A first missing read after the resume step names both steps.
@@ -1450,14 +1458,14 @@ mod tests {
             // A from-start capture has no checkpoint to name.
             (
                 reason(0, 0, 0, Some(3)),
-                "taps attached after the run's first step,",
+                "start later than the run's first step,",
             ),
             // A writer the capture holds nothing of.
             (
                 reason(1, 1, 0, None),
                 "this capture holds no frame from writer 42cbecd9a96b9f36, but its trace resumes \
                  at step 1, whose read names that writer's sequence 0, a frame the capture never \
-                 held: the recorder's taps attached after the checkpoint",
+                 held: its frames from that writer start later than the checkpoint",
             ),
         ] {
             assert!(text.contains(clause), "{clause:?} in {text}");

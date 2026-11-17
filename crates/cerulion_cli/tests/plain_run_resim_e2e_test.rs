@@ -2775,10 +2775,12 @@ const CLEAN_CAPTURE_ATTEMPTS: usize = 5;
 /// The fixed parts of the capture judge's frames-begin-late reason, one per
 /// resume shape (from a checkpoint, and from the run's first step).
 const FRAMES_BEGIN_LATE_CAUSES: [&str; 2] = [
-    "a frame the capture never held: the recorder's taps attached after the checkpoint this \
-     capture resumes from, which happens to a capture taken in the first seconds of a run.",
-    "a frame the capture never held: the recorder's taps attached after the run's first step, \
-     which happens to a capture taken in the first seconds of a run.",
+    "a frame the capture never held: its frames on that topic start later than the checkpoint \
+     this capture resumes from, because the recorder's taps attached after it, as in a capture \
+     taken in the first seconds of a run, or because the window let them go.",
+    "a frame the capture never held: its frames on that topic start later than the run's first \
+     step, because the recorder's taps attached after it, as in a capture taken in the first \
+     seconds of a run, or because the window let them go.",
 ];
 
 /// `Some(reason)` when the capture judge refused this capture because its frames
