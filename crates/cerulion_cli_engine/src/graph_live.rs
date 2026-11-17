@@ -4810,7 +4810,7 @@ fires of run 0x00000000000000000000000000005d1c (graph temi) on robot temi; the 
             Err(CliError::Validation(text)) => assert_eq!(
                 text,
                 "the cerulion-netd on this machine speaks protocol 9, and reading fires through \
-                 it needs protocol 10; upgrade cerulion-netd, or pass --connect LOCATOR (for \
+                 it needs protocol 12; upgrade cerulion-netd, or pass --connect LOCATOR (for \
                  example tcp/127.0.0.1:7683) to ask the robot directly"
             ),
             other => panic!("expected the version refusal, got {:?}", other.map(|_| ())),

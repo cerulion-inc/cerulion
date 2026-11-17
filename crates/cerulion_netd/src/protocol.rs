@@ -2763,6 +2763,33 @@ mod tests {
             serde_json::from_str::<Response>(&error.to_json_line()).expect("decodes"),
             error
         );
+        let observed = Response::Observed(ObserveResponse {
+            demand: DemandResponse {
+                id: 11,
+                robot: "temi".into(),
+                topic: "/fires/out".into(),
+                refcount: 1,
+                mirror_created: true,
+            },
+            local_topic: "/temi/fires/out".into(),
+        });
+        assert_eq!(
+            serde_json::from_str::<Response>(&observed.to_json_line()).expect("decodes"),
+            observed
+        );
+        // A mirror-loss push carries no `id`: it is classified as the push, and
+        // no response, the fires answer included, decodes from it.
+        let lost = MirrorLost {
+            event: "mirror_lost".into(),
+            robot: "temi".into(),
+            topic: "/fires/out".into(),
+        };
+        let lost_line = lost.to_json_line();
+        assert_eq!(
+            classify_control_line(&lost_line),
+            ControlLine::MirrorLost(lost)
+        );
+        assert!(serde_json::from_str::<Response>(&lost_line).is_err());
         // An answer of a kind this binary does not know is a decode error, not
         // a silently different answer.
         assert!(serde_json::from_str::<Response>(r#"{"id":8,"answer":{"kind":"later"}}"#).is_err());

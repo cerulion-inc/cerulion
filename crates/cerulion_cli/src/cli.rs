@@ -1848,7 +1848,7 @@ pub enum GraphAction {
     /// number of fires read and the number the robot lost before this desk
     /// read them. Without `--follow` or `--for`, it reads for 5 s. Without
     /// `--connect`, it reads through this machine's `cerulion-netd`, which
-    /// needs protocol 10 or newer; with it, through a session of this
+    /// needs protocol 12 or newer; with it, through a session of this
     /// command's own that reaches only the locators given.
     Fires {
         /// Zenoh locator of a robot's gateway to ask directly (repeatable),

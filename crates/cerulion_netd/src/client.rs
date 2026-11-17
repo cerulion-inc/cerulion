@@ -1503,7 +1503,7 @@ impl NetdClient {
     ///
     /// # Version
     ///
-    /// Needs a v10 daemon ([`crate::protocol::FIRES_MIN_DAEMON_VERSION`]). Against
+    /// Needs a v12 daemon ([`crate::protocol::FIRES_MIN_DAEMON_VERSION`]). Against
     /// an older one the per-verb gate refuses it BEFORE it is sent, with a
     /// [`ClientError::Protocol`] naming both versions.
     pub fn query_fires(
@@ -3904,8 +3904,8 @@ mod tests {
     /// The fires skew matrix over a REAL UDS, with the daemon's served-request
     /// count as the "refused before send" oracle (the runs-verb test's shape).
     /// Every line the fake writes is minted by the production `Response`
-    /// serializer; the one it would answer a pre-10 daemon's `query_fires` with
-    /// is the unknown-method error a real v9 daemon's `parse_request` produces.
+    /// serializer; the one it would answer a pre-12 daemon's `query_fires` with
+    /// is the unknown-method error a real v11 daemon's `parse_request` produces.
     #[test]
     fn the_fires_verb_is_refused_before_send_to_a_v11_daemon_and_served_by_v12_and_newer() {
         use std::io::{BufRead, BufReader, Write};
@@ -3983,28 +3983,28 @@ mod tests {
             (sock, dir, served)
         }
 
-        // NEW client, v9 daemon: refused locally, nothing sent.
-        let (sock, dir, served) = serve(9);
-        let mut client = NetdClient::connect_or_spawn_at(sock).expect("connect to the v9 daemon");
-        assert_eq!(client.daemon_protocol(), 9);
+        // NEW client, v11 daemon: refused locally, nothing sent.
+        let (sock, dir, served) = serve(11);
+        let mut client = NetdClient::connect_or_spawn_at(sock).expect("connect to the v11 daemon");
+        assert_eq!(client.daemon_protocol(), 11);
         match client.query_fires("temi", RUN, Some(41)) {
             Err(ClientError::Protocol(msg)) => {
                 assert!(msg.contains("query_fires"), "names the verb: {msg}");
                 assert!(
-                    msg.contains("v9") && msg.contains("v10"),
+                    msg.contains("v11") && msg.contains("v12"),
                     "names both versions: {msg}"
                 );
             }
             other => panic!("expected a Protocol refusal, got {other:?}"),
         }
         assert_eq!(served.load(Ordering::SeqCst), 0, "refused BEFORE the send");
-        // The same connection still serves what a v9 daemon speaks.
+        // The same connection still serves what a v11 daemon speaks.
         assert!(client.query_catalog(None).is_ok());
         assert_eq!(served.load(Ordering::SeqCst), 1);
         drop(client);
         let _ = std::fs::remove_dir_all(&dir);
 
-        // A v10 daemon and a NEWER daemon are both asked, and answer.
+        // A v12 daemon and a NEWER daemon are both asked, and answer.
         for protocol in [FIRES_MIN_DAEMON_VERSION, FIRES_MIN_DAEMON_VERSION + 1] {
             let (sock, dir, served) = serve(protocol);
             let mut client = NetdClient::connect_or_spawn_at(sock).expect("connect to the daemon");
@@ -4021,7 +4021,7 @@ mod tests {
         }
     }
 
-    /// A v10 fake daemon over a REAL UDS closes the first connection after it
+    /// A v12 fake daemon over a REAL UDS closes the first connection after it
     /// reads the first request (the idle-exit race), then answers on the second
     /// connection with lines minted by the production `Response` serializer.
     #[test]
