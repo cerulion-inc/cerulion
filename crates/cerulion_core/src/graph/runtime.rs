@@ -14271,19 +14271,29 @@ impl GraphRuntime {
     /// own step, and the loop top sees it before any nap. Anywhere else the park
     /// runs as it does with the switch off.
     fn period_park_applies(&self, sources: &[(waitset::WaitSource<'_>, Arc<str>)]) -> bool {
-        super::period_park::admits(super::period_park::Gate {
+        super::period_park::admits(
+            self.period_park_gate(
+                sources
+                    .iter()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            ),
+        )
+    }
+
+    /// This runtime's period-park gate, given whether the park polls an
+    /// external fd source.
+    fn period_park_gate(&self, fd_sources: bool) -> super::period_park::Gate {
+        super::period_park::Gate {
             on: self.period_park_on(),
             park_active: self.park_active(),
             primitive: crate::monitor_wait::monitor_wait_available(),
             engaged_target: super::period_park::ENGAGES_ON_THIS_TARGET,
             barrier: self.barrier_participant.is_some(),
             credit_edges: !self.credit_park_edges.is_empty(),
-            fd_sources: sources
-                .iter()
-                .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            fd_sources,
             armed_line: self.has_armed_line(),
             data_wake: self.data_wake_rung(),
-        })
+        }
     }
 
     /// Test seam over [`Self::data_wake_rung`], the decision the wait policy
@@ -15814,9 +15824,8 @@ impl GraphRuntime {
             primary_topic = tracing::field::display(self.armed_primary_topic().unwrap_or("none")),
             "live loop wait policy"
         );
-        // The period-park, as THIS process resolved it: once per live-loop entry,
-        // so a run's log shows whether it can engage and why not.
-        let period_park_on = self.period_park_on();
+        // The period-park, as THIS process resolved it, at each live-loop entry,
+        // so a run's log shows whether it engages and, once, why not.
         let period_park_at_entry = self
             .period_park
             .lock()
@@ -15831,27 +15840,20 @@ impl GraphRuntime {
                 "CERULION_PERIOD_PARK is set to a value other than 1 or 0; the period park stays off"
             );
         }
-        super::period_park::warn_if_not_engaged(
-            &super::period_park::NOT_ENGAGED_NOTICE,
-            period_park_on,
-            super::period_park::ENGAGES_ON_THIS_TARGET,
-            self.config.identity(),
-        );
-        // On a target it does not engage on, the switch says so once above and
-        // logs nothing else: no `on` line and no exit telemetry.
-        let period_park_engaged = period_park_on && super::period_park::ENGAGES_ON_THIS_TARGET;
-        if period_park_engaged {
-            tracing::info!(
-                graph = %self.config.identity(),
-                park_active = self.park_active(),
-                monitor_wait = crate::monitor_wait::monitor_wait_available(),
-                barrier = self.barrier_participant.is_some(),
-                credit_edges = self.credit_park_edges.len(),
-                external = !self.external_bindings.is_empty(),
-                data_wake = self.data_wake_rung(),
-                "live loop period park on"
+        // Requested: either the `on` line, or one WARN per runtime naming the
+        // first term that refuses it. Only an engaged period-park reports exit
+        // telemetry.
+        let period_park_engaged = {
+            let gate = self.period_park_gate(
+                self.external_wake_sources()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
             );
-        }
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            super::period_park::announce(gate, &mut st.warned, self.config.identity())
+        };
 
         // Entry snapshot of the (lifetime-cumulative) park counters so
         // the exit line reports THIS run's deltas — a resumed `run_live` must

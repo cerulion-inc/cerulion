@@ -16,7 +16,6 @@
 //! (Principle #7): the step still reads every frame off the iceoryx2 queue. The
 //! arithmetic is pure and integer-only: the same inputs give the same state.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -24,12 +23,8 @@ use std::time::{Duration, Instant};
 /// measured to keep the round trip (Linux with WAITPKG). On aarch64 the
 /// monitor-wait park is `WFE`; there, on a Jetson Orin NX, no data arrival was
 /// ever predicted (the Period side's timer wakes landed late and the arrivals
-/// never looked regular), and the switch stays off with one warning.
+/// never looked regular), so the switch stays off there and says why.
 pub(crate) const ENGAGES_ON_THIS_TARGET: bool = cfg!(target_arch = "x86_64");
-
-/// Set once this process has said the switch is on but the target does not
-/// engage it.
-pub(crate) static NOT_ENGAGED_NOTICE: AtomicBool = AtomicBool::new(false);
 
 /// The longest single kernel sleep. A ring on an input topic other than the
 /// armed one is seen at the end of the nap it lands in, at the latest.
@@ -116,41 +111,102 @@ pub(crate) struct Gate {
     pub(crate) data_wake: bool,
 }
 
-/// PURE: does the period-park apply? Only where every wake the park waits for
-/// can end a kernel nap, or has none: a barrier arrival, a credit drain and an
-/// fd readiness cannot, so a park waiting for one keeps running as it does with
-/// the switch off; so does a host with no CPU primitive (its park already
-/// sleeps), a target it does not engage on, and a runtime whose externally
-/// written input has no wake word.
-pub(crate) fn admits(g: Gate) -> bool {
-    g.on && g.park_active
-        && g.primitive
-        && g.engaged_target
-        && !g.barrier
-        && !g.credit_edges
-        && !g.fd_sources
-        && (!g.armed_line || g.data_wake)
+/// Why a requested period-park does not engage: the first [`Gate`] term that
+/// fails, in declaration order. A target it does not engage on and a host
+/// without a CPU primitive come first; the rest are this runtime's own wiring,
+/// where a wake the park waits for cannot end a kernel nap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotEngaged {
+    /// Not a target it engages on ([`ENGAGES_ON_THIS_TARGET`]).
+    TargetNotValidated,
+    /// No CPU monitor-wait primitive: the park already sleeps.
+    NoMonitorWaitPrimitive,
+    /// The monitor-wait park is off.
+    ParkOff,
+    /// A lockstep barrier rank: a barrier arrival cannot end a nap.
+    Barrier,
+    /// A producer on a cross-process `block` edge: a credit drain cannot.
+    CreditEdge,
+    /// The park polls an external fd source: its readiness cannot.
+    FdSource,
+    /// An input written from outside the runtime has no doorbell wake word.
+    NoDataWake,
 }
 
-/// Warn, once per `latch`, that the switch is on but this target does not
-/// engage the period-park. Returns whether it warned.
-pub(crate) fn warn_if_not_engaged(
-    latch: &AtomicBool,
-    on: bool,
-    engaged_target: bool,
-    graph: &str,
-) -> bool {
-    if !on || engaged_target || latch.swap(true, Ordering::Relaxed) {
+impl NotEngaged {
+    /// The `reason` field value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            NotEngaged::TargetNotValidated => "target_not_validated",
+            NotEngaged::NoMonitorWaitPrimitive => "no_monitor_wait_primitive",
+            NotEngaged::ParkOff => "park_off",
+            NotEngaged::Barrier => "barrier",
+            NotEngaged::CreditEdge => "credit_edge",
+            NotEngaged::FdSource => "fd_source",
+            NotEngaged::NoDataWake => "no_data_wake",
+        }
+    }
+}
+
+/// PURE: the first gate term that keeps the period-park off, in the order of
+/// [`NotEngaged`], or `None` when every term holds. The switch is not a term:
+/// with it off there is nothing to refuse.
+pub(crate) fn refusal(g: Gate) -> Option<NotEngaged> {
+    if !g.engaged_target {
+        Some(NotEngaged::TargetNotValidated)
+    } else if !g.primitive {
+        Some(NotEngaged::NoMonitorWaitPrimitive)
+    } else if !g.park_active {
+        Some(NotEngaged::ParkOff)
+    } else if g.barrier {
+        Some(NotEngaged::Barrier)
+    } else if g.credit_edges {
+        Some(NotEngaged::CreditEdge)
+    } else if g.fd_sources {
+        Some(NotEngaged::FdSource)
+    } else if g.armed_line && !g.data_wake {
+        Some(NotEngaged::NoDataWake)
+    } else {
+        None
+    }
+}
+
+/// PURE: does the period-park apply? The switch is on and no term refuses it:
+/// only where every wake the park waits for can end a kernel nap, or has none.
+pub(crate) fn admits(g: Gate) -> bool {
+    g.on && refusal(g).is_none()
+}
+
+/// Say whether a requested period-park engages, at a live-loop entry: the
+/// `live loop period park on` line when it does, and when it does not, one
+/// WARN naming the first refusing term, at most once per `warned` latch.
+/// Logs nothing with the switch off. Returns whether it engages.
+pub(crate) fn announce(g: Gate, warned: &mut bool, graph: &str) -> bool {
+    if !g.on {
         return false;
     }
-    tracing::warn!(
-        graph = %graph,
-        target_arch = std::env::consts::ARCH,
-        engages_on = "x86_64",
-        measured = "no data arrival predicted on a Jetson Orin NX (aarch64)",
-        "period park not engaged on this target: arrival prediction is not validated here"
-    );
-    true
+    match refusal(g) {
+        None => {
+            tracing::info!(
+                graph = %graph,
+                armed_line = g.armed_line,
+                data_wake = g.data_wake,
+                "live loop period park on"
+            );
+            true
+        }
+        Some(reason) => {
+            if !std::mem::replace(warned, true) {
+                tracing::warn!(
+                    graph = %graph,
+                    reason = reason.as_str(),
+                    target_arch = std::env::consts::ARCH,
+                    "period park requested but not engaged"
+                );
+            }
+            false
+        }
+    }
 }
 
 fn ewma(old: u64, sample: u64, shift: u32) -> u64 {
@@ -411,6 +467,8 @@ impl PeriodParkStats {
 /// The live loop's period-park state. Only the live-loop thread touches it.
 #[derive(Debug, Default)]
 pub(crate) struct State {
+    /// This runtime has warned that a requested period-park did not engage.
+    pub(crate) warned: bool,
     epoch: Option<Instant>,
     pub(crate) lead: KernelLead,
     pub(crate) arrivals: ArrivalLearner,
@@ -523,48 +581,210 @@ mod tests {
         }
     }
 
+    /// Each refusing term, alone, against a hand-written reason.
+    fn one_refusal_per_term() -> [(Gate, NotEngaged, &'static str); 7] {
+        [
+            (
+                Gate {
+                    engaged_target: false,
+                    ..open_gate()
+                },
+                NotEngaged::TargetNotValidated,
+                "target_not_validated",
+            ),
+            (
+                Gate {
+                    primitive: false,
+                    ..open_gate()
+                },
+                NotEngaged::NoMonitorWaitPrimitive,
+                "no_monitor_wait_primitive",
+            ),
+            (
+                Gate {
+                    park_active: false,
+                    ..open_gate()
+                },
+                NotEngaged::ParkOff,
+                "park_off",
+            ),
+            (
+                Gate {
+                    barrier: true,
+                    ..open_gate()
+                },
+                NotEngaged::Barrier,
+                "barrier",
+            ),
+            (
+                Gate {
+                    credit_edges: true,
+                    ..open_gate()
+                },
+                NotEngaged::CreditEdge,
+                "credit_edge",
+            ),
+            (
+                Gate {
+                    fd_sources: true,
+                    ..open_gate()
+                },
+                NotEngaged::FdSource,
+                "fd_source",
+            ),
+            (
+                Gate {
+                    data_wake: false,
+                    ..open_gate()
+                },
+                NotEngaged::NoDataWake,
+                "no_data_wake",
+            ),
+        ]
+    }
+
     #[test]
-    fn a_target_the_period_park_does_not_engage_on_keeps_the_plain_park() {
-        assert!(
-            !admits(Gate {
-                engaged_target: false,
+    fn each_refusing_term_names_its_own_reason() {
+        assert_eq!(refusal(open_gate()), None);
+        assert_eq!(
+            refusal(Gate {
+                armed_line: false,
+                data_wake: false,
                 ..open_gate()
             }),
-            "a target the period-park does not engage on keeps the plain park"
+            None,
+            "no input written from outside needs no wake word"
         );
+        for (g, reason, text) in one_refusal_per_term() {
+            assert_eq!(refusal(g), Some(reason), "{text}");
+            assert_eq!(reason.as_str(), text);
+            assert!(!admits(g), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_first_refusing_term_in_order_is_the_reason() {
+        let all_fail = Gate {
+            on: true,
+            park_active: false,
+            primitive: false,
+            engaged_target: false,
+            barrier: true,
+            credit_edges: true,
+            fd_sources: true,
+            armed_line: true,
+            data_wake: false,
+        };
+        assert_eq!(refusal(all_fail), Some(NotEngaged::TargetNotValidated));
+        let host_ok = Gate {
+            engaged_target: true,
+            ..all_fail
+        };
+        assert_eq!(refusal(host_ok), Some(NotEngaged::NoMonitorWaitPrimitive));
+        assert_eq!(
+            refusal(Gate {
+                primitive: true,
+                ..host_ok
+            }),
+            Some(NotEngaged::ParkOff)
+        );
+        assert_eq!(
+            refusal(Gate {
+                barrier: false,
+                credit_edges: false,
+                ..open_gate()
+            }),
+            None
+        );
+        assert_eq!(
+            refusal(Gate {
+                credit_edges: true,
+                fd_sources: true,
+                data_wake: false,
+                ..open_gate()
+            }),
+            Some(NotEngaged::CreditEdge)
+        );
+        assert_eq!(
+            refusal(Gate {
+                fd_sources: true,
+                data_wake: false,
+                ..open_gate()
+            }),
+            Some(NotEngaged::FdSource)
+        );
+    }
+
+    /// The lines one `announce` call wrote, by the two messages it can write.
+    fn announced(lines: &[&str], graph: &str) -> (Vec<String>, usize) {
+        let mine = |l: &&&str| l.contains(&format!("graph={graph}"));
+        let warns = lines
+            .iter()
+            .filter(mine)
+            .filter(|l| l.contains("period park requested but not engaged"))
+            .map(|l| l.to_string())
+            .collect();
+        let ons = lines
+            .iter()
+            .filter(mine)
+            .filter(|l| l.contains("live loop period park on"))
+            .count();
+        (warns, ons)
     }
 
     #[tracing_test::traced_test]
     #[test]
-    fn the_switch_on_a_target_it_does_not_engage_warns_once_and_stays_off() {
-        let latch = AtomicBool::new(false);
-        assert!(warn_if_not_engaged(&latch, true, false, "g1"));
-        assert!(
-            !warn_if_not_engaged(&latch, true, false, "g2"),
-            "once per latch"
-        );
-        assert!(
-            !warn_if_not_engaged(&AtomicBool::new(false), false, false, "g3"),
-            "switch off"
-        );
-        assert!(
-            !warn_if_not_engaged(&AtomicBool::new(false), true, true, "g4"),
-            "engaged target"
-        );
-        logs_assert(|lines: &[&str]| {
-            let warned: Vec<&&str> = lines
-                .iter()
-                .filter(|l| l.contains("period park not engaged on this target"))
-                .collect();
-            match warned.as_slice() {
-                [line]
-                    if line.contains("WARN")
-                        && line.contains("g1")
-                        && line.contains("target_arch") =>
-                {
-                    Ok(())
+    fn a_refused_period_park_warns_once_with_its_reason_and_never_says_on() {
+        for (i, (g, _, text)) in one_refusal_per_term().into_iter().enumerate() {
+            let graph = format!("refused{i}");
+            let mut warned = false;
+            assert!(!announce(g, &mut warned, &graph), "{text}");
+            assert!(!announce(g, &mut warned, &graph), "{text}: a second entry");
+            logs_assert(|lines: &[&str]| {
+                let (warns, ons) = announced(lines, &graph);
+                match warns.as_slice() {
+                    [line]
+                        if line.contains("WARN")
+                            && line.contains(&format!("reason=\"{text}\""))
+                            && line.contains("target_arch")
+                            && ons == 0 =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "{text}: {} warn lines {warns:?}, {ons} on lines",
+                        warns.len()
+                    )),
                 }
-                other => Err(format!("expected one WARN line naming g1, got {other:?}")),
+            });
+        }
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_engaged_period_park_says_on_and_never_warns() {
+        let mut warned = false;
+        assert!(announce(open_gate(), &mut warned, "engaged"));
+        assert!(!warned);
+        let mut off = false;
+        assert!(!announce(
+            Gate {
+                on: false,
+                barrier: true,
+                ..open_gate()
+            },
+            &mut off,
+            "switchoff"
+        ));
+        logs_assert(|lines: &[&str]| {
+            let (warns, ons) = announced(lines, "engaged");
+            let (off_warns, off_ons) = announced(lines, "switchoff");
+            if warns.is_empty() && ons == 1 && off_warns.is_empty() && off_ons == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "engaged: {warns:?} {ons}; switch off: {off_warns:?} {off_ons}"
+                ))
             }
         });
     }
