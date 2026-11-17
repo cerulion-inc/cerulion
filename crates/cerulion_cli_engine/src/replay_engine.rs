@@ -41,6 +41,19 @@
 //! Every recorded topic (bag channel, excluding `__cerulion/*`) is classified
 //! from the graph:
 //! - GRAPH-PRODUCED (an in-graph node output) — re-executed, captured, diffed.
+//! - DRIVER (an output whose every in-graph writer is an `external` node,
+//!   `#[cerulion_node(external)]`): graph-produced, but a recorded INPUT. A
+//!   replay never queries the node's `external_source()`, so it cannot
+//!   re-produce the frames. Its consumers are fed the recorded frames (a fed
+//!   read's private feed, or an injector on a cross-rank edge), and the topic
+//!   is neither diffed nor counted. What a replayed driver tick still
+//!   publishes on it is written to `--record-out` (`RecordOutTap`). A
+//!   record-side-lossy one is still a violation on its own topic. A
+//!   `multi_publisher_topics` topic a driver shares with other nodes stays
+//!   GRAPH-PRODUCED, diffed over the other writers' frames, each in the pass
+//!   that runs it, when the replay attributes each recorded frame to its
+//!   writer, and counted over every recorded frame no partition holds
+//!   otherwise (`DriverInputsReport::unattributed_topics`).
 //! - EXTERNAL (consumed in-graph, no in-graph producer: the
 //!   absolute `source:` class) — the recorded frames are re-INJECTED byte-exact
 //!   so the downstream graph sees the same inputs it saw live.
@@ -120,7 +133,7 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 
 /// The iceoryx2 node-name PREFIX every resim runs under
 /// (`{REPLAY_NODE_NAME_PREFIX}{identity}`, minted at
-/// [`TransportManager::init`] below).
+/// `init_resim_transport` below).
 ///
 /// A named constant rather than an inline literal because
 /// [`crate::replay_cmd`] has to SUBTRACT it: iceoryx2 caps a node name at
@@ -129,6 +142,533 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 /// twice would put a refused run one rename away (and, before
 /// `TransportManager::init`'s conversion became fallible, a PANIC one rename away).
 pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
+
+/// The fixed head of every resim's PRIVATE iceoryx2 prefix
+/// (`{RESIM_NAMESPACE_MARKER}{slot:08x}_`, see [`resim_namespace_prefix`]).
+///
+/// A resim publishes the frames it re-executes and the recorded external
+/// inputs it re-injects under the recording's own topic names, and its
+/// transport runs under this prefix. iceoryx2 names every node, service and
+/// shared-memory segment `{prefix}{name}` and opens only files carrying its own
+/// prefix, so a process on the shared namespace (iceoryx2's default `iox2_`,
+/// the one `graph run`, `cerulion-netd`, `bagd` and `topic echo` use) cannot
+/// open a service a resim creates, and a resim cannot open theirs.
+///
+/// It diverges from `iox2_` at its first character and from the multi-process
+/// planning namespace's `cer_p_` at its fifth, so iceoryx2's string-prefix
+/// listing of one namespace never reaches another's files.
+pub const RESIM_NAMESPACE_MARKER: &str = "cer_resim_";
+
+/// How many resim namespaces a machine has. A resim runs on the slot it holds
+/// ([`claim_resim_slot`]), so at most this many resims run at once, and the
+/// files resims leave behind belong to at most this many namespaces.
+const RESIM_NAMESPACE_SLOTS: u32 = 256;
+
+/// The private iceoryx2 prefix of resim namespace slot `slot`.
+///
+/// The slot is rendered as exactly eight lowercase hex digits (every `u32`
+/// fits), so every resim prefix has the same length and none is a strict
+/// prefix of another: iceoryx2 lists a namespace's nodes by string-prefix
+/// match, and prefixes of different lengths would let one slot's listing reach
+/// another's files. One process at a time holds a slot, so two resims running
+/// at once never share a namespace.
+///
+/// Nothing the run records or reports carries this prefix: it names files, and
+/// a topic's iceoryx2 service identity is derived from the topic alone.
+#[must_use]
+pub fn resim_namespace_prefix(slot: u32) -> String {
+    format!("{RESIM_NAMESPACE_MARKER}{slot:08x}_")
+}
+
+/// The resim namespace slot whose [`resim_namespace_prefix`] `file_name`
+/// begins with.
+///
+/// `None` for every other name: other namespaces' files, and a slot's lock
+/// file (`cer_resim_{slot:08x}.lock`, no `_` after the digits).
+#[must_use]
+pub fn resim_namespace_slot(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(RESIM_NAMESPACE_MARKER)?;
+    let hex = rest.get(..8)?;
+    if !rest.get(8..)?.starts_with('_')
+        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// The iceoryx2 config of resim namespace slot `slot`: `base` with the private
+/// [`resim_namespace_prefix`]. A resim passes the host's RESOLVED config
+/// (`Config::global_config()`), so an operator's iceoryx2 config file, its root
+/// path included, applies exactly as it does to a live run.
+fn resim_ix_config(
+    base: &iceoryx2::config::Config,
+    slot: u32,
+) -> Result<iceoryx2::config::Config, ReplayError> {
+    use iceoryx2::prelude::{FileName, SemanticString};
+    let prefix = resim_namespace_prefix(slot);
+    let file_name = FileName::new(prefix.as_bytes()).map_err(|e| ReplayError::Internal {
+        reason: format!(
+            "cannot build the resim's private iceoryx2 prefix '{prefix}': iceoryx2 rejects it \
+             ({e:?})"
+        ),
+    })?;
+    let mut ix_config = base.clone();
+    ix_config.global.prefix = file_name;
+    Ok(ix_config)
+}
+
+/// The directory that holds this machine's shared-memory segment names:
+/// `/dev/shm` on Linux, and on macOS the directory of the state files iceoryx2
+/// keeps one per segment. Segment names do not depend on the iceoryx2 root, so
+/// every namespace with one prefix shares its segment names here, whatever root
+/// its config names. `None` where a resim does not walk segment names.
+#[cfg(target_os = "linux")]
+const SEGMENT_NAME_DIR: Option<&str> = Some("/dev/shm/");
+#[cfg(target_os = "macos")]
+const SEGMENT_NAME_DIR: Option<&str> = Some(crate::shm_state::SHM_STATE_DIRECTORY);
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEGMENT_NAME_DIR: Option<&str> = None;
+
+/// The directory a resim takes its slot lock in: [`SEGMENT_NAME_DIR`], or
+/// `base`'s iceoryx2 root where there is none.
+///
+/// The lock sits where a slot's segment names collide, so its exclusion covers
+/// every process that could share them: two resims whose iceoryx2 configs name
+/// different roots, and two containers that share `/dev/shm` but not `/tmp`,
+/// still take different slots, and a slot's reclaim never removes a segment a
+/// running resim uses.
+fn resim_slot_lock_dir(base: &iceoryx2::config::Config) -> PathBuf {
+    SEGMENT_NAME_DIR.map_or_else(
+        || PathBuf::from(String::from(base.global.root_path())),
+        PathBuf::from,
+    )
+}
+
+/// A resim namespace slot this process holds: its lock file stays open, and
+/// its exclusive `flock` held, until the value is dropped or the process
+/// ends, a crash included (the kernel releases the lock with the descriptor).
+#[derive(Debug)]
+struct ResimSlot {
+    slot: u32,
+    /// Kept only to hold the lock.
+    _lock: std::fs::File,
+}
+
+/// Why a claim passed over a slot whose lock a running resim does not hold.
+#[derive(Debug)]
+enum SlotPassedOver {
+    /// Its lock file could not be opened or locked: the path and the error.
+    Lock(String),
+    /// The slot's private iceoryx2 config could not be built.
+    Config(String),
+    /// Its namespace did not reclaim clean: what the reclaim found, and
+    /// [`SlotReclaim::refusal`].
+    Reclaim {
+        reclaim: SlotReclaim,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SlotPassedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(failure) => {
+                write!(f, "its lock file could not be opened or locked: {failure}")
+            }
+            Self::Config(reason) | Self::Reclaim { reason, .. } => f.write_str(reason),
+        }
+    }
+}
+
+/// Log one slot a claim passed over, through the claim's `latch`: the first
+/// at warn, the repeats at debug, and the slot that takes the count across a
+/// power of ten at warn again.
+fn log_passed_over_slot(
+    latch: &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    slot: u32,
+    passed: &SlotPassedOver,
+) {
+    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+    let reclaim = match passed {
+        SlotPassedOver::Reclaim { reclaim, .. } => Some(reclaim),
+        SlotPassedOver::Lock(_) | SlotPassedOver::Config(_) => None,
+    };
+    let nodes_left = reclaim.and_then(|r| r.nodes_left.as_ref().ok().copied());
+    let cleanups = reclaim.map(|r| r.cleaned.cleanups);
+    let failed_cleanups = reclaim.map(|r| r.cleaned.failed_cleanups);
+    let deferred = reclaim.map(|r| r.cleaned.deferred);
+    let segments_failed = reclaim.map(|r| r.segments_failed);
+    match latch.on_failure() {
+        RegimeDecision::Loud => tracing::warn!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            error = %passed,
+            "replay: passed over a resim namespace slot whose lock could not be taken or whose \
+             namespace did not reclaim clean; the slot keeps its files and the resim tries the \
+             next one"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            total_failures = total,
+            suppressed,
+            error = %passed,
+            "replay: still passing over resim namespace slots"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            slot,
+            nodes_left,
+            cleanups,
+            failed_cleanups,
+            deferred,
+            segments_failed,
+            suppressed,
+            error = %passed,
+            "replay: passed over another resim namespace slot (suppressed)"
+        ),
+    }
+}
+
+/// Claim the lowest slot below `slots` whose lock file in `lock_dir`
+/// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
+/// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
+/// the lock is held.
+///
+/// A slot whose lock another process holds is skipped. A slot whose lock file
+/// cannot be opened or locked (another user's, say) or that `ready` refuses
+/// is passed over, its lock released, and logged through one
+/// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
+/// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
+/// suppressed repeats logs how many. With no slot left the claim is
+/// [`ReplayError::Internal`] (exit 5), naming the directory, the first failure
+/// to open or lock a file and the last slot `ready` refused, with its reason.
+fn claim_resim_slot(
+    lock_dir: &Path,
+    slots: u32,
+    mut ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
+) -> Result<ResimSlot, ReplayError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut latch = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
+    let mut first_failure: Option<String> = None;
+    let mut last_refusal: Option<(u32, SlotPassedOver)> = None;
+    for slot in 0..slots {
+        let path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))
+            .and_then(|lock| {
+                match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                {
+                    Ok(()) => Ok(Some(lock)),
+                    Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+                    Err(e) => Err(format!("{}: {e}", path.display())),
+                }
+            });
+        let lock = match opened {
+            Ok(Some(lock)) => lock,
+            // Held by a running resim.
+            Ok(None) => continue,
+            Err(failure) => {
+                first_failure.get_or_insert_with(|| failure.clone());
+                log_passed_over_slot(&mut latch, slot, &SlotPassedOver::Lock(failure));
+                continue;
+            }
+        };
+        match ready(slot) {
+            Ok(()) => {
+                if let Some(suppressed) = latch.on_success() {
+                    tracing::info!(
+                        slot,
+                        suppressed,
+                        total_failures = latch.total_failures(),
+                        "replay: claimed a resim namespace slot after passing over others"
+                    );
+                }
+                return Ok(ResimSlot { slot, _lock: lock });
+            }
+            Err(passed) => {
+                log_passed_over_slot(&mut latch, slot, &passed);
+                last_refusal = Some((slot, passed));
+            }
+        }
+    }
+    Err(ReplayError::Internal {
+        reason: format!(
+            "no resim namespace slot is free: none of the {slots} slot locks in '{}' could be \
+             taken by this process (each is held by a running resim, could not be opened or \
+             locked, or its namespace did not reclaim clean){}{}",
+            lock_dir.display(),
+            first_failure
+                .map(|failure| format!("; the first that could not be opened or locked: {failure}"))
+                .unwrap_or_default(),
+            last_refusal
+                .map(|(slot, passed)| format!(
+                    "; the last whose namespace was refused: slot {slot}, {passed}"
+                ))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+/// What reclaiming one slot's namespace found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotReclaim {
+    /// The dead-node sweep's counts.
+    cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
+    /// Nodes still registered after the sweep, or why the registry could not
+    /// be listed.
+    nodes_left: Result<u64, String>,
+    /// Leftover segments removed.
+    segments_removed: u64,
+    /// Leftover segments that could not be removed.
+    segments_failed: u64,
+}
+
+impl SlotReclaim {
+    /// Why a resim may not start on the slot, or `None` when it may: its
+    /// namespace holds no node, and every leftover segment the walk reached
+    /// was removed.
+    fn refusal(&self) -> Option<String> {
+        let cleaned = &self.cleaned;
+        match &self.nodes_left {
+            Err(error) => Some(format!(
+                "its namespace's node registry could not be listed after the dead-node sweep \
+                 ({error})"
+            )),
+            Ok(0) if self.segments_failed == 0 => None,
+            Ok(0) => Some(format!(
+                "leftover segments of its namespace that could not be removed: {}",
+                self.segments_failed
+            )),
+            Ok(left) => Some(format!(
+                "nodes still registered in its namespace after the dead-node sweep: {left} (the \
+                 sweep removed {}, failed on {} and deferred {}; it removes only the nodes of \
+                 processes that have ended and that this user can inspect)",
+                cleaned.cleanups, cleaned.failed_cleanups, cleaned.deferred
+            )),
+        }
+    }
+}
+
+/// Reclaim the namespace of a slot this process holds, within `budget`,
+/// before a resim starts on it.
+///
+/// A resim's iceoryx2 node lives as long as its process, so every resim
+/// leaves its node registered, and a killed one also leaves the services it
+/// held. The dead-node sweep removes those: their process is gone, so iceoryx2
+/// reads them dead, and only dead nodes are removed. Once no node is left,
+/// every segment in `segment_dir` named with the slot's prefix is removed too:
+/// whatever the sweep did not reach, and the namespace's iceoryx2 management
+/// segment, which iceoryx2 itself never removes. The caller holds the slot's
+/// lock, so no running resim uses any of them. A namespace that still holds a
+/// node keeps its segments. A walk the budget cuts short leaves the rest for
+/// the next resim on the slot.
+fn reclaim_resim_slot(
+    ix_config: &iceoryx2::config::Config,
+    slot: u32,
+    segment_dir: Option<&Path>,
+    budget: Duration,
+) -> SlotReclaim {
+    // Startup hygiene only: the elapsed time bounds how long the reclaim may
+    // delay the resim and never reaches anything the run executes or reports.
+    let started = std::time::Instant::now();
+    let cleaned =
+        cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(ix_config, budget);
+    let mut nodes = 0u64;
+    let listed =
+        iceoryx2::node::Node::<iceoryx2::service::ipc_threadsafe::Service>::list(ix_config, |_| {
+            nodes += 1;
+            iceoryx2::prelude::CallbackProgression::Continue
+        });
+    let mut reclaim = SlotReclaim {
+        cleaned,
+        nodes_left: listed.map(|()| nodes).map_err(|e| e.to_string()),
+        segments_removed: 0,
+        segments_failed: 0,
+    };
+    if reclaim.nodes_left != Ok(0) {
+        return reclaim;
+    }
+    let Some(dir) = segment_dir else {
+        return reclaim;
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                slot,
+                error = %error,
+                "replay: could not list the shared-memory segment names to reclaim a resim \
+                 namespace slot; its leftover segments stay until a later resim on the slot \
+                 lists them"
+            );
+            return reclaim;
+        }
+    };
+    for entry in entries.flatten() {
+        if started.elapsed() >= budget {
+            break;
+        }
+        if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
+            continue;
+        }
+        match remove_leftover_segment(&entry.path()) {
+            SegmentRemoval::Removed => reclaim.segments_removed += 1,
+            SegmentRemoval::NotASegment => {}
+            SegmentRemoval::Failed => reclaim.segments_failed += 1,
+        }
+    }
+    reclaim
+}
+
+/// What [`remove_leftover_segment`] did with one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentRemoval {
+    Removed,
+    /// Not a segment (a directory or a link, or on macOS anything but a state
+    /// file), so it was left alone.
+    NotASegment,
+    Failed,
+}
+
+/// Remove one leftover segment of a reclaimed namespace: a regular file, which
+/// on macOS is a state file and goes with the object it names
+/// ([`crate::shm_state::remove_unused_state_file`]).
+fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
+    let is_file = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    #[cfg(target_os = "macos")]
+    let is_segment = is_file
+        && path
+            .to_str()
+            .is_some_and(|p| p.ends_with(crate::shm_state::SHM_STATE_SUFFIX));
+    #[cfg(not(target_os = "macos"))]
+    let is_segment = is_file;
+    if !is_segment {
+        return SegmentRemoval::NotASegment;
+    }
+    #[cfg(target_os = "macos")]
+    let removed =
+        crate::shm_state::remove_unused_state_file(path, &crate::shm_state::LibcProbe).is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let removed = std::fs::remove_file(path).is_ok();
+    if removed {
+        SegmentRemoval::Removed
+    } else {
+        SegmentRemoval::Failed
+    }
+}
+
+/// The slot this process's resims run on: claimed, and its namespace
+/// reclaimed, by the first resim the process starts, then held until the
+/// process ends. The process has one transport, so every resim it runs uses
+/// that one namespace, and a later resim never reclaims the namespace the
+/// transport is running on.
+static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
+
+/// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
+/// claims the lowest free slot whose namespace reclaims clean, within the
+/// startup sweep budget for all the slots it tries.
+fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayError> {
+    let mut held = RESIM_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(running) = held.as_ref() {
+        return Ok(running.slot);
+    }
+    let budget = cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET;
+    // Startup hygiene only, as in `reclaim_resim_slot`.
+    let started = std::time::Instant::now();
+    let lock_dir = resim_slot_lock_dir(base);
+    // The iceoryx2 root a fallback names may not exist before the first node;
+    // a directory that cannot be made fails the claim's first open, by name.
+    let _ = std::fs::create_dir_all(&lock_dir);
+    // Summed over every slot whose namespace the claim reclaimed.
+    let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
+    let claimed = claim_resim_slot(&lock_dir, RESIM_NAMESPACE_SLOTS, |slot| {
+        let ix_config =
+            resim_ix_config(base, slot).map_err(|e| SlotPassedOver::Config(e.to_string()))?;
+        let reclaim = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            budget.saturating_sub(started.elapsed()),
+        );
+        cleanups += reclaim.cleaned.cleanups;
+        deferred += reclaim.cleaned.deferred;
+        segments += reclaim.segments_removed;
+        total_failures += reclaim.cleaned.failed_cleanups + reclaim.segments_failed;
+        match reclaim.refusal() {
+            None => Ok(()),
+            Some(reason) => Err(SlotPassedOver::Reclaim { reclaim, reason }),
+        }
+    })?;
+    tracing::debug!(
+        slot = claimed.slot,
+        cleanups,
+        deferred,
+        segments,
+        total_failures,
+        "replay: claimed and reclaimed a resim namespace slot"
+    );
+    let slot = claimed.slot;
+    *held = Some(claimed);
+    Ok(slot)
+}
+
+/// Start the process transport of a resim on the resim's private namespace.
+///
+/// The cross-process transport is built with [`resim_ix_config`] for the slot
+/// [`process_resim_slot`] holds. It is the process singleton (one iceoryx2
+/// node per process), so every later [`TransportManager::get`] in the run
+/// lands on the same private namespace. The singleton keeps the config of its
+/// FIRST initialization, so the namespace is checked after the call: a
+/// transport some earlier code started on another namespace refuses the run
+/// (exit 5) instead of re-executing onto it.
+///
+/// The `local-transport` build's transport is in-process only, so nothing
+/// outside the process can attach to it and it keeps the plain initializer.
+fn init_resim_transport(
+    config: cerulion_core::TransportConfig,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    match cerulion_core::transport::TRANSPORT_KIND {
+        cerulion_core::transport::TransportKind::InProcess => {
+            TransportManager::init(config).map_err(replay_transport_init_error)
+        }
+        cerulion_core::transport::TransportKind::CrossProcess => {
+            let base = iceoryx2::config::Config::global_config();
+            let slot = process_resim_slot(base)?;
+            let ix_config = resim_ix_config(base, slot)?;
+            let transport = TransportManager::init_with_config(config, ix_config)
+                .map_err(replay_transport_init_error)?;
+            let expected = resim_namespace_prefix(slot);
+            let running = transport.iox_config().global.prefix.to_string();
+            if running != expected {
+                return Err(ReplayError::Internal {
+                    reason: format!(
+                        "the replay transport was already running on the iceoryx2 namespace \
+                         '{running}' instead of the resim's private '{expected}'; refusing to \
+                         re-execute onto a namespace other processes attach to"
+                    ),
+                });
+            }
+            Ok(transport)
+        }
+    }
+}
 
 /// Burst-aware provisioning: headroom added on top of the recording's
 /// measured max intra-step burst when raising a topic's service ceiling —
@@ -155,8 +695,8 @@ pub const REPORT_VERSION: u32 = 1;
 pub struct ReplayOutcome {
     /// `true` iff the replay FULLY matched the recording — no data [`Violation`],
     /// no structural [`Self::trace_divergence`], AND no panic-class
-    /// [`Self::node_failures`]. Env divergences are WARN-only and do NOT clear
-    /// this flag (see [`Self::env_divergence`]). A `false` value is decomposed
+    /// [`Self::node_failures`]. Environment divergences never clear this flag
+    /// (see [`Self::env_divergence`]). A `false` value is decomposed
     /// by the three failure fields — a non-empty `node_failures` (exit 3, which
     /// PREEMPTS everything: root cause over symptoms), a populated
     /// `trace_divergence` (exit 6, which takes precedence over data), a
@@ -189,7 +729,9 @@ pub struct ReplayOutcome {
     /// breakdown is [`Self::rank_execution`].
     pub ticks_replayed: usize,
     /// The number of graph-produced topics the diff considered (had at least one
-    /// recorded or replayed frame).
+    /// recorded or replayed frame). A topic only external (driver) nodes write
+    /// is a recorded input and not compared, so it counts only when the
+    /// record-health stamp marks it lossy (a record-side-tap-loss violation).
     pub topics_checked: usize,
     /// The subset of [`Self::topics_checked`] that matched byte-for-byte AND was
     /// CREDITED.
@@ -213,8 +755,13 @@ pub struct ReplayOutcome {
     /// downstream data drift). Serialized in the `--report` JSON (additive field
     /// — `report_version` unchanged; old readers ignore it).
     pub trace_divergence: Option<TraceDivergenceReport>,
-    /// Environment divergences vs the bag's `env.json` — WARN-only, never
-    /// exit-affecting (a replay host legitimately differs from the record host).
+    /// Every difference between the replay's own environment and the bag's
+    /// `env.json`, sorted by name: each recorded variable that differs or is
+    /// gone, and each variable that can change the re-execution that only the
+    /// replay sets. Never exit-affecting (a replay host legitimately differs
+    /// from the record host). The terminal prints a `WARNING:` line for each
+    /// variable that can change the re-execution and one `NOTE:` counting the
+    /// rest; this list, and its `read_by` key, carries all of them.
     pub env_divergence: Vec<EnvDivergence>,
     /// The recording host's identity from the bag's `__cerulion/recorder.json`
     /// attachment, if present + parseable. `None` for
@@ -277,6 +824,16 @@ pub struct ReplayOutcome {
     /// report stays byte-identical (additive field; old readers ignore it).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unmodelled_topics: Vec<String>,
+    /// The topics the graph's `external` (driver) nodes write, and what this
+    /// replay did with them ([`DriverInputsReport`]). A driver's outputs are
+    /// recorded inputs: they leave the comparison and [`Self::topics_checked`],
+    /// so this is what tells a machine reader how much of the bag a PASS
+    /// covered, a `0/0` one included. The human-readable twin is the verdict
+    /// `NOTE` ([`render_driver_input_lines`]). `None` for a graph with no
+    /// driver, and skipped from the `--report` JSON then, so every such report
+    /// stays byte-identical (additive field; old readers ignore it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_inputs: Option<DriverInputsReport>,
     /// What this replay RESUMED from, when the recording
     /// began mid-run and an anchor was applied.
     ///
@@ -405,8 +962,10 @@ pub struct ReplayOutcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injection_stand_downs: Vec<InjectionStandDown>,
     /// The topics whose FRAME comparison was declined because
-    /// the read log steering their producer's input stream was refused, carrying
-    /// the violations that were therefore NOT reported.
+    /// the read log steering their producer's input stream was refused, or
+    /// because some process or executor unit that captured a split
+    /// `multi_publisher_topics` topic could not attribute its frames to their
+    /// writers, carrying the violations that were therefore NOT reported.
     ///
     /// A read-log condition never produces a DATA verdict, so a refusal must not
     /// surface as one, see [`DeclinedFrameComparison`] for why the violation would be an
@@ -502,8 +1061,8 @@ pub struct ReplayOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aborted: Option<ReplayAbort>,
     /// WHICH coordination contract this replay applied, and
-    /// whether the bag SAID so — the machine-readable twin of the verdict's
-    /// provenance line (the operator vocabulary). ALWAYS present, for the
+    /// whether the bag SAID so, in every state (the verdict prints a line for
+    /// the inferred one only, [`render_coordination_line`]). ALWAYS present, for the
     /// same reason [`Self::read_log`] is: the whole point is that a reader can
     /// tell "the bag was stamped lockstep" from "nothing said, so lockstep was
     /// assumed", and an absent key cannot carry that. Additive in the
@@ -556,33 +1115,180 @@ pub struct ReplayOutcome {
     pub record_out_error: Option<String>,
 }
 
-/// The verdict's coordination PROVENANCE line, verbatim.
+/// The topics a replay took as recorded inputs because an `external` (driver)
+/// node writes them ([`ReplayOutcome::driver_inputs`]). A recording stamps
+/// each node's driver flag, and the replayed build must declare the same
+/// drivers or the replay is refused; a recording made before the stamp takes
+/// the replayed build's declaration, and [`Self::declared_by`] says which.
+/// Each topic list is in graph order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DriverInputsReport {
+    /// Every driver node, in id order.
+    pub nodes: Vec<String>,
+    /// Where [`Self::nodes`] came from: `recording` (the recording's
+    /// `node_external` stamp, which the replayed build matches) or
+    /// `replayed_build` (a recording made before the stamp, so the build's
+    /// own declaration).
+    pub declared_by: DriverSetSource,
+    /// The topics only drivers write: recorded inputs, neither compared nor
+    /// counted in `topics_checked`, but for one the record-health stamp marks
+    /// lossy, which is a `record-side-tap-loss` violation on its own topic.
+    pub input_topics: Vec<String>,
+    /// The `multi_publisher_topics` topics a driver writes beside other nodes.
+    /// A topic whose every recorded frame the replay attributes to its writer
+    /// is compared and counted over the other writers' frames only, each
+    /// writer's in the pass that runs it; the rest are
+    /// [`Self::unattributed_topics`].
+    pub shared_topics: Vec<String>,
+    /// The topics of [`Self::shared_topics`] compared and counted over every
+    /// recorded frame, the drivers' included: the replay could not attribute
+    /// each recorded frame to its writer (for example, the bag labels no
+    /// writer for a frame, a frame carries no wire header, or the topics'
+    /// frame index is over the verifier's record budget), and a warning
+    /// logged during the replay names the cause. Where one pass captured the
+    /// topic, or only one pass's own writers published frames of it and that
+    /// pass fed none of its recorded frames, every frame that pass captured is
+    /// counted, those its injector re-published included. Otherwise the
+    /// passes that could not attribute them count every recorded frame no
+    /// partition holds against the frames their own writers published, which
+    /// hold a replayed driver's frames where the driver runs in such a pass,
+    /// and, once each, the recorded frames of a driver none of them runs that
+    /// any pass's injector re-published, where the injection names the writer
+    /// of each frame it re-publishes. Such a pass's frames are also compared byte
+    /// for byte with every recorded frame where it is the only pass whose own
+    /// writers published frames of the topic and it injected none, or where it
+    /// injected the topic itself; a pass of its own writers' frames alone
+    /// beside another whose writers published frames is not compared, and the
+    /// topic is then declined ([`ReplayOutcome::declined_frame_comparisons`])
+    /// unless something else on it failed.
+    pub unattributed_topics: Vec<String>,
+    /// The topics of [`Self::input_topics`] and [`Self::shared_topics`] that a
+    /// node reads where this replay does not feed it the drivers' recorded
+    /// frames, so that node cannot reproduce its recorded outputs. A lockstep
+    /// replay feeds none.
+    pub unfed_topics: Vec<String>,
+    /// The topics of [`Self::input_topics`] that no node reads: fed to nothing
+    /// and compared by nothing, so nothing in the replay verifies them.
+    pub unread_topics: Vec<String>,
+}
+
+impl DriverInputsReport {
+    /// Does the comparison leave a driver's frames out: a topic only drivers
+    /// write, or a shared topic compared over the other writers' frames only
+    /// (one not in [`Self::unattributed_topics`])?
+    pub fn leaves_driver_frames_out(&self) -> bool {
+        !self.input_topics.is_empty()
+            || self
+                .shared_topics
+                .iter()
+                .any(|t| !self.unattributed_topics.contains(t))
+    }
+}
+
+/// The verdict `NOTE` lines of a [`DriverInputsReport`]: one per non-empty
+/// topic list, the shared topics split into those compared over the other
+/// writers' frames and the [`DriverInputsReport::unattributed_topics`]
+/// compared over every recorded frame, and one more when a driver writes a
+/// topic and `topics_checked` is 0, the `0/0` verdict that compared nothing. The driver
+/// nodes are named on the lines of the topics drivers write, so a driver that
+/// writes no topic prints none. Rendered on the PASS and the FAIL path alike,
+/// since each says what the tally above or below it does not cover.
+pub fn render_driver_input_lines(
+    report: &DriverInputsReport,
+    topics_checked: usize,
+) -> Vec<String> {
+    let nodes = report.nodes.join(", ");
+    let declared = match report.declared_by {
+        DriverSetSource::Recording => "as the recording declares them",
+        DriverSetSource::ReplayedBuild => "as the replayed build declares them",
+    };
+    let mut lines = Vec::new();
+    if !report.input_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} topic(s) only external (driver) nodes write are recorded inputs and were \
+             NOT compared (driver nodes, {declared}: {nodes}): {}",
+            report.input_topics.len(),
+            report.input_topics.join(", ")
+        ));
+    }
+    let attributed: Vec<&str> = report
+        .shared_topics
+        .iter()
+        .filter(|t| !report.unattributed_topics.contains(t))
+        .map(String::as_str)
+        .collect();
+    if !attributed.is_empty() {
+        lines.push(format!(
+            "NOTE: {} topic(s) an external (driver) node shares with other writers were \
+             compared over the other writers' frames only (driver nodes, {declared}: {nodes}): {}",
+            attributed.len(),
+            attributed.join(", ")
+        ));
+    }
+    if !report.unattributed_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} topic(s) an external (driver) node shares with other writers were \
+             compared over every recorded frame, the drivers' included, since the replay could \
+             not attribute each recorded frame to its writer (driver nodes, {declared}: \
+             {nodes}): {}",
+            report.unattributed_topics.len(),
+            report.unattributed_topics.join(", ")
+        ));
+    }
+    if !report.unfed_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} external (driver) topic(s) were not fed to the nodes that read them, so \
+             those nodes cannot reproduce their recorded outputs: {}",
+            report.unfed_topics.len(),
+            report.unfed_topics.join(", ")
+        ));
+    }
+    if !report.unread_topics.is_empty() {
+        lines.push(format!(
+            "NOTE: {} external (driver) topic(s) are read by no node, so nothing in this replay \
+             verifies them: {}",
+            report.unread_topics.len(),
+            report.unread_topics.join(", ")
+        ));
+    }
+    let drivers_write = !report.input_topics.is_empty() || !report.shared_topics.is_empty();
+    if drivers_write && topics_checked == 0 {
+        lines.push(
+            "NOTE: no topic was compared against the recording: no node other than an external \
+             (driver) node recorded or replayed a frame"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// The verdict's coordination line, or `None` when the contract applied needs
+/// no word on the terminal.
 ///
-/// The three states are the canonical operator vocabulary, copied rather than
-/// re-worded — the verdict and the `--report` JSON print ONE vocabulary, so the
-/// text lives in one function and the JSON block ([`CoordinationReport`]) is the
-/// same three states in machine-readable form.
+/// A stamped contract, `free_run` or `lockstep`, is the recording saying how it
+/// ran, and the replay applied exactly that: nothing a reader can act on, so the
+/// terminal stays quiet and the `--report` JSON's [`CoordinationReport`] block
+/// carries it (always, all three states). The INFERRED lockstep of a bag that
+/// carries no stamp is a caveat, an assumption the replay made for the bag, so
+/// it is the one state that prints.
 ///
-/// `pub` because `resim_cmd`'s NEUTRAL renderer prints the SAME
-/// line (the rule is that the provenance is always visible, and a neutral
-/// resim is a surface like any other), and that crate half is
-/// platform-independent while this module is Unix-only — so the LINE crosses as
-/// a rendered `String` on `ResimReport`, produced here. A second `match` over
-/// there would be the two-copies class on the one vocabulary this function
-/// exists to keep single.
-pub fn render_coordination_line(report: &CoordinationReport) -> String {
+/// `pub` because `resim_cmd`'s NEUTRAL renderer prints the SAME line, and that
+/// crate half is platform-independent while this module is Unix-only, so the
+/// LINE crosses as a rendered `Option<String>` on `ResimReport`, produced here.
+/// A second `match` over there would be the two-copies class on the one
+/// vocabulary this function exists to keep single.
+pub fn render_coordination_line(report: &CoordinationReport) -> Option<String> {
     match (report.mode, report.inferred) {
-        (CoordinationMode::FreeRun, _) => "coordination: free_run (per-rank boundary streams + \
-             read-log agreement; cross-rank lockstep equality not applicable)"
-            .to_string(),
-        (CoordinationMode::Lockstep, false) => "coordination: lockstep".to_string(),
+        (CoordinationMode::FreeRun, _) | (CoordinationMode::Lockstep, false) => None,
         (CoordinationMode::Lockstep, true) => {
-            "coordination: lockstep (inferred: no coordination stamp)".to_string()
+            Some("coordination: lockstep (inferred: no coordination stamp)".to_string())
         }
     }
 }
 
-/// How a replay fed its reads, the second provenance line of the verdict.
+/// How a replay fed its reads: the `--report` JSON's `read_identity` block,
+/// and a verdict line when reads were fed best effort
+/// ([`render_read_identity_line`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ReadIdentityReport {
@@ -602,24 +1308,28 @@ pub enum ReadIdentityReport {
     },
 }
 
-/// The verdict line [`ReadIdentityReport`] renders as.
-pub fn render_read_identity_line(report: &ReadIdentityReport) -> String {
+/// The verdict line [`ReadIdentityReport`] renders as, or `None` for
+/// [`ReadIdentityReport::Fed`].
+///
+/// Fed by identity is the full-fidelity path every current recording takes, so
+/// it prints nothing and the `--report` JSON's `read_identity` block carries its
+/// counts. Best effort NARROWS what the verdict covers (a read reproduces only
+/// when the queue behaves as it did live), so it prints.
+pub fn render_read_identity_line(report: &ReadIdentityReport) -> Option<String> {
     match report {
-        ReadIdentityReport::Fed { reads, frames } => format!(
-            "reads: fed by recorded identity ({reads} reads, {frames} frames, each read through \
-             its own private feed)"
-        ),
+        ReadIdentityReport::Fed { .. } => None,
         ReadIdentityReport::BestEffort { reason } if reason.is_empty() => {
-            "reads: best effort, no read identity".to_string()
+            Some("reads: best effort, no read identity".to_string())
         }
         ReadIdentityReport::BestEffort { reason } => {
-            format!("reads: best effort, no read identity ({reason})")
+            Some(format!("reads: best effort, no read identity ({reason})"))
         }
     }
 }
 
-/// The `--report` JSON's coordination block — the three states
-/// the provenance line renders, in machine-readable form.
+/// The `--report` JSON's coordination block: the three states of the
+/// contract a replay applied, in machine-readable form (the terminal prints a
+/// line for the inferred one only, [`render_coordination_line`]).
 ///
 /// The two fields are independent by construction and only three of the four
 /// combinations are reachable, which is the point: `free_run` is only ever
@@ -1431,6 +2141,141 @@ pub struct RecorderInfo {
     /// carries the absence, never a sentinel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination: Option<CoordinationMode>,
+    /// Which nodes the recording ran as `external` (driver) nodes: the
+    /// document's `node_external` key, VALIDATED against the bag's own graph
+    /// ([`DriverStamp::admit`]). `None` is a recording made before the stamp.
+    ///
+    /// Never serialized, so the `--report` JSON's `recorder` object is
+    /// unchanged, and never deserialized: serde cannot validate the stamp
+    /// against a graph, so the only way to fill it is the gate's own read
+    /// (`replay_cmd::read_recorder_info` then [`DriverStamp::admit`]), and a
+    /// judge can only ever see a validated one.
+    #[serde(skip)]
+    pub driver_stamp: Option<DriverStamp>,
+}
+
+/// What a `__cerulion/recorder.json` document says about its nodes' driver
+/// flags (its `node_external` key), before it is checked against the bag's
+/// graph ([`DriverStamp::admit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedDriverStamp {
+    /// The key is ABSENT: a recording made before the stamp.
+    Absent,
+    /// A map of node ids to `true` (an `external` node) or `false`.
+    Present(BTreeMap<String, bool>),
+    /// Present but not a map of node ids to booleans (`null` included): the
+    /// value as it appeared, for the refusal to name.
+    Unreadable(String),
+}
+
+impl RecordedDriverStamp {
+    /// Read the `node_external` key off a parsed recorder.json object.
+    ///
+    /// Only an absent key is [`Self::Absent`]: an explicit `null` is
+    /// [`Self::Unreadable`], so a document that carries the key with no usable
+    /// value is refused rather than judged as a recording that predates it.
+    pub fn read(obj: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let Some(value) = obj.get("node_external") else {
+            return Self::Absent;
+        };
+        let Some(map) = value.as_object() else {
+            return Self::Unreadable(value.to_string());
+        };
+        let mut flags = BTreeMap::new();
+        for (id, flag) in map {
+            match flag.as_bool() {
+                Some(external) => {
+                    flags.insert(id.clone(), external);
+                }
+                None => return Self::Unreadable(value.to_string()),
+            }
+        }
+        Self::Present(flags)
+    }
+}
+
+/// A recording's driver flags, checked against the graph the bag embeds: one
+/// flag for every native node of that graph and for nothing else.
+///
+/// The only constructor is [`Self::admit`], so a replay that holds one holds
+/// a stamp that describes the graph it replays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverStamp {
+    flags: BTreeMap<String, bool>,
+}
+
+impl DriverStamp {
+    /// Admit a recording's `node_external` key for `config`, the bag's own
+    /// graph with its `ros2:` entries already taken out (the stamp names
+    /// native nodes only).
+    ///
+    /// # Errors
+    ///
+    /// - [`ReplayError::BagInvalidAttachment`] (exit 2) when the key is present
+    ///   but not a map of node ids to booleans: it is the key a replay judges
+    ///   drivers by, so an unreadable one is refused rather than guessed.
+    /// - [`ReplayError::RecordingInconsistent`] (exit 2) when the map names a
+    ///   node the graph does not run, or does not name one it does: a stamp
+    ///   that describes another graph is refused rather than half applied.
+    pub fn admit(
+        raw: RecordedDriverStamp,
+        config: &GraphConfig,
+    ) -> Result<Option<DriverStamp>, ReplayError> {
+        let flags = match raw {
+            RecordedDriverStamp::Absent => return Ok(None),
+            RecordedDriverStamp::Unreadable(value) => {
+                return Err(ReplayError::BagInvalidAttachment {
+                    name: crate::replay_cmd::RECORDER_ATTACHMENT.to_string(),
+                    reason: format!(
+                        "`node_external` is {value}, which is not a map of node ids to true or \
+                         false. It is the key a replay judges external (driver) nodes by, so an \
+                         unreadable value is refused rather than guessed. Re-record the bag, or \
+                         repair the attachment"
+                    ),
+                })
+            }
+            RecordedDriverStamp::Present(flags) => flags,
+        };
+        let graph: BTreeSet<&str> = config.native_nodes().map(|n| n.id.as_str()).collect();
+        let extra: Vec<&str> = flags
+            .keys()
+            .map(String::as_str)
+            .filter(|id| !graph.contains(id))
+            .collect();
+        if !extra.is_empty() {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "recorder.json's `node_external` names node(s) the embedded graph does not \
+                     run: {}",
+                    extra.join(", ")
+                ),
+            });
+        }
+        let missing: Vec<&str> = graph
+            .iter()
+            .copied()
+            .filter(|id| !flags.contains_key(*id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "recorder.json's `node_external` does not name node(s) the embedded graph \
+                     runs: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+        Ok(Some(DriverStamp { flags }))
+    }
+
+    /// The nodes the recording ran as `external` (driver) nodes, in id order.
+    pub fn drivers(&self) -> BTreeSet<String> {
+        self.flags
+            .iter()
+            .filter(|(_, external)| **external)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
 }
 
 impl RecorderInfo {
@@ -1482,9 +2327,10 @@ fn trace_format_v1() -> u32 {
 ///
 /// A CONST inventory of the binary's own emission set, deliberately NOT a
 /// runtime observation of a particular trace: `render_recorder_json`
-/// stamps a bag's format at recording START, and one of the three
-/// recorder.json producers (`bag_cmd`'s `--run` attach) COPIES a stamp frozen
-/// at run start into a bag whose records are drained later — so a stamp
+/// stamps a bag's format before any of its records is drained (once the
+/// run's nodes load), and one of the three recorder.json producers
+/// (`bag_cmd`'s `--run` attach) COPIES the run directory's stamp, written at
+/// that point, into a bag whose records are drained later, so a stamp
 /// derived from "what this stream turned out to contain" could under-claim on
 /// exactly that path. A static property of the binary cannot.
 const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
@@ -2661,19 +3507,39 @@ impl ReadLogEnforcement {
 /// Listing only topics that would have raised a divergence would
 /// keep healthy reports byte-identical, at the cost of a report that says "passed"
 /// about a comparison it cannot stand behind.
+///
+/// # A split topic's frames no stream lines up with
+///
+/// The second cause, `split_topic_frames_unattributed`, is a
+/// `multi_publisher_topics` topic whose writers run in several processes or
+/// executor units, where one that captured frames of it could not attribute its
+/// recorded frames to their writers and injected none of them. Its capture then
+/// holds its own writers' frames alone, which no recorded stream lines up with
+/// while another one's writers published frames of the topic too, so they are
+/// not compared.
+/// The topic is declined only when nothing compared on it failed: its counts
+/// are judged over every recorded frame, a ragged shutdown tail's trailing
+/// frames tolerated as on any topic, and a failure there stands. Such a row
+/// names the ranks whose frames were not compared, withholds the byte verdict and
+/// tolerance rows their one stream reads against every recorded frame, and never
+/// MATCHED under a fallback. A topic a refused read log declines as well carries
+/// both rows, one per cause.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeclinedFrameComparison {
     /// The resolved topic whose comparison was declined.
     pub topic: String,
-    /// The rank(s) producing it whose read-log-steered injection stood down.
+    /// The rank(s) producing it whose read-log-steered injection stood down,
+    /// or, on a `split_topic_frames_unattributed` row, whose captured frames
+    /// were not compared.
     pub ranks: Vec<u32>,
-    /// The stable machine token of the cause, the same one the matching
-    /// [`InjectionStandDown::code`] carries.
+    /// The stable machine token of the cause: on a read-log decline, the same
+    /// one the matching [`InjectionStandDown::code`] carries.
     ///
-    /// TWO families reach this field: a whole-rank `VerifierDecline::code`
+    /// TWO read-log families reach this field: a whole-rank `VerifierDecline::code`
     /// (`verifier_declined_*`), and a PER-TOPIC read-log-derived
     /// `replay_inject::StandDownReason::code` (`truncated_read_log`,
-    /// `unresolved_producer`). Naming only the first family was false from the
+    /// `unresolved_producer`), and so does `split_topic_frames_unattributed`,
+    /// which no stand-down carries. Naming only the first family was false from the
     /// moment the second was admitted; `no_read_log_coverage` does not belong
     /// here and is excluded from the filter
     /// because it reports a recording that never carried read records, not a
@@ -2681,16 +3547,27 @@ pub struct DeclinedFrameComparison {
     /// intra-doc LINK from this public item to it is a `-D warnings` docs
     /// failure, so it is named rather than linked).
     pub code: String,
-    /// The stand-down's own sentence, so this row is readable alone.
+    /// The stand-down's own sentence, or the cause's, so this row is readable
+    /// alone.
     pub reason: String,
     /// The violations that were NOT reported as a verdict — verbatim, so nothing
-    /// is hidden by the decline. EMPTY when the comparison matched.
+    /// is hidden by the decline. Empty when the comparison matched, on a
+    /// read-log row whose compared frames read no divergence beside a
+    /// `split_topic_frames_unattributed` row, and on such a row whose
+    /// uncompared frames read no byte mismatch and no tolerance row; neither of
+    /// the last two matched.
     pub withheld: Vec<Violation>,
     /// `true` when the comparison RAN and found no difference — the topic matched
-    /// under the fallback input stream. Always `withheld.is_empty()`; carried
-    /// explicitly so the `--report` JSON states the outcome rather than leaving a
-    /// reader to infer it from an absent array, and so the two outcomes can be
-    /// counted without walking `withheld`.
+    /// under the fallback input stream. On a read-log decline it is
+    /// `withheld.is_empty()`, and `false` where some passes' frames of a split
+    /// topic were not compared, which the topic's
+    /// `split_topic_frames_unattributed` row beside it names; carried
+    /// explicitly so the `--report` JSON states the outcome rather than leaving
+    /// a reader to infer it from an absent array. Always `false` on a
+    /// `split_topic_frames_unattributed` row, whose
+    /// frames were not compared, so such a row can carry an empty `withheld`
+    /// without having matched: count a match by this field and withheld
+    /// divergences by `withheld`, and a row with neither by its `code`.
     pub matched_under_fallback: bool,
 }
 
@@ -2703,6 +3580,84 @@ pub struct Violation {
     pub class: ViolationClass,
     /// A human-readable one-line detail (also rendered in the stderr verdict).
     pub detail: String,
+}
+
+/// What differs in a byte-mismatched frame, as the `--report` JSON carries
+/// it: one flat object whose `kind` says which keys hold a value (the
+/// byte-mismatch forms in `docs/bag.md`).
+///
+/// Hidden from the docs: the JSON is the contract; this is its carrier.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ByteDifference {
+    /// What the line names.
+    pub kind: DifferenceKind,
+    /// The field path (`field`), the header field (`header`, `schema_hash`)
+    /// or the framed field (`layout` in `field_framing`).
+    pub path: Option<String>,
+    /// The recorded value: a JSON number or bool where the value is one; a
+    /// string value is the string itself; otherwise the text the line
+    /// prints.
+    pub recorded: Option<DifferenceValue>,
+    /// The replayed value, as [`Self::recorded`].
+    pub replayed: Option<DifferenceValue>,
+    /// The differing byte inside the field (`field`): of a value compared as
+    /// opaque bytes, of a string that is not UTF-8, or of a `string_fixed`
+    /// whose text is equal (its two values are then the same text).
+    pub field_byte: Option<usize>,
+    /// The first differing character of a string longer than 64 characters
+    /// (`field`).
+    pub field_char: Option<usize>,
+    /// The first differing byte (`layout`, `undecoded`).
+    pub byte_offset: Option<usize>,
+    /// Where the byte sits (`layout`): `fixed_section_padding`,
+    /// `offset_table`, `field_framing`, `unused_variable_bytes` or
+    /// `trailing_bytes`.
+    pub region: Option<&'static str>,
+    /// Why the fields were not decoded (`undecoded`):
+    /// `recorded_frame_too_short`, `replayed_frame_too_short`,
+    /// `unknown_schema_hash`, `recorded_frame_undecodable` or
+    /// `replayed_frame_undecodable`.
+    pub reason: Option<&'static str>,
+    /// How many other values of the frame differ.
+    pub more: u64,
+}
+
+/// [`ByteDifference::kind`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferenceKind {
+    /// A message field value.
+    Field,
+    /// A wire-header field.
+    Header,
+    /// The frames carry different schemas.
+    SchemaHash,
+    /// Every value is equal; a framing byte differs.
+    Layout,
+    /// The fields were not decoded.
+    Undecoded,
+}
+
+/// One value of a [`ByteDifference`], serialized as the bare JSON value.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum DifferenceValue {
+    /// A `bool`.
+    Bool(bool),
+    /// A signed integer, exact.
+    Int(i64),
+    /// An unsigned integer, exact.
+    UInt(u64),
+    /// A finite `float32`, in its own shortest form.
+    Float32(f32),
+    /// A finite `float64`.
+    Float64(f64),
+    /// A string value, or the line's text for a value with no JSON number
+    /// form (`.nan`, `.inf`, a byte, a window of a long string).
+    Text(String),
 }
 
 /// The divergence classes. Two distinct "missing" classes, by design:
@@ -2737,12 +3692,19 @@ pub enum ViolationClass {
         /// The 0-based frame index of the first differing frame.
         index: usize,
         /// The byte offset of the first differing byte (or the shorter length
-        /// when one frame is a prefix of the other).
+        /// when one frame is a prefix of the other). It can sit in another
+        /// field than `difference.path`: the path is the first differing
+        /// value in the schema's declaration order, the offset is byte order.
         first_diff_byte_offset: usize,
         /// The recorded frame's length.
         recorded_len: usize,
         /// The replayed frame's length.
         replayed_len: usize,
+        /// What differs in that frame, from the same comparison the detail
+        /// line renders (the byte-mismatch forms in `docs/bag.md`). Hidden
+        /// with its type: the JSON is the contract.
+        #[doc(hidden)]
+        difference: ByteDifference,
     },
     /// The recording itself lost frames on this topic at RECORD time
     /// (the bag's `record_health.json` stamp reports `frames_lost > 0` or a
@@ -2807,20 +3769,41 @@ pub enum ViolationClass {
     },
 }
 
-/// One environment divergence vs the bag's `env.json` (WARN-only).
-#[derive(Debug, Clone, serde::Serialize)]
+/// One difference between the replay's own environment and the bag's
+/// `env.json`. Never exit-affecting.
+///
+/// The `--report` JSON entry carries a fourth key beside these three fields,
+/// `read_by`: `"cerulion"`, `"dynamic_linker"` or `"python"` for a variable that
+/// can change the re-execution, `null` for every other one. It is derived from
+/// [`Self::name`] by the one rule the terminal output uses, so the two can never
+/// disagree about a variable.
+#[derive(Debug, Clone)]
 pub struct EnvDivergence {
     /// The variable name.
     pub name: String,
     /// What differs.
     pub kind: EnvDivergenceKind,
-    /// A human-readable one-line detail.
+    /// A human-readable one-line detail (the `--report` JSON's `detail`).
     pub detail: String,
+}
+
+impl serde::Serialize for EnvDivergence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut entry = serializer.serialize_struct("EnvDivergence", 4)?;
+        entry.serialize_field("name", &self.name)?;
+        entry.serialize_field("kind", &self.kind)?;
+        entry.serialize_field("detail", &self.detail)?;
+        entry.serialize_field("read_by", &env_reader(&self.name).map(EnvReader::label))?;
+        entry.end()
+    }
 }
 
 /// The env-divergence classes. Values are compared only for entries the bag
 /// recorded a value for (plain string) or a hash for (redacted `fnv64`);
-/// names-only (null) entries are compared for presence only.
+/// names-only (null) entries are compared for presence only. A variable the bag
+/// did not record is reported only when it can change the re-execution
+/// ([`Self::Added`]).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind")]
 pub enum EnvDivergenceKind {
@@ -2831,6 +3814,116 @@ pub enum EnvDivergenceKind {
     /// The bag recorded a redacted `fnv64` that the current value does not hash
     /// to (the value changed under redaction).
     HashChanged,
+    /// The replay env sets a variable that can change the re-execution (a
+    /// `CERULION_`, `IOX2_`, `LD_`, `DYLD_` or `PYTHON` name that does not mark
+    /// a secret, or `CARGO_TARGET_DIR`) and the bag did not record it.
+    Added,
+}
+
+impl EnvDivergenceKind {
+    /// The variant name, which is also the serialized `kind` tag.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Missing => "Missing",
+            Self::ValueChanged => "ValueChanged",
+            Self::HashChanged => "HashChanged",
+            Self::Added => "Added",
+        }
+    }
+
+    /// How the variable changed, worded for the terminal line.
+    fn change_phrase(&self) -> &'static str {
+        match self {
+            Self::ValueChanged | Self::HashChanged => "has a different value than in the recording",
+            Self::Missing => "was set in the recording and is not set now",
+            Self::Added => "is set now and was not set in the recording",
+        }
+    }
+}
+
+/// What reads an environment variable that can change a re-execution: the
+/// re-execution itself or a runtime it starts ([`env_reader`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvReader {
+    /// Cerulion itself or its shared-memory transport (`CERULION_`, `IOX2_`).
+    Cerulion,
+    /// The dynamic linker, which maps every node library (`LD_`, `DYLD_`).
+    DynamicLinker,
+    /// The Python interpreter that runs Python nodes (`PYTHON`).
+    Python,
+    /// Cerulion's node library lookup, which picks the build directory every
+    /// node library loads from (`CARGO_TARGET_DIR`,
+    /// [`crate::graph_cmd::cdylib_target_base`]).
+    NodeLibraryLookup,
+}
+
+impl EnvReader {
+    /// The `--report` JSON's `read_by` value and the log field's value. It
+    /// names the program that reads the variable, so both Cerulion readers
+    /// are `cerulion`; [`Self::reason`] says what each reads it for.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cerulion | Self::NodeLibraryLookup => "cerulion",
+            Self::DynamicLinker => "dynamic_linker",
+            Self::Python => "python",
+        }
+    }
+
+    /// Why a difference in a variable this reader reads matters, worded for the
+    /// terminal line.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Cerulion => {
+                "Cerulion reads its settings from CERULION_ and IOX2_ variables, so this one can \
+                 change the re-execution."
+            }
+            Self::DynamicLinker => {
+                "The dynamic linker reads it to choose the libraries each node loads, so it can \
+                 change the re-execution."
+            }
+            Self::Python => {
+                "The Python interpreter that runs Python nodes reads it, so it can change the \
+                 re-execution."
+            }
+            Self::NodeLibraryLookup => {
+                "Cerulion reads it to choose the build directory it loads each node library \
+                 from, so it can change the re-execution."
+            }
+        }
+    }
+}
+
+/// The reader whose settings namespace `name` is in, or that reads `name`
+/// itself (`CARGO_TARGET_DIR`), or `None` for any other name or one that marks
+/// a secret.
+///
+/// Loud means the name is in a namespace the re-execution itself, or a
+/// runtime it starts, reads its settings from: Cerulion and its shared-memory
+/// transport (`CERULION_`, `IOX2_`), the dynamic linker that maps every node
+/// library (`LD_`, `DYLD_`), and the Python interpreter that runs Python nodes
+/// (`PYTHON`). One exact name outside those namespaces is loud too:
+/// `CARGO_TARGET_DIR`, which Cerulion reads to pick the build directory every
+/// node library loads from. Every other variable (the shell's, the session's,
+/// `PATH`, `HOME`, locale, `RUST_LOG`, library knobs such as
+/// `OMP_NUM_THREADS`) is counted with the rest; it matters when code in a node
+/// reads it, which the replay cannot see. A name that marks a secret is never
+/// loud: credentials authenticate a session and do not decide what a
+/// re-execution computes. The secret rule is the recorder's own, so the two
+/// agree on every name. Case-sensitive, like Unix names. Pure.
+fn env_reader(name: &str) -> Option<EnvReader> {
+    if crate::graph_cmd::env_name_marks_a_secret(name) {
+        None
+    } else if name.starts_with("CERULION_") || name.starts_with("IOX2_") {
+        Some(EnvReader::Cerulion)
+    } else if name.starts_with("LD_") || name.starts_with("DYLD_") {
+        Some(EnvReader::DynamicLinker)
+    } else if name.starts_with("PYTHON") {
+        Some(EnvReader::Python)
+    } else if name == "CARGO_TARGET_DIR" {
+        Some(EnvReader::NodeLibraryLookup)
+    } else {
+        None
+    }
 }
 
 // ===========================================================================
@@ -3856,10 +4949,24 @@ pub enum ReplayNodes {
 
 /// Run the deterministic replay engine and return its [`ReplayOutcome`].
 ///
-/// Writes the JSON report to `inputs.report_path` when set. Emits a
-/// `tracing::warn!` per env divergence and per data violation for log
-/// pipelines; the human-readable verdict is [`render_verdict`] (printed by the
-/// CLI). A clean run yields `outcome.passed == true`; data divergences leave it
+/// Writes the JSON report to `inputs.report_path` when set. An environment
+/// variable that differs from the recording and that Cerulion does not read
+/// is a `tracing::info!` (the terminal counts those in one NOTE line, and `-v`
+/// shows these). One that can change the re-execution is a `tracing::info!` on
+/// a run that returns its outcome, because the verdict and the neutral summary
+/// each print it, and a `tracing::warn!` on a run that returns an error once
+/// the passes ran (a rank ABORTS, or a passing run's `--report` cannot be
+/// written), where the CLI prints only that error. A node failure is a `tracing::info!` (both
+/// terminal reports name each failed node). A data violation and a
+/// structural trace divergence are a `tracing::info!` under
+/// [`ReplayPurpose::Verify`], whose human-readable verdict ([`render_verdict`],
+/// printed by the CLI) states each in full, and a `tracing::warn!` under
+/// [`ReplayPurpose::Resim`], whose neutral summary only counts them. Those
+/// `info` levels hold only for a run that returns its outcome, because only
+/// then does the CLI render a verdict or a summary: on a run a rank ABORTS,
+/// which returns the aborting error, the completed ranks' violations, trace
+/// divergence and node failures are each a `tracing::warn!`. A clean
+/// run yields `outcome.passed == true`; data divergences leave it
 /// `false` (the CLI maps that to `EXIT_VIOLATION`). Bag-vs-graph mismatch and
 /// node-load failures short-circuit as typed [`ReplayError`]s (exit 2 / 3).
 pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutcome, ReplayError> {
@@ -4018,6 +5125,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         clock,
         mut factories,
         schema_hashes,
+        verdict_schemas_dir,
         resume,
     } = build_replay_context(&config, nodes, || {
         resolve_resume(
@@ -4083,7 +5191,35 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         Some(read) => read, // the resume path already read it (one read, one warn).
         None => read_record_coverage(&recorded_messages.reader),
     };
-    let classes = classify_topics(&config, &recorded_messages, coverage.as_ref())?;
+    // The driver set: the recording's stamp when it carries one, and the
+    //    replayed build must declare exactly those drivers (a node it runs
+    //    the other way is refused here, exit 2, before any pass runs). A
+    //    recording made before the stamp takes the build's own declaration,
+    //    with one warn when that declares a driver, since nothing in the bag
+    //    can confirm the build runs those nodes the way the recording did.
+    let candidate_drivers = external_node_ids(&factories);
+    let (drivers, drivers_declared_by) = resolve_driver_set(
+        recorder.as_ref().and_then(|r| r.driver_stamp.as_ref()),
+        &candidate_drivers,
+    )
+    .map_err(|drifts| ReplayError::DriverSetDrift { drifts })?;
+    if drivers_declared_by == DriverSetSource::ReplayedBuild && !drivers.is_empty() {
+        tracing::warn!(
+            graph = %config.identity(),
+            driver_nodes = drivers.len(),
+            node_ids = %drivers.iter().cloned().collect::<Vec<_>>().join(", "),
+            "replay: this recording does not record which nodes were external (driver) nodes, \
+             so the driver set comes from the build being replayed: the outputs of each node in \
+             `node_ids` are taken as recorded inputs and are not compared, even where the \
+             recording ran that node as an ordinary node. A recording made by this version \
+             records each node's driver flag, and a replay of it refuses a build that changes \
+             one"
+        );
+    }
+    let classes = classify_topics(&config, &recorded_messages, coverage.as_ref(), &drivers)?;
+    // What the replay does with the driver topics is logged once the rank
+    // plans exist (`log_driver_topic_feeds`): whether a reader is fed depends
+    // on which rank it runs in.
     // ONE loud line for the whole skipped set, never one per topic and
     // never one per frame (the log-flood class). WARN, not info: a
     // replay verdict is a claim about how much of the recording was checked,
@@ -4174,6 +5310,17 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     //     rank's clock, which it then skips). Root cause first — the same
     //     precedence the exit codes use.
     let plans = build_rank_plans(coordination, &config, &rank_tables, &boundary_summaries)?;
+    let driver_feeds = plan_driver_topic_feeds(
+        &config,
+        &classes,
+        &plans,
+        coordination == CoordinationMode::Lockstep,
+        fed,
+    );
+    log_driver_topic_feeds(&driver_feeds, &best_effort_reason);
+    // Carried into the outcome/report (the machine-readable twin of the log
+    // lines and the verdict NOTE).
+    let driver_inputs = driver_inputs_report(&config, &classes, &driver_feeds, drivers_declared_by);
 
     // What this bag DECLARES its resume covers — or the
     // range a multi-rank lockstep bag DERIVES (rank 0's last boundary target;
@@ -4302,6 +5449,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // can run on BOTH exits of the loop below — the completed one and an
     // abort at rank k, which still owes the operator ranks 0..k's results.
     let mut acc = PassAccumulators::default();
+    // Every pass judges its byte divergences against ONE schema set, built
+    // the first time a stream diverges (a passing replay never builds it).
+    let verdict = VerdictDecoder::new(verdict_schemas_dir);
     let mut warned_partial_discard: std::collections::HashSet<Arc<str>> =
         std::collections::HashSet::new();
     let last_pass = plans.len().saturating_sub(1);
@@ -4380,7 +5530,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             // `build_pass_runtime` moves the entries into the runtime — the
             // candidate's side of the re-derivation comparison, and where each
             // input's consume mode + depth come from.
-            let (node_infos, node_info_notes) = collect_pass_node_infos(plan, &factories);
+            let (node_infos, node_info_notes) = collect_pass_node_infos(plan, &factories, &config);
             let pass = PassInputs {
                 plan,
                 fed,
@@ -4396,6 +5546,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
+                verdict: &verdict,
                 rank_tables: &rank_tables,
                 rank_count,
                 node_rank: node_rank.as_ref(),
@@ -4411,6 +5562,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 bag_side: &bag_side,
                 node_info_notes,
                 config: &config,
+                driver_nodes: &classes.driver_nodes,
                 record_out: record_out.clone(),
             };
             // A resume judges a param the recording names and this build no
@@ -4454,7 +5606,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 &transport,
                 &clock,
                 schema_hashes.as_ref(),
-                pass_wiring(&burst_floors, &verification.depth_floors),
+                pass_wiring(
+                    &burst_floors,
+                    &verification.depth_floors,
+                    plan.sibling_produced(),
+                ),
                 &wiring,
             ) {
                 Ok(runtime) => runtime,
@@ -4574,6 +5730,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             covered_range,
             coordination_report,
             ros2_entries_skipped,
+            purpose,
+            driver_inputs,
         },
         abort_marker,
     );
@@ -4608,11 +5766,38 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                  rank's pass; the abort's own error stands"
             );
         }
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
         drop(transport);
         drop(clock);
         return Err(e);
     }
-    persist_report(report_path.as_deref(), &outcome)?;
+    // A driver graph that compared nothing (every frame the graph produced a
+    // driver's) reads `0/0`, and a `--verify` of it passes. WARN, the same
+    // rule as the unmodelled topics: a verdict that covers less of the bag
+    // than its reader assumes says so at the default log level.
+    let driver_written: Vec<&str> = classes
+        .driver
+        .iter()
+        .chain(&classes.driver_shared)
+        .map(String::as_str)
+        .collect();
+    if !driver_written.is_empty() && outcome.topics_checked == 0 {
+        tracing::warn!(
+            driver_topics = driver_written.len(),
+            topics = %driver_written.join(", "),
+            "replay: no topic was compared against the recording: the frames the external \
+             (driver) nodes publish are recorded inputs, which are never compared, and no \
+             other writer recorded or replayed a frame"
+        );
+    }
+    // A PASSING run whose `--report` cannot be written returns the write error,
+    // and the CLI prints only that error, so the environment lines are logged
+    // as on an abort.
+    if let Err(e) = persist_report(report_path.as_deref(), &outcome) {
+        log_env_divergences(&outcome.env_divergence, OutcomeShown::No);
+        return Err(e);
+    }
+    log_env_divergences(&outcome.env_divergence, OutcomeShown::Yes);
     // A bag that could not be finished is reported on the outcome, not raised
     // here: the engine does not know whether a verdict was asked for, and the
     // surface keeps a failing verdict's own exit code while never letting a
@@ -4640,9 +5825,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
 /// 0..k's results.
 #[derive(Default)]
 struct PassAccumulators {
-    /// Per-topic capture SUMMARIES (the ports die with their
-    /// pass).
-    captures: IndexMap<String, CaptureSummary>,
+    /// Per topic, the capture SUMMARY of every pass that captured it, in
+    /// pass order (the ports die with their pass). A topic is captured by
+    /// every pass whose rank runs a writer of it other than a driver, so a
+    /// `multi_publisher_topics` topic whose writers are split across ranks
+    /// has one per such rank.
+    captures: IndexMap<String, Vec<CaptureSummary>>,
     tolerated_ragged_tails: Vec<String>,
     /// The two additive gates' stand-down channels. Empty on
     /// every lockstep replay.
@@ -4697,7 +5885,7 @@ impl PassAccumulators {
         self.injection_anomalies.extend(injection_anomalies);
         self.rank_execution.push(execution);
         for (topic, cap) in captures {
-            self.captures.insert(topic, cap);
+            self.captures.entry(topic).or_default().push(cap);
         }
         self.tolerated_ragged_tails.extend(tail_notes);
         if self.trace_divergence.is_none() {
@@ -4730,6 +5918,14 @@ struct EpilogueInputs<'a> {
     covered_range: Option<CoveredRange>,
     coordination_report: CoordinationReport,
     ros2_entries_skipped: Vec<String>,
+    /// Which terminal report the CLI prints for this outcome: the `--verify`
+    /// verdict, which states every data violation and schedule divergence in
+    /// full, or the neutral `--resim` summary, which counts them.
+    purpose: ReplayPurpose,
+    /// The driver classification and feed plan ([`driver_inputs_report`]),
+    /// whose [`DriverInputsReport::unattributed_topics`] the per-topic diff
+    /// fills in.
+    driver_inputs: Option<DriverInputsReport>,
 }
 
 /// The `?`-FREE epilogue of [`run_engine`] — fold the passes'
@@ -4785,6 +5981,8 @@ fn assemble_outcome(
         covered_range,
         coordination_report,
         ros2_entries_skipped,
+        purpose,
+        mut driver_inputs,
     } = ep;
 
     // 5. The read-log verdict, folded across the passes. Under lockstep there
@@ -4807,8 +6005,8 @@ fn assemble_outcome(
     let mut topics_passed = 0usize;
     // Which rank(s) OWN each graph-produced topic — each in-graph
     // producer's node → the rank whose recorded manifest lists that node. Empty
-    // on single-rank bags (`node_rank` is `None`), keeping the frame tolerance
-    // inert (`tolerated_extra == 0`) and single-rank output byte-identical.
+    // on single-rank bags (`node_rank` is `None`), keeping the frame tolerance's
+    // windows empty and single-rank output byte-identical.
     //
     // A SET per topic, not one rank. A map written
     // `entry(t).or_insert(rank)` rests on the single-writer premise
@@ -4825,7 +6023,15 @@ fn assemble_outcome(
             Some(nr) => {
                 let mut m: std::collections::HashMap<String, std::collections::BTreeSet<u32>> =
                     std::collections::HashMap::new();
+                // A driver's frames are never compared, so a driver owns only
+                // a topic no other node writes: the abort rule judges that
+                // topic, whose one verdict is its record-side loss, once a
+                // rank of its drivers completed. A topic a driver shares is
+                // owned by its other writers' ranks alone, the ranks whose
+                // pass compares it (`pass_topics`), which the abort rule and
+                // the tail tolerance below read.
                 for node in &config.nodes {
+                    let driver = classes.driver_nodes.contains(&node.id);
                     if let Some(&rank) = nr.get(node.id.as_str()) {
                         for output in &node.outputs {
                             let t = cerulion_core::graph::resolve_output_topic(
@@ -4833,6 +6039,9 @@ fn assemble_outcome(
                                 &node.id,
                                 output,
                             );
+                            if driver && !classes.driver.contains(&t) {
+                                continue;
+                            }
                             m.entry(t).or_default().insert(rank);
                         }
                     }
@@ -4841,6 +6050,24 @@ fn assemble_outcome(
             }
             None => std::collections::HashMap::new(),
         };
+    // Per `node/output` label, the rank its node ran in, off the same
+    // `node_rank` map: the label a partitioned topic's writer is keyed by, so
+    // the frame tolerance bounds each writer by its own rank's tail. Empty on
+    // a single-rank bag, whose ranks have no tail.
+    let writer_ranks: std::collections::HashMap<String, u32> = node_rank
+        .map(|nr| {
+            config
+                .nodes
+                .iter()
+                .filter_map(|node| nr.get(node.id.as_str()).map(|&rank| (node, rank)))
+                .flat_map(|(node, rank)| {
+                    node.outputs
+                        .iter()
+                        .map(move |output| (format!("{}/{}", node.id, output.name), rank))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // The ranks whose READ-LOG-STEERED INJECTION stood down for
     // a WHOLE-RANK verifier decline, with the cause. Read off the stand-down rows
@@ -4889,19 +6116,44 @@ fn assemble_outcome(
     // The ranks whose pass COMPLETED — exactly the `rank_execution` entries
     // (the abort-path judged-topic rule below keys on this set).
     let completed_ranks: BTreeSet<u32> = rank_execution.iter().map(|r| r.rank).collect();
+    // The topics a driver shares that were compared unpartitioned
+    // ([`DriverInputsReport::unattributed_topics`]).
+    let mut unattributed_shared: BTreeSet<&str> = BTreeSet::new();
     for topic in &classes.produced {
         let recorded_count =
             replayed_frame_count(recorded_messages, topic, skipped_prefix, trailing_frames);
-        // Read the pass's SUMMARY: the capture itself (and
+        // Read the passes' SUMMARIES: the capture itself (and
         // its subscriber port) died with the pass that opened it.
-        let summary = captures.get(topic);
+        let summaries: &[CaptureSummary] = captures.get(topic).map_or(&[][..], Vec::as_slice);
+        // A topic is judged over every pass that captured it: a pass whose
+        // rank runs a writer of it other than a driver captures it, so a
+        // `multi_publisher_topics` topic whose writers run in several ranks
+        // has one capture per such rank. Partitioned by writer in each, it is
+        // one verdict per writer, each from the one pass that runs the writer
+        // (`merge_partitioned_summaries`). The only pass whose own writers
+        // published a frame of it is judged alone where it neither partitioned
+        // nor injected the topic; any other mix is judged by
+        // `push_split_violations`.
+        let shared = classes.driver_shared.contains(topic);
+        let judged = judge_passes(summaries);
+        let (summary, alone_in): (Option<&CaptureSummary>, Option<u32>) = match &judged {
+            PassJudgement::One { summary, alone_in } => (*summary, *alone_in),
+            PassJudgement::Merged(merged) => (Some(&**merged), None),
+            PassJudgement::Split => (None, None),
+        };
+        let split_passes = matches!(judged, PassJudgement::Split)
+            .then(|| SplitPasses::of(summaries, |driver| writer_ranks.get(driver).copied()));
+        // Every frame the replay compared is attributed to its writer.
+        let attributed =
+            split_passes.is_none() && summary.is_some_and(|c| c.partition_counts.is_some());
         // Partial report: under an ABORT a topic is judged iff
         // some rank that OWNS it COMPLETED — membership in the report's own
         // `rank_execution`, the same set the report states as complete, so
         // the judged-topic set and `rank_execution` cannot disagree. The rule
         // is keyed on that RUN FACT rather than on "a summary is present":
         // the two are equivalent BY CONSTRUCTION today — a completed pass
-        // opens a capture for every produced topic it owns (the graph
+        // opens a capture for every produced topic it owns but one only its
+        // drivers write, which is never compared (the graph
         // pre-creates every owned topic's service at build, so an inert
         // producer's tap opens and harvests zero frames) and a tap that
         // cannot be opened ABORTS the pass as a harness failure rather than
@@ -4940,17 +6192,38 @@ fn assemble_outcome(
         // reads the DIFFERENCE between the counts: a replay that under-produces
         // inside the band still lands short, and one that over-produces beyond it
         // still lands long.
-        let replayed_count = summary.map_or(0, |c| c.replayed_count).saturating_sub(
-            covered_range
-                .as_ref()
-                .and_then(|c| c.reproduced.get(topic).copied())
-                .unwrap_or(0),
-        );
-        let byte_violation = summary.and_then(|c| c.byte_violation);
+        //
+        // A split topic counts the frames its passes' own writers published
+        // and the driver frames their injectors re-published
+        // (`SplitPasses::replayed`), with no reproduced band taken off: the
+        // vacuous check and the tail tolerance read it, and
+        // `push_split_violations` reads its own counts off the passes.
+        let replayed_count = match &split_passes {
+            Some(passes) => passes.replayed(),
+            None => summary.map_or(0, |c| c.replayed_count).saturating_sub(
+                covered_range
+                    .as_ref()
+                    .and_then(|c| c.reproduced.get(topic).copied())
+                    .unwrap_or(0),
+            ),
+        };
+        let byte_violation = summary.and_then(|c| c.byte_violation.as_ref());
         let partition_counts = summary.and_then(|c| c.partition_counts.clone());
-        let tolerance_violations = summary
-            .map(|c| c.tolerance_violations.clone())
-            .unwrap_or_default();
+        // A topic a driver shares with re-executed writers is judged per
+        // writer over the re-executed writers' partitions only
+        // (`build_capture_partitionings`), so its topic-level count is theirs
+        // too: the driver's recorded frames are inputs nothing re-produces.
+        // Unpartitioned, the replay cannot say which frames are the driver's,
+        // so the whole recorded count stands and the report lists the topic in
+        // `DriverInputsReport::unattributed_topics`.
+        let recorded_count = match &partition_counts {
+            Some(parts) if shared => parts.values().map(|c| c.recorded).sum(),
+            _ => recorded_count,
+        };
+        // A split topic's rows come from `push_split_violations`, which
+        // judges each pass's.
+        let tolerance_violations: Vec<Violation> =
+            summary.map_or_else(Vec::new, |c| tolerance_rows(topic, &c.tolerance_worsts));
         // A record-side-lossy topic (rules 5b/5e) RE-LABELS its real
         // diff to ONE attributed violation and forces exit 1 REGARDLESS of the
         // byte/count result (even a would-be-clean topic). A `multi_publisher`
@@ -4973,14 +6246,29 @@ fn assemble_outcome(
             });
             continue; // NOT counted in topics_passed (it is a violation).
         }
+        // A driver topic is a recorded input: nothing re-produced it, so there
+        // is nothing to compare and `topics_checked` does not count it; the
+        // topics of the nodes that read it are judged here, and whether those
+        // nodes were fed its frames is logged up front
+        // (`log_driver_topic_feeds`). Its record-side loss is attributed by the
+        // arm above, on its own topic, so a bag that lost driver frames still
+        // fails.
+        if classes.driver.contains(topic) {
+            continue;
+        }
         if recorded_count == 0 && replayed_count == 0 {
             continue; // vacuous — nothing produced or recorded on this topic.
         }
         topics_checked += 1;
+        // A shared topic a pass did not partition is counted over every
+        // recorded frame no partition holds, the drivers' included.
+        if shared && !attributed {
+            unattributed_shared.insert(topic.as_str());
+        }
         // Tolerate TRAILING extra frames on a topic whose producing
         // node belongs to a rank that ended in a ragged shutdown tail — the
         // monolith re-fired that node past the recording's end, so up to
-        // (tail width × the topic's per-step frame count) extra frames at the
+        // (tail width × the per-step frame count) extra frames at the
         // END of the stream are legitimate, matching the window the in-comparator
         // `TailTolerance` (`is_tail_refire`) tolerates. THREE guards keep it tight:
         //   * NO byte violation ANYWHERE — the extra is TRAILING, not mid-stream:
@@ -4992,61 +6280,82 @@ fn assemble_outcome(
         //     leaves the topic-level one `None` forever, so the bare field made
         //     this guard vacuously true and let a byte-diverged co-located
         //     `multi_publisher_topics` topic take the tolerated arm (which pushes
-        //     no violation at all) and score PASSED;
+        //     no violation at all) and score PASSED. A split topic reads the
+        //     byte verdicts of the frames it compares (`SplitPasses::tail_clean`);
         //   * NO writer under-produced (`no_writer_under_produced`) — the
         //     topic-level `extra` is a SUM across a partitioned topic's writers,
         //     so one writer's legitimate tail re-fire can NET against another
         //     writer's genuine shortfall and land inside the window. The window
         //     only ever explains frames produced PAST the recording's end, so it
         //     never explains a shortfall;
-        //   * `extra <= tolerated_extra` — bounded by the recording's own
-        //     `tail width × frames-per-step`; over-production beyond the tail is
-        //     a real bug and still fails;
-        //   * `tolerated_extra == 0` with no ragged tail (single-rank, or a rank
-        //     that ran to the authoritative end, or a non-owned/rank-0 topic) —
-        //     the tolerance is INERT, so a byte-identical replay still passes and
-        //     an over-produced frame still fails.
+        //   * the extra frames lie within the recording's own
+        //     `tail width × frames-per-step` (`tail_extra_ranks`);
+        //     over-production beyond the tail is a real bug and still fails;
+        //   * with no ragged tail (single-rank, or a rank that ran to the
+        //     authoritative end, or a non-owned/rank-0 topic) the window is
+        //     empty and the tolerance INERT, so a byte-identical replay still
+        //     passes and an over-produced frame still fails.
         // Recorded in `tolerated_ragged_tails` (never silent).
         //
-        // Over a topic owned by MORE THAN ONE rank (only a
-        // `multi_publisher_topics` topic whose writers were split) the
-        // widths are SUMMED — each owning rank can re-fire its own tail
-        // independently and the frames add, so the sum is the true ceiling on
-        // "extra frames the ragged shutdown can explain". In the single-rank case
-        // the sum has one term, so a single-writer topic's tolerance is exactly
-        // its one owner's width.
-        let owner_ranks = topic_owner_ranks.get(topic.as_str());
-        let tolerated_extra = owner_ranks
-            .map(|ranks| {
-                let per_step = recorded_messages.max_burst(topic).max(1);
-                ranks
-                    .iter()
-                    .map(|&rank| (ragged.tail_width(rank) as usize).saturating_mul(per_step))
-                    .fold(0usize, usize::saturating_add)
-            })
-            .unwrap_or(0);
+        // A partitioned topic is bounded WRITER BY WRITER: a writer's extra
+        // frames lie within its own window, its rank's tail width times the
+        // most frames it published in one recorded step
+        // (`PartitionCounts::burst`), so neither another rank's tail nor
+        // another writer's frames explain them, and the note names the ranks
+        // whose writers produced them. A topic compared as one stream cannot
+        // say which writer produced an extra frame, so it is bounded by the
+        // SUM of the windows of the ranks its frames come from, each its tail
+        // width times the topic's largest one-step burst: the topic's owning
+        // ranks, or the one pass judged alone. On a single-writer topic the sum
+        // has one term, its one owner's width. A split topic is bounded part
+        // by part (`SplitPasses::tail_extra_ranks`): its partitioned writers
+        // writer by writer, and the frames its one-stream passes' own writers
+        // published by the sum of those passes' ranks' windows.
+        let per_step = recorded_messages.max_burst(topic).max(1);
         let extra = replayed_count.saturating_sub(recorded_count);
+        let tail_width = |rank: u32| ragged.tail_width(rank) as usize;
+        let writer_rank = |writer: &WriterKey| match writer {
+            WriterKey::Named(label) => writer_ranks.get(&**label).copied(),
+            WriterKey::Origin(_) => None,
+        };
+        let (tail_clean, tail_ranks) = match &split_passes {
+            Some(passes) => (
+                passes.tail_clean(recorded_count),
+                passes.tail_extra_ranks(recorded_count, per_step, tail_width, writer_rank),
+            ),
+            None => {
+                let stream_ranks: BTreeSet<u32> = match alone_in {
+                    Some(rank) => BTreeSet::from([rank]),
+                    None => topic_owner_ranks
+                        .get(topic.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                (
+                    summary.is_none_or(|c| !c.any_byte_violation() && c.no_writer_under_produced()),
+                    tail_extra_ranks(
+                        partition_counts.as_ref(),
+                        &stream_ranks,
+                        if partition_counts.is_some() { 0 } else { extra },
+                        per_step,
+                        tail_width,
+                        writer_rank,
+                    ),
+                )
+            }
+        };
         let ragged_trailing_tolerated = extra > 0
             && recorded_count > 0
-            && summary.is_none_or(|c| !c.any_byte_violation())
-            && summary.is_none_or(CaptureSummary::no_writer_under_produced)
-            && extra <= tolerated_extra;
+            && tail_clean
+            && tail_ranks.as_ref().is_some_and(|r| !r.is_empty());
         let before = violations.len();
+        let mut split_unjudged: Option<SplitUnjudged> = None;
         if ragged_trailing_tolerated {
-            // The note names every owning rank whose tail CONTRIBUTED
-            // to the tolerance (width > 0). `tolerated_extra > 0` here, so at
-            // least one did; on every single-writer topic that is exactly the
-            // one owning rank. Only a split `multi_publisher_topics` topic
-            // reaches the multi-rank arm.
-            let contributing: Vec<u32> = owner_ranks
-                .map(|ranks| {
-                    ranks
-                        .iter()
-                        .copied()
-                        .filter(|&rank| ragged.tail_width(rank) > 0)
-                        .collect()
-                })
-                .unwrap_or_default();
+            // The note names every rank whose tail explains extra frames: on a
+            // single-writer topic exactly the one owning rank, and the multi-rank
+            // arm only on a `multi_publisher_topics` topic whose writers were
+            // split.
+            let contributing: Vec<u32> = tail_ranks.unwrap_or_default();
             // The same two causes the structural note distinguishes —
             // a short boundary stream, or a final boundary that banked no fires.
             // The fire-less arm states the cause as an EITHER/OR because the
@@ -5066,8 +6375,8 @@ fn assemble_outcome(
                      tail of rank {rank} (recorded {recorded_count}, replay produced \
                      {replayed_count})"
                 ),
-                // A split multi-writer topic: each rank's tail is its own cause
-                // and its own width, and the tolerance is their SUM — say so,
+                // A multi-writer topic whose writers run in several ranks: each
+                // rank's tail is its own cause and its own width, so say so,
                 // per rank, rather than collapsing the set to one rank (a
                 // collapsed map would name a rank whose tail may not
                 // have produced a single one of the extra frames).
@@ -5090,9 +6399,9 @@ fn assemble_outcome(
                         })
                         .collect();
                     format!(
-                        "frame: {extra} trailing frame(s) on '{topic}' tolerated: the topic's \
-                         writers span {} ranks whose tails add up — {} (recorded \
-                         {recorded_count}, replay produced {replayed_count})",
+                        "frame: {extra} trailing frame(s) on '{topic}' tolerated: the tails of \
+                         {} ranks explain them: {} (recorded {recorded_count}, replay \
+                         produced {replayed_count})",
                         ranks.len(),
                         causes.join("; ")
                     )
@@ -5104,6 +6413,34 @@ fn assemble_outcome(
             // partitioned topic as well as the topic-level one — a mid-stream
             // extra keeps its byte violation and falls through below), and
             // neither can a per-writer SHORTFALL (`no_writer_under_produced`).
+            // A split topic still returns its tolerance rows and the passes
+            // whose frames it does not compare.
+            if let Some(passes) = &split_passes {
+                split_unjudged = push_split_violations(
+                    topic,
+                    recorded_count,
+                    passes,
+                    SplitCounts::TailTolerated,
+                    &mut violations,
+                );
+            }
+        } else if let Some(passes) = &split_passes {
+            // The topic-level triage reads counts that leave a driver's frames
+            // out wherever a pass partitioned a topic a driver shares.
+            let triage = !shared || summaries.iter().all(|c| c.partition_counts.is_none());
+            split_unjudged = push_split_violations(
+                topic,
+                recorded_count,
+                passes,
+                SplitCounts::Judged { triage },
+                &mut violations,
+            );
+        } else if let Some(parts) = partition_counts.as_ref().filter(|_| shared) {
+            // Per writer, with no topic-level triage: the topic-level counts
+            // leave the drivers' frames out, so a `MissingTopic` ("replay
+            // produced NONE") or an `ExtraTopic` ("the bag has no channel")
+            // read off them could be false of the topic.
+            push_partition_violations(topic, parts, &mut violations);
         } else {
             push_topic_violations(
                 topic,
@@ -5163,27 +6500,32 @@ fn assemble_outcome(
         };
         if !declining.is_empty() {
             let withheld: Vec<Violation> = violations.split_off(before);
-            let matched_under_fallback = withheld.is_empty();
             // The cause is taken from the FIRST declining owner. Where the cause
             // is the whole-rank census decline that is exact — one
             // `VerifierDecline` per pass — and where a rank carries BOTH shapes the
             // table above has already resolved the precedence deterministically, so
             // "first" is a stable choice rather than an iteration accident.
             // `ranks` carries every declining owner.
-            let (code, reason) = declined_ranks
+            let cause = declined_ranks
                 .get(&declining[0])
                 .cloned()
                 .unwrap_or_default();
+            // One row per cause: the read-log row, and beside it a split topic's
+            // `split_topic_frames_unattributed` row where some passes' frames
+            // were not compared, which the read-log row then does not claim to
+            // have matched (`read_log_decline_rows`).
+            let (read_log, split_row) =
+                read_log_decline_rows(topic, declining, cause, withheld, split_unjudged.take());
             // TWO LEVELS, because the two outcomes are not equally interesting: a
             // WITHHELD divergence is something the verdict would have reported and
             // now does not (an operator must see it), while a topic that MATCHED
             // hid nothing and is merely uncredited. One level for both would either
             // bury the first or warn once per topic on every refused bag.
-            if matched_under_fallback {
+            if read_log.matched_under_fallback {
                 tracing::info!(
                     topic = %topic,
-                    ranks = ?declining,
-                    code = %code,
+                    ranks = ?read_log.ranks,
+                    code = %read_log.code,
                     "replay: the frame comparison on this topic MATCHED, but under a \
                      recorded-clock FALLBACK input stream — the read log that steers its \
                      producer's cross-rank inputs was refused — so it is DECLINED rather \
@@ -5196,9 +6538,9 @@ fn assemble_outcome(
             } else {
                 tracing::warn!(
                     topic = %topic,
-                    ranks = ?declining,
-                    code = %code,
-                    withheld = withheld.len(),
+                    ranks = ?read_log.ranks,
+                    code = %read_log.code,
+                    withheld = read_log.withheld.len(),
                     "replay: the frame comparison on this topic is DECLINED, not failed — the \
                      read log that steers its producer's cross-rank input stream was refused, so \
                      the injection fell back to the recorded-clock window and a byte difference \
@@ -5208,14 +6550,11 @@ fn assemble_outcome(
                      binary to make this topic verifiable."
                 );
             }
-            declined_frame_comparisons.push(DeclinedFrameComparison {
-                topic: topic.clone(),
-                ranks: declining,
-                code,
-                reason,
-                matched_under_fallback,
-                withheld,
-            });
+            declined_frame_comparisons.push(read_log);
+            if let Some(row) = split_row {
+                log_split_unattributed_row(&row);
+                declined_frame_comparisons.push(row);
+            }
             // Deliberately NOT counted in `topics_passed`, whichever way it went: it
             // was checked and neither passed nor failed. `topics_checked -
             // topics_passed` is therefore the failed-or-declined count, and the
@@ -5223,9 +6562,39 @@ fn assemble_outcome(
             // claim a verification that did not happen.
             continue;
         }
+        // A split topic some pass's frames could not be compared on is
+        // DECLINED when nothing else on it failed: neither passed, for those
+        // frames were not compared, nor failed, for their one-stream verdicts
+        // say nothing of the candidate, which `withheld` carries verbatim. Not
+        // counted in `topics_passed`, as above. Where something else failed,
+        // the topic fails on that alone.
+        if let Some(unjudged) = split_unjudged {
+            if violations.len() == before {
+                let row = split_unattributed_row(topic, unjudged);
+                log_split_unattributed_row(&row);
+                declined_frame_comparisons.push(row);
+                continue;
+            }
+            tracing::warn!(
+                topic = %topic,
+                ranks = ?unjudged.ranks,
+                "replay: this `multi_publisher_topics` topic failed on the frames the replay \
+                 could compare, and the frames the processes or executor units in `ranks` \
+                 captured were not compared: those could not attribute the topic's recorded \
+                 frames to their writers"
+            );
+        }
         if violations.len() == before {
             topics_passed += 1;
         }
+    }
+    if let Some(report) = driver_inputs.as_mut() {
+        report.unattributed_topics = report
+            .shared_topics
+            .iter()
+            .filter(|t| unattributed_shared.contains(t.as_str()))
+            .cloned()
+            .collect();
     }
 
     // Rule 5e (global catch-all): a LOSSY stamp must NEVER produce
@@ -5248,27 +6617,59 @@ fn assemble_outcome(
         ));
     }
 
-    // 7. Env divergence (WARN-only) + report + verdict data.
+    // 7. Env divergence (never exit-affecting) + report + verdict data. The
+    // divergences are logged by `run_engine` once it knows whether the CLI
+    // shows this outcome, which a failed `--report` write decides after this
+    // epilogue (`log_env_divergences`).
     let env_divergence = compare_env(env_json);
-    for d in &env_divergence {
-        tracing::warn!(var = %d.name, detail = %d.detail, "replay: environment divergence vs bag env.json");
-    }
+    // A completed `--verify`: INFO, because the verdict renders each violation
+    // and the schedule divergence as its own block on the same stderr, so these
+    // lines are for a log pipeline only. A bare `--resim`: WARN, because its
+    // neutral summary only counts the differing topics and says the schedule
+    // differs, so these lines are where the terminal names each topic, frame
+    // and position. An ABORTED run renders neither (the CLI prints only the
+    // aborting error), so these lines are the only place the terminal names
+    // what the completed ranks found: WARN under both purposes.
+    let verdict_states_detail = purpose == ReplayPurpose::Verify && aborted.is_none();
     for v in &violations {
-        tracing::warn!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        if verdict_states_detail {
+            tracing::info!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        } else {
+            tracing::warn!(topic = %v.topic, detail = %v.detail, "replay: data violation");
+        }
     }
     if let Some(td) = &trace_divergence {
-        tracing::warn!(
-            position = td.position,
-            detail = %td.detail,
-            "replay: structural trace divergence vs the recorded scheduler trace"
-        );
+        if verdict_states_detail {
+            tracing::info!(
+                position = td.position,
+                detail = %td.detail,
+                "replay: structural trace divergence vs the recorded scheduler trace"
+            );
+        } else {
+            tracing::warn!(
+                position = td.position,
+                detail = %td.detail,
+                "replay: structural trace divergence vs the recorded scheduler trace"
+            );
+        }
     }
+    // INFO under both purposes on a completed run: the verdict and the neutral
+    // summary each name every failed node with its reason. WARN on an aborted
+    // run, which renders neither.
     for f in &node_failures {
-        tracing::warn!(
-            node_id = %f.node_id,
-            reason = %f.reason,
-            "replay: node suffered a panic-class failure (exit-3 root cause)"
-        );
+        if aborted.is_none() {
+            tracing::info!(
+                node_id = %f.node_id,
+                reason = %f.reason,
+                "replay: node suffered a panic-class failure (exit-3 root cause)"
+            );
+        } else {
+            tracing::warn!(
+                node_id = %f.node_id,
+                reason = %f.reason,
+                "replay: node suffered a panic-class failure (exit-3 root cause)"
+            );
+        }
     }
 
     // Surface every engaged ragged-tail tolerance (INFO — a benign,
@@ -5319,6 +6720,7 @@ fn assemble_outcome(
         record_health,
         tolerated_ragged_tails,
         unmodelled_topics,
+        driver_inputs,
         resume: resume_report,
         // The range this bag declared — or the reader
         // derived — carried into the verdict so the exclusion is REPORTED
@@ -5447,6 +6849,47 @@ fn build_read_log_verdict(
         unmet_total,
         detail,
     })
+}
+
+/// Whether the CLI shows a run's outcome: `Yes` when [`run_engine`] returns it
+/// (the verdict and the neutral summary each print
+/// [`render_env_divergence_lines`]), `No` when it returns an error instead,
+/// which is all the CLI then prints.
+#[derive(Clone, Copy)]
+enum OutcomeShown {
+    Yes,
+    No,
+}
+
+/// Log each environment divergence once. A variable that can change the
+/// re-execution ([`env_reader`]) is an `info!` when the outcome is shown, which
+/// already prints it, and a `warn!` when it is not, so it still reaches the
+/// terminal. Every other variable is an `info!` either way: the NOTE line
+/// counts it, and `-v` lists it.
+fn log_env_divergences(divergences: &[EnvDivergence], shown: OutcomeShown) {
+    for d in divergences {
+        match (env_reader(&d.name), shown) {
+            (None, _) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                "replay: an environment variable differs from the recording"
+            ),
+            (Some(reader), OutcomeShown::Yes) => tracing::info!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+            (Some(reader), OutcomeShown::No) => tracing::warn!(
+                env_var = %d.name,
+                change = %d.kind.label(),
+                read_by = %reader.label(),
+                "replay: an environment variable that can change the re-execution differs \
+                 from the recording"
+            ),
+        }
+    }
 }
 
 /// Persist the `--report` artifact, if one was requested, under the decided
@@ -7956,10 +9399,13 @@ struct ReplayContext {
     factories: IndexMap<String, Box<dyn NodeEntry>>,
     /// The workspace schema hashes on the CLI path; `None` on the test seam.
     schema_hashes: Option<std::collections::HashMap<String, u64>>,
+    /// The workspace `schemas/` directory a byte-mismatch verdict decodes
+    /// with on the CLI path; `None` (the built-in set alone) on the test seam.
+    verdict_schemas_dir: Option<PathBuf>,
     resume: Option<ResumePlan>,
 }
 
-/// Classify a `TransportManager::init` failure on the resim path.
+/// Classify a failure to start the resim's transport ([`init_resim_transport`]).
 ///
 /// One failure class here is NOT a harness bug: an
 /// [`UnrepresentableNodeName`](cerulion_core::TransportError::UnrepresentableNodeName)
@@ -8019,11 +9465,13 @@ fn build_replay_context(
             // The resume plan: after the load (so `NodeLoad` keeps precedence),
             // before the transport (so its seeds reach publisher creation).
             let resume = resolve_resume()?;
-            // Smart, dead-node-only cleanup (the `graph_run` precedent) — live
-            // sibling Cerulion processes are untouched.
-            let _ = crate::ipc_cleanup::cleanup_dead_iceoryx2_nodes();
             let clock = Arc::new(VirtualClock::new());
-            let transport = TransportManager::init(cerulion_core::TransportConfig {
+            // On the resim's PRIVATE namespace (`init_resim_transport`), so no
+            // live graph, recorder or network daemon on this host receives
+            // the frames it re-executes or the recorded inputs it re-injects.
+            // The resim opens nothing on the shared namespace, so it sweeps
+            // only its own slot's namespace (`reclaim_resim_slot`).
+            let transport = init_resim_transport(cerulion_core::TransportConfig {
                 node_name: format!("{REPLAY_NODE_NAME_PREFIX}{}", config.identity()),
                 clock: clock.clone(),
                 subscriber_buffer_size: REPLAY_SUBSCRIBER_BUFFER,
@@ -8034,8 +9482,7 @@ fn build_replay_context(
                 // deliberately NOT a warn, since this arm is hit by design
                 // on every replay of a networked graph).
                 network: None,
-            })
-            .map_err(replay_transport_init_error)?;
+            })?;
             if let Some(plan) = resume.as_ref() {
                 if !plan.seeds.is_empty() {
                     transport.set_replay_sequence_seeds(plan.seeds.clone());
@@ -8047,6 +9494,7 @@ fn build_replay_context(
                 clock,
                 factories,
                 schema_hashes: Some(schema_hashes),
+                verdict_schemas_dir: Some(workspace_root.join("schemas")),
                 resume,
             })
         }
@@ -8069,6 +9517,7 @@ fn build_replay_context(
                 clock,
                 factories,
                 schema_hashes: None,
+                verdict_schemas_dir: None,
                 resume,
             })
         }
@@ -8079,12 +9528,23 @@ fn build_replay_context(
 /// per `(node, input)` the depth a bag-fed input's subscriber is built at when
 /// its steered schedule holds more frames than it declares
 /// (`PassVerification::depth_floors`). An empty map adds nothing.
+///
+/// `sibling_topics` is the rank's [`RankPlan::sibling_produced`]: the topics
+/// another rank produces for this one, handed to the pass's validation exactly
+/// as a live worker hands its plan's set, so a correct cross-rank edge is not
+/// reported as a possible typo. It changes no wiring.
 fn pass_wiring<'a>(
     burst_floors: &'a BTreeMap<String, cerulion_core::transport::TopicRequirements>,
     depth_floors: &'a BTreeMap<(String, String), usize>,
+    sibling_topics: &'a cerulion_core::graph::SiblingProducedTopics,
 ) -> cerulion_core::graph::CrossProcessWiring<'a> {
     let provisioning = (!burst_floors.is_empty()).then_some(burst_floors);
-    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning);
+    // A pass logs no paced-topic warning. A lockstep pass re-executes the
+    // `block` gate; a free-run pass takes its fires from the recording and
+    // bypasses the gate (`run_rank_pass`).
+    let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning)
+        .with_paced_topic_warnings(&[])
+        .with_sibling_topics(sibling_topics);
     if depth_floors.is_empty() {
         wiring
     } else {
@@ -8327,6 +9787,9 @@ struct PassInputs<'a> {
     catchup_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     trace: &'a RecordedTrace,
     recorded_messages: &'a RecordedMessages,
+    /// The schema set each byte divergence is decoded with at the pass
+    /// harvest, built on first use and shared by every pass.
+    verdict: &'a VerdictDecoder,
     rank_tables: &'a [Vec<Arc<str>>],
     rank_count: usize,
     node_rank: Option<&'a std::collections::HashMap<Arc<str>, u32>>,
@@ -8361,6 +9824,9 @@ struct PassInputs<'a> {
     /// The whole-graph config — `multi_publisher_topics` is a graph-level
     /// declaration, not a subgraph one.
     config: &'a GraphConfig,
+    /// The graph's `external` (driver) nodes ([`TopicClasses::driver_nodes`]):
+    /// writers a shared topic's partitioned diff leaves out.
+    driver_nodes: &'a BTreeSet<String>,
     /// The `--record-out` sink, if one was asked for.
     record_out: Option<Arc<crate::resim_record_out::RecordOut>>,
 }
@@ -8392,15 +9858,28 @@ impl PassInputs<'_> {
 struct CaptureSummary {
     /// Frames replay produced on the topic — [`Capture::replayed_count`].
     replayed_count: usize,
-    /// The TOPIC-level first byte divergence — written by the single-stream
-    /// diff only. A partitioned topic leaves this `None` and reports per writer
-    /// in [`Self::partition_counts`]; see [`Self::any_byte_violation`].
-    byte_violation: Option<ByteViolation>,
-    /// The per-field tolerance violations, already rendered against the topic.
-    tolerance_violations: Vec<Violation>,
+    /// The TOPIC-level first byte divergence, judged: written by the
+    /// single-stream diff only. A partitioned topic leaves this `None` and
+    /// reports per writer in [`Self::partition_counts`]; see
+    /// [`Self::any_byte_violation`].
+    byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
+    /// The `--tolerance` fields whose bound some frame exceeded, each with its
+    /// worst frame, unrendered: the passes that captured one topic fold them
+    /// into one row per field and metric ([`fold_tolerance_worsts`]).
+    tolerance_worsts: Vec<FieldMetric>,
     /// The per-WRITER count/byte inputs of a label-partitioned topic (`None` on
     /// every single-stream topic).
     partition_counts: Option<BTreeMap<WriterKey, PartitionCounts>>,
+    /// The rank of the pass that captured the topic.
+    rank: u32,
+    /// The frames this pass's injector re-published on the topic: recorded
+    /// frames of the writers other passes run, which a capture that did not
+    /// partition the topic counts beside its own writers' frames.
+    injected: usize,
+    /// Of [`Self::injected`], per driver (`node/output`), the frames that
+    /// driver recorded, where the injection names the writer of each recorded
+    /// frame ([`DriverCopies`]); empty where it names none.
+    injected_drivers: BTreeMap<Arc<str>, usize>,
 }
 
 impl CaptureSummary {
@@ -8438,6 +9917,18 @@ impl CaptureSummary {
         self.partition_counts
             .as_ref()
             .is_none_or(|p| p.values().all(|c| c.replayed >= c.recorded))
+    }
+
+    /// The counted frames this pass's own writers published: every counted
+    /// frame of a partitioned topic, whose capture leaves its injector's frames
+    /// out, and every counted frame but the injected ones of a topic captured
+    /// as one stream.
+    fn own_replayed(&self) -> usize {
+        if self.partition_counts.is_some() {
+            self.replayed_count
+        } else {
+            self.replayed_count.saturating_sub(self.injected)
+        }
     }
 }
 
@@ -9603,6 +11094,11 @@ struct TopicFrameIndex {
     /// INVARIANT: `ordinals.len() == sequences.len()` — the two are pushed
     /// together, entry for entry.
     ordinals: Vec<u64>,
+    /// Each [`Self::sequences`] entry's wire timestamp, pushed with it, so
+    /// `timestamps.len() == sequences.len()`: a partitioned capture reads
+    /// each writer's largest one-step burst off it
+    /// ([`PartitionCounts::burst`]).
+    timestamps: Vec<u64>,
     /// Every recorded frame on this topic, headerless ones INCLUDED — the
     /// recorder's own frame count, and so the exclusive upper bound of the
     /// ordinal space above.
@@ -9634,7 +11130,7 @@ struct TopicFrameIndex {
 }
 
 /// Walk the recorded frames of `topics` once, collecting each topic's ordered
-/// sequences and its `sequence -> wire stamp` join table.
+/// sequences and wire timestamps and its `sequence -> wire stamp` join table.
 ///
 /// `Ok(None)` = the budget was blown (same contract as
 /// [`collect_rank_read_log`]).
@@ -9650,6 +11146,7 @@ fn collect_topic_frame_index(
                 TopicFrameIndex {
                     sequences: Vec::new(),
                     ordinals: Vec::new(),
+                    timestamps: Vec::new(),
                     recorded: 0,
                     stamps: std::collections::HashMap::new(),
                     headerless: 0,
@@ -9687,6 +11184,7 @@ fn collect_topic_frame_index(
         // Pushed TOGETHER — `TopicFrameIndex::ordinals`' length invariant.
         idx.sequences.push(h.sequence);
         idx.ordinals.push(ordinal);
+        idx.timestamps.push(h.timestamp_ns);
         match idx.stamps.get(&h.sequence) {
             None => {
                 idx.stamps.insert(h.sequence, h.timestamp_ns);
@@ -10622,6 +12120,11 @@ fn read_log_edge_not_gateable(
 struct PassVerification {
     /// Topics whose injection is STEERED, and the schedule to drive.
     steered: std::collections::HashMap<String, Vec<replay_inject::StepInjection>>,
+    /// Per injected `multi_publisher_topics` topic whose recorded frames the
+    /// injection attributes to their writers, the frames its drivers wrote,
+    /// which the topic's injector counts as it re-publishes them. Steered or
+    /// not.
+    driver_copies: std::collections::HashMap<String, DriverCopies>,
     stand_downs: Vec<InjectionStandDown>,
     coverage: Vec<InjectionCoverageNote>,
     /// Non-verdict notes minted while PLANNING — today only the
@@ -10843,6 +12346,7 @@ impl PassVerification {
     fn inert() -> Self {
         Self {
             steered: std::collections::HashMap::new(),
+            driver_copies: std::collections::HashMap::new(),
             stand_downs: Vec::new(),
             coverage: Vec::new(),
             notes: Vec::new(),
@@ -11130,10 +12634,9 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 ///
 /// The rank's runtime builds a `GraphTopology` from the same subgraph and node
 /// infos, and installs a block pre-fire check on every in-graph producer of a
-/// topic whose every consumer reads it with `backpressure = block`
-/// (`TopicFlow::is_all_block`). A topic that mixes `block` with another policy
-/// degrades its `block` consumers to `drop_oldest` and installs none. This is
-/// that producer set, read off the same build.
+/// topic that a `block` input reads, whatever the topic's other consumers
+/// declare (`TopicFlow::holds_its_producers`, the predicate its wiring reads).
+/// This is that producer set, read off the same build by the same predicate.
 ///
 /// # Errors
 ///
@@ -11153,7 +12656,7 @@ fn local_block_producers(
         })?;
     Ok(topology
         .topics()
-        .filter(|flow| flow.is_all_block())
+        .filter(|flow| flow.holds_its_producers())
         .flat_map(|flow| flow.producers.iter().cloned())
         .collect())
 }
@@ -11207,7 +12710,7 @@ fn latest_input_depth(info: &cerulion_core::graph::NodeInfo, input: &str) -> Opt
 /// (`NodeInfo::unifies_data_trigger` refuses them on policy), so they are
 /// [`replay_rederive::LatestDrain::Separate`]. Every other input reads through
 /// one subscriber only when its entry answers `NodeEntry::unifies_trigger_drain`
-/// (a node library through its unified drain export, a closure unless built
+/// (a stable node library through its host-owned unified drain, a closure unless built
 /// with `ClosureNodeEntry::with_unified_drain(false)`) and
 /// `CERULION_DRAIN_DISCIPLINE=separate` did not force two at the graph build.
 /// Such a bag records neither, and the replayed entry need not be the recorded
@@ -11888,7 +13391,7 @@ fn plan_bag_side_admissions(
                     read: decoded.read,
                 });
         }
-        let (node_infos, _notes) = collect_pass_node_infos(plan, factories);
+        let (node_infos, _notes) = collect_pass_node_infos(plan, factories, config);
         // The table is built PER RANK because the wiring answer reads this rank's
         // own declared node metadata. The topic a blocked input consumes is the
         // one `consumed` names it under, which is also the only vocabulary the
@@ -12219,7 +13722,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// TWELVE arguments. `roles_stamped` is a per-BAG contract term resolved once
+// THIRTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -12253,6 +13756,9 @@ fn prepare_pass_verification(
     // handed to the latest rule so it reads the writer runs as they were
     // staged.
     identity: cerulion_core::replay_feed::EdgeIdentity,
+    // The graph's `external` (driver) nodes, whose recorded frames an
+    // injector counts apart ([`PassVerification::driver_copies`]).
+    drivers: &BTreeSet<String>,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -12614,6 +14120,18 @@ fn prepare_pass_verification(
             },
         ));
     let mut steered = std::collections::HashMap::new();
+    // The `node/output` labels of the drivers' outputs the bag's publisher
+    // tables name.
+    let driver_labels: BTreeSet<&str> = producer_tokens
+        .values()
+        .filter_map(|resolution| match resolution {
+            ProducerResolution::Named { label, node } if drivers.contains(node) => {
+                Some(label.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut driver_copies = std::collections::HashMap::new();
     let mut stand_downs = Vec::new();
     let mut coverage = Vec::new();
     let mut notes: Vec<RederivationNote> = Vec::new();
@@ -12765,6 +14283,12 @@ fn prepare_pass_verification(
             edges,
         };
         let topic_plan = replay_inject::plan_topic_injection(&replay, &local_producers);
+        // Steered or not, the injector re-publishes these frames by their
+        // index, so it can count a driver's apart.
+        let copies = DriverCopies::of(&replay.frames, &driver_labels);
+        if !copies.is_empty() {
+            driver_copies.insert(topic.clone(), copies);
+        }
         let declines_this_topic = match &topic_plan {
             replay_inject::TopicPlan::StandDown(sd) => {
                 is_read_log_derived_standdown(sd.reason.code())
@@ -13185,6 +14709,7 @@ fn prepare_pass_verification(
 
     Ok(PassVerification {
         steered,
+        driver_copies,
         stand_downs,
         coverage,
         notes,
@@ -13543,6 +15068,7 @@ fn plan_pass_admission(
 fn collect_pass_node_infos(
     plan: &RankPlan,
     factories: &IndexMap<String, Box<dyn NodeEntry>>,
+    config: &GraphConfig,
 ) -> (
     IndexMap<String, cerulion_core::graph::NodeInfo>,
     Vec<RederivationNote>,
@@ -13586,6 +15112,15 @@ fn collect_pass_node_infos(
             }
         }
     }
+    // The graph's per-input `backpressure:` / `depth:` keys, as the replayed
+    // runtime applies them at its own build.
+    if let Err(e) = cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut out,
+        cerulion_core::graph::topology::MissingInputMeta::Skip,
+    ) {
+        tracing::warn!(error = %e, "replay: the graph's per-input backpressure keys did not apply");
+    }
     (out, notes)
 }
 
@@ -13613,14 +15148,23 @@ fn plan_pass_verification(
         pass.kind_width,
         pass.catchup_onset,
         pass.identity,
+        pass.driver_nodes,
     )?;
     Ok(verification)
 }
 
 /// The topic sets one pass works over, derived from its plan alone.
 struct PassTopics {
-    /// The graph-produced topics this rank produces, in graph order.
+    /// The graph-produced topics this rank produces and the pass captures, in
+    /// graph order: every one a member other than a driver
+    /// ([`TopicClasses::driver_nodes`]) writes.
     produced: Vec<String>,
+    /// The graph-produced topics this rank produces that only its drivers
+    /// write, in graph order. Their frames are recorded inputs, so nothing
+    /// compares them, but a replayed driver tick that writes its outputs
+    /// publishes, and `--record-out` holds every frame the re-executed graph
+    /// published: a run that asks for it taps these ([`RecordOutTap`]).
+    record_out_only: Vec<String>,
     /// The topics this rank consumes and another rank (or no graph node)
     /// produces: what the pass injects from the bag.
     inject_topics: Vec<String>,
@@ -13640,12 +15184,16 @@ struct PassTopics {
 /// lists rather than out of the plan's sorted sets, so a whole-graph (lockstep)
 /// plan keeps the graph's own order exactly.
 fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool, fed: bool) -> PassTopics {
-    let produced: Vec<String> = classes
+    // A topic only this rank's drivers write opens no capture: its frames are
+    // recorded inputs, and a driver re-executed here has no device to read.
+    // What such a driver still publishes goes to `--record-out` alone.
+    let re_executed = re_executed_output_topics(plan.subgraph(), &classes.driver_nodes);
+    let (produced, record_out_only): (Vec<String>, Vec<String>) = classes
         .produced
         .iter()
         .filter(|t| plan.produced().contains(*t))
         .cloned()
-        .collect();
+        .partition(|t| re_executed.contains(t));
     // A FED pass injects nothing: every consumed topic, external and
     // cross-rank included, reaches its consumers through their private feeds.
     let mut inject_topics: Vec<String> = if fed {
@@ -13699,6 +15247,7 @@ fn pass_topics(plan: &RankPlan, classes: &TopicClasses, lockstep: bool, fed: boo
     };
     PassTopics {
         produced,
+        record_out_only,
         inject_topics,
         cross: cross.into_iter().map(str::to_string).collect(),
         enforce_topics,
@@ -13802,6 +15351,7 @@ fn run_rank_pass(
     //    target" once each rank has its own clock.
     let PassTopics {
         produced,
+        record_out_only,
         inject_topics,
         cross: cross_rank_topics,
         enforce_topics,
@@ -13969,12 +15519,13 @@ fn run_rank_pass(
         None
     };
     // The injectors are opened BEFORE the capture partitionings,
-    // because on a SPLIT `multi_publisher_topics` topic the injector is one of
-    // the writers the capture has to tell apart — its publisher id stands in
-    // for the FOREIGN writer whose recorded frames it re-publishes. Opening
+    // because on a SPLIT `multi_publisher_topics` topic the capture tells the
+    // injector's frames apart from its own writers' by the injector's
+    // publisher id, and leaves them out: they are the recorded frames of the
+    // FOREIGN writers it re-publishes. Opening
     // order is the only thing that changed; the injectors are handed to the
     // dispatch below exactly as before.
-    let injectors = open_injectors(
+    let mut injectors = open_injectors(
         transport,
         &inject_topics,
         pass.recorded_messages,
@@ -13983,6 +15534,11 @@ fn run_rank_pass(
         &cross,
         plan.rank(),
     )?;
+    for (topic, copies) in std::mem::take(&mut verification.driver_copies) {
+        if let Some(injector) = injectors.get_mut(&topic) {
+            injector.driver_copies = copies;
+        }
+    }
     // The per-WRITER capture diff of every co-located
     // `multi_publisher_topics` topic this pass produces. Built HERE and not
     // inside `open_captures` because the captured side's resolver is the LIVE
@@ -13997,6 +15553,7 @@ fn run_rank_pass(
         pass.skipped_prefix,
         pass.trailing_frames,
         plan.members(),
+        pass.driver_nodes,
         &injectors,
     )?;
     let mut captures_owned = open_captures(
@@ -14011,6 +15568,12 @@ fn run_rank_pass(
         pass.record_out.as_ref(),
         &injectors,
     )?;
+    // The topics only this pass's drivers write, tapped for `--record-out`
+    // alone: no capture compares them, and a run without the flag opens none.
+    let mut record_out_taps = match pass.record_out.as_ref() {
+        Some(sink) => open_record_out_taps(transport, &record_out_only, sink, &injectors)?,
+        None => Vec::new(),
+    };
     // The injectors live behind the pass's ONE injection lock, so
     // the scheduler's intra-step hook — which runs inside `runtime.step()` and
     // can borrow nothing the loop holds — reaches the same publishers the
@@ -14536,6 +16099,9 @@ fn run_rank_pass(
             for (_topic, cap) in captures_owned.iter_mut() {
                 cap.drain(cap_feed)?;
             }
+        }
+        for tap in &mut record_out_taps {
+            tap.drain()?;
         }
         // Advise-behind: this step's frames are drained + diffed and all
         // borrowed slices dropped, so evict the page-aligned bag region behind
@@ -15402,16 +16968,36 @@ fn run_rank_pass(
     // [`CaptureSummary`]), so the capture subscriber ports die with the pass
     // that opened them instead of being carried — still attached, still being
     // filled by the transport — across every later rank's pass.
+    //
+    // A stream's first byte divergence is judged HERE, after the step loop:
+    // its frame pair is decoded to name the differing field, then dropped.
+    // The injector's count is read here too, while the dispatch still holds
+    // the injectors.
     let captures: IndexMap<String, CaptureSummary> = captures_owned
-        .iter()
+        .iter_mut()
         .map(|(topic, c)| {
+            let skip = CaptureTolerance::tolerated_fields(c.tolerance.as_ref());
+            let byte_violation = c
+                .byte_violation
+                .take()
+                .map(|v| judge_byte_violation(pass.verdict, &skip, v));
+            let partition_counts = c
+                .partitions
+                .as_mut()
+                .map(|p| p.counts(&mut |v| judge_byte_violation(pass.verdict, &skip, v)));
             (
                 topic.clone(),
                 CaptureSummary {
                     replayed_count: c.replayed_count,
-                    byte_violation: c.byte_violation,
-                    tolerance_violations: c.tolerance_violations(topic),
-                    partition_counts: c.partition_counts(),
+                    byte_violation,
+                    tolerance_worsts: c.tolerance_worsts(),
+                    partition_counts,
+                    rank: plan.rank(),
+                    injected: injectors.get(topic).map_or(0, |i| i.injected),
+                    injected_drivers: injectors
+                        .get(topic)
+                        .map(|i| i.driver_copies.by_driver())
+                        .unwrap_or_default(),
                 },
             )
         })
@@ -15426,6 +17012,7 @@ fn run_rank_pass(
     drop(dispatch);
     drop(feed);
     drop(captures_owned);
+    drop(record_out_taps);
     let fed = match &read_feed {
         Some(f) => {
             let (faults, dropped) = f.faults();
@@ -15593,8 +17180,30 @@ fn read_record_coverage(reader: &BagReader) -> Option<RecordCoverage> {
 
 /// The recorded topics partitioned by class (graph order, deduplicated).
 struct TopicClasses {
-    /// Graph-produced topics (an in-graph node output) — captured + diffed.
+    /// Graph-produced topics (an in-graph node output), captured + diffed,
+    /// except the [`Self::driver`] topics among them.
     produced: Vec<String>,
+    /// The `produced` topics whose every in-graph writer is an `external`
+    /// (driver) node, in graph order: recorded INPUTS, not re-executed
+    /// outputs. A replay never queries a driver's `external_source()`, so the
+    /// node has no device to read and cannot re-produce its frames. Every
+    /// derivation that asks which topics the GRAPH writes (the recording's
+    /// consistency checks, a cross-rank injector, the read gate, the
+    /// `--record-out` channels) still keeps them in `produced`; only the diff
+    /// and the topic tally leave them out, and a pass taps them for
+    /// `--record-out` alone ([`PassTopics::record_out_only`]).
+    driver: Vec<String>,
+    /// The `produced` topics a driver writes beside at least one other node (a
+    /// `multi_publisher_topics` topic), in graph order: captured, and diffed
+    /// over the other writers' frames only where every pass that captures it
+    /// partitions it (`build_capture_partitionings`), and counted over every
+    /// recorded frame no partition holds where one does not
+    /// (`push_split_violations`).
+    driver_shared: Vec<String>,
+    /// The graph's `external` (driver) nodes ([`external_node_ids`]). A pass
+    /// captures only a topic one of its other members writes, and a driver's
+    /// own frames leave a shared topic's partitioned diff.
+    driver_nodes: BTreeSet<String>,
     /// External topics (consumed in-graph, no in-graph producer) — injected.
     external: Vec<String>,
     /// Recorded topics the graph neither produces nor consumes, which
@@ -15604,6 +17213,26 @@ struct TopicClasses {
     /// consumer to feed) and not diffed (the graph has no producer to
     /// re-execute), so they are NOT part of the replay comparison.
     unmodelled: Vec<String>,
+}
+
+/// Every topic the graph DECLARES an input on, resolved under its prefix.
+///
+/// Extracted so [`classify_topics`] and [`external_prefix_below_capture_anchor`]
+/// ask it through the SAME code. Two spellings can disagree: a classifier asking
+/// "consumed" while the prefix scan asks the wider "not produced" is a second
+/// classification rule in the codebase, so the rule lives here instead of
+/// being written twice.
+fn graph_consumed_topics(config: &GraphConfig) -> std::collections::HashSet<String> {
+    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for node in &config.nodes {
+        for input in &node.inputs {
+            consumed.insert(cerulion_core::graph::resolve_source(
+                &config.prefix,
+                &input.source,
+            ));
+        }
+    }
+    consumed
 }
 
 /// Classify every recorded topic against the graph.
@@ -15637,30 +17266,19 @@ struct TopicClasses {
 /// graph models is replayed normally whatever the manifest says about how its
 /// tap was opened — the manifest describes the RECORDER's provenance, and can
 /// never demote a topic the graph itself declares.
-/// Every topic the graph DECLARES an input on, resolved under its prefix.
 ///
-/// Extracted so [`classify_topics`] and [`external_prefix_below_capture_anchor`]
-/// ask it through the SAME code. Two spellings can disagree: a classifier asking
-/// "consumed" while the prefix scan asks the wider "not produced" is a second
-/// classification rule in the codebase — so the rule lives here instead of
-/// being written twice.
-fn graph_consumed_topics(config: &GraphConfig) -> std::collections::HashSet<String> {
-    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for node in &config.nodes {
-        for input in &node.inputs {
-            consumed.insert(cerulion_core::graph::resolve_source(
-                &config.prefix,
-                &input.source,
-            ));
-        }
-    }
-    consumed
-}
-
+/// # Driver outputs
+///
+/// `external_nodes` names the graph's `external` (driver) nodes
+/// ([`external_node_ids`]). The produced topics they alone write are returned
+/// again as `driver` ([`driver_output_topics`]): still graph-produced, so every
+/// derivation about what the graph writes keeps them, but recorded inputs as
+/// far as the diff and the topic tally are concerned.
 fn classify_topics(
     config: &GraphConfig,
     recorded_messages: &RecordedMessages,
     coverage: Option<&RecordCoverage>,
+    external_nodes: &BTreeSet<String>,
 ) -> Result<TopicClasses, ReplayError> {
     // Graph-produced topics, graph order, deduped — the SAME derivation the
     // resume resolver scopes its lossy refusal and seed ladder to, so
@@ -15720,9 +17338,395 @@ fn classify_topics(
 
     Ok(TopicClasses {
         produced,
+        driver: driver_output_topics(config, external_nodes),
+        driver_shared: driver_shared_topics(config, external_nodes),
+        driver_nodes: external_nodes.clone(),
         external,
         unmodelled,
     })
+}
+
+/// Whether a node's declared policy makes it an `external` (driver) node:
+/// [`MacroPolicy::External`] and nothing else, the one policy the runtime
+/// builds its `External` trigger from.
+///
+/// The recorder stamps each node's driver flag with this predicate
+/// ([`node_external_flags`]) and the replay classifies the build it replays
+/// with it (`external_node_ids`), so the two cannot disagree about what a
+/// driver is.
+///
+/// [`MacroPolicy::External`]: cerulion_core::graph::node::MacroPolicy::External
+pub fn is_external_policy(policy: Option<&cerulion_core::graph::node::MacroPolicy>) -> bool {
+    matches!(
+        policy,
+        Some(cerulion_core::graph::node::MacroPolicy::External)
+    )
+}
+
+/// Each node's driver flag, keyed by node id: `true` where the node's loaded
+/// metadata declares the `external` policy ([`is_external_policy`]), `false`
+/// for every other node. This is the `node_external` map a recording's
+/// `__cerulion/recorder.json` carries.
+///
+/// A `BTreeMap`, so the map is in id order whatever order the nodes arrive in
+/// and the rendered attachment is byte-identical for the same graph and
+/// builds.
+pub fn node_external_flags<'a>(
+    infos: impl IntoIterator<Item = (&'a String, &'a cerulion_core::graph::NodeInfo)>,
+) -> BTreeMap<String, bool> {
+    infos
+        .into_iter()
+        .map(|(id, info)| (id.clone(), is_external_policy(info.policy().as_ref())))
+        .collect()
+}
+
+/// The ids of the replayed build's `external` (driver) nodes: every candidate
+/// whose declared policy is the `external` one ([`is_external_policy`]).
+///
+/// A node whose metadata cannot be read is NOT counted as a driver. On a bag
+/// whose recording stamps its drivers, such a node is refused when the
+/// recording ran it as a driver ([`resolve_driver_set`]); on a bag with no
+/// stamp its outputs stay compared. The per-pass metadata read already
+/// reports such a node loudly (`collect_pass_node_infos`).
+fn external_node_ids(factories: &IndexMap<String, Box<dyn NodeEntry>>) -> BTreeSet<String> {
+    let infos: Vec<(String, cerulion_core::graph::NodeInfo)> = factories
+        .iter()
+        .filter_map(|(id, entry)| entry.info().ok().map(|info| (id.clone(), info)))
+        .collect();
+    node_external_flags(infos.iter().map(|(id, info)| (id, info)))
+        .into_iter()
+        .filter_map(|(id, external)| external.then_some(id))
+        .collect()
+}
+
+/// Where a replay's driver set came from: the `--report` JSON's
+/// `driver_inputs.declared_by`, and the parenthetical of the verdict's driver
+/// `NOTE` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverSetSource {
+    /// The recording's `node_external` stamp, which the replayed build
+    /// matches.
+    Recording,
+    /// The replayed build's declared policies: the recording was made before
+    /// the stamp, so it says nothing about its drivers.
+    ReplayedBuild,
+}
+
+/// The driver set a replay classifies the graph with. PURE.
+///
+/// A stamped recording decides it, and the replayed build must declare
+/// exactly the recorded drivers: a node it runs the other way is a
+/// [`DriverDrift`], every one of them in id order, and the replay is refused
+/// rather than judged on a narrowed or a wrong comparison. With no stamp the
+/// build's own declaration (`candidate`) decides, and the source says so.
+///
+/// [`DriverDrift`]: crate::replay_cmd::DriverDrift
+fn resolve_driver_set(
+    stamp: Option<&DriverStamp>,
+    candidate: &BTreeSet<String>,
+) -> Result<(BTreeSet<String>, DriverSetSource), Vec<crate::replay_cmd::DriverDrift>> {
+    let Some(stamp) = stamp else {
+        return Ok((candidate.clone(), DriverSetSource::ReplayedBuild));
+    };
+    let recorded = stamp.drivers();
+    let drifts: Vec<crate::replay_cmd::DriverDrift> = recorded
+        .symmetric_difference(candidate)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|node| crate::replay_cmd::DriverDrift {
+            node: node.clone(),
+            recorded_external: recorded.contains(node),
+        })
+        .collect();
+    if drifts.is_empty() {
+        Ok((recorded, DriverSetSource::Recording))
+    } else {
+        Err(drifts)
+    }
+}
+
+/// Per graph-produced topic, in graph order, deduplicated: does a node in
+/// `external_nodes` write it, and does any other node?
+fn driver_writer_census(
+    config: &GraphConfig,
+    external_nodes: &BTreeSet<String>,
+) -> IndexMap<String, (bool, bool)> {
+    let mut census: IndexMap<String, (bool, bool)> = IndexMap::new();
+    for node in &config.nodes {
+        let external = external_nodes.contains(&node.id);
+        for output in &node.outputs {
+            let topic =
+                cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output);
+            let (driver, other) = census.entry(topic).or_insert((false, false));
+            *driver |= external;
+            *other |= !external;
+        }
+    }
+    census
+}
+
+/// The graph-produced topics whose EVERY in-graph writer is in
+/// `external_nodes`, in graph order, deduplicated.
+///
+/// One non-driver writer keeps a topic re-executed: a `multi_publisher_topics`
+/// topic shared by a driver and an ordinary node is still captured and diffed
+/// ([`driver_shared_topics`]), over its re-executed writers' frames where the
+/// capture is partitioned.
+fn driver_output_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>) -> Vec<String> {
+    driver_writer_census(config, external_nodes)
+        .into_iter()
+        .filter_map(|(topic, (driver, other))| (driver && !other).then_some(topic))
+        .collect()
+}
+
+/// The graph-produced topics a node in `external_nodes` writes beside at
+/// least one other node, in graph order, deduplicated.
+fn driver_shared_topics(config: &GraphConfig, external_nodes: &BTreeSet<String>) -> Vec<String> {
+    driver_writer_census(config, external_nodes)
+        .into_iter()
+        .filter_map(|(topic, (driver, other))| (driver && other).then_some(topic))
+        .collect()
+}
+
+/// The topics `graph`'s nodes other than `drivers` write, resolved under its
+/// prefix: what a pass over `graph` re-produces. A replay never queries a
+/// driver's `external_source()`, so a topic only a pass's drivers write holds
+/// nothing the pass can compare.
+fn re_executed_output_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) -> BTreeSet<String> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| !drivers.contains(&n.id))
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(|o| cerulion_core::graph::resolve_output_topic(&graph.prefix, &n.id, o))
+        })
+        .collect()
+}
+
+/// The topics `graph`'s nodes in `drivers` write, resolved under its prefix.
+/// A replayed driver reads no device, so a node of the same pass reads its
+/// recorded frames of these topics only when the pass feeds them from the bag.
+fn driver_written_topics(graph: &GraphConfig, drivers: &BTreeSet<String>) -> BTreeSet<String> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| drivers.contains(&n.id))
+        .flat_map(|n| {
+            n.outputs
+                .iter()
+                .map(|o| cerulion_core::graph::resolve_output_topic(&graph.prefix, &n.id, o))
+        })
+        .collect()
+}
+
+/// What a replay does with the topics the graph's `external` (driver) nodes
+/// write, alone ([`TopicClasses::driver`]) or beside other nodes
+/// ([`TopicClasses::driver_shared`]), decided from the graph and the pass
+/// layout before the first pass. Each topic list is in graph order.
+#[derive(Debug, PartialEq, Eq)]
+enum DriverTopicFeeds {
+    /// A lockstep replay decides its own fires and installs no recorded one,
+    /// so it fires no driver and feeds no node a driver's recorded frame.
+    Lockstep {
+        /// Every driver node ([`TopicClasses::driver_nodes`]), in id order.
+        /// Empty when the graph has no driver, and then nothing is logged.
+        drivers: Vec<String>,
+        /// Every topic a driver writes, alone or beside other nodes. Empty
+        /// when no driver declares an output.
+        topics: Vec<String>,
+    },
+    /// A free-run replay.
+    FreeRun {
+        /// Written by drivers alone and read by nodes this replay feeds the
+        /// recorded frames to.
+        fed: Vec<String>,
+        /// Written by a driver, alone or beside other nodes, and read in a
+        /// rank where a driver of the topic runs, by a pass that is not FED:
+        /// such a pass injects no in-rank topic, so the reader gets none of
+        /// the driver's recorded frames.
+        unfed: Vec<String>,
+        /// Written by drivers alone and read by no node in the graph: neither
+        /// fed nor compared. A shared topic is never here, since its other
+        /// writers' frames are still compared.
+        unread: Vec<String>,
+    },
+}
+
+/// Sort every driver topic into [`DriverTopicFeeds`]. PURE: the graph, the
+/// rank plans and the two run facts decide it.
+///
+/// A FED pass feeds every read from the bag; a free-run pass that is not fed
+/// injects only the cross-rank edges (`pass_topics`), so a reader beside a
+/// driver of the topic gets none of its frames; a lockstep pass decides its
+/// own fires and installs no recorded one, so nothing fires a driver at all.
+fn plan_driver_topic_feeds(
+    config: &GraphConfig,
+    classes: &TopicClasses,
+    plans: &[RankPlan],
+    lockstep: bool,
+    fed: bool,
+) -> DriverTopicFeeds {
+    let driver_topics = classes
+        .produced
+        .iter()
+        .filter(|t| classes.driver.contains(t) || classes.driver_shared.contains(t));
+    if lockstep {
+        return DriverTopicFeeds::Lockstep {
+            drivers: classes.driver_nodes.iter().cloned().collect(),
+            topics: driver_topics.cloned().collect(),
+        };
+    }
+    let consumed = graph_consumed_topics(config);
+    // Per rank: the topics its drivers write, and the topics it reads.
+    let ranks: Vec<(BTreeSet<String>, BTreeSet<String>)> = plans
+        .iter()
+        .map(|plan| {
+            (
+                driver_written_topics(plan.subgraph(), &classes.driver_nodes),
+                rank_consumed_topics(plan),
+            )
+        })
+        .collect();
+    let (mut fed_topics, mut unfed, mut unread) = (Vec::new(), Vec::new(), Vec::new());
+    for topic in driver_topics {
+        let shared = classes.driver_shared.contains(topic);
+        if !consumed.contains(topic) {
+            if !shared {
+                unread.push(topic.clone());
+            }
+            continue;
+        }
+        let read_beside_its_driver = ranks
+            .iter()
+            .any(|(written, read)| written.contains(topic) && read.contains(topic));
+        if !fed && read_beside_its_driver {
+            unfed.push(topic.clone());
+        } else if !shared {
+            fed_topics.push(topic.clone());
+        }
+    }
+    DriverTopicFeeds::FreeRun {
+        fed: fed_topics,
+        unfed,
+        unread,
+    }
+}
+
+/// The [`DriverInputsReport`] of a replay, from the graph's classification and
+/// the feed plan [`plan_driver_topic_feeds`] made, with no
+/// [`DriverInputsReport::unattributed_topics`] yet. `None` when the graph has
+/// no driver. PURE.
+///
+/// A free-run plan states the unfed and unread topics itself. A lockstep
+/// replay fires no driver and feeds no reader, so there every driver topic a
+/// node reads is unfed, and a topic only drivers write that no node reads is
+/// unread.
+fn driver_inputs_report(
+    config: &GraphConfig,
+    classes: &TopicClasses,
+    feeds: &DriverTopicFeeds,
+    declared_by: DriverSetSource,
+) -> Option<DriverInputsReport> {
+    if classes.driver_nodes.is_empty() {
+        return None;
+    }
+    let (unfed_topics, unread_topics) = match feeds {
+        DriverTopicFeeds::FreeRun { unfed, unread, .. } => (unfed.clone(), unread.clone()),
+        DriverTopicFeeds::Lockstep { topics, .. } => {
+            let consumed = graph_consumed_topics(config);
+            let (read, not_read): (Vec<String>, Vec<String>) =
+                topics.iter().cloned().partition(|t| consumed.contains(t));
+            let unread = not_read
+                .into_iter()
+                .filter(|t| classes.driver.contains(t))
+                .collect();
+            (read, unread)
+        }
+    };
+    Some(DriverInputsReport {
+        nodes: classes.driver_nodes.iter().cloned().collect(),
+        declared_by,
+        input_topics: classes.driver.clone(),
+        shared_topics: classes.driver_shared.clone(),
+        // Which shared topics fell back to the single-stream diff is a fact of
+        // the captures, which `assemble_outcome` fills in.
+        unattributed_topics: Vec::new(),
+        unfed_topics,
+        unread_topics,
+    })
+}
+
+/// Log [`DriverTopicFeeds`]: one line per list, never one per topic.
+///
+/// The fed list is INFO, since an input is not a topic the verdict claims to
+/// check and every graph with a camera has one. The others are WARN, the same
+/// rule as the unmodelled topics: a lockstep replay of a graph with a driver
+/// cannot reproduce its schedule, a reader not fed its recorded frames cannot
+/// reproduce its outputs, and a driver topic nobody reads is covered by no
+/// verdict at all. The lockstep line names the drivers, and their topics when
+/// they declare any. `best_effort_reason` says why a free-run pass is not
+/// fed.
+fn log_driver_topic_feeds(feeds: &DriverTopicFeeds, best_effort_reason: &str) {
+    let (fed, unfed, unread) = match feeds {
+        DriverTopicFeeds::Lockstep { drivers, .. } if drivers.is_empty() => return,
+        DriverTopicFeeds::Lockstep { drivers, topics } if topics.is_empty() => {
+            tracing::warn!(
+                driver_nodes = drivers.len(),
+                node_ids = %drivers.join(", "),
+                "replay: this recording is lockstep, so a resim never fires its external \
+                 (driver) nodes and the schedule cannot reproduce: record a graph with a \
+                 driver under the multi-process default, without `--single-process` and \
+                 without CERULION_EXECUTION_MODE=lockstep"
+            );
+            return;
+        }
+        DriverTopicFeeds::Lockstep { drivers, topics } => {
+            tracing::warn!(
+                driver_nodes = drivers.len(),
+                node_ids = %drivers.join(", "),
+                driver_topics = topics.len(),
+                topics = %topics.join(", "),
+                "replay: this recording is lockstep, so a resim neither fires its external \
+                 (driver) nodes nor feeds their recorded frames to the nodes that read them, \
+                 and the schedule and those nodes' outputs cannot reproduce: record a graph \
+                 with a driver under the multi-process default, without `--single-process` \
+                 and without CERULION_EXECUTION_MODE=lockstep"
+            );
+            return;
+        }
+        DriverTopicFeeds::FreeRun { fed, unfed, unread } => (fed, unfed, unread),
+    };
+    if !fed.is_empty() {
+        tracing::info!(
+            driver_topics = fed.len(),
+            topics = %fed.join(", "),
+            "replay: the outputs of the external (driver) nodes are recorded inputs, fed to \
+             their consumers from the bag and neither re-produced nor compared"
+        );
+    }
+    if !unfed.is_empty() {
+        tracing::warn!(
+            driver_topics = unfed.len(),
+            topics = %unfed.join(", "),
+            reason = %best_effort_reason,
+            "replay: this resim does not feed the frames the external (driver) nodes \
+             recorded on these topics to the nodes that read them in a driver's own process \
+             or executor unit, so those nodes cannot reproduce their recorded outputs: a \
+             `--verify` resim of a recording whose reads name their frames feeds them"
+        );
+    }
+    if !unread.is_empty() {
+        tracing::warn!(
+            driver_topics = unread.len(),
+            topics = %unread.join(", "),
+            "replay: no node in the graph reads these external (driver) topics, so they are \
+             recorded inputs that are neither fed nor compared: nothing in this replay \
+             verifies them"
+        );
+    }
 }
 
 // ===========================================================================
@@ -16338,16 +18342,77 @@ mod provisionable_depth_tests {
 /// the replayed frame is compared to its recorded twin the moment it is drained,
 /// then dropped — the replayed side is never accumulated). At most one per topic
 /// (comparison stops at the first differing frame, matching the batch diff).
-#[derive(Debug, Clone, Copy)]
+///
+/// It keeps a copy of BOTH frames of that one pair, so the pass harvest can
+/// name the field that differs ([`judge_byte_violation`]); every other frame
+/// is still dropped once compared.
+#[derive(Debug)]
 struct ByteViolation {
     /// 0-based frame index of the first differing frame.
     index: usize,
     /// Byte offset of the first differing byte (or the shorter length).
     first_diff_byte_offset: usize,
-    /// The recorded frame's length.
-    recorded_len: usize,
-    /// The replayed frame's length.
-    replayed_len: usize,
+    /// The recorded frame.
+    recorded: Box<[u8]>,
+    /// The replayed frame.
+    replayed: Box<[u8]>,
+    /// The tolerance plan's field decoder refused one of the two frames, so
+    /// its byte-exact remainder was not compared.
+    refusal: Option<crate::replay_value_diff::RemainderRefusal>,
+}
+
+/// Turn a stream's first divergence into its verdict: what differs in that
+/// frame pair. The frame copies are dropped here.
+///
+/// `skip` is the top-level fields a tolerance metric judges on this topic
+/// (the set the byte-exact remainder leaves out), so a tolerated field is
+/// never named in a byte mismatch.
+fn judge_byte_violation(
+    decoder: &VerdictDecoder,
+    skip: &[&str],
+    violation: ByteViolation,
+) -> crate::replay_value_diff::ByteVerdict {
+    let difference = crate::replay_value_diff::locate_difference(
+        || decoder.walker(),
+        &violation.recorded,
+        &violation.replayed,
+        violation.first_diff_byte_offset,
+        skip,
+        violation.refusal.as_ref(),
+    );
+    crate::replay_value_diff::ByteVerdict {
+        index: violation.index,
+        first_diff_byte_offset: violation.first_diff_byte_offset,
+        recorded_len: violation.recorded.len(),
+        replayed_len: violation.replayed.len(),
+        difference,
+    }
+}
+
+/// The schema set a byte-mismatch verdict decodes its frames with: the one
+/// `topic echo` decodes with (built-ins, then the workspace's `.msg` store
+/// and YAML schemas), built at most once per run and only when a stream
+/// diverged, so a passing replay never builds it.
+struct VerdictDecoder {
+    /// The workspace `schemas/` directory; `None` decodes with the built-in
+    /// set alone (the in-process test path, which has no workspace).
+    schemas_dir: Option<PathBuf>,
+    walker: std::sync::OnceLock<cerulion_core::codegen::FrameWalker>,
+}
+
+impl VerdictDecoder {
+    fn new(schemas_dir: Option<PathBuf>) -> Self {
+        Self {
+            schemas_dir,
+            walker: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn walker(&self) -> &cerulion_core::codegen::FrameWalker {
+        self.walker.get_or_init(|| {
+            crate::topic_cmd::local_walker_from_workspace(self.schemas_dir.as_deref())
+        })
+    }
 }
 
 // ===========================================================================
@@ -16451,6 +18516,10 @@ struct CaptureStream {
     /// This partition's recorded frame count — the `total_recorded` elision
     /// guard, per writer.
     total_recorded: usize,
+    /// The most frames this writer published in one recorded step
+    /// ([`PartitionCounts::burst`]); 0 for a writer the recording does not
+    /// carry.
+    recorded_burst: usize,
     /// The wire `sequence` of the last captured frame on THIS partition.
     last_seq: Option<u32>,
     /// This partition's RECORDED sequences, run-length compressed — the
@@ -16488,11 +18557,17 @@ struct CaptureStream {
 }
 
 /// One partition's count/byte verdict inputs, for the violation assembly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PartitionCounts {
     recorded: usize,
     replayed: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<crate::replay_value_diff::ByteVerdict>,
+    /// The most frames this writer published in one recorded step: the
+    /// longest run of equal wire timestamps among its own recorded frames of
+    /// the replayed window, in file order ([`writer_bursts`]), 0 for a writer
+    /// the recording does not carry. The ragged-tail window of the writer is its rank's tail width
+    /// times this ([`tail_extra_ranks`]).
+    burst: usize,
 }
 
 /// The label-partitioned diff state of ONE co-located multi-publisher topic.
@@ -16509,21 +18584,33 @@ struct CapturePartitioning {
     /// the RECORDED writer. Every entry is `Named`: a topic with any
     /// unattributed frame is never partitioned in the first place.
     recorded_writers: Vec<WriterKey>,
-    /// The writers THIS PASS can put on the wire — the ones it
-    /// produces LIVE (members of its rank) plus, where the topic is injected
-    /// here, the single foreign writer the injector re-publishes.
+    /// The writers THIS PASS replays and compares: the ones it produces
+    /// LIVE, members of its rank but its `external` drivers, whose frames are
+    /// recorded inputs (see [`Self::uncompared`]).
     ///
     /// A SPLIT `multi_publisher_topics:` topic is written by several ranks, and
-    /// a pass reproduces only what it owns or injects: a writer that is neither
-    /// is ANOTHER pass's business, and its recorded frames belong to no verdict
-    /// this pass can reach. Counting them here would report the whole of the
-    /// other rank's stream as `MissingMessages` on every pass — the exact shape
-    /// this scoping exists to prevent, measured on the three-rank split fixture
-    /// as "recorded 28 frame(s), replay produced 14".
+    /// a pass reproduces only what it owns: another rank's writer is ANOTHER
+    /// pass's business, and its recorded frames belong to no verdict this pass
+    /// can reach, whether or not its injector re-publishes them. Counting them
+    /// here would report the whole of the other rank's stream as
+    /// `MissingMessages` on every pass, the shape this scoping prevents: on
+    /// the three-rank split fixture, "recorded 28 frame(s), replay produced
+    /// 14". The verdict over every pass is the union of the passes'
+    /// partitions ([`merge_partitioned_summaries`]).
     ///
-    /// On a CO-LOCATED topic (every writer on one rank) it holds every writer,
-    /// so the behaviour is that of an unsplit topic.
+    /// On a CO-LOCATED topic (every writer on one rank) it holds every writer
+    /// but the drivers, so the behaviour is that of an unsplit topic.
     producible: BTreeSet<WriterKey>,
+    /// The writers of the topic whose frames this pass captures and does not
+    /// compare: its own `external` drivers, whose frames are recorded inputs,
+    /// and, as a [`WriterKey::Origin`], the publisher of its injector, which
+    /// re-publishes the recorded frames of every foreign writer of the topic,
+    /// copies of what each writer's own pass publishes and compares, or a
+    /// foreign driver's recorded inputs, which no pass compares. A
+    /// captured frame of one of these is left out of the diff, the loss
+    /// tripwire and every count, and a replayed driver's (not an injected
+    /// one's) is written to `--record-out`.
+    uncompared: BTreeSet<WriterKey>,
     /// How many feed positions have been walked into [`Self::streams`].
     walked: usize,
     /// Per writer, its stream state. `BTreeMap` — the violation order is
@@ -16544,6 +18631,7 @@ impl CapturePartitioning {
                 CaptureStream {
                     replayed_count: 0,
                     total_recorded: 0,
+                    recorded_burst: 0,
                     last_seq: None,
                     recorded_seq_runs: Vec::new(),
                     pending: VecDeque::new(),
@@ -16589,20 +18677,56 @@ impl CapturePartitioning {
             };
             let owner = self.recorded_writers[self.walked].clone();
             self.walked += 1;
-            // A frame belonging to a writer this pass cannot put on
-            // the wire is DISCARDED, not buffered. Nothing will ever ask for it
-            // (its partition carries no verdict here), and holding it would grow
-            // a queue the size of the other rank's whole stream.
+            // A frame belonging to a writer this pass does not replay (another
+            // rank's, injected here or not) is DISCARDED, not buffered. Nothing
+            // will ever ask for it (its partition carries no verdict here), and
+            // holding it would grow a queue the size of the other rank's whole
+            // stream.
             if self.producible.contains(&owner) {
                 self.stream(&owner).pending.push_back(span);
             }
         }
     }
 
-    /// Per writer, the count/byte verdict inputs.
-    fn counts(&self) -> BTreeMap<WriterKey, PartitionCounts> {
-        fold_partition_counts(&self.recorded_writers, &self.producible, &self.streams)
+    /// Per writer, the count/byte verdict inputs; each writer's first
+    /// divergence goes through `judge` (and its frame copies are dropped).
+    fn counts(
+        &mut self,
+        judge: &mut dyn FnMut(ByteViolation) -> crate::replay_value_diff::ByteVerdict,
+    ) -> BTreeMap<WriterKey, PartitionCounts> {
+        fold_partition_counts(
+            &self.recorded_writers,
+            &self.producible,
+            &mut self.streams,
+            judge,
+        )
     }
+}
+
+/// Per writer of `frames`, the `(writer, wire timestamp)` of each recorded
+/// frame in file order, the most frames it published in one recorded step:
+/// the longest run of equal timestamps among its own frames, the other
+/// writers' frames between them skipped. One step's clock is stamped into
+/// every frame it publishes, so the run counts the frames one writer
+/// published in one step, whichever other writers published in it too. PURE.
+fn writer_bursts<'a>(
+    frames: impl IntoIterator<Item = (&'a WriterKey, u64)>,
+) -> BTreeMap<&'a WriterKey, usize> {
+    // Per writer: the stamp of its current run, the run's length, the longest.
+    let mut runs: BTreeMap<&WriterKey, (u64, usize, usize)> = BTreeMap::new();
+    for (writer, stamp) in frames {
+        let (at, run, longest) = runs.entry(writer).or_insert((stamp, 0, 0));
+        if *at == stamp {
+            *run += 1;
+        } else {
+            *at = stamp;
+            *run = 1;
+        }
+        *longest = (*longest).max(*run);
+    }
+    runs.into_iter()
+        .map(|(writer, (_, _, longest))| (writer, longest))
+        .collect()
 }
 
 /// Per writer, the count/byte verdict inputs — the UNION of the writers the
@@ -16615,15 +18739,16 @@ impl CapturePartitioning {
 /// wrong in a way no end-to-end arm on a HEALTHY fixture would notice.
 ///
 /// The RECORDED side is scoped to `producible` — the writers this
-/// pass can put on the wire. A writer another rank owns and this pass neither
-/// produces nor injects has no verdict here, so counting its recorded frames
-/// would report the whole of that rank's stream as missing on every pass. The
+/// pass replays. A writer another rank owns has no verdict here, whether or
+/// not this pass injects its frames, so counting its recorded frames would
+/// report the whole of that rank's stream as missing on every pass. The
 /// REPLAYED side is not scoped: a stream that exists was really captured, and an
 /// unexpected one must still surface as `ExtraMessages` rather than vanish.
 fn fold_partition_counts(
     recorded_writers: &[WriterKey],
     producible: &BTreeSet<WriterKey>,
-    streams: &BTreeMap<WriterKey, CaptureStream>,
+    streams: &mut BTreeMap<WriterKey, CaptureStream>,
+    judge: &mut dyn FnMut(ByteViolation) -> crate::replay_value_diff::ByteVerdict,
 ) -> BTreeMap<WriterKey, PartitionCounts> {
     let mut out: BTreeMap<WriterKey, PartitionCounts> = BTreeMap::new();
     for key in recorded_writers {
@@ -16635,17 +18760,20 @@ fn fold_partition_counts(
                 recorded: 0,
                 replayed: 0,
                 byte_violation: None,
+                burst: 0,
             })
             .recorded += 1;
     }
-    for (key, stream) in streams {
+    for (key, stream) in streams.iter_mut() {
         let entry = out.entry(key.clone()).or_insert(PartitionCounts {
             recorded: 0,
             replayed: 0,
             byte_violation: None,
+            burst: 0,
         });
         entry.replayed = stream.replayed_count;
-        entry.byte_violation = stream.byte_violation;
+        entry.burst = stream.recorded_burst;
+        entry.byte_violation = stream.byte_violation.take().map(&mut *judge);
     }
     out
 }
@@ -16756,6 +18884,7 @@ struct CaptureTolerance {
 }
 
 /// One overridden field's metric plan + O(1) running-worst accumulator.
+#[derive(Debug, Clone)]
 struct FieldMetric {
     /// The top-level field name.
     field: String,
@@ -16834,9 +18963,18 @@ impl FieldMetric {
 /// so it stays byte-compared along with schema_hash, offset_table_count,
 /// sequence and timestamp_ns (any layout change that could move it also
 /// changes schema_hash). See [`CaptureTolerance::remainder_first_diff`].
-const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
+pub(crate) const HEADER_LENGTH_DERIVED_BYTES: std::ops::Range<usize> = 8..12;
 
 impl CaptureTolerance {
+    /// The top-level fields a tolerance metric judges on a topic: the
+    /// fields the byte-exact remainder leaves out, so a byte-mismatch line
+    /// never names one. Empty with no tolerance plan.
+    fn tolerated_fields(plan: Option<&Self>) -> Vec<&str> {
+        plan.map_or_else(Vec::new, |ct| {
+            ct.metrics.iter().map(|m| m.field.as_str()).collect()
+        })
+    }
+
     /// The offset of the first BYTE that differs between the recorded and
     /// replayed frames OUTSIDE every overridden field's span, or `None` when the
     /// non-tolerated bytes match. This is the byte-exact "remainder" — a
@@ -16849,9 +18987,18 @@ impl CaptureTolerance {
     /// override may change length) compares the header + fixed section (minus
     /// overridden fixed spans) + each non-overridden variable field's DATA span,
     /// ignoring the offset table + overridden fields.
-    fn remainder_first_diff(&mut self, rec: &[u8], rep: &[u8]) -> Option<usize> {
+    ///
+    /// The second half of the pair is set when the field decoder refused a
+    /// frame, so the remainder could not be compared field by field; the
+    /// offset is then the end of the header.
+    fn remainder_first_diff(
+        &mut self,
+        rec: &[u8],
+        rep: &[u8],
+    ) -> Option<(usize, Option<crate::replay_value_diff::RemainderRefusal>)> {
         if !self.has_variable_override {
-            return remainder_skip_ranges(rec, rep, &self.excluded_frame_ranges);
+            return remainder_skip_ranges(rec, rep, &self.excluded_frame_ranges)
+                .map(|offset| (offset, None));
         }
         // Structural (Case B): header compared FIELD-WISE, EXCLUDING the ONE
         // LENGTH-DERIVED header field. A tolerated variable field whose
@@ -16880,17 +19027,17 @@ impl CaptureTolerance {
                 continue;
             }
             if rec[i] != rep[i] {
-                return Some(i);
+                return Some((i, None));
             }
         }
         if rec.len() < hdr || rep.len() < hdr {
-            return Some(common_hdr); // a frame too short to hold the header.
+            return Some((common_hdr, None)); // a frame too short to hold the header.
         }
         // Fixed section (payload-relative 0..fixed_size), skipping overridden
         // fixed spans (their frame-coord ranges are in excluded_frame_ranges).
         let fixed_end = hdr + self.fixed_size;
         if rec.len() < fixed_end || rep.len() < fixed_end {
-            return Some(hdr.min(rec.len()).min(rep.len()));
+            return Some((hdr.min(rec.len()).min(rep.len()), None));
         }
         for i in hdr..fixed_end {
             if self
@@ -16901,7 +19048,7 @@ impl CaptureTolerance {
                 continue;
             }
             if rec[i] != rep[i] {
-                return Some(i);
+                return Some((i, None));
             }
         }
         // Each non-overridden variable field's DATA span, compared byte-exact.
@@ -16919,15 +19066,110 @@ impl CaptureTolerance {
                         let off = (0..common)
                             .find(|&i| rl.bytes[i] != pl.bytes[i])
                             .unwrap_or(common);
-                        return Some(base + off);
+                        return Some((base + off, None));
                     }
                 }
                 // A decode failure on either side is a structural difference
                 // (a corrupt frame the bounds-checked decoder refused).
-                _ => return Some(hdr),
+                (Err(e), _) => {
+                    return Some((
+                        hdr,
+                        Some(crate::replay_value_diff::RemainderRefusal {
+                            side: crate::replay_value_diff::Side::Recorded,
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
+                (_, Err(e)) => {
+                    return Some((
+                        hdr,
+                        Some(crate::replay_value_diff::RemainderRefusal {
+                            side: crate::replay_value_diff::Side::Replayed,
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod remainder_refusal_tests {
+    use super::*;
+    use crate::replay_value_diff::{RemainderRefusal, Side};
+
+    const TOPIC: &str = "/rt/arm/out";
+
+    /// A `sensor_msgs/JointState` topic whose `position` (a variable
+    /// `float64[]`) a `max_abs` metric judges: the remainder takes the
+    /// structural path and locates `header`, `name`, `velocity` and `effort`
+    /// itself.
+    fn joint_state_plan() -> CaptureTolerance {
+        let config = cerulion_core::graph::parse_graph(&format!(
+            "name: rt\nprefix: rt\nnodes:\n\
+             \x20 - id: arm\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: sensor_msgs/JointState\n        topic: {TOPIC}\n"
+        ))
+        .expect("fixture graph parses");
+        let root = tempfile::tempdir().expect("a workspace directory");
+        let registry =
+            crate::replay_field_registry::FieldRegistry::from_graph(&config, root.path());
+        let spec = crate::tolerance::ToleranceSpec::parse(&format!(
+            "topics:\n  {TOPIC}:\n    fields:\n      position:\n        kind: max_abs\n        \
+             threshold: 0.1\n"
+        ))
+        .expect("fixture tolerance parses");
+        let plan = build_capture_tolerance(&CompiledTolerance { spec, registry }, TOPIC)
+            .expect("position is judged by a metric");
+        assert!(plan.has_variable_override, "a variable field is tolerated");
+        plan
+    }
+
+    /// A JointState frame, and the same frame with `header`'s offset-table
+    /// entry (the first of five, frame bytes 40..48) claiming 10000 bytes.
+    fn frames() -> (Vec<u8>, Vec<u8>) {
+        let walker = crate::topic_cmd::local_walker_from_workspace(None);
+        let good = cerulion_core::dynamic::yaml_to_message(
+            &walker,
+            "sensor_msgs/JointState",
+            b"header: {stamp: {sec: 0, nanosec: 0}, frame_id: \"base\"}\nname: [\"j1\"]\n\
+              position: [1.0]\nvelocity: [0.0]\neffort: [0.0]\n",
+            7,
+        )
+        .expect("fixture YAML encodes");
+        // header's data starts right after the 40-byte table.
+        assert_eq!(good[40..44], 40u32.to_le_bytes());
+        let mut bad = good.clone();
+        bad[44..48].copy_from_slice(&10_000u32.to_le_bytes());
+        (good, bad)
+    }
+
+    /// The side the field decoder refused is the side the refusal names, and
+    /// the offset is the end of the wire header.
+    #[test]
+    fn a_refused_frame_is_named_by_its_side() {
+        let mut plan = joint_state_plan();
+        let (good, bad) = frames();
+        let refused = |got: Option<(usize, Option<RemainderRefusal>)>, side: Side| {
+            let (offset, refusal) = got.expect("a refused frame is a difference");
+            let refusal = refusal.expect("the decoder refused a frame");
+            assert_eq!((offset, refusal.side), (WireHeader::SIZE, side));
+            assert!(
+                refusal
+                    .error
+                    .starts_with("variable field 'header' offset-table entry [40, 10040) exceeds"),
+                "{}",
+                refusal.error
+            );
+        };
+        refused(plan.remainder_first_diff(&bad, &good), Side::Recorded);
+        refused(plan.remainder_first_diff(&good, &bad), Side::Replayed);
+        // Both refused: the recorded side is the one named.
+        refused(plan.remainder_first_diff(&bad, &bad), Side::Recorded);
+        // Neither refused and nothing differs.
+        assert_eq!(plan.remainder_first_diff(&good, &good), None);
     }
 }
 
@@ -17097,15 +19339,13 @@ impl Capture {
             None
         };
         if let Some(rec_frame) = rec_frame {
-            let mut byte_violation = self.byte_violation;
             diff_recorded_twin(
                 self.tolerance.as_mut(),
-                &mut byte_violation,
+                &mut self.byte_violation,
                 index,
                 rec_frame,
                 sample.payload(),
             );
-            self.byte_violation = byte_violation;
         }
         self.replayed_count += 1;
         Ok(())
@@ -17147,11 +19387,18 @@ impl Capture {
         // comment above claims.
         let p = self.partitions.as_mut().expect("caller checked");
         let key = classify_capture_origin(&p.live_labels, sample.origin());
+        // A driver's frame, or one this pass's injector re-published, is a
+        // recorded frame: the drain already wrote a replayed driver's to
+        // `--record-out`, and nothing else reads it.
+        if p.uncompared.contains(&key) {
+            return Ok(());
+        }
         if matches!(key, WriterKey::Origin(_)) {
             // A captured frame whose origin this run's OWN table does not name.
             // Structurally unreachable — the topic is partitioned only when
             // every in-graph producer of it appears in that table, and nothing
-            // else can hold the SHM write slot — so it is LOUD and then handled:
+            // else can hold the SHM write slot but this pass's injector, whose
+            // frames the check above leaves out. So it is LOUD and then handled:
             // it costs only its own partition's ExtraMessages verdict.
             // (A `debug_assert!` here would abort a test build at the consumer
             // rather than report, so it was dropped.)
@@ -17328,50 +19575,83 @@ impl Capture {
         }))
     }
 
-    /// Per WRITER, the count/byte verdict inputs of a partitioned
-    /// topic — `None` on every single-stream topic, where the topic-level
-    /// counts are the whole answer.
-    fn partition_counts(&self) -> Option<BTreeMap<WriterKey, PartitionCounts>> {
-        self.partitions.as_ref().map(CapturePartitioning::counts)
+    /// The overridden fields whose running-worst accumulator tripped its bound
+    /// across the replayed frames, each with its worst frame, in field
+    /// declaration order. Empty when no tolerance targets the topic or every
+    /// tolerated field stayed within bounds.
+    fn tolerance_worsts(&self) -> Vec<FieldMetric> {
+        self.tolerance.as_ref().map_or_else(Vec::new, |ct| {
+            ct.metrics.iter().filter(|m| m.violated).cloned().collect()
+        })
     }
+}
 
-    /// The [`ViolationClass::ToleranceExceeded`]
-    /// violations for this topic — one per overridden field whose running-worst
-    /// accumulator tripped its bound across the replayed frames. Empty when no
-    /// tolerance targets the topic or every tolerated field stayed within
-    /// bounds. Deterministic order (field declaration order in the document).
-    fn tolerance_violations(&self, topic: &str) -> Vec<Violation> {
-        let Some(ct) = &self.tolerance else {
-            return Vec::new();
-        };
-        ct.metrics
-            .iter()
-            .filter(|m| m.violated)
-            .map(|m| {
-                let threshold = m.metric.report_threshold();
-                let (worst_value, worst_desc) = m.worst_value_report();
-                Violation {
-                    topic: topic.to_string(),
-                    class: ViolationClass::ToleranceExceeded {
-                        metric: m.metric.label().to_string(),
-                        field: Some(m.field.clone()),
-                        worst_value,
-                        threshold,
-                        worst_tick: m.worst_tick,
-                    },
-                    detail: format!(
-                        "field '{}' exceeded the {} tolerance on '{topic}': {} vs threshold {} \
-                         (worst at frame {})",
-                        m.field,
-                        m.metric.label(),
-                        worst_desc,
-                        threshold,
-                        m.worst_tick
-                    ),
+/// The tolerated fields that tripped their bound in any of the passes that
+/// captured one topic, folded to one entry per field and metric, in first-seen
+/// order. PURE.
+///
+/// Each entry keeps the worst frame [`FieldMetric::observe`] would keep over
+/// the frames of every pass: the larger `worst_exceedance`, and on a tie the
+/// earlier pass's. A structurally incomparable worst frame carries an infinite
+/// exceedance, so it outranks every finite divergence here as it does within
+/// a pass. Every pass compiles the same tolerance plan for a topic, so a
+/// field and metric pair names one declaration.
+fn fold_tolerance_worsts<'a>(
+    passes: impl IntoIterator<Item = &'a [FieldMetric]>,
+) -> Vec<FieldMetric> {
+    let mut folded: Vec<FieldMetric> = Vec::new();
+    for metrics in passes {
+        for m in metrics {
+            match folded
+                .iter_mut()
+                .find(|f| f.field == m.field && f.metric == m.metric)
+            {
+                Some(kept) => {
+                    if m.worst_exceedance > kept.worst_exceedance {
+                        kept.worst_exceedance = m.worst_exceedance;
+                        kept.worst_value = m.worst_value;
+                        kept.worst_tick = m.worst_tick;
+                        kept.worst_cause = m.worst_cause;
+                    }
+                    kept.violated |= m.violated;
                 }
-            })
-            .collect()
+                None => folded.push(m.clone()),
+            }
+        }
     }
+    folded
+}
+
+/// The [`ViolationClass::ToleranceExceeded`] violations of `topic`: one per
+/// field of `worsts` that tripped its bound, in their order.
+fn tolerance_rows(topic: &str, worsts: &[FieldMetric]) -> Vec<Violation> {
+    worsts
+        .iter()
+        .filter(|m| m.violated)
+        .map(|m| {
+            let threshold = m.metric.report_threshold();
+            let (worst_value, worst_desc) = m.worst_value_report();
+            Violation {
+                topic: topic.to_string(),
+                class: ViolationClass::ToleranceExceeded {
+                    metric: m.metric.label().to_string(),
+                    field: Some(m.field.clone()),
+                    worst_value,
+                    threshold,
+                    worst_tick: m.worst_tick,
+                },
+                detail: format!(
+                    "field '{}' exceeded the {} tolerance on '{topic}': {} vs threshold {} \
+                     (worst at frame {})",
+                    m.field,
+                    m.metric.label(),
+                    worst_desc,
+                    threshold,
+                    m.worst_tick
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Every graph-produced topic on this pass with TWO OR MORE
@@ -17542,8 +19822,12 @@ fn build_capture_partitionings(
     // LOCAL (published live, and so nameable from this run's publisher table)
     // and which are FOREIGN (re-published by the injector).
     members: &[String],
-    // This pass's injectors, for the id of the publisher that
-    // stands in for a split topic's foreign writer.
+    // The graph's `external` (driver) nodes. A driver's recorded frames are
+    // inputs, so its partition is not one this pass compares, and what a
+    // local one's replayed ticks publish is left out of the diff.
+    drivers: &BTreeSet<String>,
+    // This pass's injectors, for the id of the publisher that re-publishes
+    // a split topic's foreign writers' recorded frames.
     injectors: &IndexMap<String, Injector>,
 ) -> Result<BTreeMap<String, CapturePartitioning>, ReplayError> {
     let mut out: BTreeMap<String, CapturePartitioning> = BTreeMap::new();
@@ -17551,27 +19835,35 @@ fn build_capture_partitionings(
     if candidates.is_empty() {
         return Ok(out); // the zero-cost path every other bag takes.
     }
-    let mut live_labels = live_publisher_labels(live_publisher_ids);
+    let live_labels = live_publisher_labels(live_publisher_ids);
     // On a SPLIT `multi_publisher_topics` topic this rank produces
-    // only SOME of the writers; the rest are injected from the bag, and their
-    // captured frames carry the INJECTOR's publisher id — which this run's own
-    // table does not name, so every one of them classified `WriterKey::Origin`
-    // and tripped the "structurally unreachable" assertion. The injector IS the
-    // foreign writer for the purpose of the partition: it re-publishes exactly
-    // that writer's recorded frames, in that writer's recorded order.
-    //
-    // Only where the foreign side is a SINGLE writer. With two foreign writers
-    // one injector serves both, and one publisher id cannot say which frame
-    // belongs to which — so the topic declines partitioning (loudly, below)
-    // rather than attributing half its frames by a guess.
+    // only SOME of the writers. Where a node of the rank reads the topic, the
+    // others' recorded frames are injected from the bag through ONE
+    // publisher, the injector's, however many writers that is; its id is not
+    // in this run's own table, so its captured frames classify
+    // `WriterKey::Origin`. They are recorded frames: copies of what each
+    // foreign writer's own pass publishes and compares, or a foreign driver's
+    // recorded inputs, which no pass compares. So none of them is compared here, and none needs attributing to
+    // the writer that recorded it: the injector's id is named in
+    // `CapturePartitioning::uncompared` as `WriterKey::Origin`, and the drain
+    // leaves its frames out of the diff, the tripwire and every count. Each
+    // writer is compared in the pass that runs it.
     let local: BTreeSet<&str> = members.iter().map(String::as_str).collect();
-    let mut ambiguous_injection: BTreeSet<&str> = BTreeSet::new();
-    // Per topic, the writers THIS PASS can put on the wire — see
-    // `CapturePartitioning::producible`.
+    // Per topic, the writers THIS PASS replays and compares (see
+    // `CapturePartitioning::producible`), its drivers, whose frames it
+    // captures and leaves out (`CapturePartitioning::uncompared`), and the
+    // publisher id of the injector that re-publishes its foreign writers'
+    // frames, also left out.
     let mut producible_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut uncompared_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut injected_by_topic: BTreeMap<String, u128> = BTreeMap::new();
     for (topic, writers) in &candidates {
         let (mine, foreign) = split_local_and_foreign(writers, &local);
-        let mut producible: BTreeSet<String> = mine.into_iter().map(|w| w.label.clone()).collect();
+        let (local_drivers, mine): (Vec<&ProducedWriter>, Vec<&ProducedWriter>) =
+            mine.into_iter().partition(|w| drivers.contains(&w.node_id));
+        let uncompared: BTreeSet<String> =
+            local_drivers.into_iter().map(|w| w.label.clone()).collect();
+        let producible: BTreeSet<String> = mine.into_iter().map(|w| w.label.clone()).collect();
         match (injectors.get(topic), foreign.as_slice()) {
             (_, []) => {}
             (None, _) => {
@@ -17586,15 +19878,12 @@ fn build_capture_partitionings(
                      partition(s) and leaves the others to the passes that own them"
                 );
             }
-            (Some(injector), [only]) => {
-                live_labels.insert(injector.publisher_id(), Arc::from(only.label.as_str()));
-                producible.insert(only.label.clone());
-            }
-            (Some(_), _) => {
-                ambiguous_injection.insert(topic.as_str());
+            (Some(injector), _) => {
+                injected_by_topic.insert(topic.clone(), injector.publisher_id());
             }
         }
         producible_by_topic.insert(topic.clone(), producible);
+        uncompared_by_topic.insert(topic.clone(), uncompared);
     }
     let live_labels = Arc::new(live_labels);
     let tokens = load_recorded_publisher_tokens(trace);
@@ -17611,26 +19900,13 @@ fn build_capture_partitionings(
     };
 
     for topic in candidates.keys() {
-        // A topic whose FOREIGN side is more than one writer — one
-        // injector publisher id cannot tell them apart, so the capture cannot
-        // attribute its own frames and must not pretend to.
-        if ambiguous_injection.contains(topic.as_str()) {
-            tracing::warn!(
-                topic = %topic,
-                "replay: this `multi_publisher_topics` topic is written by SEVERAL writers on \
-                 other ranks, whose recorded frames one injection publisher re-publishes — so a \
-                 captured injected frame cannot be attributed to the writer that recorded it. \
-                 The capture diff falls back to the single-stream path rather than attributing \
-                 by a guess"
-            );
-            continue;
-        }
-        // (2) every producer THIS PASS can put on the wire must be nameable from
-        // it — its own publishers directly, and a split topic's single
-        // foreign writer through the injector that re-publishes it. A writer
-        // this pass neither produces nor injects is deliberately NOT required:
-        // no frame of it will ever be captured here, so nothing needs a name for
-        // it (that is `producible`, and it is what the counts are scoped to).
+        // (2) every producer THIS PASS publishes through its own publishers
+        // must be nameable from its table. The frames its injector
+        // re-publishes are named by the injector's publisher id, and a foreign
+        // writer needs no name here: none of its frames is captured but
+        // through the injector. The writers it replays are `producible`, what
+        // the counts are scoped to; its drivers and its injector are
+        // `uncompared`.
         let producible: &BTreeSet<String> = producible_by_topic
             .get(topic)
             .expect("every candidate got a producible set above");
@@ -17642,8 +19918,17 @@ fn build_capture_partitionings(
             );
             continue;
         }
+        let uncompared: &BTreeSet<String> = uncompared_by_topic
+            .get(topic)
+            .expect("every candidate got an uncompared set above");
         let live: BTreeSet<&str> = live_labels.values().map(|l| &**l).collect();
-        if let Some(missing) = producible.iter().find(|w| !live.contains(w.as_str())) {
+        // A driver's frames must be nameable too: one the table cannot name
+        // would be diffed as an unknown writer instead of left out.
+        if let Some(missing) = producible
+            .iter()
+            .chain(uncompared)
+            .find(|w| !live.contains(w.as_str()))
+        {
             tracing::warn!(
                 topic = %topic,
                 writer = %missing,
@@ -17725,8 +20010,13 @@ fn build_capture_partitionings(
         // wrong direction for an index-length defect. Refuse the partition
         // (fall back to the single-stream path, exactly as the producer
         // window does) instead of seeding a shorter set silently.
-        let seqs = match idx.sequences.get(skip..skip + keep) {
-            Some(s) if s.len() == keep => s,
+        // The timestamps are pushed with the sequences, so one length check
+        // guards both.
+        let (seqs, stamps) = match (
+            idx.sequences.get(skip..skip + keep),
+            idx.timestamps.get(skip..skip + keep),
+        ) {
+            (Some(s), Some(t)) if s.len() == keep && t.len() == keep => (s, t),
             _ => {
                 tracing::warn!(
                     topic = %topic,
@@ -17737,6 +20027,7 @@ fn build_capture_partitionings(
                 continue;
             }
         };
+        let bursts = writer_bursts(recorded_writers.iter().zip(stamps.iter().copied()));
         for (key, seq) in recorded_writers.iter().zip(seqs) {
             // Seed only the partitions this pass can reproduce.
             if !producible_keys.contains(key) {
@@ -17745,6 +20036,7 @@ fn build_capture_partitionings(
             let stream = streams.entry(key.clone()).or_insert_with(|| CaptureStream {
                 replayed_count: 0,
                 total_recorded: 0,
+                recorded_burst: bursts.get(key).copied().unwrap_or(0),
                 last_seq: None,
                 recorded_seq_runs: Vec::new(),
                 pending: VecDeque::new(),
@@ -17769,6 +20061,11 @@ fn build_capture_partitionings(
                 live_labels: Arc::clone(&live_labels),
                 recorded_writers,
                 producible: producible_keys,
+                uncompared: uncompared
+                    .iter()
+                    .map(|w| WriterKey::Named(Arc::from(w.as_str())))
+                    .chain(injected_by_topic.get(topic).copied().map(WriterKey::Origin))
+                    .collect(),
                 walked: 0,
                 streams,
             },
@@ -17828,20 +20125,105 @@ fn diff_recorded_twin(
             None
         }
     } else if want_byte {
-        frame_first_diff(DiffMetric::BitExact, rec_frame, rep_frame)
+        frame_first_diff(DiffMetric::BitExact, rec_frame, rep_frame).map(|offset| (offset, None))
     } else {
         None
     };
     if want_byte {
-        if let Some(offset) = remainder {
+        if let Some((offset, refusal)) = remainder {
             *byte_violation = Some(ByteViolation {
                 index,
                 first_diff_byte_offset: offset,
-                recorded_len: rec_frame.len(),
-                replayed_len: rep_frame.len(),
+                // hot-path-alloc-ok: once per diverging stream, at its first
+                // differing frame (`want_byte` is false after it); the pair is
+                // decoded at the pass harvest to name the differing field.
+                recorded: rec_frame.into(),
+                replayed: rep_frame.into(),
+                refusal,
             });
         }
     }
+}
+
+/// A `--record-out` tap on a topic only this pass's `external` (driver) nodes
+/// write ([`PassTopics::record_out_only`]). Drained after every step beside
+/// the [`Capture`]s, it writes every drained frame to the sink and compares
+/// nothing: a driver's frames are recorded inputs, so the diff, the verdict
+/// and the topic tally never read it.
+struct RecordOutTap {
+    subscriber: cerulion_core::transport::subscriber::DataOnlySubscriber,
+    scratch: Vec<cerulion_core::transport::subscriber::OwnedInboundSample>,
+    /// The `--record-out` sink every drained frame is written to.
+    sink: Arc<crate::resim_record_out::RecordOut>,
+    /// The publisher id of this pass's injector for the topic, when the pass
+    /// both produces and injects it. Its frames are the input bag's, so they
+    /// are not written.
+    injected_origin: Option<u128>,
+}
+
+impl RecordOutTap {
+    /// Write every frame queued on the tap to the sink, in arrival order, and
+    /// release each one's shared-memory slot as it is written.
+    fn drain(&mut self) -> Result<(), ReplayError> {
+        let budget = self.subscriber.max_borrowed_samples().max(1);
+        loop {
+            self.scratch.clear();
+            let n = self
+                .subscriber
+                .drain_owned(budget, &mut self.scratch)
+                .map_err(|e| ReplayError::Internal {
+                    reason: format!(
+                        "failed to capture replayed frames on '{}' for --record-out: {e}",
+                        self.subscriber.topic()
+                    ),
+                })?;
+            for sample in self.scratch.drain(..) {
+                if self.injected_origin != Some(sample.origin()) {
+                    self.sink
+                        .write_frame(self.subscriber.topic(), sample.payload())?;
+                }
+            }
+            if n < budget {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Open a [`RecordOutTap`] on every topic in `topics`, before the first step
+/// like the captures. The graph pre-creates the service of every topic a
+/// member writes at build, so a tap that cannot be opened is the harness
+/// failing to observe the topic, and the pass refuses rather than write an
+/// output bag missing its frames.
+fn open_record_out_taps(
+    transport: &Arc<TransportManager>,
+    topics: &[String],
+    sink: &Arc<crate::resim_record_out::RecordOut>,
+    injectors: &IndexMap<String, Injector>,
+) -> Result<Vec<RecordOutTap>, ReplayError> {
+    topics
+        .iter()
+        .map(|topic| {
+            let opened = match capture_open_fault(topic) {
+                Some(fault) => Err(fault),
+                None => transport.create_data_only_subscriber(topic),
+            };
+            let subscriber = opened.map_err(|e| ReplayError::Internal {
+                reason: format!(
+                    "the --record-out tap for topic '{topic}', which only external (driver) \
+                     nodes write, could not be opened ({e}); the graph pre-creates every owned \
+                     topic's service at build, so this is the harness failing to observe the \
+                     topic (subscriber slots exhausted, a transport fault)"
+                ),
+            })?;
+            Ok(RecordOutTap {
+                subscriber,
+                scratch: Vec::new(),
+                sink: Arc::clone(sink),
+                injected_origin: injectors.get(topic).map(Injector::publisher_id),
+            })
+        })
+        .collect()
 }
 
 /// Open a capture tap on every graph-produced topic (open-only, so a topic the
@@ -18288,6 +20670,7 @@ mod node_trigger_decl_tests {
             depth: 4,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
             consume: Default::default(),
         };
         let info = NodeInfo::with_meta(vec![meta("cam"), meta("lidar")], vec![])
@@ -18309,6 +20692,7 @@ mod node_trigger_decl_tests {
             .map(|n| InputDef {
                 name: n.to_string(),
                 source: format!("/{n}"),
+                ..Default::default()
             })
             .collect()
     }
@@ -18365,6 +20749,7 @@ mod node_trigger_decl_tests {
                     backpressure,
                     expect_within_ms: None,
                     consume,
+                    accumulate: false,
                 }],
                 vec![],
             )
@@ -18376,6 +20761,7 @@ mod node_trigger_decl_tests {
         let wired = vec![InputDef {
             name: "cam".to_string(),
             source: "/cam".to_string(),
+            ..Default::default()
         }];
         let cam = vec!["cam".to_string()];
         let latest = data(InputConsume::Latest);
@@ -18476,7 +20862,7 @@ mod node_trigger_decl_tests {
     }
 
     /// An older bag's `drop_oldest` latest input, whose node read it through
-    /// two subscribers (a library without the unified drain export, an
+    /// two subscribers (an entry without unified drain capability, an
     /// opted-out closure, or the drain override), recorded a step that popped
     /// a frame an earlier read already took and fired nothing. Judged as one
     /// subscriber that step is a false finding; declared from what the bag
@@ -18500,6 +20886,7 @@ mod node_trigger_decl_tests {
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
                 consume: InputConsume::Latest,
+                accumulate: false,
             }],
             vec![],
         )
@@ -18509,6 +20896,7 @@ mod node_trigger_decl_tests {
         let wired = vec![InputDef {
             name: "cam".to_string(),
             source: "/cam".to_string(),
+            ..Default::default()
         }];
         let decl = |trigger| NodeDecl {
             node_id: "sink".to_string(),
@@ -18643,6 +21031,7 @@ mod node_trigger_decl_tests {
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
                 consume: InputConsume::Latest,
+                accumulate: false,
             }],
             vec![],
         )
@@ -18652,6 +21041,7 @@ mod node_trigger_decl_tests {
         let wired = vec![InputDef {
             name: "cam".to_string(),
             source: "/cam".to_string(),
+            ..Default::default()
         }];
         let node = NodeDecl {
             node_id: "sink".to_string(),
@@ -18873,6 +21263,953 @@ mod restored_sync_heads_tests {
             ]),
         )]);
         assert_eq!(restored_sync_heads_by_input(&config, &by_topic), want);
+    }
+}
+
+#[cfg(test)]
+mod driver_stamp_tests {
+    use super::{DriverStamp, RecordedDriverStamp, ReplayError};
+    use cerulion_core::graph::parse_graph;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const TWO: &str = "prefix: rig\n\
+         nodes:\n\
+         \x20 - id: meter\n\
+         \x20   type: meter\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n";
+
+    fn read(doc: &str) -> RecordedDriverStamp {
+        let v: serde_json::Value = serde_json::from_str(doc).expect("valid JSON");
+        RecordedDriverStamp::read(v.as_object().expect("an object"))
+    }
+
+    fn flags(pairs: &[(&str, bool)]) -> BTreeMap<String, bool> {
+        pairs
+            .iter()
+            .map(|(id, f)| ((*id).to_string(), *f))
+            .collect()
+    }
+
+    /// Every shape of the key: absent, a map of booleans, and each unreadable
+    /// value, `null` among them, quoted as it appeared.
+    #[test]
+    fn the_stamp_reads_absent_present_or_unreadable() {
+        assert_eq!(read(r#"{"trace_format":9}"#), RecordedDriverStamp::Absent);
+        assert_eq!(
+            read(r#"{"node_external":{"cam":true,"meter":false}}"#),
+            RecordedDriverStamp::Present(flags(&[("cam", true), ("meter", false)]))
+        );
+        assert_eq!(
+            read(r#"{"node_external":{}}"#),
+            RecordedDriverStamp::Present(BTreeMap::new()),
+            "an empty map is a stamp (a graph with no native node), not an absence"
+        );
+        for (doc, quoted) in [
+            (r#"{"node_external":null}"#, "null"),
+            (r#"{"node_external":42}"#, "42"),
+            (r#"{"node_external":["cam"]}"#, r#"["cam"]"#),
+            (r#"{"node_external":{"cam":"yes"}}"#, r#"{"cam":"yes"}"#),
+        ] {
+            assert_eq!(
+                read(doc),
+                RecordedDriverStamp::Unreadable(quoted.to_string()),
+                "{doc}"
+            );
+        }
+    }
+
+    /// A stamp naming exactly the graph's nodes is admitted and names its
+    /// drivers; an absent one admits nothing; one that names a node too many
+    /// or too few is refused naming it; an unreadable one is refused.
+    #[test]
+    fn a_stamp_is_admitted_only_when_it_describes_the_graph() {
+        let config = parse_graph(TWO).expect("graph parses");
+        let admitted = DriverStamp::admit(
+            RecordedDriverStamp::Present(flags(&[("cam", true), ("meter", false)])),
+            &config,
+        )
+        .expect("an exact stamp is admitted")
+        .expect("and is a stamp");
+        assert_eq!(
+            admitted.drivers(),
+            BTreeSet::from(["cam".to_string()]),
+            "the drivers are the nodes flagged true"
+        );
+        assert_eq!(
+            DriverStamp::admit(RecordedDriverStamp::Absent, &config).expect("absent is fine"),
+            None
+        );
+        match DriverStamp::admit(
+            RecordedDriverStamp::Present(flags(&[
+                ("cam", true),
+                ("meter", false),
+                ("ghost", true),
+            ])),
+            &config,
+        ) {
+            Err(ReplayError::RecordingInconsistent { detail }) => assert_eq!(
+                detail,
+                "recorder.json's `node_external` names node(s) the embedded graph does not \
+                 run: ghost"
+            ),
+            other => panic!("an extra node is refused, got {other:?}"),
+        }
+        match DriverStamp::admit(
+            RecordedDriverStamp::Present(flags(&[("cam", true)])),
+            &config,
+        ) {
+            Err(ReplayError::RecordingInconsistent { detail }) => assert_eq!(
+                detail,
+                "recorder.json's `node_external` does not name node(s) the embedded graph \
+                 runs: meter"
+            ),
+            other => panic!("a missing node is refused, got {other:?}"),
+        }
+        match DriverStamp::admit(RecordedDriverStamp::Unreadable("null".to_string()), &config) {
+            Err(ReplayError::BagInvalidAttachment { name, .. }) => {
+                assert_eq!(name, "__cerulion/recorder.json")
+            }
+            other => panic!("an unreadable stamp is refused, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod driver_topic_tests {
+    use super::{
+        build_rank_plans, classify_topics, driver_inputs_report, driver_output_topics,
+        driver_shared_topics, driver_written_topics, external_node_ids, is_external_policy,
+        log_driver_topic_feeds, node_external_flags, plan_driver_topic_feeds,
+        re_executed_output_topics, render_driver_input_lines, resolve_driver_set, CoordinationMode,
+        DriverInputsReport, DriverSetSource, DriverStamp, DriverTopicFeeds, NodeEntry,
+        RecordedDriverStamp, RecordedMessages, TopicClasses,
+    };
+    use crate::replay_rank::RankBoundarySummary;
+    use cerulion_core::graph::node::{ClosureNodeEntry, MacroPolicy, NodeInfo};
+    use cerulion_core::graph::parse_graph;
+    use cerulion_core::{TransportError, TransportResult};
+    use indexmap::IndexMap;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    /// A camera driver feeding a meter; the meter's output is the only topic
+    /// a node re-computes.
+    const CAMERA: &str = "prefix: rig\n\
+         nodes:\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n\
+         \x20   outputs:\n\
+         \x20     - name: image\n\
+         \x20       schema: sensor_msgs/Image\n\
+         \x20     - name: info\n\
+         \x20       schema: std_msgs/Float32\n\
+         \x20 - id: meter\n\
+         \x20   type: meter\n\
+         \x20   inputs:\n\
+         \x20     - name: image\n\
+         \x20       source: cam/image\n\
+         \x20   outputs:\n\
+         \x20     - name: brightness\n\
+         \x20       schema: std_msgs/Float32\n";
+
+    /// One topic written by a driver and by an ordinary node, read by a sink.
+    const SHARED_BUS: &str = "prefix: rig\n\
+         multi_publisher_topics:\n\
+         \x20 - /rig/bus\n\
+         nodes:\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n\
+         \x20   outputs:\n\
+         \x20     - name: out\n\
+         \x20       schema: std_msgs/Float32\n\
+         \x20       topic: /rig/bus\n\
+         \x20 - id: timer\n\
+         \x20   type: timer\n\
+         \x20   outputs:\n\
+         \x20     - name: out\n\
+         \x20       schema: std_msgs/Float32\n\
+         \x20       topic: /rig/bus\n\
+         \x20 - id: sink\n\
+         \x20   type: sink\n\
+         \x20   inputs:\n\
+         \x20     - name: inp\n\
+         \x20       source: /rig/bus\n";
+
+    /// The shared bus with no node reading it.
+    const UNREAD_SHARED_BUS: &str = "prefix: rig\n\
+         multi_publisher_topics:\n\
+         \x20 - /rig/bus\n\
+         nodes:\n\
+         \x20 - id: cam\n\
+         \x20   type: cam\n\
+         \x20   outputs:\n\
+         \x20     - name: out\n\
+         \x20       schema: std_msgs/Float32\n\
+         \x20       topic: /rig/bus\n\
+         \x20 - id: timer\n\
+         \x20   type: timer\n\
+         \x20   outputs:\n\
+         \x20     - name: out\n\
+         \x20       schema: std_msgs/Float32\n\
+         \x20       topic: /rig/bus\n";
+
+    /// A driver that declares no output, beside a timer.
+    const OUTPUTLESS_DRIVER: &str = "prefix: rig\n\
+         nodes:\n\
+         \x20 - id: door\n\
+         \x20   type: door\n\
+         \x20 - id: timer\n\
+         \x20   type: timer\n\
+         \x20   outputs:\n\
+         \x20     - name: tick\n\
+         \x20       schema: std_msgs/Float32\n";
+
+    fn ids(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    fn entry(policy: MacroPolicy) -> Box<dyn NodeEntry> {
+        Box::new(ClosureNodeEntry::new(
+            NodeInfo::from_names(vec![], vec![]).with_policy(policy),
+            |_| Ok(()),
+        ))
+    }
+
+    /// A node whose metadata cannot be read, as a corrupt library's is.
+    struct UnreadableInfo;
+
+    impl NodeEntry for UnreadableInfo {
+        fn info(&self) -> TransportResult<NodeInfo> {
+            Err(TransportError::GraphError {
+                reason: "corrupt node info".to_string(),
+            })
+        }
+        fn init(&mut self, _context: cerulion_core::NodeContext) -> TransportResult<()> {
+            Ok(())
+        }
+        fn tick(&mut self) -> TransportResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Exactly the nodes that declare the `external` policy are drivers: every
+    /// other policy, a node with none, and a node whose metadata cannot be read
+    /// are not, so their outputs stay compared.
+    #[test]
+    fn only_a_declared_external_policy_makes_a_driver() {
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("cam".into(), entry(MacroPolicy::External));
+        factories.insert("timer".into(), entry(MacroPolicy::Period { period_ms: 10 }));
+        factories.insert(
+            "meter".into(),
+            entry(MacroPolicy::DataTrigger {
+                input_name: "image".into(),
+            }),
+        );
+        factories.insert("fuse".into(), entry(MacroPolicy::Sync { window_ms: 5 }));
+        factories.insert("lidar".into(), entry(MacroPolicy::External));
+        factories.insert(
+            "plain".into(),
+            Box::new(ClosureNodeEntry::new(
+                NodeInfo::from_names(vec![], vec![]),
+                |_| Ok(()),
+            )),
+        );
+        factories.insert("opaque".into(), Box::new(UnreadableInfo));
+        assert_eq!(external_node_ids(&factories), ids(&["cam", "lidar"]));
+    }
+
+    /// The recorder's stamp marks exactly the nodes that declare the
+    /// `external` policy, names every node it is handed whatever its policy,
+    /// and is in id order whatever order the nodes arrive in.
+    #[test]
+    fn node_external_flags_mark_only_the_external_policy() {
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("sink".into(), NodeInfo::from_names(vec![], vec![]));
+        infos.insert(
+            "cam".into(),
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::External),
+        );
+        infos.insert(
+            "meter".into(),
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::Period { period_ms: 10 }),
+        );
+        infos.insert(
+            "fuse".into(),
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::DataTrigger {
+                input_name: "image".into(),
+            }),
+        );
+        let flags = node_external_flags(&infos);
+        assert_eq!(
+            flags.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("cam".to_string(), true),
+                ("fuse".to_string(), false),
+                ("meter".to_string(), false),
+                ("sink".to_string(), false),
+            ]
+        );
+        assert!(is_external_policy(Some(&MacroPolicy::External)));
+        assert!(!is_external_policy(None));
+    }
+
+    /// Every output of a driver is a driver topic, in graph order; the
+    /// consumer's output is not.
+    #[test]
+    fn every_output_of_a_driver_and_nothing_else_is_a_driver_topic() {
+        let config = parse_graph(CAMERA).expect("the camera graph parses");
+        assert_eq!(
+            driver_output_topics(&config, &ids(&["cam"])),
+            vec!["/rig/cam/image".to_string(), "/rig/cam/info".to_string()]
+        );
+        assert!(driver_output_topics(&config, &ids(&[])).is_empty());
+        assert_eq!(
+            driver_output_topics(&config, &ids(&["meter"])),
+            vec!["/rig/meter/brightness".to_string()],
+            "a node is a driver by its policy, not by its place in the graph"
+        );
+    }
+
+    /// One re-executed writer keeps a shared topic compared; with every writer
+    /// a driver it is a driver topic.
+    #[test]
+    fn a_topic_a_re_executed_node_also_writes_stays_compared() {
+        let config = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        assert!(driver_output_topics(&config, &ids(&["cam"])).is_empty());
+        assert_eq!(
+            driver_shared_topics(&config, &ids(&["cam"])),
+            vec!["/rig/bus".to_string()],
+            "the bus is shared by the driver and the timer"
+        );
+        assert_eq!(
+            re_executed_output_topics(&config, &ids(&["cam"])),
+            ids(&["/rig/bus"]),
+            "the timer re-produces the bus"
+        );
+        assert_eq!(
+            driver_output_topics(&config, &ids(&["cam", "timer"])),
+            vec!["/rig/bus".to_string()]
+        );
+        assert!(driver_shared_topics(&config, &ids(&["cam", "timer"])).is_empty());
+        assert!(re_executed_output_topics(&config, &ids(&["cam", "timer"])).is_empty());
+        assert!(driver_shared_topics(&config, &ids(&[])).is_empty());
+    }
+
+    /// A pass over the camera graph re-produces the meter's topic only.
+    #[test]
+    fn a_pass_re_produces_only_the_topics_its_other_nodes_write() {
+        let config = parse_graph(CAMERA).expect("the camera graph parses");
+        assert_eq!(
+            re_executed_output_topics(&config, &ids(&["cam"])),
+            ids(&["/rig/meter/brightness"])
+        );
+        assert_eq!(
+            re_executed_output_topics(&config, &ids(&[])),
+            ids(&["/rig/cam/image", "/rig/cam/info", "/rig/meter/brightness"])
+        );
+    }
+
+    fn classes_of(config: &cerulion_core::graph::GraphConfig, drivers: &[&str]) -> TopicClasses {
+        let recorded = RecordedMessages::from_owned_frames(IndexMap::new());
+        classify_topics(config, &recorded, None, &ids(drivers)).expect("nothing is recorded")
+    }
+
+    fn rank_plans(
+        config: &cerulion_core::graph::GraphConfig,
+        coordination: CoordinationMode,
+        ranks: &[&[&str]],
+    ) -> Vec<crate::replay_rank::RankPlan> {
+        let tables: Vec<Vec<Arc<str>>> = ranks
+            .iter()
+            .map(|r| r.iter().map(|id| Arc::from(*id)).collect())
+            .collect();
+        let summaries: Vec<RankBoundarySummary> = (0..ranks.len() as u32)
+            .map(|rank| RankBoundarySummary::new(rank, 0, 9, 1_000))
+            .collect();
+        build_rank_plans(coordination, config, &tables, &summaries).expect("the graph plans")
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    fn free_run(fed: &[&str], unfed: &[&str], unread: &[&str]) -> DriverTopicFeeds {
+        DriverTopicFeeds::FreeRun {
+            fed: strings(fed),
+            unfed: strings(unfed),
+            unread: strings(unread),
+        }
+    }
+
+    fn lockstep(drivers: &[&str], topics: &[&str]) -> DriverTopicFeeds {
+        DriverTopicFeeds::Lockstep {
+            drivers: strings(drivers),
+            topics: strings(topics),
+        }
+    }
+
+    /// Which driver topics a replay feeds, per layout and mode: a fed pass
+    /// feeds every read, a pass that is not fed only a reader in another rank
+    /// than a driver of the topic, a lockstep replay none, naming every driver
+    /// and every topic one writes, and a topic only drivers write that no node
+    /// reads is neither fed nor compared on any layout. A topic a driver
+    /// shares is compared over its other writers, so it is never fed or
+    /// unread, read or not, only unfed beside its driver.
+    #[test]
+    fn a_driver_topic_is_fed_only_where_the_pass_feeds_its_reader() {
+        let camera = parse_graph(CAMERA).expect("the camera graph parses");
+        let bus = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        let unread_bus = parse_graph(UNREAD_SHARED_BUS).expect("the unread bus graph parses");
+        let door = parse_graph(OUTPUTLESS_DRIVER).expect("the outputless driver graph parses");
+        let image = "/rig/cam/image";
+        let info = "/rig/cam/info";
+        let shared = "/rig/bus";
+        let free = CoordinationMode::FreeRun;
+        let lock = CoordinationMode::Lockstep;
+        let one_cam: &[&[&str]] = &[&["cam", "meter"]];
+        let two_cam: &[&[&str]] = &[&["cam"], &["meter"]];
+        let one_bus: &[&[&str]] = &[&["cam", "timer", "sink"]];
+        let two_bus: &[&[&str]] = &[&["cam"], &["timer", "sink"]];
+        let one_unread_bus: &[&[&str]] = &[&["cam", "timer"]];
+        let one_door: &[&[&str]] = &[&["door", "timer"]];
+        for (layout, config, drivers, coordination, ranks, fed, want) in [
+            (
+                "camera, one rank, fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
+                true,
+                free_run(&[image], &[], &[info]),
+            ),
+            (
+                "camera, one rank, not fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
+                false,
+                free_run(&[], &[image], &[info]),
+            ),
+            (
+                "camera, two ranks, fed",
+                &camera,
+                &["cam"][..],
+                free,
+                two_cam,
+                true,
+                free_run(&[image], &[], &[info]),
+            ),
+            (
+                "camera, two ranks, not fed",
+                &camera,
+                &["cam"][..],
+                free,
+                two_cam,
+                false,
+                free_run(&[image], &[], &[info]),
+            ),
+            (
+                "camera, lockstep",
+                &camera,
+                &["cam"][..],
+                lock,
+                one_cam,
+                false,
+                lockstep(&["cam"], &[image, info]),
+            ),
+            (
+                "shared bus, one rank, fed",
+                &bus,
+                &["cam"][..],
+                free,
+                one_bus,
+                true,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "shared bus, one rank, not fed",
+                &bus,
+                &["cam"][..],
+                free,
+                one_bus,
+                false,
+                free_run(&[], &[shared], &[]),
+            ),
+            (
+                "shared bus, the driver alone in its rank, not fed",
+                &bus,
+                &["cam"][..],
+                free,
+                two_bus,
+                false,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "shared bus, lockstep",
+                &bus,
+                &["cam"][..],
+                lock,
+                one_bus,
+                false,
+                lockstep(&["cam"], &[shared]),
+            ),
+            (
+                "shared bus no node reads, not fed",
+                &unread_bus,
+                &["cam"][..],
+                free,
+                one_unread_bus,
+                false,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "shared bus no node reads, lockstep",
+                &unread_bus,
+                &["cam"][..],
+                lock,
+                one_unread_bus,
+                false,
+                lockstep(&["cam"], &[shared]),
+            ),
+            (
+                "outputless driver, free run",
+                &door,
+                &["door"][..],
+                free,
+                one_door,
+                false,
+                free_run(&[], &[], &[]),
+            ),
+            (
+                "outputless driver, lockstep",
+                &door,
+                &["door"][..],
+                lock,
+                one_door,
+                false,
+                lockstep(&["door"], &[]),
+            ),
+            (
+                "no driver, lockstep",
+                &camera,
+                &[][..],
+                lock,
+                one_cam,
+                false,
+                lockstep(&[], &[]),
+            ),
+        ] {
+            let classes = classes_of(config, drivers);
+            let plans = rank_plans(config, coordination, ranks);
+            assert_eq!(
+                plan_driver_topic_feeds(config, &classes, &plans, lock == coordination, fed),
+                want,
+                "{layout}"
+            );
+        }
+    }
+
+    /// The topics a pass's drivers write, a shared one included; none
+    /// without a driver.
+    #[test]
+    fn the_driver_written_topics_are_every_output_of_a_driver() {
+        let bus = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        assert_eq!(
+            driver_written_topics(&bus, &ids(&["cam"])),
+            ids(&["/rig/bus"])
+        );
+        assert!(driver_written_topics(&bus, &ids(&["sink"])).is_empty());
+        let camera = parse_graph(CAMERA).expect("the camera graph parses");
+        assert_eq!(
+            driver_written_topics(&camera, &ids(&["cam"])),
+            ids(&["/rig/cam/image", "/rig/cam/info"])
+        );
+        assert!(driver_written_topics(&camera, &ids(&[])).is_empty());
+    }
+
+    /// A lockstep replay of a graph whose driver declares no output still
+    /// warns once, naming the driver and the remedy; a lockstep replay
+    /// without a driver logs nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_lockstep_driver_without_outputs_is_named_by_its_node_id() {
+        log_driver_topic_feeds(&lockstep(&[], &[]), "");
+        assert!(
+            !logs_contain("this recording is lockstep"),
+            "no driver, no line"
+        );
+        log_driver_topic_feeds(&lockstep(&["door"], &[]), "");
+        logs_assert(|lines: &[&str]| {
+            let hits: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("this recording is lockstep"))
+                .collect();
+            match hits.as_slice() {
+                [line]
+                    if line.contains("WARN")
+                        && line.contains("node_ids=door")
+                        && !line.contains("topics=")
+                        && line.contains("without `--single-process`") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected exactly ONE WARN line naming the driver and the remedy, got \
+                     {other:?}"
+                )),
+            }
+        });
+    }
+
+    /// A driver topic a node consumes stays GRAPH-PRODUCED: it is not the
+    /// external class, so no second injector is opened on it, and it is named
+    /// as a driver topic so the diff and the topic tally leave it out.
+    #[test]
+    fn a_consumed_driver_topic_is_produced_and_driver_never_external() {
+        let config = parse_graph(CAMERA).expect("the camera graph parses");
+        let frames: IndexMap<String, Vec<Vec<u8>>> = [
+            ("/rig/cam/image".to_string(), vec![vec![0u8; 48]]),
+            ("/rig/meter/brightness".to_string(), vec![vec![0u8; 48]]),
+        ]
+        .into_iter()
+        .collect();
+        let recorded = RecordedMessages::from_owned_frames(frames);
+        let classes = classify_topics(&config, &recorded, None, &ids(&["cam"]))
+            .expect("every recorded topic is modelled");
+        assert_eq!(
+            classes.produced,
+            vec![
+                "/rig/cam/image".to_string(),
+                "/rig/cam/info".to_string(),
+                "/rig/meter/brightness".to_string()
+            ]
+        );
+        assert_eq!(
+            classes.driver,
+            vec!["/rig/cam/image".to_string(), "/rig/cam/info".to_string()]
+        );
+        assert!(
+            classes.driver_shared.is_empty(),
+            "{:?}",
+            classes.driver_shared
+        );
+        assert_eq!(classes.driver_nodes, ids(&["cam"]));
+        assert!(classes.external.is_empty(), "{:?}", classes.external);
+        assert!(classes.unmodelled.is_empty(), "{:?}", classes.unmodelled);
+    }
+
+    /// A report with no unattributed topic, the shape
+    /// [`driver_inputs_report`] builds before the diff runs.
+    fn report(
+        nodes: &[&str],
+        input: &[&str],
+        shared: &[&str],
+        unfed: &[&str],
+        unread: &[&str],
+    ) -> DriverInputsReport {
+        DriverInputsReport {
+            nodes: strings(nodes),
+            declared_by: DriverSetSource::ReplayedBuild,
+            input_topics: strings(input),
+            shared_topics: strings(shared),
+            unattributed_topics: Vec::new(),
+            unfed_topics: strings(unfed),
+            unread_topics: strings(unread),
+        }
+    }
+
+    /// The report names the drivers, every topic only they write and every
+    /// topic they share, and carries the free-run plan's unfed and unread
+    /// lists. A lockstep replay feeds nothing, so every driver topic a node
+    /// reads is unfed there, and a shared topic no node reads is never unread,
+    /// since its other writers' frames are compared. A graph with no driver
+    /// has no report.
+    #[test]
+    fn the_driver_inputs_report_names_every_driver_topic_and_what_was_fed() {
+        let camera = parse_graph(CAMERA).expect("the camera graph parses");
+        let bus = parse_graph(SHARED_BUS).expect("the shared bus graph parses");
+        let unread_bus = parse_graph(UNREAD_SHARED_BUS).expect("the unread bus graph parses");
+        let door = parse_graph(OUTPUTLESS_DRIVER).expect("the outputless driver graph parses");
+        let image = "/rig/cam/image";
+        let info = "/rig/cam/info";
+        let shared = "/rig/bus";
+        let free = CoordinationMode::FreeRun;
+        let lock = CoordinationMode::Lockstep;
+        let one_cam: &[&[&str]] = &[&["cam", "meter"]];
+        let one_bus: &[&[&str]] = &[&["cam", "timer", "sink"]];
+        let one_unread_bus: &[&[&str]] = &[&["cam", "timer"]];
+        let one_door: &[&[&str]] = &[&["door", "timer"]];
+        for (layout, config, drivers, coordination, ranks, fed, want) in [
+            (
+                "camera, one rank, fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
+                true,
+                Some(report(&["cam"], &[image, info], &[], &[], &[info])),
+            ),
+            (
+                "camera, one rank, not fed",
+                &camera,
+                &["cam"][..],
+                free,
+                one_cam,
+                false,
+                Some(report(&["cam"], &[image, info], &[], &[image], &[info])),
+            ),
+            (
+                "camera, lockstep",
+                &camera,
+                &["cam"][..],
+                lock,
+                one_cam,
+                false,
+                Some(report(&["cam"], &[image, info], &[], &[image], &[info])),
+            ),
+            (
+                "shared bus, one rank, not fed",
+                &bus,
+                &["cam"][..],
+                free,
+                one_bus,
+                false,
+                Some(report(&["cam"], &[], &[shared], &[shared], &[])),
+            ),
+            (
+                "shared bus, lockstep",
+                &bus,
+                &["cam"][..],
+                lock,
+                one_bus,
+                false,
+                Some(report(&["cam"], &[], &[shared], &[shared], &[])),
+            ),
+            (
+                "shared bus no node reads, lockstep",
+                &unread_bus,
+                &["cam"][..],
+                lock,
+                one_unread_bus,
+                false,
+                Some(report(&["cam"], &[], &[shared], &[], &[])),
+            ),
+            (
+                "outputless driver, lockstep",
+                &door,
+                &["door"][..],
+                lock,
+                one_door,
+                false,
+                Some(report(&["door"], &[], &[], &[], &[])),
+            ),
+            (
+                "no driver, free run",
+                &camera,
+                &[][..],
+                free,
+                one_cam,
+                true,
+                None,
+            ),
+        ] {
+            let classes = classes_of(config, drivers);
+            let plans = rank_plans(config, coordination, ranks);
+            let feeds =
+                plan_driver_topic_feeds(config, &classes, &plans, lock == coordination, fed);
+            assert_eq!(
+                driver_inputs_report(config, &classes, &feeds, DriverSetSource::ReplayedBuild),
+                want,
+                "{layout}"
+            );
+        }
+    }
+
+    /// One NOTE per non-empty list, each naming its topics, the first two
+    /// naming the drivers as the replayed build declares them, and one more
+    /// when nothing was compared. A driver that writes nothing prints no line.
+    #[test]
+    fn the_driver_input_lines_name_every_list_and_a_comparison_of_nothing() {
+        let inputs = "NOTE: 2 topic(s) only external (driver) nodes write are recorded inputs \
+                      and were NOT compared (driver nodes, as the replayed build declares them: \
+                      cam, lidar): /rig/cam/image, /rig/lidar/scan";
+        let shared = "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                      compared over the other writers' frames only (driver nodes, as the \
+                      replayed build declares them: cam, lidar): /rig/bus";
+        let unfed = "NOTE: 1 external (driver) topic(s) were not fed to the nodes that read \
+                     them, so those nodes cannot reproduce their recorded outputs: /rig/bus";
+        let unread = "NOTE: 1 external (driver) topic(s) are read by no node, so nothing in this \
+                      replay verifies them: /rig/lidar/scan";
+        let nothing = "NOTE: no topic was compared against the recording: no node other than an \
+                       external (driver) node recorded or replayed a frame";
+        let full = report(
+            &["cam", "lidar"],
+            &["/rig/cam/image", "/rig/lidar/scan"],
+            &["/rig/bus"],
+            &["/rig/bus"],
+            &["/rig/lidar/scan"],
+        );
+        assert_eq!(
+            render_driver_input_lines(&full, 0),
+            vec![inputs, shared, unfed, unread, nothing]
+        );
+        assert_eq!(
+            render_driver_input_lines(&full, 1),
+            vec![inputs, shared, unfed, unread],
+            "a compared topic prints no nothing-compared line"
+        );
+        let shared_only = report(&["cam", "lidar"], &[], &["/rig/bus"], &[], &[]);
+        assert_eq!(
+            render_driver_input_lines(&shared_only, 0),
+            vec![shared, nothing]
+        );
+        let silent = report(&["door"], &[], &[], &[], &[]);
+        assert!(
+            render_driver_input_lines(&silent, 0).is_empty(),
+            "a driver that writes nothing leaves nothing out of the comparison"
+        );
+    }
+
+    /// A shared topic the replay could not attribute frame by frame is named on
+    /// a NOTE of its own, which says its frames were compared, the drivers'
+    /// included, and leaves the other-writers NOTE to the shared topics it
+    /// partitioned. Every shared topic unattributed prints no other-writers
+    /// NOTE.
+    #[test]
+    fn an_unattributed_shared_topic_is_named_as_compared_over_every_frame() {
+        let attributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
+                          writers were compared over the other writers' frames only (driver \
+                          nodes, as the replayed build declares them: cam): /rig/bus";
+        let unattributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
+                            writers were compared over every recorded frame, the drivers' \
+                            included, since the replay could not attribute each recorded \
+                            frame to its writer (driver nodes, as the replayed build declares \
+                            them: cam): /rig/tf";
+        let both = DriverInputsReport {
+            unattributed_topics: strings(&["/rig/tf"]),
+            ..report(&["cam"], &[], &["/rig/bus", "/rig/tf"], &[], &[])
+        };
+        assert_eq!(
+            render_driver_input_lines(&both, 2),
+            vec![attributed, unattributed]
+        );
+        let only = DriverInputsReport {
+            unattributed_topics: strings(&["/rig/tf"]),
+            ..report(&["cam"], &[], &["/rig/tf"], &[], &[])
+        };
+        assert_eq!(render_driver_input_lines(&only, 1), vec![unattributed]);
+    }
+
+    /// A driver set the recording declares is named as the recording's on
+    /// every NOTE that names the drivers; the unfed line names no driver and
+    /// reads the same either way.
+    #[test]
+    fn a_stamped_driver_set_is_named_as_the_recordings() {
+        let inputs = "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs \
+                      and were NOT compared (driver nodes, as the recording declares them: \
+                      cam): /rig/cam/image";
+        let shared = "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                      compared over the other writers' frames only (driver nodes, as the \
+                      recording declares them: cam): /rig/bus";
+        let unattributed = "NOTE: 1 topic(s) an external (driver) node shares with other \
+                            writers were compared over every recorded frame, the drivers' \
+                            included, since the replay could not attribute each recorded \
+                            frame to its writer (driver nodes, as the recording declares \
+                            them: cam): /rig/tf";
+        let unfed = "NOTE: 1 external (driver) topic(s) were not fed to the nodes that read \
+                     them, so those nodes cannot reproduce their recorded outputs: /rig/bus";
+        let stamped = DriverInputsReport {
+            declared_by: DriverSetSource::Recording,
+            unattributed_topics: strings(&["/rig/tf"]),
+            ..report(
+                &["cam"],
+                &["/rig/cam/image"],
+                &["/rig/bus", "/rig/tf"],
+                &["/rig/bus"],
+                &[],
+            )
+        };
+        assert_eq!(
+            render_driver_input_lines(&stamped, 1),
+            vec![inputs, shared, unattributed, unfed]
+        );
+        assert_eq!(
+            serde_json::to_value(&stamped).expect("serializes")["declared_by"],
+            "recording"
+        );
+        assert_eq!(
+            serde_json::to_value(report(&["cam"], &[], &[], &[], &[])).expect("serializes")
+                ["declared_by"],
+            "replayed_build"
+        );
+    }
+
+    /// A stamp admitted for a graph of `nodes` with `drivers` flagged true.
+    fn stamp(nodes: &[&str], drivers: &[&str]) -> DriverStamp {
+        let mut yaml = String::from("prefix: rig\nnodes:\n");
+        for n in nodes {
+            yaml.push_str(&format!("  - id: {n}\n    type: {n}\n"));
+        }
+        let config = parse_graph(&yaml).expect("graph parses");
+        DriverStamp::admit(
+            RecordedDriverStamp::Present(
+                nodes
+                    .iter()
+                    .map(|n| ((*n).to_string(), drivers.contains(n)))
+                    .collect(),
+            ),
+            &config,
+        )
+        .expect("an exact stamp")
+        .expect("a stamp")
+    }
+
+    /// Every arm of the driver-set resolution: an unstamped recording takes the
+    /// build's set (empty or not) and says so; a stamp the build matches is
+    /// the recording's; a stamp the build departs from is refused naming every
+    /// node in id order, both directions in one list.
+    #[test]
+    fn the_driver_set_is_the_recordings_and_a_build_that_departs_is_refused() {
+        use crate::replay_cmd::DriverDrift;
+        let drift = |node: &str, recorded_external: bool| DriverDrift {
+            node: node.to_string(),
+            recorded_external,
+        };
+        assert_eq!(
+            resolve_driver_set(None, &ids(&[])),
+            Ok((ids(&[]), DriverSetSource::ReplayedBuild))
+        );
+        assert_eq!(
+            resolve_driver_set(None, &ids(&["cam"])),
+            Ok((ids(&["cam"]), DriverSetSource::ReplayedBuild))
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["cam", "meter"], &["cam"])), &ids(&["cam"])),
+            Ok((ids(&["cam"]), DriverSetSource::Recording))
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["meter", "src"], &[])), &ids(&[])),
+            Ok((ids(&[]), DriverSetSource::Recording)),
+            "an all-false stamp is a stamp: the recording had no driver"
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["meter", "src"], &[])), &ids(&["src"])),
+            Err(vec![drift("src", false)]),
+            "a build that newly declares a recorded node external is refused"
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["cam", "meter"], &["cam"])), &ids(&[])),
+            Err(vec![drift("cam", true)]),
+            "a build that no longer declares a recorded driver external is refused"
+        );
+        assert_eq!(
+            resolve_driver_set(Some(&stamp(&["a", "z"], &["z"])), &ids(&["a"])),
+            Err(vec![drift("a", false), drift("z", true)]),
+            "both directions at once, in id order"
+        );
     }
 }
 
@@ -19243,13 +22580,17 @@ struct Injector {
     /// Distinct from `injected`, which counts frames PUBLISHED: the two
     /// diverge only on the intra-step slot path, which walks PAST a frame a
     /// LOCAL producer publishes live (see `stage_slot_frames`).
-    /// Maintained on the STEERED arms only — the recorded-clock window arm
-    /// never reads it, and a steered topic never takes that arm.
+    /// Maintained on every arm. The recorded-clock window arm injects every
+    /// frame it pops, so there it is the frame index [`DriverCopies::count`]
+    /// reads, and a steered topic never takes that arm.
     feed_position: usize,
     /// Frames walked past on the feed because a LOCAL producer
     /// publishes them — report-only, and structurally zero until a co-located
     /// topic is planned.
     skipped_live_local: usize,
+    /// The topic's recorded driver frames, by frame index, and how many of
+    /// each driver's this injector re-published.
+    driver_copies: DriverCopies,
     /// The rank whose pass owns this injector, for blame text (every pass opens
     /// its own set, so a bare topic name cannot say which one failed).
     rank: u32,
@@ -19446,8 +22787,8 @@ impl Drop for CaptureOpenFaultGuard {
     }
 }
 
-/// Make the NEXT `open_captures` on `topic` fail as a transport error, on this
-/// thread, while the guard lives.
+/// Make the NEXT `open_captures` or `open_record_out_taps` on `topic` fail as
+/// a transport error, on this thread, while the guard lives.
 #[cfg(any(test, feature = "test-seams"))]
 pub fn fail_capture_open_for_test(topic: &str) -> CaptureOpenFaultGuard {
     let prev = FAIL_CAPTURE_OPEN_FOR.with(|s| s.borrow_mut().replace(topic.to_string()));
@@ -19467,7 +22808,8 @@ fn capture_open_fault(topic: &str) -> Option<cerulion_core::TransportError> {
 }
 
 /// The shipped twin: a constant `None`, so the fault check in `open_captures`
-/// folds to the real open in any build without `test-seams`.
+/// and `open_record_out_taps` folds to the real open in any build without
+/// `test-seams`.
 #[cfg(not(any(test, feature = "test-seams")))]
 fn capture_open_fault(_topic: &str) -> Option<cerulion_core::TransportError> {
     None
@@ -21060,6 +24402,7 @@ impl Injector {
                 })?;
             feed.pop(self.publisher.topic())?;
             self.injected += 1;
+            self.driver_copies.count(planned.frame_index);
             self.feed_position += 1;
         }
         Ok(())
@@ -21181,6 +24524,7 @@ impl Injector {
                 ),
             })?;
         self.injected += 1;
+        self.driver_copies.count(planned.frame_index);
         Ok(())
     }
     /// Re-publish every not-yet-injected frame this step's [`InjectionWindow`]
@@ -21236,6 +24580,8 @@ impl Injector {
                 })?;
             feed.pop(self.publisher.topic())?;
             self.injected += 1;
+            self.driver_copies.count(self.feed_position);
+            self.feed_position += 1;
             if self.injected >= self.total_recorded {
                 // The frame just served was the topic's LAST recorded frame —
                 // break BEFORE the loop's next peek, which would otherwise
@@ -21246,6 +24592,75 @@ impl Injector {
             }
         }
         Ok(())
+    }
+}
+
+/// The recorded frames of a topic's drivers that an [`Injector`] can
+/// re-publish, by frame index, and how many of each driver's it has
+/// re-published.
+///
+/// Built where the injection names the writer of each recorded frame
+/// ([`prepare_pass_verification`]), and empty where it names none, so an
+/// injector then counts no frame as a driver's.
+#[derive(Debug, Default)]
+struct DriverCopies {
+    /// `(frame index, index into labels)` of each driver frame, by frame
+    /// index.
+    frames: Vec<(usize, usize)>,
+    /// The drivers' `node/output` labels.
+    labels: Vec<Arc<str>>,
+    /// Per label, the frames re-published so far.
+    counts: Vec<usize>,
+}
+
+impl DriverCopies {
+    /// The frames of `frames`, a topic's recorded frames by frame index, whose
+    /// writer is one of `drivers` (`node/output` labels). PURE.
+    fn of(frames: &[replay_inject::RecordedFrame], drivers: &BTreeSet<&str>) -> Self {
+        let mut out = Self::default();
+        for (index, frame) in frames.iter().enumerate() {
+            let Some(replay_inject::ResolvedProducer::Named(label)) = &frame.producer else {
+                continue;
+            };
+            if !drivers.contains(label.as_str()) {
+                continue;
+            }
+            let at = match out.labels.iter().position(|l| **l == **label) {
+                Some(at) => at,
+                None => {
+                    out.labels.push(Arc::from(label.as_str()));
+                    out.counts.push(0);
+                    out.labels.len() - 1
+                }
+            };
+            out.frames.push((index, at));
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Count the re-published frame at `frame_index` if a driver wrote it.
+    fn count(&mut self, frame_index: usize) {
+        if let Ok(i) = self
+            .frames
+            .binary_search_by_key(&frame_index, |&(index, _)| index)
+        {
+            let at = self.frames[i].1;
+            self.counts[at] += 1;
+        }
+    }
+
+    /// Per driver, the frames re-published, a driver with none left out.
+    fn by_driver(&self) -> BTreeMap<Arc<str>, usize> {
+        self.labels
+            .iter()
+            .zip(&self.counts)
+            .filter(|(_, &n)| n > 0)
+            .map(|(label, &n)| (Arc::clone(label), n))
+            .collect()
     }
 }
 
@@ -21369,6 +24784,7 @@ fn open_injectors(
                 // the `skipped_prefix` parameter doc).
                 feed_position: skipped_prefix.get(topic).copied().unwrap_or(0),
                 skipped_live_local: 0,
+                driver_copies: DriverCopies::default(),
                 rank,
             },
         );
@@ -21598,10 +25014,11 @@ fn validate_step_boundaries(
     // above (per-rank consecutive steps + non-decreasing targets) is the part
     // that still holds per rank and SURVIVES VERBATIM for both modes.
     //
-    // The skip is never silent: the verdict's coordination provenance line
-    // (`render_coordination_line`) states which contract was applied and
-    // that cross-rank lockstep equality is "not applicable" — that line is
-    // where a mode-gated validation says so.
+    // The skip is stated where the contract is: the `--report` JSON's
+    // `coordination` block names the `free_run` contract this replay applied,
+    // under which cross-rank lockstep equality is not applicable. The terminal
+    // prints a coordination line only for an INFERRED contract
+    // (`render_coordination_line`).
     if coordination == CoordinationMode::FreeRun {
         return Ok(BoundaryWalk {
             summaries,
@@ -22340,7 +25757,7 @@ fn push_topic_violations(
     topic: &str,
     recorded_count: usize,
     replayed_count: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<&crate::replay_value_diff::ByteVerdict>,
     // Per WRITER, the count/byte inputs of a label-partitioned
     // topic. `None` — every single-writer topic, and every multi-publisher one
     // the capture could not fully attribute — reports exactly as an unpartitioned
@@ -22381,16 +25798,7 @@ fn push_topic_violations(
     // topic-level triage above is untouched: a topic that produced nothing at
     // all is still ONE `MissingTopic`, not one per writer.
     if let Some(parts) = partitions {
-        for (writer, counts) in parts {
-            push_stream_violations(
-                topic,
-                Some(writer),
-                counts.recorded,
-                counts.replayed,
-                counts.byte_violation,
-                violations,
-            );
-        }
+        push_partition_violations(topic, parts, violations);
         return;
     }
     push_stream_violations(
@@ -22401,6 +25809,526 @@ fn push_topic_violations(
         byte_violation,
         violations,
     );
+}
+
+/// The count and byte verdicts of a label-partitioned topic, one writer at a
+/// time in writer order.
+fn push_partition_violations(
+    topic: &str,
+    parts: &BTreeMap<WriterKey, PartitionCounts>,
+    violations: &mut Vec<Violation>,
+) {
+    for (writer, counts) in parts {
+        push_stream_violations(
+            topic,
+            Some(writer),
+            counts.recorded,
+            counts.replayed,
+            counts.byte_violation.as_ref(),
+            violations,
+        );
+    }
+}
+
+/// How the capture summaries of one topic, one per pass that captured it in
+/// pass order, are judged ([`judge_passes`]).
+#[derive(Debug)]
+enum PassJudgement<'a> {
+    /// One summary stands for the topic: its only capture, or none at all,
+    /// with `alone_in: None`; or, with `alone_in: Some(rank)`, the only pass
+    /// of several whose own writers published a frame of it, which neither
+    /// partitioned nor injected it.
+    One {
+        summary: Option<&'a CaptureSummary>,
+        alone_in: Option<u32>,
+    },
+    /// Every pass partitioned the topic: the union of their partitions
+    /// ([`merge_partitioned_summaries`]).
+    Merged(Box<CaptureSummary>),
+    /// Several passes captured the topic and at least one did not partition
+    /// it ([`SplitPasses`]).
+    Split,
+}
+
+/// Choose how the capture summaries of one topic are judged. PURE.
+///
+/// A pass captures a topic when its rank runs a writer of it other than a
+/// driver. A pass that did not partition the topic and injected none of its
+/// frames captured its own writers' frames alone. Where it is the only pass
+/// whose own writers published a frame of the topic
+/// ([`CaptureSummary::own_replayed`]), it is judged alone against every
+/// recorded frame: the other passes' writers published nothing, so a recorded
+/// frame of theirs is one this stream lacks, and the stream fails. The frames
+/// another pass captured are then recorded frames its injector re-published,
+/// which no writer the candidate runs published.
+fn judge_passes(summaries: &[CaptureSummary]) -> PassJudgement<'_> {
+    if summaries.len() <= 1 {
+        return PassJudgement::One {
+            summary: summaries.first(),
+            alone_in: None,
+        };
+    }
+    if let Some(merged) = merge_partitioned_summaries(summaries) {
+        return PassJudgement::Merged(Box::new(merged));
+    }
+    let mut publishing = summaries.iter().filter(|s| s.own_replayed() > 0);
+    if let (Some(only), None) = (publishing.next(), publishing.next()) {
+        if only.partition_counts.is_none() && only.injected == 0 {
+            return PassJudgement::One {
+                summary: Some(only),
+                alone_in: Some(only.rank),
+            };
+        }
+    }
+    PassJudgement::Split
+}
+
+/// The passes of a topic [`judge_passes`] splits, apart by how each captured
+/// it.
+struct SplitPasses<'a> {
+    /// Every pass that captured the topic, in pass order.
+    all: &'a [CaptureSummary],
+    /// The union of the partitions of the passes that partitioned the topic
+    /// ([`merge_partitioned_summaries`]), `None` when none did.
+    merged: Option<CaptureSummary>,
+    /// The passes that captured the topic as one stream, in pass order.
+    one_stream: Vec<&'a CaptureSummary>,
+    /// The recorded frames of the drivers no one-stream pass runs that the
+    /// passes' injectors re-published, a partitioned pass's included, each
+    /// driver's counted once, as the most any one of them re-published
+    /// ([`CaptureSummary::injected_drivers`]). No pass's own writers publish
+    /// them, no partition holds them, and every recorded frame no partition
+    /// holds counts them.
+    driver_copies: usize,
+}
+
+impl<'a> SplitPasses<'a> {
+    /// Split `all`, each driver's rank read off `driver_rank`.
+    fn of(all: &'a [CaptureSummary], driver_rank: impl Fn(&str) -> Option<u32>) -> Self {
+        let (partitioned, one_stream): (Vec<&CaptureSummary>, Vec<&CaptureSummary>) =
+            all.iter().partition(|s| s.partition_counts.is_some());
+        // A driver a one-stream pass runs is counted by that pass's own
+        // writers' frames, so another pass's copies of it are not counted.
+        // A partitioned pass leaves its injector's frames out of every
+        // partition, so its copies of a driver count here like a one-stream
+        // pass's.
+        let stream_ranks: BTreeSet<u32> = one_stream.iter().map(|s| s.rank).collect();
+        let mut copies: BTreeMap<&str, usize> = BTreeMap::new();
+        for s in all {
+            for (driver, &n) in &s.injected_drivers {
+                if driver_rank(driver).is_some_and(|rank| stream_ranks.contains(&rank)) {
+                    continue;
+                }
+                let most = copies.entry(&**driver).or_insert(0);
+                *most = (*most).max(n);
+            }
+        }
+        Self {
+            all,
+            merged: merge_partitioned_summaries(partitioned),
+            one_stream,
+            driver_copies: copies.values().sum(),
+        }
+    }
+
+    /// The writers the partitioned passes run, each with its counts.
+    fn parts(&self) -> Option<&BTreeMap<WriterKey, PartitionCounts>> {
+        self.merged
+            .as_ref()
+            .and_then(|m| m.partition_counts.as_ref())
+    }
+
+    /// The frames counted as replayed on the topic: those every pass's own
+    /// writers published ([`CaptureSummary::own_replayed`]), and the driver
+    /// copies ([`Self::driver_copies`]).
+    fn replayed(&self) -> usize {
+        self.all
+            .iter()
+            .map(CaptureSummary::own_replayed)
+            .sum::<usize>()
+            .saturating_add(self.driver_copies)
+    }
+
+    /// Of the topic's `recorded_count` frames, those no partition holds, a
+    /// driver's included.
+    fn stream_recorded(&self, recorded_count: usize) -> usize {
+        let partitioned: usize = self
+            .parts()
+            .map_or(0, |p| p.values().map(|c| c.recorded).sum());
+        recorded_count.saturating_sub(partitioned)
+    }
+
+    /// The frames the one-stream passes' own writers published, and the
+    /// driver copies ([`Self::driver_copies`]).
+    fn stream_replayed(&self) -> usize {
+        self.one_stream
+            .iter()
+            .map(|s| s.own_replayed())
+            .sum::<usize>()
+            .saturating_add(self.driver_copies)
+    }
+
+    /// The passes whose frames are compared, in pass order: every pass that
+    /// partitioned the topic, and every one-stream pass that injected some of
+    /// its frames, whose stream holds its own writers' frames among the
+    /// recorded frames of every other writer.
+    fn judged(&self) -> Vec<&'a CaptureSummary> {
+        self.all
+            .iter()
+            .filter(|s| s.partition_counts.is_some() || s.injected > 0)
+            .collect()
+    }
+
+    /// The one-stream passes, in pass order, that injected none of the
+    /// topic's frames and captured some: their own writers' frames alone,
+    /// which no recorded stream lines up with while another pass's writers
+    /// published frames of the topic too ([`judge_passes`]).
+    fn unjudged(&self) -> Vec<&'a CaptureSummary> {
+        self.one_stream
+            .iter()
+            .copied()
+            .filter(|s| s.injected == 0 && s.replayed_count > 0)
+            .collect()
+    }
+
+    /// Whether every frame compared on the topic matched its recorded twin and
+    /// nothing compared fell short of the recorded frames: no partitioned
+    /// writer and no injecting pass carries a byte verdict, no partitioned
+    /// writer published fewer frames than it recorded, and the one-stream
+    /// passes' own writers published no fewer than the recorded frames no
+    /// partition holds. A pass of its own writers' frames alone is not
+    /// compared, so its byte verdict is not read.
+    fn tail_clean(&self, recorded_count: usize) -> bool {
+        self.merged
+            .as_ref()
+            .is_none_or(|m| !m.any_byte_violation() && m.no_writer_under_produced())
+            && self
+                .one_stream
+                .iter()
+                .all(|s| s.injected == 0 || s.byte_violation.is_none())
+            && self.stream_replayed() >= self.stream_recorded(recorded_count)
+    }
+
+    /// The ranks whose ragged shutdown tails explain the topic's trailing
+    /// extra frames ([`tail_extra_ranks`]): its partitioned writers' writer by
+    /// writer, and the frames the one-stream passes' own writers published past
+    /// the recorded frames no partition holds within the windows of those
+    /// passes' ranks together.
+    fn tail_extra_ranks(
+        &self,
+        recorded_count: usize,
+        per_step: usize,
+        tail_width: impl Fn(u32) -> usize,
+        writer_rank: impl Fn(&WriterKey) -> Option<u32>,
+    ) -> Option<Vec<u32>> {
+        let stream_ranks: BTreeSet<u32> = self
+            .one_stream
+            .iter()
+            .filter(|s| s.own_replayed() > 0)
+            .map(|s| s.rank)
+            .collect();
+        tail_extra_ranks(
+            self.parts(),
+            &stream_ranks,
+            self.stream_replayed()
+                .saturating_sub(self.stream_recorded(recorded_count)),
+            per_step,
+            tail_width,
+            writer_rank,
+        )
+    }
+}
+
+/// What [`push_split_violations`] could not judge: the passes that captured a
+/// split topic as one stream of their own writers' frames alone, beside other
+/// passes whose writers published frames of it too, by rank, and the verdicts
+/// their one stream reads against every recorded frame, which say nothing of
+/// the candidate.
+#[derive(Debug)]
+struct SplitUnjudged {
+    ranks: Vec<u32>,
+    withheld: Vec<Violation>,
+}
+
+/// The machine token of a [`DeclinedFrameComparison`] whose topic
+/// [`push_split_violations`] could not judge.
+const SPLIT_FRAMES_UNATTRIBUTED: &str = "split_topic_frames_unattributed";
+
+/// The [`DeclinedFrameComparison::reason`] of a [`SPLIT_FRAMES_UNATTRIBUTED`]
+/// decline.
+const SPLIT_FRAMES_UNATTRIBUTED_REASON: &str = "the topic's writers run in several processes \
+     or executor units, and those these ranks name could not attribute its recorded frames to \
+     their writers: the frames each captured, its own writers' alone, were not compared, since \
+     another one captured frames of the topic too and no recorded stream lines up with them. \
+     A bag that labels each frame with its writer, within the verifier's record budget, \
+     compares each writer where it runs";
+
+/// The [`SPLIT_FRAMES_UNATTRIBUTED`] row of `topic`: the ranks whose frames
+/// [`push_split_violations`] could not judge, and their one-stream verdicts
+/// verbatim. It never MATCHED, since those frames were not compared. PURE.
+fn split_unattributed_row(topic: &str, unjudged: SplitUnjudged) -> DeclinedFrameComparison {
+    DeclinedFrameComparison {
+        topic: topic.to_string(),
+        ranks: unjudged.ranks,
+        code: SPLIT_FRAMES_UNATTRIBUTED.to_string(),
+        reason: SPLIT_FRAMES_UNATTRIBUTED_REASON.to_string(),
+        matched_under_fallback: false,
+        withheld: unjudged.withheld,
+    }
+}
+
+/// The line a [`split_unattributed_row`] is logged with.
+fn log_split_unattributed_row(row: &DeclinedFrameComparison) {
+    tracing::warn!(
+        topic = %row.topic,
+        ranks = ?row.ranks,
+        code = %row.code,
+        withheld = row.withheld.len(),
+        "replay: the frame comparison on this `multi_publisher_topics` topic is \
+         DECLINED, not passed: the processes or executor units in `ranks` could not \
+         attribute its recorded frames to their writers, and the frames each \
+         captured, its own writers' alone, have no recorded stream to be compared \
+         with while another one captured frames of the topic too. It is counted in \
+         `topics_checked`, never `topics_passed`, and recorded in \
+         `declined_frame_comparisons`. A bag that labels each frame with its writer, \
+         within the verifier's record budget, compares each writer where it runs."
+    );
+}
+
+/// The [`DeclinedFrameComparison`] rows of a topic whose producing ranks
+/// `declining` stood down under a refused read log, `(code, reason)` the
+/// cause of the first of them: the read-log row, which withholds
+/// `withheld`, and, where some passes of a split topic captured frames that
+/// were not compared (`split_unjudged`), that topic's
+/// [`split_unattributed_row`] beside it. PURE.
+///
+/// One row per cause, since a row carries one code. The read-log row MATCHED
+/// only when it withholds nothing and every pass's frames of the topic were
+/// compared: a match over the frames compared says nothing of the frames that
+/// were not.
+fn read_log_decline_rows(
+    topic: &str,
+    declining: Vec<u32>,
+    (code, reason): (String, String),
+    withheld: Vec<Violation>,
+    split_unjudged: Option<SplitUnjudged>,
+) -> (DeclinedFrameComparison, Option<DeclinedFrameComparison>) {
+    let read_log = DeclinedFrameComparison {
+        topic: topic.to_string(),
+        ranks: declining,
+        code,
+        reason,
+        matched_under_fallback: withheld.is_empty() && split_unjudged.is_none(),
+        withheld,
+    };
+    (
+        read_log,
+        split_unjudged.map(|u| split_unattributed_row(topic, u)),
+    )
+}
+
+/// How [`push_split_violations`] judges a split topic's counts.
+#[derive(Debug, Clone, Copy)]
+enum SplitCounts {
+    /// Every count and byte verdict is judged. With `triage`, a topic whose
+    /// passes counted no frame ([`SplitPasses::replayed`]) is one
+    /// `MissingTopic`, and one whose bag holds no frame one `ExtraTopic`, as
+    /// [`push_topic_violations`] judges a topic; the caller turns it off on a
+    /// topic a driver shares that a pass partitioned, whose partitions leave
+    /// the driver's frames out.
+    Judged { triage: bool },
+    /// The trailing extra frames lie within the ragged shutdown tails
+    /// ([`SplitPasses::tail_extra_ranks`]) of a topic whose compared frames
+    /// all matched and fell short nowhere ([`SplitPasses::tail_clean`]): no
+    /// count or byte verdict is pushed.
+    TailTolerated,
+}
+
+/// The violations of a topic several passes captured, at least one of them
+/// without partitioning it by writer, and what could not be judged. PURE.
+///
+/// The partitioned passes are judged per writer
+/// ([`merge_partitioned_summaries`]). The other passes are judged together by
+/// count: every recorded frame no partition holds, a driver's included,
+/// against the frames their own writers published, which leaves out the
+/// frames their injectors re-published ([`CaptureSummary::own_replayed`]),
+/// and the recorded frames of the drivers none of them runs that any pass's
+/// injector re-published, counted once ([`SplitPasses::driver_copies`]). A
+/// pass that injected the topic captured its own writers' frames among the
+/// recorded frames of every other writer, so its one stream is compared with
+/// every recorded frame byte for byte. `counts` says whether those count and
+/// byte verdicts are pushed. A pass that injected nothing captured its own
+/// writers' frames alone, which no recorded stream lines up with while
+/// another pass's writers published frames too, so its byte verdict and its
+/// tolerance rows are returned unjudged ([`SplitUnjudged`]), with its rank.
+/// The tolerance rows of the judged passes fold to one per field and metric
+/// in pass order ([`fold_tolerance_worsts`]).
+fn push_split_violations(
+    topic: &str,
+    recorded_count: usize,
+    passes: &SplitPasses<'_>,
+    counts: SplitCounts,
+    violations: &mut Vec<Violation>,
+) -> Option<SplitUnjudged> {
+    if let SplitCounts::Judged { triage } = counts {
+        let replayed = passes.replayed();
+        if triage {
+            if recorded_count > 0 && replayed == 0 {
+                push_topic_violations(topic, recorded_count, 0, None, None, violations);
+                return None;
+            }
+            if recorded_count == 0 && replayed > 0 {
+                push_topic_violations(topic, 0, replayed, None, None, violations);
+                return None;
+            }
+        }
+        if let Some(parts) = passes.parts() {
+            push_partition_violations(topic, parts, violations);
+        }
+        push_stream_violations(
+            topic,
+            None,
+            passes.stream_recorded(recorded_count),
+            passes.stream_replayed(),
+            None,
+            violations,
+        );
+        for s in passes.one_stream.iter().filter(|s| s.injected > 0) {
+            if let Some(bv) = &s.byte_violation {
+                violations.push(byte_mismatch_violation(topic, None, bv));
+            }
+        }
+    }
+    violations.extend(tolerance_rows(
+        topic,
+        &fold_tolerance_worsts(
+            passes
+                .judged()
+                .into_iter()
+                .map(|s| s.tolerance_worsts.as_slice()),
+        ),
+    ));
+    let unjudged = passes.unjudged();
+    if unjudged.is_empty() {
+        return None;
+    }
+    let mut ranks: Vec<u32> = unjudged.iter().map(|s| s.rank).collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+    let mut withheld = Vec::new();
+    for s in &unjudged {
+        if let Some(bv) = &s.byte_violation {
+            withheld.push(byte_mismatch_violation(topic, None, bv));
+        }
+        withheld.extend(tolerance_rows(topic, &s.tolerance_worsts));
+    }
+    Some(SplitUnjudged { ranks, withheld })
+}
+
+/// The capture summaries of one topic, from every pass that captured it in
+/// pass order, folded into one when every one of them partitioned the topic
+/// by writer; `None` when one did not or there is none. PURE.
+///
+/// A pass partitions a topic over the writers its rank runs, and a writer runs
+/// in one rank, so the fold is the union of the passes' partitions. A
+/// partition two passes both hold has its counts added, keeps the first
+/// pass's byte violation, so no captured frame drops out of the verdict, and
+/// keeps the larger recorded burst ([`PartitionCounts::burst`]). The
+/// fold's frame count is its partitions' sum, its tolerance worsts fold to one
+/// per field and metric ([`fold_tolerance_worsts`]), its injected count is the
+/// passes' sum, which no partition counts, its injected driver frames are
+/// none, since no verdict on a partitioned topic reads them, and its rank is
+/// the first pass's.
+fn merge_partitioned_summaries<'a>(
+    summaries: impl IntoIterator<Item = &'a CaptureSummary>,
+) -> Option<CaptureSummary> {
+    let mut parts: BTreeMap<WriterKey, PartitionCounts> = BTreeMap::new();
+    let mut worsts: Vec<&[FieldMetric]> = Vec::new();
+    let mut first_rank: Option<u32> = None;
+    let mut injected = 0usize;
+    for summary in summaries {
+        let counts = summary.partition_counts.as_ref()?;
+        first_rank.get_or_insert(summary.rank);
+        injected = injected.saturating_add(summary.injected);
+        for (writer, c) in counts {
+            let kept = parts.entry(writer.clone()).or_insert(PartitionCounts {
+                recorded: 0,
+                replayed: 0,
+                byte_violation: None,
+                burst: 0,
+            });
+            kept.recorded += c.recorded;
+            kept.replayed += c.replayed;
+            kept.burst = kept.burst.max(c.burst);
+            if kept.byte_violation.is_none() {
+                kept.byte_violation = c.byte_violation.clone();
+            }
+        }
+        worsts.push(&summary.tolerance_worsts);
+    }
+    first_rank.map(|rank| CaptureSummary {
+        replayed_count: parts.values().map(|c| c.replayed).sum(),
+        byte_violation: None,
+        tolerance_worsts: fold_tolerance_worsts(worsts),
+        partition_counts: Some(parts),
+        rank,
+        injected,
+        injected_drivers: BTreeMap::new(),
+    })
+}
+
+/// The ranks whose ragged shutdown tails explain a topic's trailing extra
+/// frames, or `None` when some of them lie past every window that could
+/// explain them. PURE.
+///
+/// The writers of `partitions` are bounded writer by writer: a writer's extra
+/// frames, `replayed - recorded`, lie within its own window, the tail width
+/// of its rank (`writer_rank`) times the most frames it published in one
+/// recorded step ([`PartitionCounts::burst`], at least one), so neither another
+/// rank's tail nor another writer's frames widen it, and a writer whose rank
+/// is unknown has no window. Frames compared as one stream cannot say which
+/// writer produced an extra frame, so their window in a rank is
+/// `tail_width(rank) x per_step`, `per_step` the topic's largest one-step
+/// burst, and the stream's `stream_extra` frames lie within the room the
+/// windows of `stream_ranks`, the ranks its frames come from, keep past the
+/// partitioned writers' extra frames there. The ranks named are those whose
+/// writers produced extra frames and, where the stream has extra frames, those
+/// of `stream_ranks` with room in their window.
+fn tail_extra_ranks(
+    partitions: Option<&BTreeMap<WriterKey, PartitionCounts>>,
+    stream_ranks: &BTreeSet<u32>,
+    stream_extra: usize,
+    per_step: usize,
+    tail_width: impl Fn(u32) -> usize,
+    writer_rank: impl Fn(&WriterKey) -> Option<u32>,
+) -> Option<Vec<u32>> {
+    let window = |rank: u32| tail_width(rank).saturating_mul(per_step);
+    let mut used: BTreeMap<u32, usize> = BTreeMap::new();
+    for (writer, c) in partitions.into_iter().flatten() {
+        let over = c.replayed.saturating_sub(c.recorded);
+        if over == 0 {
+            continue;
+        }
+        let rank = writer_rank(writer)?;
+        if over > tail_width(rank).saturating_mul(c.burst.max(1)) {
+            return None;
+        }
+        let in_rank = used.entry(rank).or_insert(0);
+        *in_rank = in_rank.saturating_add(over);
+    }
+    let room = |rank: u32| window(rank).saturating_sub(used.get(&rank).copied().unwrap_or(0));
+    let mut ranks: BTreeSet<u32> = used.keys().copied().collect();
+    if stream_extra > 0 {
+        let allowance = stream_ranks
+            .iter()
+            .map(|&rank| room(rank))
+            .fold(0usize, usize::saturating_add);
+        if stream_extra > allowance {
+            return None;
+        }
+        ranks.extend(stream_ranks.iter().copied().filter(|&rank| room(rank) > 0));
+    }
+    Some(ranks.into_iter().collect())
 }
 
 /// The count + byte verdict of ONE frame stream — a whole topic when `writer`
@@ -22415,7 +26343,7 @@ fn push_stream_violations(
     writer: Option<&WriterKey>,
     recorded_count: usize,
     replayed_count: usize,
-    byte_violation: Option<ByteViolation>,
+    byte_violation: Option<&crate::replay_value_diff::ByteVerdict>,
     violations: &mut Vec<Violation>,
 ) {
     // `""` on the single-stream path, so a single-writer topic's message
@@ -22444,22 +26372,32 @@ fn push_stream_violations(
     }
 
     // The byte-level divergence (first differing frame) was found in-loop during
-    // the incremental diff — append it, matching the batch diff which reported
-    // only the FIRST differing frame per topic.
+    // the incremental diff and judged at the pass harvest; append it, matching
+    // the batch diff which reported only the FIRST differing frame per topic.
     if let Some(bv) = byte_violation {
-        violations.push(Violation {
-            topic: topic.to_string(),
-            class: ViolationClass::ByteMismatch {
-                index: bv.index,
-                first_diff_byte_offset: bv.first_diff_byte_offset,
-                recorded_len: bv.recorded_len,
-                replayed_len: bv.replayed_len,
-            },
-            detail: format!(
-                "frame {} differs at byte {} on '{topic}'{scope} (recorded {} B, replayed {} B)",
-                bv.index, bv.first_diff_byte_offset, bv.recorded_len, bv.replayed_len
-            ),
-        });
+        violations.push(byte_mismatch_violation(topic, writer, bv));
+    }
+}
+
+/// The [`ViolationClass::ByteMismatch`] of one frame stream's first byte
+/// divergence: a whole topic's when `writer` is `None`, one writer's
+/// partition's when it is `Some`.
+fn byte_mismatch_violation(
+    topic: &str,
+    writer: Option<&WriterKey>,
+    bv: &crate::replay_value_diff::ByteVerdict,
+) -> Violation {
+    let scope = writer.map_or_else(String::new, |w| format!(" from writer {w}"));
+    Violation {
+        topic: topic.to_string(),
+        class: ViolationClass::ByteMismatch {
+            index: bv.index,
+            first_diff_byte_offset: bv.first_diff_byte_offset,
+            recorded_len: bv.recorded_len,
+            replayed_len: bv.replayed_len,
+            difference: crate::replay_value_diff::report_entry(&bv.difference),
+        },
+        detail: crate::replay_value_diff::byte_mismatch_detail(topic, &scope, bv),
     }
 }
 
@@ -25859,14 +29797,42 @@ fn describe_fire(f: &FireTuple) -> String {
 // Environment divergence
 // ===========================================================================
 
-/// Compare the CURRENT process environment against the bag's `env.json`
-/// (WARN-only). Iterates the RECORDED entries (the bag is the golden): a
-/// recorded name absent now is `Missing`; a recorded plain value that differs is
-/// `ValueChanged`; a recorded redacted `fnv64` the current value does not hash
-/// to is `HashChanged`; a names-only (null) entry is presence-checked only.
-/// Extra current-only variables are NOT reported (a replay host legitimately
-/// has more). Returns divergences in the recorded object's key order.
+/// Compare the replay process's own environment with the bag's `env.json`.
+///
+/// [`compare_env_against`] over `std::env::vars_os()`: every variable whose
+/// name is UTF-8 (a recorded name always is, since `env.json` is JSON), with its
+/// value as raw bytes, so a value that is not UTF-8 compares as the bytes it is
+/// rather than reading as absent.
 fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let current: BTreeMap<String, Vec<u8>> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            name.to_str()
+                .map(|name| (name.to_string(), value.as_bytes().to_vec()))
+        })
+        .collect();
+    compare_env_against(env_json, &current)
+}
+
+/// Compare `current` (name to raw value bytes) with the bag's `env.json`. Pure.
+///
+/// The RECORDED entries are walked first: a recorded name absent now is
+/// `Missing`; a recorded plain value the current bytes differ from is
+/// `ValueChanged`; a recorded redacted `fnv64` the current bytes do not hash to
+/// is `HashChanged`; a names-only (null) entry is presence-checked only; a
+/// redacted object without an `fnv64` and a bool or number carry nothing to
+/// compare and are skipped. Then every CURRENT name the bag did not record is
+/// `Added` when [`env_reader`] says it can change the re-execution, and ignored
+/// otherwise (a replay host legitimately has more shell and session variables
+/// than the recording host).
+///
+/// No `env.json` means no comparison at all, `Added` included. The result is
+/// sorted by name, so its order depends on neither the JSON object's key order
+/// nor the environment's.
+fn compare_env_against(
+    env_json: Option<&[u8]>,
+    current: &BTreeMap<String, Vec<u8>>,
+) -> Vec<EnvDivergence> {
     let Some(bytes) = env_json else {
         return Vec::new();
     };
@@ -25878,12 +29844,11 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
     };
     let mut out = Vec::new();
     for (name, value) in &map {
-        let current = std::env::var(name).ok();
+        let now = current.get(name);
         match value {
-            // Names-only: presence check only. (Match-arm guard rather than
-            // a nested `if` — newer stable clippy collapses the two,
-            // deny-level in CI.)
-            serde_json::Value::Null if current.is_none() => {
+            // Names-only: presence check only. A match-arm guard rather than a
+            // nested `if`, which newer stable clippy collapses (deny-level in CI).
+            serde_json::Value::Null if now.is_none() => {
                 out.push(EnvDivergence {
                     name: name.clone(),
                     kind: EnvDivergenceKind::Missing,
@@ -25891,26 +29856,28 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                 });
             }
             serde_json::Value::Null => {}
-            serde_json::Value::String(recorded_value) => match current {
+            serde_json::Value::String(recorded_value) => match now {
                 None => out.push(EnvDivergence {
                     name: name.clone(),
                     kind: EnvDivergenceKind::Missing,
                     detail: format!("recorded variable '{name}' is absent at replay"),
                 }),
-                Some(cur) if cur != *recorded_value => out.push(EnvDivergence {
-                    name: name.clone(),
-                    kind: EnvDivergenceKind::ValueChanged,
-                    detail: format!("variable '{name}' value changed since recording"),
-                }),
+                Some(cur) if cur.as_slice() != recorded_value.as_bytes() => {
+                    out.push(EnvDivergence {
+                        name: name.clone(),
+                        kind: EnvDivergenceKind::ValueChanged,
+                        detail: format!("variable '{name}' value changed since recording"),
+                    })
+                }
                 Some(_) => {}
             },
             serde_json::Value::Object(obj) => {
                 // Redacted shape: {"redacted": true, "fnv64": "<hex>"}.
                 let recorded_fnv = obj.get("fnv64").and_then(serde_json::Value::as_str);
                 let Some(recorded_fnv) = recorded_fnv else {
-                    continue; // unknown object shape — nothing to compare.
+                    continue; // An unknown object shape has nothing to compare.
                 };
-                match current {
+                match now {
                     None => out.push(EnvDivergence {
                         name: name.clone(),
                         kind: EnvDivergenceKind::Missing,
@@ -25919,8 +29886,7 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                         ),
                     }),
                     Some(cur) => {
-                        let cur_fnv =
-                            format!("{:016x}", cerulion_core::wire::fnv1a_hash(cur.as_bytes()));
+                        let cur_fnv = format!("{:016x}", cerulion_core::wire::fnv1a_hash(cur));
                         if cur_fnv != recorded_fnv {
                             out.push(EnvDivergence {
                                 name: name.clone(),
@@ -25934,10 +29900,912 @@ fn compare_env(env_json: Option<&[u8]>) -> Vec<EnvDivergence> {
                     }
                 }
             }
-            _ => {} // unexpected scalar (bool/number) — no value semantics.
+            _ => {} // An unexpected scalar (bool or number) has no value semantics.
         }
     }
+    for name in current.keys() {
+        if !map.contains_key(name) && env_reader(name).is_some() {
+            out.push(EnvDivergence {
+                name: name.clone(),
+                kind: EnvDivergenceKind::Added,
+                detail: format!("variable '{name}' is set at replay but absent from the recording"),
+            });
+        }
+    }
+    // Names are unique (a recorded name is never also `Added`), so the order is
+    // total.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The NOTE line for `n` differing variables that Cerulion does not read
+/// ([`env_reader`] gives `None`), or `None` for zero. It names no variable and
+/// no value.
+fn render_other_env_note(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some(
+            "NOTE: 1 other environment variable differs from the recording. Cerulion does not \
+             read it to decide what the re-execution runs, so it matters only if code in one of \
+             your nodes reads it. Run with -v to list it."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "NOTE: {n} other environment variables differ from the recording. Cerulion does not \
+             read them to decide what the re-execution runs, so they matter only if code in one \
+             of your nodes reads them. Run with -v to list them."
+        )),
+    }
+}
+
+/// The terminal lines for `divergences`, the one source of that text for the
+/// verdict ([`render_verdict`]) and the neutral resim summary.
+///
+/// One `WARNING:` line for each variable that can change the re-execution
+/// ([`env_reader`]), in list order, then at most one `NOTE:` that counts every
+/// other one. No line carries a value or a hash, and the NOTE names no
+/// variable: `-v` lists those (the engine's `info` line for each), and the
+/// `--report` JSON carries every divergence in full. A name is printed escaped
+/// (`str::escape_debug`), so a crafted `env.json` key cannot start a line of its
+/// own.
+pub(crate) fn render_env_divergence_lines(divergences: &[EnvDivergence]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut others = 0usize;
+    for d in divergences {
+        match env_reader(&d.name) {
+            Some(reader) => lines.push(format!(
+                "WARNING: environment variable {} {}. {}",
+                d.name.escape_debug(),
+                d.kind.change_phrase(),
+                reader.reason()
+            )),
+            None => others += 1,
+        }
+    }
+    lines.extend(render_other_env_note(others));
+    lines
+}
+
+#[cfg(test)]
+mod env_divergence_tests {
+    use super::*;
+
+    /// A current environment from hand-written pairs.
+    fn current(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.to_vec()))
+            .collect()
+    }
+
+    /// `(name, kind tag, detail, read_by)` as the `--report` JSON states them.
+    type Row = (String, String, String, serde_json::Value);
+
+    /// Each divergence as a [`Row`], read through the `--report` serialization
+    /// so the JSON contract is what is compared.
+    fn project(divergences: &[EnvDivergence]) -> Vec<Row> {
+        divergences
+            .iter()
+            .map(|d| {
+                let json = serde_json::to_value(d).expect("an entry serializes");
+                (
+                    json["name"].as_str().expect("name").to_string(),
+                    json["kind"]["kind"].as_str().expect("kind tag").to_string(),
+                    json["detail"].as_str().expect("detail").to_string(),
+                    json["read_by"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn row(name: &str, kind: &str, detail: &str, read_by: Option<&str>) -> Row {
+        (
+            name.to_string(),
+            kind.to_string(),
+            detail.to_string(),
+            read_by.map_or(serde_json::Value::Null, |r| {
+                serde_json::Value::String(r.to_string())
+            }),
+        )
+    }
+
+    #[test]
+    fn the_variables_cerulion_the_linker_and_python_read_are_classified_by_reader() {
+        let table = [
+            ("CERULION_DRAIN_DISCIPLINE", EnvReader::Cerulion),
+            ("CERULION_FIRE_THREADS", EnvReader::Cerulion),
+            ("IOX2_LOG_LEVEL", EnvReader::Cerulion),
+            ("CERULION_KEYBOARD_LAYOUT", EnvReader::Cerulion),
+            ("CERULION_APIKEY", EnvReader::Cerulion),
+            ("LD_LIBRARY_PATH", EnvReader::DynamicLinker),
+            ("LD_PRELOAD", EnvReader::DynamicLinker),
+            ("DYLD_INSERT_LIBRARIES", EnvReader::DynamicLinker),
+            ("DYLD_FALLBACK_LIBRARY_PATH", EnvReader::DynamicLinker),
+            ("PYTHONPATH", EnvReader::Python),
+            ("PYTHONHASHSEED", EnvReader::Python),
+            ("CARGO_TARGET_DIR", EnvReader::NodeLibraryLookup),
+        ];
+        for (name, reader) in table {
+            assert_eq!(env_reader(name), Some(reader), "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_session_library_and_secret_named_variables_are_not_classified() {
+        let none = [
+            "SHLVL",
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "TERM_SESSION_ID",
+            "ROS_DOMAIN_ID",
+            "RMW_IMPLEMENTATION",
+            "AMENT_PREFIX_PATH",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "LDFLAGS",
+            "LD",
+            "CARGO_HOME",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_TARGET_DIRS",
+            "CARGO_TARGET",
+            "cargo_target_dir",
+            "CERULION",
+            "IOX2",
+            "DYLD",
+            "cerulion_drain_discipline",
+            "ld_library_path",
+            "pythonpath",
+            "",
+            // Secret-marked names, by the recorder's own marker rule.
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "CERULION_KEY2",
+            "CERULION_ACCOUNTD_SUPABASE_JWT_SECRET",
+            "IOX2_SECRET",
+            "LD_PASSWORD",
+            "PYTHON_KEYS",
+        ];
+        for name in none {
+            assert_eq!(env_reader(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_changed_hash_and_a_changed_plain_value_are_reported_with_their_details() {
+        // FNV-1a 64 of "a" is the published test vector af63dc4c8601ec8c, and of
+        // "foobar" 85944171f73967e8.
+        let env = br#"{"SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("SHLVL", b"foobar")])
+            )),
+            vec![row(
+                "SHLVL",
+                "HashChanged",
+                "redacted variable 'SHLVL' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                None,
+            )]
+        );
+
+        let env = br#"{"CERULION_X": "a"}"#;
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("CERULION_X", b"b")])
+            )),
+            vec![row(
+                "CERULION_X",
+                "ValueChanged",
+                "variable 'CERULION_X' value changed since recording",
+                Some("cerulion"),
+            )]
+        );
+    }
+
+    #[test]
+    fn matching_values_and_hashes_report_nothing() {
+        // FNV-1a 64 of "" is the offset basis cbf29ce484222325, of "a"
+        // af63dc4c8601ec8c.
+        let env = br#"{
+            "EMPTY": {"redacted": true, "fnv64": "cbf29ce484222325"},
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "CERULION_X": "a",
+            "PRESENT_NAME": null
+        }"#;
+        let now = current(&[
+            ("EMPTY", b""),
+            ("SHLVL", b"a"),
+            ("CERULION_X", b"a"),
+            ("PRESENT_NAME", b"anything"),
+        ]);
+        assert!(compare_env_against(Some(env), &now).is_empty());
+    }
+
+    #[test]
+    fn a_bag_without_env_json_is_never_compared_even_for_added_variables() {
+        let now = current(&[("CERULION_A", b"1"), ("LD_PRELOAD", b"/x.so")]);
+        assert!(compare_env_against(None, &now).is_empty());
+    }
+
+    #[test]
+    fn every_recorded_arm_reports_its_own_kind_and_detail() {
+        let env = br#"{
+            "NAMES_ONLY_ABSENT": null,
+            "NAMES_ONLY_PRESENT": null,
+            "PLAIN_ABSENT": "v",
+            "REDACTED_ABSENT": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "REDACTED_NO_HASH": {"redacted": true},
+            "A_BOOL": true,
+            "A_NUMBER": 3
+        }"#;
+        let now = current(&[
+            ("NAMES_ONLY_PRESENT", b"x"),
+            ("REDACTED_NO_HASH", b"x"),
+            ("A_BOOL", b"false"),
+            ("A_NUMBER", b"4"),
+        ]);
+        assert_eq!(
+            project(&compare_env_against(Some(env), &now)),
+            vec![
+                row(
+                    "NAMES_ONLY_ABSENT",
+                    "Missing",
+                    "recorded (names-only) variable 'NAMES_ONLY_ABSENT' is absent at replay",
+                    None,
+                ),
+                row(
+                    "PLAIN_ABSENT",
+                    "Missing",
+                    "recorded variable 'PLAIN_ABSENT' is absent at replay",
+                    None,
+                ),
+                row(
+                    "REDACTED_ABSENT",
+                    "Missing",
+                    "recorded (redacted) variable 'REDACTED_ABSENT' is absent at replay",
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loud_variable_set_only_at_replay_is_added_in_name_order() {
+        let now = current(&[
+            ("CERULION_B", b"2"),
+            ("LD_PRELOAD", b"/x.so"),
+            ("CERULION_A", b"1"),
+        ]);
+        assert_eq!(
+            project(&compare_env_against(Some(b"{}"), &now)),
+            vec![
+                row(
+                    "CERULION_A",
+                    "Added",
+                    "variable 'CERULION_A' is set at replay but absent from the recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "CERULION_B",
+                    "Added",
+                    "variable 'CERULION_B' is set at replay but absent from the recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "LD_PRELOAD",
+                    "Added",
+                    "variable 'LD_PRELOAD' is set at replay but absent from the recording",
+                    Some("dynamic_linker"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn other_and_secret_variables_set_only_at_replay_are_not_added() {
+        let env = br#"{"CERULION_X": {"redacted": true}}"#;
+        let now = current(&[
+            ("SHLVL", b"2"),
+            ("PATH", b"/bin"),
+            ("HOME", b"/h"),
+            ("OMP_NUM_THREADS", b"4"),
+            ("CERULION_RCP_TOKEN", b"t"),
+            // Recorded, as an object with no hash: skipped, never Added.
+            ("CERULION_X", b"x"),
+        ]);
+        assert!(compare_env_against(Some(env), &now).is_empty());
+    }
+
+    #[test]
+    fn a_value_that_is_not_utf8_is_compared_as_bytes_and_never_reads_as_absent() {
+        let env =
+            br#"{"CERULION_X": "a", "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let now = current(&[("CERULION_X", &[0xff]), ("SHLVL", &[0xff])]);
+        let kinds: Vec<(String, String)> = project(&compare_env_against(Some(env), &now))
+            .into_iter()
+            .map(|(name, kind, _, _)| (name, kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("CERULION_X".to_string(), "ValueChanged".to_string()),
+                ("SHLVL".to_string(), "HashChanged".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shape_the_gate_refuses_yields_no_divergence() {
+        let now = current(&[("CERULION_A", b"1")]);
+        assert!(compare_env_against(Some(b"[1, 2]"), &now).is_empty());
+        assert!(compare_env_against(Some(b"{not json"), &now).is_empty());
+    }
+
+    #[test]
+    fn a_mixed_list_is_sorted_by_name_whatever_the_key_order() {
+        // Keys deliberately out of order in the document.
+        let env = br#"{
+            "ZZ_SESSION": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "PYTHONPATH": "/old",
+            "AA_GONE": null
+        }"#;
+        let now = current(&[
+            ("ZZ_SESSION", b"foobar"),
+            ("PYTHONPATH", b"/new"),
+            ("DYLD_INSERT_LIBRARIES", b"/x.dylib"),
+        ]);
+        let names: Vec<String> = compare_env_against(Some(env), &now)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "AA_GONE",
+                "DYLD_INSERT_LIBRARIES",
+                "PYTHONPATH",
+                "ZZ_SESSION"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_comparison_is_identical_across_runs_and_insertion_orders() {
+        let env =
+            br#"{"SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}, "CERULION_X": "a"}"#;
+        let pairs: [(&str, &[u8]); 4] = [
+            ("SHLVL", b"foobar"),
+            ("CERULION_X", b"b"),
+            ("LD_PRELOAD", b"/x.so"),
+            ("HOME", b"/h"),
+        ];
+        let forward = current(&pairs);
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let reversed = current(&reversed_pairs);
+        let first = compare_env_against(Some(env), &forward);
+        let second = compare_env_against(Some(env), &forward);
+        let other_order = compare_env_against(Some(env), &reversed);
+        assert_eq!(project(&first), project(&second));
+        assert_eq!(project(&first), project(&other_order));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+    }
+
+    #[test]
+    fn a_report_entry_carries_read_by_after_the_existing_keys() {
+        let entries = [
+            EnvDivergence {
+                name: "CERULION_DRAIN_DISCIPLINE".to_string(),
+                kind: EnvDivergenceKind::Added,
+                detail: "variable 'CERULION_DRAIN_DISCIPLINE' is set at replay but absent from \
+                         the recording"
+                    .to_string(),
+            },
+            EnvDivergence {
+                name: "SHLVL".to_string(),
+                kind: EnvDivergenceKind::HashChanged,
+                detail: "d".to_string(),
+            },
+            EnvDivergence {
+                name: "PYTHONHOME".to_string(),
+                kind: EnvDivergenceKind::Missing,
+                detail: "d".to_string(),
+            },
+            EnvDivergence {
+                name: "LD_LIBRARY_PATH".to_string(),
+                kind: EnvDivergenceKind::ValueChanged,
+                detail: "d".to_string(),
+            },
+        ];
+        let rendered: Vec<String> = entries
+            .iter()
+            .map(|e| serde_json::to_string(e).expect("serializes"))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                r#"{"name":"CERULION_DRAIN_DISCIPLINE","kind":{"kind":"Added"},"detail":"variable 'CERULION_DRAIN_DISCIPLINE' is set at replay but absent from the recording","read_by":"cerulion"}"#,
+                r#"{"name":"SHLVL","kind":{"kind":"HashChanged"},"detail":"d","read_by":null}"#,
+                r#"{"name":"PYTHONHOME","kind":{"kind":"Missing"},"detail":"d","read_by":"python"}"#,
+                r#"{"name":"LD_LIBRARY_PATH","kind":{"kind":"ValueChanged"},"detail":"d","read_by":"dynamic_linker"}"#,
+            ]
+        );
+    }
+
+    fn divergence(name: &str, kind: EnvDivergenceKind) -> EnvDivergence {
+        EnvDivergence {
+            name: name.to_string(),
+            kind,
+            detail: format!("detail of {name}"),
+        }
+    }
+
+    const NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
+                            Cerulion does not read it to decide what the re-execution runs, so \
+                            it matters only if code in one of your nodes reads it. Run with -v \
+                            to list it.";
+
+    #[test]
+    fn the_change_label_is_the_serialized_kind_tag() {
+        for (kind, tag) in [
+            (EnvDivergenceKind::Missing, "Missing"),
+            (EnvDivergenceKind::ValueChanged, "ValueChanged"),
+            (EnvDivergenceKind::HashChanged, "HashChanged"),
+            (EnvDivergenceKind::Added, "Added"),
+        ] {
+            assert_eq!(kind.label(), tag);
+            assert_eq!(
+                serde_json::to_value(&kind).expect("serializes")["kind"],
+                serde_json::Value::String(tag.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_and_reader_renders_its_exact_warning_line() {
+        let table = [
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE has a different value \
+                 than in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE has a different value \
+                 than in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE was set in the \
+                 recording and is not set now. Cerulion reads its settings from CERULION_ and \
+                 IOX2_ variables, so this one can change the re-execution.",
+            ),
+            (
+                "CERULION_DRAIN_DISCIPLINE",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable CERULION_DRAIN_DISCIPLINE is set now and was not \
+                 set in the recording. Cerulion reads its settings from CERULION_ and IOX2_ \
+                 variables, so this one can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable LD_PRELOAD has a different value than in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable LD_PRELOAD has a different value than in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable LD_PRELOAD was set in the recording and is not \
+                 set now. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "LD_PRELOAD",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::ValueChanged,
+                "WARNING: environment variable PYTHONHASHSEED has a different value than in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::HashChanged,
+                "WARNING: environment variable PYTHONHASHSEED has a different value than in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable PYTHONHASHSEED was set in the recording and is \
+                 not set now. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "PYTHONHASHSEED",
+                EnvDivergenceKind::Added,
+                "WARNING: environment variable PYTHONHASHSEED is set now and was not set in the \
+                 recording. The Python interpreter that runs Python nodes reads it, so it can \
+                 change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::ValueChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::HashChanged,
+                CARGO_TARGET_DIR_CHANGED,
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Missing,
+                "WARNING: environment variable CARGO_TARGET_DIR was set in the recording and is \
+                 not set now. Cerulion reads it to choose the build directory it loads each node \
+                 library from, so it can change the re-execution.",
+            ),
+            (
+                "CARGO_TARGET_DIR",
+                EnvDivergenceKind::Added,
+                CARGO_TARGET_DIR_ADDED,
+            ),
+        ];
+        for (name, kind, expected) in table {
+            assert_eq!(
+                render_env_divergence_lines(&[divergence(name, kind)]),
+                vec![expected.to_string()]
+            );
+        }
+    }
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` whose value or hash differs,
+    /// hand-written.
+    const CARGO_TARGET_DIR_CHANGED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR has a different value than in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    /// The WARNING line for a `CARGO_TARGET_DIR` set only at replay,
+    /// hand-written.
+    const CARGO_TARGET_DIR_ADDED: &str =
+        "WARNING: environment variable CARGO_TARGET_DIR is set now and was not set in the \
+         recording. Cerulion reads it to choose the build directory it loads each node library \
+         from, so it can change the re-execution.";
+
+    #[test]
+    fn a_changed_cargo_target_dir_is_reported_loud_on_its_own_line() {
+        // A plain recorded value (`--record-env all`) the replay shell changed,
+        // beside one differing shell variable the NOTE counts. FNV-1a 64 of "a"
+        // is the published vector af63dc4c8601ec8c, and of "foobar"
+        // 85944171f73967e8.
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[("CARGO_TARGET_DIR", b"/build/replay"), ("SHLVL", b"foobar")]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(
+            project(&divergences),
+            vec![
+                row(
+                    "CARGO_TARGET_DIR",
+                    "ValueChanged",
+                    "variable 'CARGO_TARGET_DIR' value changed since recording",
+                    Some("cerulion"),
+                ),
+                row(
+                    "SHLVL",
+                    "HashChanged",
+                    "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)",
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string(), NOTE_ONE.to_string()]
+        );
+
+        // The default recorder hashes the value: a changed hash is just as loud.
+        let env = br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#;
+        let divergences =
+            compare_env_against(Some(env), &current(&[("CARGO_TARGET_DIR", b"foobar")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "HashChanged",
+                "redacted variable 'CARGO_TARGET_DIR' hash changed since recording (recorded \
+                 af63dc4c8601ec8c, now 85944171f73967e8)",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_CHANGED.to_string()]
+        );
+
+        // Set only in the replay shell: Added, though the name is in no loud
+        // namespace.
+        let divergences =
+            compare_env_against(Some(b"{}"), &current(&[("CARGO_TARGET_DIR", b"/build/x")]));
+        assert_eq!(
+            project(&divergences),
+            vec![row(
+                "CARGO_TARGET_DIR",
+                "Added",
+                "variable 'CARGO_TARGET_DIR' is set at replay but absent from the recording",
+                Some("cerulion"),
+            )]
+        );
+        assert_eq!(
+            render_env_divergence_lines(&divergences),
+            vec![CARGO_TARGET_DIR_ADDED.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_cargo_target_dir_equal_to_the_recording_is_silent() {
+        // FNV-1a 64 of "a" is the published vector af63dc4c8601ec8c.
+        let now = current(&[("CARGO_TARGET_DIR", b"a")]);
+        for env in [
+            &br#"{"CARGO_TARGET_DIR": "a"}"#[..],
+            &br#"{"CARGO_TARGET_DIR": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}}"#[..],
+            &br#"{"CARGO_TARGET_DIR": null}"#[..],
+        ] {
+            let divergences = compare_env_against(Some(env), &now);
+            assert!(divergences.is_empty(), "{divergences:?}");
+            assert!(render_env_divergence_lines(&divergences).is_empty());
+        }
+        // Unset on both sides: nothing to compare.
+        assert!(compare_env_against(Some(b"{}"), &current(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_cargo_target_dir_lines_are_identical_across_runs_and_insertion_orders() {
+        let env = br#"{
+            "CARGO_TARGET_DIR": "/build/recorded",
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let pairs: [(&str, &[u8]); 3] = [
+            ("SHLVL", b"foobar"),
+            ("CARGO_TARGET_DIR", b"/build/replay"),
+            ("LD_PRELOAD", b"/x.so"),
+        ];
+        let mut reversed_pairs = pairs;
+        reversed_pairs.reverse();
+        let first = compare_env_against(Some(env), &current(&pairs));
+        let second = compare_env_against(Some(env), &current(&pairs));
+        let other_order = compare_env_against(Some(env), &current(&reversed_pairs));
+        let bytes = |v: &[EnvDivergence]| serde_json::to_vec(v).expect("serializes");
+        assert_eq!(bytes(&first), bytes(&second));
+        assert_eq!(bytes(&first), bytes(&other_order));
+        let lines = render_env_divergence_lines(&first);
+        assert_eq!(lines, render_env_divergence_lines(&second));
+        assert_eq!(lines, render_env_divergence_lines(&other_order));
+        assert_eq!(
+            lines,
+            vec![
+                CARGO_TARGET_DIR_CHANGED.to_string(),
+                "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                NOTE_ONE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_other_variable_renders_the_singular_note() {
+        assert_eq!(
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]),
+            vec![NOTE_ONE.to_string()]
+        );
+    }
+
+    #[test]
+    fn two_other_variables_render_the_plural_note() {
+        assert_eq!(
+            render_env_divergence_lines(&[
+                divergence("SHLVL", EnvDivergenceKind::HashChanged),
+                divergence("OLDPWD", EnvDivergenceKind::Missing),
+            ]),
+            vec![
+                "NOTE: 2 other environment variables differ from the recording. Cerulion does \
+                 not read them to decide what the re-execution runs, so they matter only if code \
+                 in one of your nodes reads them. Run with -v to list them."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn no_divergence_renders_no_line_and_loud_only_input_renders_no_note() {
+        assert!(render_env_divergence_lines(&[]).is_empty());
+        let lines = render_env_divergence_lines(&[
+            divergence("CERULION_A", EnvDivergenceKind::Added),
+            divergence("DYLD_INSERT_LIBRARIES", EnvDivergenceKind::Missing),
+        ]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.starts_with("WARNING: ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_input_renders_the_loud_lines_in_list_order_and_then_one_note() {
+        let lines = render_env_divergence_lines(&[
+            divergence("SHLVL", EnvDivergenceKind::HashChanged),
+            divergence("LD_PRELOAD", EnvDivergenceKind::Missing),
+            divergence("TERM_SESSION_ID", EnvDivergenceKind::HashChanged),
+            divergence("CERULION_A", EnvDivergenceKind::Added),
+            divergence("OMP_NUM_THREADS", EnvDivergenceKind::ValueChanged),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: environment variable LD_PRELOAD was set in the recording and is not \
+                 set now. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution."
+                    .to_string(),
+                "WARNING: environment variable CERULION_A is set now and was not set in the \
+                 recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, so \
+                 this one can change the re-execution."
+                    .to_string(),
+                "NOTE: 3 other environment variables differ from the recording. Cerulion does \
+                 not read them to decide what the re-execution runs, so they matter only if code \
+                 in one of your nodes reads them. Run with -v to list them."
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// Whether `line` holds a run of 16 hex digits, the shape of an `fnv64`.
+    fn has_hex_run(line: &str) -> bool {
+        let mut run = 0usize;
+        for c in line.chars() {
+            run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+            if run >= 16 {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn no_rendered_line_carries_a_value_a_hash_or_an_other_name() {
+        // FNV-1a 64 of "a" is af63dc4c8601ec8c; the current values hash to
+        // something else, so both entries diverge.
+        let env = br#"{
+            "SHLVL": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+            "CERULION_SECRETARY_MODE": "recorded-value",
+            "LD_LIBRARY_PATH": {"redacted": true, "fnv64": "af63dc4c8601ec8c"}
+        }"#;
+        let now = current(&[
+            ("SHLVL", b"foobar"),
+            ("CERULION_SECRETARY_MODE", b"current-value"),
+            ("LD_LIBRARY_PATH", b"/opt/lib"),
+        ]);
+        let divergences = compare_env_against(Some(env), &now);
+        assert_eq!(divergences.len(), 3, "{divergences:?}");
+        let lines = render_env_divergence_lines(&divergences);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(!has_hex_run(line), "a hash reached the terminal: {line}");
+            for value in ["foobar", "recorded-value", "current-value", "/opt/lib"] {
+                assert!(
+                    !line.contains(value),
+                    "a value reached the terminal: {line}"
+                );
+            }
+        }
+        let note = lines.last().expect("the NOTE");
+        assert!(note.starts_with("NOTE: 1 other"), "{note}");
+        assert!(
+            !note.contains("SHLVL"),
+            "the NOTE names no variable: {note}"
+        );
+        assert_eq!(lines, render_env_divergence_lines(&divergences));
+    }
+
+    #[test]
+    fn a_control_character_in_a_name_cannot_start_a_line_of_its_own() {
+        let lines = render_env_divergence_lines(&[divergence(
+            "CERULION_X\nreplay PASS: forged",
+            EnvDivergenceKind::Added,
+        )]);
+        assert_eq!(
+            lines,
+            vec![
+                "WARNING: environment variable CERULION_X\\nreplay PASS: forged is set now and \
+                 was not set in the recording. Cerulion reads its settings from CERULION_ and \
+                 IOX2_ variables, so this one can change the re-execution."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The getting-started tutorial quotes the NOTE line a resim prints for
+    /// one differing shell variable, in a fence of its own in the section that
+    /// verifies the unchanged code, names the WARNING prefix the renderer
+    /// prints, and quotes no `WARNING: env divergence` line, a prefix the
+    /// renderer does not print.
+    #[test]
+    fn the_getting_started_tutorial_quotes_the_environment_lines_the_resim_prints() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/tutorials/01-getting-started.md");
+        let tutorial = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let section = tutorial
+            .split_once("### Verify the unchanged code")
+            .expect("the tutorial verifies the unchanged code")
+            .1
+            .split_once("### Change the controller")
+            .expect("the section ends at the controller change")
+            .0;
+        let fences: Vec<&str> = section
+            .split("```")
+            .skip(1)
+            .step_by(2)
+            .map(str::trim)
+            .collect();
+        let note =
+            render_env_divergence_lines(&[divergence("SHLVL", EnvDivergenceKind::HashChanged)]);
+        assert_eq!(note.len(), 1, "{note:?}");
+        assert!(
+            fences.contains(&note[0].as_str()),
+            "the tutorial must fence the exact NOTE line: {fences:?}"
+        );
+        let loud = render_env_divergence_lines(&[divergence(
+            "CERULION_DRAIN_DISCIPLINE",
+            EnvDivergenceKind::ValueChanged,
+        )]);
+        assert!(
+            loud[0].starts_with("WARNING: environment variable "),
+            "{loud:?}"
+        );
+        assert!(
+            section.contains("`WARNING: environment variable`"),
+            "the tutorial names the WARNING prefix"
+        );
+        assert!(
+            !tutorial.contains("WARNING: env divergence"),
+            "the tutorial must not quote the `WARNING: env divergence` prefix, which the \
+             renderer does not print"
+        );
+    }
 }
 
 // ===========================================================================
@@ -26112,13 +30980,107 @@ fn is_read_log_derived_standdown(code: &str) -> bool {
 /// one of them would read "2/3 matched" while all three had in fact matched. The line
 /// says what its numbers mean.
 fn declined_counts(outcome: &ReplayOutcome) -> (usize, usize) {
-    let declined = outcome.declined_frame_comparisons.len();
-    let matched = outcome
-        .declined_frame_comparisons
-        .iter()
-        .filter(|d| d.matched_under_fallback)
-        .count();
+    let (declined, matched, _) = declined_topic_counts(outcome);
     (declined, matched)
+}
+
+/// `(declined, of which matched, of which had divergences withheld)`, counted
+/// in TOPICS. A topic declined for two causes carries a row per cause and
+/// counts once: it matched when every row of it did, and had divergences
+/// withheld when any row of it withholds one.
+fn declined_topic_counts(outcome: &ReplayOutcome) -> (usize, usize, usize) {
+    let mut by_topic: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
+    for d in &outcome.declined_frame_comparisons {
+        let (matched, withheld) = by_topic.entry(d.topic.as_str()).or_insert((true, false));
+        *matched &= d.matched_under_fallback;
+        *withheld |= !d.withheld.is_empty();
+    }
+    (
+        by_topic.len(),
+        by_topic.values().filter(|(matched, _)| *matched).count(),
+        by_topic.values().filter(|(_, withheld)| *withheld).count(),
+    )
+}
+
+/// The verdict's read-log ENFORCEMENT line, newline-terminated, or `None` when
+/// the enforcement ran clean or had nothing to do.
+///
+/// Prints when the enforcement says something that narrows the verdict: stages
+/// that could not be gated or a rank whose edges were not enforced (their
+/// intra-step arrival is whatever their queue held), and an `Enforced` run with
+/// any anomaly count above zero (a planned step never reached, a refill empty by
+/// enforcement, a consult the plan held no position for, a stage not gateable).
+/// A clean `Enforced` run, `NotApplicable` and `Lockstep` print nothing; the
+/// `--report` JSON's `read_log_enforcement` block carries every state with its
+/// counts.
+pub fn render_enforcement_line(enforcement: &ReadLogEnforcement) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    match enforcement {
+        ReadLogEnforcement::NotApplicable | ReadLogEnforcement::Lockstep => return None,
+        ReadLogEnforcement::NotGateable { stages, reasons } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: {stages} graph-produced stage(s) could NOT be \
+                 gated, so their intra-step arrival is whatever their queue held:"
+            );
+            for r in reasons {
+                let _ = writeln!(s, "  - {r}");
+            }
+        }
+        ReadLogEnforcement::NotEnforced { topics, reason } => {
+            let _ = writeln!(
+                s,
+                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
+                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
+                 whatever its queue held."
+            );
+        }
+        ReadLogEnforcement::Enforced {
+            stages,
+            steps,
+            frames_admitted,
+            consults_refused,
+            unplanned_consults,
+            enforced_empty_refills,
+            steps_not_reached,
+            stages_not_gateable,
+        } => {
+            if *steps_not_reached == 0
+                && *enforced_empty_refills == 0
+                && *unplanned_consults == 0
+                && *stages_not_gateable == 0
+            {
+                return None;
+            }
+            let _ = write!(
+                s,
+                "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
+                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
+                 consult(s) refused"
+            );
+            if *steps_not_reached > 0 {
+                let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
+            }
+            if *enforced_empty_refills > 0 {
+                let _ = write!(
+                    s,
+                    ", {enforced_empty_refills} refill(s) empty by enforcement"
+                );
+            }
+            if *unplanned_consults > 0 {
+                let _ = write!(
+                    s,
+                    ", {unplanned_consults} consult(s) the installed plan held no position for"
+                );
+            }
+            if *stages_not_gateable > 0 {
+                let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");
+            }
+            let _ = writeln!(s, ").");
+        }
+    }
+    Some(s)
 }
 
 /// Render the human-readable stderr verdict for `outcome` (the CLI prints this).
@@ -26129,8 +31091,10 @@ fn declined_counts(outcome: &ReplayOutcome) -> (usize, usize) {
 /// (both headers render from [`DivergenceClass`]) naming each
 /// violated topic and its first divergence, in graph-definition order
 /// (deterministic). Both blocks render when both are present (the trace
-/// divergence takes exit precedence but the data section is still shown). Env
-/// divergences are always listed as warnings (they never fail the run).
+/// divergence takes exit precedence but the data section is still shown). On
+/// both paths, a `WARNING:` line names each environment variable that can
+/// change the re-execution and differs from the recording, and one `NOTE:`
+/// counts the other differing variables; neither fails the run.
 ///
 /// Both count lines also state how many topics were DECLINED and
 /// how many of those matched under the fallback — `topics_passed` excludes a
@@ -26139,16 +31103,23 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
 
-    // The PROVENANCE line — which coordination contract
-    // this replay applied — FIRST, above everything else, on the pass path and
-    // the fail path alike. It is where a mode-gated validation says so: when a
-    // free-run bag skips the cross-rank lockstep equality check, this line is
-    // the statement that it was skipped, never a silent difference.
-    let _ = writeln!(s, "{}", render_coordination_line(&outcome.coordination));
-    let _ = writeln!(s, "{}", render_read_identity_line(&outcome.read_identity));
+    // The two PROVENANCE caveats FIRST, on the pass path and the fail path
+    // alike: a coordination contract the replay had to infer, and reads fed
+    // best effort. Each narrows what the verdict below covers. The clean states
+    // (a stamped contract, reads fed by identity) print nothing; the
+    // `--report` JSON carries every state.
+    if let Some(line) = render_coordination_line(&outcome.coordination) {
+        let _ = writeln!(s, "{line}");
+    }
+    if let Some(line) = render_read_identity_line(&outcome.read_identity) {
+        let _ = writeln!(s, "{line}");
+    }
 
-    for d in &outcome.env_divergence {
-        let _ = writeln!(s, "WARNING: env divergence: {}", d.detail);
+    // The environment block, on the pass path and the fail path alike: a
+    // WARNING for each variable that can change the re-execution, then one
+    // NOTE counting the rest.
+    for line in render_env_divergence_lines(&outcome.env_divergence) {
+        let _ = writeln!(s, "{line}");
     }
 
     // The ragged shutdown-tail tolerances that ENGAGED — rendered in
@@ -26224,6 +31195,15 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         );
     }
 
+    // The topics the external (driver) nodes write, rendered in BOTH the PASS
+    // and the FAIL path for the same reason: they are recorded inputs, the
+    // tally does not count them, and a `0/0` verdict compared nothing.
+    if let Some(report) = &outcome.driver_inputs {
+        for line in render_driver_input_lines(report, outcome.topics_checked) {
+            let _ = writeln!(s, "{line}");
+        }
+    }
+
     // The topics whose frame comparison was DECLINED. Rendered
     // for the same reason as the two blocks below — an operator reading the terminal
     // must see what was NOT judged — and FIRST, because unlike those two it
@@ -26236,25 +31216,18 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
     // "never a verdict" described THIS branch, which is the opposite of true —
     // a decline changes what the verdict covers.
     if !outcome.declined_frame_comparisons.is_empty() {
+        let (declined, matched, withheld) = declined_topic_counts(outcome);
         let _ = writeln!(
             s,
             "NOTE: the frame comparison was DECLINED on {} topic(s) ({} matched under the \
-             fallback, {} had divergences withheld) — a refused read log steered their \
-             producer's input stream, so a difference there would be the harness, not the \
-             candidate, and a MATCH is evidence the fallback reproduced the frames rather \
-             than evidence the candidate is correct. None is counted as passed; none is \
-             reported as a violation. Re-record the bag with this binary to verify them:",
-            outcome.declined_frame_comparisons.len(),
-            outcome
-                .declined_frame_comparisons
-                .iter()
-                .filter(|d| d.matched_under_fallback)
-                .count(),
-            outcome
-                .declined_frame_comparisons
-                .iter()
-                .filter(|d| !d.matched_under_fallback)
-                .count()
+             fallback, {} had divergences withheld). Where a refused read log steered the \
+             producer's input stream, a difference would be the harness, not the candidate, \
+             and a MATCH is evidence the fallback reproduced the frames rather than evidence \
+             the candidate is correct; re-record the bag with this binary to verify such a \
+             topic. Where the replay could not attribute a split topic's frames to their \
+             writers, the frames no recorded stream lines up with were not compared. None is \
+             counted as passed; none is reported as a violation. Each line names its cause:",
+            declined, matched, withheld
         );
         for d in &outcome.declined_frame_comparisons {
             let outcome_phrase = if d.matched_under_fallback {
@@ -26353,87 +31326,14 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
             let _ = writeln!(s, "  - edge {}.{}: {}", u.node_id, u.input, u.detail);
         }
     }
-    // The ENFORCEMENT's positive line, on EVERY path, for the reason the
-    // `read log:` status line below exists: a clean verdict must say what it
-    // enforced, and silence is what a reader cannot audit.
-    match &outcome.read_log_enforcement {
-        ReadLogEnforcement::NotApplicable => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: no graph-produced input edge runs inside one rank \
-                 on this recording, so none was gated."
-            );
-        }
-        ReadLogEnforcement::Lockstep => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: none (a lockstep replay's one gating clock orders \
-                 every publish against every step)."
-            );
-        }
-        ReadLogEnforcement::NotGateable { stages, reasons } => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: {stages} graph-produced stage(s) could NOT be \
-                 gated, so their intra-step arrival is whatever their queue held:"
-            );
-            for r in reasons {
-                let _ = writeln!(s, "  - {r}");
-            }
-        }
-        ReadLogEnforcement::NotEnforced { topics, reason } => {
-            let _ = writeln!(
-                s,
-                "NOTE: read-log enforcement: NONE over {topics} topic(s) this rank both \
-                 produces and consumes ({reason}), so each such edge's intra-step arrival is \
-                 whatever its queue held."
-            );
-        }
-        ReadLogEnforcement::Enforced {
-            stages,
-            steps,
-            frames_admitted,
-            consults_refused,
-            unplanned_consults,
-            enforced_empty_refills,
-            steps_not_reached,
-            stages_not_gateable,
-        } => {
-            let _ = write!(
-                s,
-                "NOTE: read-log enforcement: {stages} graph-produced stage(s) gated across \
-                 {steps} step(s) ({frames_admitted} frame(s) admitted, {consults_refused} \
-                 consult(s) refused"
-            );
-            if *steps_not_reached > 0 {
-                let _ = write!(s, ", {steps_not_reached} planned step(s) never reached");
-            }
-            if *enforced_empty_refills > 0 {
-                let _ = write!(
-                    s,
-                    ", {enforced_empty_refills} refill(s) empty by enforcement"
-                );
-            }
-            if *unplanned_consults > 0 {
-                let _ = write!(
-                    s,
-                    ", {unplanned_consults} consult(s) the installed plan held no position for"
-                );
-            }
-            if *stages_not_gateable > 0 {
-                let _ = write!(s, ", {stages_not_gateable} stage(s) NOT gateable");
-            }
-            let _ = writeln!(s, ").");
-        }
+    // The enforcement's line, when it says something the verdict does not:
+    // see `render_enforcement_line`.
+    if let Some(line) = render_enforcement_line(&outcome.read_log_enforcement) {
+        let _ = write!(s, "{line}");
     }
 
-    // The read-log verifier's POSITIVE status — one
-    // line on EVERY path (pass and fail), so "verified clean" is a visible
-    // claim distinct from "never looked" (inert/disabled), which is what
-    // makes a clean read log auditable by a human too.
-    // What the verifier DECLINED to compare, rendered on EVERY
-    // path — a clean read-log line beside an unstated exclusion is the claim
-    // this block exists to scope.
+    // What the verifier DECLINED to compare, rendered on EVERY path: the
+    // `read log:` line below names the quarantine, and this block scopes it.
     if !outcome.read_log_quarantine.is_empty() {
         let _ = writeln!(
             s,
@@ -26462,7 +31362,17 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         }
     }
 
+    // A clean verification with nothing quarantined is what the `replay PASS`
+    // line already says, so it prints nothing; the `--report` JSON's `read_log`
+    // block carries its edge count. Every other state scopes the verdict (what
+    // the verifier did not compare, never looked at, or stopped looking at), so
+    // it prints.
     match &outcome.read_log {
+        ReadLogStatus::VerifiedClean {
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+            ..
+        } => {}
         ReadLogStatus::VerifiedClean {
             edges_compared,
             quarantined_nodes,
@@ -28315,25 +33225,127 @@ mod recorder_info_version_tests {
         }
     }
 
-    /// The provenance line's three states, HAND-WRITTEN
-    /// verbatim. This is the operator vocabulary — verdict and `--report` JSON
-    /// print one wording, so the strings are pinned rather than described.
+    /// Only the INFERRED contract prints a coordination line; a stamped
+    /// `free_run` or `lockstep` prints none (the `--report` block carries all
+    /// three states, pinned by the arm below).
     #[test]
-    fn provenance_line_renders_three_states() {
+    fn only_an_inferred_coordination_contract_renders_a_line() {
         let line =
             |mode, inferred| render_coordination_line(&CoordinationReport { mode, inferred });
+        assert_eq!(line(CoordinationMode::FreeRun, false), None);
+        assert_eq!(line(CoordinationMode::Lockstep, false), None);
         assert_eq!(
-            line(CoordinationMode::FreeRun, false),
-            "coordination: free_run (per-rank boundary streams + read-log agreement; \
-             cross-rank lockstep equality not applicable)"
+            line(CoordinationMode::Lockstep, true).as_deref(),
+            Some("coordination: lockstep (inferred: no coordination stamp)")
+        );
+    }
+
+    /// Reads fed by identity print nothing; best effort prints, with its reason
+    /// when it has one.
+    #[test]
+    fn only_best_effort_reads_render_a_line() {
+        assert_eq!(
+            render_read_identity_line(&ReadIdentityReport::Fed {
+                reads: 346,
+                frames: 346
+            }),
+            None
         );
         assert_eq!(
-            line(CoordinationMode::Lockstep, false),
-            "coordination: lockstep"
+            render_read_identity_line(&ReadIdentityReport::BestEffort {
+                reason: String::new()
+            })
+            .as_deref(),
+            Some("reads: best effort, no read identity")
         );
         assert_eq!(
-            line(CoordinationMode::Lockstep, true),
-            "coordination: lockstep (inferred: no coordination stamp)"
+            render_read_identity_line(&ReadIdentityReport::BestEffort {
+                reason: "recorded before read identity".into()
+            })
+            .as_deref(),
+            Some("reads: best effort, no read identity (recorded before read identity)")
+        );
+    }
+
+    fn enforced(
+        unplanned_consults: u64,
+        enforced_empty_refills: u64,
+        steps_not_reached: usize,
+        stages_not_gateable: usize,
+    ) -> ReadLogEnforcement {
+        ReadLogEnforcement::Enforced {
+            stages: 1,
+            steps: 292,
+            frames_admitted: 290,
+            consults_refused: 2,
+            unplanned_consults,
+            enforced_empty_refills,
+            steps_not_reached,
+            stages_not_gateable,
+        }
+    }
+
+    /// The enforcement line prints only when it narrows the verdict: a clean
+    /// `Enforced` run, `NotApplicable` and `Lockstep` print nothing, while every
+    /// anomaly count, an ungateable stage set and an unenforced rank print, each
+    /// against its hand-written line.
+    #[test]
+    fn the_enforcement_line_renders_only_what_narrows_the_verdict() {
+        assert_eq!(render_enforcement_line(&enforced(0, 0, 0, 0)), None);
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotApplicable),
+            None
+        );
+        assert_eq!(render_enforcement_line(&ReadLogEnforcement::Lockstep), None);
+
+        let head = "NOTE: read-log enforcement: 1 graph-produced stage(s) gated across 292 \
+                    step(s) (290 frame(s) admitted, 2 consult(s) refused";
+        for (e, tail) in [
+            (enforced(0, 0, 3, 0), ", 3 planned step(s) never reached"),
+            (enforced(0, 4, 0, 0), ", 4 refill(s) empty by enforcement"),
+            (
+                enforced(5, 0, 0, 0),
+                ", 5 consult(s) the installed plan held no position for",
+            ),
+            (enforced(0, 0, 0, 6), ", 6 stage(s) NOT gateable"),
+        ] {
+            assert_eq!(
+                render_enforcement_line(&e),
+                Some(format!("{head}{tail}).\n")),
+                "{e:?}"
+            );
+        }
+        assert_eq!(
+            render_enforcement_line(&enforced(5, 4, 3, 6)),
+            Some(format!(
+                "{head}, 3 planned step(s) never reached, 4 refill(s) empty by enforcement, \
+                 5 consult(s) the installed plan held no position for, 6 stage(s) NOT \
+                 gateable).\n"
+            ))
+        );
+
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotGateable {
+                stages: 2,
+                reasons: vec!["a".into(), "b".into()],
+            })
+            .as_deref(),
+            Some(
+                "NOTE: read-log enforcement: 2 graph-produced stage(s) could NOT be gated, so \
+                 their intra-step arrival is whatever their queue held:\n  - a\n  - b\n"
+            )
+        );
+        assert_eq!(
+            render_enforcement_line(&ReadLogEnforcement::NotEnforced {
+                topics: 3,
+                reason: "no read log".into(),
+            })
+            .as_deref(),
+            Some(
+                "NOTE: read-log enforcement: NONE over 3 topic(s) this rank both produces and \
+                 consumes (no read log), so each such edge's intra-step arrival is whatever \
+                 its queue held.\n"
+            )
         );
     }
 
@@ -29476,6 +34488,7 @@ mod frame_feed_tests {
             over_planned: 0,
             feed_position: 0,
             skipped_live_local: 0,
+            driver_copies: DriverCopies::default(),
             rank: 7,
         };
         (transport, inj)
@@ -29601,6 +34614,7 @@ mod frame_feed_tests {
             over_planned: 0,
             feed_position: 0,
             skipped_live_local: 0,
+            driver_copies: DriverCopies::default(),
             rank: 0,
         };
         assert_eq!(inj.total_recorded, 3, "aggregate pass counted /e");
@@ -31906,6 +36920,7 @@ mod capture_partition_tests {
                     CaptureStream {
                         replayed_count: *n,
                         total_recorded: 0,
+                        recorded_burst: 0,
                         last_seq: None,
                         recorded_seq_runs: Vec::new(),
                         pending: VecDeque::new(),
@@ -31917,6 +36932,11 @@ mod capture_partition_tests {
                 )
             })
             .collect()
+    }
+
+    /// The judge of a fold whose streams never diverged.
+    fn no_divergence(_: ByteViolation) -> crate::replay_value_diff::ByteVerdict {
+        unreachable!("no stream in these folds diverged")
     }
 
     /// The verdict inputs are the UNION of both sides: a writer the recording
@@ -31934,11 +36954,12 @@ mod capture_partition_tests {
             .iter()
             .map(|l| key(l))
             .collect();
-        let got = fold_partition_counts(
-            &recorded,
-            &producible,
-            &streams(&[("alpha/out", 2), ("gamma/out", 1)]),
-        );
+        let mut captured = streams(&[("alpha/out", 2), ("gamma/out", 1)]);
+        captured
+            .get_mut(&key("alpha/out"))
+            .expect("seeded")
+            .recorded_burst = 2;
+        let got = fold_partition_counts(&recorded, &producible, &mut captured, &mut no_divergence);
         let recorded_only = got
             .get(&key("beta/out"))
             .expect("a recorded-only writer reports");
@@ -31947,6 +36968,8 @@ mod capture_partition_tests {
             .get(&key("alpha/out"))
             .expect("a writer on both sides reports once");
         assert_eq!((both.recorded, both.replayed), (2, 2));
+        assert_eq!(both.burst, 2, "a writer's recorded burst rides its counts");
+        assert_eq!(recorded_only.burst, 0, "no stream, no burst");
         let replayed_only = got
             .get(&key("gamma/out"))
             .expect("a replay-only writer reports");
@@ -31971,7 +36994,12 @@ mod capture_partition_tests {
         // This pass owns `left` only: `right` runs on another rank and is not
         // injected here.
         let producible: BTreeSet<WriterKey> = std::iter::once(key("left/bus")).collect();
-        let got = fold_partition_counts(&recorded, &producible, &streams(&[("left/bus", 2)]));
+        let got = fold_partition_counts(
+            &recorded,
+            &producible,
+            &mut streams(&[("left/bus", 2)]),
+            &mut no_divergence,
+        );
         assert_eq!(
             got.keys().cloned().collect::<Vec<_>>(),
             vec![key("left/bus")],
@@ -31986,7 +37014,8 @@ mod capture_partition_tests {
         let surprise = fold_partition_counts(
             &recorded,
             &producible,
-            &streams(&[("left/bus", 2), ("right/bus", 1)]),
+            &mut streams(&[("left/bus", 2), ("right/bus", 1)]),
+            &mut no_divergence,
         );
         let extra = surprise
             .get(&key("right/bus"))
@@ -31995,22 +37024,40 @@ mod capture_partition_tests {
     }
 
     /// The count/byte sentences NAME the writer on a partitioned topic and carry
-    /// no writer clause at all without one.
+    /// no writer clause at all without one; the byte line names the field and
+    /// both values either way.
     #[test]
     fn a_stream_violation_names_its_writer_only_when_it_has_one() {
-        let bv = ByteViolation {
+        use crate::replay_value_diff::{ByteVerdict, FrameDifference, Shown, ValueDifference};
+        let bv = ByteVerdict {
             index: 4,
-            first_diff_byte_offset: 37,
-            recorded_len: 56,
-            replayed_len: 56,
+            first_diff_byte_offset: 40,
+            recorded_len: 64,
+            replayed_len: 64,
+            difference: FrameDifference::Field {
+                value: ValueDifference {
+                    path: "x".to_string(),
+                    within: None,
+                    recorded: Shown {
+                        text: "5.0".to_string(),
+                        json: DifferenceValue::Float64(5.0),
+                    },
+                    replayed: Shown {
+                        text: "6.0".to_string(),
+                        json: DifferenceValue::Float64(6.0),
+                    },
+                },
+                more: 0,
+            },
         };
         let mut plain = Vec::new();
-        push_stream_violations("/mp/bus", None, 3, 2, Some(bv), &mut plain);
+        push_stream_violations("/mp/bus", None, 3, 2, Some(&bv), &mut plain);
         assert_eq!(
             plain.iter().map(|v| v.detail.clone()).collect::<Vec<_>>(),
             vec![
                 "recorded 3 frame(s), replay produced 2 on '/mp/bus'".to_string(),
-                "frame 4 differs at byte 37 on '/mp/bus' (recorded 56 B, replayed 56 B)"
+                "frame 4 on '/mp/bus' differs at x: recorded 5.0, replayed 6.0 (recorded 64 B, \
+                 replayed 64 B)"
                     .to_string(),
             ]
         );
@@ -32020,7 +37067,7 @@ mod capture_partition_tests {
             Some(&WriterKey::Named("beta/out".into())),
             3,
             2,
-            Some(bv),
+            Some(&bv),
             &mut named,
         );
         assert_eq!(
@@ -32028,8 +37075,8 @@ mod capture_partition_tests {
             vec![
                 "recorded 3 frame(s), replay produced 2 on '/mp/bus' from writer beta/out"
                     .to_string(),
-                "frame 4 differs at byte 37 on '/mp/bus' from writer beta/out (recorded 56 B, \
-                 replayed 56 B)"
+                "frame 4 on '/mp/bus' from writer beta/out differs at x: recorded 5.0, replayed \
+                 6.0 (recorded 64 B, replayed 64 B)"
                     .to_string(),
             ]
         );
@@ -32044,6 +37091,29 @@ mod capture_partition_tests {
                 .iter()
                 .map(|v| format!("{:?}", v.class))
                 .collect::<Vec<_>>()
+        );
+        // The report keeps the frame coordinates and gains the flat entry.
+        assert_eq!(
+            serde_json::to_value(&plain[1].class).expect("serializes"),
+            serde_json::json!({
+                "kind": "ByteMismatch",
+                "index": 4,
+                "first_diff_byte_offset": 40,
+                "recorded_len": 64,
+                "replayed_len": 64,
+                "difference": {
+                    "kind": "field",
+                    "path": "x",
+                    "recorded": 5.0,
+                    "replayed": 6.0,
+                    "field_byte": null,
+                    "field_char": null,
+                    "byte_offset": null,
+                    "region": null,
+                    "reason": null,
+                    "more": 0,
+                },
+            })
         );
     }
 
@@ -32113,6 +37183,7 @@ mod capture_partition_tests {
                 key("right/bus"),
             ],
             producible: [key("left/bus"), key("right/bus")].into_iter().collect(),
+            uncompared: BTreeSet::new(),
             walked: 0,
             streams: BTreeMap::new(),
             topic: "/mp/bus".to_string(),
@@ -32149,6 +37220,7 @@ mod capture_partition_tests {
                 recorded: 3,
                 replayed: 0,
                 byte_violation: None,
+                burst: 1,
             },
         )]
         .into_iter()
@@ -32162,6 +37234,1020 @@ mod capture_partition_tests {
             "and it does not name a writer: {}",
             got[0].detail
         );
+    }
+
+    /// A byte verdict at `index` of a stream, its first differing value `x`.
+    fn verdict_at(index: usize) -> crate::replay_value_diff::ByteVerdict {
+        use crate::replay_value_diff::{ByteVerdict, FrameDifference, Shown, ValueDifference};
+        ByteVerdict {
+            index,
+            first_diff_byte_offset: 40,
+            recorded_len: 64,
+            replayed_len: 64,
+            difference: FrameDifference::Field {
+                value: ValueDifference {
+                    path: "x".to_string(),
+                    within: None,
+                    recorded: Shown {
+                        text: "5.0".to_string(),
+                        json: DifferenceValue::Float64(5.0),
+                    },
+                    replayed: Shown {
+                        text: "6.0".to_string(),
+                        json: DifferenceValue::Float64(6.0),
+                    },
+                },
+                more: 0,
+            },
+        }
+    }
+
+    /// One pass's partitioned summary: per writer, its `(recorded, replayed)`
+    /// counts and the index of its first byte divergence, if any, each writer
+    /// one frame per recorded step.
+    fn pass_summary(parts: &[(&str, usize, usize, Option<usize>)]) -> CaptureSummary {
+        CaptureSummary {
+            replayed_count: parts.iter().map(|p| p.2).sum(),
+            byte_violation: None,
+            tolerance_worsts: Vec::new(),
+            rank: 0,
+            injected: 0,
+            injected_drivers: BTreeMap::new(),
+            partition_counts: Some(
+                parts
+                    .iter()
+                    .map(|&(w, recorded, replayed, diverged)| {
+                        (
+                            WriterKey::Named(w.into()),
+                            PartitionCounts {
+                                recorded,
+                                replayed,
+                                byte_violation: diverged.map(verdict_at),
+                                burst: 1,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The `(writer, recorded, replayed, first divergence)` rows of a merged
+    /// summary.
+    fn rows(summary: &CaptureSummary) -> Vec<(String, usize, usize, Option<usize>)> {
+        summary
+            .partition_counts
+            .as_ref()
+            .expect("a merged summary is partitioned")
+            .iter()
+            .map(|(w, c)| {
+                (
+                    w.to_string(),
+                    c.recorded,
+                    c.replayed,
+                    c.byte_violation.as_ref().map(|b| b.index),
+                )
+            })
+            .collect()
+    }
+
+    /// The summaries of a topic fold writer by writer across passes: the
+    /// union of every pass's partitions, in either pass order, a writer's
+    /// byte divergence kept from the pass that found it and the frame count
+    /// the partitions' sum. A partition two passes both hold has its counts
+    /// added and keeps the first pass's divergence. One pass's summary folds
+    /// to itself. A pass that did not partition the topic, or no pass at all,
+    /// folds to nothing.
+    #[test]
+    fn the_passes_of_a_topic_fold_writer_by_writer() {
+        let w = |name: &str, recorded: usize, replayed: usize, diverged: Option<usize>| {
+            (name.to_string(), recorded, replayed, diverged)
+        };
+        // `a/out` diverges at its frame 2 in pass 0, which `c/out` never runs in.
+        let passes = [
+            pass_summary(&[("a/out", 4, 4, Some(2)), ("b/out", 6, 5, None)]),
+            pass_summary(&[("c/out", 2, 3, None)]),
+        ];
+        let want = vec![
+            w("a/out", 4, 4, Some(2)),
+            w("b/out", 6, 5, None),
+            w("c/out", 2, 3, None),
+        ];
+        let merged = merge_partitioned_summaries(&passes).expect("both passes partitioned");
+        assert_eq!(rows(&merged), want);
+        assert_eq!(merged.replayed_count, 12);
+        assert!(merged.byte_violation.is_none(), "per writer only");
+        let reversed = [passes[1].clone(), passes[0].clone()];
+        assert_eq!(
+            rows(&merge_partitioned_summaries(&reversed).expect("partitioned")),
+            want,
+            "the same fold in either pass order"
+        );
+        // One writer held by both passes: its counts add, and the first
+        // pass's divergence stands, or the later one's where the first found
+        // none.
+        let twice = [
+            pass_summary(&[("a/out", 4, 4, Some(1)), ("b/out", 1, 1, None)]),
+            pass_summary(&[("a/out", 4, 3, Some(0)), ("b/out", 1, 2, Some(1))]),
+        ];
+        assert_eq!(
+            rows(&merge_partitioned_summaries(&twice).expect("partitioned")),
+            vec![w("a/out", 8, 7, Some(1)), w("b/out", 2, 3, Some(1))]
+        );
+        // And it keeps the larger recorded burst.
+        let mut wide = twice[1].clone();
+        if let Some(c) = wide
+            .partition_counts
+            .as_mut()
+            .and_then(|p| p.get_mut(&WriterKey::Named("a/out".into())))
+        {
+            c.burst = 3;
+        }
+        let bursts: Vec<usize> = merge_partitioned_summaries([&twice[0], &wide])
+            .expect("partitioned")
+            .partition_counts
+            .expect("partitioned")
+            .values()
+            .map(|c| c.burst)
+            .collect();
+        assert_eq!(bursts, vec![3, 1]);
+        let one = pass_summary(&[("a/out", 4, 3, None)]);
+        let folded = merge_partitioned_summaries([&one]).expect("partitioned");
+        assert_eq!(rows(&folded), vec![w("a/out", 4, 3, None)]);
+        assert_eq!(folded.replayed_count, one.replayed_count);
+        let unpartitioned = CaptureSummary {
+            partition_counts: None,
+            ..one.clone()
+        };
+        assert!(merge_partitioned_summaries([&one, &unpartitioned]).is_none());
+        assert!(merge_partitioned_summaries([&unpartitioned, &one]).is_none());
+        assert!(merge_partitioned_summaries(&[] as &[CaptureSummary]).is_none());
+    }
+
+    /// One pass's summary of a topic it captured as one stream: `replayed`
+    /// counted frames, `injected` of them its injector's, in rank `rank`,
+    /// its first byte divergence at `diverged`.
+    fn one_stream(
+        rank: u32,
+        replayed: usize,
+        injected: usize,
+        diverged: Option<usize>,
+    ) -> CaptureSummary {
+        CaptureSummary {
+            replayed_count: replayed,
+            byte_violation: diverged.map(verdict_at),
+            tolerance_worsts: Vec::new(),
+            partition_counts: None,
+            rank,
+            injected,
+            injected_drivers: BTreeMap::new(),
+        }
+    }
+
+    /// `pass_summary` in rank `rank`.
+    fn partitioned_in(rank: u32, parts: &[(&str, usize, usize, Option<usize>)]) -> CaptureSummary {
+        CaptureSummary {
+            rank,
+            ..pass_summary(parts)
+        }
+    }
+
+    /// The `(rank of the pass judged alone, its frame count)` a judgement
+    /// names, `"merged"` or `"split"`.
+    fn judgement(summaries: &[CaptureSummary]) -> String {
+        match judge_passes(summaries) {
+            PassJudgement::One { summary, alone_in } => format!(
+                "one {alone_in:?} {:?}",
+                summary.map(|s| (s.rank, s.replayed_count))
+            ),
+            PassJudgement::Merged(_) => "merged".to_string(),
+            PassJudgement::Split => "split".to_string(),
+        }
+    }
+
+    /// A topic one pass captured is that pass's; every pass partitioned is
+    /// their union. The only pass whose own writers published a frame,
+    /// neither partitioning nor injecting the topic, is judged alone in either
+    /// pass order, beside a partitioned pass that injected it too or an
+    /// unpartitioned one that counted its injector's frames alone. Any other
+    /// mix is split: an unpartitioned pass whose writers published frames
+    /// beside its injector's, a partitioned one whose writers published
+    /// frames, two whose writers did, or none.
+    #[test]
+    fn a_topic_s_passes_are_judged_alone_merged_or_split() {
+        assert_eq!(judgement(&[]), "one None None");
+        assert_eq!(
+            judgement(&[one_stream(1, 5, 0, None)]),
+            "one None Some((1, 5))"
+        );
+        assert_eq!(
+            judgement(&[pass_summary(&[("a/out", 1, 1, None)]), pass_summary(&[])]),
+            "merged"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 0, 0, None), one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 5, 0, None), one_stream(1, 0, 0, None)]),
+            "one Some(0) Some((0, 5))"
+        );
+        assert_eq!(
+            judgement(&[partitioned_in(0, &[]), one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))",
+            "a partitioned pass that captured nothing"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 0, 0, None), one_stream(1, 5, 2, None)]),
+            "split",
+            "an injected pass"
+        );
+        let partitioned_injecting = CaptureSummary {
+            injected: 3,
+            ..partitioned_in(0, &[])
+        };
+        assert_eq!(
+            judgement(&[partitioned_injecting, one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))",
+            "a partitioned pass counts none of its injector's frames"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 5, 0, Some(0)), one_stream(1, 5, 5, None)]),
+            "one Some(0) Some((0, 5))",
+            "a pass that counted its injector's frames alone"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 5, 5, None), one_stream(1, 5, 0, None)]),
+            "one Some(1) Some((1, 5))",
+            "a pass that counted its injector's frames alone, first"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 2, 0, None), one_stream(1, 5, 0, None)]),
+            "split"
+        );
+        assert_eq!(
+            judgement(&[
+                partitioned_in(0, &[("a/out", 4, 4, None)]),
+                one_stream(1, 0, 0, None)
+            ]),
+            "split",
+            "the capturing pass partitioned"
+        );
+        assert_eq!(
+            judgement(&[one_stream(0, 0, 0, None), one_stream(1, 0, 0, None)]),
+            "split"
+        );
+    }
+
+    /// The `(class, detail)` rows of `violations`, classes by kind and counts.
+    fn named(violations: &[Violation]) -> Vec<String> {
+        violations
+            .iter()
+            .map(|v| match &v.class {
+                ViolationClass::MissingMessages { recorded, replayed } => {
+                    format!("missing {recorded} {replayed}: {}", v.detail)
+                }
+                ViolationClass::ExtraMessages { recorded, replayed } => {
+                    format!("extra {recorded} {replayed}: {}", v.detail)
+                }
+                ViolationClass::ByteMismatch { index, .. } => format!("byte {index}"),
+                ViolationClass::MissingTopic => format!("missing-topic: {}", v.detail),
+                ViolationClass::ExtraTopic => format!("extra-topic: {}", v.detail),
+                ViolationClass::ToleranceExceeded {
+                    field, worst_tick, ..
+                } => format!("tolerance {field:?} at {worst_tick}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// The rows `push_split_violations` pushed and, when it could not judge
+    /// some pass, those passes' ranks and withheld rows.
+    type SplitRows = (Vec<String>, Option<(Vec<u32>, Vec<String>)>);
+
+    /// Run `push_split_violations` on `/t` under `counts` and return its rows
+    /// and what it could not judge.
+    fn split_counted(
+        recorded: usize,
+        summaries: &[CaptureSummary],
+        counts: SplitCounts,
+    ) -> SplitRows {
+        let mut violations = Vec::new();
+        let unjudged = push_split_violations(
+            "/t",
+            recorded,
+            &SplitPasses::of(summaries, |_| None),
+            counts,
+            &mut violations,
+        );
+        (
+            named(&violations),
+            unjudged.map(|u| (u.ranks, named(&u.withheld))),
+        )
+    }
+
+    /// [`split_counted`] with every count judged.
+    fn split(recorded: usize, summaries: &[CaptureSummary], triage: bool) -> SplitRows {
+        split_counted(recorded, summaries, SplitCounts::Judged { triage })
+    }
+
+    /// `summary` with `worsts` as its tolerance worsts.
+    fn with_worsts(summary: CaptureSummary, worsts: Vec<FieldMetric>) -> CaptureSummary {
+        CaptureSummary {
+            tolerance_worsts: worsts,
+            ..summary
+        }
+    }
+
+    /// A split topic's partitioned passes are judged per writer, and the rest
+    /// together by count: every recorded frame no partition holds against the
+    /// frames their own writers published. A pass that injected the topic is
+    /// judged byte for byte; one that injected nothing, beside another pass
+    /// whose writers published frames, is unjudged, its byte verdict withheld.
+    /// Hand oracles.
+    #[test]
+    fn a_split_topic_is_counted_together_and_compared_where_a_stream_lines_up() {
+        // Rank 0 attributes `w2`'s 4 frames; rank 1 published `w3`'s 4 and
+        // its one stream reads a difference at frame 1 against all 8.
+        let mixed = |w3: usize| {
+            [
+                partitioned_in(0, &[("w2/out", 4, 4, None)]),
+                one_stream(1, w3, 0, Some(1)),
+            ]
+        };
+        assert_eq!(
+            split(8, &mixed(4), true),
+            (vec![], Some((vec![1], vec!["byte 1".to_string()])))
+        );
+        assert_eq!(
+            split(8, &mixed(3), true),
+            (
+                vec!["missing 4 3: recorded 4 frame(s), replay produced 3 on '/t'".to_string()],
+                Some((vec![1], vec!["byte 1".to_string()]))
+            )
+        );
+        // A changed `w2` is its own writer's verdict.
+        let changed = [
+            partitioned_in(0, &[("w2/out", 4, 4, Some(0))]),
+            one_stream(1, 4, 0, Some(1)),
+        ];
+        assert_eq!(
+            split(8, &changed, true),
+            (
+                vec!["byte 0".to_string()],
+                Some((vec![1], vec!["byte 1".to_string()]))
+            )
+        );
+        // Two passes of their own writers' frames alone: counted together.
+        let two = |a: usize, b: usize| [one_stream(0, a, 0, Some(0)), one_stream(1, b, 0, None)];
+        assert_eq!(
+            split(7, &two(2, 5), true),
+            (vec![], Some((vec![0, 1], vec!["byte 0".to_string()])))
+        );
+        assert_eq!(
+            split(7, &two(1, 5), true).0,
+            vec!["missing 7 6: recorded 7 frame(s), replay produced 6 on '/t'".to_string()]
+        );
+        // Passes that injected the rest are compared with every recorded
+        // frame, counted by their own writers' frames.
+        let injecting = [one_stream(0, 6, 3, None), one_stream(1, 6, 3, Some(2))];
+        assert_eq!(
+            split(6, &injecting, true),
+            (vec!["byte 2".to_string()], None)
+        );
+        let short = [one_stream(0, 6, 3, None), one_stream(1, 5, 3, None)];
+        assert_eq!(
+            split(6, &short, true),
+            (
+                vec!["missing 6 5: recorded 6 frame(s), replay produced 5 on '/t'".to_string()],
+                None
+            )
+        );
+        // An injected pass beside one of its own writers' frames alone.
+        assert_eq!(
+            split(
+                6,
+                &[one_stream(0, 6, 3, None), one_stream(1, 3, 0, None)],
+                true
+            ),
+            (vec![], Some((vec![1], vec![])))
+        );
+        // A pass with no frame of its own is counted, never unjudged.
+        assert_eq!(
+            split(
+                6,
+                &[
+                    partitioned_in(0, &[("w2/out", 3, 3, None)]),
+                    one_stream(1, 0, 0, None)
+                ],
+                true
+            ),
+            (
+                vec!["missing 3 0: recorded 3 frame(s), replay produced 0 on '/t'".to_string()],
+                None
+            )
+        );
+        // `--tolerance` rows: those of the partitioned pass and of the pass
+        // that injected the topic fold, in pass order, the larger exceedance
+        // kept; those of the pass of its own writers' frames alone are
+        // withheld with it.
+        let worsts = [
+            with_worsts(
+                partitioned_in(0, &[("w2/out", 4, 4, None)]),
+                vec![worst("x", 2.0, 1.5, 3), worst("y", 5.0, 4.5, 4)],
+            ),
+            with_worsts(
+                one_stream(1, 4, 2, None),
+                vec![worst("x", 3.0, 2.5, 1), worst("z", 9.0, 8.5, 2)],
+            ),
+            with_worsts(one_stream(2, 2, 0, None), vec![worst("x", 7.0, 6.5, 0)]),
+        ];
+        let rows = (
+            vec![
+                "tolerance Some(\"x\") at 1".to_string(),
+                "tolerance Some(\"y\") at 4".to_string(),
+                "tolerance Some(\"z\") at 2".to_string(),
+            ],
+            Some((vec![2], vec!["tolerance Some(\"x\") at 0".to_string()])),
+        );
+        assert_eq!(split(8, &worsts, true), rows);
+        // Tolerated as a ragged tail: no count verdict, the same rows.
+        assert_eq!(
+            split_counted(7, &worsts, SplitCounts::TailTolerated),
+            rows,
+            "the counts are not judged"
+        );
+        assert_eq!(
+            split(7, &worsts, true).0[0],
+            "extra 3 4: recorded 3 frame(s), replay produced 4 on '/t'",
+            "judged, the same counts are an extra frame"
+        );
+    }
+
+    /// The ragged-tail bound of a split topic and the guard it stands on: its
+    /// partitioned writers writer by writer, and the frames its one-stream passes'
+    /// own writers published past the recorded frames no partition holds by
+    /// what their ranks' windows hold together; the guard reads the byte
+    /// verdicts of the frames compared and every shortfall. Rank 1's tail is 1
+    /// step, rank 0's and rank 2's none, 1 frame per step. Hand oracles.
+    #[test]
+    fn a_split_topic_s_tail_is_bounded_part_by_part() {
+        let width = |rank: u32| usize::from(rank == 1);
+        let rank_of = |w: &WriterKey| match w {
+            WriterKey::Named(label) if label.starts_with("r0/") => Some(0),
+            WriterKey::Named(label) if label.starts_with("r1/") => Some(1),
+            _ => None,
+        };
+        let bound = |recorded: usize, summaries: &[CaptureSummary]| {
+            let passes = SplitPasses::of(summaries, |_| None);
+            (
+                passes.tail_clean(recorded),
+                passes.tail_extra_ranks(recorded, 1, width, rank_of),
+            )
+        };
+        // Two passes of their own writers' frames alone, one frame past the
+        // recorded ones: inside rank 1's window, whichever pass's it is.
+        let two = [one_stream(0, 5, 0, Some(0)), one_stream(1, 5, 0, None)];
+        assert_eq!(bound(9, &two), (true, Some(vec![1])));
+        assert_eq!(bound(8, &two), (true, None), "two frames past it");
+        // A pass whose writers recorded nothing and published one frame.
+        assert_eq!(
+            bound(
+                5,
+                &[one_stream(0, 5, 0, None), one_stream(1, 1, 0, Some(0))]
+            ),
+            (true, Some(vec![1]))
+        );
+        // A partitioned writer's extra frame inside its own window,
+        // the one-stream pass's frames the recorded ones no partition holds.
+        let mixed = |rank: u32, label: &str| {
+            [
+                partitioned_in(rank, &[(label, 4, 5, None)]),
+                one_stream(1 - rank, 4, 0, Some(1)),
+            ]
+        };
+        assert_eq!(bound(8, &mixed(1, "r1/w")), (true, Some(vec![1])));
+        assert_eq!(
+            bound(8, &mixed(0, "r0/w")),
+            (true, None),
+            "rank 0 has no tail"
+        );
+        // Partitioned writers beside a pass that captured nothing.
+        assert_eq!(
+            bound(
+                8,
+                &[
+                    partitioned_in(1, &[("r1/w", 4, 5, None)]),
+                    partitioned_in(0, &[("r0/v", 4, 4, None)]),
+                    one_stream(2, 0, 0, None),
+                ]
+            ),
+            (true, Some(vec![1]))
+        );
+        // The guard: a compared frame that differs, the one-stream passes'
+        // shortfall, a writer's shortfall.
+        assert!(
+            !bound(
+                6,
+                &[one_stream(0, 6, 3, Some(4)), one_stream(1, 6, 3, None)]
+            )
+            .0
+        );
+        assert!(!bound(6, &[one_stream(0, 5, 3, None), one_stream(1, 6, 3, None)]).0);
+        assert!(
+            !bound(
+                8,
+                &[
+                    partitioned_in(1, &[("r1/w", 4, 3, None)]),
+                    one_stream(0, 5, 0, None)
+                ]
+            )
+            .0
+        );
+        assert!(
+            !bound(
+                8,
+                &[
+                    partitioned_in(1, &[("r1/w", 4, 4, Some(2))]),
+                    one_stream(0, 5, 0, None)
+                ]
+            )
+            .0
+        );
+    }
+
+    /// With `triage`, a split topic whose writers published nothing is one
+    /// `MissingTopic` and one with no recorded frame one `ExtraTopic`, the
+    /// injected frames no writer's; without it, the counts stand.
+    #[test]
+    fn a_split_topic_takes_the_topic_level_triage_once() {
+        let none = [one_stream(0, 0, 0, None), one_stream(1, 2, 2, None)];
+        assert_eq!(
+            split(5, &none, true),
+            (
+                vec![
+                    "missing-topic: recorded 5 frame(s) but replay produced NONE on '/t'"
+                        .to_string()
+                ],
+                None
+            )
+        );
+        let unrecorded = [one_stream(0, 2, 0, None), one_stream(1, 1, 0, None)];
+        assert_eq!(
+            split(0, &unrecorded, true),
+            (
+                vec![
+                    "extra-topic: replay produced 3 frame(s) on '/t' but the bag has no channel \
+                      for it"
+                        .to_string()
+                ],
+                None
+            )
+        );
+        let partitioned = [
+            partitioned_in(0, &[("w2/out", 0, 0, None)]),
+            one_stream(1, 0, 0, None),
+        ];
+        assert_eq!(
+            split(5, &partitioned, false),
+            (
+                vec!["missing 5 0: recorded 5 frame(s), replay produced 0 on '/t'".to_string()],
+                None
+            )
+        );
+    }
+
+    /// `summary` with `drivers`, `(driver, frames)`, as its injected driver
+    /// frames.
+    fn with_drivers(summary: CaptureSummary, drivers: &[(&str, usize)]) -> CaptureSummary {
+        CaptureSummary {
+            injected_drivers: drivers.iter().map(|&(d, n)| (Arc::from(d), n)).collect(),
+            ..summary
+        }
+    }
+
+    /// An injector counts the driver frames it re-publishes by their frame
+    /// index, per driver: of five recorded frames, `cam` wrote 1 and 4, `mic`
+    /// 3, `w2` 0, and frame 2 names no writer. Re-publishing frames 1 to 4
+    /// counts `cam` twice and `mic` once. Hand oracle.
+    #[test]
+    fn an_injector_counts_the_driver_frames_it_re_publishes() {
+        let named = |label: &str| Some(replay_inject::ResolvedProducer::Named(label.to_string()));
+        let frames: Vec<replay_inject::RecordedFrame> = [
+            named("w2/out"),
+            named("cam/out"),
+            None,
+            named("mic/out"),
+            named("cam/out"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, producer)| replay_inject::RecordedFrame {
+            sequence: i as u32,
+            producer,
+        })
+        .collect();
+        let mut copies = DriverCopies::of(&frames, &BTreeSet::from(["cam/out", "mic/out"]));
+        assert!(!copies.is_empty());
+        assert!(copies.by_driver().is_empty(), "nothing re-published yet");
+        for index in 1..=4 {
+            copies.count(index);
+        }
+        let got: Vec<(String, usize)> = copies
+            .by_driver()
+            .into_iter()
+            .map(|(d, n)| (d.to_string(), n))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("cam/out".to_string(), 2), ("mic/out".to_string(), 1)]
+        );
+        assert!(DriverCopies::of(&frames, &BTreeSet::new()).is_empty());
+    }
+
+    /// A split topic's one-stream count takes the recorded frames of a driver
+    /// no one-stream pass runs that any pass's injector re-published once, as
+    /// the most one of them re-published, a partitioned pass's copies
+    /// included, and none of a driver a one-stream pass runs, whose own
+    /// writers' frames count it. `cam` writes 3 of the 9 recorded frames, `w2`
+    /// in rank 0 and `w3` in rank 1 3 each, and each rank injects the other's
+    /// 3 and `cam`'s. Hand oracles.
+    #[test]
+    fn a_split_topic_counts_a_driver_s_injected_frames_once() {
+        let judge = |summaries: &[CaptureSummary], cam: Option<u32>| -> SplitRows {
+            let passes = SplitPasses::of(summaries, |d| (d == "cam/out").then_some(cam).flatten());
+            let mut violations = Vec::new();
+            let unjudged = push_split_violations(
+                "/t",
+                9,
+                &passes,
+                SplitCounts::Judged { triage: true },
+                &mut violations,
+            );
+            (
+                named(&violations),
+                unjudged.map(|u| (u.ranks, named(&u.withheld))),
+            )
+        };
+        let both = |cam0: usize, cam1: usize| {
+            [
+                with_drivers(
+                    one_stream(0, 6 + cam0, 3 + cam0, None),
+                    &[("cam/out", cam0)],
+                ),
+                with_drivers(
+                    one_stream(1, 6 + cam1, 3 + cam1, None),
+                    &[("cam/out", cam1)],
+                ),
+            ]
+        };
+        assert_eq!(judge(&both(3, 3), Some(2)), (vec![], None), "cam in rank 2");
+        assert_eq!(
+            judge(&both(3, 3), None),
+            (vec![], None),
+            "cam in no rank the bag names"
+        );
+        assert_eq!(
+            judge(&both(3, 2), Some(2)),
+            (vec![], None),
+            "the most one pass re-published"
+        );
+        assert_eq!(
+            judge(&both(2, 2), Some(2)),
+            (
+                vec!["missing 9 8: recorded 9 frame(s), replay produced 8 on '/t'".to_string()],
+                None
+            ),
+            "a frame no pass re-published"
+        );
+        assert_eq!(
+            judge(&both(3, 3), Some(0)),
+            (
+                vec!["missing 9 6: recorded 9 frame(s), replay produced 6 on '/t'".to_string()],
+                None
+            ),
+            "cam in rank 0, whose own frames hold none of it"
+        );
+        let unnamed = [one_stream(0, 9, 6, None), one_stream(1, 9, 6, None)];
+        assert_eq!(
+            judge(&unnamed, Some(2)),
+            (
+                vec!["missing 9 6: recorded 9 frame(s), replay produced 6 on '/t'".to_string()],
+                None
+            ),
+            "an injection that names no frame's writer"
+        );
+        // Rank 0 partitions `w2`'s 3 and injects `w3`'s 3 and `cam`'s 3, which
+        // its partitions leave out; rank 1 captures `w3`'s 3 alone, unjudged.
+        let beside_a_partition = [
+            with_drivers(
+                CaptureSummary {
+                    injected: 6,
+                    ..partitioned_in(0, &[("w2/out", 3, 3, None)])
+                },
+                &[("cam/out", 3)],
+            ),
+            one_stream(1, 3, 0, None),
+        ];
+        assert_eq!(
+            judge(&beside_a_partition, Some(2)),
+            (vec![], Some((vec![1], vec![]))),
+            "a partitioned pass's copies"
+        );
+    }
+
+    /// The `(topic, ranks, code, matched, withheld classes)` of a declined row.
+    type DeclinedRow = (String, Vec<u32>, String, bool, Vec<String>);
+
+    fn declined_row(row: &DeclinedFrameComparison) -> DeclinedRow {
+        (
+            row.topic.clone(),
+            row.ranks.clone(),
+            row.code.clone(),
+            row.matched_under_fallback,
+            row.withheld
+                .iter()
+                .map(|v| class_label(&v.class).to_string())
+                .collect(),
+        )
+    }
+
+    /// A refused read log declines a topic by one row per cause. Where it is
+    /// the only cause the row MATCHED exactly when it withholds nothing. Where a
+    /// split topic's pass also captured frames that were not compared, the
+    /// read-log row never MATCHED, even with nothing withheld on either side,
+    /// and the `split_topic_frames_unattributed` row beside it names that
+    /// pass's rank and withholds its one-stream verdicts. Hand oracles.
+    #[test]
+    fn a_read_log_decline_beside_an_unjudged_split_pass_never_matched() {
+        let cause = || {
+            (
+                "verifier_declined_census".to_string(),
+                "refused".to_string(),
+            )
+        };
+        let missing = || Violation {
+            topic: "/bus".to_string(),
+            class: ViolationClass::MissingMessages {
+                recorded: 4,
+                replayed: 3,
+            },
+            detail: "missing".to_string(),
+        };
+        let rows = |withheld: Vec<Violation>, unjudged: Option<SplitUnjudged>| {
+            let (read_log, split) =
+                read_log_decline_rows("/bus", vec![0], cause(), withheld, unjudged);
+            (declined_row(&read_log), split.as_ref().map(declined_row))
+        };
+        let read_log = |matched: bool, withheld: &[&str]| -> DeclinedRow {
+            (
+                "/bus".to_string(),
+                vec![0],
+                "verifier_declined_census".to_string(),
+                matched,
+                withheld.iter().map(|c| c.to_string()).collect(),
+            )
+        };
+        let split = |withheld: &[&str]| -> DeclinedRow {
+            (
+                "/bus".to_string(),
+                vec![1],
+                "split_topic_frames_unattributed".to_string(),
+                false,
+                withheld.iter().map(|c| c.to_string()).collect(),
+            )
+        };
+
+        assert_eq!(rows(vec![], None), (read_log(true, &[]), None));
+        assert_eq!(
+            rows(vec![missing()], None),
+            (read_log(false, &["missing-messages"]), None)
+        );
+        // Rank 1's frames, a byte-identical prefix, read nothing: still
+        // uncompared, so the read-log row is no match.
+        assert_eq!(
+            rows(
+                vec![],
+                Some(SplitUnjudged {
+                    ranks: vec![1],
+                    withheld: vec![],
+                })
+            ),
+            (read_log(false, &[]), Some(split(&[])))
+        );
+        assert_eq!(
+            rows(
+                vec![missing()],
+                Some(SplitUnjudged {
+                    ranks: vec![1],
+                    withheld: vec![missing()],
+                })
+            ),
+            (
+                read_log(false, &["missing-messages"]),
+                Some(split(&["missing-messages"]))
+            )
+        );
+    }
+
+    /// One field's tolerance worst: `worst` at `tick`, `exceedance` past the
+    /// bound.
+    fn worst(field: &str, worst: f64, exceedance: f64, tick: u64) -> FieldMetric {
+        FieldMetric {
+            field: field.to_string(),
+            metric: MetricKind::MaxAbs { threshold: 0.5 },
+            integer_domain: false,
+            worst_value: worst,
+            worst_exceedance: exceedance,
+            worst_tick: tick,
+            worst_cause: if worst.is_finite() {
+                NonFiniteCause::Finite
+            } else {
+                NonFiniteCause::Structural
+            },
+            violated: true,
+        }
+    }
+
+    /// The `(field, worst value, tick)` of each folded worst.
+    fn worsts(folded: &[FieldMetric]) -> Vec<(String, f64, u64)> {
+        folded
+            .iter()
+            .map(|m| (m.field.clone(), m.worst_value, m.worst_tick))
+            .collect()
+    }
+
+    /// The passes' tolerance worsts fold to one per field and metric, in
+    /// first-seen order: the larger exceedance wins, the earlier pass's on a
+    /// tie, and an incomparable frame outranks every finite one.
+    #[test]
+    fn the_passes_tolerance_worsts_fold_to_one_per_declaration() {
+        let a = [worst("x", 2.0, 1.5, 3), worst("z", 9.0, 8.5, 1)];
+        let b = [worst("x", 3.0, 2.5, 0)];
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&a[..], &b[..]])),
+            vec![("x".to_string(), 3.0, 0), ("z".to_string(), 9.0, 1)]
+        );
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&b[..], &a[..]])),
+            vec![("x".to_string(), 3.0, 0), ("z".to_string(), 9.0, 1)]
+        );
+        let tie = [worst("x", 3.0, 2.5, 7)];
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&b[..], &tie[..]])),
+            vec![("x".to_string(), 3.0, 0)]
+        );
+        let incomparable = [worst("x", f64::INFINITY, f64::INFINITY, 4)];
+        assert_eq!(
+            worsts(&fold_tolerance_worsts([&b[..], &incomparable[..]])),
+            vec![("x".to_string(), f64::INFINITY, 4)]
+        );
+        let rows = tolerance_rows("/t", &fold_tolerance_worsts([&a[..], &b[..]]));
+        assert_eq!(
+            rows.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>(),
+            vec![
+                "field 'x' exceeded the max_abs tolerance on '/t': worst value 3 vs threshold 0.5 \
+                 (worst at frame 0)",
+                "field 'z' exceeded the max_abs tolerance on '/t': worst value 9 vs threshold 0.5 \
+                 (worst at frame 1)",
+            ]
+        );
+    }
+
+    /// The ragged-tail window of a partitioned topic bounds each writer by
+    /// its rank's tail times the most frames it published in one recorded
+    /// step, at least one, and names the ranks whose writers produced extra
+    /// frames; a one-stream topic is bounded by the sum of its ranks' windows
+    /// at the topic's largest one-step burst and names the ranks with a tail.
+    /// Rank 0's tail is 1 step, rank 1's none, and the topic's largest burst
+    /// is 2 frames. Hand oracles.
+    #[test]
+    fn the_tail_window_bounds_each_writer_by_its_own_burst() {
+        let width = |rank: u32| usize::from(rank == 0);
+        let rank_of = |w: &WriterKey| match w {
+            WriterKey::Named(label) if label.starts_with("r0/") => Some(0),
+            WriterKey::Named(label) if label.starts_with("r1/") => Some(1),
+            _ => None,
+        };
+        // Per writer: `(label, recorded, replayed, burst)`.
+        let parts = |rows: &[(&str, usize, usize, usize)]| -> BTreeMap<WriterKey, PartitionCounts> {
+            rows.iter()
+                .map(|&(label, recorded, replayed, burst)| {
+                    (
+                        key(label),
+                        PartitionCounts {
+                            recorded,
+                            replayed,
+                            byte_violation: None,
+                            burst,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let ranks = BTreeSet::from([0, 1]);
+        let bound = |rows: &[(&str, usize, usize, usize)]| {
+            tail_extra_ranks(Some(&parts(rows)), &ranks, 0, 2, width, rank_of)
+        };
+        assert_eq!(
+            bound(&[("r0/out", 9, 9, 1), ("r1/out", 9, 10, 1)]),
+            None,
+            "rank 1 has no tail"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 10, 1), ("r1/out", 9, 9, 1)]),
+            Some(vec![0])
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 11, 1), ("r1/out", 9, 9, 1)]),
+            None,
+            "a writer of one frame per step: two extra frames are past its window of \
+             one, though inside the topic's window of two"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 11, 2), ("r1/out", 9, 9, 1)]),
+            Some(vec![0]),
+            "a writer of two frames per step"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 12, 2)]),
+            None,
+            "past its window of two"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 0, 1, 0)]),
+            Some(vec![0]),
+            "a writer the recording does not carry has a window of one frame per step"
+        );
+        assert_eq!(
+            bound(&[("r0/out", 9, 9, 1), ("r1/out", 9, 9, 1)]),
+            Some(vec![])
+        );
+        assert_eq!(
+            bound(&[("q/out", 1, 2, 1)]),
+            None,
+            "a writer of no known rank"
+        );
+        assert_eq!(
+            bound(&[("r0/a", 9, 10, 1), ("r0/b", 9, 10, 1)]),
+            Some(vec![0]),
+            "two writers of rank 0, each inside its own window"
+        );
+        assert_eq!(
+            bound(&[("r0/a", 9, 11, 1), ("r0/b", 9, 9, 3)]),
+            None,
+            "a writer's window is never widened by another writer's burst"
+        );
+        let stream = |extra: usize| tail_extra_ranks(None, &ranks, extra, 2, width, rank_of);
+        assert_eq!(stream(2), Some(vec![0]));
+        assert_eq!(stream(3), None);
+        // A stream beside partitioned writers keeps the room their extra
+        // frames leave in a window they share.
+        let beside = |extra: usize| {
+            tail_extra_ranks(
+                Some(&parts(&[("r0/out", 9, 10, 1), ("r1/out", 9, 9, 1)])),
+                &BTreeSet::from([0]),
+                extra,
+                2,
+                width,
+                rank_of,
+            )
+        };
+        assert_eq!(beside(1), Some(vec![0]));
+        assert_eq!(beside(2), None, "past the room rank 0's writer left");
+        assert_eq!(
+            tail_extra_ranks(None, &BTreeSet::from([1]), 1, 2, width, rank_of),
+            None,
+            "the one pass judged alone has no tail"
+        );
+    }
+
+    /// A writer's burst is the longest run of equal wire timestamps among its
+    /// own recorded frames, the other writers' frames between them skipped:
+    /// `a` publishes two frames at 10 and one each at 20 and 30, `b` one at 10
+    /// and three at 20. Hand oracle.
+    #[test]
+    fn a_writer_s_burst_is_its_own_longest_one_step_run() {
+        let (a, b) = (key("a/out"), key("b/out"));
+        let frames = [
+            (&a, 10),
+            (&b, 10),
+            (&a, 10),
+            (&b, 20),
+            (&a, 20),
+            (&b, 20),
+            (&b, 20),
+            (&a, 30),
+        ];
+        let got: Vec<(String, usize)> = writer_bursts(frames)
+            .into_iter()
+            .map(|(w, n)| (w.to_string(), n))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a/out".to_string(), 2), ("b/out".to_string(), 3)]
+        );
+        assert!(writer_bursts(std::iter::empty()).is_empty());
     }
 }
 
@@ -32248,6 +38334,7 @@ mod trigger_input_capacity_tests {
             vec![InputDef {
                 name: "cam".to_string(),
                 source: source.to_string(),
+                ..Default::default()
             }]
         };
         let cap = |source: &str| live_writer_cap(&config, &producers, &wired(source), "cam");
@@ -32264,13 +38351,16 @@ mod trigger_input_capacity_tests {
         );
     }
 
-    /// A node is a local `block` producer when it produces a topic every
-    /// consumer in the rank reads with `backpressure = block`, the producers the
-    /// runtime installs a block pre-fire check on. `c` feeds `d`'s `block`
-    /// input; `e` feeds a `block` input and a `drop_oldest` one, which degrades
-    /// the `block` one and installs no check; `p` feeds a `drop_oldest` input.
+    /// A node is a local `block` producer when it produces a topic a `block`
+    /// input in the rank reads, whatever the topic's other consumers declare:
+    /// the producers the runtime installs a block pre-fire check on. `p` feeds
+    /// only a `drop_oldest` input (`c.cam`); `c` feeds `d`'s `block` input; `e`
+    /// feeds `f`'s `block` input beside `g`'s `drop_oldest` one, and `h` feeds
+    /// `i`'s `block` input beside `j`'s `sample(20)` one. Hand oracle: `c`,
+    /// `e` and `h` are held, `p` is not; once `f` reads `drop_oldest` too, `e`
+    /// is not held either.
     #[test]
-    fn a_local_block_producer_is_a_producer_of_a_topic_every_rank_consumer_blocks_on() {
+    fn a_local_block_producer_is_a_producer_of_a_topic_a_rank_block_input_reads() {
         use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
         let yaml = "name: lb\nprefix: lb\nnodes:\n\
             \x20 - id: p\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
@@ -32278,7 +38368,10 @@ mod trigger_input_capacity_tests {
             \x20 - id: d\n    type: w\n    inputs:\n      - name: cmd\n        source: c/out\n\
             \x20 - id: e\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
             \x20 - id: f\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n\
-            \x20 - id: g\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n";
+            \x20 - id: g\n    type: w\n    inputs:\n      - name: x\n        source: e/out\n\
+            \x20 - id: h\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+            \x20 - id: i\n    type: w\n    inputs:\n      - name: x\n        source: h/out\n\
+            \x20 - id: j\n    type: w\n    inputs:\n      - name: x\n        source: h/out\n";
         let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
         let reads = |name: &str, backpressure| {
             NodeInfo::with_meta(
@@ -32290,6 +38383,7 @@ mod trigger_input_capacity_tests {
                     backpressure,
                     expect_within_ms: None,
                     consume: InputConsume::Latest,
+                    accumulate: false,
                 }],
                 vec![],
             )
@@ -32302,15 +38396,21 @@ mod trigger_input_capacity_tests {
         infos.insert("d".to_string(), reads("cmd", BackpressurePolicy::Block));
         infos.insert("f".to_string(), reads("x", BackpressurePolicy::Block));
         infos.insert("g".to_string(), reads("x", BackpressurePolicy::DropOldest));
-        let producers = local_block_producers(&config, &infos, 0).expect("builds");
-        assert_eq!(producers, BTreeSet::from(["c".to_string()]));
-
-        infos.insert("g".to_string(), reads("x", BackpressurePolicy::Block));
+        infos.insert("i".to_string(), reads("x", BackpressurePolicy::Block));
+        infos.insert("j".to_string(), reads("x", BackpressurePolicy::Sample(20)));
         let producers = local_block_producers(&config, &infos, 0).expect("builds");
         assert_eq!(
             producers,
-            BTreeSet::from(["c".to_string(), "e".to_string()]),
-            "every consumer of e's topic blocks once g does"
+            BTreeSet::from(["c".to_string(), "e".to_string(), "h".to_string()]),
+            "a block input holds its producer on a mixed topic too"
+        );
+
+        infos.insert("f".to_string(), reads("x", BackpressurePolicy::DropOldest));
+        let producers = local_block_producers(&config, &infos, 0).expect("builds");
+        assert_eq!(
+            producers,
+            BTreeSet::from(["c".to_string(), "h".to_string()]),
+            "no block input reads e's topic once f reads it drop_oldest"
         );
     }
 
@@ -32761,5 +38861,895 @@ mod unlisted_macro_output_tests {
     fn a_hand_written_node_output_the_embedded_graph_does_not_list_is_not_refused() {
         let info = NodeInfo::from_names(vec![], vec!["echo".to_string()]);
         assert!(refuse_unlisted_macro_output(&subgraph(), &entries(info)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod resim_namespace_tests {
+    use super::{
+        claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
+        resim_namespace_slot, ResimSlot, SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER,
+        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+    };
+    use cerulion_core::testing::IsolatedRoot;
+    use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
+    use iceoryx2::node::{Node, NodeBuilder, NodeState};
+    use iceoryx2::prelude::CallbackProgression;
+    use iceoryx2::service::ipc_threadsafe::Service;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// What the child below prints once it holds its node and publisher.
+    const CHILD_READY: &str = "resim slot child holds a publisher";
+
+    /// A slot no claim reaches (at or above [`RESIM_NAMESPACE_SLOTS`]), distinct
+    /// per test process and per `index`, so no resim on the machine and no
+    /// concurrent run of these tests shares its segment names.
+    fn unclaimable_slot(index: u32) -> u32 {
+        RESIM_NAMESPACE_SLOTS + std::process::id() * 4 + index
+    }
+
+    /// Every file under `dir`, `depth` levels down, named with `slot`'s prefix.
+    fn files_of_slot(dir: &Path, slot: u32, depth: usize) -> BTreeSet<PathBuf> {
+        let mut found = BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_str().and_then(resim_namespace_slot) == Some(slot) {
+                found.insert(path.clone());
+            }
+            if depth > 1 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                found.extend(files_of_slot(&path, slot, depth - 1));
+            }
+        }
+        found
+    }
+
+    /// Every file of `slot`'s namespace: under the isolated root (three levels
+    /// reach a node's `<prefix>node.details`) and among this machine's segment
+    /// names.
+    fn namespace_files(root: &IsolatedRoot, slot: u32) -> BTreeSet<PathBuf> {
+        let mut found = files_of_slot(Path::new(&root.root), slot, 3);
+        if let Some(dir) = SEGMENT_NAME_DIR {
+            found.extend(files_of_slot(Path::new(dir), slot, 1));
+        }
+        found
+    }
+
+    fn alive_nodes(ix_config: &iceoryx2::config::Config) -> usize {
+        let mut alive = 0usize;
+        Node::<Service>::list(ix_config, |state| {
+            if matches!(state, NodeState::Alive(_)) {
+                alive += 1;
+            }
+            CallbackProgression::Continue
+        })
+        .expect("list the resim namespace");
+        alive
+    }
+
+    /// The claim every caller below makes: any slot the lock admits is ready.
+    fn claim(dir: &Path, slots: u32) -> ResimSlot {
+        claim_resim_slot(dir, slots, |_| Ok(())).expect("a free slot")
+    }
+
+    /// Hand oracles: the marker, the slot in exactly eight lowercase hex
+    /// digits, then `_`, nineteen characters for every slot, and the name
+    /// parses back to its slot. The last slot a claim takes is `0xff`.
+    #[test]
+    fn the_private_prefix_is_the_marker_then_the_slot_in_eight_hex_digits() {
+        for (slot, prefix) in [
+            (0, "cer_resim_00000000_"),
+            (1, "cer_resim_00000001_"),
+            (RESIM_NAMESPACE_SLOTS - 1, "cer_resim_000000ff_"),
+            (0x1234, "cer_resim_00001234_"),
+            (u32::MAX, "cer_resim_ffffffff_"),
+        ] {
+            assert_eq!(resim_namespace_prefix(slot), prefix);
+            assert_eq!(prefix.len(), 19, "{prefix}");
+            assert_eq!(resim_namespace_slot(prefix), Some(slot), "{prefix}");
+        }
+    }
+
+    /// No resim prefix string-prefixes another resim's, the default
+    /// namespace's, the planning namespace's or iceoryx2's test namespaces',
+    /// in either direction: the property that keeps one namespace's node
+    /// listing out of another's files.
+    #[test]
+    fn no_resim_prefix_lists_another_namespace() {
+        let slots = [0u32, 1, 0x10, 0xff, 0x100, 0x1234, 0x0fff_ffff, u32::MAX];
+        let resim: Vec<String> = slots.iter().map(|&s| resim_namespace_prefix(s)).collect();
+        for a in &resim {
+            assert_eq!(a.len(), RESIM_NAMESPACE_MARKER.len() + 9, "{a}");
+            for b in &resim {
+                if a != b {
+                    assert!(!b.starts_with(a.as_str()), "{a} lists {b}'s files");
+                }
+            }
+            for other in ["iox2_", "cer_p_0123456789abcdef", "test_prefix_"] {
+                assert!(
+                    !other.starts_with(a.as_str()) && !a.starts_with(other),
+                    "{a} and {other} overlap"
+                );
+            }
+        }
+    }
+
+    /// iceoryx2 accepts every prefix, and the config keeps the base's root.
+    #[test]
+    fn the_private_config_is_the_base_with_the_private_prefix() {
+        let base = iceoryx2::config::Config::global_config();
+        for slot in [0, 0xff, u32::MAX] {
+            let ix_config = resim_ix_config(base, slot).expect("a prefix iceoryx2 accepts");
+            assert_eq!(
+                ix_config.global.prefix.to_string(),
+                resim_namespace_prefix(slot)
+            );
+            assert_eq!(
+                String::from(ix_config.global.root_path()),
+                String::from(base.global.root_path())
+            );
+        }
+    }
+
+    /// A file of a slot's namespace names the slot; every other name, a slot's
+    /// lock file and other namespaces' files included, names none.
+    #[test]
+    fn only_a_file_of_a_slots_namespace_names_the_slot() {
+        assert_eq!(
+            resim_namespace_slot("cer_resim_0000abcd_1234567890.node_monitor"),
+            Some(0xabcd)
+        );
+        assert_eq!(
+            resim_namespace_slot("cer_resim_00000000_x_node.0_10_0.global_mgmt"),
+            Some(0)
+        );
+        for name in [
+            // A slot's lock file: no `_` after the digits.
+            "cer_resim_00000000.lock",
+            // Upper case: the prefix renders lower case only.
+            "cer_resim_0000ABCD_1234567890.node_monitor",
+            // Seven digits, then the separator.
+            "cer_resim_000abcd_1234567890.node_monitor",
+            // No separator after the eight digits.
+            "cer_resim_0000abcd1234567890.node_monitor",
+            // A sign `u32::from_str_radix` would accept.
+            "cer_resim_+000abcd_1.node_monitor",
+            "iox2_1234567890.node_monitor",
+            "cer_p_0123456789abcdef1234567890.node_monitor",
+            "1234567890",
+            "cer_resim_",
+            "",
+        ] {
+            assert_eq!(resim_namespace_slot(name), None, "{name}");
+        }
+    }
+
+    /// Two claims held at once take different slots, the lowest free first,
+    /// each by its own lock file.
+    #[test]
+    fn two_concurrent_claims_take_different_slots() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        let second = claim(dir.path(), 4);
+        assert_eq!((first.slot, second.slot), (0, 1));
+        assert!(dir.path().join("cer_resim_00000000.lock").is_file());
+        assert!(dir.path().join("cer_resim_00000001.lock").is_file());
+    }
+
+    /// Dropping a holder closes its lock file, as the kernel does for every
+    /// descriptor of a process that ends: the next claim reuses that slot,
+    /// the lowest free one again, while the other holder keeps its own.
+    #[test]
+    fn a_claim_after_a_holder_lets_go_reuses_its_slot() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        let second = claim(dir.path(), 4);
+        drop(first);
+        let third = claim(dir.path(), 4);
+        assert_eq!((second.slot, third.slot), (1, 0));
+        drop(second);
+        drop(third);
+        assert_eq!(claim(dir.path(), 4).slot, 0);
+    }
+
+    /// A slot whose reclaim refuses it is passed over, and its lock released:
+    /// the next claim takes it.
+    #[test]
+    fn a_slot_its_reclaim_refuses_is_passed_over_and_released() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let mut tried = Vec::new();
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            tried.push(slot);
+            if slot == 0 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 1 is ready");
+        assert_eq!((claimed.slot, tried), (1, vec![0, 1]));
+        assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+    }
+
+    /// A reclaim that leaves a node: what the dead-node sweep did, from
+    /// `cleaned`, and the nodes left.
+    fn holding(left: u64, cleaned: BoundedCleanup) -> SlotReclaim {
+        SlotReclaim {
+            cleaned,
+            nodes_left: Ok(left),
+            segments_removed: 0,
+            segments_failed: 0,
+        }
+    }
+
+    /// Hand oracles: each way a reclaim does not come back clean gives its
+    /// own reason, with the counts it read; a clean reclaim gives none.
+    #[test]
+    fn a_reclaim_that_is_not_clean_names_its_cause() {
+        let clean = holding(0, BoundedCleanup::default());
+        assert_eq!(clean.refusal(), None);
+
+        let left = holding(
+            1,
+            BoundedCleanup {
+                cleanups: 2,
+                failed_cleanups: 3,
+                deferred: 4,
+            },
+        );
+        assert_eq!(
+            left.refusal().as_deref(),
+            Some(
+                "nodes still registered in its namespace after the dead-node sweep: 1 (the sweep \
+                 removed 2, failed on 3 and deferred 4; it removes only the nodes of processes \
+                 that have ended and that this user can inspect)"
+            )
+        );
+
+        let unlisted = SlotReclaim {
+            nodes_left: Err("NodeListFailure::InsufficientPermissions".to_string()),
+            ..clean.clone()
+        };
+        assert_eq!(
+            unlisted.refusal().as_deref(),
+            Some(
+                "its namespace's node registry could not be listed after the dead-node sweep \
+                 (NodeListFailure::InsufficientPermissions)"
+            )
+        );
+
+        let stuck = SlotReclaim {
+            segments_removed: 1,
+            segments_failed: 2,
+            ..clean
+        };
+        assert_eq!(
+            stuck.refusal().as_deref(),
+            Some("leftover segments of its namespace that could not be removed: 2")
+        );
+    }
+
+    /// Every slot refused by its reclaim: exit 5, naming the LAST slot passed
+    /// over and its reason, and no open failure, since every lock file opened.
+    #[test]
+    fn a_claim_with_every_slot_refused_names_the_last_refusal_in_its_exit_5_text() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let err = claim_resim_slot(dir.path(), 3, |slot| {
+            let reclaim = holding(u64::from(slot) + 1, BoundedCleanup::default());
+            let reason = reclaim.refusal().expect("a node is left");
+            Err(SlotPassedOver::Reclaim { reclaim, reason })
+        })
+        .expect_err("every slot refused");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(
+            text.contains(
+                "; the last whose namespace was refused: slot 2, nodes still registered in its \
+                 namespace after the dead-node sweep: 3 (the sweep removed 0, failed on 0 and \
+                 deferred 0;"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("could not be opened or locked:"), "{text}");
+        assert_eq!(
+            claim(dir.path(), 3).slot,
+            0,
+            "every refused lock was released"
+        );
+    }
+
+    /// Every slot held: exit 5, naming the directory and the slot count, and
+    /// neither an open failure, since every lock file opened, nor a refusal,
+    /// since no namespace was reclaimed.
+    #[test]
+    fn a_claim_with_every_slot_held_is_refused_with_exit_5() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let _first = claim(dir.path(), 2);
+        let _second = claim(dir.path(), 2);
+        let err = claim_resim_slot(dir.path(), 2, |_| Ok(())).expect_err("no free slot");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(text.contains("none of the 2 slot locks"), "{text}");
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+        assert!(!text.contains("could not be opened or locked:"), "{text}");
+        assert!(
+            !text.contains("the last whose namespace was refused"),
+            "{text}"
+        );
+    }
+
+    /// A lock directory that does not exist: exit 5, naming the first lock
+    /// file that could not be opened.
+    #[test]
+    fn a_missing_lock_directory_is_refused_naming_the_first_open_failure() {
+        let dir = tempfile::tempdir().expect("a parent directory");
+        let missing = dir.path().join("absent");
+        let err = claim_resim_slot(&missing, 2, |_| Ok(())).expect_err("nothing opens");
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        let first = missing.join("cer_resim_00000000.lock");
+        assert!(
+            text.contains(&format!(
+                "the first that could not be opened or locked: {}",
+                first.display()
+            )),
+            "{text}"
+        );
+    }
+
+    /// The message of the warn a claim logs for the first slot it passes over.
+    const PASSED_OVER: &str = "replay: passed over a resim namespace slot whose lock could not be \
+                               taken or whose namespace did not reclaim clean";
+    /// The message of the debug line for a further slot it passes over.
+    const PASSED_OVER_AGAIN: &str = "replay: passed over another resim namespace slot (suppressed)";
+    /// The message of the warn for the slot that takes the count across a
+    /// power of ten (the tenth, the hundredth).
+    const STILL_PASSING_OVER: &str = "replay: still passing over resim namespace slots";
+    /// The message of the info line of a claim that took a slot after
+    /// suppressing at least one repeat.
+    const CLAIMED_AFTER: &str = "replay: claimed a resim namespace slot after passing over others";
+
+    /// How many of `lines` (a `#[traced_test]`'s own) are `level` events that
+    /// contain every one of `texts` and carry every one of `fields`, each a
+    /// whole `name=value` token as the log writes it.
+    fn logged(lines: &[&str], level: &str, texts: &[&str], fields: &[&str]) -> usize {
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(" {level} "))
+                    && texts.iter().all(|text| line.contains(text))
+                    && fields
+                        .iter()
+                        .all(|field| line.split(' ').any(|token| token == *field))
+            })
+            .count()
+    }
+
+    /// `Ok` when every `(what, got, want)` count matches, else every count and
+    /// the lines read.
+    fn counts_match(lines: &[&str], counts: &[(&str, usize, usize)]) -> Result<(), String> {
+        if counts.iter().all(|(_, got, want)| got == want) {
+            Ok(())
+        } else {
+            Err(format!("(what, got, want): {counts:#?}\nlines: {lines:#?}"))
+        }
+    }
+
+    /// One slot passed over, then a claim: one warn naming the slot, what its
+    /// reclaim counted (each count distinct, so a swapped field shows) and why
+    /// it was refused. A lone pass-over closes without a recovery line.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_that_passes_over_one_slot_warns_naming_the_slot_and_its_counts() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            if slot > 0 {
+                return Ok(());
+            }
+            let reclaim = SlotReclaim {
+                segments_failed: 5,
+                ..holding(
+                    1,
+                    BoundedCleanup {
+                        cleanups: 2,
+                        failed_cleanups: 3,
+                        deferred: 4,
+                    },
+                )
+            };
+            let reason = reclaim.refusal().expect("a node is left");
+            Err(SlotPassedOver::Reclaim { reclaim, reason })
+        })
+        .expect("slot 1 is ready");
+        assert_eq!(claimed.slot, 1);
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(
+                            lines,
+                            "WARN",
+                            &[
+                                PASSED_OVER,
+                                "error=nodes still registered in its namespace after the \
+                                 dead-node sweep: 1 (the sweep removed 2, failed on 3 and \
+                                 deferred 4;",
+                            ],
+                            &[
+                                "slot=0",
+                                "nodes_left=1",
+                                "cleanups=2",
+                                "failed_cleanups=3",
+                                "deferred=4",
+                                "segments_failed=5",
+                            ],
+                        ),
+                        1,
+                    ),
+                    (
+                        "any pass-over line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains("replay: passed over"))
+                            .count(),
+                        1,
+                    ),
+                    (
+                        "a recovery line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(CLAIMED_AFTER))
+                            .count(),
+                        0,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// Two slots passed over, then a claim of the third: the first at warn,
+    /// the repeat at debug with one suppressed, and an info line for the slot
+    /// taken naming the one suppressed and both passed over. A slot refused
+    /// before any reclaim carries no reclaim count. The repeat never logs at
+    /// a loud level, and the recovery line, at info, carries the count in
+    /// every build.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_after_two_slots_passed_over_logs_the_repeat_at_debug_and_the_claim_at_info() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 4, |slot| {
+            if slot < 2 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 2 is ready");
+        assert_eq!(claimed.slot, 2);
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(
+                            lines,
+                            "WARN",
+                            &[PASSED_OVER, "error=refused by the test"],
+                            &["slot=0"],
+                        ),
+                        1,
+                    ),
+                    (
+                        "the debug repeat for slot 1",
+                        logged(
+                            lines,
+                            "DEBUG",
+                            &[PASSED_OVER_AGAIN, "error=refused by the test"],
+                            &["slot=1", "suppressed=1"],
+                        ),
+                        cerulion_core::testing::debug_lines_expected(1),
+                    ),
+                    (
+                        "the repeat at a loud level",
+                        logged(lines, "WARN", &[PASSED_OVER_AGAIN], &[])
+                            + logged(lines, "INFO", &[PASSED_OVER_AGAIN], &[]),
+                        0,
+                    ),
+                    (
+                        "a reclaim count on a slot refused before its reclaim",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(" nodes_left="))
+                            .count(),
+                        0,
+                    ),
+                    (
+                        "the info for the slot taken",
+                        logged(
+                            lines,
+                            "INFO",
+                            &[CLAIMED_AFTER],
+                            &["slot=2", "suppressed=1", "total_failures=2"],
+                        ),
+                        1,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// Ten slots passed over, then a claim of the eleventh: the first at
+    /// warn, the next eight at debug counting up the suppressed, the tenth at
+    /// warn again with the total, and the claim at info with all ten.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_claim_that_passes_over_ten_slots_warns_again_at_the_tenth() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let claimed = claim_resim_slot(dir.path(), 12, |slot| {
+            if slot < 10 {
+                Err(SlotPassedOver::Config("refused by the test".to_string()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("slot 10 is ready");
+        assert_eq!(claimed.slot, 10);
+        logs_assert(|lines| {
+            let mut counts = vec![
+                (
+                    "the warn for slot 0".to_string(),
+                    logged(lines, "WARN", &[PASSED_OVER], &["slot=0"]),
+                    1,
+                ),
+                (
+                    "debug repeats".to_string(),
+                    logged(lines, "DEBUG", &[PASSED_OVER_AGAIN], &[]),
+                    cerulion_core::testing::debug_lines_expected(8),
+                ),
+                (
+                    "the warn for slot 9".to_string(),
+                    logged(
+                        lines,
+                        "WARN",
+                        &[STILL_PASSING_OVER],
+                        &["slot=9", "total_failures=10", "suppressed=8"],
+                    ),
+                    1,
+                ),
+                (
+                    "the info for the slot taken".to_string(),
+                    logged(
+                        lines,
+                        "INFO",
+                        &[CLAIMED_AFTER],
+                        &["slot=10", "suppressed=8", "total_failures=10"],
+                    ),
+                    1,
+                ),
+            ];
+            for slot in 1..9 {
+                counts.push((
+                    format!("the debug repeat for slot {slot}"),
+                    logged(
+                        lines,
+                        "DEBUG",
+                        &[PASSED_OVER_AGAIN],
+                        &[&format!("slot={slot}"), &format!("suppressed={slot}")],
+                    ),
+                    cerulion_core::testing::debug_lines_expected(1),
+                ));
+            }
+            let counts: Vec<(&str, usize, usize)> = counts
+                .iter()
+                .map(|(what, got, want)| (what.as_str(), *got, *want))
+                .collect();
+            counts_match(lines, &counts)
+        });
+    }
+
+    /// Lock files that cannot be opened: a warn for the first naming the slot
+    /// and the file, a debug repeat for the second, no reclaim count, and no
+    /// claim line, since nothing was claimed.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_warned_naming_the_slot_and_the_file() {
+        let dir = tempfile::tempdir().expect("a parent directory");
+        let missing = dir.path().join("absent");
+        claim_resim_slot(&missing, 2, |_| Ok(())).expect_err("nothing opens");
+        let first = format!(
+            "error=its lock file could not be opened or locked: {}",
+            missing.join("cer_resim_00000000.lock").display()
+        );
+        let second = format!(
+            "error=its lock file could not be opened or locked: {}",
+            missing.join("cer_resim_00000001.lock").display()
+        );
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[
+                    (
+                        "the warn for slot 0",
+                        logged(lines, "WARN", &[PASSED_OVER, &first], &["slot=0"]),
+                        1,
+                    ),
+                    (
+                        "the debug repeat for slot 1",
+                        logged(
+                            lines,
+                            "DEBUG",
+                            &[PASSED_OVER_AGAIN, &second],
+                            &["slot=1", "suppressed=1"],
+                        ),
+                        cerulion_core::testing::debug_lines_expected(1),
+                    ),
+                    (
+                        "a reclaim count",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains(" nodes_left="))
+                            .count(),
+                        0,
+                    ),
+                    (
+                        "a claim line",
+                        lines
+                            .iter()
+                            .filter(|line| line.contains("replay: claimed"))
+                            .count(),
+                        0,
+                    ),
+                ],
+            )
+        });
+    }
+
+    /// A namespace with no node: the reclaim removes the slot's segments in
+    /// the segment directory and nothing else (another slot's segment, the
+    /// slot's lock file, another namespace's segment, a directory). A zero
+    /// budget removes nothing and still reads clean.
+    #[test]
+    fn the_reclaim_of_an_empty_namespace_removes_its_slots_segments_only() {
+        let root = IsolatedRoot::mint("rslotseg");
+        let slot = unclaimable_slot(0);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let prefix = resim_namespace_prefix(slot);
+        let other = resim_namespace_prefix(slot + 1);
+        let kept: BTreeSet<String> = [
+            format!("{other}c.shm_state"),
+            format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"),
+            "iox2_d.shm_state".to_string(),
+            format!("{prefix}dir"),
+        ]
+        .into_iter()
+        .collect();
+        for name in [
+            format!("{prefix}a.shm_state"),
+            format!("{prefix}b.shm_state"),
+        ]
+        .iter()
+        .chain(kept.iter().filter(|name| !name.ends_with("dir")))
+        {
+            std::fs::write(segments.path().join(name), b"").expect("write a segment name");
+        }
+        std::fs::create_dir(segments.path().join(format!("{prefix}dir"))).expect("a directory");
+        let left = || -> BTreeSet<String> {
+            std::fs::read_dir(segments.path())
+                .expect("read the segment directory")
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        };
+
+        let untouched = reclaim_resim_slot(&ix_config, slot, Some(segments.path()), Duration::ZERO);
+        assert_eq!(
+            untouched,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(untouched.refusal(), None);
+        assert_eq!(
+            left().len(),
+            kept.len() + 2,
+            "a zero budget removes nothing"
+        );
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            reclaimed,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 2,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(reclaimed.refusal(), None);
+        assert_eq!(left(), kept);
+    }
+
+    /// A namespace with no node whose segment directory cannot be listed: a
+    /// warn naming the slot and the error, and a reclaim that removed nothing
+    /// and still reads clean.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_segment_directory_that_cannot_be_listed_is_warned_naming_the_slot() {
+        let root = IsolatedRoot::mint("rslotnodir");
+        let slot = unclaimable_slot(3);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let parent = tempfile::tempdir().expect("a parent directory");
+        let missing = parent.path().join("absent");
+        let reclaimed =
+            reclaim_resim_slot(&ix_config, slot, Some(&missing), Duration::from_secs(10));
+        assert_eq!(
+            reclaimed,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(0),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert_eq!(reclaimed.refusal(), None);
+        let slot_field = format!("slot={slot}");
+        logs_assert(|lines| {
+            counts_match(
+                lines,
+                &[(
+                    "the warn for the unlisted directory",
+                    logged(
+                        lines,
+                        "WARN",
+                        &[
+                            "replay: could not list the shared-memory segment names to reclaim \
+                             a resim namespace slot",
+                            "(os error 2)",
+                        ],
+                        &[&slot_field],
+                    ),
+                    1,
+                )],
+            )
+        });
+    }
+
+    /// A namespace with a LIVE node is left as it is: the node is not reaped
+    /// and the slot's segment stays. Once the node is dropped, the reclaim of
+    /// the real segment names removes the namespace's iceoryx2 management
+    /// segment, the one segment a node leaves, and the namespace holds no file.
+    #[test]
+    fn the_reclaim_leaves_a_namespace_with_a_live_node_as_it_is() {
+        let root = IsolatedRoot::mint("rslotlive");
+        let slot = unclaimable_slot(1);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let node = NodeBuilder::new()
+            .config(&ix_config)
+            .create::<Service>()
+            .expect("a live node on the slot");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let segment = segments
+            .path()
+            .join(format!("{}a.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&segment, b"").expect("write a segment name");
+
+        let held = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            held,
+            SlotReclaim {
+                cleaned: BoundedCleanup::default(),
+                nodes_left: Ok(1),
+                segments_removed: 0,
+                segments_failed: 0,
+            }
+        );
+        assert!(held.refusal().is_some());
+        assert!(
+            segment.exists(),
+            "a namespace with a node keeps its segments"
+        );
+        assert_eq!(alive_nodes(&ix_config), 1, "the live node was not reaped");
+
+        drop(node);
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            Duration::from_secs(10),
+        );
+        assert_eq!(reclaimed.nodes_left, Ok(0));
+        assert_eq!(reclaimed.refusal(), None);
+        if SEGMENT_NAME_DIR.is_some() {
+            assert_eq!(reclaimed.segments_removed, 1, "the management segment");
+        }
+        assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+
+    /// The child process the next test kills: a node and a publisher on the
+    /// slot namespace its parent names, held until it is killed.
+    #[test]
+    #[ignore = "a child process `the_reclaim_removes_every_file_a_killed_resim_left` spawns"]
+    fn child_holds_a_publisher_on_a_resim_slot() {
+        let Some(config) = cerulion_core::testing::child_iceoryx_config() else {
+            return;
+        };
+        let node = NodeBuilder::new()
+            .config(&config)
+            .create::<Service>()
+            .expect("a node on the slot");
+        let service = node
+            .service_builder(&"resim_slot_child".try_into().expect("a service name"))
+            .publish_subscribe::<u64>()
+            .open_or_create()
+            .expect("a service on the slot");
+        let _publisher = service.publisher_builder().create().expect("a publisher");
+        println!("{CHILD_READY}");
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// A resim killed while it held a service leaves its node, the service and
+    /// the namespace's management segment. The reclaim reaps the dead node,
+    /// which takes the service with it, then removes the management segment:
+    /// the namespace holds no file afterwards.
+    #[test]
+    fn the_reclaim_removes_every_file_a_killed_resim_left() {
+        let mut root = IsolatedRoot::mint("rslotdead");
+        let slot = unclaimable_slot(2);
+        root.prefix = resim_namespace_prefix(slot);
+        cerulion_core::testing::kill_child_holding_ports(
+            "replay_engine::resim_namespace_tests::child_holds_a_publisher_on_a_resim_slot",
+            &root,
+            CHILD_READY,
+            Duration::from_millis(200),
+        );
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let left = namespace_files(&root, slot);
+        assert!(
+            left.iter()
+                .any(|path| path.to_string_lossy().ends_with(".node_monitor")),
+            "the killed child left its node: {left:?}"
+        );
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            SEGMENT_NAME_DIR.map(Path::new),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            reclaimed.cleaned,
+            BoundedCleanup {
+                cleanups: 1,
+                failed_cleanups: 0,
+                deferred: 0,
+            },
+            "the dead node is reaped"
+        );
+        assert_eq!(reclaimed.nodes_left, Ok(0));
+        assert_eq!(reclaimed.refusal(), None);
+        assert_eq!(namespace_files(&root, slot), BTreeSet::new());
     }
 }

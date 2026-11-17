@@ -37,6 +37,7 @@ pub mod dead_node_sweep;
 pub mod demand_authorizer;
 pub mod discovery;
 pub(crate) mod drain_clip_latch;
+pub mod egress_scope;
 pub(crate) mod egress_send;
 pub mod events;
 pub mod failure_regime_latch;
@@ -48,12 +49,15 @@ pub mod ingress_build;
 pub mod input_view;
 pub mod kind;
 pub mod liveness;
+pub(crate) mod marker_teardown;
 pub mod mirror_origin;
 pub mod mirror_registry;
 pub mod network;
 pub mod notify_delivery_latch;
 pub mod output_discard_latch;
 pub mod output_proxy;
+#[doc(hidden)]
+pub mod plugin_lease;
 pub mod publisher;
 pub mod reg_channel;
 pub mod run_artifacts;
@@ -69,6 +73,7 @@ pub mod uds_write;
 pub mod wire_header_attribute;
 
 pub use kind::{TransportKind, TRANSPORT_KIND};
+pub use marker_teardown::TeardownWait;
 #[doc(hidden)]
 pub use shm_guard::{shm_pool_advice_scans_run, shm_safety_checks_run};
 
@@ -4118,6 +4123,7 @@ impl TransportManager {
         expected_schema_hash: u64,
         max_slice_len: MaxSliceLen,
     ) -> TransportResult<IngressInjector> {
+        let remote_lease = self.acquire_remote_topic_lease(topic)?;
         let marker = mirror_origin::MirrorOrigin::open(&self.node, topic)?;
         let publisher = self.create_ingress_publisher(topic, max_slice_len)?;
         Ok(IngressInjector::new_with_origin(
@@ -4125,13 +4131,84 @@ impl TransportManager {
             expected_schema_hash,
             publisher,
             Some(marker),
-        ))
+        )
+        .with_remote_lease(remote_lease))
+    }
+
+    /// Exclude a topic from every remote reader and writer before creating data ports.
+    /// Hold the guard until after the run's publishers and subscribers drop.
+    pub fn exclude_remote_topic(
+        &self,
+        topic: &str,
+    ) -> TransportResult<egress_scope::LocalOnlyTopic> {
+        egress_scope::LocalOnlyTopic::acquire(&self.node, topic)
+    }
+
+    /// Retain an existing producer exclusion for a dynamically created local port.
+    /// Hold it after that port drops, including a detached producer's lifetime.
+    /// `wait` says whether a policy marker being torn down is waited out.
+    pub fn retain_local_topic_scope(
+        &self,
+        topic: &str,
+        wait: TeardownWait,
+    ) -> TransportResult<Option<egress_scope::LocalOnlyTopic>> {
+        if egress_scope::allowed(&self.node, topic, wait)? {
+            Ok(None)
+        } else {
+            self.exclude_remote_topic(topic).map(Some)
+        }
+    }
+
+    /// Hold remote admission for an operation until after its data ports drop.
+    pub fn acquire_remote_topic_lease(
+        &self,
+        topic: &str,
+    ) -> TransportResult<egress_scope::RemoteTopicLease> {
+        let result = egress_scope::RemoteTopicLease::acquire(&self.node, topic);
+        if result.is_err() {
+            egress_scope::REMOTE_ACCESS_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Read producer policy without creating a data service or subscriber.
+    /// `wait` says whether a policy marker being torn down is waited out.
+    pub fn remote_topic_allowed(&self, topic: &str, wait: TeardownWait) -> TransportResult<bool> {
+        let result = egress_scope::allowed(&self.node, topic, wait);
+        if !matches!(result, Ok(true)) {
+            egress_scope::REMOTE_ACCESS_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Process-wide refused remote admissions and producer-policy checks (Principle #3).
+    pub fn remote_access_refusals(&self) -> u64 {
+        egress_scope::REMOTE_ACCESS_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count an application cache refusal whose producer admission has already expired.
+    pub fn record_remote_access_refusal(&self) {
+        egress_scope::REMOTE_ACCESS_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An export tap that holds producer policy and local source identity through teardown.
+    pub fn create_remote_data_only_subscriber(
+        &self,
+        topic: &str,
+    ) -> TransportResult<DataOnlySubscriber> {
+        let local = self.acquire_local_topic_lease(topic)?;
+        let lease = self.acquire_remote_topic_lease(topic)?;
+        let mut tap = self.create_data_only_subscriber(topic)?;
+        tap.hold_remote_lease(lease);
+        tap.hold_local_lease(local);
+        Ok(tap)
     }
 
     /// Whether this topic has an active, authoritative network mirror marker.
     /// This open-only check never starts a network session or creates a service.
-    pub fn is_network_mirror(&self, topic: &str) -> TransportResult<bool> {
-        mirror_origin::is_network_mirror(&self.node, topic)
+    /// `wait` says whether a mirror marker being torn down is waited out.
+    pub fn is_network_mirror(&self, topic: &str, wait: TeardownWait) -> TransportResult<bool> {
+        mirror_origin::is_network_mirror(&self.node, topic, wait)
     }
 
     /// Hold an explicitly local observer's source local until its subscriber drops.
@@ -4147,8 +4224,9 @@ impl TransportManager {
     }
 
     /// Network mirror topics on this manager's namespace, independent of attribution.
-    pub fn network_mirror_topics(&self) -> TransportResult<Vec<String>> {
-        mirror_origin::topics(&self.node)
+    /// `wait` says whether each candidate marker being torn down is waited out.
+    pub fn network_mirror_topics(&self, wait: TeardownWait) -> TransportResult<Vec<String>> {
+        mirror_origin::topics(&self.node, wait)
     }
 
     /// Register a complete network→local INGRESS bridge for `topic`
@@ -4248,6 +4326,9 @@ impl TransportManager {
                 ),
             });
         };
+        // Every remote input, including a declared run gateway, admits producer
+        // scope before the watch or SHM publisher can reach another local run.
+        let remote_lease = Some(self.acquire_remote_topic_lease(topic)?);
         // Step 1: latched watch start (see ordering rationale in the doc).
         self.start_network_bridge_watch()?;
         // Step 2: the identity marker (shared mirrors only), then the
@@ -4260,7 +4341,13 @@ impl TransportManager {
         };
         let publisher = self.create_ingress_publisher(topic, max_slice_len)?;
         // Step 3: zenoh subscriber + liveliness token + validate/re-inject.
-        network.register_ingress_with_origin(topic, expected_schema_hash, publisher, marker)
+        network.register_ingress_with_scope(
+            topic,
+            expected_schema_hash,
+            publisher,
+            marker,
+            remote_lease,
+        )
     }
 
     /// Tear down a network→local INGRESS bridge for `topic`

@@ -1105,27 +1105,46 @@ fn the_one<'a>(events: &'a [serde_json::Value], name: &str) -> &'a serde_json::V
     found[0]
 }
 
-/// A domain event is delivered, not only built: a `pair` the CLI refuses
-/// before it resolves or spawns anything lands in the batch as a failure,
-/// next to the command's own `cli_command_run`.
+/// A domain event is delivered, not only built: a `connect` the CLI refuses
+/// before it spawns anything lands in the batch as a failure, next to the
+/// command's own `cli_command_run`.
 #[test]
-fn a_refused_pair_delivers_pair_completed_as_a_failure() {
+fn a_refused_connect_delivers_connect_session_completed_as_a_failure() {
     let sink = sink();
     let home = primed_home(&sink);
-    // A positional robot AND `--eid` is refused before any lookup.
+    // A positional robot AND `--eid` is refused before any dial.
+    let out = cerulion(
+        home.path(),
+        &sending(&sink),
+        &["connect", "robot", "--eid", "ab"],
+    );
+    assert_eq!(out.code, Some(1), "stderr={}", out.stderr);
+    let events = events_sent(&sink);
+    let session = the_one(&events, "connect_session_completed");
+    assert_eq!(session["properties"]["exit_code"], 1, "{events:?}");
+    let run = the_one(&events, "cli_command_run");
+    assert_eq!(run["properties"]["verb"], "connect", "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
+    assert_eq!(events.len(), 2, "{events:?}");
+}
+
+/// The hidden `pair` stub runs no pairing, so it records its
+/// `cli_command_run` (exit 2) and no domain event.
+#[test]
+fn the_hidden_pair_stub_delivers_only_its_command_run() {
+    let sink = sink();
+    let home = primed_home(&sink);
     let out = cerulion(
         home.path(),
         &sending(&sink),
         &["pair", "robot", "--eid", "ab"],
     );
-    assert_eq!(out.code, Some(1), "stderr={}", out.stderr);
+    assert_eq!(out.code, Some(2), "stderr={}", out.stderr);
     let events = events_sent(&sink);
-    let pair = the_one(&events, "pair_completed");
-    assert_eq!(pair["properties"]["is_success"], false, "{events:?}");
     let run = the_one(&events, "cli_command_run");
     assert_eq!(run["properties"]["verb"], "pair", "{events:?}");
-    assert_eq!(run["properties"]["exit_code"], 1, "{events:?}");
-    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(run["properties"]["exit_code"], 2, "{events:?}");
+    assert_eq!(events.len(), 1, "{events:?}");
 }
 
 /// Nothing leaves while the network kill switch is engaged: `CERULION_NETWORK`
@@ -1142,7 +1161,7 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
         (Some("off"), &["graph", "list"]),
         (Some(" OFF "), &["graph", "list"]),
         (Some("typo"), &["graph", "list"]),
-        (Some("off"), &["pair", "robot", "--eid", "ab"]),
+        (Some("off"), &["viz", "/camera", "--robot", "bench-arm"]),
         (None, &["graph", "run", "demo", "--network", "off"]),
         (None, &["graph", "run", "demo", "--local"]),
         (None, &["connect", "bench-arm", "--network", "on"]),
@@ -1158,6 +1177,16 @@ fn nothing_is_sent_while_the_network_kill_switch_is_engaged() {
             "{}",
             out.stderr
         );
+        // The viz row must be refused by the switch, so `assert_nothing_sent`
+        // is not passing on a verb that failed for another reason.
+        if args[0] == "viz" {
+            assert_eq!(out.code, Some(1), "{}", out.stderr);
+            assert!(
+                out.stderr.contains("remote visualization is disabled by"),
+                "{}",
+                out.stderr
+            );
+        }
         assert_nothing_sent(
             &sink,
             &format!("{args:?} ran under CERULION_NETWORK={network:?}"),

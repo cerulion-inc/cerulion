@@ -137,12 +137,16 @@ pub fn no_policy_note(field_attrs: &crate::parse::FieldAttrs) -> &'static str {
 /// entry's `AccumulatorSet` (`self.__cer_accumulators`) before the user's
 /// `init` runs.
 pub fn register_calls(inputs: &[FieldInputAttr]) -> TokenStream {
+    register_calls_for(inputs, &quote! { self })
+}
+
+pub(crate) fn register_calls_for(inputs: &[FieldInputAttr], entry: &TokenStream) -> TokenStream {
     let calls = inputs.iter().filter_map(|i| {
         let cap = i.accumulate?;
         let name = i.field_name.to_string();
         let ty = &i.field_type;
         Some(quote! {
-            self.__cer_accumulators.register::<#ty>(&mut context, #name, #cap)?;
+            #entry.__cer_accumulators.register::<#ty>(&mut context, #name, #cap)?;
         })
     });
     quote! { #(#calls)* }

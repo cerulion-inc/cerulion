@@ -767,7 +767,7 @@ fn vizd_never_calls_netds_looping_query_verbs() {
 /// The LOCK-SCOPE pin: the netd client mutex is taken in exactly ONE place.
 ///
 /// `with_client` takes the guard, runs one round trip, and drops it. Every
-/// `DemandPlane` method must reach the client through it — a method that locked the
+/// query method must reach the demand-free client through it; a method that locked the
 /// client itself could hold it across anything.
 #[test]
 fn the_netd_client_mutex_is_taken_only_inside_with_client() {
@@ -1622,10 +1622,10 @@ fn monitors_v1_the_sampler_takes_the_state_lock_exactly_once() {
 /// keyed by TOPIC NAME, so it describes a name rather than a tap's generation, and
 /// recording one into a tap at attach time turns a 3-second staleness into a
 /// permanent, affirmatively-wrong robot on a desk-owned topic (MEASURED: it never
-/// healed, because the HELD half of `attribution_snapshot` then re-asserts it to
-/// every surface forever). The rule that prevents it is not "be careful" — it is
-/// that the only path from that map to a tap runs through a refresher that re-reads
-/// it every pass and can therefore take the claim BACK.
+/// healed, because the authoritative per-tap half of `attribution_snapshot` then
+/// re-asserts it to every surface forever). The rule that prevents it is not "be
+/// careful": it is that the only path from that map to a tap runs through a
+/// refresher that re-reads it every pass and can therefore take the claim BACK.
 ///
 /// So: the attach seams may not WRITE the map onto a tap, and the refresher must
 /// consult the CACHE rather than gather (it runs on the poll thread every 400 ms).
@@ -1697,14 +1697,16 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
     // `attach_local`'s documented one.
     //
     // The enumeration is taken from the registry's whole read surface rather than
-    // guessed. In vizd's `src/` a provenance FETCH is reachable by exactly two
-    // names: `Ctx::gather_mirror_provenance` (which wraps
-    // `TransportManager::gather_mirror_provenance{,_checked}` — the `_checked` twin
-    // carries the bare name as a prefix, so one needle covers both), and
-    // `Ctx::attribution_snapshot`, which calls it and then merges the authoritative
-    // held half. Everything else in that API is pure (`merge_attribution`), a WRITE
-    // (`{,un}register_mirror_provenance`, called nowhere in vizd) or a cache read
-    // (the `mirror_provenance` FIELD, which is what the refresher above uses).
+    // guessed. In vizd's `src/` a provenance FETCH is reachable by exactly three
+    // names, covered by two needles: `Ctx::gather_mirror_provenance` and the
+    // uncached registry read under it, `Ctx::gather_mirror_provenance_uncached`
+    // (which wraps `TransportManager::gather_mirror_provenance{,_checked}`; the
+    // bare name is a prefix of every one of these, so one needle covers them all),
+    // and `Ctx::attribution_snapshot`, which calls the first on a `RefreshOnMiss`
+    // read and then merges the authoritative per-tap half. Everything else in that
+    // API is pure (`merge_attribution`), a WRITE (`{,un}register_mirror_provenance`,
+    // called nowhere in vizd) or a cache read (the `mirror_provenance` FIELD, which
+    // is what the refresher above uses).
     //
     // Each seam carries its OWN `why`, because a shared sentence would be wrong for
     // one of them: compose's regression is a gather whose answer is thrown away,
@@ -1718,18 +1720,18 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
             // — a per-call answer
             // thrown away, never written onto the tap. It is also load-bearing to the
             // convergence bound `refresh_hinted_origin_robots`' own doc states, which
-            // names `attach_local` among the verbs whose gather REPLACES the cached
+            // names the local `attach` reply among the verbs whose gather REPLACES the cached
             // snapshot a wrong hint survives on. What is forbidden is reaching the RAW
             // map underneath it: that half is name-keyed with no authoritative merge,
             // so a reply built from it loses the robot of a tap whose mirror netd tore
-            // down under it, the attribution flicker `attribution_snapshot`'s held half
-            // exists to prevent.
+            // down under it, the attribution flicker `attribution_snapshot`'s per-tap
+            // half exists to prevent.
             &["gather_mirror_provenance"][..],
             "that is the RAW name-keyed map, reached UNDER the merge. \
              `attribution_snapshot` is the legitimate call here (it computes the \
              reply's `robot`, and it is one of the gathering verbs the wrong-hint \
              convergence bound is stated against) — what it adds is the AUTHORITATIVE \
-             held half, without which the reply loses the robot of a tap whose mirror \
+             per-tap half, without which the reply loses the robot of a tap whose mirror \
              netd tore down under it, which is the attribution flicker that half exists \
              to prevent",
         ),
@@ -1790,8 +1792,10 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
     // (2) …and `attach_local` still ANSWERS the attribution question for its reply.
     // Without this, the forbidden-fetch list above reads as "attach_local must not
     // gather", which is the opposite of the shipped contract: dropping the call would
-    // both blank the reply's `robot` and remove one of the four verbs whose
-    // gather is what lets a wrong hint converge at all.
+    // both blank the reply's `robot` and remove one of the two verbs whose
+    // gather is what lets a wrong hint converge at all (`list` and `status` serve
+    // the stored snapshot and never gather, so the two refreshing verbs are
+    // `discover` and this one).
     //
     // Checked where the value LANDS, not merely that the body mentions the call —
     // the same lesson `monitors_v1_the_served_ring_is_stamped_through_the_one_age_helper`
@@ -1815,7 +1819,7 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
     let literal = block_at(local, open).expect("the reply literal is balanced");
     let robot = struct_field_value(local, literal, "robot");
     assert!(
-        robot.contains("attribution_snapshot"),
+        robot.contains("attribution_snapshot(ProvenanceRead::RefreshOnMiss)"),
         "the attach reply's `robot` must be COMPUTED from the merged snapshot — that \
          per-call answer is the attribution rule's, and `attribution_snapshot` is also one of the \
          gathering verbs the hint-refresh convergence bound is stated against. A call \
@@ -1824,14 +1828,56 @@ fn monitors_v1_a_name_keyed_claim_reaches_a_tap_only_through_the_refresher() {
     );
 }
 
+/// `list` and `status` serve the HELD attribution and never fetch.
+///
+/// Both answer the Studio shell's polls, and a fetch there is a registry open plus up
+/// to `MIRROR_GATHER_WINDOW` on a reply the shipped client bounds at 5 s, so a slow
+/// registry turns a shell poll into a dead connection. Each attribution read names
+/// its policy (`ProvenanceRead`), which is what this walk reads: `Held` here,
+/// `RefreshOnMiss` on `discover`, which stays the verb that keeps the snapshot
+/// current.
+///
+/// Behaviourally pinned by
+/// `vizd_e2e_test::list_and_status_answer_from_the_held_snapshot_while_a_provenance_gather_is_held_e2e`,
+/// which holds a gather in flight and requires both replies inside the shipped
+/// client's deadline.
+#[test]
+fn list_and_status_serve_the_held_attribution_and_never_fetch() {
+    let code = code_containing("fn attribution_snapshot(");
+    for verb in ["fn list(&self", "fn status(&self"] {
+        let body = fn_body(&code, verb);
+        assert!(
+            body.contains("attribution_snapshot(ProvenanceRead::Held)"),
+            "`{verb}` must read the HELD snapshot:\n{body}"
+        );
+        for fetch in ["gather_mirror_provenance", "RefreshOnMiss"] {
+            assert!(
+                !body.contains(fetch),
+                "`{verb}` reaches `{fetch}`, which gathers on a miss: a registry open \
+                 plus up to MIRROR_GATHER_WINDOW on a reply the shipped client bounds \
+                 at 5 s:\n{body}"
+            );
+        }
+    }
+    // ANTI-TAUTOLOGY: the negatives above also pass a daemon in which nothing
+    // refreshes the snapshot at all, so `discover` must still be the verb that does.
+    let discover = fn_body(&code, "fn discover(&self");
+    assert!(
+        discover.contains("attribution_snapshot(ProvenanceRead::RefreshOnMiss)"),
+        "`discover` must refresh the snapshot on a miss, or `list` and `status` serve \
+         a snapshot nothing renews:\n{discover}"
+    );
+}
+
 /// The monitor plane never reaches the network, on any verb.
 ///
 /// The cost claim is "zero netd round trips", and the whole reason the attached
 /// plane reads `TopicStat` is that everything it needs is already computed. The
 /// tempting regression is `attribution_snapshot` — it is the map every OTHER vizd
-/// surface uses for exactly this attribution question, it is one call away, and it
-/// pays a 150-600 ms `/__cerulion/mirrors` gather to answer. On the poll thread
-/// every 400 ms that is not a slow monitor, it is a slow DAEMON, and no assertion
+/// surface uses for exactly this attribution question, it is one call away, a
+/// `RefreshOnMiss` read pays a `/__cerulion/mirrors` gather to answer,
+/// and even a `Held` one takes the state lock again. A gather on the poll thread
+/// every 400 ms is not a slow monitor, it is a slow DAEMON, and no assertion
 /// about alerts would notice.
 #[test]
 fn monitors_v1_the_plane_pays_no_gather_and_opens_no_connection() {

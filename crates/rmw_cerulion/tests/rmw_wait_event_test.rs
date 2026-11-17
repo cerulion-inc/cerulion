@@ -260,6 +260,32 @@ impl Drop for MonitorWaitUnset {
     }
 }
 
+/// Unsets `CERULION_RMW_PERIOD_PARK` for the test and restores the caller's value on drop,
+/// so a run that sets it for the whole binary (a CI step turning the learned park off)
+/// still drives every arm.
+#[cfg(cerulion_period_park)]
+struct PeriodParkUnset {
+    prior: Option<std::ffi::OsString>,
+}
+
+#[cfg(cerulion_period_park)]
+impl PeriodParkUnset {
+    fn new() -> Self {
+        let prior = std::env::var_os("CERULION_RMW_PERIOD_PARK");
+        std::env::remove_var("CERULION_RMW_PERIOD_PARK");
+        Self { prior }
+    }
+}
+
+#[cfg(cerulion_period_park)]
+impl Drop for PeriodParkUnset {
+    fn drop(&mut self) {
+        if let Some(v) = self.prior.take() {
+            std::env::set_var("CERULION_RMW_PERIOD_PARK", v);
+        }
+    }
+}
+
 /// Counter snapshot off the opaque wait-set data pointer. ONLY sound when
 /// no `rmw_wait` on this wait set is in flight (read-after-join in every
 /// test below).
@@ -2638,6 +2664,112 @@ fn a_recreated_publisher_re_rings_the_parked_wait() {
     }
 }
 
+/// A publish that lands after the wait's entry probe found nothing and
+/// before its park starts rings a LIVE bell: the park must return on that
+/// ring at its first check, and the stale-bell reconcile must not re-map the
+/// page. The seam issues the publish from inside `rmw_wait` at exactly that
+/// point, so the order is fixed rather than raced (a publisher on another
+/// thread or process can land there on any call). A park that measured the
+/// ring against seqs read when the park starts would count the ring as
+/// already seen, take the frame through the fd behind a bell that looks
+/// silent, and re-map a page nobody replaced: `fd_wakes` 1,
+/// `park_bell_reopens` 1, no doorbell wake. Off Linux no park runs, so the
+/// seam has no park to precede and the wait times out with nothing sent.
+#[test]
+#[serial]
+fn a_publish_between_the_entry_probe_and_the_park_rings_the_park_and_keeps_the_bell() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    // Park FORCED on (see the park pin above).
+    let _park = EnvVarGuard::set("CERULION_MONITOR_WAIT", "1");
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevPb{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_pb_{suffix}"));
+        let topic = CString::new(format!("/rmw_wev/pb/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!subscription.is_null());
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!publisher.is_null());
+        let ws = rmw_create_wait_set(context, 8);
+        let data = &*((*ws).data as *const WaitSetData);
+
+        let msg = CPoint {
+            x: 7.0,
+            y: 1.5,
+            z: -1.5,
+        };
+        let fired_before = test_seams::publishes_before_park_fired();
+        let parks_before = data.park_blocks.load(Ordering::Relaxed);
+        let bell_before = data.park_wakes_doorbell.load(Ordering::Relaxed);
+        let fd_before = data.fd_wakes.load(Ordering::Relaxed);
+        let reopens_before = data.park_bell_reopens.load(Ordering::Relaxed);
+        let timeout = if cfg!(target_os = "linux") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(200)
+        };
+        let (ret, ready) = {
+            let _seam = test_seams::PublishBeforeParkGuard::arm(
+                publisher,
+                &msg as *const CPoint as *const c_void,
+            );
+            wait_on_sub((*subscription).data, ws, timeout)
+        };
+        let fired = test_seams::publishes_before_park_fired() - fired_before;
+        let parks = data.park_blocks.load(Ordering::Relaxed) - parks_before;
+        let bell_wakes = data.park_wakes_doorbell.load(Ordering::Relaxed) - bell_before;
+        let fd_wakes = data.fd_wakes.load(Ordering::Relaxed) - fd_before;
+        let reopens = data.park_bell_reopens.load(Ordering::Relaxed) - reopens_before;
+        eprintln!(
+            "publish before park: fired={fired} parks={parks} bell_wakes={bell_wakes} \
+             fd_wakes={fd_wakes} reopens={reopens}"
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                fired, 1,
+                "the seam must have published inside the wait, before its park \
+                 (else this pin proves nothing)"
+            );
+            assert_eq!(ret, RMW_RET_OK, "the publish must wake the wait");
+            assert!(ready);
+            assert_eq!(parks, 1, "one park, the call's first block");
+            assert_eq!(
+                bell_wakes, 1,
+                "the ring landed after the entry read, so the park returns on it"
+            );
+            assert_eq!(fd_wakes, 0, "the frame never waits for the fd path");
+            assert_eq!(reopens, 0, "a live bell is never re-mapped");
+            let mut out = CPoint::default();
+            let mut taken = false;
+            assert_eq!(
+                rmw_take(
+                    subscription,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut taken,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+            assert!(taken);
+            assert_eq!(out, msg);
+        } else {
+            assert_eq!(fired, 0, "off Linux no park runs for the seam to precede");
+            assert_eq!(ret, ffi::RMW_RET_TIMEOUT);
+            assert!(!ready);
+            assert_eq!(parks, 0);
+            assert_eq!(reopens, 0);
+        }
+
+        assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
 /// Wake-cost pin on a stock-executor-shaped set — ONE subscription plus
 /// TWO guard conditions plus SIX services (rclcpp's parameter services):
 /// per hop (a publish waking a blocked wait) the wait may DRAIN at most 3
@@ -3798,7 +3930,7 @@ fn a_wake_pass_that_runs_the_pump_drains_first_and_still_delivers() {
 ///
 /// A publisher thread sends `CERULION_SYSCALL_PROBE_MESSAGES` messages (default
 /// 1000) at a fixed period of `CERULION_SYSCALL_PROBE_PERIOD_US` (default 1000), so a
-/// period-park build learns the topic and predicts it. The waiter loops `rmw_wait`
+/// build that carries the period-learned park learns the topic and predicts it. The waiter loops `rmw_wait`
 /// then `rmw_take` until it has taken the last message, or every message was sent
 /// and a wait finds nothing. It prints both thread ids (`gettid` on Linux), the
 /// messages taken and dropped (a queue that overflowed while the waiter was
@@ -3968,18 +4100,166 @@ fn syscall_probe_wait_then_take_per_message() {
                 / per,
             per_msg.join(" ")
         );
-        #[cfg(feature = "period-park")]
+        #[cfg(cerulion_period_park)]
         eprintln!(
             "syscall-probe predicted_parks={} predicted_bell_wakes={} \
-             predicted_rings_before_park={}",
+             predicted_rings_before_park={} learner_entry_arrivals={}",
             data.predicted_parks.load(Ordering::Relaxed),
             data.predicted_bell_wakes.load(Ordering::Relaxed),
-            data.predicted_rings_before_park.load(Ordering::Relaxed)
+            data.predicted_rings_before_park.load(Ordering::Relaxed),
+            data.learner_entry_arrivals.load(Ordering::Relaxed)
         );
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The period-learned park's switch on real waits. Each arm sets `CERULION_RMW_PERIOD_PARK`
+/// and `CERULION_MONITOR_WAIT` and runs three waits on a fresh wait set: one after a publish
+/// (ready, and its take delivers the message), one that times out with nothing, and one after
+/// a second publish (ready at its entry pass, and its take delivers). `predicting_waits`
+/// counts the waits that ran the learned park, and `learner_entry_arrivals` the second
+/// message, which only the learners' entry read observes: 3 and 1, unless either flag is
+/// `0`, where both stay 0 and the wait is the stock one. The park runs only where a ring
+/// wakes it (Linux) and the CPU has a monitor-wait primitive; elsewhere every arm counts 0,
+/// and every arm still delivers.
+#[cfg(cerulion_period_park)]
+#[test]
+#[serial]
+fn the_period_park_switch_turns_the_learned_park_off_and_every_arm_delivers() {
+    let _spin = EnvVarGuard::set("CERULION_LIVE_SPIN_US", "0");
+    let _monitor_unset = MonitorWaitUnset::new();
+    let _period_unset = PeriodParkUnset::new();
+    let runs_here =
+        cfg!(target_os = "linux") && cerulion_core::monitor_wait::monitor_wait_available();
+    // (CERULION_RMW_PERIOD_PARK, CERULION_MONITOR_WAIT, both waits run the learned park)
+    let arms: [(Option<&str>, Option<&str>, bool); 6] = [
+        (None, None, runs_here),
+        (Some("1"), None, runs_here),
+        (Some("on"), None, runs_here),
+        (Some("0"), None, false),
+        (None, Some("0"), false),
+        (Some("1"), Some("0"), false),
+    ];
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("WevPs{suffix}"));
+        let (context, node, _opts) = setup_node(&format!("wev_ps_{suffix}"));
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        for (k, (period, monitor, expect)) in arms.into_iter().enumerate() {
+            let _period = period.map(|v| EnvVarGuard::set("CERULION_RMW_PERIOD_PARK", v));
+            let _monitor = monitor.map(|v| EnvVarGuard::set("CERULION_MONITOR_WAIT", v));
+            let arm = format!(
+                "arm {k}: CERULION_RMW_PERIOD_PARK {period:?}, CERULION_MONITOR_WAIT {monitor:?}"
+            );
+            let topic = CString::new(format!("/rmw_wev/ps/{suffix}/{k}")).expect("topic");
+            let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+            assert!(!subscription.is_null(), "{arm}");
+            let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+            assert!(!publisher.is_null(), "{arm}");
+            let ws = rmw_create_wait_set(context, 8);
+            let data = &*((*ws).data as *const WaitSetData);
+            let msg = CPoint {
+                x: f64::from(k as u32),
+                y: 2.5,
+                z: -0.75,
+            };
+            assert_eq!(
+                rmw_publish(
+                    publisher,
+                    &msg as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK,
+                "{arm}"
+            );
+            // One wait on the subscription: the wait's code, and whether it was ready.
+            let wait = |ms: u32| {
+                let mut slot = [(*subscription).data];
+                let mut subs = ffi::rmw_subscriptions_t {
+                    subscriber_count: 1,
+                    subscribers: slot.as_mut_ptr(),
+                };
+                let t = ffi::rmw_time_t {
+                    sec: 0,
+                    nsec: u64::from(ms) * 1_000_000,
+                };
+                let ret = rmw_wait(
+                    &mut subs,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    ws,
+                    &t,
+                );
+                (ret, !slot[0].is_null())
+            };
+            let take = || {
+                let mut out = CPoint::default();
+                let mut taken = false;
+                assert_eq!(
+                    rmw_take(
+                        subscription,
+                        &mut out as *mut _ as *mut c_void,
+                        &mut taken,
+                        std::ptr::null_mut()
+                    ),
+                    RMW_RET_OK,
+                    "{arm}"
+                );
+                assert!(taken, "{arm}: the take delivers");
+                out
+            };
+            assert_eq!(
+                wait(1000),
+                (RMW_RET_OK, true),
+                "{arm}: the publish is ready"
+            );
+            assert_eq!(take(), msg, "{arm}: payload oracle");
+            assert_eq!(
+                wait(20),
+                (ffi::RMW_RET_TIMEOUT, false),
+                "{arm}: nothing else was published"
+            );
+            let second = CPoint {
+                x: -msg.x - 1.0,
+                ..msg
+            };
+            assert_eq!(
+                rmw_publish(
+                    publisher,
+                    &second as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK,
+                "{arm}"
+            );
+            assert_eq!(
+                wait(1000),
+                (RMW_RET_OK, true),
+                "{arm}: the second publish is ready"
+            );
+            assert_eq!(take(), second, "{arm}: second payload oracle");
+            assert_eq!(
+                data.predicting_waits.load(Ordering::Relaxed),
+                if expect { 3 } else { 0 },
+                "{arm}: waits that ran the learned park"
+            );
+            assert_eq!(
+                data.learner_entry_arrivals.load(Ordering::Relaxed),
+                u64::from(expect),
+                "{arm}: the second message, read by the third wait's entry pass"
+            );
+            assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
+            assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+            assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        }
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }

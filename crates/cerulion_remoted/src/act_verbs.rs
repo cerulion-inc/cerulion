@@ -35,7 +35,18 @@
 //! publish still running
 //! [`PUBLISH_DEADLINE`] after it started is stopped too. A `message` or
 //! `request` longer than [`MAX_MESSAGE_TEXT_BYTES`] is refused. A topic under
-//! the reserved `/__cerulion` namespace is refused.
+//! the reserved `/__cerulion` namespace or a network mirror is refused by every
+//! act verb; read imported topics on their source robot.
+//!
+//! Every act verb answers in one order. `topic-publish` and `service-call`
+//! read the e-stop first, so while it holds every call to them is refused
+//! with the e-stop reason. Each verb then checks its arguments (required
+//! keys, numbers and limits, and for those two verbs that the type resolves
+//! on this robot) before it reads anything in shared memory, so such a
+//! malformed request is a usage error whatever the topic's state. Only then
+//! does it read the topic's network mirror marker and remote access policy
+//! and take the topic's remote lease. The `message` or `request` text itself
+//! is parsed and encoded after that, when the publish or call runs.
 //!
 //! A failure is `CerudError::Verb` with a message that starts with the
 //! error's class (`usage: `, `encode: `, `unavailable: `, `internal: `,
@@ -117,6 +128,45 @@ pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(100);
 /// that tree's re-serialized text at once, so the cap bounds that memory
 /// below what the 16 MiB ops frame would allow.
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 1 << 20;
+
+fn remote_lease(
+    topic: &str,
+) -> CerudResult<cerulion_core::transport::egress_scope::RemoteTopicLease> {
+    cerulion_core::TransportManager::get_or_init()
+        .and_then(|manager| manager.acquire_remote_topic_lease(topic))
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))
+}
+
+fn servable(topic: &str) -> CerudResult<()> {
+    let requested_topic = topic;
+    let canonical;
+    let topic = if topic.starts_with('/') {
+        topic
+    } else {
+        canonical = format!("/{topic}");
+        &canonical
+    };
+    let manager = cerulion_core::TransportManager::get_or_init()
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
+    // An act verb runs on a blocking thread of its own: it waits out a marker
+    // being torn down.
+    crate::wire::wire_servable(
+        &manager,
+        topic,
+        cerulion_core::transport::TeardownWait::Bounded,
+    )
+    .map_err(|refusal| {
+        let message = refusal.message(requested_topic);
+        match refusal {
+            crate::wire::SourceRefusal::Reserved => verb_error(VerbError::Usage(message)),
+            crate::wire::SourceRefusal::Mirror
+            | crate::wire::SourceRefusal::MarkerUnavailable(_)
+            | crate::wire::SourceRefusal::Excluded(_) => {
+                verb_error(VerbError::Unavailable(message))
+            }
+        }
+    })
+}
 
 fn schemas_dir() -> Option<PathBuf> {
     std::env::var_os(SCHEMAS_DIR_ENV)
@@ -312,27 +362,6 @@ fn send_unless_estop(lease: &EstopLease, send: &mut dyn FnMut()) -> bool {
     }
 }
 
-/// Refuse a topic in the reserved control-plane namespace.
-fn refuse_reserved(topic: &str) -> CerudResult<()> {
-    let canonical = if topic.starts_with('/') {
-        topic.to_string()
-    } else {
-        format!("/{topic}")
-    };
-    if canonical == cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX
-        || canonical.starts_with(&format!(
-            "{}/",
-            cerulion_core::transport::gateway::RESERVED_TOPIC_PREFIX
-        ))
-    {
-        return Err(usage(format!(
-            "'{}' is in Cerulion's reserved control-plane namespace",
-            topic.escape_debug()
-        )));
-    }
-    Ok(())
-}
-
 /// `topic-publish`: publish frames of one message on a local topic. Refused
 /// while the e-stop is engaged; each frame goes out only with the latch read
 /// clear and no engage counted under the lease's lock at its send, so an
@@ -368,8 +397,8 @@ impl VerbHandler for TopicPublishVerb {
     }
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
+        refuse_under_estop(&self.lease, TOPIC_PUBLISH)?;
         let topic = str_arg(args, "topic")?;
-        refuse_reserved(topic)?;
         let type_arg = str_arg(args, "type")?;
         let message = text_arg(args, "message")?;
         let times = match args.get("times") {
@@ -399,7 +428,6 @@ impl VerbHandler for TopicPublishVerb {
                 MAX_PUBLISH_SPAN.as_secs()
             )));
         }
-        refuse_under_estop(&self.lease, TOPIC_PUBLISH)?;
         let name = qualified_type_name(type_arg, InterfaceKind::Message).map_err(verb_error)?;
         let walker =
             cerulion_msgio::checked_walker(cerulion_msgio::store_schemas(schemas_dir().as_deref()))
@@ -410,6 +438,8 @@ impl VerbHandler for TopicPublishVerb {
                  in the {SCHEMAS_DIR_ENV} store"
             )));
         }
+        servable(topic)?;
+        let _remote_lease = remote_lease(topic)?;
         let req = publish::PubRequest {
             topic,
             message: &message,
@@ -504,14 +534,18 @@ impl VerbHandler for ServiceCallVerb {
     }
 
     fn execute(&self, args: &Value) -> CerudResult<Value> {
+        refuse_under_estop(&self.lease, SERVICE_CALL)?;
         let service_name = str_arg(args, "service")?;
         let type_arg = str_arg(args, "type")?;
         let request = text_arg(args, "request")?;
         let timeout = seconds_arg(args, "timeout_s", service::DEFAULT_CALL_TIMEOUT)?;
         service::check_service_name(service_name).map_err(verb_error)?;
-        refuse_under_estop(&self.lease, SERVICE_CALL)?;
         let types = service::resolve_store_service_types(type_arg, schemas_dir().as_deref())
             .map_err(verb_error)?;
+        servable(service_name)?;
+        let request_topic = cerulion_core::transport::service::request_topic(service_name);
+        servable(&request_topic)?;
+        let _request_lease = remote_lease(&request_topic)?;
         let req = service::CallRequest {
             service: service_name,
             type_name: type_arg,
@@ -566,6 +600,8 @@ impl VerbHandler for TopicSnapshotVerb {
                 .map(|q| q as u8)
                 .ok_or_else(|| usage("`quality` must be an integer from 1 to 100".to_string()))?,
         };
+        servable(topic)?;
+        let _remote_lease = remote_lease(topic)?;
         let walker =
             cerulion_msgio::checked_walker(cerulion_msgio::store_schemas(schemas_dir().as_deref()))
                 .map_err(verb_error)?;
@@ -598,6 +634,8 @@ impl VerbHandler for TopicEchoOnceVerb {
     fn execute(&self, args: &Value) -> CerudResult<Value> {
         let topic = str_arg(args, "topic")?;
         let timeout = seconds_arg(args, "timeout_s", DEFAULT_READ_TIMEOUT)?;
+        servable(topic)?;
+        let _remote_lease = remote_lease(topic)?;
         let walker =
             cerulion_msgio::checked_walker(cerulion_msgio::store_schemas(schemas_dir().as_deref()))
                 .map_err(verb_error)?;
@@ -639,6 +677,11 @@ fn echo_result(walker: &cerulion_core::codegen::FrameWalker, frame: &[u8]) -> Ce
 
 /// The newest frame of the local topic within `timeout`.
 fn newest_frame(topic: &str, timeout: Duration) -> CerudResult<Vec<u8>> {
+    let manager = cerulion_core::TransportManager::get_or_init()
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
+    let _local_source = manager
+        .acquire_local_topic_lease(topic)
+        .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
     let running = running();
     let deadline = Instant::now() + timeout;
     let (_transport, subscriber) =
@@ -681,7 +724,44 @@ mod tests {
             let err = TopicPublishVerb::new(lease())
                 .execute(&json!({"topic": topic, "type": "std_msgs/String"}))
                 .unwrap_err();
-            assert_eq!(class_of(err), "usage", "{topic}");
+            assert!(
+                matches!(err, CerudError::Verb(ref message) if message == &format!(
+                    "usage: '{topic}' is in Cerulion's reserved control-plane namespace"
+                )),
+                "{topic}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_engaged_estop_is_the_answer_before_any_argument_is_read() {
+        let l = lease();
+        l.lock().unwrap().engage_estop("test");
+        let publish = TopicPublishVerb::new(l.clone());
+        let call = ServiceCallVerb::new(l);
+        for (verb, args, refused) in [
+            (&publish as &dyn VerbHandler, json!({}), TOPIC_PUBLISH),
+            (&publish, json!({"topic": "/x", "times": 0}), TOPIC_PUBLISH),
+            (
+                &publish,
+                json!({"topic": "/__cerulion/x", "type": "std_msgs/String"}),
+                TOPIC_PUBLISH,
+            ),
+            (&call, json!({}), SERVICE_CALL),
+            (
+                &call,
+                json!({"service": "/", "type": "a/srv/B"}),
+                SERVICE_CALL,
+            ),
+        ] {
+            let err = verb.execute(&args).unwrap_err();
+            assert!(
+                matches!(err, CerudError::Verb(ref message) if message == &format!(
+                    "unavailable: the robot's e-stop is engaged, so {refused} is refused"
+                )),
+                "{} {args}: {err}",
+                verb.name()
+            );
         }
     }
 
@@ -715,6 +795,8 @@ mod tests {
         );
     }
 
+    /// Every case is malformed, so each is answered before any marker opens:
+    /// the answer cannot depend on another test's markers on the same topic.
     #[test]
     fn missing_and_malformed_arguments_are_usage_errors() {
         let publish = TopicPublishVerb::new(lease());

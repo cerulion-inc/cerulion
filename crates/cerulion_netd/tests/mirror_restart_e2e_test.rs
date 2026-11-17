@@ -231,6 +231,9 @@ fn run_restart_self_heal(suppress_liveliness_token: bool) {
                 root_a.clone(),
             )
             .expect("init gateway G");
+            g.network()
+                .expect("network fixture")
+                .set_lan_access(cerulion_core::LanAccess::Open);
             let plan = GatewayPlan {
                 egress_policy: GatewayEgressPolicy::AllowAll,
                 announce: vec![topic.clone()],
@@ -285,6 +288,9 @@ fn run_restart_self_heal(suppress_liveliness_token: bool) {
         iceoryx_test_config(),
     )
     .expect("init netd manager B");
+    b.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     if suppress_liveliness_token {
         // Isolation: never declare B's liveliness demand token, so the
         // ONLY demand path to the robot is the demand-GET keepalive (the strict-link

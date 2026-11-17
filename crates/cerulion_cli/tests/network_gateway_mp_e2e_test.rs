@@ -194,6 +194,7 @@ fn spawn_supervisor(root: &Path) -> (ChildGuard, PathBuf, PathBuf) {
     cmd.args(["graph", "run", "gwmp", "--no-validate"])
         .current_dir(root)
         .env("CERULION_HOME", &login_home)
+        .env("CERULION_LAN_ACCESS", "open")
         .env_remove("CERULION_LOGIN_GATE")
         .env_remove("CERULION_NETWORK")
         .env_remove("CARGO_TARGET_DIR")
@@ -245,6 +246,9 @@ fn build_ingress_manager(
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init test-side ingress manager");
+    mgr.network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     let sub = mgr
         .create_subscriber(EGRESS_TOPIC)
         .expect("test-side subscriber");
@@ -491,6 +495,7 @@ fn networked_mp_delivers_to_external_ingress_and_announces_topic() {
         .current_dir(_tmp.path())
         .env_remove("CARGO_TARGET_DIR")
         .env("HOME", &cache_home)
+        .env("CERULION_LAN_ACCESS", "open")
         .env_remove("CERULION_PEERS")
         .output()
         .expect("run cerulion topic list --connect");
