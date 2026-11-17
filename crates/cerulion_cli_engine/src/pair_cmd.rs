@@ -1201,8 +1201,8 @@ enabled = true
             Ok(())
         };
 
-        // Every non-zero outcome — INCLUDING the signal-killed 130 (a Ctrl-C at the
-        // code prompt) and the two ends the helper reports unconfirmed — must
+        // Every non-zero outcome, INCLUDING the signal-killed 130 (a Ctrl-C at the
+        // code prompt) and the two ends the helper reports unconfirmed, must
         // NOT pin.
         for code in [130, 2, 3, 4, 1] {
             for unconfirmed in [false, true] {

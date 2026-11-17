@@ -942,7 +942,7 @@ fn record_end(outcome_file: Option<&Path>, eid: &str, end: &PairEnd) {
         }
         PairEnd::Failed(error) => {
             // Every other `PairError` variant renders HERE, and the
-            // Refused / CodeMismatch ones carry text the ROBOT chose — at the moment
+            // Refused / CodeMismatch ones carry text the ROBOT chose, at the moment
             // the desk trusts the robot LEAST. Peer text is neutered + bounded where
             // it ENTERS (`pair::classify_call_error` / `classify_transport_error` /
             // `parse_finish_reply` / `decode_hex_field` / `classify_finish_error`);
