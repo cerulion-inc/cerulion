@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- The remoted library provides `SessionLimits` and reusable `ShellFlags` for validated shell resource settings. Either local off setting prohibits access, invalid text refuses configuration, and timeout/stream limits remain distinct. Rust callers using `RemotedConfig` struct literals must supply its four shell configuration fields or use `RemotedConfig::from_state_root` for defaults.
 - `cerulion_remoted::shell_policy` supplies an owner setting for shell and exec authorization. An absent policy file defaults on; invalid or unreadable files disable access. A robot-local prohibition cannot be overridden by the owner, and failed persistence disables the live setting. The authorizer requires an installed policy handle as well as owner scope.
 - `cerulion_wireclient::owner_pair::present_owner_certificate_checked` accepts an identity check after the ordinary ops handshake and before sending a certificate. A failed check sends no pairing request. Owner-pair clients negotiate ordinary ops versions 1 through 2.
 - `cerulion_wireclient::local_identity` provides locked account and machine-key reads, with a separate full-proof snapshot. Identity-only reads do not open certificates. Netd shares the full reader while retaining its prior-login and durable-pairing rules.
