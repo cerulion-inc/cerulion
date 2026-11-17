@@ -258,8 +258,48 @@ impl TopicLearners {
         }
     }
 
+    /// Has any mapped bell's seq (`seqs`, in bell order) moved since the last [`Self::note`], [`Self::note_unwoken`]
+    /// or [`Self::sync`]?
+    pub fn rang_since_noted(&self, seqs: impl IntoIterator<Item = u64>) -> bool {
+        seqs.into_iter()
+            .zip(self.noted_seqs())
+            .any(|(seq, noted)| seq != noted)
+    }
+
+    /// Observe an arrival at `now_ns` for every bell whose seq (`seqs`, in bell order) moved since the last note,
+    /// with the pending predicted block's end dropped, not applied: these messages reached the caller with no wake of
+    /// the predicted block, so they say nothing about how its window ended. For seqs read before a readiness probe
+    /// that serves every message behind them, and a `now_ns` read after them, so no earlier than any of their rings.
+    /// Because `now_ns` is only an upper bound, a moved bell less than [`MIN_PERIOD_NS`] after its learner's last
+    /// noted arrival (or before it) is marked seen with no arrival: it is a burst's tail, or a ring that a late-noted
+    /// last arrival already stands for, and observed it would reset the learner. Returns how many arrivals it observed.
+    pub fn note_unwoken(&mut self, now_ns: u64, seqs: impl IntoIterator<Item = u64>) -> u64 {
+        self.pending = None;
+        let mut observed = 0;
+        for (bell, seq) in seqs.into_iter().enumerate() {
+            let Some(&idx) = self.map.get(bell) else {
+                break;
+            };
+            let (_, last, learner) = &mut self.learners[idx];
+            if seq == *last {
+                continue;
+            }
+            *last = seq;
+            if learner
+                .last_ns
+                .is_some_and(|prev| now_ns.saturating_sub(prev) < MIN_PERIOD_NS)
+            {
+                continue;
+            }
+            learner.observe(now_ns);
+            observed += 1;
+        }
+        observed
+    }
+
     /// Record each mapped bell's seq (`seqs`, in bell order) as seen without observing an arrival, and drop the
-    /// pending predicted block's end. For seqs read before a readiness probe that serves every message behind them.
+    /// pending predicted block's end. For seqs read before a readiness probe that serves every message behind them,
+    /// once [`Self::rang_since_noted`] found none moved (a moved one goes to [`Self::note_unwoken`]).
     pub fn sync(&mut self, seqs: impl IntoIterator<Item = u64>) {
         self.pending = None;
         for (bell, seq) in seqs.into_iter().enumerate() {
@@ -270,7 +310,8 @@ impl TopicLearners {
         }
     }
 
-    /// Each mapped bell's seq at the last [`Self::note`] or [`Self::sync`] (the seed for a topic not yet noted), in
+    /// Each mapped bell's seq at the last [`Self::note`], [`Self::note_unwoken`] or [`Self::sync`] (the seed for a
+    /// topic not yet noted), in
     /// bell order. A bell whose seq differs from this has rung since the learners last looked.
     pub fn noted_seqs(&self) -> impl Iterator<Item = u64> + '_ {
         self.map.iter().map(|&idx| self.learners[idx].1)
@@ -692,6 +733,136 @@ mod tests {
         assert_eq!(
             unsynced.learners[1].2.early_ns, MIN_WINDOW_NS,
             "without the sync the pending end widens the window"
+        );
+    }
+
+    /// A steady topic whose 11 ms message is served at an entry pass: observed there, it keeps
+    /// the topic regular and the next window one period on. Marked seen without an arrival (a
+    /// sync), it leaves a two-period gap that drops the topic back to learning.
+    #[test]
+    fn an_arrival_seen_by_the_entry_read_keeps_a_steady_topic_regular() {
+        // Seqs 1 to 11 noted at 0 to 10 ms: a regular 1 ms topic per bell, last seq 11.
+        let mut set = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        assert!(!set.rang_since_noted([11, 11]), "nothing rang since 10 ms");
+        assert!(set.rang_since_noted([11, 12]), "/b rang once");
+        assert_eq!(
+            set.note_unwoken(11_000_000, [11, 12]),
+            1,
+            "one arrival, on /b"
+        );
+        assert_eq!(set.noted_seqs().collect::<Vec<_>>(), [11, 12]);
+        assert_eq!(set.learners[1].2.last_ns, Some(11_000_000));
+        assert_eq!(
+            set.learners[0].2.last_ns,
+            Some(10_000_000),
+            "/a did not ring: no arrival"
+        );
+        set.note(12_000_000, [12, 13]);
+        assert_eq!(
+            set.learners[1].2.predict().map(|p| p.next_ns),
+            Some(13_000_000),
+            "still regular, one period on"
+        );
+        let mut synced = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        synced.sync([11, 12]);
+        synced.note(12_000_000, [12, 13]);
+        assert_eq!(
+            synced.learners[1].2.predict(),
+            None,
+            "after a sync the 2 ms gap is a missed beat"
+        );
+    }
+
+    /// A bell seen moved by the entry read less than `MIN_PERIOD_NS` after its learner's last
+    /// arrival is a burst's tail (the entry instant only bounds its ring from above): it is
+    /// marked seen with no arrival and the topic stays regular. At the bound it is observed.
+    #[test]
+    fn a_burst_tail_seen_by_the_entry_read_is_not_an_arrival() {
+        let mut set = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        assert_eq!(
+            set.note_unwoken(10_000_000 + MIN_PERIOD_NS - 1, [11, 12]),
+            0,
+            "199.999 us after the 10 ms arrival: a burst's tail"
+        );
+        assert_eq!(set.noted_seqs().collect::<Vec<_>>(), [11, 12], "but seen");
+        assert_eq!(set.learners[1].2.last_ns, Some(10_000_000));
+        assert_eq!(
+            set.learners[1].2.predict().map(|p| p.next_ns),
+            Some(11_000_000),
+            "still regular, the window unchanged"
+        );
+        let mut at_bound = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        assert_eq!(
+            at_bound.note_unwoken(10_000_000 + MIN_PERIOD_NS, [11, 12]),
+            1,
+            "200 us after it: an arrival"
+        );
+        assert_eq!(
+            at_bound.learners[1].2.last_ns,
+            Some(10_000_000 + MIN_PERIOD_NS)
+        );
+        let mut earlier = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        let before = earlier.learners[1].2;
+        assert_eq!(
+            earlier.note_unwoken(10_000_000 - 1, [11, 12]),
+            0,
+            "an instant before the last arrival is only marked seen"
+        );
+        assert_eq!(earlier.noted_seqs().collect::<Vec<_>>(), [11, 12]);
+        assert_eq!(
+            earlier.learners[1].2, before,
+            "and does not reset the learner"
+        );
+        let mut first = TopicLearners::default();
+        first.remap(1, &[("/new", 4)]);
+        assert_eq!(
+            first.note_unwoken(5_000, [5]),
+            1,
+            "a learner with no arrival yet observes its first"
+        );
+        assert_eq!(first.learners[0].2.last_ns, Some(5_000));
+    }
+
+    /// The same notes and entry reads give the same learners, arrival for arrival.
+    #[test]
+    fn the_same_entry_reads_give_the_same_state() {
+        let run = || {
+            let mut set = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+            let mut counts = Vec::new();
+            counts.push(set.note_unwoken(11_000_000, [12, 11]));
+            set.note(12_000_000, [13, 12]);
+            counts.push(set.note_unwoken(12_050_000, [14, 12]));
+            counts.push(set.note_unwoken(13_000_000, [15, 13]));
+            let state: Vec<PeriodLearner> = set.learners.iter().map(|(_, _, l)| *l).collect();
+            (counts, state, set.noted_seqs().collect::<Vec<_>>())
+        };
+        let (counts, state, seqs) = run();
+        assert_eq!(counts, [1, 0, 2], "the 12.05 ms read is /a's burst tail");
+        assert_eq!(seqs, [15, 13]);
+        assert_eq!(run(), (counts, state, seqs));
+    }
+
+    /// The entry read drops the pending predicted block's end: a message served with no wake
+    /// says nothing about how the window ended, so it neither widens nor resets the next one.
+    #[test]
+    fn an_arrival_seen_by_the_entry_read_drops_the_pending_end() {
+        let mut set = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        set.end_window(Some((1, WindowEnd::BeforePark)));
+        assert_eq!(set.note_unwoken(11_000_000, [12, 12]), 2);
+        assert_eq!(set.learners[1].2.early_ns, 0, "BeforePark was dropped");
+        set.note(12_000_000, [13, 13]);
+        assert_eq!(
+            set.learners[1].2.early_ns, 0,
+            "and does not reach the next note"
+        );
+        let mut widened = regular_set(&["/a", "/b"], 1_000_000, 10_000_000);
+        widened.end_window(Some((1, WindowEnd::BeforePark)));
+        widened.note(11_000_000, [12, 12]);
+        widened.end_window(Some((1, WindowEnd::Caught)));
+        assert_eq!(widened.note_unwoken(12_000_000, [13, 13]), 2);
+        assert_eq!(
+            widened.learners[1].2.early_ns, MIN_WINDOW_NS,
+            "a dropped Caught keeps the widening"
         );
     }
 
