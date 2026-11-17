@@ -2986,148 +2986,6 @@ pub fn live_wait_for_test(scheduler: &Scheduler, now_ns: u64) -> Duration {
     Duration::from_nanos(live_wait_ns(scheduler.next_fire_split(now_ns), None))
 }
 
-#[cfg(test)]
-mod live_wait_tests {
-    use super::{live_wait_ns, LIVE_DEADLINE_FLOOR_NS, LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS};
-    use crate::scheduler::NextFire;
-
-    const US: u64 = 1_000;
-    const MS: u64 = 1_000_000;
-
-    fn next(deadline: Option<u64>, poll: Option<u64>) -> NextFire {
-        NextFire {
-            deadline_ns: deadline,
-            poll_ns: poll,
-        }
-    }
-
-    /// The wait the live loop sized before the exact deadline: the soonest of
-    /// everything, capped at the boundary, clamped to [1 ms, 250 ms].
-    fn single_floor_oracle(n: NextFire, boundary: Option<u64>) -> u64 {
-        match n.soonest() {
-            None => LIVE_WAIT_CAP_NS,
-            Some(soonest) => boundary
-                .map_or(soonest, |b| soonest.min(b))
-                .clamp(LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS),
-        }
-    }
-
-    #[test]
-    fn a_period_deadline_below_a_millisecond_is_waited_for_exactly() {
-        assert_eq!(live_wait_ns(next(Some(300 * US), None), None), 300 * US);
-        assert_eq!(live_wait_ns(next(Some(999 * US), None), None), 999 * US);
-        assert_eq!(live_wait_ns(next(Some(4 * MS), None), None), 4 * MS);
-    }
-
-    #[test]
-    fn a_deadline_closer_than_the_deadline_floor_waits_the_floor() {
-        assert_eq!(LIVE_DEADLINE_FLOOR_NS, 10 * US);
-        assert_eq!(live_wait_ns(next(Some(1), None), None), 10 * US);
-        assert_eq!(live_wait_ns(next(Some(9_999), None), None), 10 * US);
-        assert_eq!(live_wait_ns(next(Some(10_001), None), None), 10_001);
-    }
-
-    #[test]
-    fn every_other_pending_fire_keeps_the_millisecond_poll() {
-        assert_eq!(LIVE_POLL_FLOOR_NS, MS);
-        assert_eq!(live_wait_ns(next(None, Some(0)), None), MS, "due now");
-        assert_eq!(
-            live_wait_ns(next(None, Some(300 * US)), None),
-            MS,
-            "a window below 1 ms"
-        );
-        assert_eq!(
-            live_wait_ns(next(None, Some(7 * MS)), None),
-            7 * MS,
-            "a later release"
-        );
-    }
-
-    #[test]
-    fn a_deadline_and_a_poll_take_the_sooner_of_their_floored_waits() {
-        assert_eq!(live_wait_ns(next(Some(300 * US), Some(0)), None), 300 * US);
-        assert_eq!(live_wait_ns(next(Some(5 * MS), Some(0)), None), MS);
-        assert_eq!(live_wait_ns(next(Some(2 * US), Some(0)), None), 10 * US);
-    }
-
-    #[test]
-    fn nothing_pending_or_a_far_wait_is_capped_at_the_liveliness_sweep() {
-        assert_eq!(LIVE_WAIT_CAP_NS, 250 * MS);
-        assert_eq!(live_wait_ns(next(None, None), None), 250 * MS);
-        assert_eq!(live_wait_ns(next(None, None), Some(3 * MS)), 250 * MS);
-        assert_eq!(live_wait_ns(next(Some(400 * MS), None), None), 250 * MS);
-        assert_eq!(live_wait_ns(next(None, Some(900 * MS)), None), 250 * MS);
-    }
-
-    #[test]
-    fn a_quantum_boundary_is_exact_only_beside_a_deadline_still_ahead() {
-        // Beside a deadline: the sooner of the two, exact.
-        assert_eq!(
-            live_wait_ns(next(Some(4 * MS), None), Some(2_500 * US)),
-            2_500 * US
-        );
-        assert_eq!(
-            live_wait_ns(next(Some(4 * MS), None), Some(3 * US)),
-            10 * US
-        );
-        assert_eq!(
-            live_wait_ns(next(Some(400 * US), None), Some(2 * MS)),
-            400 * US
-        );
-        // Without one: it caps the poll and keeps the poll floor.
-        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(2 * MS)), 2 * MS);
-        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(400 * US)), MS);
-        assert_eq!(live_wait_ns(next(None, Some(0)), Some(400 * US)), MS);
-    }
-
-    /// No case polls faster than a single 1 ms floor: wherever no Period
-    /// deadline is ahead, the wait is exactly the old one, and a deadline ahead
-    /// only ever brings the wait forward to that deadline (never below it, and
-    /// never below the deadline floor).
-    #[test]
-    fn only_a_deadline_still_ahead_waits_less_than_the_single_floor_did() {
-        let values = [
-            None,
-            Some(0),
-            Some(1),
-            Some(9 * US),
-            Some(10 * US),
-            Some(300 * US),
-            Some(MS - 1),
-            Some(MS),
-            Some(2 * MS),
-            Some(250 * MS),
-            Some(900 * MS),
-        ];
-        for deadline in values {
-            let deadline = deadline.filter(|&d| d > 0);
-            for poll in values {
-                for boundary in values {
-                    let n = next(deadline, poll);
-                    let new = live_wait_ns(n, boundary);
-                    let old = single_floor_oracle(n, boundary);
-                    let case = format!("deadline {deadline:?} poll {poll:?} boundary {boundary:?}");
-                    match deadline {
-                        None => assert_eq!(new, old, "{case}"),
-                        Some(d) => {
-                            assert!(new <= old, "{case}: {new} > {old}");
-                            assert!(new >= LIVE_DEADLINE_FLOOR_NS, "{case}: {new}");
-                            if new < LIVE_POLL_FLOOR_NS {
-                                let exact =
-                                    boundary.map_or(d, |b| d.min(b)).max(LIVE_DEADLINE_FLOOR_NS);
-                                assert_eq!(
-                                    new, exact,
-                                    "{case}: only the deadline waits under 1 ms"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// The manual-ceiling clamp for `CERULION_LIVE_SPIN_US`
 /// (100 ms, in µs). A spin budget beyond this is never sensible — the spin is a
 /// pre-block latency optimization for an *imminent* wake, not a polling loop —
@@ -19187,6 +19045,148 @@ fn shared_start_decision(
         SharedStart::OnTime(epoch_ns)
     } else {
         SharedStart::Missed { late_ns }
+    }
+}
+
+#[cfg(test)]
+mod live_wait_tests {
+    use super::{live_wait_ns, LIVE_DEADLINE_FLOOR_NS, LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS};
+    use crate::scheduler::NextFire;
+
+    const US: u64 = 1_000;
+    const MS: u64 = 1_000_000;
+
+    fn next(deadline: Option<u64>, poll: Option<u64>) -> NextFire {
+        NextFire {
+            deadline_ns: deadline,
+            poll_ns: poll,
+        }
+    }
+
+    /// The wait the live loop sized before the exact deadline: the soonest of
+    /// everything, capped at the boundary, clamped to [1 ms, 250 ms].
+    fn single_floor_oracle(n: NextFire, boundary: Option<u64>) -> u64 {
+        match n.soonest() {
+            None => LIVE_WAIT_CAP_NS,
+            Some(soonest) => boundary
+                .map_or(soonest, |b| soonest.min(b))
+                .clamp(LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS),
+        }
+    }
+
+    #[test]
+    fn a_period_deadline_below_a_millisecond_is_waited_for_exactly() {
+        assert_eq!(live_wait_ns(next(Some(300 * US), None), None), 300 * US);
+        assert_eq!(live_wait_ns(next(Some(999 * US), None), None), 999 * US);
+        assert_eq!(live_wait_ns(next(Some(4 * MS), None), None), 4 * MS);
+    }
+
+    #[test]
+    fn a_deadline_closer_than_the_deadline_floor_waits_the_floor() {
+        assert_eq!(LIVE_DEADLINE_FLOOR_NS, 10 * US);
+        assert_eq!(live_wait_ns(next(Some(1), None), None), 10 * US);
+        assert_eq!(live_wait_ns(next(Some(9_999), None), None), 10 * US);
+        assert_eq!(live_wait_ns(next(Some(10_001), None), None), 10_001);
+    }
+
+    #[test]
+    fn every_other_pending_fire_keeps_the_millisecond_poll() {
+        assert_eq!(LIVE_POLL_FLOOR_NS, MS);
+        assert_eq!(live_wait_ns(next(None, Some(0)), None), MS, "due now");
+        assert_eq!(
+            live_wait_ns(next(None, Some(300 * US)), None),
+            MS,
+            "a window below 1 ms"
+        );
+        assert_eq!(
+            live_wait_ns(next(None, Some(7 * MS)), None),
+            7 * MS,
+            "a later release"
+        );
+    }
+
+    #[test]
+    fn a_deadline_and_a_poll_take_the_sooner_of_their_floored_waits() {
+        assert_eq!(live_wait_ns(next(Some(300 * US), Some(0)), None), 300 * US);
+        assert_eq!(live_wait_ns(next(Some(5 * MS), Some(0)), None), MS);
+        assert_eq!(live_wait_ns(next(Some(2 * US), Some(0)), None), 10 * US);
+    }
+
+    #[test]
+    fn nothing_pending_or_a_far_wait_is_capped_at_the_liveliness_sweep() {
+        assert_eq!(LIVE_WAIT_CAP_NS, 250 * MS);
+        assert_eq!(live_wait_ns(next(None, None), None), 250 * MS);
+        assert_eq!(live_wait_ns(next(None, None), Some(3 * MS)), 250 * MS);
+        assert_eq!(live_wait_ns(next(Some(400 * MS), None), None), 250 * MS);
+        assert_eq!(live_wait_ns(next(None, Some(900 * MS)), None), 250 * MS);
+    }
+
+    #[test]
+    fn a_quantum_boundary_is_exact_only_beside_a_deadline_still_ahead() {
+        // Beside a deadline: the sooner of the two, exact.
+        assert_eq!(
+            live_wait_ns(next(Some(4 * MS), None), Some(2_500 * US)),
+            2_500 * US
+        );
+        assert_eq!(
+            live_wait_ns(next(Some(4 * MS), None), Some(3 * US)),
+            10 * US
+        );
+        assert_eq!(
+            live_wait_ns(next(Some(400 * US), None), Some(2 * MS)),
+            400 * US
+        );
+        // Without one: it caps the poll and keeps the poll floor.
+        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(2 * MS)), 2 * MS);
+        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(400 * US)), MS);
+        assert_eq!(live_wait_ns(next(None, Some(0)), Some(400 * US)), MS);
+    }
+
+    /// No case polls faster than a single 1 ms floor: wherever no Period
+    /// deadline is ahead, the wait is exactly the old one, and a deadline ahead
+    /// only ever brings the wait forward to that deadline (never below it, and
+    /// never below the deadline floor).
+    #[test]
+    fn only_a_deadline_still_ahead_waits_less_than_the_single_floor_did() {
+        let values = [
+            None,
+            Some(0),
+            Some(1),
+            Some(9 * US),
+            Some(10 * US),
+            Some(300 * US),
+            Some(MS - 1),
+            Some(MS),
+            Some(2 * MS),
+            Some(250 * MS),
+            Some(900 * MS),
+        ];
+        for deadline in values {
+            let deadline = deadline.filter(|&d| d > 0);
+            for poll in values {
+                for boundary in values {
+                    let n = next(deadline, poll);
+                    let new = live_wait_ns(n, boundary);
+                    let old = single_floor_oracle(n, boundary);
+                    let case = format!("deadline {deadline:?} poll {poll:?} boundary {boundary:?}");
+                    match deadline {
+                        None => assert_eq!(new, old, "{case}"),
+                        Some(d) => {
+                            assert!(new <= old, "{case}: {new} > {old}");
+                            assert!(new >= LIVE_DEADLINE_FLOOR_NS, "{case}: {new}");
+                            if new < LIVE_POLL_FLOOR_NS {
+                                let exact =
+                                    boundary.map_or(d, |b| d.min(b)).max(LIVE_DEADLINE_FLOOR_NS);
+                                assert_eq!(
+                                    new, exact,
+                                    "{case}: only the deadline waits under 1 ms"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -18,6 +18,12 @@
 //! monitor-wait park the live loop runs by default (the degraded sleep-recheck
 //! park on a host without the CPU primitive). Per-test SHM roots; `#[serial]`
 //! because the assertions are about wall-clock timing.
+//!
+//! The grid and wait-sizing assertions need a park that wakes within a few
+//! hundred µs of its deadline, so they run on Linux. On macOS the park is the
+//! degraded `os_sync` nap, whose wake on a hosted runner can land later than
+//! the 700 µs this tick leaves in each period; there the first arm judges
+//! delivery and the fire count only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +41,7 @@ use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
 
 /// The producer's period and the time each of its ticks takes.
+#[cfg(target_os = "linux")]
 const PERIOD: Duration = Duration::from_millis(1);
 const TICK_WORK: Duration = Duration::from_micros(300);
 /// Fires the run collects before it judges.
@@ -48,6 +55,7 @@ const BUDGET: Duration = Duration::from_secs(6);
 /// The most fires closer than half a period to the previous one that a passing
 /// run may have, as a share of all fires: 2 %, where a 1 ms floor gives about
 /// 25 %.
+#[cfg(target_os = "linux")]
 const DOUBLE_FIRE_BUDGET: f64 = 0.02;
 
 #[cerulion_node(period_ms = 1)]
@@ -225,7 +233,23 @@ fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_fr
         all.len(),
         WARMUP + FIRES
     );
-    let ticks = &all[WARMUP..];
+    #[cfg(target_os = "linux")]
+    assert_on_grid(&all[WARMUP..]);
+
+    let fires = fired(&rt);
+    assert_eq!(fires as usize, all.len(), "every fire logged its tick");
+    let (fires_at, received_at) = at_warmup.expect("the run passed its warm-up");
+    assert_eq!(
+        received.load(Ordering::Relaxed) - received_at,
+        fires - fires_at,
+        "the consumer received every frame the producer published after the warm-up"
+    );
+}
+
+/// No more than [`DOUBLE_FIRE_BUDGET`] of the gaps between `ticks` are under
+/// half a period, and the median gap is the period.
+#[cfg(target_os = "linux")]
+fn assert_on_grid(ticks: &[u64]) {
     let half = PERIOD / 2;
     let gaps: Vec<Duration> = ticks
         .windows(2)
@@ -249,20 +273,12 @@ fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_fr
             && median <= PERIOD + Duration::from_micros(100),
         "the median gap between fires is {median:?}; the grid is {PERIOD:?}"
     );
-
-    let fires = fired(&rt);
-    assert_eq!(fires as usize, all.len(), "every fire logged its tick");
-    let (fires_at, received_at) = at_warmup.expect("the run passed its warm-up");
-    assert_eq!(
-        received.load(Ordering::Relaxed) - received_at,
-        fires - fires_at,
-        "the consumer received every frame the producer published after the warm-up"
-    );
 }
 
 /// The same graph, stepped by hand: once the node is on its grid, the wait the
 /// loop sizes after a step that fired is the time left to the next deadline,
 /// not a whole period.
+#[cfg(target_os = "linux")]
 #[test]
 #[serial]
 fn after_a_slow_step_the_wait_is_the_time_left_not_a_period() {
