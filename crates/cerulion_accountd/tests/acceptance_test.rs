@@ -1986,16 +1986,17 @@ async fn a_malformed_robot_access_body_names_the_fields_its_route_needs() {
         (
             format!("{addr}/v1/robots/{robot}/access/challenge"),
             serde_json::json!({ "requested_at_ns": 5 }),
-            "This endpoint needs no session: send `requested_at_ns`, the request time as Unix \
-             nanoseconds in decimal digits, and `request_signature`, the robot's transport key \
-             signature over it.",
+            "This endpoint needs no session: send `requested_at_ns`, the request time as a string \
+             of Unix nanoseconds, and `request_signature`, the robot's transport key signature \
+             over the robot proof message for `robot-access-challenge` ending in that time.",
         ),
         (
             format!("{addr}/v1/robots/{robot}/access"),
             serde_json::json!({ "pop_signature": "AA" }),
             "This endpoint needs no session: send `pop_challenge`, a challenge from POST \
              /v1/robots/{robot_id}/access/challenge, and `pop_signature`, the robot's transport \
-             key signature over it.",
+             key signature over the robot proof message for `robot-access` ending in that \
+             challenge.",
         ),
     ];
     for (url, body, hint) in cases {
