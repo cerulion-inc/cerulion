@@ -600,6 +600,10 @@ fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
 /// process ends. The process has one transport, so every resim it runs uses
 /// that one namespace, and a later resim never reclaims the namespace the
 /// transport is running on.
+///
+/// A static is never dropped, so the claimed slot's [`SlotLock`] never runs its
+/// unlock: the kernel releases the lock when the last copy of the descriptor
+/// closes, at process exit, or at the exec of a child forked just before it.
 static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
 
 /// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
