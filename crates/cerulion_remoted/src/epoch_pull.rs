@@ -80,9 +80,10 @@ pub fn resolve_key_recheck(env_value: Option<&str>) -> Duration {
 pub fn key_recheck_from_env() -> Duration {
     resolve_key_recheck(std::env::var(KEY_RECHECK_ENV).ok().as_deref())
 }
-/// The largest pending artifact read (far above a real epoch); a larger file is
+/// The largest pending artifact read
+/// ([`cerulion_pairing::verify::MAX_EPOCH_PENDING_BYTES`]); a larger file is
 /// discarded unread.
-const MAX_PENDING_BYTES: u64 = 1024 * 1024;
+const MAX_PENDING_BYTES: u64 = cerulion_pairing::verify::MAX_EPOCH_PENDING_BYTES as u64;
 /// Keys remembered for the recheck interval, bounding the map's memory; past
 /// this the expired entries, then all, are dropped.
 const MAX_REMEMBERED_KEYS: usize = 4096;
