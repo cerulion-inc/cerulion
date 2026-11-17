@@ -2713,7 +2713,7 @@ jobs:
             exit 0
           fi
           args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 4)
-          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+          if ! grep -qFx upstream_waivers_test <<<"$args"; then
             echo "this shard does not run the waiver gate; nothing to build"
             exit 0
           fi
@@ -3927,7 +3927,7 @@ jobs:
             exit 0
           fi
           args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 3)
-          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+          if ! grep -qFx upstream_waivers_test <<<"$args"; then
             echo "this shard does not run the waiver gate; nothing to build"
             exit 0
           fi
