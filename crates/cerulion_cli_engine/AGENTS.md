@@ -14,7 +14,7 @@ Ports: `graph_cmd::stage_declared_node`.
 - Observers pin source/hash/channel; busy=unknown. Loss re-demands, graph rechecks identity. Epoch errors retain trust and route latches on reconnect.
 - Paired starts are quiet; Open warns for every plan using the daemon's posture.
 - `account_robot_access`: only netd opens WAN. Probes 4s/500ms per robot, no pair/demand; catalogs 4s, coalesce keys. LAN/account merge only on robot ID AND key. Auth keeps `/v1/me.account_id`; pairing maps via `account_identity::pairing_account_id`. Login checks mapping/challenge/registration/leaf/key before writing; `device-chain.json` commits LAST.
-- `node build` uses Cargo compiler selection/MSRV; load checks the frozen boundary, never compiler provenance.
+- `node build` uses Cargo's rustc/MSRV, no pin; load checks the frozen boundary, never compiler provenance.
 - Android libs: <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn; account TLS: system roots, no JVM.
 - Ports/triggers: only `node_metadata::parse_node_metadata`; INFO_END before INFO_START is fatal.
 - Pinned hashes: run `pinned_hashes`, copy into `topic_cmd.rs`; never hand-compute.

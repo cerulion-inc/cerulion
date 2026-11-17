@@ -149,7 +149,7 @@ fn attachments(graph: Vec<u8>) -> Vec<Att> {
             "application/json",
             33,
             44,
-            br#"{"arch":"aarch64","os":"macos"}"#,
+            br#"{"arch":"aarch64","os":"macos","node_external":{"pub1":true}}"#,
         ),
         att(
             "__cerulion/trace_manifest_rank0.json",
@@ -521,6 +521,17 @@ fn every_frame_channel_and_other_attachment_survives_byte_for_byte() {
     assert_eq!(
         src_graph_idx, dst_graph_idx,
         "the graph attachment must be replaced IN PLACE, not moved"
+    );
+
+    // The recorder identity, driver stamp included, against its hand bytes:
+    // a replay of the migrated bag judges drivers by this key.
+    assert_eq!(
+        dst.attachment("__cerulion/recorder.json")
+            .unwrap()
+            .expect("the recorder identity survives")
+            .data,
+        br#"{"arch":"aarch64","os":"macos","node_external":{"pub1":true}}"#.to_vec(),
+        "the migration keeps the driver stamp byte for byte"
     );
 
     let new_graph = dst_atts[dst_graph_idx].4.clone();

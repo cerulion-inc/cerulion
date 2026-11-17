@@ -331,7 +331,7 @@ fn salvage_struct_for_error_path(input: &DeriveInput) -> DeriveInput {
 /// | `depth = N` | Queue depth in messages, `1..=64`. Default 10. Every unit of depth reserves a full message-sized shared-memory slot, so prefer a backpressure policy to a deep queue |
 /// | `backpressure = drop_oldest` | Default. When the queue is full the oldest message is reclaimed |
 /// | `backpressure = sample(N)` | Admit at most one message per `N` ms, by the message's own timestamp |
-/// | `backpressure = block` | Lossless: the producer's tick is deferred while this consumer's queue is full. Installed only when EVERY consumer of the topic declares `block`; on a mixed topic this input is degraded to `drop_oldest`, with a `warn` at graph build |
+/// | `backpressure = block` | Lossless: the producer's tick is deferred while this consumer's queue is full. Each `block` consumer has its own credit slot, so the topic's other consumers may declare any policy; a deferred producer defers its whole node. The graph's `inputs[].backpressure`, `depth` and `block_timeout_ms` keys override this attribute |
 /// | `expect_within_ms = N` | Arrival watchdog. If `N` ms pass with no new message, `expect_within_missed_count` increments and a `warn` is logged. Independent of `trigger` |
 /// | `consume = fifo` | Default, `trigger` only. One fire per queued message, in arrival order |
 /// | `consume = latest` | `trigger` only, not on a sync node. At most one fire per scheduler step; that fire's read drains the queue and serves the newest message, and the older ones it drained are not served. A message no fire has read yet (the fire was deferred by `throttle_ms` or a `block` gate) is kept until a newer one arrives |

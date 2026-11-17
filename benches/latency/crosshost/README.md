@@ -60,7 +60,7 @@ Both machines need a checkout of this repository. On each:
 
 ```sh
 cd benches/latency/crosshost
-python3 crosshost.py build --stack cerulion-tcp     # cerulion CLI + the three node cdylibs
+python3 crosshost.py build --stack cerulion-tcp     # cerulion CLI + cerulion-netd + the three node cdylibs
 python3 crosshost.py build --stack fastdds-tcp      # colcon build of ../ros2 (ROS 2 sourced)
 python3 crosshost.py build --stack fastdds-tcp --ros-docker ros:humble-ros-base   # or in a container
 ```

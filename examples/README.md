@@ -5,10 +5,9 @@ This page covers what the example workspaces have in common.
 
 ## Which directories are Cargo workspaces
 
-These eight directories are Cerulion workspaces, each with its own
+These seven directories are Cerulion workspaces, each with its own
 `[workspace]` `Cargo.toml` and `Cargo.lock`:
 
-- `aspire_arm`
 - `basic_timer`
 - `camera_pipeline`
 - `go2`
