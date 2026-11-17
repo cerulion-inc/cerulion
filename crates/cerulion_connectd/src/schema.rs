@@ -20,9 +20,11 @@
 //!
 //! An absent path is written whole or not at all (`write_whole`): the text goes
 //! to a hidden temporary sibling, is synced, and is hard linked into place, so a
-//! reader sees no file or the whole file, a write that fails or is cut short
-//! leaves no partial file to be kept later as a local edit, and a file another
-//! writer created meanwhile is classified like any existing file, never replaced.
+//! reader sees no file or the whole file, and a write that fails or is cut short
+//! leaves no partial file to be kept later as a local edit. A file another writer
+//! created meanwhile makes the link fail and is classified like any existing
+//! file. Where the link fails for any other reason the text is renamed into
+//! place instead, which can replace a file created since the path was read.
 //!
 //! # Peer text
 //!
@@ -144,8 +146,14 @@ fn materialize_one(schemas_dir: &Path, doc: &SchemaDoc) -> ConnectResult<Materia
                     );
                     Ok(MaterializeOutcome::Wrote(dest.clone()))
                 }
-                // Something appeared at `dest` after the read above: read it again.
-                Published::Exists => Ok(existing_file(std::fs::read(&dest).map_err(io_failed)?)),
+                // Something appeared at `dest` after the read above, or is an
+                // entry the read could not follow, such as a link to a missing file.
+                Published::Exists => match std::fs::read(&dest) {
+                    Ok(existing) => Ok(existing_file(existing)),
+                    Err(e) => Err(ConnectError::Schema(format!(
+                        "{shown_path}: something at this path is kept and cannot be read: {e}"
+                    ))),
+                },
             }
         }
         Err(e) => Err(io_failed(e)),
@@ -161,17 +169,24 @@ enum Published {
     Exists,
 }
 
-/// Counts the staging files this process names, so no two calls share one.
+/// Counts the staging names this process makes; with the process id it gives
+/// each call of [`staging_path`] a different name.
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// How many fresh staging names [`stage`] tries before it gives up on a
 /// directory where each one already exists.
 const STAGING_ATTEMPTS: u32 = 8;
 
-/// A fresh hidden sibling of `dest` for [`stage`] to write: the same directory,
-/// so publishing stays on one filesystem; a name made unique by the process id
-/// and [`STAGING_SEQ`]; and a `.tmp` extension, which no schema store reader
-/// loads.
+/// The longest part of a schema's file name a staging name embeds, so the
+/// staging name stays inside a filesystem's name limit wherever the schema's
+/// own name fits.
+const STAGING_NAME_CHARS: usize = 64;
+
+/// A hidden sibling of `dest` for [`stage`] to create: the same directory, so
+/// publishing stays on one filesystem; the start of `dest`'s file name, the
+/// process id and the next [`STAGING_SEQ`]; and a `.tmp` extension, which no
+/// schema store reader loads. A name left by an earlier process with the same
+/// id can repeat, which [`stage`] meets by creating new and trying the next.
 fn staging_path(dest: &Path) -> std::io::Result<PathBuf> {
     let name = dest.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -179,12 +194,13 @@ fn staging_path(dest: &Path) -> std::io::Result<PathBuf> {
             "a schema path has no file name",
         )
     })?;
+    let name: String = name
+        .to_string_lossy()
+        .chars()
+        .take(STAGING_NAME_CHARS)
+        .collect();
     let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-    Ok(dest.with_file_name(format!(
-        ".{}.{}.{seq}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    )))
+    Ok(dest.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id())))
 }
 
 /// Write `bytes` at `dest` whole or not at all: [`stage`] it, then
@@ -227,11 +243,12 @@ fn stage(dest: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
     }
 }
 
-/// Put a synced staging file at `dest` without replacing anything there: a
-/// hard link fails when `dest` exists, which is [`Published::Exists`]. On a
-/// filesystem without hard links the staging file is renamed onto `dest`
-/// instead, which replaces a file created at `dest` since it was read. The
-/// staging file is discarded afterwards.
+/// Put a synced staging file at `dest` by hard link, which fails when `dest`
+/// exists: that is [`Published::Exists`], and `dest` is left as it was. A link
+/// that fails for any other reason (a filesystem without hard links among them)
+/// renames the staging file onto `dest` instead, which replaces a file created
+/// at `dest` since it was read. The staging file is gone afterwards: discarded
+/// after a link, renamed, or discarded when the rename fails too.
 fn publish(staging: &Path, dest: &Path) -> std::io::Result<Published> {
     let published = match std::fs::hard_link(staging, dest) {
         Ok(()) => Ok(Published::Wrote),
@@ -240,7 +257,7 @@ fn publish(staging: &Path, dest: &Path) -> std::io::Result<Published> {
             tracing::debug!(
                 path = %sanitize_peer_text(&dest.display().to_string()),
                 error = %link_error,
-                "cerulion connect: no hard link for a schema file, renaming it into place"
+                "cerulion connect: hard linking a schema file failed, renaming it into place"
             );
             return std::fs::rename(staging, dest)
                 .map(|()| Published::Wrote)
@@ -515,7 +532,7 @@ mod tests {
     /// A write that cannot stage leaves nothing behind, and a schema path held
     /// by a directory keeps the directory and what is in it.
     #[test]
-    fn a_failed_write_leaves_nothing_behind() {
+    fn a_write_that_cannot_stage_leaves_nothing_and_a_held_path_is_kept() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing").join("Sub.msg");
         assert_eq!(
@@ -539,9 +556,43 @@ mod tests {
         assert_eq!(left, vec![std::ffi::OsString::from("Sub.msg")]);
     }
 
+    /// A publish whose hard link and fallback rename both fail returns the
+    /// rename's error and discards its staging file.
+    #[test]
+    fn a_publish_whose_link_and_rename_both_fail_discards_its_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = stage(&dir.path().join("Sub.msg"), b"float64 x\n").unwrap();
+        let unreachable = dir.path().join("missing").join("Sub.msg");
+        assert_eq!(
+            publish(&staging, &unreachable).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!staging.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A staging name embeds at most the first 64 characters of the schema's
+    /// file name, and a path with no file name has no staging name.
+    #[test]
+    fn a_staging_name_is_bounded_and_needs_a_file_name() {
+        let long = format!("{}.msg", "a".repeat(250));
+        let staging = staging_path(&Path::new("store").join(&long)).unwrap();
+        assert_eq!(staging.parent(), Some(Path::new("store")));
+        let name = staging.file_name().unwrap().to_str().unwrap();
+        let prefix = format!(".{}.{}.", "a".repeat(64), std::process::id());
+        assert!(
+            name.starts_with(&prefix) && name.ends_with(".tmp"),
+            "{name}"
+        );
+        assert_eq!(
+            staging_path(Path::new("/")).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
     /// A link to a missing file at a schema's path is left as it is: nothing is
-    /// written through it and it is not replaced, and the doc fails with the
-    /// schema's path.
+    /// written through it and it is not replaced, and materializing fails with
+    /// an error that names the schema's path and says it is kept.
     #[cfg(unix)]
     #[test]
     fn a_dangling_link_at_a_schema_path_is_left_as_it_is() {
@@ -552,8 +603,9 @@ mod tests {
         std::os::unix::fs::symlink(&target, &dest).unwrap();
         let err = materialize_docs(dir.path(), &[msg_doc("acme/Sub", "float64 x\n")]).unwrap_err();
         assert!(
-            err.to_string().contains("Sub.msg: "),
-            "the error names the schema path: {err}"
+            err.to_string()
+                .contains("Sub.msg: something at this path is kept and cannot be read: "),
+            "{err}"
         );
         assert!(std::fs::symlink_metadata(&dest)
             .unwrap()
