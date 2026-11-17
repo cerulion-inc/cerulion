@@ -4077,10 +4077,11 @@ fn syscall_probe_wait_then_take_per_message() {
         #[cfg(feature = "period-park")]
         eprintln!(
             "syscall-probe predicted_parks={} predicted_bell_wakes={} \
-             predicted_rings_before_park={}",
+             predicted_rings_before_park={} learner_entry_arrivals={}",
             data.predicted_parks.load(Ordering::Relaxed),
             data.predicted_bell_wakes.load(Ordering::Relaxed),
-            data.predicted_rings_before_park.load(Ordering::Relaxed)
+            data.predicted_rings_before_park.load(Ordering::Relaxed),
+            data.learner_entry_arrivals.load(Ordering::Relaxed)
         );
 
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);

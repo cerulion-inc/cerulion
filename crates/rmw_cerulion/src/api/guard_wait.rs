@@ -821,6 +821,11 @@ pub struct WaitSetData {
     /// started.
     #[cfg(feature = "period-park")]
     pub predicted_rings_before_park: AtomicU64,
+    /// Arrivals the period learners observed at a call's entry pass: a mapped bell had rung
+    /// since their last note (later in the previous call, after it returned, or during a
+    /// spin of this call), and no wake of this wait set reported its message.
+    #[cfg(feature = "period-park")]
+    pub learner_entry_arrivals: AtomicU64,
     /// How the last predicted block ended, kept for the learners' next use
     /// ([`WaitSetData::apply_rung_note`]); see [`encode_window_end`].
     #[cfg(feature = "period-park")]
@@ -867,6 +872,9 @@ fn decode_window_end(word: u64) -> Option<Option<(usize, super::period_learner::
 struct PeriodState {
     epoch: Option<Instant>,
     learners: super::period_learner::TopicLearners,
+    /// The entry pass's read of every mapped bell ([`WaitSetData::note_entry_arrivals`]),
+    /// kept so its capacity is reused from call to call.
+    entry_read: Vec<u64>,
 }
 
 /// `at` in ns since `epoch`: 0 before it, `u64::MAX` past the u64 range.
@@ -933,14 +941,38 @@ impl WaitSetData {
         st.learners.remap(bells.generation, &seqs);
     }
 
-    /// Mark every mapped bell's current seq as seen, with no arrival observed. The call's
-    /// entry pass runs this before its full readiness probe, and the probe serves every
-    /// message committed before this read (a publisher commits, then rings), so the next
-    /// predicted park ([`ParkRef::Noted`]) reacts only to rings after it.
-    fn sync_noted_bells(&self) {
+    /// The learners' read of every mapped bell at the call's entry pass, before its full
+    /// readiness probe. The probe serves every message committed before this read (a
+    /// publisher commits, then rings), so the next predicted park ([`ParkRef::Noted`])
+    /// reacts only to rings after it. A bell that rang since the learners last looked
+    /// carries a message no wake of this wait set reported: it rang after their last note
+    /// (later in the previous call, after it returned, or during a spin of this call), and
+    /// this entry pass serves it. That
+    /// arrival is observed at `at`, read once after every bell (so no earlier than any of
+    /// their rings) and only when one moved, and counted in `learner_entry_arrivals`; a
+    /// burst's tail is marked seen instead (`TopicLearners::note_unwoken`). A kept bell-wake
+    /// note is applied first ([`Self::learners`]), so a ring that note covers is not
+    /// counted again.
+    fn note_entry_arrivals(&self, at: impl FnOnce() -> Instant) {
         let (bells, mut st) = self.learners();
         Self::map_learners_locked(&bells, &mut st);
-        st.learners.sync(bells.bells.iter().map(|(_, b)| b.seq()));
+        let PeriodState {
+            epoch,
+            learners,
+            entry_read,
+        } = &mut *st;
+        entry_read.clear();
+        // hot-path-alloc-ok: grows only when the bell set does; the capacity is reused.
+        entry_read.extend(bells.bells.iter().map(|(_, b)| b.seq()));
+        if !learners.rang_since_noted(entry_read.iter().copied()) {
+            learners.sync(entry_read.iter().copied());
+            return;
+        }
+        let at = at();
+        let now = ns_since(*epoch.get_or_insert(at), at);
+        let observed = learners.note_unwoken(now, entry_read.iter().copied());
+        self.learner_entry_arrivals
+            .fetch_add(observed, Ordering::Relaxed);
     }
 
     /// Record an arrival at `at` for every mapped bell whose seq moved since the last note,
@@ -1229,6 +1261,20 @@ impl WaitSetData {
     /// if it is already there, else creates the page that producer will
     /// join by name; a genuinely failed re-open keeps the old mapping and
     /// is retried on the next stale detection.)
+    ///
+    /// The period learners (feature `period-park`) keep the old page's seq
+    /// through a re-map, and the bell set generation stays. In a call that
+    /// predicts this is safe: a re-map happens only after a park's fd wake
+    /// (the suspect flag), and that wake's note (`note_rung_bells`) runs right
+    /// after this reconcile, in the same pass.
+    /// The note reads the new page, records its seq, and observes the frame
+    /// that woke the park at the wake. The next predicted park therefore
+    /// measures a ring against the new page's seq, and the re-map is never a
+    /// ring of its own. Two paths leave the old seq in place until the next
+    /// predicting call's entry read: a re-map in a call that does not predict,
+    /// and a bell set rebuild that maps a replaced page (the remap keeps a
+    /// known topic's seq). That read can then count one arrival that did not
+    /// happen, which can drop a regular topic back to learning.
     ///
     /// # Safety
     /// Same contract as [`check_ready`] for `subscriptions`.
@@ -2815,15 +2861,16 @@ unsafe fn rmw_wait_live(
                     match phase {
                         Phase::Entry => {
                             // The stock park's reference, read before the full
-                            // probe below for the same reason as the sync below.
+                            // probe below for the same reason as the learners' read below.
                             if parked {
                                 ws.note_entry_bells();
                             }
                             // Period-learned park: the full probe below serves every
-                            // message whose ring came before this read.
+                            // message whose ring came before this read, and a ring since
+                            // the learners last looked is an arrival they observe here.
                             #[cfg(feature = "period-park")]
                             if parked && predict {
-                                ws.sync_noted_bells();
+                                ws.note_entry_arrivals(Instant::now);
                             }
                             let mut fd_set = ws.fd_set.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = fd_set.check();
@@ -3627,18 +3674,32 @@ mod tests {
         assert!(!pb.fd_wake_suspect);
     }
 
-    /// A ring the call's entry pass synced (its message is served by the full probe) is not
-    /// a ring for the next predicted park, which then runs to its end; the sync feeds the
-    /// learner no arrival. Negative: a ring after the sync still ends the park at its first
-    /// check.
+    /// A ring the call's entry pass reads (its message is served by the full probe) is an
+    /// arrival the learners observe at the instant the read passes them, and not a ring for
+    /// the next predicted park, which then runs to its end. With nothing rung, the read marks
+    /// the bells seen, observes nothing and reads no clock. Negative: a ring after the read
+    /// still ends the park at its first check.
     #[cfg(feature = "period-park")]
     #[test]
-    fn a_ring_synced_by_the_entry_pass_does_not_end_the_next_predicted_park() {
+    fn a_ring_read_by_the_entry_pass_is_an_arrival_and_not_a_ring_for_the_next_park() {
         let ms = Duration::from_millis;
         let us = Duration::from_micros;
-        let (ws, page, base, noted) = regular_one_ms_topic("entry_sync");
+        let (ws, page, base, noted) = regular_one_ms_topic("entry_read");
+        ws.note_entry_arrivals(|| panic!("nothing rang, so no clock read"));
+        assert_eq!(ws.learner_entry_arrivals.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            ws.next_window(base + ms(10)),
+            Some((base + ms(11) - us(20), us(40), 0)),
+            "nothing rang: the window of the last noted arrival at 10 ms"
+        );
         page.ring();
-        ws.sync_noted_bells();
+        ws.note_entry_arrivals(|| base + ms(11));
+        assert_eq!(ws.learner_entry_arrivals.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            ws.next_window(base + ms(11)),
+            Some((base + ms(12) - us(20), us(40), 0)),
+            "the 11 ms arrival keeps the topic regular, one period on"
+        );
         let end = Instant::now() + ms(3);
         assert_eq!(
             ws.predicted_wait((Duration::ZERO, end, 0)),
@@ -3648,12 +3709,7 @@ mod tests {
         assert_eq!(
             ws.park_bells.lock().expect("bells").last_snap,
             [noted + 1],
-            "the reference is the synced seq"
-        );
-        assert_eq!(
-            ws.next_window(base + ms(10)),
-            Some((base + ms(11) - us(20), us(40), 0)),
-            "the window of the last noted arrival at 10 ms"
+            "the reference is the seq the entry pass read"
         );
         page.ring();
         let end = Instant::now() + Duration::from_secs(2);
@@ -3662,6 +3718,59 @@ mod tests {
             BlockWake::Bell(0)
         );
         assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            ws.learner_entry_arrivals.load(Ordering::Relaxed),
+            1,
+            "a park's ring is not an entry arrival"
+        );
+    }
+
+    /// A stale bell re-mapped to another page, as the stale-bell reconcile re-maps one (here
+    /// by hand). The learners keep the old page's seq until the fd wake's note that follows
+    /// the reconcile. That note records the new page's seq and observes the frame that woke
+    /// the park at the 11 ms beat. The next predicted park then measures against the new page
+    /// and runs to its end: the re-map is not a ring. The structural pin below holds the note
+    /// after the reconcile.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn a_remapped_bell_is_not_a_ring_for_the_next_predicted_park() {
+        use cerulion_core::doorbell::Doorbell;
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        let (ws, _old_page, base, noted) = regular_one_ms_topic("remap_old");
+        let new_name = format!("/rmw_pp/{}/remap_new", std::process::id());
+        let new_page = Doorbell::open_owned(doorbell_ns(), &new_name).expect("new page");
+        for _ in 0..3 {
+            new_page.ring();
+        }
+        assert_ne!(new_page.seq(), noted, "the pages' seqs differ");
+        ws.park_bells.lock().expect("bells").bells[0].1 =
+            Doorbell::open_unowned(doorbell_ns(), &new_name).expect("re-map");
+        ws.note_rung_bells(base + ms(11));
+        assert_eq!(
+            ws.next_window(base + ms(11)),
+            Some((base + ms(12) - us(20), us(40), 0)),
+            "the frame that woke the park is the 11 ms arrival"
+        );
+        let end = Instant::now() + ms(3);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Timeout,
+            "no ring since the note: the park runs to its end"
+        );
+        assert_eq!(ws.predicted_rings_before_park.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            ws.park_bells.lock().expect("bells").last_snap,
+            [3],
+            "the reference is the new page's seq, three rings"
+        );
+        new_page.ring();
+        let end = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            ws.predicted_wait((Duration::ZERO, end, 0)),
+            BlockWake::Bell(0),
+            "a ring of the new page ends the park"
+        );
     }
 
     /// The same ring with the listener notify already readable. The bell check comes before
@@ -3963,6 +4072,46 @@ mod tests {
         );
     }
 
+    /// A ring a kept bell-wake note covers is not an entry arrival: the entry read applies
+    /// the kept note first, finds no bell moved, counts nothing and reads no clock, and the
+    /// windows are the ones the wake's instant gives. Two bells that rang after the note are
+    /// two entry arrivals.
+    #[cfg(feature = "period-park")]
+    #[test]
+    fn an_entry_read_counts_each_ring_once_after_a_kept_bell_wake_note() {
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        let (ws, pages, base) = two_regular_topics("entry_once");
+        pages[0].ring();
+        let mut subs = Vec::new();
+        ws.bell_woke(0, Some(base + ms(11)), &mut subs);
+        ws.note_entry_arrivals(|| panic!("the kept note covers the ring, so no clock read"));
+        assert_eq!(ws.learner_entry_arrivals.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            ws.next_window(base + ms(11)),
+            Some((base + ms(11) - us(20), us(40), 1)),
+            "bell 1's 11 ms window, still open, opens first"
+        );
+        assert_eq!(
+            ws.next_window(base + ms(11) + us(21)),
+            Some((base + ms(12) - us(20), us(40), 0)),
+            "bell 0's window follows the kept note's 11 ms instant"
+        );
+        pages[0].ring();
+        pages[1].ring();
+        ws.note_entry_arrivals(|| base + ms(12));
+        assert_eq!(
+            ws.learner_entry_arrivals.load(Ordering::Relaxed),
+            2,
+            "each moved bell is one arrival"
+        );
+        assert_eq!(
+            ws.next_window(base + ms(12)),
+            Some((base + ms(13) - us(20), us(40), 0)),
+            "bell 0 stays regular; bell 1's 2 ms gap is a missed beat"
+        );
+    }
+
     /// The stock park measures a ring against the entry pass's read, taken before the
     /// call's probe: a ring that lands after that read and before the park, its listener
     /// notify already readable, returns on the bell at the first check and leaves the
@@ -4040,12 +4189,12 @@ mod tests {
         );
     }
 
-    /// STRUCTURAL: the entry pass syncs the learners' seqs before its fd check and its full
-    /// probe. A sync after the probe would mark a ring as seen whose message no probe looked
+    /// STRUCTURAL: the entry pass reads the learners' bells before its fd check and its full
+    /// probe. A read after the probe would mark a ring as seen whose message no probe looked
     /// for, and the next predicted park would wait past it. Walked over a comment-stripped
     /// view of `rmw_wait_live`.
     #[test]
-    fn the_entry_pass_syncs_the_learners_before_its_full_probe() {
+    fn the_entry_pass_reads_the_learners_bells_before_its_full_probe() {
         let src = include_str!("guard_wait.rs");
         let start = src
             .find("unsafe fn rmw_wait_live(")
@@ -4056,17 +4205,46 @@ mod tests {
             .expect("rmw_publisher_event_init follows rmw_wait_live");
         let body = code_only(&src[start..end]);
         let arm = &body[body.find("Phase::Entry => {").expect("the entry arm")..];
-        let sync = arm
-            .find("ws.sync_noted_bells()")
-            .expect("the entry arm syncs");
+        let read = arm
+            .find("ws.note_entry_arrivals(Instant::now)")
+            .expect("the entry arm reads the learners' bells");
         let check = arm
             .find("fd_set.check()")
             .expect("the entry arm checks the fds");
         let probe = arm.find("probe_ready_into(").expect("the probe follows");
         assert!(
-            sync < check && check < probe,
-            "sync, then the fd check, then the probe"
+            read < check && check < probe,
+            "the learners' read, then the fd check, then the probe"
         );
+    }
+
+    /// STRUCTURAL: after a block, the stale-bell reconcile runs before the fd wake's learner
+    /// note, so the note records a re-mapped bell's new seq
+    /// (`a_remapped_bell_is_not_a_ring_for_the_next_predicted_park`). With the note first, the
+    /// learners would keep the old page's seq, and the next predicted park would return at
+    /// its first check on a ring that never happened. Walked over a comment-stripped view of
+    /// `rmw_wait_live`.
+    #[test]
+    fn the_fd_wake_notes_the_learners_after_the_stale_bell_reconcile() {
+        let src = include_str!("guard_wait.rs");
+        let start = src
+            .find("unsafe fn rmw_wait_live(")
+            .expect("rmw_wait_live present");
+        let end = src[start..]
+            .find("fn rmw_publisher_event_init(")
+            .map(|e| start + e)
+            .expect("rmw_publisher_event_init follows rmw_wait_live");
+        let body = code_only(&src[start..end]);
+        let arm = &body[body
+            .find("BlockWake::Fd | BlockWake::Timeout => {")
+            .expect("the fd and timeout arm")..];
+        let reconcile = arm
+            .find("ws.reconcile_stale_bells(subscriptions)")
+            .expect("the arm reconciles stale bells");
+        let note = arm
+            .find("ws.note_rung_bells(at)")
+            .expect("the arm notes the fd wake");
+        assert!(reconcile < note, "the reconcile, then the note");
     }
 
     /// STRUCTURAL (off Linux the wait never takes the park tier, so the desk
