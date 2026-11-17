@@ -104,6 +104,20 @@ ignore = [
     # cerulion_dds ROS 2 path, so the workspace cannot drop it on its own.
     # Remove this ignore when cerulion-ros2-client drops the dependency.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 via cerulion_dds -> cerulion-ros2-client 0.10.1: unmaintained-class, no vulnerability, no replacement at the verified pin" },
+    # chrono is UNMAINTAINED-class (RUSTSEC-2026-0543), not a vulnerability:
+    # its maintainers announced the end of maintenance, every version is
+    # affected and none is patched. No workspace crate depends on chrono
+    # directly. It reaches us through cerulion-ros2-client 0.10.1 and
+    # cerulion-rustdds 0.14.2 (the cerulion_dds ROS 2 path), rmcp 3.9.0,
+    # schemars 1.2.1 and the arrow crates, so the workspace cannot drop it on
+    # its own. Re-audit on every bump of those crates; remove this ignore when
+    # none of them depends on chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.44, transitive only (cerulion-ros2-client, cerulion-rustdds, rmcp, schemars, arrow): unmaintained-class, no vulnerability, no maintained release to move to" },
+    # humantime is UNMAINTAINED-class (RUSTSEC-2026-0542), declared alongside
+    # chrono's, not a vulnerability. No workspace crate depends on humantime
+    # directly; it reaches us only through zenoh-util 1.10.1 and uhlc 0.8.2
+    # under the zenoh transport. Remove this ignore when zenoh drops it.
+    { id = "RUSTSEC-2026-0542", reason = "humantime 2.3.0 via zenoh-util 1.10.1 and uhlc 0.8.2: unmaintained-class, no vulnerability, no replacement at the zenoh pin" },
 ]
 
 # -----------------------------------------------------------------------------
