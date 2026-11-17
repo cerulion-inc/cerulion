@@ -115,20 +115,20 @@ fn main() -> ExitCode {
     // login gate, so they never start a browser login, record no event, and
     // their JSON stdout carries nothing else. The engine requires an existing
     // login. The revocation sync logs to stderr, which netd passes through, at
-    // the one-shot verbs' `warn` default; first-serve registration's stderr is
-    // netd's error text and carries only its error.
+    // its verb class's default level and in colour only on a terminal;
+    // first-serve registration's stderr is netd's error text and carries only
+    // its error.
     #[cfg(unix)]
     if matches!(
         matches.subcommand_name(),
         Some("bootstrap-robot" | "robot-sync-epoch")
     ) {
-        let worker = match Cli::from_arg_matches(&matches)
-            .unwrap_or_else(|e| e.exit())
-            .command
-        {
+        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        let quiet_default = cli.command.log_verb_class().is_quiet_default();
+        let worker = match cli.command {
             Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
             Commands::RobotSyncEpoch { state_root } => {
-                init_logging(matches.get_flag("verbose"), true);
+                cerulion_core::init_worker_logging(cli.verbose, quiet_default);
                 robot_sync_epoch(&state_root)
             }
             _ => unreachable!("the subcommand name selected an internal worker"),
