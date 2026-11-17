@@ -182,10 +182,10 @@ fn diagnostics(lines: &[Value]) -> Vec<&Value> {
 
 fn read_version(root: &Path, relative: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!(
-        "{:x}",
-        Sha256::digest(std::fs::read(root.join(relative)).expect("file"))
-    )
+    Sha256::digest(std::fs::read(root.join(relative)).expect("file"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn error_code(response: &Value) -> &str {

@@ -235,7 +235,7 @@ fn load_desk_seed(path: &Path) -> ConnectResult<[u8; 32]> {
 /// Generate a fresh ephemeral 32-byte seed from OS entropy.
 fn ephemeral_seed() -> ConnectResult<[u8; 32]> {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
+    getrandom::fill(&mut seed)
         .map_err(|e| ConnectError::KeyGen(format!("getrandom failed: {e}")))?;
     Ok(seed)
 }

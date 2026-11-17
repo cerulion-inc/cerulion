@@ -94,8 +94,7 @@ mod unix {
 
     fn random32() -> Result<[u8; 32], RemotedError> {
         let mut bytes = [0; 32];
-        getrandom::getrandom(&mut bytes)
-            .map_err(|_| refused("operating system entropy unavailable"))?;
+        getrandom::fill(&mut bytes).map_err(|_| refused("operating system entropy unavailable"))?;
         Ok(bytes)
     }
 

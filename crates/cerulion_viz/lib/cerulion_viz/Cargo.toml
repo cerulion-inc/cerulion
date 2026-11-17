@@ -129,10 +129,11 @@ ureq = "3"
 # This one is MIT OR Apache-2.0 — already on the root allow-list — and decode is
 # all we need. License MIT OR Apache-2.0.
 bzip2-rs = "0.1"
-# `sha2` — the digest the fetcher pins each platform's blob against. Already in
-# the tree as `openh264-sys2`'s own dependency, which is what the LOADER hashes
-# with, so both checks run the same implementation. License MIT OR Apache-2.0.
-sha2 = "0.10"
+# `sha2`: the digest the fetcher pins each platform's blob against. The LOADER
+# (`openh264-sys2`) hashes with its own sha2 0.10; both compute SHA-256, and the
+# fetcher's pins come from the loader's own list, so a blob the fetcher accepts
+# the loader accepts too. License MIT OR Apache-2.0.
+sha2 = "0.11"
 # Rerun logging SDK, added CRATE-LOCALLY (never in cerulion_core).
 # `default-features = false` + `sdk` gives the RecordingStream + core logging +
 # the gRPC client sink + the archetypes (Points3D / EncodedImage / Scalars /
@@ -204,7 +205,7 @@ bzip2-rs = "0.1"
 # The live test must compute the digest INDEPENDENTLY rather than
 # calling the fetcher's own `verify_digest` — a verifier that always answered Ok
 # would otherwise carry the very assertion meant to catch it.
-sha2 = "0.10"
+sha2 = "0.11"
 # The store-seeded-walker tests write ament-
 # mirror `<dir>/<pkg>/msg/<Type>.msg` trees + bridge configs into scratch dirs
 # (matches the dds_bridge dev-dep).

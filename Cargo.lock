@@ -1144,7 +1144,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -1236,7 +1236,7 @@ dependencies = [
  "base64 0.22.1",
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "jsonwebtoken",
  "postcard",
  "reqwest",
@@ -1244,7 +1244,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1385,7 +1385,7 @@ dependencies = [
  "cerulion_pairing",
  "clap",
  "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "iceoryx2",
  "if-addrs",
@@ -1403,7 +1403,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "syn 2.0.114",
  "tempfile",
  "thiserror 2.0.21",
@@ -1494,7 +1494,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1663,15 +1663,15 @@ dependencies = [
  "data-encoding",
  "dirs",
  "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
- "hmac",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
  "pake-cpace",
  "postcard",
  "rcgen",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -1729,9 +1729,9 @@ dependencies = [
  "clap",
  "ed25519-dalek 2.2.0",
  "futures-util",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1745,7 +1745,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -1764,7 +1764,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1798,7 +1798,7 @@ dependencies = [
  "roxmltree",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -1851,7 +1851,7 @@ dependencies = [
  "cerulion_link",
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hex",
  "postcard",
  "serde",
@@ -1872,7 +1872,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2793,6 +2793,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -3741,6 +3742,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -7074,7 +7084,7 @@ dependencies = [
  "ehttp",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
- "hmac",
+ "hmac 0.12.1",
  "http",
  "jiff",
  "js-sys",
@@ -11537,7 +11547,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e281a36cfd351ba9232a24899d946a782d0ff3ac0c3d759f87f3e7cbe09a4553"
 dependencies = [
  "aes",
- "hmac",
+ "hmac 0.12.1",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "sha3",

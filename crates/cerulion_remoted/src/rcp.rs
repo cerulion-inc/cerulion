@@ -700,7 +700,7 @@ pub fn ensure_token_file(path: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("rcpd token file {}: {e}", path.display())),
     }
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
+    getrandom::fill(&mut seed)
         .map_err(|e| format!("rcpd token file {}: no randomness: {e}", path.display()))?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
