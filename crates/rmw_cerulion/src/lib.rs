@@ -63,6 +63,10 @@ pub mod gated_latch;
 pub mod gid;
 pub mod heaphook;
 pub mod loan_refusal_latch;
+// The rule `build.rs` emits the `cerulion_period_park` cfg from; compiled here only for
+// its tests, since the crate reads the cfg, not the function.
+#[cfg(test)]
+mod period_park_cfg;
 pub mod publish_reject_latch;
 mod replay;
 pub mod rosidl_buffer;
