@@ -1401,6 +1401,7 @@ fn pre_stamp_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec
             std::time::Duration::from_nanos(1_783_092_278_948_123_456),
             coordination,
             &std::collections::BTreeMap::new(),
+            0,
         ))
         .expect("the production recorder.json parses");
     doc.as_object_mut()
@@ -1424,6 +1425,7 @@ fn stamped_recorder_json(
             .iter()
             .map(|(id, external)| ((*id).to_string(), *external))
             .collect(),
+        0,
     )
 }
 

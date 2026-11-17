@@ -17,7 +17,8 @@ User-facing recording docs live in `docs/bag.md`.
   `recorder.json` (host identity: arch/os/version, used by replay's
   cross-host advisory, plus the contract keys `trace_format`, `coordination`
   and `node_external`, each native node's driver flag from its loaded
-  metadata), `record_health.json` (per-topic drain health),
+  metadata, and `env_names_left_out`, the count of names `env.json` left out
+  for not being valid UTF-8), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.
 - The bag's `env.json` attachment and the run directory's `env.json` are

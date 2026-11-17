@@ -6642,10 +6642,17 @@ pub fn graph_run(
     let run_recorded_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
+    // How many names the run directory's `env.json` left out, stamped into the
+    // run directory's `recorder.json` once the nodes load. It stays 0 when no
+    // run directory is written, and then no `recorder.json` is either.
+    #[cfg(unix)]
+    let mut run_env_names_left_out = 0;
     #[cfg(unix)]
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
             Ok(graph_yaml) => {
+                let env_json = render_process_env_json(record_env, EnvJsonArtifact::RunDirectory);
+                run_env_names_left_out = env_json.left_out_names.len();
                 crate::run_dir::begin_run_descriptor(crate::run_dir::RunDescriptorSpec {
                     // The chain census THIS run's graph implies, under the
                     // colocation this run EXECUTES: the settled
@@ -6724,7 +6731,7 @@ pub fn graph_run(
                     // here: it carries each node's driver flag, so it is
                     // written once the nodes load (`write_run_recorder_best_effort`).
                     graph_yaml,
-                    env_json: render_process_env_json(record_env, EnvJsonArtifact::RunDirectory),
+                    env_json: env_json.bytes,
                 })
             }
             Err(e) => {
@@ -6857,6 +6864,11 @@ pub fn graph_run(
                 // rest of the description; the supervisor writes the file once
                 // its nodes load.
                 run_recorded_at,
+                // The count of names its `env.json` left out, for the same file.
+                #[cfg(unix)]
+                run_env_names_left_out,
+                #[cfg(not(unix))]
+                0,
                 // ONE resolved tag for the whole deployment, so
                 // every rank opens the SAME word (onset agreement is
                 // arithmetic only if the word is shared).
@@ -6952,6 +6964,7 @@ pub fn graph_run(
             // COPIES these bytes verbatim).
             resolve_run_coordination(execution_mode),
             &crate::replay_engine::node_external_flags(&infos),
+            run_env_names_left_out,
         );
     }
 
@@ -11338,6 +11351,9 @@ fn graph_run_supervisor(
     // the rest of the description. The file is written HERE, once the nodes
     // load, because it carries each node's driver flag.
     run_recorded_at: Duration,
+    // How many names the run directory's `env.json` left out, stamped into the
+    // same `recorder.json`.
+    run_env_names_left_out: usize,
     // The deployment's checkpoint arm tag, RESOLVED by `graph_run`
     // (explicit env, else derived from this run's `run_id`) and stamped from
     // here into every worker plan.
@@ -11537,9 +11553,10 @@ fn graph_run_supervisor(
         run_recorded_at,
         resolve_run_coordination(execution_mode),
         &node_external,
+        run_env_names_left_out,
     );
     #[cfg(not(unix))]
-    let _ = run_recorded_at;
+    let _ = (run_recorded_at, run_env_names_left_out);
     #[cfg(unix)]
     let record_entry_infos: Option<
         &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
@@ -17450,12 +17467,14 @@ impl EnvJsonArtifact {
 
 /// Render `env.json` for `mode` from this process's environment
 /// (`std::env::vars_os()`, which never panics) and warn about each variable
-/// it could not store as the mode asks ([`warn_env_json_render`]).
+/// it could not store as the mode asks ([`warn_env_json_render`]). The caller
+/// writes the bytes and stamps the count of names left out into the same
+/// artifact's `recorder.json`.
 #[cfg(unix)]
-fn render_process_env_json(mode: RecordEnvMode, artifact: EnvJsonArtifact) -> Vec<u8> {
+fn render_process_env_json(mode: RecordEnvMode, artifact: EnvJsonArtifact) -> EnvJsonRender {
     let render = render_env_json(mode, std::env::vars_os());
     warn_env_json_render(&render, artifact);
-    render.bytes
+    render
 }
 
 /// Warn once per list that `render` left a variable out or stored a hash in
@@ -17685,7 +17704,14 @@ fn run_dir_partition_provenance(
 /// `cerulion_version`, `recorded_at_ns` (the recording's start timestamp —
 /// the same `now` that stamps the bag filename; no second clock read), and
 /// three CONTRACT keys a replay applies: `trace_format`, `coordination` and
-/// `node_external`.
+/// `node_external`, plus one count a replay does not read,
+/// `env_names_left_out`.
+///
+/// `env_names_left_out` is how many variables the same artifact's `env.json`
+/// left out because their name is not valid UTF-8 (`render_env_json`), so a
+/// bag says it is missing them without its log. It is REQUIRED like
+/// `node_external` and written as `0` when none was, so an ABSENT key means a
+/// recorder older than the count.
 ///
 /// `node_external` is each native node's driver flag (`true` where the LOADED
 /// node declares the `external` policy), from
@@ -17724,6 +17750,7 @@ pub fn render_recorder_json(
     now: Duration,
     coordination: crate::replay_engine::CoordinationMode,
     node_external: &std::collections::BTreeMap<String, bool>,
+    env_names_left_out: usize,
 ) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "arch": std::env::consts::ARCH,
@@ -17771,6 +17798,8 @@ pub fn render_recorder_json(
         "coordination": coordination,
         // Each native node's driver flag, from the loaded metadata.
         "node_external": node_external,
+        // How many names `env.json` left out for not being valid UTF-8.
+        "env_names_left_out": env_names_left_out,
     }))
     .expect("recorder.json is a static-shape object; serialization cannot fail")
 }
@@ -18296,7 +18325,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     // trade in the non-default modes (extracted + `#[traced_test]`-pinned).
     warn_record_env_mode(record_env);
     let env_json = render_process_env_json(record_env, EnvJsonArtifact::Recording);
-    std::fs::write(&paths.env_json, &env_json)
+    std::fs::write(&paths.env_json, &env_json.bytes)
         .map_err(|e| CliError::Validation(format!("recording: write env.json: {e}")))?;
     // recorder.json: the recording host's arch/os/
     // version + the recording's own stamp (`now` reused — no second clock
@@ -18304,7 +18333,12 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     // multi-process recordings both carry the attachment.
     std::fs::write(
         &paths.recorder_json,
-        render_recorder_json(now, coordination, node_external),
+        render_recorder_json(
+            now,
+            coordination,
+            node_external,
+            env_json.left_out_names.len(),
+        ),
     )
     .map_err(|e| CliError::Validation(format!("recording: write recorder.json: {e}")))?;
     // graph.yaml: the EFFECTIVE config this run executes, rendered to
@@ -20546,11 +20580,12 @@ fn write_run_recorder_best_effort(
     recorded_at: Duration,
     coordination: crate::replay_engine::CoordinationMode,
     node_external: &std::collections::BTreeMap<String, bool>,
+    env_names_left_out: usize,
 ) {
     let Some(dir) = run_dir else {
         return;
     };
-    let bytes = render_recorder_json(recorded_at, coordination, node_external);
+    let bytes = render_recorder_json(recorded_at, coordination, node_external, env_names_left_out);
     if let Err(e) = crate::run_dir::write_run_recorder(dir, &bytes) {
         tracing::warn!(
             dir = %dir.display(),
@@ -30994,18 +31029,19 @@ process_groups:
     }
 
     /// `render_recorder_json` carries EXACTLY
-    /// seven fields (a sacred user-facing format: a speculative EIGHTH
+    /// eight fields (a sacred user-facing format: a speculative NINTH
     /// field fails the count pin), with `arch`/`os` from the compile-time consts,
     /// `recorded_at_ns` equal to the filename-stamp `now` (no second clock), and
     /// `trace_format` = the INTENTIONAL scheduler-trace format version this binary
     /// writes. `trace_format` is the fifth field (the discard-bit-
     /// aware v2) so replay refuses a bag from a newer binary instead of mis-
     /// decoding the discard bit; `node_external` is the seventh, each node's
-    /// driver flag exactly as the caller handed it. The exact-count assert stays
-    /// (no speculative extras; each count move is one intentional add).
+    /// driver flag exactly as the caller handed it; `env_names_left_out` is the
+    /// eighth, the count of names `env.json` left out. The exact-count assert
+    /// stays (no speculative extras; each count move is one intentional add).
     #[cfg(unix)]
     #[test]
-    fn recorder_json_carries_exactly_the_seven_fields() {
+    fn recorder_json_carries_exactly_the_eight_fields() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(1_783_092_278_948_123_456);
         let flags = std::collections::BTreeMap::from([
@@ -31016,15 +31052,19 @@ process_groups:
             now,
             CoordinationMode::Lockstep,
             &flags,
+            2,
         ))
         .expect("valid JSON");
         let obj = v.as_object().expect("an object");
         assert_eq!(
             obj.len(),
-            7,
-            "exactly seven fields (arch/os/cerulion_version/recorded_at_ns + the \
-             trace_format + the coordination stamp + the driver flags), no speculative extras"
+            8,
+            "exactly eight fields (arch/os/cerulion_version/recorded_at_ns + the \
+             trace_format + the coordination stamp + the driver flags + the count of \
+             env.json names left out), no speculative extras"
         );
+        // The eighth field: the count exactly as the caller handed it.
+        assert_eq!(v["env_names_left_out"], 2);
         // The seventh field: each native node's driver flag, as a map of node id
         // to a bool, the key a replay judges drivers by.
         assert_eq!(
@@ -31088,6 +31128,7 @@ process_groups:
             now,
             CoordinationMode::FreeRun,
             &std::collections::BTreeMap::new(),
+            0,
         ))
         .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
@@ -31119,13 +31160,18 @@ process_groups:
         backward.insert("cam".into(), cam);
         let now = Duration::from_nanos(7);
         let render = |infos: &indexmap::IndexMap<String, NodeInfo>| {
-            render_recorder_json(now, CoordinationMode::FreeRun, &node_external_flags(infos))
+            render_recorder_json(
+                now,
+                CoordinationMode::FreeRun,
+                &node_external_flags(infos),
+                0,
+            )
         };
         let a = render(&forward);
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -34555,7 +34601,8 @@ process_groups:
             env_json: render_process_env_json(
                 RecordEnvMode::Allowlist,
                 EnvJsonArtifact::RunDirectory,
-            ),
+            )
+            .bytes,
         })
         .expect("run dir");
 
