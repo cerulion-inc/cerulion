@@ -55,7 +55,9 @@ use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
 use cerulion_core::state::{SkipCause, VecSink};
 use cerulion_core::state_arm::MappedStateArm;
-use cerulion_core::state_restore::{capture_anchor_blob_with_framework, NodeFrameworkState};
+use cerulion_core::state_restore::{
+    capture_anchor_blob_with_framework, AnchorBlob, NodeFrameworkState,
+};
 use cerulion_core::state_ring::{
     StateAnchorEvent, StateAssembler, StateRingConsumer, StateRingOwner,
 };
@@ -102,6 +104,44 @@ impl Guarded {
         self.total += 2;
         self.out.x = self.total as f64;
         Ok(())
+    }
+}
+
+/// Plain data, host-driven: inline-eligible, and its one fire returns
+/// `NodeError::Fatal`, so the scheduler stops it.
+#[cerulion_node(external)]
+struct InlineStop {
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl InlineStop {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Err(NodeError::Fatal("inline node stops".to_string()))
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
+/// [`InlineStop`] carrying a lock, so the boundary DEFERS it to the fork carrier.
+#[cerulion_node(external)]
+struct ForkStop {
+    #[output]
+    out: Vector3,
+    shared: Arc<Mutex<u64>>,
+}
+
+#[cerulion_node_impl]
+impl ForkStop {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Err(NodeError::Fatal("forked node stops".to_string()))
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
     }
 }
 
@@ -398,6 +438,7 @@ fn framework_oracle(step: u64) -> NodeFrameworkState {
         input_service: None,
         sync_capture_high_water: Default::default(),
         sync_epoch_floor: None,
+        stopped: false,
     }
 }
 
@@ -1172,4 +1213,91 @@ fn an_unarmed_run_forks_nothing_and_spawns_nothing() {
         "an un-armed run must write NOTHING — not an anchor, not a skip"
     );
     assert_eq!(h.arm.busy_workers(), 0, "and claim nothing");
+}
+
+// ===========================================================================
+// A stopped node: both carriers state the same stop
+// ===========================================================================
+
+/// A stopped node's framework section when it states nothing else, byte for
+/// byte (43 bytes): version 5, the version-1 prefix with nothing in it, an
+/// empty service table, an empty high-water table, the epoch floor stated
+/// absent, then the flags byte with bit 0 set.
+fn stopped_only_bytes() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0x05, 0x00, 0x00, 0x00]); // version 5
+    b.push(0x00); // no next fire
+    b.extend_from_slice(&[0x00; 8]);
+    b.extend_from_slice(&[0x00; 8]); // pending data
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no sync heads
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty service table
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty high-water table
+    b.push(0x00); // no epoch floor
+    b.extend_from_slice(&[0x00; 8]);
+    b.push(0x01); // flags: stopped
+    b
+}
+
+#[test]
+#[serial]
+fn a_forked_anchor_states_the_same_stop_bytes() {
+    // Both nodes are marked before step 0, fire once there and stop. The one
+    // anchor, at step 4, takes `inline` on the node thread and `forked` in the
+    // fork child; each must state the stop, with the same bytes.
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("inline".to_string(), Box::new(InlineStopEntry::new()));
+    factories.insert("forked".to_string(), Box::new(ForkStopEntry::new()));
+    let ids = vec!["inline".to_string(), "forked".to_string()];
+    let mut h = harness("stop", factories, &ids, RING_RECORDS);
+
+    h.arm.arm(1000, 4);
+    h.runtime.attach_state_arm(Arc::clone(&h.arm));
+    for id in ["inline", "forked"] {
+        h.runtime.trigger_external(id).expect("host-driven node");
+    }
+    step_n(&mut h.runtime, 5);
+    assert!(h.runtime.is_node_stopped("inline"));
+    assert!(h.runtime.is_node_stopped("forked"));
+
+    let split = h
+        .runtime
+        .last_anchor_carriers()
+        .expect("the boundary at step 4 took an anchor");
+    assert_eq!(split.inline_nodes, 1);
+    assert_eq!(split.forked_nodes, 1);
+
+    wait_for_reap(&mut h.runtime);
+
+    let events = drain(&h.ring_name);
+    assert!(
+        skips(&events).is_empty(),
+        "both nodes are captured: {:?}",
+        skips(&events)
+    );
+    let got = completes(&events);
+    assert_eq!(
+        got.iter().map(|(s, i, _)| (*s, *i)).collect::<Vec<_>>(),
+        vec![(4, 0), (4, 1)],
+        "one anchor per node, at the cadence's step"
+    );
+    let inline = AnchorBlob::decode("inline", &got[0].2).expect("framed");
+    let forked = AnchorBlob::decode("forked", &got[1].2).expect("framed");
+    assert_eq!(inline.framework, stopped_only_bytes().as_slice(), "inline");
+    assert_eq!(
+        inline.framework, forked.framework,
+        "the fork child states the same stop as the node thread"
+    );
+
+    // The whole blobs, through the production helper over hand-constructed
+    // values: the payload rides the stop section unchanged.
+    let stopped = NodeFrameworkState {
+        stopped: true,
+        ..Default::default()
+    };
+    let mut sink = VecSink::new();
+    capture_anchor_blob_with_framework(&InlineStop::default(), &stopped, &mut sink).expect("fits");
+    assert_eq!(got[0].2, sink.into_inner(), "the inline blob");
+    let mut sink = VecSink::new();
+    capture_anchor_blob_with_framework(&ForkStop::default(), &stopped, &mut sink).expect("fits");
+    assert_eq!(got[1].2, sink.into_inner(), "the forked blob");
 }
