@@ -3293,11 +3293,11 @@ pub trait NodeEntry: Send {
     /// Write each output's committed-frame count into `out`, in the graph's
     /// `outputs:` order, through [`NodeContext::output_commit_counts`].
     ///
-    /// The default returns `false`: the entry cannot see its publishers (a
-    /// cdylib moves its context into the library at `init`), so the fire tap
-    /// records its fires with `FireFlags::WROTE_UNKNOWN`. An entry that owns
-    /// its `NodeContext` forwards to it; the generated `#[cerulion_node]`
-    /// entry and `ClosureNodeEntry` do.
+    /// The default returns `false`: the entry cannot see its publishers, so
+    /// the fire tap records its fires with `FireFlags::WROTE_UNKNOWN`. An
+    /// entry that reaches its `NodeContext` forwards to it: the generated
+    /// `#[cerulion_node]` entry, `ClosureNodeEntry`, and `DylibNodeEntry`,
+    /// whose context the host keeps.
     fn output_commit_counts(&self, _out: &mut [u32]) -> bool {
         false
     }

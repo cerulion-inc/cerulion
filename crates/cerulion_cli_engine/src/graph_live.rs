@@ -5204,6 +5204,7 @@ nodes:
                     backpressure: BackpressurePolicy::DropOldest,
                     expect_within_ms: None,
                     consume: Default::default(),
+                    accumulate: false,
                 }],
                 vec![OutputMeta::new("out".to_string(), 0, None)],
             )
@@ -5352,6 +5353,10 @@ nodes:
             .unwrap();
             let entry = RunEntry::new(RUN_ID, "wire", 0, RunState::Live, GRAPH, run_json)
                 .expect("a well-formed entry");
+            assert!(
+                cerulion_core::transport::run_artifacts::remote_visible(&entry),
+                "a local-only run is hidden from the desk"
+            );
             let (manager, _gateway, port) = listening_gateway();
             let network = manager.network().expect("a configured network");
             network.set_lan_access(LanAccess::Open);
