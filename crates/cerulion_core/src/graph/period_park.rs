@@ -301,11 +301,12 @@ impl ArrivalLearner {
             && self.dev_ns.saturating_mul(4) <= MAX_WINDOW_NS
     }
 
+    /// The predicted window's half-width. Read only while [`Self::regular`]
+    /// holds, so it never exceeds half a period: there four deviations are at
+    /// most half the period, and the period is at least [`MIN_GAP_NS`], ten
+    /// times [`MIN_WINDOW_NS`].
     fn half_width_ns(&self) -> u64 {
-        self.dev_ns
-            .saturating_mul(4)
-            .max(MIN_WINDOW_NS)
-            .min(self.period_ns / 2)
+        self.dev_ns.saturating_mul(4).max(MIN_WINDOW_NS)
     }
 
     /// The next predicted window `(open_ns, close_ns)` that has not closed by
@@ -391,19 +392,16 @@ impl Plan {
                 Phase::Hot
             }
         };
+        // A window that goes hot before the timer and has not closed: nap
+        // until it goes hot, or park once it has (nothing is left to sleep).
         if let Some((open, close)) = self.window {
             let window_hot = open.checked_sub(self.lead).unwrap_or(now);
-            if now < window_hot && window_hot < timer_hot {
+            if window_hot < timer_hot && now < close {
                 return hot_or_kernel(window_hot, true);
             }
-            if now < close && window_hot < timer_hot {
-                return Phase::Hot;
-            }
         }
-        if now < timer_hot {
-            return hot_or_kernel(timer_hot, false);
-        }
-        Phase::Hot
+        // Nap until one lead before the deadline, or park once that is past.
+        hot_or_kernel(timer_hot, false)
     }
 }
 
@@ -900,6 +898,74 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_of_exactly_the_shortest_period_is_a_period_not_a_burst() {
+        let mut a = ArrivalLearner::default();
+        assert!(a.observe(0));
+        assert!(
+            a.observe(MIN_GAP_NS),
+            "a gap of exactly MIN_GAP_NS is a period"
+        );
+        assert_eq!((a.period_ns, a.run), (MIN_GAP_NS, 1));
+        let mut b = ArrivalLearner::default();
+        b.observe(0);
+        assert!(
+            !b.observe(MIN_GAP_NS - 1),
+            "one ns shorter is a burst member"
+        );
+        assert_eq!((b.period_ns, b.run), (0, 0));
+    }
+
+    #[test]
+    fn a_gap_of_exactly_the_longest_period_is_learned_and_one_ns_more_forgets() {
+        let mut a = ArrivalLearner::default();
+        a.observe(0);
+        assert!(a.observe(MAX_GAP_NS));
+        assert_eq!(
+            (a.period_ns, a.run),
+            (MAX_GAP_NS, 1),
+            "exactly the longest gap is a period"
+        );
+        let mut b = ArrivalLearner::default();
+        b.observe(0);
+        assert!(b.observe(MAX_GAP_NS + 1));
+        assert_eq!(
+            (b.period_ns, b.run, b.last_ns),
+            (0, 0, Some(MAX_GAP_NS + 1)),
+            "one ns more is an idle spell"
+        );
+    }
+
+    #[test]
+    fn a_regular_stream_folds_a_gap_up_to_its_tolerance_and_relearns_past_it() {
+        // Twelve arrivals 1 ms apart: eleven gaps, deviation 0, so the
+        // tolerance is 3 x max(0, 1 ms / 16) = 187.5 us.
+        let steady = || {
+            let mut a = ArrivalLearner::default();
+            regular_stream(&mut a, 12, 1_000_000);
+            a
+        };
+        let mut inside = steady();
+        assert_eq!(
+            (inside.period_ns, inside.dev_ns, inside.run),
+            (1_000_000, 0, 11)
+        );
+        assert!(inside.observe(11_000_000 + 1_187_500));
+        // Folded: period 1 ms + 187.5 us / 8 and deviation 187.5 us / 8,
+        // both rounded down.
+        assert_eq!(
+            (inside.period_ns, inside.dev_ns, inside.run),
+            (1_023_437, 23_437, 12)
+        );
+        let mut outside = steady();
+        assert!(outside.observe(11_000_000 + 1_187_501));
+        assert_eq!(
+            (outside.period_ns, outside.dev_ns, outside.run),
+            (1_187_501, 0, 1),
+            "one ns past the tolerance starts the period over"
+        );
+    }
+
+    #[test]
     fn an_idle_spell_or_a_step_back_in_time_forgets_a_regular_stream() {
         let mut a = ArrivalLearner::default();
         regular_stream(&mut a, 12, 1_000_000);
@@ -1036,6 +1102,14 @@ mod tests {
         );
         assert_eq!(plan.phase(t0 + Duration::from_micros(905)), Phase::Hot);
         assert_eq!(plan.phase(t0 + Duration::from_micros(1_010)), Phase::Hot);
+        assert_eq!(
+            plan.phase(t0 + Duration::from_micros(1_020)),
+            Phase::Kernel {
+                until: t0 + Duration::from_micros(250_000 - 80),
+                before_window: false
+            },
+            "the window has closed at its close: back to the timer plan"
+        );
         assert_eq!(
             plan.phase(t0 + Duration::from_micros(1_030)),
             Phase::Kernel {
