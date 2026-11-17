@@ -185,19 +185,33 @@ fn parse_sig64_b64(s: &str, field: &'static str) -> Result<Signature> {
     Ok(Signature(arr))
 }
 
-/// A JSON body extractor for the PoP-gated registration endpoints (`POST
-/// /v1/devices`, `POST /v1/robots`). Unlike the stock `Json<T>` extractor — whose
+/// A JSON body extractor for the PoP-gated endpoints (`POST /v1/devices`,
+/// `POST /v1/robots`, and a robot's own `POST /v1/robots/{robot_id}/access/challenge`
+/// and `POST /v1/robots/{robot_id}/access`). Unlike the stock `Json<T>` extractor — whose
 /// deserialization failure surfaces as a framework-default 422 with a bare serde
 /// string — a parse failure here maps to the crate's STABLE
 /// [`AccountdError::BadRequest`] body (`{error:"invalid_request", error_description}`)
-/// that NAMES the missing proof-of-possession requirement + the challenge endpoint.
-/// This keeps a client that omits `pop_challenge`/`pop_signature` on the
-/// account service's loud-actionable-error norm rather than an unnamed 4xx.
+/// that names, from the body type's [`PopBody::HINT`], the fields that endpoint
+/// needs and where its challenge comes from. This keeps a client that omits a proof
+/// field on the account service's loud-actionable-error norm rather than an
+/// unnamed 4xx.
 struct PopJson<T>(T);
+
+/// A proof-of-possession request body: what a parse failure tells its caller to send.
+trait PopBody: DeserializeOwned {
+    /// The sentence after the parse error naming the endpoint's fields.
+    const HINT: &'static str;
+}
+
+/// The hint of the registration endpoints, which prove possession of the key
+/// being registered with a challenge issued to the caller's session.
+const REGISTRATION_POP_HINT: &str = "This endpoint requires a proof of possession — request \
+     a challenge from POST /v1/devices/challenge, sign it with the key you are \
+     registering, and include `pop_challenge` + `pop_signature`.";
 
 impl<T, S> FromRequest<S> for PopJson<T>
 where
-    T: DeserializeOwned,
+    T: PopBody,
     S: Send + Sync,
 {
     type Rejection = AccountdError;
@@ -207,11 +221,7 @@ where
             .await
             .map_err(|_| AccountdError::BadRequest("could not read the request body".into()))?;
         let value = serde_json::from_slice::<T>(&bytes).map_err(|e| {
-            AccountdError::BadRequest(format!(
-                "invalid request body: {e}. This endpoint requires a proof of possession — request \
-                 a challenge from POST /v1/devices/challenge, sign it with the key you are \
-                 registering, and include `pop_challenge` + `pop_signature`."
-            ))
+            AccountdError::BadRequest(format!("invalid request body: {e}. {}", T::HINT))
         })?;
         Ok(PopJson(value))
     }
@@ -870,6 +880,10 @@ struct RegisterDeviceRequest {
     pop_signature: String,
 }
 
+impl PopBody for RegisterDeviceRequest {
+    const HINT: &'static str = REGISTRATION_POP_HINT;
+}
+
 #[derive(Serialize)]
 struct RegisterDeviceResponse {
     device_id: String,
@@ -1052,6 +1066,10 @@ struct RegisterRobotRequest {
     /// validated here).
     #[serde(default)]
     org_id: Option<String>,
+}
+
+impl PopBody for RegisterRobotRequest {
+    const HINT: &'static str = REGISTRATION_POP_HINT;
 }
 
 #[derive(Serialize)]
@@ -1477,6 +1495,12 @@ struct RobotChallengeRequest {
     request_signature: String,
 }
 
+impl PopBody for RobotChallengeRequest {
+    const HINT: &'static str = "This endpoint needs no session: send `requested_at_ns`, the \
+         request time as Unix nanoseconds in decimal digits, and `request_signature`, the \
+         robot's transport key signature over it.";
+}
+
 #[derive(Serialize)]
 struct RobotAccessChallengeResponse {
     /// The opaque single-use challenge the robot signs.
@@ -1587,6 +1611,12 @@ struct RobotProofRequest {
     pop_challenge: String,
     /// base64url ed25519 signature over the robot proof message.
     pop_signature: String,
+}
+
+impl PopBody for RobotProofRequest {
+    const HINT: &'static str = "This endpoint needs no session: send `pop_challenge`, a \
+         challenge from POST /v1/robots/{robot_id}/access/challenge, and `pop_signature`, \
+         the robot's transport key signature over it.";
 }
 
 /// `POST /v1/robots/{robot_id}/access`, with no session: the robot's own access state,
