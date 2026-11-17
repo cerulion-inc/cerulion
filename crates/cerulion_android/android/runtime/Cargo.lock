@@ -709,6 +709,7 @@ dependencies = [
 name = "cerulion_ops_proto"
 version = "2.0.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
