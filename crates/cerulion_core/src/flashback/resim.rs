@@ -279,8 +279,8 @@ pub struct ResimFacts<'a> {
     /// held frames.
     ///
     /// A RECORDER fact, like [`trace_gap`](Self::trace_gap): the trace and the
-    /// checkpoint are read from rings that reach back to the run's first
-    /// record, while the frames are what the taps drained from the moment they
+    /// checkpoint come from rings a recorder can read from their first record,
+    /// while the frames are what its taps drained from the moment they
     /// attached. A capture whose resume begins before its frames do, or whose
     /// window lost a frame a kept read consumed, carries a trace that names a
     /// frame `bag play --resim --verify` then cannot find (its

@@ -43,8 +43,9 @@ gating clock: the same execution, replayable on your laptop.
 
 Multi-process runs, the default shape on Linux and macOS, provision the
 scheduler-trace rings without requiring `--record`. Declining those rings with
-`--no-rings` also stops the window recorder. Each capture reports whether its
-retained trace and checkpoint boundary support resim in `anchor.resimmable`,
+`--no-rings` also stops the window recorder. Each capture reports in
+`anchor.resimmable` whether `cerulion bag play --resim all --verify` can judge
+it: its retained trace, its checkpoint boundary and every frame its trace reads,
 with a reason when they do not; `cerulion bag info` shows that verdict.
 
 What makes that possible is that **every multi-process `cerulion graph run`
@@ -134,7 +135,7 @@ Open one with `cerulion bag info`. Beyond the frames, a capture carries:
 
 | Attachment | What it holds |
 |---|---|
-| `__cerulion/flashback.json` | What the capture was ABOUT: `causes[]` (each with the `detail` your `--note` became), the window it claimed (`span_ms`) against the window it achieved (`achieved_span_ms`), a `handoff` object saying what this recorder was given, and `anchor.resimmable`, whether `bag play --resim` will accept this bag. |
+| `__cerulion/flashback.json` | What the capture was ABOUT: `causes[]` (each with the `detail` your `--note` became), the window it claimed (`span_ms`) against the window it achieved (`achieved_span_ms`), a `handoff` object saying what this recorder was given, and `anchor.resimmable`, whether `bag play --resim all --verify` can judge this bag: its trace, its checkpoint and every frame its trace reads are in it. |
 | `__cerulion/state_coverage.json` | The node-state side: which nodes have an anchor, and which were skipped and why. Absent when the recorder had nothing to say about the state plane. |
 | `graph.yaml`, `env.json` | The graph as executed and the environment it ran in. Bare names, not `__cerulion/`-prefixed: that namespace is reserved for manifests the recorder mints itself. |
 | `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew, and the replay contract its trace is judged under (`trace_format`, `coordination`, `node_external`). A run that could not write it into its run directory warns, and a capture of it that carries the trace carries no `graph.yaml` either, so `anchor.resimmable` is false. |
@@ -340,6 +341,21 @@ process mints the rings like any multi-process run.
 carry a coverage manifest saying which of those topics belonged to the run's own
 graph, so a co-tenant topic looks to replay like a bag that disagrees with its
 own graph, and the resim exits 2 blaming corruption.
+
+**A capture from a run's first seconds may not be re-runnable.** A
+`graph run` takes its first checkpoint at step 0, and its window recorder starts
+a moment after the run is released, so its taps miss the frames published before
+they attach. A capture taken within one Flashback window of the start resumes
+from that checkpoint. When a step it re-executes reads a frame published before
+the taps attached, the capture is stamped not resimmable, and
+`anchor.resimmable_reason` names the topic, the step, the writer and the
+sequences. A capture whose trace reads a frame the window lost later in the run
+is refused the same way. Take the capture more than one Flashback window into the
+run (`CERULION_FLASHBACK_WINDOW_MS`), or record with
+`cerulion graph run --record`, whose recorder is ready before step 0. A capture
+written by 2.0.0 was not checked this way: it can claim
+`anchor.resimmable: true` and then be refused by
+`bag play --resim all --verify`, so take it again.
 
 **A topic that first publishes mid-recording gets no channel.** A
 bag's channel set is fixed when the bag is created, so a producer that appears

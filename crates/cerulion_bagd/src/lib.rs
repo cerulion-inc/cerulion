@@ -9945,8 +9945,8 @@ fn judge_capture_resimmable(
             anchor_facts,
             // The first frame a kept read consumed that the window does not
             // hold. The recorder alone knows it: its taps hold frames from the
-            // moment they attached, while the trace and the checkpoint reach
-            // back to the run's first record.
+            // moment they attached, while it can read the trace and the checkpoint
+            // rings from their first record.
             frame_gap,
         },
     )
