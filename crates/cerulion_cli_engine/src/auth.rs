@@ -1212,6 +1212,23 @@ pub(crate) fn hold_refresh_lock_within(
     )
 }
 
+/// The never-renamed sibling of `auth.json` whose exclusive lock admits one
+/// device-cert renewal at a time across processes.
+pub const DEVICE_RENEW_LOCK_FILE: &str = ".device-renew.lock";
+
+/// The device-cert renewal lock, taken without waiting: a contended lock means a
+/// peer is renewing the same cert right now, so the caller skips its own renewal
+/// instead of waiting on that peer's requests.
+#[cfg(unix)]
+pub(crate) fn try_hold_device_renew_lock(auth_path: &Path) -> std::io::Result<StoreLock> {
+    hold_lock_file(
+        &auth_path.with_file_name(DEVICE_RENEW_LOCK_FILE),
+        auth_path,
+        std::time::Duration::ZERO,
+        "renewing the device certificate in",
+    )
+}
+
 /// An exclusive `flock` on `path` (created 0600 if absent), retried every
 /// [`LOCK_POLL`] until `wait` passes.
 #[cfg(unix)]
