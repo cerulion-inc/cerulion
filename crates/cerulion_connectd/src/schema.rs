@@ -178,8 +178,10 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 /// directory where each one already exists.
 const STAGING_ATTEMPTS: u32 = 8;
 
-/// The longest file name, in bytes, a staging name is held to: the name limit
-/// of the filesystems a schema store sits on.
+/// The longest file name, in bytes, a staging name is held to: the per-name
+/// limit of Linux filesystems such as ext4 and tmpfs. macOS and Windows count
+/// their 255 in UTF-16 units, and a name within 255 bytes never has more units
+/// than bytes.
 const NAME_MAX_BYTES: usize = 255;
 
 /// A hidden sibling of `dest` for [`stage`] to create: the same directory, so
@@ -613,9 +615,9 @@ mod tests {
     }
 
     /// A staging name embeds a short schema name whole and a long one cut at a
-    /// character boundary, and stays within the 255-byte name limit for a
-    /// 254-byte ASCII name and a 252-byte name of four-byte characters; a path
-    /// with no file name has no staging name.
+    /// character boundary, and stays within 255 bytes: exactly 255 for a
+    /// 254-byte ASCII name, and at least 252 for a 252-byte name of 62 four-byte
+    /// characters and `.msg`; a path with no file name has no staging name.
     #[test]
     fn a_staging_name_fits_the_name_limit_and_needs_a_file_name() {
         let pid = std::process::id();
@@ -625,9 +627,9 @@ mod tests {
             short.starts_with(&format!(".Sub.msg.{pid}.")) && short.ends_with(".tmp"),
             "{short}"
         );
-        for long in [
-            format!("{}.msg", "a".repeat(250)),
-            format!("{}.msg", "\u{1d538}".repeat(62)),
+        for (long, shortest) in [
+            (format!("{}.msg", "a".repeat(250)), 255),
+            (format!("{}.msg", "\u{1d538}".repeat(62)), 252),
         ] {
             let staging = staging_path(&Path::new("store").join(&long)).unwrap();
             assert_eq!(staging.parent(), Some(Path::new("store")));
@@ -638,7 +640,7 @@ mod tests {
             assert!(name.len() <= 255, "{} bytes: {name}", name.len());
             assert!(long.starts_with(embedded), "{embedded}");
             // Cut at most one character short of the limit.
-            assert!(name.len() > 255 - 4, "{} bytes: {name}", name.len());
+            assert!(name.len() >= shortest, "{} bytes: {name}", name.len());
         }
         assert_eq!(
             staging_path(Path::new("/")).unwrap_err().kind(),
@@ -647,11 +649,12 @@ mod tests {
     }
 
     /// A type name of 62 four-byte characters makes a 252-byte `.msg` file name,
-    /// inside the 255-byte limit: it is staged and written whole under its own
-    /// name. One character more is past the limit and is refused, as before,
-    /// with nothing left in the store.
+    /// inside every platform's limit: it is staged and written whole under its
+    /// own name. A type name of 128 such characters, 516 bytes and 260 UTF-16
+    /// units, is past the limit everywhere: it is refused when its path is read,
+    /// before anything is staged, so the package's msg directory holds no file.
     #[test]
-    fn a_multibyte_name_at_the_limit_is_written_and_one_past_it_is_refused() {
+    fn a_multibyte_name_within_the_limit_is_written_and_one_past_it_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let at_limit = "\u{1d538}".repeat(62);
         let dest = dir
@@ -683,7 +686,10 @@ mod tests {
         let past = tempfile::tempdir().unwrap();
         let err = materialize_docs(
             past.path(),
-            &[msg_doc(&format!("acme/{at_limit}\u{1d538}"), "float64 x\n")],
+            &[msg_doc(
+                &format!("acme/{}", "\u{1d538}".repeat(128)),
+                "float64 x\n",
+            )],
         )
         .unwrap_err();
         assert!(err.to_string().contains("File name too long"), "{err}");
