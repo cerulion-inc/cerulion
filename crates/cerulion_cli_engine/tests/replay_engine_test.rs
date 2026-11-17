@@ -32932,6 +32932,381 @@ fn the_mid_loop_schedule_budget_declines_the_rederivation_alone() {
     );
 }
 
+/// The stopping-sink graph with a sink that never fails: `SinkFailure::Logic`
+/// at a value no counter frame reaches.
+fn ls_never_failing_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    ls_factories(SinkFailure::Logic(f64::MAX))
+}
+
+/// The topic the never-failing sink consumes, the counter's output.
+const LS_COUNTER_TOPIC: &str = "/stop/counter/out";
+
+/// The reads rank 0's read log holds on the never-failing recording, by hand:
+/// the sink's boundary drain records one `DrainedBatch` per step (12), its
+/// body one `Served` per fire (12), and each of its two read sites one
+/// `Producer` annotation at step 0 (2). The counter has no input.
+const LS_READS: u64 = 26;
+
+/// The recorded frames rank 0 consumes: the counter's one frame per step.
+const LS_FRAMES: u64 = 12;
+
+/// Record the never-failing stopping-sink graph with its read log, and check
+/// the recording against the hand oracle the budget arms count on
+/// ([`LS_READS`], [`LS_FRAMES`]): the sink fires and serves a frame at every
+/// step, its boundary drain counts one frame at every step, each read site
+/// opens its writer run at step 0, no record folds a run, and the rank's step
+/// boundaries sit [`DELTA_MS`] apart, so its last read, at step 11, is 55 ms
+/// after its first boundary, which is also its span.
+fn ls_never_failing_reference() -> Recording {
+    use cerulion_core::read_outcome::ReadOutcomeKind;
+    let rec = record_uniform_with_read_log(ls_yaml(), ls_never_failing_factories, &[], LS_STEPS);
+    let every_step: Vec<u64> = (0..LS_STEPS as u64).collect();
+    let (fires, served) = ls_sink_records(&rec, ReadOutcomeKind::Served, ReadSiteRole::Body);
+    assert_eq!(fires, every_step, "the sink fires at every step");
+    assert_eq!(served, every_step, "its body serves a frame at every fire");
+    let (_, drained) = ls_sink_records(&rec, ReadOutcomeKind::DrainedBatch, ReadSiteRole::Drain);
+    assert_eq!(
+        drained, every_step,
+        "its drain counts its input at every step"
+    );
+    for role in [ReadSiteRole::Body, ReadSiteRole::Drain] {
+        let (_, annotated) = ls_sink_records(&rec, ReadOutcomeKind::Producer, role);
+        assert_eq!(
+            annotated,
+            vec![0],
+            "the {role:?} site's run opens at step 0"
+        );
+    }
+    let kind6: Vec<&TraceRingRecord> = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .collect();
+    assert_eq!(
+        kind6.len() as u64,
+        LS_READS,
+        "the read log holds exactly the hand-counted records, no other kind"
+    );
+    assert!(
+        kind6
+            .iter()
+            .filter(|r| is_read_record(r))
+            .all(|r| cerulion_core::trace_ring::unpack_read_outcome_run(r.duration_ns) == 1),
+        "no record folds a run, so each record is one read"
+    );
+    let counter = &rec.messages[LS_COUNTER_TOPIC];
+    assert_eq!(
+        counter.len() as u64,
+        LS_FRAMES,
+        "one counter frame per step"
+    );
+    assert!(
+        counter
+            .iter()
+            .all(|f| WireHeader::read_from_buf(f).is_some()),
+        "every counter frame carries a wire header"
+    );
+    let boundaries: Vec<(u64, u64)> = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .map(|r| (r.step, r.fire_time_ns))
+        .collect();
+    let first = boundaries.first().expect("the rank records boundaries").1;
+    assert_eq!(
+        boundaries,
+        every_step
+            .iter()
+            .map(|&k| (k, first + k * DELTA_MS * 1_000_000))
+            .collect::<Vec<_>>(),
+        "one boundary per step, {DELTA_MS} ms apart"
+    );
+    rec
+}
+
+/// [`ls_never_failing_reference`], written as a one-rank free-run bag.
+fn ls_never_failing_bag(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let bag = dir.path().join(name);
+    write_ls_free_run_bag(&ls_never_failing_reference(), &bag);
+    bag
+}
+
+/// `rec` as a one-rank free-run bag the way a recorder writes it: the stage
+/// rows, the input table and the publisher table, and no producer label (the
+/// counter is the topic's one writer).
+fn write_ls_free_run_bag(rec: &Recording, bag: &std::path::Path) {
+    write_bag_impl(
+        rec,
+        bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(rec)),
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+}
+
+/// A `--verify` replay of the never-failing bag under a read-log budget of
+/// `read_log` and a frame-index budget of `frames` (`None` = the shipped one).
+fn ls_verify_under(
+    bag: &std::path::Path,
+    read_log: Option<usize>,
+    frames: Option<usize>,
+) -> Result<ReplayOutcome, ReplayError> {
+    let _read_log = read_log.map(replay_engine::override_read_log_record_budget);
+    let _frames = frames.map(replay_engine::override_frame_index_record_budget);
+    ri_replay(
+        bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+    )
+    .0
+}
+
+/// The read-log refusal of the never-failing bag one read over its budget,
+/// word for word.
+const LS_READ_LOG_REFUSAL: &str = "this recording's read log cannot be enforced \
+     [read_identity_unplanned]: rank 0's read log was declined \
+     (verifier_declined_read_log_budget): it holds 26 reads, more than the verifier's budget of \
+     25 reads per rank, and reaches the budget at step 11, 0.055 s into the rank's 0.055 s of \
+     recording. A verifying replay holds each rank's read log in memory up to this budget, so \
+     verify a recording of this graph no longer than that.";
+
+/// `--verify` replays of the never-failing bag under each read-log or
+/// frame-index budget in `budgets` verify, each fed the sink's 24 reads (12
+/// body reads and 12 drain reads, one frame each).
+fn assert_ls_verifies_under(bag: &std::path::Path, budgets: &[(Option<usize>, Option<usize>)]) {
+    for &(read_log, frames) in budgets {
+        let outcome = ls_verify_under(bag, read_log, frames);
+        let outcome =
+            outcome.unwrap_or_else(|e| panic!("budgets {read_log:?}/{frames:?} verify: {e}"));
+        assert_eq!(ri_assert_fed(&outcome), (24, 24), "{read_log:?}/{frames:?}");
+        assert!(
+            outcome.passed,
+            "{read_log:?}/{frames:?}: {:?}",
+            outcome.violations
+        );
+        assert_eq!(resim_exit(&outcome, true), 0, "{read_log:?}/{frames:?}");
+    }
+}
+
+/// **A `--verify` one read over the read-log budget is refused before its
+/// first step, naming the reads, the budget, the step and the time.**
+///
+/// The never-failing bag holds 26 reads on rank 0 ([`LS_READS`]), so a budget
+/// of 25 is one short. The 26th read is at step 11, the last step, 55 ms
+/// after the rank's first boundary in a 55 ms recording. The remedy is a
+/// shorter recording; the refusal names neither `--duration` nor a re-record,
+/// which would not help.
+///
+/// CONTROL, on the same bag: at the shipped budget, one read under the budget
+/// (27) and exactly at it (26, the side a `>` / `>=` slip moves) the replay
+/// verifies, so the refusal is the budget's and not the bag's.
+#[test]
+#[serial]
+fn a_verify_one_read_over_the_read_log_budget_is_refused_naming_both_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_read_log_budget.mcap");
+    let at = LS_READS as usize;
+    assert_ls_verifies_under(
+        &bag,
+        &[(None, None), (Some(at + 1), None), (Some(at), None)],
+    );
+
+    let outcome = ls_verify_under(&bag, Some(at - 1), None);
+    let err = outcome.expect_err("one read over the budget is refused");
+    assert_eq!(err.exit_code(), 2, "not replay-grade: {err}");
+    let ReplayError::ReadLogNotEnforceable { edge, cause, .. } = &err else {
+        panic!("a read-log refusal: {err:?}");
+    };
+    assert_eq!((edge, cause.as_str()), (&None, "read_identity_unplanned"));
+    let msg = err.to_string();
+    assert_eq!(msg, LS_READ_LOG_REFUSAL);
+    assert!(
+        !msg.contains("--duration") && !msg.contains("Re-record"),
+        "no remedy that does not help: {msg}"
+    );
+}
+
+/// **A neutral `--resim all` of a rank that reads a topic it produces is
+/// refused at its pass, naming the reads, the budget and a shorter
+/// recording.**
+///
+/// The never-failing bag's one rank runs the counter and the sink that reads
+/// it, so its pass gates that topic over the read log, and a census over the
+/// budget leaves the gate nothing to be built from. The refusal ends with the
+/// budget's remedy, not the re-record sentence, which would give the same
+/// overrun again. CONTROL: at the shipped budget the same resim runs.
+#[test]
+#[serial]
+fn a_neutral_resim_of_a_rank_that_reads_its_own_topic_names_the_budget_and_a_shorter_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_resim_over.mcap");
+    let (control, _) = ri_replay(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    assert!(
+        control.expect("the shipped budget resims").passed,
+        "the control passes"
+    );
+
+    let _budget = replay_engine::override_read_log_record_budget(LS_READS as usize - 1);
+    let (outcome, _) = ri_replay(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let err = outcome.expect_err("the gated rank is refused at its pass");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let ReplayError::ReadLogNotEnforceable {
+        edge,
+        cause,
+        detail,
+    } = &err
+    else {
+        panic!("a read-log refusal: {err:?}");
+    };
+    assert_eq!((edge, cause.as_str()), (&None, "read_log_budget_declined"));
+    assert_eq!(
+        detail,
+        "this rank consumes 1 topic(s) it also produces (/stop/counter/out), whose recorded \
+         reads the replay must admit at their recorded steps, and the read log they would be \
+         built from was declined before the first step (verifier_declined_read_log_budget): it \
+         holds 26 reads, more than the verifier's budget of 25 reads per rank, and reaches the \
+         budget at step 11, 0.055 s into the rank's 0.055 s of recording. A verifying replay \
+         holds each rank's read log in memory up to this budget, so verify a recording of this \
+         graph no longer than that"
+    );
+    assert!(
+        !detail.contains("Re-record the bag with this binary"),
+        "a re-record gives the same overrun: {detail}"
+    );
+}
+
+/// **A `--verify` one frame over the frame-index budget is refused at its
+/// pass, naming the frames and the budget.** Rank 0 consumes the counter's 12
+/// recorded frames ([`LS_FRAMES`]), so a budget of 11 is one short. The frames
+/// carry their producers' stamps, so the refusal names no time. CONTROL: exactly
+/// at the budget (12) the replay verifies.
+#[test]
+#[serial]
+fn a_verify_one_frame_over_the_frame_index_budget_is_refused_naming_both_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_frame_budget.mcap");
+    assert_ls_verifies_under(&bag, &[(None, Some(LS_FRAMES as usize))]);
+
+    let outcome = ls_verify_under(&bag, None, Some(LS_FRAMES as usize - 1));
+    let err = outcome.expect_err("one frame over the budget is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let ReplayError::ReadLogNotEnforceable {
+        edge,
+        cause,
+        detail,
+    } = &err
+    else {
+        panic!("a read-log refusal: {err:?}");
+    };
+    assert_eq!((edge, cause.as_str()), (&None, "read_log_budget_declined"));
+    assert_eq!(
+        detail,
+        "this rank consumes 1 topic(s) it also produces (/stop/counter/out), whose recorded \
+         reads the replay must admit at their recorded steps, and the read log they would be \
+         built from was declined before the first step (verifier_declined_frame_index_budget): \
+         it consumes 12 recorded frames, more than the verifier's budget of 11 frames per rank. \
+         A verifying replay holds the frames each rank consumes in memory up to this budget, so \
+         verify a shorter recording of this graph"
+    );
+}
+
+/// **Two refusals of one over-budget bag print byte-identical text, and two
+/// verifies under the budget write byte-identical reports.** The refusal's
+/// numbers come from a walk of the bag, not from the run, so nothing about the
+/// run can move them.
+#[test]
+#[serial]
+fn two_refusals_of_one_over_budget_bag_render_byte_identical_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_determinism.mcap");
+    let refusals: Vec<String> = (0..2)
+        .map(|run| {
+            let outcome = ls_verify_under(&bag, Some(LS_READS as usize - 1), None);
+            outcome
+                .expect_err(&format!("run {run} is refused"))
+                .to_string()
+        })
+        .collect();
+    assert_eq!(refusals[0], refusals[1], "byte-identical refusals");
+    assert_eq!(refusals[0], LS_READ_LOG_REFUSAL);
+
+    let _budget = replay_engine::override_read_log_record_budget(LS_READS as usize + 1);
+    let reports = ri_two_reports(dir.path(), "ls_under", |report| {
+        ri_replay_reporting(
+            &bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report),
+        )
+        .0
+    });
+    assert_eq!(
+        ri_report_classes(&reports[0]),
+        Vec::<String>::new(),
+        "the verify under the budget reports no violation"
+    );
+}
+
+/// **A hostile run count in the census is counted whole.**
+///
+/// The sink's first body read is rewritten to a run of 4,096 identical reads.
+/// The census counts every read the run stands for, so the refusal names the
+/// 4,121 reads the rank's log now holds (the other 25 plus 4,096), against a
+/// budget of 64 that the rewritten record runs past at step 0, its own step.
+/// That the census holds none of a record past the budget is the tally's own
+/// arm, `a_folded_run_that_straddles_the_budget_is_counted_whole`.
+#[test]
+#[serial]
+fn a_hostile_run_count_in_the_census_is_counted_whole() {
+    const HOSTILE_RUN: u32 = 4_096;
+    let mut rec = ls_never_failing_reference();
+    let served = cerulion_core::read_outcome::ReadOutcomeKind::Served.wire();
+    let target = rec
+        .trace
+        .iter_mut()
+        .find(|r| {
+            r.record_type == RECORD_TYPE_READ_OUTCOME
+                && cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level).1
+                    == served
+        })
+        .expect("the sink's first body read");
+    assert_eq!(target.step, 0, "PREMISE: the first body read is at step 0");
+    let popped = unpack_read_outcome_popped(target.duration_ns);
+    target.duration_ns = cerulion_core::trace_ring::pack_read_outcome_aux_run(popped, HOSTILE_RUN);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ls_hostile_run.mcap");
+    write_ls_free_run_bag(&rec, &bag);
+
+    let outcome = ls_verify_under(&bag, Some(64), None);
+    let err = outcome.expect_err("the hostile run takes the log past the budget");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert_eq!(
+        err.to_string(),
+        "this recording's read log cannot be enforced [read_identity_unplanned]: rank 0's read \
+         log was declined (verifier_declined_read_log_budget): it holds 4121 reads, more than \
+         the verifier's budget of 64 reads per rank, and reaches the budget at step 0, 0.000 s \
+         into the rank's 0.055 s of recording. A verifying replay holds each rank's read log in \
+         memory up to this budget, so verify a recording of this graph no longer than that."
+    );
+}
+
 /// **The bag-time epoch is the MINIMUM first target across the ranks, not rank
 /// 0's own.**
 ///
