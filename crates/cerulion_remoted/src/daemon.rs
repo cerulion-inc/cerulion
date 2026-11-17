@@ -398,10 +398,13 @@ pub async fn serve_endpoint(
 /// claim/pair takes effect at the next accept with no restart), the ops plane with the
 /// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
 /// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
-/// `shutdown`. The wire plane's `status` reports the armed code's state and the
-/// refused requests on every host. When [`serve_planes`] returns, after its
-/// shutdown stage, it ends the rcpd e-stop delivery in flight and stops the
-/// epoch poller, then returns what `serve_planes` returned.
+/// `shutdown`. On the daemon an armed pairing code keeps it serving until the
+/// code's end is written, and an exhausted code to its window plus a margin (a
+/// serving-hold source, bounded by that margin). The wire plane's `status`
+/// reports the armed code's state and the refused requests on every host. When
+/// [`serve_planes`] returns, after its shutdown stage, it ends the rcpd e-stop
+/// delivery in flight and stops the epoch poller, then returns what
+/// `serve_planes` returned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_core(
     files: &PlaneFiles,
@@ -467,6 +470,16 @@ pub(crate) async fn serve_core(
                     RemotedError::Ops(format!("registering owed delivery hold: {error}"))
                 })?;
         }
+        // An armed pairing code keeps the daemon serving until its end is
+        // written, an exhausted one to its window plus a margin, and never
+        // past that. The source reads an atomic and the clock and takes no
+        // lock: it runs under the holds' own lock.
+        let codes = sessions.clone();
+        holds
+            .register_source(Arc::new(move || codes.holds_serving()))
+            .map_err(|error| {
+                RemotedError::Ops(format!("registering pairing code hold: {error}"))
+            })?;
         Some(holds)
     } else {
         None

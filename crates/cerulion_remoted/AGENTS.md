@@ -5,9 +5,9 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 ## Invariants
 - Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
-  final drain/witness. Paired ops/RCP, non-bootstrap verbs, latch/owed work hold the
-  shared fence (unpaired: none); parent exclusive fences idle. Never unlink;
-  explicit SIGTERM still runs shutdown participants.
+  final drain/witness. Paired ops/RCP, non-bootstrap verbs, armed code, latch/owed
+  work hold the shared fence (unpaired: none); parent exclusive fences idle. Never
+  unlink; explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
   verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness); pairing subject = TLS device key, never client arg; validity/rollback: RemotedClock; code window/rate: MonotonicClock.
@@ -34,7 +34,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
-- The revocation sweep runs on its OWN task and timer: assert the revocation stands
+- The revocation sweep has its OWN task/timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata: namespace-checked netd snapshots or `SchemaSource`; no startup.
   Recheck CAP_OBSERVE/privacy after awaits; schema-only reads hold no leases.

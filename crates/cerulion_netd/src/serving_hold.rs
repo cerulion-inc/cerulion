@@ -21,6 +21,9 @@ pub enum HoldReason {
     Session,
     /// A remote shell or exec, including its final drain and witness.
     Shell,
+    /// A robot-local pairing code being armed, until its first result is
+    /// written; the armed code then keeps serving through a source of its own.
+    PairCode,
 }
 
 type Source = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -91,8 +94,9 @@ impl ServingHolds {
     }
 }
 
-/// Keeps admitted work alive; dropping it refreshes the latch/owed-work sources
-/// before releasing the last shared lock, closing the disconnect/idle race.
+/// Keeps admitted work alive; dropping it refreshes the latch, owed-work and
+/// armed-pairing-code sources before releasing the last shared lock, closing
+/// the disconnect/idle race.
 pub struct ServingHold(ServingHolds);
 
 impl Drop for ServingHold {
@@ -188,10 +192,13 @@ mod tests {
             let holds = ServingHolds::open(&path).unwrap();
             let a = holds.acquire(HoldReason::Session).unwrap();
             let b = holds.acquire(HoldReason::Shell).unwrap();
+            let c = holds.acquire(HoldReason::PairCode).unwrap();
             assert!(IdleFence::try_acquire(&path).unwrap().is_none());
             drop(a);
             assert!(IdleFence::try_acquire(&path).unwrap().is_none());
             drop(b);
+            assert!(IdleFence::try_acquire(&path).unwrap().is_none());
+            drop(c);
             let idle = IdleFence::try_acquire(&path).unwrap().unwrap();
             assert_eq!(
                 holds.acquire(HoldReason::Session).err().unwrap().kind(),

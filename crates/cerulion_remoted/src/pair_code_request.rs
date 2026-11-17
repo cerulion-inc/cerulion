@@ -18,23 +18,27 @@
 //!
 //! A look for a request ([`PairCodeArm::apply_request`]):
 //!
-//! 1. It claims the request by renaming it to [`CLAIMED_FILE`], so a request
+//! 1. When a request is there, it takes a serving hold ([`HoldReason::PairCode`])
+//!    before it claims the request, so the daemon is not stopped for idle while
+//!    the code is armed and its result written. A hold that is refused (the
+//!    daemon's stop for idle has started) leaves the request where it is.
+//! 2. It claims the request by renaming it to [`CLAIMED_FILE`], so a request
 //!    written meanwhile waits for the next poll.
-//! 2. It reads the claimed file through the owner-only checks: the directory
+//! 3. It reads the claimed file through the owner-only checks: the directory
 //!    and the file are owned by the user this daemon runs as (its effective
 //!    user id) and give their group and others no permission bit, the file is
 //!    a regular file with a single link of at most [`MAX_FILE_BYTES`] bytes,
 //!    neither the directory nor the file is a symbolic link (each is opened
 //!    without following one at its last component), and both are inspected
 //!    through their open handles.
-//! 3. It removes the claimed file. A request whose claimed file cannot be
+//! 4. It removes the claimed file. A request whose claimed file cannot be
 //!    removed, or is gone before it is read, is refused, so no armed code stays
 //!    on disk.
-//! 4. It parses the request and arms its code under [`PAIR_CODE_POLICY`]: the
+//! 5. It parses the request and arms its code under [`PAIR_CODE_POLICY`]: the
 //!    code pairs one desk, within the window counted from the arm on the
 //!    store's monotonic clock, with one budget of tries every desk shares
 //!    ([`SharedCodePairSessions`]).
-//! 5. It writes [`RESULT_FILE`], mode 0600, through [`RESULT_STAGING_FILE`] and
+//! 6. It writes [`RESULT_FILE`], mode 0600, through [`RESULT_STAGING_FILE`] and
 //!    a rename: `armed`, no try failed. The result repeats the request's nonce
 //!    and names this robot's endpoint id, the window in seconds and the tries;
 //!    it never carries the code. The result is built before the code is
@@ -61,8 +65,14 @@
 //! From then on [`PairCodeArm::report`] writes the result again when the
 //! code's state changed since the last write: the failed count, then `paired`
 //! with the desk's account and label, `exhausted` or `expired`. A window that
-//! passes with no desk acting is written as `expired`. A write that fails is
-//! retried on the next look.
+//! passes with no desk acting is written as `expired`. Once a paired or
+//! expired end is written the code's serving hold is released
+//! ([`SharedCodePairSessions::release_hold`]); an exhausted code keeps the
+//! daemon serving until its window plus
+//! [`HOLD_MARGIN`](crate::pairing_verbs::HOLD_MARGIN), so a desk that arrives
+//! later still reaches the robot and is told the code was used up. A write
+//! that fails is retried on the next look, and the hold ends at the window
+//! plus the margin however the writes go.
 //!
 //! A newer request's code replaces the armed code and its nonce in the
 //! result, and a refusal replaces the armed code too, once a right code's row
@@ -73,13 +83,14 @@
 //! ([`LAST_WRITE_FAILED_LINE`]) and not written again, and the result file is
 //! removed, so no result names a code that is gone.
 //!
-//! A claim, a removal of the handoff files or a write of the result that keeps
-//! failing is logged at warn once and again at each tenfold count, and at
-//! debug with a count in between; a claim or a result write that works again
-//! after a suppressed repeat is logged at info, and so is the removal that
-//! lets requests be armed. A failed try is logged at info, a pairing and an
-//! expiry at info, and a code whose tries all failed at warn.
-//! [`PairCodeArm::claim_failures`], [`PairCodeArm::removal_failures`] and
+//! A claim, a removal of the handoff files, a serving hold or a write of the
+//! result that keeps failing is logged at warn once and again at each
+//! tenfold count, and at debug with a count in between; a claim, a hold or a
+//! result write that works again after a suppressed repeat is logged at
+//! info, and so is the removal that lets requests be armed. A failed try is
+//! logged at info, a pairing and an expiry at info, and a code whose tries
+//! all failed at warn. [`PairCodeArm::claim_failures`],
+//! [`PairCodeArm::removal_failures`], [`PairCodeArm::admission_failures`] and
 //! [`PairCodeArm::report_failures`] count every failure.
 //!
 //! [`PairCodeArm::stop_arming`] waits for a look or a write in progress to
@@ -111,6 +122,7 @@ use cerulion_pairing::PairingError;
 
 use crate::owner_only::{read_owner_only, ExpectedOwner};
 use crate::pairing_verbs::{CodeSnapshot, SharedCodePairSessions};
+use crate::serving_hold::{admit_logged, HoldReason, ServingHold, ServingHolds};
 
 /// The line logged at info, with `failed` and `tries`, when a try on the armed
 /// code failed.
@@ -142,6 +154,8 @@ pub const WITHDRAWN_LINE: &str = "cerulion_remoted: the daemon stops; the armed 
 pub const LAST_WRITE_FAILED_LINE: &str = "cerulion_remoted: could not write the last pair-code \
                                           result for a code that is replaced or withdrawn; the \
                                           result file is removed and not written again";
+/// The work the serving-hold admission names for a pair-code request.
+const PAIR_CODE_WORK: &str = "a pair-code request, which waits for the next poll when refused";
 /// The refusal of a claimed request whose file could not be removed.
 const CLAIMED_NOT_REMOVED: &str = "the claimed pair-code request could not be removed";
 /// The refusal of a claimed request that was gone before it was read.
@@ -177,6 +191,11 @@ pub enum ArmOutcome {
     },
     /// The request could not be claimed; it is left for the next poll.
     ClaimFailed {
+        /// Why.
+        reason: String,
+    },
+    /// The serving hold was refused; the request is left for the next poll.
+    NotAdmitted {
         /// Why.
         reason: String,
     },
@@ -295,10 +314,12 @@ pub struct PairCodeArm {
     endpoint_id: [u8; 32],
     owner_uid: u32,
     policy: CeremonyConfig,
+    holds: Option<ServingHolds>,
     /// Every file of the handoff left before requests were armed is removed.
     leftovers_removed: AtomicBool,
     removal_failures: Mutex<FailureRegimeLatch>,
     claim_failures: Mutex<FailureRegimeLatch>,
+    admission_failures: Mutex<FailureRegimeLatch>,
     report_failures: Mutex<FailureRegimeLatch>,
     answer: Mutex<Option<Answer>>,
     /// Set by [`PairCodeArm::stop_arming`]; held across a look and a write.
@@ -309,12 +330,14 @@ impl PairCodeArm {
     /// An arm step over the remoted state directory `dir`, arming into
     /// `sessions` for the robot whose endpoint id is `endpoint_id`, after the
     /// removal `start` ran over `dir`. Only a directory and files owned by
-    /// `owner_uid`, the user this daemon runs as, are read.
+    /// `owner_uid`, the user this daemon runs as, are read. A request is
+    /// armed under a hold taken from `holds`, when the daemon has them.
     pub fn new(
         dir: impl Into<PathBuf>,
         sessions: SharedCodePairSessions,
         endpoint_id: [u8; 32],
         owner_uid: u32,
+        holds: Option<ServingHolds>,
         start: StartSweep,
     ) -> Self {
         let mut removal_failures = FailureRegimeLatch::new();
@@ -328,9 +351,11 @@ impl PairCodeArm {
             endpoint_id,
             owner_uid,
             policy: PAIR_CODE_POLICY,
+            holds,
             leftovers_removed: AtomicBool::new(start.0.is_ok()),
             removal_failures: Mutex::new(removal_failures),
             claim_failures: Mutex::new(FailureRegimeLatch::new()),
+            admission_failures: Mutex::new(FailureRegimeLatch::new()),
             report_failures: Mutex::new(FailureRegimeLatch::new()),
             answer: Mutex::new(None),
             stopped: Mutex::new(false),
@@ -346,6 +371,11 @@ impl PairCodeArm {
     /// armed, the start's included.
     pub fn removal_failures(&self) -> u64 {
         lock_regime_latch(&self.removal_failures).total_failures()
+    }
+
+    /// Every refused serving hold for a request.
+    pub fn admission_failures(&self) -> u64 {
+        lock_regime_latch(&self.admission_failures).total_failures()
     }
 
     /// Every failed write of the result after the first write for a request:
@@ -374,6 +404,11 @@ impl PairCodeArm {
             self.claim_worked();
             return ArmOutcome::Nothing;
         }
+        // Taken before the claim: a refused hold leaves the request on disk.
+        let _hold = match self.admit() {
+            Ok(hold) => hold,
+            Err(reason) => return ArmOutcome::NotAdmitted { reason },
+        };
         let claimed = self.dir.join(CLAIMED_FILE);
         match std::fs::rename(&request, &claimed) {
             Ok(()) => self.claim_worked(),
@@ -404,6 +439,21 @@ impl PairCodeArm {
         };
         self.refuse(None, refusal, &reason);
         ArmOutcome::Refused { refusal, reason }
+    }
+
+    /// The serving hold a request is armed under; `None` without holds.
+    fn admit(&self) -> Result<Option<ServingHold>, String> {
+        let Some(holds) = &self.holds else {
+            return Ok(None);
+        };
+        admit_logged(
+            holds,
+            HoldReason::PairCode,
+            &self.admission_failures,
+            PAIR_CODE_WORK,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
     }
 
     /// Remove the handoff files left before requests were armed, unless that
@@ -615,7 +665,9 @@ impl PairCodeArm {
 
     /// Write what the result is to say for the request this step claimed
     /// last, when it changed since the last write: the armed code's new state,
-    /// or the refusal a failed write left to write.
+    /// releasing the code's serving hold once a paired or expired end is
+    /// written (an exhausted code keeps it to its window plus the margin, see
+    /// the module docs), or the refusal a failed write left to write.
     pub fn report(&self) -> ReportOutcome {
         let stopped = self.stop_flag();
         if *stopped {
@@ -666,7 +718,9 @@ impl PairCodeArm {
         t.written = snapshot.generation;
         t.failed = snapshot.failed;
         if status.is_terminal() {
+            let arm = t.arm;
             *answer = None;
+            self.sessions.release_hold(arm);
         }
         ReportOutcome::Written(status)
     }
@@ -928,7 +982,14 @@ mod tests {
         let uid = std::fs::metadata(&dir).unwrap().uid();
         let clock = MonotonicClock::fixed(T_ARM);
         let sessions = SharedCodePairSessions::with_clock(clock.clone());
-        let arm = PairCodeArm::new(&dir, sessions.clone(), EID, uid, StartSweep::run(&dir));
+        let arm = PairCodeArm::new(
+            &dir,
+            sessions.clone(),
+            EID,
+            uid,
+            None,
+            StartSweep::run(&dir),
+        );
         Fixture {
             _root: root,
             dir,
@@ -941,9 +1002,20 @@ mod tests {
 
     impl Fixture {
         /// An arm step over this fixture's directory and sessions, built from
-        /// `start`.
+        /// `start`, taking its holds from `holds`.
+        fn rebuilt_with(&self, holds: Option<ServingHolds>, start: StartSweep) -> PairCodeArm {
+            PairCodeArm::new(
+                &self.dir,
+                self.sessions.clone(),
+                EID,
+                self.uid,
+                holds,
+                start,
+            )
+        }
+
         fn rebuilt(&self, start: StartSweep) -> PairCodeArm {
-            PairCodeArm::new(&self.dir, self.sessions.clone(), EID, self.uid, start)
+            self.rebuilt_with(None, start)
         }
 
         fn result(&self) -> String {
@@ -1285,6 +1357,7 @@ mod tests {
             f.sessions.clone(),
             EID,
             f.uid.wrapping_add(1),
+            None,
             StartSweep::run(&f.dir),
         );
         leave(&f.dir, &request_line(CODE), 0o600);
@@ -1503,22 +1576,27 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn the_stop_withdraws_a_code_no_desk_paired_with_and_the_result_says_refused_stopping() {
+        use cerulion_netd::serving_hold::IdleFence;
         let f = fixture();
+        let (fence, holds, arm) = held_arm(&f);
         leave(&f.dir, &request_line(CODE), 0o600);
-        assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+        assert_eq!(arm.apply_request(), ArmOutcome::Armed);
         wrong_try(&f.sessions, [1; 32]);
-        f.arm.stop_arming();
+        arm.stop_arming();
         // The result names the request's nonce, the failed try and why the
         // code no longer works.
         assert_eq!(f.result(), refused_line(NONCE_HEX, "stopping", 1));
         assert_eq!(f.sessions.requests_refused(), 1);
-        // No desk can pair any more.
+        // No desk can pair any more, and the code holds nothing.
         f.clock.set(T_ARM + RATE);
         assert_refused(pair(&f.sessions, [4; 32], CODE), "no code pairing is armed");
+        assert!(!f.sessions.holds_serving());
+        holds.refresh().unwrap();
+        assert!(IdleFence::try_acquire(&fence).unwrap().is_some());
         // Nothing more is written once the stop returned, and a second stop
         // is the first.
-        assert_eq!(f.arm.report(), ReportOutcome::Nothing);
-        f.arm.stop_arming();
+        assert_eq!(arm.report(), ReportOutcome::Nothing);
+        arm.stop_arming();
         assert_eq!(f.result(), refused_line(NONCE_HEX, "stopping", 1));
         assert_eq!(f.sessions.requests_refused(), 1);
         logs_assert(|logs| {
@@ -1576,9 +1654,11 @@ mod tests {
             f.arm.report(),
             ReportOutcome::Written(PairCodeStatus::Exhausted)
         );
+        assert!(f.sessions.holds_serving(), "an exhausted code serves on");
         f.arm.stop_arming();
         assert_eq!(f.result(), line(NONCE_HEX, "exhausted", 3, "- -"));
         assert_eq!(f.sessions.snapshot(), None);
+        assert!(!f.sessions.holds_serving(), "the stop ends the hold");
         assert_eq!(f.sessions.requests_refused(), 0);
     }
 
@@ -1621,6 +1701,7 @@ mod tests {
             f.arm.stop_arming();
             assert_eq!(f.arm.report_failures(), 1, "{blocked}");
             assert_nothing_armed(&f.sessions);
+            assert!(!f.sessions.holds_serving(), "{blocked}");
             // No result is left that names the withdrawn code as armed.
             assert_eq!(names(&f.dir), vec![blocked.to_string()], "{blocked}");
             // The stop does not try again.
@@ -1967,46 +2048,140 @@ mod tests {
     /// How a desk or the clock brings the armed code to one of its ends.
     type Reach = fn(&Fixture);
 
-    /// Each end a code comes to, and how a desk or the clock reaches it.
-    fn code_ends() -> [(PairCodeStatus, Reach); 3] {
+    /// The code's hard end: its window plus the margin, from the arm.
+    const HARD_END: u64 = T_ARM + TTL_NS + 30 * SECOND;
+
+    /// Each end a code comes to, how a desk or the clock reaches it, and
+    /// whether the daemon serves on for it once the end is written: an
+    /// exhausted code serves to its hard end, so a later desk is told the code
+    /// was used up. The expiry is inside the margin, so only the written end
+    /// releases its hold.
+    fn code_ends() -> [(PairCodeStatus, Reach, bool); 3] {
         [
-            (PairCodeStatus::Paired, |f| {
-                pair(&f.sessions, [4; 32], CODE).unwrap()
-            }),
-            (PairCodeStatus::Exhausted, |f| {
-                for (i, desk) in [[1; 32], [2; 32], [3; 32]].into_iter().enumerate() {
-                    f.clock.set(T_ARM + RATE * i as u64);
-                    wrong_try(&f.sessions, desk);
-                }
-            }),
-            (PairCodeStatus::Expired, |f| f.clock.set(T_ARM + TTL_NS + 1)),
+            (
+                PairCodeStatus::Paired,
+                |f| pair(&f.sessions, [4; 32], CODE).unwrap(),
+                false,
+            ),
+            (
+                PairCodeStatus::Exhausted,
+                |f| {
+                    for (i, desk) in [[1; 32], [2; 32], [3; 32]].into_iter().enumerate() {
+                        f.clock.set(T_ARM + RATE * i as u64);
+                        wrong_try(&f.sessions, desk);
+                    }
+                },
+                true,
+            ),
+            (
+                PairCodeStatus::Expired,
+                |f| f.clock.set(T_ARM + TTL_NS + 1),
+                false,
+            ),
         ]
     }
 
+    /// Whether nothing holds `holds` serving, read through the idle fence at
+    /// `fence` after a refresh.
+    fn fence_free(fence: &Path, holds: &ServingHolds) -> bool {
+        holds.refresh().unwrap();
+        cerulion_netd::serving_hold::IdleFence::try_acquire(fence)
+            .unwrap()
+            .is_some()
+    }
+
+    /// After the end `end` is written: held to the hard end when
+    /// `serves_on`, and free from then on; free at once otherwise.
+    fn assert_released_after_the_end(
+        f: &Fixture,
+        fence: &Path,
+        holds: &ServingHolds,
+        end: PairCodeStatus,
+        serves_on: bool,
+    ) {
+        if serves_on {
+            assert!(
+                !fence_free(fence, holds),
+                "{end:?}: held once the end is written"
+            );
+            f.clock.set(HARD_END - 1);
+            assert!(
+                !fence_free(fence, holds),
+                "{end:?}: held up to the hard end"
+            );
+            f.clock.set(HARD_END);
+        }
+        assert!(
+            fence_free(fence, holds),
+            "{end:?}: released once the end is written, or at the hard end"
+        );
+    }
+
+    /// The fence `serving.hold` in `f`'s directory, serving holds on it with
+    /// the armed code's hold as a source, and an arm step taking its holds
+    /// from them.
+    fn held_arm(f: &Fixture) -> (PathBuf, ServingHolds, PairCodeArm) {
+        let fence = f.dir.join("serving.hold");
+        let holds = ServingHolds::open(&fence).unwrap();
+        let source = f.sessions.clone();
+        holds
+            .register_source(Arc::new(move || source.holds_serving()))
+            .unwrap();
+        let arm = f.rebuilt_with(Some(holds.clone()), StartSweep(Ok(0)));
+        (fence, holds, arm)
+    }
+
     #[test]
-    fn a_failed_write_of_an_end_is_retried_until_the_next_look_writes_it() {
-        for (end, reach) in code_ends() {
+    fn the_serving_hold_is_held_from_the_arm_until_each_end_is_written_or_its_hard_end() {
+        for (end, reach, serves_on) in code_ends() {
             let f = fixture();
+            let (fence, holds, arm) = held_arm(&f);
+            assert!(fence_free(&fence, &holds), "{end:?}: idle before a code");
             leave(&f.dir, &request_line(CODE), 0o600);
-            assert_eq!(f.arm.apply_request(), ArmOutcome::Armed);
+            assert_eq!(arm.apply_request(), ArmOutcome::Armed);
+            assert!(
+                !fence_free(&fence, &holds),
+                "{end:?}: an armed code holds serving"
+            );
+            reach(&f);
+            assert!(
+                !fence_free(&fence, &holds),
+                "{end:?}: held until the end is written"
+            );
+            assert_eq!(arm.report(), ReportOutcome::Written(end));
+            assert_released_after_the_end(&f, &fence, &holds, end, serves_on);
+        }
+    }
+
+    #[test]
+    fn a_failed_write_of_an_end_keeps_the_serving_hold_until_a_retry_writes_it() {
+        for (end, reach, serves_on) in code_ends() {
+            let f = fixture();
+            let (fence, holds, arm) = held_arm(&f);
+            leave(&f.dir, &request_line(CODE), 0o600);
+            assert_eq!(arm.apply_request(), ArmOutcome::Armed);
             reach(&f);
             // A non-empty directory at the staging name refuses the write.
             let staging = f.dir.join(RESULT_STAGING_FILE);
             std::fs::create_dir(&staging).unwrap();
             std::fs::write(staging.join("x"), b"").unwrap();
             assert!(
-                matches!(f.arm.report(), ReportOutcome::Failed { .. }),
+                matches!(arm.report(), ReportOutcome::Failed { .. }),
                 "{end:?}: the write of the end fails"
             );
-            assert_eq!(f.arm.report_failures(), 1, "{end:?}");
+            assert_eq!(arm.report_failures(), 1, "{end:?}");
             assert_eq!(
                 f.result(),
                 line(NONCE_HEX, "armed", 0, "- -"),
                 "{end:?}: the end is not on disk"
             );
+            assert!(
+                !fence_free(&fence, &holds),
+                "{end:?}: held while the end is not written"
+            );
             std::fs::remove_dir_all(&staging).unwrap();
             assert_eq!(
-                f.arm.report(),
+                arm.report(),
                 ReportOutcome::Written(end),
                 "{end:?}: the next look writes the end"
             );
@@ -2017,7 +2192,58 @@ mod tests {
                 end,
                 "{end:?}: the end is on disk"
             );
+            assert_released_after_the_end(&f, &fence, &holds, end, serves_on);
         }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_serving_hold_leaves_the_request_for_the_next_poll() {
+        use cerulion_netd::serving_hold::IdleFence;
+        let f = fixture();
+        let fence = f.dir.join("serving.hold");
+        let holds = ServingHolds::open(&fence).unwrap();
+        let arm = f.rebuilt_with(Some(holds), StartSweep(Ok(0)));
+        leave(&f.dir, &request_line(CODE), 0o600);
+        // The parent's stop for idle holds the fence.
+        let idle = IdleFence::try_acquire(&fence).unwrap().unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                arm.apply_request(),
+                ArmOutcome::NotAdmitted { .. }
+            ));
+        }
+        assert_eq!(arm.admission_failures(), 2);
+        assert_eq!(names(&f.dir), vec!["pair-code.request", "serving.hold"]);
+        assert_nothing_armed(&f.sessions);
+        drop(idle);
+        assert_eq!(arm.apply_request(), ArmOutcome::Armed);
+        logs_assert(|logs| {
+            let refused = lines_with(
+                logs,
+                &[
+                    "WARN",
+                    "remote serving admission refused during idle stop",
+                    "hold=PairCode",
+                    PAIR_CODE_WORK,
+                    "total_failures=1",
+                ],
+            );
+            let recovered = lines_with(
+                logs,
+                &[
+                    "INFO",
+                    "remote serving admission recovered",
+                    "hold=PairCode",
+                    "suppressed=1",
+                    "total_failures=2",
+                ],
+            );
+            if refused.len() != 1 || recovered.len() != 1 {
+                return Err(format!("admission lines: {refused:#?} {recovered:#?}"));
+            }
+            Ok(())
+        });
     }
 
     #[test]
