@@ -24,7 +24,8 @@
 //! leaves no partial file to be kept later as a local edit. A file another writer
 //! created meanwhile makes the link fail and is classified like any existing
 //! file. Where the link fails for any other reason the text is renamed into
-//! place instead, which can replace a file created since the path was read.
+//! place instead, with a warning, which can replace a file created since the
+//! path was read.
 //!
 //! # Peer text
 //!
@@ -246,18 +247,29 @@ fn stage(dest: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
 /// Put a synced staging file at `dest` by hard link, which fails when `dest`
 /// exists: that is [`Published::Exists`], and `dest` is left as it was. A link
 /// that fails for any other reason (a filesystem without hard links among them)
-/// renames the staging file onto `dest` instead, which replaces a file created
-/// at `dest` since it was read. The staging file is gone afterwards: discarded
-/// after a link, renamed, or discarded when the rename fails too.
+/// is a warning, and the staging file is renamed onto `dest` instead, which
+/// replaces a file created at `dest` since it was read. The staging file is gone
+/// afterwards: discarded after a link, renamed, or discarded when the rename
+/// fails too.
 fn publish(staging: &Path, dest: &Path) -> std::io::Result<Published> {
-    let published = match std::fs::hard_link(staging, dest) {
+    publish_by(staging, dest, |from, to| std::fs::hard_link(from, to))
+}
+
+/// [`publish`] with the hard link made by `link`.
+fn publish_by(
+    staging: &Path,
+    dest: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<Published> {
+    let published = match link(staging, dest) {
         Ok(()) => Ok(Published::Wrote),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Exists),
         Err(link_error) => {
-            tracing::debug!(
+            tracing::warn!(
                 path = %sanitize_peer_text(&dest.display().to_string()),
                 error = %link_error,
-                "cerulion connect: hard linking a schema file failed, renaming it into place"
+                "cerulion connect: hard linking a schema file failed, so it is renamed into \
+                 place, which can replace a file created at that path since it was read"
             );
             return std::fs::rename(staging, dest)
                 .map(|()| Published::Wrote)
@@ -569,6 +581,32 @@ mod tests {
         );
         assert!(!staging.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A hard link that fails for a reason other than an existing path is a
+    /// warning naming the path, and the staging file is renamed into place,
+    /// replacing what was created at that path meanwhile.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_link_that_fails_otherwise_renames_into_place_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Sub.msg");
+        let staging = stage(&dest, b"float64 x\n").unwrap();
+        std::fs::write(&dest, "float64 local\n").unwrap();
+        let no_links =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        assert_eq!(
+            publish_by(&staging, &dest, no_links).unwrap(),
+            Published::Wrote
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "float64 x\n");
+        assert!(!staging.exists());
+        assert!(logs_contain(
+            "cerulion connect: hard linking a schema file failed, so it is renamed into place, \
+             which can replace a file created at that path since it was read"
+        ));
+        assert!(logs_contain("Sub.msg"));
+        assert!(logs_contain("WARN"));
     }
 
     /// A staging name embeds at most the first 64 characters of the schema's
