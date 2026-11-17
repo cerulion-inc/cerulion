@@ -192,6 +192,16 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Client checkpoints**: Unix `session_checkpoint::CheckpointWriter` keeps only
+  the newest pending commitment and writes it on a blocking worker. Each run has
+  a private directory; synced updates replace only that run's previous witness.
+  Identifiers, session identity, event order and same-count commitments are
+  validated before an offer is accepted. An accepted offer is not a durability
+  result: consume `progress` to obtain the saved commitment. Call `finish` and
+  drain progress before runtime shutdown. A timeout or I/O error ends the worker
+  without a replacement writer; a blocking syscall may still complete after
+  timeout or `abort`. Dropping the handle closes input but cannot promise a save.
+
 - **Client final witnesses**: Unix `cerulion_connectd::session_witness::WitnessStore`
   holds a private directory descriptor. Its blocking `persist` checks filename
   components and requires the witness count/head to match a valid Exit before

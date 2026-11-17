@@ -53,6 +53,8 @@ pub mod pair;
 pub mod rcp;
 pub mod schema;
 #[cfg(unix)]
+pub mod session_checkpoint;
+#[cfg(unix)]
 pub mod session_witness;
 pub mod worker;
 

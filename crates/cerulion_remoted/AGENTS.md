@@ -29,8 +29,7 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
   connectd mirrors the robot protocol (no production remoted dep): update both,
   pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Audit verification: regular files, bounded lines; external witness required.
-- Final desk witnesses bind matching Exit, create 0600 files, never replace.
+- Audit: regular files, bounded lines, external witness. Finals match Exit, 0600, no replacement. Checkpoints: newest valid, bounded sync wait; failure stops.
 - Desk keys: 32 raw bytes; `create_new`, 0600, NEVER overwrite.
   `~/.cerulion` secrets: `auth::atomic_write_secret`.
   Epoch cache: ONE `cerulion_pairing::verify` resolver for writer and both desk readers;
