@@ -180,7 +180,7 @@ impl HostedRuns {
                 reason: refusal_reason(error),
             }
         });
-        self.insert(run_id, live, fires, served)
+        self.insert(run_id, remote_visible, live, fires, served)
     }
 
     /// Host a run that cannot be described under `run_id`, until the returned
@@ -207,7 +207,9 @@ impl HostedRuns {
         // An undescribable run serves no state, so its live flag is never read.
         // hot-path-alloc-ok: one flag per hosted run, when the host starts it.
         let live = Arc::new(AtomicBool::new(false));
-        self.insert(run_id, live, None, served)
+        // No run.json is read, so no network label hides it: a run without one
+        // keeps the visibility an unlabelled run has.
+        self.insert(run_id, true, live, None, served)
     }
 
     /// Put one slot under `run_id`, replacing any slot there, and return the
@@ -215,6 +217,7 @@ impl HostedRuns {
     fn insert(
         &self,
         run_id: u128,
+        remote_visible: bool,
         live: Arc<AtomicBool>,
         fires: Option<Arc<FireTap>>,
         served: Result<RunEntry, UndescribableRun>,
