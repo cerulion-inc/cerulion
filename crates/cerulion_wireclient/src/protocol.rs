@@ -17,6 +17,7 @@
 //! (imported, not mirrored), so those halves cannot diverge by construction.
 
 use cerulion_core::transport::cerulion_q::{CatalogReply, SchemaReply};
+use cerulion_pairing::pair_code::PairCodeReport;
 use serde::{Deserialize, Serialize};
 
 /// The first frame of every per-topic uni data stream: names the topic the
@@ -123,8 +124,9 @@ pub enum WireResponse {
     },
 }
 
-/// The `status` reply payload: one row per demanded topic, and the robot
-/// daemon's count of dropped log lines.
+/// The `status` reply payload: one row per demanded topic, the robot
+/// daemon's count of dropped log lines, its armed pairing code's state and
+/// how many pair-code requests it refused.
 ///
 /// Mirror of `cerulion_remoted::StatusReply`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +138,16 @@ pub struct StatusReply {
     /// robot or host that does not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_lines_dropped: Option<u64>,
+    /// The robot's last armed pairing code: its status, the tries every desk
+    /// shares and how many failed. `None` while no code is armed and from a
+    /// robot that does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code: Option<PairCodeReport>,
+    /// How many pair-code requests the robot daemon claimed and answered
+    /// `refused` since it started. `None` while none was and from a robot that
+    /// does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code_refused: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
@@ -368,6 +380,8 @@ mod tests {
             serde_json::to_string(&WireResponse::Status(StatusReply {
                 topics: vec![],
                 log_lines_dropped: None,
+                pair_code: None,
+                pair_code_refused: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[]}"#
@@ -376,10 +390,53 @@ mod tests {
             serde_json::to_string(&WireResponse::Status(StatusReply {
                 topics: vec![],
                 log_lines_dropped: Some(7),
+                pair_code: None,
+                pair_code_refused: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
         );
+    }
+
+    /// A status reply names the robot's armed pairing code only when it has
+    /// one, and its refused requests only once one was. Hand oracle.
+    #[test]
+    fn a_status_reply_names_the_armed_pairing_code_and_refused_requests_only_when_there_are() {
+        use cerulion_pairing::pair_code::PairCodeStatus;
+        let cases = [
+            (
+                StatusReply {
+                    topics: vec![],
+                    log_lines_dropped: None,
+                    pair_code: Some(PairCodeReport {
+                        status: PairCodeStatus::Exhausted,
+                        tries: 3,
+                        failed: 3,
+                    }),
+                    pair_code_refused: None,
+                },
+                r#"{"reply":"status","topics":[],"pair_code":{"status":"exhausted","tries":3,"failed":3}}"#,
+            ),
+            (
+                StatusReply {
+                    topics: vec![],
+                    log_lines_dropped: None,
+                    pair_code: None,
+                    pair_code_refused: Some(2),
+                },
+                r#"{"reply":"status","topics":[],"pair_code_refused":2}"#,
+            ),
+        ];
+        for (reply, json) in cases {
+            assert_eq!(
+                serde_json::to_string(&WireResponse::Status(reply.clone())).unwrap(),
+                json
+            );
+            assert_eq!(
+                serde_json::from_str::<WireResponse>(json).unwrap(),
+                WireResponse::Status(reply)
+            );
+        }
     }
 
     /// Every request variant round-trips through JSON.

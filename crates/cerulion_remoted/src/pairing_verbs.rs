@@ -526,7 +526,7 @@ impl CodeSnapshot {
         }
     }
 
-    /// The state as a [`PairCodeReport`].
+    /// The state as the daemon's `status` reply reports it.
     pub fn report(&self) -> PairCodeReport {
         PairCodeReport {
             status: self.state.status(),
@@ -638,11 +638,12 @@ impl HeldBuild {
 ///
 /// **No disk write or CPace step under the lock.** A right code's row is
 /// saved, and a try's CPace step runs, with the store's state lock released,
-/// so an ops session's open and close, and a reader of the state, never wait
-/// for a disk or for a CPace computation. A start takes its try under the
-/// lock, runs the step, then stores the responder under the lock again: a
-/// code that ended meanwhile refuses the try, counted failed when the window
-/// passed and uncounted when a desk paired.
+/// so an ops session's open and close, and a reader of the state such as the
+/// wire plane's `status`, never wait for a disk or for a CPace computation. A
+/// start takes its try under the lock, runs the step, then stores the
+/// responder under the lock again: a code that ended meanwhile refuses the
+/// try, counted failed when the window passed and uncounted when a desk
+/// paired.
 #[derive(Clone)]
 pub struct SharedCodePairSessions(Arc<SessionsInner>);
 

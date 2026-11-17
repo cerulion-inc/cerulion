@@ -38,12 +38,14 @@ use cerulion_core::{TransportConfig, TransportManager, WireHeader};
 use cerulion_link::{
     accept_frame_stream, read_frame, write_frame, Connection, DEFAULT_MAX_FRAME_LEN,
 };
+use cerulion_pairing::pair_code::PairCodeReport;
 use cerulion_pairing::verify::{
     EpochOutcome, EpochSyncWire, NO_EPOCH_SINK_NEEDLE, UNDECODABLE_REQUEST_NEEDLE,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::local_schema::{LocalSchemaSource, SchemaSource};
+use crate::pairing_verbs::SharedCodePairSessions;
 use crate::tap::{peek_schema_hash, TapManager};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -259,8 +261,9 @@ pub enum WireResponse {
     },
 }
 
-/// The `status` reply payload: one row per demanded topic, and the daemon's
-/// count of dropped log lines.
+/// The `status` reply payload: one row per demanded topic, the daemon's
+/// count of dropped log lines, the armed pairing code's state and how many
+/// pair-code requests the daemon refused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReply {
     /// Per-topic WAN counter rows, sorted by topic.
@@ -271,6 +274,17 @@ pub struct StatusReply {
     /// stderr. Absent, and `None`, from a host that runs no daemon log writer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_lines_dropped: Option<u64>,
+    /// The last armed pairing code's status, its tries and how many failed
+    /// ([`SharedCodePairSessions::snapshot`]). Absent, and `None`, while no
+    /// code is armed and from a plane with no code-pairing store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code: Option<PairCodeReport>,
+    /// How many pair-code requests the daemon claimed and answered `refused`
+    /// since it started, a code its stop withdrew included
+    /// ([`SharedCodePairSessions::requests_refused`]). Absent, and `None`,
+    /// while none was and from a plane with no code-pairing store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_code_refused: Option<u64>,
 }
 
 /// One demanded topic's WAN counters + free wire-timestamp Hz + live/dead state.
@@ -341,6 +355,9 @@ pub struct WirePlane {
     /// accept epoch sync and answers `sync_epoch` with a LOUD error — never a
     /// silent success that would let a desk believe a revocation landed.
     epoch_sink: Option<(SharedTrust, RemotedClock)>,
+    /// The code-pairing store whose armed code `status` reports; `None` (the
+    /// default) reports none.
+    pair_code: Option<SharedCodePairSessions>,
 }
 
 impl WirePlane {
@@ -356,6 +373,7 @@ impl WirePlane {
             demand_authorizer: Arc::new(AllowAllAuthorizer),
             revocation_sweep_interval: DEFAULT_REVOCATION_SWEEP_INTERVAL,
             epoch_sink: None,
+            pair_code: None,
         }
     }
 
@@ -371,6 +389,7 @@ impl WirePlane {
             demand_authorizer: Arc::new(AllowAllAuthorizer),
             revocation_sweep_interval: DEFAULT_REVOCATION_SWEEP_INTERVAL,
             epoch_sink: None,
+            pair_code: None,
         }
     }
 
@@ -435,6 +454,33 @@ impl WirePlane {
     pub fn with_epoch_sink(mut self, shared: SharedTrust, clock: RemotedClock) -> Self {
         self.epoch_sink = Some((shared, clock));
         self
+    }
+
+    /// Report the armed pairing code of `sessions` in each `status` reply
+    /// (builder style). The serving core installs the store its code-pair
+    /// verbs use.
+    pub fn with_pair_code_status(mut self, sessions: SharedCodePairSessions) -> Self {
+        self.pair_code = Some(sessions);
+        self
+    }
+
+    /// The `status` reply over the demanded `topics`: this process's dropped
+    /// log lines, and the installed store's armed code and refused requests.
+    fn status_reply(&self, topics: Vec<TopicStatus>) -> StatusReply {
+        StatusReply {
+            topics,
+            log_lines_dropped: crate::log_writer::lines_dropped(),
+            pair_code: self
+                .pair_code
+                .as_ref()
+                .and_then(SharedCodePairSessions::snapshot)
+                .map(|snapshot| snapshot.report()),
+            pair_code_refused: self
+                .pair_code
+                .as_ref()
+                .map(SharedCodePairSessions::requests_refused)
+                .filter(|refused| *refused > 0),
+        }
     }
 
     /// Apply a desk-pushed access-list epoch to the live trust store.
@@ -970,10 +1016,7 @@ async fn handle_request(
                 },
             }
         }
-        WireRequest::Status => WireResponse::Status(StatusReply {
-            topics: taps.status(),
-            log_lines_dropped: crate::log_writer::lines_dropped(),
-        }),
+        WireRequest::Status => WireResponse::Status(plane.status_reply(taps.status())),
         // The desk pushed the robot's latest revocation epoch. Applying it
         // may revoke the VERY desk that pushed it — that is correct and expected (a
         // desk carrying its own revocation still delivers it faithfully). The revocation
@@ -1255,6 +1298,8 @@ mod tests {
             serde_json::to_string(&WireResponse::Status(StatusReply {
                 topics: vec![],
                 log_lines_dropped: None,
+                pair_code: None,
+                pair_code_refused: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[]}"#
@@ -1263,9 +1308,62 @@ mod tests {
             serde_json::to_string(&WireResponse::Status(StatusReply {
                 topics: vec![],
                 log_lines_dropped: Some(7),
+                pair_code: None,
+                pair_code_refused: None,
             }))
             .unwrap(),
             r#"{"reply":"status","topics":[],"log_lines_dropped":7}"#
+        );
+    }
+
+    /// A status reply names the armed pairing code's status, tries and
+    /// failed count once a code is armed, and the refused requests once one
+    /// was, from the store the plane reports. Hand oracle.
+    #[test]
+    fn a_status_reply_names_the_armed_codes_state_failed_count_and_refused_requests() {
+        use cerulion_pairing::format::PublicKey;
+        use cerulion_pairing::pair_code::PAIR_CODE_POLICY;
+        let clock = crate::MonotonicClock::fixed(1_000_000_000_000);
+        let sessions = SharedCodePairSessions::with_clock(clock.clone());
+        let plane = WirePlane::lazy("robo").with_pair_code_status(sessions.clone());
+        let json = |plane: &WirePlane| {
+            serde_json::to_string(&WireResponse::Status(plane.status_reply(vec![]))).unwrap()
+        };
+        assert_eq!(json(&plane), r#"{"reply":"status","topics":[]}"#, "no code");
+        sessions.arm("48213907", PAIR_CODE_POLICY);
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code":{"status":"armed","tries":3,"failed":0}}"#
+        );
+        // A try whose step 1 the robot refuses fails.
+        let _ = sessions.start([1; 32], PublicKey([2; 32]), b"short");
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code":{"status":"armed","tries":3,"failed":1}}"#
+        );
+        // A window that passed with no desk acting reads expired.
+        clock.set(1_000_000_000_000 + 600_000_000_001);
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code":{"status":"expired","tries":3,"failed":1}}"#
+        );
+        // A refused request is counted next to the code's state; once the
+        // code is disarmed only the count is left.
+        assert_eq!(sessions.count_refused_request(), 1);
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code":{"status":"expired","tries":3,"failed":1},"pair_code_refused":1}"#
+        );
+        sessions.disarm();
+        assert_eq!(sessions.count_refused_request(), 2);
+        assert_eq!(
+            json(&plane),
+            r#"{"reply":"status","topics":[],"pair_code_refused":2}"#
+        );
+        // A plane with no store reports no code and no count.
+        assert_eq!(
+            json(&WirePlane::lazy("robo")),
+            r#"{"reply":"status","topics":[]}"#
         );
     }
 

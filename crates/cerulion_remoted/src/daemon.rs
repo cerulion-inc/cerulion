@@ -398,9 +398,10 @@ pub async fn serve_endpoint(
 /// claim/pair takes effect at the next accept with no restart), the ops plane with the
 /// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
 /// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
-/// `shutdown`. When [`serve_planes`] returns, after its shutdown stage, it ends
-/// the rcpd e-stop delivery in flight and stops the epoch poller, then returns
-/// what `serve_planes` returned.
+/// `shutdown`. The wire plane's `status` reports the armed code's state and the
+/// refused requests on every host. When [`serve_planes`] returns, after its
+/// shutdown stage, it ends the rcpd e-stop delivery in flight and stops the
+/// epoch poller, then returns what `serve_planes` returned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_core(
     files: &PlaneFiles,
@@ -430,6 +431,9 @@ pub(crate) async fn serve_core(
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
     let sessions = SharedCodePairSessions::new();
+    // The wire plane's `status` reports the armed code of the SAME store the
+    // code-pair verbs read.
+    let status_sessions = sessions.clone();
     // The daemon's e-stop lease, for the rcp plane below: the same instance the
     // `engage-estop` and act verbs use, so its latch and its engage count are
     // shared. A library host has none, and serves no rcp plane.
@@ -493,7 +497,8 @@ pub(crate) async fn serve_core(
     // reaches the robot" close on one shared handle.
     let mut wire_plane = base
         .with_demand_authorizer(classify.clone())
-        .with_epoch_sink(epoch_sink, access_clock);
+        .with_epoch_sink(epoch_sink, access_clock)
+        .with_pair_code_status(status_sessions);
     if let Some(interval) = sweep_interval {
         wire_plane = wire_plane.with_revocation_sweep_interval(interval);
     }
