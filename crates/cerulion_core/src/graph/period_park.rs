@@ -712,26 +712,30 @@ mod tests {
     fn a_refused_period_park_warns_once_with_its_reason_and_never_says_on() {
         for (i, (g, _, text)) in one_refusal_per_term().into_iter().enumerate() {
             let graph = format!("refused{i}");
+            let one_warning = |entry: &str| {
+                logs_assert(|lines: &[&str]| {
+                    let (warns, ons) = announced(lines, &graph);
+                    match warns.as_slice() {
+                        [line]
+                            if line.contains("WARN")
+                                && line.contains(&format!("reason=\"{text}\""))
+                                && line.contains("target_arch")
+                                && ons == 0 =>
+                        {
+                            Ok(())
+                        }
+                        _ => Err(format!(
+                            "{text} after the {entry} entry: {} warn lines {warns:?}, {ons} on lines",
+                            warns.len()
+                        )),
+                    }
+                })
+            };
             let mut warned = false;
             assert!(!announce(g, &mut warned, &graph), "{text}");
+            one_warning("first");
             assert!(!announce(g, &mut warned, &graph), "{text}: a second entry");
-            logs_assert(|lines: &[&str]| {
-                let (warns, ons) = announced(lines, &graph);
-                match warns.as_slice() {
-                    [line]
-                        if line.contains("WARN")
-                            && line.contains(&format!("reason=\"{text}\""))
-                            && line.contains("target_arch")
-                            && ons == 0 =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(format!(
-                        "{text}: {} warn lines {warns:?}, {ons} on lines",
-                        warns.len()
-                    )),
-                }
-            });
+            one_warning("second");
         }
     }
 
@@ -851,6 +855,15 @@ mod tests {
     }
 
     #[test]
+    fn an_overshoot_past_twice_the_largest_lead_is_clipped_before_it_is_folded_in() {
+        let mut l = KernelLead::default();
+        l.observe(5_000_000);
+        // Clipped to 2 x 400 us = 800 us. Mean: 60 + (800 - 60) / 8 = 152.5 us.
+        // Deviation: 20 + (|800 - 60| - 20) / 4 = 200 us.
+        assert_eq!((l.mean_ns, l.dev_ns), (152_500, 200_000));
+    }
+
+    #[test]
     fn one_late_overshoot_raises_the_lead_by_its_deviation() {
         let mut l = KernelLead::default();
         for _ in 0..200 {
@@ -884,6 +897,29 @@ mod tests {
         let (open, close) = a.predict(last + 10).expect("regular");
         assert_eq!(open, last + 1_000_000 - MIN_WINDOW_NS);
         assert_eq!(close, last + 1_000_000 + MIN_WINDOW_NS);
+    }
+
+    #[test]
+    fn an_idle_spell_or_a_step_back_in_time_forgets_a_regular_stream() {
+        let mut a = ArrivalLearner::default();
+        regular_stream(&mut a, 12, 1_000_000);
+        assert!(
+            a.regular(),
+            "apparatus: twelve arrivals 1 ms apart are regular"
+        );
+        let back = 11_000_000 + MAX_GAP_NS + 1;
+        assert!(a.observe(back));
+        assert!(
+            !a.regular(),
+            "an idle spell longer than the largest gap starts over"
+        );
+        assert_eq!(a.predict(back + 10), None);
+
+        let mut b = ArrivalLearner::default();
+        regular_stream(&mut b, 12, 1_000_000);
+        assert!(b.observe(5_000_000), "an arrival before the last one");
+        assert!(!b.regular(), "a step back in time starts over");
+        assert_eq!(b.predict(5_000_010), None);
     }
 
     #[test]
