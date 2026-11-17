@@ -258,7 +258,17 @@ naming here because they are easy to get wrong:
   anchor and `GraphRuntime::node_framework_state` fill these two fields through one helper,
   so an anchor states the same Sync state as the read seam: a restart re-bases every partner, and a re-based
   partner's frames are tested against that floor, so a run resumed before the partner's first
-  new-epoch frame discards the same old-epoch straggler live discarded. The block-credit check
+  new-epoch frame discards the same old-epoch straggler live discarded. A node the scheduler has stopped
+  (`ScheduledNode::disabled`: a `NodeError::Fatal` return, or the consecutive-panic breaker) writes
+  its section at version 5: every earlier tail, each stated empty or absent where the node has
+  nothing to say there, then one flags byte whose bit 0 (`NODE_FLAG_STOPPED`) states the stop. A
+  running node's section keeps the version and bytes it had before. A node whose entry a host-side
+  panic poisoned is not stopped: the scheduler keeps firing it. A version-5 reader refuses any other
+  flag bit; a later version's unknown bits are read past. `GraphRuntime::restore_stopped_nodes` keeps
+  each named node stopped on a runtime about to resume (it sets `disabled` only, through
+  `Scheduler::restore_stopped_nodes`) and releases each `block` slot the node holds as a consumer, as
+  its stop released it live. That release emits no event and moves no counter, because the recorded
+  run already reported it. The block-credit check
   counts every pop on a capture-time trigger input as credit (`AllPops`), because the opt-in
   builds only per-set, so there is no legacy port to decline over. The replay verifier cannot re-derive capture-time sets from
   the wire-stamp read log, so it stands down on such a node (`capture_time_sync`). Stamp
